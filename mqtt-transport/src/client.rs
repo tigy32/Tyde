@@ -24,6 +24,8 @@ use crate::config::{ConnectionPlan, ManagedMqttConnectConfig, MqttConnectConfig}
 use crate::error::MqttTransportError;
 use crate::framing::SESSION_SALT_LEN;
 use crate::link_native::NativeMqttLink;
+#[cfg(test)]
+use crate::link_native::TestConnectionDiagnosticContext;
 use crate::protocol_driver::{
     EphemeralDataRoom, ProtocolDriver, PublishPacer, generate_session_salt,
     negotiate_ephemeral_data_room,
@@ -42,6 +44,35 @@ struct ConnectOverrides {
     subscribe_barrier: Option<Arc<Barrier>>,
     #[cfg(test)]
     accepted_publish_count: Option<Arc<AtomicUsize>>,
+    #[cfg(test)]
+    diagnostic: Option<TestConnectionDiagnostic>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct TestConnectionDiagnostic {
+    label: String,
+    phase: &'static str,
+    started_at: std::time::Instant,
+}
+
+#[cfg(test)]
+impl TestConnectionDiagnostic {
+    fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            phase: "rendezvous",
+            started_at: std::time::Instant::now(),
+        }
+    }
+
+    fn data_room(&self) -> Self {
+        Self {
+            label: self.label.clone(),
+            phase: "data-room",
+            started_at: self.started_at,
+        }
+    }
 }
 
 pub async fn connect(config: MqttConnectConfig) -> Result<EnvelopeStream, MqttTransportError> {
@@ -89,26 +120,28 @@ pub(crate) async fn connect_with_test_overrides(
             fixed_session_salt,
             subscribe_barrier,
             accepted_publish_count,
+            diagnostic: None,
         },
     )
     .await
 }
 
 #[cfg(test)]
-pub(crate) async fn connect_ephemeral_with_test_overrides(
+async fn connect_ephemeral_with_test_diagnostic(
     config: MqttConnectConfig,
     tls_ca_pem: Vec<u8>,
     fixed_session_salt: Option<[u8; SESSION_SALT_LEN]>,
-    subscribe_barrier: Option<Arc<Barrier>>,
     accepted_publish_count: Option<Arc<AtomicUsize>>,
+    label: String,
 ) -> Result<EnvelopeStream, MqttTransportError> {
     connect_ephemeral_plan(
         ConnectionPlan::legacy(config),
         ConnectOverrides {
             tls_ca_pem: Some(tls_ca_pem),
             fixed_session_salt,
-            subscribe_barrier,
+            subscribe_barrier: None,
             accepted_publish_count,
+            diagnostic: Some(TestConnectionDiagnostic::new(label)),
         },
     )
     .await
@@ -135,6 +168,17 @@ async fn connect_plan(
     let link = {
         let mut link = link;
         link.set_accepted_publish_count_for_test(overrides.accepted_publish_count.clone());
+        if let Some(diagnostic) = overrides.diagnostic.as_ref() {
+            link.set_test_connection_diagnostic(TestConnectionDiagnosticContext {
+                label: diagnostic.label.clone(),
+                phase: diagnostic.phase,
+                started_at: diagnostic.started_at,
+                role: format!("{:?}", config.role),
+                inbound_topic: inbound_topic.clone(),
+                outbound_topic: outbound_topic.clone(),
+                client_identity: format!("{:?}", broker.client_id),
+            });
+        }
         link
     };
 
@@ -175,7 +219,40 @@ async fn connect_ephemeral_plan(
     plan: ConnectionPlan,
     overrides: ConnectOverrides,
 ) -> Result<EnvelopeStream, MqttTransportError> {
-    let data = negotiate_ephemeral_data_room_native(&plan, &overrides).await?;
+    #[cfg(test)]
+    if let Some(diagnostic) = overrides.diagnostic.as_ref() {
+        eprintln!(
+            "mqtt transport test connection begin label={} phase={} elapsed_ms={}",
+            diagnostic.label,
+            diagnostic.phase,
+            diagnostic.started_at.elapsed().as_millis()
+        );
+    }
+    let data = match negotiate_ephemeral_data_room_native(&plan, &overrides).await {
+        Ok(data) => data,
+        Err(error) => {
+            #[cfg(test)]
+            if let Some(diagnostic) = overrides.diagnostic.as_ref() {
+                eprintln!(
+                    "mqtt transport test connection failed label={} phase={} elapsed_ms={} error={error:?}",
+                    diagnostic.label,
+                    diagnostic.phase,
+                    diagnostic.started_at.elapsed().as_millis(),
+                );
+            }
+            return Err(error);
+        }
+    };
+    #[cfg(test)]
+    if let Some(diagnostic) = overrides.diagnostic.as_ref() {
+        eprintln!(
+            "mqtt transport test connection ready label={} phase={} elapsed_ms={} data_room={:?}",
+            diagnostic.label,
+            diagnostic.phase,
+            diagnostic.started_at.elapsed().as_millis(),
+            data.room,
+        );
+    }
     let data_config = MqttConnectConfig {
         endpoint: plan.config.endpoint,
         room: data.room,
@@ -187,9 +264,19 @@ async fn connect_ephemeral_plan(
         broker: plan.broker,
         topics: plan.topics,
     };
-    tokio::time::timeout(
+    #[cfg(test)]
+    let data_overrides = {
+        let mut data_overrides = overrides;
+        if let Some(diagnostic) = data_overrides.diagnostic.as_mut() {
+            *diagnostic = diagnostic.data_room();
+        }
+        data_overrides
+    };
+    #[cfg(not(test))]
+    let data_overrides = overrides;
+    let connected = tokio::time::timeout(
         RENDEZVOUS_DATA_CONNECT_TIMEOUT,
-        connect_plan(data_plan, overrides),
+        connect_plan(data_plan, data_overrides),
     )
     .await
     .map_err(|_| MqttTransportError::BrokerDisconnected {
@@ -197,7 +284,12 @@ async fn connect_ephemeral_plan(
             "timed out waiting for MQTT ephemeral data room after {:?}",
             RENDEZVOUS_DATA_CONNECT_TIMEOUT
         ),
-    })?
+    });
+    #[cfg(test)]
+    if let Err(error) = &connected {
+        eprintln!("mqtt transport test data-room boundary failed error={error:?}");
+    }
+    connected?
 }
 
 /// Construct the native link for the main (rendezvous) room and run the
@@ -211,7 +303,20 @@ async fn negotiate_ephemeral_data_room_native(
     let outbound_topic = plan.topics.outbound_topic(config.role, &config.room)?;
     let mut link = NativeMqttLink::connect(&plan.broker, overrides.tls_ca_pem.clone())?;
     #[cfg(test)]
-    link.set_accepted_publish_count_for_test(overrides.accepted_publish_count.clone());
+    {
+        link.set_accepted_publish_count_for_test(overrides.accepted_publish_count.clone());
+        if let Some(diagnostic) = overrides.diagnostic.as_ref() {
+            link.set_test_connection_diagnostic(TestConnectionDiagnosticContext {
+                label: diagnostic.label.clone(),
+                phase: diagnostic.phase,
+                started_at: diagnostic.started_at,
+                role: format!("{:?}", config.role),
+                inbound_topic: inbound_topic.clone(),
+                outbound_topic: outbound_topic.clone(),
+                client_identity: format!("{:?}", plan.broker.client_id),
+            });
+        }
+    }
     negotiate_ephemeral_data_room(config, &inbound_topic, &outbound_topic, &mut link).await
 }
 
@@ -224,7 +329,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use rcgen::{CertifiedKey, generate_simple_self_signed};
     use rumqttc::v5::mqttbytes::QoS;
@@ -255,6 +360,7 @@ mod tests {
         endpoint: BrokerEndpoint,
         ca_pem: Vec<u8>,
         accepted_publish_count: Arc<AtomicUsize>,
+        started_at: Instant,
         _temp_dir: TempDir,
         _broker_thread: thread::JoinHandle<()>,
     }
@@ -332,9 +438,9 @@ mod tests {
         let main_room = RoomId([0x3c; 16]);
         let psk = PreSharedKey([0xc1; 32]);
         let (mut host_a, mut client_a) =
-            connect_ephemeral_pair(&broker, main_room, psk.clone(), psk.clone()).await?;
+            connect_ephemeral_pair(&broker, main_room, psk.clone(), psk.clone(), "pair-a").await?;
         let (mut host_b, mut client_b) =
-            connect_ephemeral_pair(&broker, main_room, psk.clone(), psk).await?;
+            connect_ephemeral_pair(&broker, main_room, psk.clone(), psk, "pair-b").await?;
 
         host_a.write_all(b"first session").await?;
         host_a.flush().await?;
@@ -789,6 +895,7 @@ mod tests {
         room: RoomId,
         host_psk: PreSharedKey,
         client_psk: PreSharedKey,
+        label: &str,
     ) -> Result<(EnvelopeStream, EnvelopeStream), Box<dyn Error>> {
         let host_config = MqttConnectConfig {
             endpoint: broker.endpoint.clone(),
@@ -802,25 +909,52 @@ mod tests {
             psk: client_psk,
             role: ParticipantRole::Client,
         };
+        eprintln!(
+            "mqtt transport test pair begin label={label} elapsed_ms={} main_room={room:?}",
+            broker.started_at.elapsed().as_millis(),
+        );
         let connected = timeout(Duration::from_secs(10), async {
             tokio::try_join!(
-                connect_ephemeral_with_test_overrides(
+                connect_ephemeral_with_test_diagnostic(
                     host_config,
                     broker.ca_pem.clone(),
                     Some(HOST_SALT),
-                    None,
                     Some(broker.accepted_publish_count.clone()),
+                    format!("{label}/host"),
                 ),
-                connect_ephemeral_with_test_overrides(
+                connect_ephemeral_with_test_diagnostic(
                     client_config,
                     broker.ca_pem.clone(),
                     Some(CLIENT_SALT),
-                    None,
                     Some(broker.accepted_publish_count.clone()),
+                    format!("{label}/client"),
                 )
             )
         })
-        .await??;
+        .await;
+        let connected = match connected {
+            Ok(Ok(connected)) => {
+                eprintln!(
+                    "mqtt transport test pair ready label={label} elapsed_ms={}",
+                    broker.started_at.elapsed().as_millis(),
+                );
+                connected
+            }
+            Ok(Err(error)) => {
+                eprintln!(
+                    "mqtt transport test pair failed label={label} elapsed_ms={} error={error:?}",
+                    broker.started_at.elapsed().as_millis(),
+                );
+                return Err(Box::new(error));
+            }
+            Err(error) => {
+                eprintln!(
+                    "mqtt transport test pair timed out label={label} elapsed_ms={} error={error:?}",
+                    broker.started_at.elapsed().as_millis(),
+                );
+                return Err(Box::new(error));
+            }
+        };
         Ok(connected)
     }
 
@@ -866,6 +1000,7 @@ mod tests {
     fn start_tls_broker(
         auth: Option<HashMap<String, String>>,
     ) -> Result<TestBroker, Box<dyn Error>> {
+        let started_at = Instant::now();
         let temp_dir = TempDir::new()?;
         let CertifiedKey { cert, signing_key } =
             generate_simple_self_signed(vec!["localhost".to_string()])?;
@@ -926,6 +1061,10 @@ mod tests {
         });
 
         wait_for_port(port)?;
+        eprintln!(
+            "mqtt transport test broker tcp-ready port={port} elapsed_ms={} tls_mqtt_ready=awaiting_connack",
+            started_at.elapsed().as_millis(),
+        );
 
         Ok(TestBroker {
             endpoint: BrokerEndpoint {
@@ -934,6 +1073,7 @@ mod tests {
             },
             ca_pem: cert_pem.into_bytes(),
             accepted_publish_count,
+            started_at,
             _temp_dir: temp_dir,
             _broker_thread: broker_thread,
         })

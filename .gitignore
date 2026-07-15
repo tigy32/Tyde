@@ -1,6 +1,7 @@
 /target
 /old
 /build
+/node_modules
 
 # Python cache artifacts
 __pycache__/
@@ -9,8 +10,6 @@ __pycache__/
 # Frontend build artifacts
 frontend/dist/
 mobile-frontend/dist/
-mobile/dist/
-mobile/dist
 
 # macOS
 .DS_Store

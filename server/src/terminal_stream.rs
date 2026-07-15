@@ -11,7 +11,17 @@ use protocol::{
 };
 use tokio::sync::{Notify, mpsc};
 
+use crate::process_env;
 use crate::stream::{Stream, StreamClosed};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TerminalLaunchCommand {
+    DefaultShell,
+    Trusted {
+        program: String,
+        arguments: Vec<String>,
+    },
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct TerminalLaunchInfo {
@@ -20,6 +30,7 @@ pub(crate) struct TerminalLaunchInfo {
     pub cwd: String,
     pub cols: u16,
     pub rows: u16,
+    pub command: TerminalLaunchCommand,
 }
 
 #[derive(Clone)]
@@ -327,7 +338,7 @@ fn create_terminal_session(launch: &TerminalLaunchInfo) -> Result<CreatedTermina
         })
         .map_err(|err| format!("failed to allocate PTY: {err}"))?;
 
-    let (command, shell) = build_shell_command(&launch.cwd);
+    let (command, shell) = build_terminal_command(launch);
     let child = pair
         .slave
         .spawn_command(command)
@@ -475,15 +486,28 @@ fn unix_time_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn build_shell_command(cwd: &str) -> (CommandBuilder, String) {
-    let shell = default_shell();
-    let mut command = CommandBuilder::new(shell.clone());
-    if !cfg!(target_os = "windows") {
-        command.arg("-l");
-    }
+fn build_terminal_command(launch: &TerminalLaunchInfo) -> (CommandBuilder, String) {
+    let (mut command, program) = match &launch.command {
+        TerminalLaunchCommand::DefaultShell => {
+            let shell = default_shell();
+            let mut command = CommandBuilder::new(shell.clone());
+            if !cfg!(target_os = "windows") {
+                command.arg("-l");
+            }
+            (command, shell)
+        }
+        TerminalLaunchCommand::Trusted { program, arguments } => {
+            let mut command = CommandBuilder::new(program);
+            command.args(arguments);
+            (command, program.clone())
+        }
+    };
     command.env("TERM", "xterm-256color");
-    command.cwd(cwd);
-    (command, shell)
+    if let Some(path) = process_env::resolved_child_process_path() {
+        command.env("PATH", path);
+    }
+    command.cwd(&launch.cwd);
+    (command, program)
 }
 
 fn default_shell() -> String {
@@ -522,7 +546,11 @@ fn last_complete_utf8(data: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::last_complete_utf8;
+    use std::ffi::OsString;
+
+    use super::{
+        TerminalLaunchCommand, TerminalLaunchInfo, build_terminal_command, last_complete_utf8,
+    };
 
     fn emitted_chunks(reads: &[&[u8]], flush_pending: bool) -> Vec<String> {
         let mut chunks = Vec::new();
@@ -584,6 +612,32 @@ mod tests {
         assert_eq!(
             emitted_chunks(&[b"ok", partial_crab], true),
             vec!["ok", "�"]
+        );
+    }
+
+    #[test]
+    fn trusted_command_uses_exact_program_and_arguments() {
+        let launch = TerminalLaunchInfo {
+            project_id: None,
+            root: None,
+            cwd: "/tmp".to_owned(),
+            cols: 100,
+            rows: 28,
+            command: TerminalLaunchCommand::Trusted {
+                program: "/bin/sh".to_owned(),
+                arguments: vec!["/tmp/tyde setup script.sh".to_owned()],
+            },
+        };
+
+        let (command, program) = build_terminal_command(&launch);
+
+        assert_eq!(program, "/bin/sh");
+        assert_eq!(
+            command.get_argv(),
+            &[
+                OsString::from("/bin/sh"),
+                OsString::from("/tmp/tyde setup script.sh"),
+            ]
         );
     }
 }

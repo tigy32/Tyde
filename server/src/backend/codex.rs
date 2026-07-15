@@ -12,22 +12,27 @@ use tokio::process::{ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
+use protocol::types::StreamIdentityViolation;
 use protocol::{
-    BackendAccessMode, ModelRequestId, ModelRequestTokenUsage, ModelTurnId, TokenUsage,
-    TokenUsageUnavailableReason,
+    BackendAccessMode, CapacityBucket, CapacityBucketId, CapacityCoverage, CapacityMeasure,
+    CapacityPlanLabel, CapacityReport, CapacityReset, CapacityScope, CapacitySource,
+    CapacityUnavailableReason, CapacityWindow, ChatMessageId, CodexLimitSlot, ModelRequestId,
+    ModelRequestTokenUsage, ModelTurnId, ServerGeneratedChatMessageIdOrigin,
+    ServerGeneratedChatMessageIdentity, TokenUsage, TokenUsageUnavailableReason,
+    ToolExecutionNormalizationFailure, ValueProvenance,
 };
 
 use crate::agent_control_mcp::AGENT_CONTROL_AWAIT_MCP_SERVER_NAME;
 use crate::backend::agent_control_progress::{
-    await_progress_data_for_tool, is_tyde_agent_control_spawn_tool_name,
-    spawn_progress_data_for_tool_result,
+    await_progress_data_for_tool, spawn_progress_data_for_tool_result, tyde_tool_request_type,
+    tyde_tool_result,
 };
 use crate::backend::turn_emitter::{
     AgentName, MessageMetadataUpdatePayload, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
 };
 use crate::backend::{
-    BackendStartupError, SessionCommand, StartupMcpServer, StartupMcpTransport,
-    render_combined_spawn_instructions,
+    BackendExecutionMode, BackendStartupError, SessionCommand, StartupMcpServer,
+    StartupMcpTransport, render_combined_spawn_instructions,
 };
 use crate::process_env;
 use crate::review_mcp::REVIEW_FEEDBACK_MCP_SERVER_NAME;
@@ -46,25 +51,152 @@ const CODEX_ESTIMATED_CONTEXT_WINDOW_GPT5_FAMILY: u64 = 400_000;
 const CODEX_ESTIMATED_BYTES_PER_TOKEN: u64 = 4;
 const CODEX_MIN_SYSTEM_PROMPT_BYTES: u64 = 1_024;
 const CODEX_FORCED_APPROVAL_POLICY: &str = "never";
+const CODEX_INFERENCE_APPROVAL_POLICY: &str = "untrusted";
 const CODEX_UNRESTRICTED_SANDBOX: &str = "danger-full-access";
 // ReadOnly is advisory in Tyde; keep Codex writable enough for cargo target/.
 const CODEX_READ_ONLY_SANDBOX: &str = "workspace-write";
+const CODEX_INFERENCE_SANDBOX: &str = "read-only";
 const CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS: bool = true;
 const CODEX_REASONING_SUMMARY_LEVEL: &str = "detailed";
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static CODEX_TEST_APP_SERVER_BINARY: std::sync::OnceLock<
     std::sync::Mutex<Option<std::path::PathBuf>>,
 > = std::sync::OnceLock::new();
-
 #[cfg(test)]
+static CODEX_TEST_NATIVE_HOME: std::sync::OnceLock<std::sync::Mutex<Option<std::path::PathBuf>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(any(test, feature = "test-support"))]
 fn codex_test_app_server_binary_override() -> &'static std::sync::Mutex<Option<std::path::PathBuf>>
 {
     CODEX_TEST_APP_SERVER_BINARY.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+#[cfg(test)]
+fn codex_test_native_home_override() -> &'static std::sync::Mutex<Option<std::path::PathBuf>> {
+    CODEX_TEST_NATIVE_HOME.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(feature = "test-support")]
+pub struct CodexTestAppServerGuard {
+    previous: Option<std::path::PathBuf>,
+}
+
+#[cfg(feature = "test-support")]
+impl Drop for CodexTestAppServerGuard {
+    fn drop(&mut self) {
+        *codex_test_app_server_binary_override()
+            .lock()
+            .expect("codex test app-server binary mutex poisoned") = self.previous.take();
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub fn install_test_app_server_binary(binary: std::path::PathBuf) -> CodexTestAppServerGuard {
+    let previous = codex_test_app_server_binary_override()
+        .lock()
+        .expect("codex test app-server binary mutex poisoned")
+        .replace(binary);
+    CodexTestAppServerGuard { previous }
+}
+
+#[cfg(test)]
+mod capacity_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn passive_notification_maps_complete_vendor_buckets_without_unit_conversion() {
+        let report = map_passive_rate_limits_updated(&json!({
+            "rateLimits": {
+                "limitId": "subscription", "limitName": "subscription",
+                "primary": {"usedPercent": 82, "windowDurationMins": 300, "resetsAt": 1_700_000_000},
+                "secondary": {"usedPercent": 17, "windowDurationMins": 10_080, "resetsAt": 1_700_100_000},
+                "credits": {"hasCredits": true, "unlimited": false, "balance": "12"},
+                "individualLimit": true, "planType": "pro", "rateLimitReachedType": null
+            }
+        })).expect("complete passive notification");
+        assert_eq!(
+            report.coverage,
+            protocol::CapacityCoverage::AllVendorBuckets
+        );
+        assert_eq!(
+            report.plan.as_ref().map(|plan| plan.label.as_str()),
+            Some("pro")
+        );
+        assert_eq!(report.buckets[0].label, "subscription primary limit");
+        let protocol::CapacityMeasure::UsedPercent {
+            used_percent,
+            remaining_percent,
+            provenance,
+        } = &report.buckets[0].measure
+        else {
+            panic!("primary percent");
+        };
+        assert_eq!((*used_percent, *remaining_percent), (82, 18));
+        assert!(provenance.vendor_reported);
+        assert_eq!(
+            report.buckets[0].measure.used_percent_provenance(),
+            Some(protocol::PercentValueProvenance::VendorReported)
+        );
+        assert_eq!(
+            report.buckets[0].measure.remaining_percent_provenance(),
+            Some(protocol::PercentValueProvenance::DerivedComplement)
+        );
+        assert!(matches!(
+            &report.buckets[2].measure,
+            protocol::CapacityMeasure::Credits { .. }
+        ));
+    }
+
+    #[test]
+    fn incomplete_or_out_of_range_passive_notification_never_claims_full_coverage() {
+        assert_eq!(
+            map_passive_rate_limits_updated(&json!({"rateLimits": {}})),
+            Err(protocol::CapacityUnavailableReason::MalformedReport)
+        );
+        let malformed = json!({"rateLimits": {
+            "limitId":"x", "limitName":"x",
+            "primary":{"usedPercent":101,"windowDurationMins":300,"resetsAt":1},
+            "secondary":{"usedPercent":1,"windowDurationMins":300,"resetsAt":1},
+            "credits":{"hasCredits":false,"unlimited":false,"balance":null},
+            "individualLimit":false,"planType":null,"rateLimitReachedType":null
+        }});
+        assert_eq!(
+            map_passive_rate_limits_updated(&malformed),
+            Err(protocol::CapacityUnavailableReason::MalformedReport)
+        );
+    }
+
+    #[test]
+    fn malformed_credit_or_timestamp_fields_are_unavailable_without_raw_values() {
+        let malformed = json!({"rateLimits": {
+            "limitId":"x", "limitName":"x",
+            "primary":{"usedPercent":1,"windowDurationMins":300,"resetsAt":1},
+            "secondary":{"usedPercent":1,"windowDurationMins":300,"resetsAt":1},
+            "credits":{"hasCredits":true,"unlimited":false,"balance":{"raw":"secret"}},
+            "individualLimit":false,"planType":null,"rateLimitReachedType":null
+        }});
+        assert_eq!(
+            map_passive_rate_limits_updated(&malformed),
+            Err(protocol::CapacityUnavailableReason::MalformedReport)
+        );
+        let overflow = json!({"rateLimits": {
+            "limitId":"x", "limitName":"x",
+            "primary":{"usedPercent":1,"windowDurationMins":300,"resetsAt":18446744073709551615_u64},
+            "secondary":{"usedPercent":1,"windowDurationMins":300,"resetsAt":1},
+            "credits":{"hasCredits":true,"unlimited":false,"balance":null},
+            "individualLimit":false,"planType":null,"rateLimitReachedType":null
+        }});
+        assert_eq!(
+            map_passive_rate_limits_updated(&overflow),
+            Err(protocol::CapacityUnavailableReason::MalformedReport)
+        );
+    }
+}
+
 fn codex_command() -> Command {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         let override_path = codex_test_app_server_binary_override()
             .lock()
@@ -95,6 +227,23 @@ impl CodexCommandHandle {
 
 pub struct CodexSession {
     inner: Arc<CodexInner>,
+    // The thread/start or thread/fork response is the authoritative source for
+    // this value. Keep it outside the event-state lock so parent-session
+    // publication cannot be delayed by an early raw child notification.
+    session_id: SessionId,
+}
+
+struct CodexThreadResponseConfig<'a> {
+    startup_mcp_servers: &'a [StartupMcpServer],
+    access_mode: BackendAccessMode,
+    execution_mode: BackendExecutionMode,
+}
+
+struct CodexSessionSpawnOptions {
+    ephemeral: bool,
+    access_mode: BackendAccessMode,
+    subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
+    execution_mode: BackendExecutionMode,
 }
 
 impl CodexSession {
@@ -107,11 +256,15 @@ impl CodexSession {
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
-            false,
             ssh_host,
             startup_mcp_servers,
             steering_content,
-            access_mode,
+            CodexSessionSpawnOptions {
+                ephemeral: false,
+                access_mode,
+                subagent_emitter: None,
+                execution_mode: BackendExecutionMode::Agent,
+            },
         )
         .await
     }
@@ -125,11 +278,15 @@ impl CodexSession {
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
-            true,
             ssh_host,
             startup_mcp_servers,
             steering_content,
-            access_mode,
+            CodexSessionSpawnOptions {
+                ephemeral: true,
+                access_mode,
+                subagent_emitter: None,
+                execution_mode: BackendExecutionMode::Agent,
+            },
         )
         .await
     }
@@ -143,23 +300,32 @@ impl CodexSession {
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
-            true,
             ssh_host,
             startup_mcp_servers,
             steering_content,
-            access_mode,
+            CodexSessionSpawnOptions {
+                ephemeral: true,
+                access_mode,
+                subagent_emitter: None,
+                execution_mode: BackendExecutionMode::Agent,
+            },
         )
         .await
     }
 
     async fn spawn_with_mode(
         workspace_roots: &[String],
-        ephemeral: bool,
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
-        access_mode: BackendAccessMode,
+        options: CodexSessionSpawnOptions,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
+        let CodexSessionSpawnOptions {
+            ephemeral,
+            access_mode,
+            subagent_emitter,
+            execution_mode,
+        } = options;
         let steering_tempfile = match steering_content {
             Some(content) if !content.trim().is_empty() => {
                 Some(crate::steering::write_codex_steering_tempfile(content)?)
@@ -171,6 +337,7 @@ impl CodexSession {
             startup_mcp_servers,
             steering_tempfile.as_deref(),
             access_mode,
+            execution_mode,
         )
         .await
         {
@@ -214,9 +381,9 @@ impl CodexSession {
                 "thread/start",
                 json!({
                     "cwd": cwd,
-                    "sandbox": codex_sandbox_mode(access_mode),
-                    "approvalPolicy": CODEX_FORCED_APPROVAL_POLICY,
-                    "ephemeral": ephemeral,
+                    "sandbox": codex_sandbox_mode(access_mode, execution_mode),
+                    "approvalPolicy": codex_approval_policy(execution_mode),
+                    "ephemeral": ephemeral || execution_mode == BackendExecutionMode::InferenceOnly,
                     "experimentalRawEvents": CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS,
                     "persistExtendedHistory": false
                 }),
@@ -227,10 +394,14 @@ impl CodexSession {
             rpc,
             inbound_rx,
             steering_tempfile,
-            startup_mcp_servers,
-            access_mode,
+            CodexThreadResponseConfig {
+                startup_mcp_servers,
+                access_mode,
+                execution_mode,
+            },
             thread_started,
             "thread/start",
+            subagent_emitter,
         )
         .await
     }
@@ -254,6 +425,7 @@ impl CodexSession {
             startup_mcp_servers,
             steering_tempfile.as_deref(),
             access_mode,
+            BackendExecutionMode::Agent,
         )
         .await
         {
@@ -314,7 +486,7 @@ impl CodexSession {
         let mut fork_params = json!({
             "threadId": from_thread_id,
             "cwd": cwd.clone(),
-            "sandbox": codex_sandbox_mode(access_mode),
+            "sandbox": codex_sandbox_mode(access_mode, BackendExecutionMode::Agent),
             "approvalPolicy": CODEX_FORCED_APPROVAL_POLICY,
             "ephemeral": false,
             "experimentalRawEvents": CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS,
@@ -344,10 +516,14 @@ impl CodexSession {
             rpc,
             inbound_rx,
             steering_tempfile,
-            startup_mcp_servers,
-            access_mode,
+            CodexThreadResponseConfig {
+                startup_mcp_servers,
+                access_mode,
+                execution_mode: BackendExecutionMode::Agent,
+            },
             thread_forked,
             "thread/fork",
+            None,
         )
         .await
     }
@@ -356,10 +532,10 @@ impl CodexSession {
         rpc: CodexRpc,
         inbound_rx: mpsc::UnboundedReceiver<CodexInbound>,
         steering_tempfile: Option<std::path::PathBuf>,
-        startup_mcp_servers: &[StartupMcpServer],
-        access_mode: BackendAccessMode,
+        config: CodexThreadResponseConfig<'_>,
         thread_response: Value,
         method: &str,
+        subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         let thread_id = thread_response
             .get("thread")
@@ -367,6 +543,8 @@ impl CodexSession {
             .and_then(Value::as_str)
             .ok_or_else(|| format!("Codex {method} response missing thread.id"))?
             .to_string();
+        let session_id = SessionId(thread_id.clone());
+        let generated_identity_epoch = codex_generated_identity_epoch(&thread_id);
 
         let model = thread_response
             .get("model")
@@ -390,10 +568,15 @@ impl CodexSession {
                     .and_then(Value::as_str)
                     .map(str::to_string),
                 approval_policy: None,
-                access_mode,
-                turn_network_access: codex_has_http_mcp_servers(startup_mcp_servers),
+                access_mode: config.access_mode,
+                execution_mode: config.execution_mode,
+                turn_network_access: codex_has_http_mcp_servers(config.startup_mcp_servers),
                 active_turn_id: None,
                 active_stream: None,
+                completed_agent_messages: HashMap::new(),
+                quarantined_turn_id: None,
+                generated_identity_epoch,
+                next_generated_identity_ordinal: 1,
                 pending_tool_call_ids: HashSet::new(),
                 close_active_stream_when_tools_idle: false,
                 pending_message_metadata: None,
@@ -405,7 +588,11 @@ impl CodexSession {
                 pending_request: None,
                 pending_user_input_bytes: 0,
                 conversation_bytes_total: 0,
-                subagent_emitter: None,
+                subagent_emitter,
+                pending_subagent_spawns: HashMap::new(),
+                conflicting_subagent_threads: HashMap::new(),
+                registering_subagent_threads: HashSet::new(),
+                unknown_owner_notifications: HashSet::new(),
                 subagent_streams: HashMap::new(),
                 completed_subagent_streams: HashMap::new(),
             }),
@@ -420,12 +607,11 @@ impl CodexSession {
             }
         });
 
-        Ok((Self { inner }, event_rx))
+        Ok((Self { inner, session_id }, event_rx))
     }
 
-    pub(crate) async fn session_id(&self) -> SessionId {
-        let state = self.inner.state.lock().await;
-        SessionId(state.thread_id.clone())
+    pub(crate) fn session_id(&self) -> SessionId {
+        self.session_id.clone()
     }
 
     pub fn command_handle(&self) -> CodexCommandHandle {
@@ -474,10 +660,13 @@ impl CodexSession {
             .await
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) async fn set_subagent_emitter(&self, emitter: Arc<dyn SubAgentEmitter>) {
+    pub(crate) async fn set_subagent_emitter(
+        &self,
+        emitter: Arc<dyn SubAgentEmitter>,
+    ) -> Result<(), String> {
         let mut state = self.inner.state.lock().await;
         state.subagent_emitter = Some(emitter);
+        Ok(())
     }
 
     pub async fn shutdown(self) {
@@ -505,28 +694,172 @@ fn remove_codex_steering_tempfile(steering_tempfile: &Option<std::path::PathBuf>
     }
 }
 
-pub async fn query_account_rate_limits(ssh_host: Option<&str>) -> Result<Value, String> {
-    let (rpc, _inbound_rx) =
-        CodexRpc::spawn(ssh_host, &[], None, BackendAccessMode::Unrestricted).await?;
-
-    rpc.request(
-        "initialize",
-        json!({
-            "clientInfo": {
-                "name": "tyde",
-                "title": Value::Null,
-                "version": "0.1"
-            },
-            "capabilities": {
-                "experimentalApi": true
+/// Maps only the verified passive app-server notification. This deliberately
+/// consumes the already-open app-server notification.
+pub(crate) fn map_passive_rate_limits_updated(
+    params: &Value,
+) -> Result<CapacityReport, CapacityUnavailableReason> {
+    let snapshot = params.get("rateLimits").unwrap_or(params);
+    const REQUIRED: [&str; 8] = [
+        "limitId",
+        "limitName",
+        "primary",
+        "secondary",
+        "credits",
+        "individualLimit",
+        "planType",
+        "rateLimitReachedType",
+    ];
+    if !snapshot.is_object() || REQUIRED.iter().any(|field| snapshot.get(field).is_none()) {
+        return Err(CapacityUnavailableReason::MalformedReport);
+    }
+    if snapshot.get("limitId").and_then(Value::as_str).is_none()
+        || !matches!(snapshot.get("individualLimit"), Some(Value::Bool(_)))
+    {
+        return Err(CapacityUnavailableReason::MalformedReport);
+    }
+    let reached_scope = match snapshot.get("rateLimitReachedType") {
+        Some(Value::Null) => CapacityScope::NotReported,
+        Some(Value::String(value))
+            if value.len() <= 128 && !value.chars().any(char::is_control) =>
+        {
+            if value.starts_with("workspace_") {
+                CapacityScope::Workspace
+            } else if value.starts_with("organization_") {
+                CapacityScope::OrganizationSpend
+            } else {
+                CapacityScope::NotReported
             }
-        }),
-    )
-    .await?;
+        }
+        _ => return Err(CapacityUnavailableReason::MalformedReport),
+    };
+    let limit_name = snapshot
+        .get("limitName")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+        })
+        .ok_or(CapacityUnavailableReason::MalformedReport)?;
+    let mut buckets = Vec::new();
+    for (field, slot, label) in [
+        ("primary", CodexLimitSlot::Primary, "primary limit"),
+        ("secondary", CodexLimitSlot::Secondary, "secondary limit"),
+    ] {
+        let window = snapshot
+            .get(field)
+            .and_then(Value::as_object)
+            .ok_or(CapacityUnavailableReason::MalformedReport)?;
+        let used = window
+            .get("usedPercent")
+            .and_then(Value::as_u64)
+            .filter(|value| *value <= 100)
+            .ok_or(CapacityUnavailableReason::MalformedReport)? as u8;
+        let duration_minutes = window
+            .get("windowDurationMins")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or(CapacityUnavailableReason::MalformedReport)?;
+        let reset = match window.get("resetsAt") {
+            None | Some(Value::Null) => CapacityReset::NotReported,
+            Some(value) => value
+                .as_u64()
+                .and_then(|seconds| seconds.checked_mul(1000))
+                .map(|at_ms| CapacityReset::At { at_ms })
+                .ok_or(CapacityUnavailableReason::MalformedReport)?,
+        };
+        buckets.push(CapacityBucket {
+            id: CapacityBucketId::Codex { slot },
+            label: format!("{limit_name} {label}"),
+            measure: CapacityMeasure::UsedPercent {
+                used_percent: used,
+                remaining_percent: 100 - used,
+                provenance: ValueProvenance {
+                    vendor_reported: true,
+                },
+            },
+            scope: if snapshot.get("individualLimit").and_then(Value::as_bool) == Some(true) {
+                CapacityScope::Individual
+            } else {
+                CapacityScope::Account
+            },
+            window: CapacityWindow::Rolling { duration_minutes },
+            reset,
+            status: None,
+        });
+    }
+    let credits = snapshot
+        .get("credits")
+        .and_then(Value::as_object)
+        .ok_or(CapacityUnavailableReason::MalformedReport)?;
+    let has_credits = credits
+        .get("hasCredits")
+        .and_then(Value::as_bool)
+        .ok_or(CapacityUnavailableReason::MalformedReport)?;
+    let unlimited = credits
+        .get("unlimited")
+        .and_then(Value::as_bool)
+        .ok_or(CapacityUnavailableReason::MalformedReport)?;
+    let balance = match credits.get("balance") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value))
+            if !value.is_empty() && value.len() <= 64 && !value.chars().any(char::is_control) =>
+        {
+            Some(value.clone())
+        }
+        Some(Value::Number(value)) => {
+            let value = value.to_string();
+            Some(
+                (value.len() <= 64)
+                    .then_some(value)
+                    .ok_or(CapacityUnavailableReason::MalformedReport)?,
+            )
+        }
+        Some(_) => return Err(CapacityUnavailableReason::MalformedReport),
+    };
+    buckets.push(CapacityBucket {
+        id: CapacityBucketId::Codex {
+            slot: CodexLimitSlot::Credits,
+        },
+        label: "credits".to_string(),
+        measure: CapacityMeasure::Credits {
+            has_credits,
+            unlimited,
+            balance,
+        },
+        scope: reached_scope,
+        window: CapacityWindow::NotReported,
+        reset: CapacityReset::NotReported,
+        status: None,
+    });
+    Ok(CapacityReport {
+        source: CapacitySource::CodexAccountRateLimitsUpdated,
+        observed_at_ms: None,
+        plan: match snapshot.get("planType") {
+            Some(Value::Null) => None,
+            Some(Value::String(label))
+                if !label.is_empty()
+                    && label.len() <= 128
+                    && !label.chars().any(char::is_control) =>
+            {
+                Some(CapacityPlanLabel {
+                    label: label.clone(),
+                })
+            }
+            _ => return Err(CapacityUnavailableReason::MalformedReport),
+        },
+        buckets,
+        coverage: CapacityCoverage::AllVendorBuckets,
+    })
+}
 
-    let limits = rpc.request("account/rateLimits/read", Value::Null).await;
-    rpc.shutdown().await;
-    limits
+/// Route the verified passive notification through the emitter supplied by the
+/// owning agent session. The adapter never discovers a host globally.
+pub(crate) fn forward_passive_rate_limits_updated(params: &Value, emitter: &dyn SubAgentEmitter) {
+    let state = match map_passive_rate_limits_updated(params) {
+        Ok(report) => protocol::BackendCapacityState::Known { report },
+        Err(reason) => protocol::BackendCapacityState::Unavailable { reason },
+    };
+    emitter.on_backend_capacity(protocol::BackendKind::Codex, state);
 }
 
 pub(crate) async fn probe_session_settings_schema(
@@ -537,6 +870,7 @@ pub(crate) async fn probe_session_settings_schema(
         &[],
         None,
         BackendAccessMode::Unrestricted,
+        BackendExecutionMode::Agent,
         program,
     )
     .await
@@ -733,6 +1067,12 @@ fn numeric_components(value: &str) -> Vec<u64> {
     components
 }
 
+fn codex_generated_identity_epoch(thread_id: &str) -> u64 {
+    thread_id.bytes().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
 #[derive(Clone)]
 struct PendingRequest {
     request_id: Value,
@@ -749,12 +1089,33 @@ enum PendingRequestKind {
     UserInput { questions: Vec<String> },
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct ActiveStreamState {
     turn_id: String,
-    message_id: String,
+    message_id: ChatMessageId,
+    generated_identity: Option<ServerGeneratedChatMessageIdentity>,
     text: String,
     reasoning: String,
+    reasoning_only: bool,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct CompletedCodexAgentMessage {
+    completion_text: String,
+    completion_reasoning: Option<String>,
+    generated_identity: Option<ServerGeneratedChatMessageIdentity>,
+}
+
+enum CodexAgentMessageOpen {
+    Open {
+        message_id: ChatMessageId,
+        generated_identity: Option<ServerGeneratedChatMessageIdentity>,
+        model: String,
+    },
+    Existing,
+    Terminal,
+    Foreign,
+    Quarantined,
 }
 
 #[derive(Clone, Default)]
@@ -764,19 +1125,10 @@ struct TurnContextEstimate {
     reasoning_bytes: u64,
 }
 
-struct CodexStreamSegment {
-    turn_id: String,
-    message_id: String,
-    content: String,
-    reasoning: Option<String>,
-    model: String,
-    turn_context: TurnContextEstimate,
-}
-
 #[derive(Clone)]
 struct PendingCodexMessageMetadata {
     turn_id: String,
-    message_id: String,
+    message_id: ChatMessageId,
     model: String,
     turn_context: TurnContextEstimate,
 }
@@ -792,42 +1144,67 @@ struct CodexTurnTokenUsage {
 
 struct CodexSubAgentStream {
     emitter: Arc<TurnEmitter>,
-    receiver_thread_id: Option<String>,
-    external_agent_id: Option<String>,
+    spawn_item_id: String,
+    activity_item_id: Option<String>,
+    agent_path: String,
+    sender_thread_id: String,
     active_turn_id: Option<String>,
-    current_message_id: Option<String>,
+    current_message_id: Option<ChatMessageId>,
+    current_generated_identity: Option<ServerGeneratedChatMessageIdentity>,
+    current_reasoning_only: bool,
+    current_text: String,
+    current_reasoning: String,
+    completed_agent_messages: HashMap<ChatMessageId, CompletedCodexAgentMessage>,
+    quarantined_turn_id: Option<String>,
+    quarantined: bool,
+    generated_identity_epoch: u64,
+    next_generated_identity_ordinal: u64,
     pending_message_metadata: Option<PendingCodexMessageMetadata>,
     token_usage_by_turn: HashMap<String, Value>,
 }
 
 struct CompletedCodexSubAgentStream {
     emitter: Arc<TurnEmitter>,
-    receiver_thread_id: Option<String>,
-    external_agent_id: Option<String>,
+    spawn_item_id: String,
+    activity_item_id: Option<String>,
+    agent_path: String,
+    sender_thread_id: String,
     pending_message_metadata: Option<PendingCodexMessageMetadata>,
 }
 
 fn completed_codex_subagent_stream(stream: CodexSubAgentStream) -> CompletedCodexSubAgentStream {
     CompletedCodexSubAgentStream {
         emitter: stream.emitter,
-        receiver_thread_id: stream.receiver_thread_id,
-        external_agent_id: stream.external_agent_id,
+        spawn_item_id: stream.spawn_item_id,
+        activity_item_id: stream.activity_item_id,
+        agent_path: stream.agent_path,
+        sender_thread_id: stream.sender_thread_id,
         pending_message_metadata: stream.pending_message_metadata,
     }
 }
 
+#[derive(Clone)]
 struct CodexSubAgentSpawnInfo {
     item_id: String,
     name: String,
     description: String,
     agent_type: String,
-    receiver_thread_id: Option<String>,
-    tool_name: String,
+    receiver_thread_id: String,
+    sender_thread_id: String,
 }
 
-#[derive(Clone)]
-struct CodexWaitAgentCompletion {
-    external_agent_id: String,
+struct CodexSubAgentActivity {
+    item_id: Option<String>,
+    agent_thread_id: String,
+    agent_path: String,
+    kind: String,
+}
+
+enum CodexNotificationOwner {
+    Parent { thread_id: String },
+    LiveChild { thread_id: String },
+    CompletedChild { thread_id: String },
+    Unknown { thread_id: Option<String> },
 }
 
 struct CodexState {
@@ -836,9 +1213,14 @@ struct CodexState {
     reasoning_effort: Option<String>,
     approval_policy: Option<String>,
     access_mode: BackendAccessMode,
+    execution_mode: BackendExecutionMode,
     turn_network_access: bool,
     active_turn_id: Option<String>,
     active_stream: Option<ActiveStreamState>,
+    completed_agent_messages: HashMap<ChatMessageId, CompletedCodexAgentMessage>,
+    quarantined_turn_id: Option<String>,
+    generated_identity_epoch: u64,
+    next_generated_identity_ordinal: u64,
     pending_tool_call_ids: HashSet<String>,
     close_active_stream_when_tools_idle: bool,
     pending_message_metadata: Option<PendingCodexMessageMetadata>,
@@ -851,6 +1233,10 @@ struct CodexState {
     pending_user_input_bytes: u64,
     conversation_bytes_total: u64,
     subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
+    pending_subagent_spawns: HashMap<String, CodexSubAgentSpawnInfo>,
+    conflicting_subagent_threads: HashMap<String, String>,
+    registering_subagent_threads: HashSet<String>,
+    unknown_owner_notifications: HashSet<String>,
     subagent_streams: HashMap<String, CodexSubAgentStream>,
     completed_subagent_streams: HashMap<String, CompletedCodexSubAgentStream>,
 }
@@ -913,23 +1299,192 @@ impl CodexInner {
         Ok(())
     }
 
-    async fn ensure_active_stream_for_message(&self, message_id: &str) -> Option<(String, String)> {
+    async fn open_agent_message_item(&self, message_id: ChatMessageId) -> CodexAgentMessageOpen {
         let mut state = self.state.lock().await;
-        if state.active_stream.is_none() {
-            let turn_id = state
-                .active_turn_id
-                .clone()
-                .unwrap_or_else(|| message_id.to_string());
-            let model = state.model.clone().unwrap_or_else(|| "codex".to_string());
-            state.active_stream = Some(ActiveStreamState {
-                turn_id,
-                message_id: message_id.to_string(),
-                text: String::new(),
-                reasoning: String::new(),
-            });
-            Some((message_id.to_string(), model))
+        if state.quarantined_turn_id.is_some() {
+            return CodexAgentMessageOpen::Quarantined;
+        }
+        if state.completed_agent_messages.contains_key(&message_id) {
+            return CodexAgentMessageOpen::Terminal;
+        }
+        if let Some(stream) = state.active_stream.as_ref() {
+            return if stream.message_id == message_id {
+                CodexAgentMessageOpen::Existing
+            } else {
+                CodexAgentMessageOpen::Foreign
+            };
+        }
+
+        let turn_id = state
+            .active_turn_id
+            .clone()
+            .unwrap_or_else(|| message_id.0.clone());
+        let model = state.model.clone().unwrap_or_else(|| "codex".to_string());
+        state.active_stream = Some(ActiveStreamState {
+            turn_id,
+            message_id: message_id.clone(),
+            generated_identity: None,
+            text: String::new(),
+            reasoning: String::new(),
+            reasoning_only: false,
+        });
+        CodexAgentMessageOpen::Open {
+            message_id,
+            generated_identity: None,
+            model,
+        }
+    }
+
+    async fn open_reasoning_message_item(
+        &self,
+        provider_message_id: Option<ChatMessageId>,
+    ) -> CodexAgentMessageOpen {
+        let mut state = self.state.lock().await;
+        if state.quarantined_turn_id.is_some() {
+            return CodexAgentMessageOpen::Quarantined;
+        }
+        if let Some(stream) = state.active_stream.as_ref() {
+            let same_identity = match provider_message_id.as_ref() {
+                Some(message_id) => stream.message_id == *message_id,
+                None => {
+                    stream.reasoning_only
+                        && stream.generated_identity.as_ref().is_some_and(|identity| {
+                            identity.origin == ServerGeneratedChatMessageIdOrigin::IdlessReasoning
+                        })
+                }
+            };
+            return if same_identity {
+                CodexAgentMessageOpen::Existing
+            } else {
+                CodexAgentMessageOpen::Foreign
+            };
+        }
+        let generated_identity = provider_message_id.is_none().then(|| {
+            let identity = ServerGeneratedChatMessageIdentity {
+                origin: ServerGeneratedChatMessageIdOrigin::IdlessReasoning,
+                stream_epoch: state.generated_identity_epoch,
+                item_ordinal: state.next_generated_identity_ordinal,
+            };
+            state.next_generated_identity_ordinal =
+                state.next_generated_identity_ordinal.saturating_add(1);
+            identity
+        });
+        let message_id = provider_message_id.unwrap_or_else(|| {
+            generated_identity
+                .as_ref()
+                .expect("generated identity")
+                .message_id()
+        });
+        if state.completed_agent_messages.contains_key(&message_id) {
+            return CodexAgentMessageOpen::Terminal;
+        }
+        let turn_id = state
+            .active_turn_id
+            .clone()
+            .unwrap_or_else(|| message_id.0.clone());
+        let model = state.model.clone().unwrap_or_else(|| "codex".to_string());
+        state.active_stream = Some(ActiveStreamState {
+            turn_id,
+            message_id: message_id.clone(),
+            generated_identity: generated_identity.clone(),
+            text: String::new(),
+            reasoning: String::new(),
+            reasoning_only: true,
+        });
+        CodexAgentMessageOpen::Open {
+            message_id,
+            generated_identity,
+            model,
+        }
+    }
+
+    fn emit_stream_start(
+        emitter: &TurnEmitter,
+        message_id: ChatMessageId,
+        generated_identity: Option<&ServerGeneratedChatMessageIdentity>,
+        model: &str,
+    ) {
+        if let Some(identity) = generated_identity {
+            emitter.stream_start_with_generated_identity(
+                identity,
+                AgentName(CODEX_AGENT_NAME),
+                Some(model),
+            );
         } else {
-            None
+            emitter.stream_start_with_id(message_id, AgentName(CODEX_AGENT_NAME), Some(model));
+        }
+    }
+
+    async fn reject_agent_message_identity(
+        &self,
+        violation: StreamIdentityViolation,
+        method: &str,
+        provider_item_id: Option<&str>,
+    ) {
+        let (thread_id, turn_id, active_item_id, active_buffer_len) = {
+            let mut state = self.state.lock().await;
+            if state.quarantined_turn_id.is_some() {
+                return;
+            }
+            state.quarantined_turn_id = state.active_turn_id.clone();
+            let active_stream = state.active_stream.take();
+            state.pending_message_metadata = None;
+            (
+                state.thread_id.clone(),
+                state.active_turn_id.clone(),
+                active_stream
+                    .as_ref()
+                    .map(|stream| stream.message_id.clone()),
+                active_stream.as_ref().map_or(0, |stream| stream.text.len()),
+            )
+        };
+        tracing::warn!(
+            codex_method = method,
+            thread_id,
+            ?turn_id,
+            ?provider_item_id,
+            ?active_item_id,
+            active_buffer_len,
+            ?violation,
+            "Codex agentMessage identity violation"
+        );
+        self.emitter
+            .discard_open_stream_with_identity_violation(violation);
+    }
+
+    async fn append_reasoning_to_active_stream(&self, reasoning: &str) {
+        if !contains_non_whitespace(reasoning) {
+            return;
+        }
+        let emission = {
+            let mut state = self.state.lock().await;
+            if state.quarantined_turn_id.is_some() {
+                return;
+            }
+            let (message_id, appended) = if let Some(stream) = state.active_stream.as_mut() {
+                if stream.reasoning.split('\n').any(|line| line == reasoning) {
+                    (None, false)
+                } else {
+                    if !stream.reasoning.is_empty() && !stream.reasoning.ends_with('\n') {
+                        stream.reasoning.push('\n');
+                    }
+                    stream.reasoning.push_str(reasoning);
+                    (Some(stream.message_id.clone()), true)
+                }
+            } else {
+                (None, true)
+            };
+            if appended && let Some(turn_id) = state.active_turn_id.as_ref().cloned() {
+                let estimate = state.turn_context_by_turn.entry(turn_id).or_default();
+                estimate.reasoning_bytes = estimate
+                    .reasoning_bytes
+                    .saturating_add(reasoning.len() as u64);
+            }
+            message_id
+        };
+        if let Some(message_id) = emission {
+            self.emitter
+                .stream_reasoning_delta_with_id(message_id, reasoning);
         }
     }
 
@@ -939,45 +1494,11 @@ impl CodexInner {
     }
 
     async fn mark_tool_completed(&self, tool_call_id: &str) {
-        let segment = {
-            let mut state = self.state.lock().await;
-            state.pending_tool_call_ids.remove(tool_call_id);
-            take_codex_stream_segment_if_ready(&mut state)
-        };
-        if let Some(segment) = segment {
-            self.emit_stream_segment(segment).await;
-        }
-    }
-
-    async fn finish_stream_after_reasoning_item(&self) {
-        let segment = {
-            let mut state = self.state.lock().await;
-            state.close_active_stream_when_tools_idle = true;
-            take_codex_stream_segment_if_ready(&mut state)
-        };
-        if let Some(segment) = segment {
-            self.emit_stream_segment(segment).await;
-        }
-    }
-
-    async fn emit_stream_segment(&self, segment: CodexStreamSegment) {
-        let metadata = metadata_target_from_segment(&segment);
-        self.emitter.stream_end(StreamEndPayload {
-            content: segment.content,
-            agent: Some(AgentName(CODEX_AGENT_NAME)),
-            model: Some(segment.model.clone()),
-            request_usage: None,
-            turn_usage: None,
-            cumulative_usage: None,
-            token_usage_unavailable_reason: None,
-            reasoning: segment.reasoning,
-            tool_calls: Vec::new(),
-            context_breakdown: None,
-        });
-        if let Some(metadata) = metadata {
-            let mut state = self.state.lock().await;
-            state.pending_message_metadata = Some(metadata);
-        }
+        self.state
+            .lock()
+            .await
+            .pending_tool_call_ids
+            .remove(tool_call_id);
     }
 
     async fn execute(&self, command: SessionCommand) -> Result<(), String> {
@@ -998,16 +1519,24 @@ impl CodexInner {
                     effort_override,
                     approval_policy_override,
                     access_mode,
+                    execution_mode,
                     turn_network_access,
                 ) = {
                     let mut state = self.state.lock().await;
                     state.pending_user_input_bytes = message.len() as u64;
+                    let (model_override, effort_override) = match state.execution_mode {
+                        BackendExecutionMode::Agent => {
+                            (state.model.clone(), state.reasoning_effort.clone())
+                        }
+                        BackendExecutionMode::InferenceOnly => (None, None),
+                    };
                     (
                         state.thread_id.clone(),
-                        state.model.clone(),
-                        state.reasoning_effort.clone(),
+                        model_override,
+                        effort_override,
                         state.approval_policy.clone(),
                         state.access_mode,
+                        state.execution_mode,
                         state.turn_network_access,
                     )
                 };
@@ -1041,9 +1570,10 @@ impl CodexInner {
                 }
                 params["summary"] = Value::String(CODEX_REASONING_SUMMARY_LEVEL.to_string());
                 let approval_policy = approval_policy_override
-                    .unwrap_or_else(|| CODEX_FORCED_APPROVAL_POLICY.to_string());
+                    .unwrap_or_else(|| codex_approval_policy(execution_mode).to_string());
                 params["approvalPolicy"] = Value::String(approval_policy);
-                params["sandboxPolicy"] = codex_sandbox_policy(access_mode, turn_network_access);
+                params["sandboxPolicy"] =
+                    codex_sandbox_policy(access_mode, turn_network_access, execution_mode);
 
                 if let Err(err) = self.rpc.request("turn/start", params).await {
                     self.emitter.typing_status_changed(false);
@@ -1458,14 +1988,80 @@ impl CodexInner {
     }
 
     async fn handle_notification(&self, method: &str, params: &Value) {
+        self.trace_agent_message_identity_event(method, params)
+            .await;
+        if matches!(method, "subAgentActivity" | "sub_agent_activity") {
+            let mut item = params
+                .get("item")
+                .cloned()
+                .unwrap_or_else(|| params.clone());
+            if item.get("type").is_none() {
+                item["type"] = Value::String("subAgentActivity".to_string());
+            }
+            self.register_codex_subagent_activity_if_needed(&item).await;
+            return;
+        }
+        let suppress_root_response_before_routing = if is_codex_response_side_notification(method) {
+            let notification_thread_id = extract_notification_thread_id(params);
+            let state = self.state.lock().await;
+            state
+                .quarantined_turn_id
+                .as_ref()
+                .is_some_and(|quarantined_turn_id| {
+                    let belongs_to_root = notification_thread_id
+                        .as_ref()
+                        .is_none_or(|thread_id| thread_id == &state.thread_id);
+                    let repeats_quarantined_turn = method != "turn/started"
+                        || extract_turn_id(params)
+                            .as_ref()
+                            .is_none_or(|turn_id| turn_id == quarantined_turn_id);
+                    belongs_to_root && repeats_quarantined_turn
+                })
+        } else {
+            false
+        };
+        if suppress_root_response_before_routing {
+            tracing::debug!(
+                codex_method = method,
+                "Ignoring late Codex response notification for quarantined root turn"
+            );
+            return;
+        }
         if self
             .handle_subagent_notification_if_needed(method, params)
             .await
         {
             return;
         }
+        let suppress_quarantined_response = if is_codex_response_side_notification(method) {
+            let state = self.state.lock().await;
+            state
+                .quarantined_turn_id
+                .as_ref()
+                .is_some_and(|quarantined_turn_id| {
+                    method != "turn/started"
+                        || extract_turn_id(params)
+                            .as_ref()
+                            .is_none_or(|turn_id| turn_id == quarantined_turn_id)
+                })
+        } else {
+            false
+        };
+        if suppress_quarantined_response {
+            tracing::debug!(
+                codex_method = method,
+                "Ignoring late Codex response notification for quarantined root turn"
+            );
+            return;
+        }
 
         match method {
+            "account/rateLimits/updated" => {
+                let emitter = self.state.lock().await.subagent_emitter.clone();
+                if let Some(emitter) = emitter {
+                    forward_passive_rate_limits_updated(params, emitter.as_ref());
+                }
+            }
             "turn/started" => {
                 let turn_id = params
                     .get("turn")
@@ -1473,15 +2069,11 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or("turn")
                     .to_string();
-                let model = {
+                {
                     let mut state = self.state.lock().await;
                     state.active_turn_id = Some(turn_id.clone());
-                    state.active_stream = Some(ActiveStreamState {
-                        turn_id: turn_id.clone(),
-                        message_id: turn_id.clone(),
-                        text: String::new(),
-                        reasoning: String::new(),
-                    });
+                    state.quarantined_turn_id = None;
+                    state.active_stream = None;
                     state.pending_tool_call_ids.clear();
                     state.close_active_stream_when_tools_idle = false;
                     state.pending_message_metadata = None;
@@ -1498,11 +2090,8 @@ impl CodexInner {
                             ..TurnContextEstimate::default()
                         },
                     );
-                    state.model.clone().unwrap_or_else(|| "codex".to_string())
-                };
+                }
                 self.emitter.typing_status_changed(true);
-                self.emitter
-                    .stream_start(&turn_id, AgentName(CODEX_AGENT_NAME), Some(&model));
             }
             "item/agentMessage/delta" => {
                 let delta = params
@@ -1510,38 +2099,120 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                let message_id = params
+                let Some(message_id) = params
                     .get("itemId")
+                    .or_else(|| params.get("item_id"))
                     .and_then(Value::as_str)
-                    .unwrap_or("assistant")
-                    .to_string();
+                    .filter(|item_id| !item_id.trim().is_empty())
+                    .map(|item_id| ChatMessageId(item_id.to_string()))
+                else {
+                    self.reject_agent_message_identity(
+                        StreamIdentityViolation::MissingMessageId,
+                        method,
+                        None,
+                    )
+                    .await;
+                    return;
+                };
                 if delta.is_empty() {
                     return;
                 }
-                if let Some((stream_message_id, model)) =
-                    self.ensure_active_stream_for_message(&message_id).await
-                {
-                    self.emitter.typing_status_changed(true);
-                    self.emitter.stream_start(
-                        &stream_message_id,
-                        AgentName(CODEX_AGENT_NAME),
-                        Some(&model),
-                    );
+                match self.open_agent_message_item(message_id.clone()).await {
+                    CodexAgentMessageOpen::Open {
+                        message_id,
+                        generated_identity,
+                        model,
+                    } => {
+                        self.emitter.typing_status_changed(true);
+                        Self::emit_stream_start(
+                            self.emitter.as_ref(),
+                            message_id,
+                            generated_identity.as_ref(),
+                            &model,
+                        );
+                    }
+                    CodexAgentMessageOpen::Existing => {}
+                    CodexAgentMessageOpen::Terminal => {
+                        self.reject_agent_message_identity(
+                            StreamIdentityViolation::DuplicateTerminalMessageId,
+                            method,
+                            Some(&message_id.0),
+                        )
+                        .await;
+                        return;
+                    }
+                    CodexAgentMessageOpen::Quarantined => (),
+                    CodexAgentMessageOpen::Foreign => {
+                        self.reject_agent_message_identity(
+                            StreamIdentityViolation::ForeignActiveMessageId,
+                            method,
+                            Some(&message_id.0),
+                        )
+                        .await;
+                        return;
+                    }
                 }
                 {
                     let mut state = self.state.lock().await;
-                    if let Some(stream) = state.active_stream.as_mut() {
-                        stream.message_id = message_id.clone();
+                    if let Some(stream) = state
+                        .active_stream
+                        .as_mut()
+                        .filter(|stream| stream.message_id == message_id)
+                    {
                         stream.text.push_str(&delta);
                     }
                 }
-                self.emitter.stream_delta(&message_id, &delta);
+                self.emitter.stream_delta_with_id(message_id, &delta);
             }
             reasoning_method if is_reasoning_notification_method(reasoning_method) => {
                 let Some(delta) = extract_codex_reasoning_delta_text(params) else {
                     return;
                 };
-                self.emit_reasoning_delta(params, delta).await;
+                let provider_item_id = params
+                    .get("itemId")
+                    .or_else(|| params.get("item_id"))
+                    .and_then(Value::as_str)
+                    .filter(|item_id| !item_id.trim().is_empty())
+                    .map(|item_id| ChatMessageId(item_id.to_string()));
+                match self
+                    .open_reasoning_message_item(provider_item_id.clone())
+                    .await
+                {
+                    CodexAgentMessageOpen::Open {
+                        message_id,
+                        generated_identity,
+                        model,
+                    } => {
+                        self.emitter.typing_status_changed(true);
+                        Self::emit_stream_start(
+                            self.emitter.as_ref(),
+                            message_id,
+                            generated_identity.as_ref(),
+                            &model,
+                        );
+                    }
+                    CodexAgentMessageOpen::Existing => {}
+                    CodexAgentMessageOpen::Terminal => {
+                        self.reject_agent_message_identity(
+                            StreamIdentityViolation::DuplicateTerminalMessageId,
+                            method,
+                            provider_item_id.as_ref().map(|item_id| item_id.0.as_str()),
+                        )
+                        .await;
+                        return;
+                    }
+                    CodexAgentMessageOpen::Quarantined => (),
+                    CodexAgentMessageOpen::Foreign => {
+                        self.reject_agent_message_identity(
+                            StreamIdentityViolation::ForeignActiveMessageId,
+                            method,
+                            provider_item_id.as_ref().map(|item_id| item_id.0.as_str()),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+                self.append_reasoning_to_active_stream(&delta).await;
             }
             "item/started" => {
                 self.handle_item_started(params).await;
@@ -1569,6 +2240,53 @@ impl CodexInner {
             }
             _ => {}
         }
+    }
+
+    async fn trace_agent_message_identity_event(&self, method: &str, params: &Value) {
+        let item = params.get("item");
+        let item_type = item
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str)
+            .or_else(|| (method == "item/agentMessage/delta").then_some("agentMessage"));
+        if item_type != Some("agentMessage") {
+            return;
+        }
+
+        let provider_item_id = item
+            .and_then(|item| item.get("id"))
+            .and_then(Value::as_str)
+            .or_else(|| params.get("itemId").and_then(Value::as_str))
+            .or_else(|| params.get("item_id").and_then(Value::as_str));
+        let thread_id = params
+            .get("threadId")
+            .or_else(|| params.get("thread_id"))
+            .and_then(Value::as_str);
+        let turn_id = extract_turn_id(params);
+        let (active_turn_id, active_item_id, active_buffer_len) = {
+            let state = self.state.lock().await;
+            (
+                state.active_turn_id.clone(),
+                state
+                    .active_stream
+                    .as_ref()
+                    .map(|stream| stream.message_id.clone()),
+                state
+                    .active_stream
+                    .as_ref()
+                    .map_or(0, |stream| stream.text.len()),
+            )
+        };
+        tracing::debug!(
+            codex_method = method,
+            ?thread_id,
+            ?turn_id,
+            ?provider_item_id,
+            provider_item_type = item_type,
+            ?active_turn_id,
+            ?active_item_id,
+            active_buffer_len,
+            "Codex agentMessage identity event"
+        );
     }
 
     async fn handle_root_token_usage_updated(&self, params: &Value) {
@@ -1634,35 +2352,81 @@ impl CodexInner {
     }
 
     async fn handle_subagent_notification_if_needed(&self, method: &str, params: &Value) -> bool {
-        let Some(thread_id) = extract_notification_thread_id(params) else {
+        let explicitly_thread_scoped_control = matches!(method, "model/rerouted" | "error")
+            && extract_notification_thread_id(params).is_some();
+        if !is_thread_scoped_codex_notification(method) && !explicitly_thread_scoped_control {
             return false;
-        };
-
-        let (stream_key, model, is_active_stream) = {
-            let state = self.state.lock().await;
-            if thread_id == state.thread_id {
-                return false;
-            }
-            let model = state.model.clone().unwrap_or_else(|| "codex".to_string());
-            if let Some(stream_key) = find_subagent_stream_key_for_thread(&state, &thread_id) {
-                (stream_key, model, true)
-            } else if let Some(stream_key) =
-                find_completed_subagent_stream_key_for_thread(&state, &thread_id)
-            {
-                (stream_key, model, false)
-            } else {
-                return false;
-            }
-        };
-
-        if is_active_stream {
-            self.handle_subagent_notification(method, params, &stream_key, &model)
-                .await;
-        } else {
-            self.handle_completed_subagent_notification(method, params, &stream_key, &model)
-                .await;
         }
-        true
+        let owner = {
+            let state = self.state.lock().await;
+            classify_codex_notification_owner(&state, params)
+        };
+
+        match owner {
+            CodexNotificationOwner::Parent { thread_id } => {
+                tracing::debug!(method, thread_id, "Codex notification ownership: parent");
+                false
+            }
+            CodexNotificationOwner::LiveChild { thread_id } => {
+                let model = self
+                    .state
+                    .lock()
+                    .await
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "codex".to_string());
+                tracing::debug!(
+                    method,
+                    thread_id,
+                    "Codex notification ownership: live child"
+                );
+                self.handle_subagent_notification(method, params, &thread_id, &model)
+                    .await;
+                true
+            }
+            CodexNotificationOwner::CompletedChild { thread_id } => {
+                let model = self
+                    .state
+                    .lock()
+                    .await
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "codex".to_string());
+                tracing::warn!(
+                    method,
+                    thread_id,
+                    "Codex notification ownership: completed child"
+                );
+                self.handle_completed_subagent_notification(method, params, &thread_id, &model)
+                    .await;
+                true
+            }
+            CodexNotificationOwner::Unknown { thread_id } => {
+                let thread_id = thread_id.unwrap_or_else(|| "<missing>".to_string());
+                let key = format!("{method}:{thread_id}");
+                let (first_observation, known_child_count) = {
+                    let mut state = self.state.lock().await;
+                    let first_observation = state.unknown_owner_notifications.insert(key);
+                    let known_child_count =
+                        state.subagent_streams.len() + state.completed_subagent_streams.len();
+                    (first_observation, known_child_count)
+                };
+                if first_observation {
+                    let message = format!(
+                        "Codex ownership invariant failed: thread-scoped notification '{method}' belongs to unregistered thread '{thread_id}'"
+                    );
+                    tracing::error!(method, thread_id, known_child_count, "{message}");
+                    self.emitter.backend_error(&message);
+                } else {
+                    tracing::debug!(
+                        method,
+                        thread_id,
+                        "Repeated unknown Codex thread notification suppressed"
+                    );
+                }
+                true
+            }
+        }
     }
 
     async fn handle_subagent_notification(
@@ -1672,6 +2436,29 @@ impl CodexInner {
         stream_key: &str,
         model: &str,
     ) {
+        {
+            let suppress_quarantined_response = {
+                let state = self.state.lock().await;
+                state
+                    .subagent_streams
+                    .get(stream_key)
+                    .is_some_and(|stream| {
+                        stream.quarantined
+                            && (method != "turn/started"
+                                || extract_turn_id(params).as_ref().is_none_or(|turn_id| {
+                                    Some(turn_id) == stream.quarantined_turn_id.as_ref()
+                                }))
+                    })
+            };
+            if suppress_quarantined_response {
+                tracing::debug!(
+                    child_thread_id = stream_key,
+                    codex_method = method,
+                    "Ignoring late Codex response notification for quarantined child turn"
+                );
+                return;
+            }
+        }
         match method {
             "turn/started" => {
                 let turn_id = extract_turn_id(params).unwrap_or_else(|| "turn".to_string());
@@ -1679,6 +2466,12 @@ impl CodexInner {
                     .update_codex_subagent_stream(stream_key, |stream| {
                         stream.active_turn_id = Some(turn_id.clone());
                         stream.current_message_id = None;
+                        stream.current_generated_identity = None;
+                        stream.current_reasoning_only = false;
+                        stream.current_text.clear();
+                        stream.current_reasoning.clear();
+                        stream.quarantined_turn_id = None;
+                        stream.quarantined = false;
                         stream.pending_message_metadata = None;
                     })
                     .await
@@ -1686,7 +2479,6 @@ impl CodexInner {
                     return;
                 };
                 emitter.typing_status_changed(true);
-                emitter.stream_start(&turn_id, AgentName(CODEX_AGENT_NAME), Some(model));
             }
             "item/agentMessage/delta" => {
                 let delta = params
@@ -1697,41 +2489,331 @@ impl CodexInner {
                 if delta.is_empty() {
                     return;
                 }
-                let message_id = params
+                let Some(message_id) = params
                     .get("itemId")
+                    .or_else(|| params.get("item_id"))
                     .and_then(Value::as_str)
-                    .unwrap_or("assistant")
-                    .to_string();
-                let Some(emitter) = self
-                    .update_codex_subagent_stream(stream_key, |stream| {
-                        stream.current_message_id = Some(message_id.clone());
-                    })
-                    .await
+                    .filter(|message_id| !message_id.trim().is_empty())
+                    .map(|message_id| ChatMessageId(message_id.to_string()))
                 else {
+                    self.reject_subagent_message_identity(
+                        stream_key,
+                        StreamIdentityViolation::MissingMessageId,
+                        method,
+                    )
+                    .await;
                     return;
                 };
-                emitter.stream_delta(&message_id, &delta);
+                let (emitter, open_stream, violation) = {
+                    let mut state = self.state.lock().await;
+                    let Some(stream) = state.subagent_streams.get_mut(stream_key) else {
+                        return;
+                    };
+                    if stream.quarantined {
+                        return;
+                    }
+                    if stream.completed_agent_messages.contains_key(&message_id) {
+                        (
+                            Arc::clone(&stream.emitter),
+                            false,
+                            Some(StreamIdentityViolation::DuplicateTerminalMessageId),
+                        )
+                    } else if let Some(active_id) = stream.current_message_id.as_ref() {
+                        if active_id == &message_id && !stream.current_reasoning_only {
+                            (Arc::clone(&stream.emitter), false, None)
+                        } else {
+                            (
+                                Arc::clone(&stream.emitter),
+                                false,
+                                Some(StreamIdentityViolation::ForeignActiveMessageId),
+                            )
+                        }
+                    } else {
+                        stream.current_message_id = Some(message_id.clone());
+                        stream.current_generated_identity = None;
+                        stream.current_reasoning_only = false;
+                        stream.current_text.clear();
+                        stream.current_reasoning.clear();
+                        (Arc::clone(&stream.emitter), true, None)
+                    }
+                };
+                if let Some(violation) = violation {
+                    self.reject_subagent_message_identity(stream_key, violation, method)
+                        .await;
+                    return;
+                }
+                if open_stream {
+                    emitter.stream_start_with_id(
+                        message_id.clone(),
+                        AgentName(CODEX_AGENT_NAME),
+                        Some(model),
+                    );
+                }
+                {
+                    let mut state = self.state.lock().await;
+                    if let Some(stream) = state.subagent_streams.get_mut(stream_key) {
+                        stream.current_text.push_str(&delta);
+                    }
+                }
+                emitter.stream_delta_with_id(message_id, &delta);
             }
             reasoning_method if is_reasoning_notification_method(reasoning_method) => {
                 let Some(delta) = extract_codex_reasoning_delta_text(params) else {
                     return;
                 };
-                let message_id = params
+                let provider_item_id = params
                     .get("itemId")
+                    .or_else(|| params.get("item_id"))
                     .and_then(Value::as_str)
-                    .unwrap_or("assistant")
-                    .to_string();
-                let Some(emitter) = self
-                    .update_codex_subagent_stream(stream_key, |stream| {
-                        stream.current_message_id = Some(message_id.clone());
-                    })
-                    .await
-                else {
-                    return;
+                    .filter(|item_id| !item_id.trim().is_empty())
+                    .map(|item_id| ChatMessageId(item_id.to_string()));
+                let (emitter, message_id, generated_identity, open_stream, violation) = {
+                    let mut state = self.state.lock().await;
+                    let Some(stream) = state.subagent_streams.get_mut(stream_key) else {
+                        return;
+                    };
+                    if stream.quarantined {
+                        return;
+                    }
+                    if let Some(active_message_id) = stream.current_message_id.clone() {
+                        let matches_idless_reasoning = stream.current_reasoning_only
+                            && stream
+                                .current_generated_identity
+                                .as_ref()
+                                .is_some_and(|identity| {
+                                    identity.origin
+                                        == ServerGeneratedChatMessageIdOrigin::IdlessReasoning
+                                });
+                        let matches = match provider_item_id.as_ref() {
+                            Some(item_id) => {
+                                item_id == &active_message_id && stream.current_reasoning_only
+                            }
+                            None => matches_idless_reasoning,
+                        };
+                        if !matches {
+                            (
+                                Arc::clone(&stream.emitter),
+                                None,
+                                None,
+                                false,
+                                Some(StreamIdentityViolation::ForeignActiveMessageId),
+                            )
+                        } else {
+                            stream.current_reasoning.push_str(&delta);
+                            (
+                                Arc::clone(&stream.emitter),
+                                Some(active_message_id),
+                                stream.current_generated_identity.clone(),
+                                false,
+                                None,
+                            )
+                        }
+                    } else {
+                        let generated_identity = provider_item_id.is_none().then(|| {
+                            let identity = ServerGeneratedChatMessageIdentity {
+                                origin: ServerGeneratedChatMessageIdOrigin::IdlessReasoning,
+                                stream_epoch: stream.generated_identity_epoch,
+                                item_ordinal: stream.next_generated_identity_ordinal,
+                            };
+                            stream.next_generated_identity_ordinal =
+                                stream.next_generated_identity_ordinal.saturating_add(1);
+                            identity
+                        });
+                        let message_id = provider_item_id.clone().unwrap_or_else(|| {
+                            generated_identity
+                                .as_ref()
+                                .expect("generated child reasoning identity")
+                                .message_id()
+                        });
+                        if stream.completed_agent_messages.contains_key(&message_id) {
+                            (
+                                Arc::clone(&stream.emitter),
+                                Some(message_id),
+                                generated_identity,
+                                false,
+                                Some(StreamIdentityViolation::DuplicateTerminalMessageId),
+                            )
+                        } else {
+                            stream.current_message_id = Some(message_id.clone());
+                            stream.current_generated_identity = generated_identity.clone();
+                            stream.current_reasoning_only = true;
+                            stream.current_text.clear();
+                            stream.current_reasoning = delta.clone();
+                            (
+                                Arc::clone(&stream.emitter),
+                                Some(message_id),
+                                generated_identity,
+                                true,
+                                None,
+                            )
+                        }
+                    }
                 };
-                emitter.stream_reasoning_delta(&message_id, &delta);
+                if let Some(violation) = violation {
+                    self.reject_subagent_message_identity(stream_key, violation, method)
+                        .await;
+                    return;
+                }
+                if let Some(message_id) = message_id {
+                    if open_stream {
+                        Self::emit_stream_start(
+                            emitter.as_ref(),
+                            message_id.clone(),
+                            generated_identity.as_ref(),
+                            model,
+                        );
+                    }
+                    emitter.stream_reasoning_delta_with_id(message_id, &delta);
+                }
             }
             "item/started" => {
+                if params.pointer("/item/type").and_then(Value::as_str) == Some("reasoning") {
+                    let provider_message_id = params
+                        .pointer("/item/id")
+                        .and_then(Value::as_str)
+                        .filter(|message_id| !message_id.trim().is_empty())
+                        .map(|message_id| ChatMessageId(message_id.to_string()));
+                    let (emitter, message_id, generated_identity, open_stream, violation) = {
+                        let mut state = self.state.lock().await;
+                        let Some(stream) = state.subagent_streams.get_mut(stream_key) else {
+                            return;
+                        };
+                        if stream.quarantined {
+                            return;
+                        }
+                        if let Some(active_message_id) = stream.current_message_id.clone() {
+                            let matches = stream.current_reasoning_only
+                                && match provider_message_id.as_ref() {
+                                    Some(message_id) => message_id == &active_message_id,
+                                    None => stream.current_generated_identity.as_ref().is_some_and(
+                                        |identity| {
+                                            identity.origin
+                                                == ServerGeneratedChatMessageIdOrigin::IdlessReasoning
+                                        },
+                                    ),
+                                };
+                            (
+                                Arc::clone(&stream.emitter),
+                                Some(active_message_id),
+                                stream.current_generated_identity.clone(),
+                                false,
+                                (!matches)
+                                    .then_some(StreamIdentityViolation::ForeignActiveMessageId),
+                            )
+                        } else {
+                            let generated_identity = provider_message_id.is_none().then(|| {
+                                let identity = ServerGeneratedChatMessageIdentity {
+                                    origin: ServerGeneratedChatMessageIdOrigin::IdlessReasoning,
+                                    stream_epoch: stream.generated_identity_epoch,
+                                    item_ordinal: stream.next_generated_identity_ordinal,
+                                };
+                                stream.next_generated_identity_ordinal =
+                                    stream.next_generated_identity_ordinal.saturating_add(1);
+                                identity
+                            });
+                            let message_id = provider_message_id.clone().unwrap_or_else(|| {
+                                generated_identity
+                                    .as_ref()
+                                    .expect("generated child reasoning identity")
+                                    .message_id()
+                            });
+                            let violation = stream
+                                .completed_agent_messages
+                                .contains_key(&message_id)
+                                .then_some(StreamIdentityViolation::DuplicateTerminalMessageId);
+                            if violation.is_none() {
+                                stream.current_message_id = Some(message_id.clone());
+                                stream.current_generated_identity = generated_identity.clone();
+                                stream.current_reasoning_only = true;
+                                stream.current_text.clear();
+                                stream.current_reasoning.clear();
+                            }
+                            (
+                                Arc::clone(&stream.emitter),
+                                Some(message_id),
+                                generated_identity,
+                                violation.is_none(),
+                                violation,
+                            )
+                        }
+                    };
+                    if let Some(violation) = violation {
+                        self.reject_subagent_message_identity(stream_key, violation, method)
+                            .await;
+                        return;
+                    }
+                    if open_stream {
+                        Self::emit_stream_start(
+                            emitter.as_ref(),
+                            message_id.expect("opened child reasoning message"),
+                            generated_identity.as_ref(),
+                            model,
+                        );
+                    }
+                    return;
+                }
+                if params.pointer("/item/type").and_then(Value::as_str) == Some("agentMessage") {
+                    let Some(message_id) = params
+                        .pointer("/item/id")
+                        .and_then(Value::as_str)
+                        .filter(|message_id| !message_id.trim().is_empty())
+                        .map(|message_id| ChatMessageId(message_id.to_string()))
+                    else {
+                        self.reject_subagent_message_identity(
+                            stream_key,
+                            StreamIdentityViolation::MissingMessageId,
+                            method,
+                        )
+                        .await;
+                        return;
+                    };
+                    let (emitter, open_stream, violation) = {
+                        let mut state = self.state.lock().await;
+                        let Some(stream) = state.subagent_streams.get_mut(stream_key) else {
+                            return;
+                        };
+                        if stream.quarantined {
+                            return;
+                        }
+                        if stream.completed_agent_messages.contains_key(&message_id) {
+                            (
+                                Arc::clone(&stream.emitter),
+                                false,
+                                Some(StreamIdentityViolation::DuplicateTerminalMessageId),
+                            )
+                        } else if let Some(active_id) = stream.current_message_id.as_ref() {
+                            if active_id == &message_id && !stream.current_reasoning_only {
+                                (Arc::clone(&stream.emitter), false, None)
+                            } else {
+                                (
+                                    Arc::clone(&stream.emitter),
+                                    false,
+                                    Some(StreamIdentityViolation::ForeignActiveMessageId),
+                                )
+                            }
+                        } else {
+                            stream.current_message_id = Some(message_id.clone());
+                            stream.current_generated_identity = None;
+                            stream.current_reasoning_only = false;
+                            stream.current_text.clear();
+                            stream.current_reasoning.clear();
+                            (Arc::clone(&stream.emitter), true, None)
+                        }
+                    };
+                    if let Some(violation) = violation {
+                        self.reject_subagent_message_identity(stream_key, violation, method)
+                            .await;
+                        return;
+                    }
+                    if open_stream {
+                        emitter.stream_start_with_id(
+                            message_id,
+                            AgentName(CODEX_AGENT_NAME),
+                            Some(model),
+                        );
+                    }
+                    return;
+                }
                 let Some(emitter) = self.codex_subagent_emitter(stream_key).await else {
                     return;
                 };
@@ -1789,7 +2871,22 @@ impl CodexInner {
                 self.handle_completed_subagent_token_usage(params, stream_key, model)
                     .await;
             }
-            _ => {}
+            _ => {
+                let emitter = {
+                    let state = self.state.lock().await;
+                    state
+                        .completed_subagent_streams
+                        .get(stream_key)
+                        .map(|stream| Arc::clone(&stream.emitter))
+                };
+                if let Some(emitter) = emitter {
+                    let message = format!(
+                        "Codex ownership invariant failed: late child content '{method}' arrived after child thread '{stream_key}' completed"
+                    );
+                    tracing::error!(method, thread_id = stream_key, "{message}");
+                    emitter.backend_error(&message);
+                }
+            }
         }
     }
 
@@ -1810,6 +2907,38 @@ impl CodexInner {
         let stream = state.subagent_streams.get_mut(stream_key)?;
         update(stream);
         Some(Arc::clone(&stream.emitter))
+    }
+
+    async fn reject_subagent_message_identity(
+        &self,
+        stream_key: &str,
+        violation: StreamIdentityViolation,
+        method: &str,
+    ) {
+        let emitter = {
+            let mut state = self.state.lock().await;
+            let Some(stream) = state.subagent_streams.get_mut(stream_key) else {
+                return;
+            };
+            if stream.quarantined {
+                return;
+            }
+            stream.quarantined = true;
+            stream.quarantined_turn_id = stream.active_turn_id.clone();
+            stream.current_message_id = None;
+            stream.current_generated_identity = None;
+            stream.current_reasoning_only = false;
+            stream.current_text.clear();
+            stream.current_reasoning.clear();
+            Arc::clone(&stream.emitter)
+        };
+        tracing::warn!(
+            child_thread_id = stream_key,
+            codex_method = method,
+            ?violation,
+            "Codex child agentMessage identity violation"
+        );
+        emitter.discard_open_stream_with_identity_violation(violation);
     }
 
     fn handle_subagent_item_started(&self, params: &Value, emitter: &TurnEmitter) {
@@ -1894,44 +3023,82 @@ impl CodexInner {
 
         match item_type {
             "agentMessage" => {
+                let Some(provider_item_id) = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|item_id| !item_id.trim().is_empty())
+                else {
+                    self.reject_subagent_message_identity(
+                        stream_key,
+                        StreamIdentityViolation::MissingMessageId,
+                        "item/completed",
+                    )
+                    .await;
+                    return;
+                };
+                let message_id = ChatMessageId(provider_item_id.to_string());
                 let text = extract_codex_item_text(item);
                 let reasoning = extract_codex_item_reasoning(item);
                 let turn_id_from_params = extract_turn_id(params);
-                let Some((emitter, token_usage, unavailable_reason)) = self
+                let Some((
+                    emitter,
+                    token_usage,
+                    unavailable_reason,
+                    synthetic_start,
+                    content,
+                    final_reasoning,
+                )) = self
                     .complete_subagent_message(
                         stream_key,
                         turn_id_from_params,
-                        item_id.clone(),
+                        message_id.clone(),
                         model.to_string(),
+                        text,
+                        reasoning,
                     )
                     .await
                 else {
                     return;
                 };
-                emitter.stream_end(StreamEndPayload {
-                    content: text,
-                    agent: Some(AgentName(CODEX_AGENT_NAME)),
-                    model: Some(model.to_string()),
-                    request_usage: token_usage.clone(),
-                    turn_usage: token_usage,
-                    cumulative_usage: None,
-                    token_usage_unavailable_reason: unavailable_reason,
-                    reasoning,
-                    tool_calls: Vec::new(),
-                    context_breakdown: None,
-                });
+                if synthetic_start {
+                    emitter.stream_start_with_id(
+                        message_id.clone(),
+                        AgentName(CODEX_AGENT_NAME),
+                        Some(model),
+                    );
+                    if let Some(reasoning) = final_reasoning.as_deref() {
+                        emitter.stream_reasoning_delta_with_id(message_id.clone(), reasoning);
+                    }
+                }
+                emitter.stream_end_with_id(
+                    message_id,
+                    StreamEndPayload {
+                        content,
+                        agent: Some(AgentName(CODEX_AGENT_NAME)),
+                        model: Some(model.to_string()),
+                        request_usage: token_usage.clone(),
+                        turn_usage: token_usage,
+                        cumulative_usage: None,
+                        token_usage_unavailable_reason: unavailable_reason,
+                        reasoning: final_reasoning,
+                        tool_calls: Vec::new(),
+                        context_breakdown: None,
+                    },
+                );
             }
             "reasoning" => {
-                let Some(emitter) = self.codex_subagent_emitter(stream_key).await else {
-                    return;
-                };
-                let Some(reasoning_text) = extract_codex_item_reasoning(item) else {
-                    return;
-                };
-                if !contains_non_whitespace(&reasoning_text) {
-                    return;
-                }
-                emitter.stream_reasoning_delta(&item_id, &reasoning_text);
+                self.complete_subagent_reasoning_item(
+                    stream_key,
+                    extract_turn_id(params),
+                    item.get("id")
+                        .and_then(Value::as_str)
+                        .filter(|item_id| !item_id.trim().is_empty())
+                        .map(|item_id| ChatMessageId(item_id.to_string())),
+                    model,
+                    extract_codex_item_reasoning(item)
+                        .filter(|reasoning| contains_non_whitespace(reasoning)),
+                )
+                .await;
             }
             "commandExecution" => {
                 let Some(emitter) = self.codex_subagent_emitter(stream_key).await else {
@@ -2061,32 +3228,244 @@ impl CodexInner {
         &self,
         stream_key: &str,
         turn_id_from_params: Option<String>,
-        message_id: String,
+        message_id: ChatMessageId,
         model: String,
+        completion_text: String,
+        completion_reasoning: Option<String>,
     ) -> Option<(
         Arc<TurnEmitter>,
         Option<Value>,
         Option<TokenUsageUnavailableReason>,
+        bool,
+        String,
+        Option<String>,
     )> {
-        let mut state = self.state.lock().await;
-        let stream = state.subagent_streams.get_mut(stream_key)?;
-        let turn_id = turn_id_from_params
-            .or_else(|| stream.active_turn_id.clone())
-            .unwrap_or_else(|| "turn".to_string());
-        stream.current_message_id = Some(message_id.clone());
-        let token_usage = stream.token_usage_by_turn.remove(&turn_id);
-        let unavailable_reason = if token_usage.is_some() {
-            None
-        } else {
-            stream.pending_message_metadata = Some(PendingCodexMessageMetadata {
-                turn_id,
-                message_id,
-                model,
-                turn_context: TurnContextEstimate::default(),
-            });
-            Some(TokenUsageUnavailableReason::BackendDidNotReport)
+        let result = {
+            let mut state = self.state.lock().await;
+            let stream = state.subagent_streams.get_mut(stream_key)?;
+            if stream.quarantined {
+                return None;
+            }
+            let completion = CompletedCodexAgentMessage {
+                completion_text: completion_text.clone(),
+                completion_reasoning: completion_reasoning.clone(),
+                generated_identity: None,
+            };
+            if let Some(previous) = stream.completed_agent_messages.get(&message_id) {
+                if previous == &completion {
+                    Ok(None)
+                } else {
+                    Err(StreamIdentityViolation::ConflictingDuplicateCompletion)
+                }
+            } else if stream
+                .current_message_id
+                .as_ref()
+                .is_some_and(|active_message_id| {
+                    active_message_id != &message_id || stream.current_reasoning_only
+                })
+            {
+                Err(StreamIdentityViolation::ForeignActiveMessageId)
+            } else {
+                let synthetic_start = stream.current_message_id.is_none();
+                let content = if completion_text.is_empty() {
+                    stream.current_text.clone()
+                } else {
+                    completion_text
+                };
+                let reasoning = if stream.current_reasoning.trim().is_empty() {
+                    completion_reasoning
+                } else {
+                    Some(stream.current_reasoning.clone())
+                }
+                .filter(|reasoning| contains_non_whitespace(reasoning));
+                let turn_id = turn_id_from_params
+                    .or_else(|| stream.active_turn_id.clone())
+                    .unwrap_or_else(|| "turn".to_string());
+                stream.current_message_id = None;
+                stream.current_generated_identity = None;
+                stream.current_reasoning_only = false;
+                stream.current_text.clear();
+                stream.current_reasoning.clear();
+                stream
+                    .completed_agent_messages
+                    .insert(message_id.clone(), completion);
+                let token_usage = stream.token_usage_by_turn.remove(&turn_id);
+                let unavailable_reason = if token_usage.is_some() {
+                    None
+                } else {
+                    stream.pending_message_metadata = Some(PendingCodexMessageMetadata {
+                        turn_id,
+                        message_id: message_id.clone(),
+                        model,
+                        turn_context: TurnContextEstimate::default(),
+                    });
+                    Some(TokenUsageUnavailableReason::BackendDidNotReport)
+                };
+                Ok(Some((
+                    Arc::clone(&stream.emitter),
+                    token_usage,
+                    unavailable_reason,
+                    synthetic_start,
+                    content,
+                    reasoning,
+                )))
+            }
         };
-        Some((Arc::clone(&stream.emitter), token_usage, unavailable_reason))
+        match result {
+            Ok(result) => result,
+            Err(violation) => {
+                self.reject_subagent_message_identity(stream_key, violation, "item/completed")
+                    .await;
+                None
+            }
+        }
+    }
+
+    async fn complete_subagent_reasoning_item(
+        &self,
+        stream_key: &str,
+        turn_id_from_params: Option<String>,
+        provider_message_id: Option<ChatMessageId>,
+        model: &str,
+        completion_reasoning: Option<String>,
+    ) {
+        let raw_completion_reasoning = completion_reasoning.clone();
+        let result = {
+            let mut state = self.state.lock().await;
+            let Some(stream) = state.subagent_streams.get_mut(stream_key) else {
+                return;
+            };
+            if stream.quarantined {
+                return;
+            }
+            let matches_active = stream.current_reasoning_only
+                && match provider_message_id.as_ref() {
+                    Some(message_id) => stream.current_message_id.as_ref() == Some(message_id),
+                    None => stream
+                        .current_generated_identity
+                        .as_ref()
+                        .is_some_and(|identity| {
+                            identity.origin == ServerGeneratedChatMessageIdOrigin::IdlessReasoning
+                        }),
+                };
+            if stream.current_message_id.is_some() && !matches_active {
+                Err(StreamIdentityViolation::ForeignActiveMessageId)
+            } else {
+                let generated_identity = if stream.current_message_id.is_some() {
+                    stream.current_generated_identity.clone()
+                } else {
+                    provider_message_id.is_none().then(|| {
+                        let identity = ServerGeneratedChatMessageIdentity {
+                            origin: ServerGeneratedChatMessageIdOrigin::IdlessReasoning,
+                            stream_epoch: stream.generated_identity_epoch,
+                            item_ordinal: stream.next_generated_identity_ordinal,
+                        };
+                        stream.next_generated_identity_ordinal =
+                            stream.next_generated_identity_ordinal.saturating_add(1);
+                        identity
+                    })
+                };
+                let message_id = stream.current_message_id.clone().unwrap_or_else(|| {
+                    provider_message_id.clone().unwrap_or_else(|| {
+                        generated_identity
+                            .as_ref()
+                            .expect("generated child reasoning identity")
+                            .message_id()
+                    })
+                });
+                let synthetic_start = stream.current_message_id.is_none();
+                let reasoning = completion_reasoning.or_else(|| {
+                    contains_non_whitespace(&stream.current_reasoning)
+                        .then_some(stream.current_reasoning.clone())
+                });
+                let completion = CompletedCodexAgentMessage {
+                    completion_text: String::new(),
+                    completion_reasoning: raw_completion_reasoning,
+                    generated_identity: generated_identity.clone(),
+                };
+                if let Some(previous) = stream.completed_agent_messages.get(&message_id) {
+                    if previous == &completion {
+                        return;
+                    }
+                    Err(StreamIdentityViolation::ConflictingDuplicateCompletion)
+                } else {
+                    let turn_id = turn_id_from_params
+                        .or_else(|| stream.active_turn_id.clone())
+                        .unwrap_or_else(|| "turn".to_string());
+                    stream.current_message_id = None;
+                    stream.current_generated_identity = None;
+                    stream.current_reasoning_only = false;
+                    stream.current_text.clear();
+                    stream.current_reasoning.clear();
+                    stream
+                        .completed_agent_messages
+                        .insert(message_id.clone(), completion);
+                    let token_usage = stream.token_usage_by_turn.remove(&turn_id);
+                    let unavailable_reason = if token_usage.is_some() {
+                        None
+                    } else {
+                        stream.pending_message_metadata = Some(PendingCodexMessageMetadata {
+                            turn_id,
+                            message_id: message_id.clone(),
+                            model: model.to_string(),
+                            turn_context: TurnContextEstimate::default(),
+                        });
+                        Some(TokenUsageUnavailableReason::BackendDidNotReport)
+                    };
+                    Ok((
+                        Arc::clone(&stream.emitter),
+                        message_id,
+                        generated_identity,
+                        synthetic_start,
+                        reasoning,
+                        token_usage,
+                        unavailable_reason,
+                    ))
+                }
+            }
+        };
+        let (
+            emitter,
+            message_id,
+            generated_identity,
+            synthetic_start,
+            reasoning,
+            token_usage,
+            unavailable_reason,
+        ) = match result {
+            Ok(result) => result,
+            Err(violation) => {
+                self.reject_subagent_message_identity(stream_key, violation, "item/completed")
+                    .await;
+                return;
+            }
+        };
+        if synthetic_start {
+            Self::emit_stream_start(
+                emitter.as_ref(),
+                message_id.clone(),
+                generated_identity.as_ref(),
+                model,
+            );
+            if let Some(reasoning) = reasoning.as_deref() {
+                emitter.stream_reasoning_delta_with_id(message_id.clone(), reasoning);
+            }
+        }
+        emitter.stream_end_with_id(
+            message_id,
+            StreamEndPayload {
+                content: String::new(),
+                agent: Some(AgentName(CODEX_AGENT_NAME)),
+                model: Some(model.to_string()),
+                request_usage: token_usage.clone(),
+                turn_usage: token_usage,
+                cumulative_usage: None,
+                token_usage_unavailable_reason: unavailable_reason,
+                reasoning,
+                tool_calls: Vec::new(),
+                context_breakdown: None,
+            },
+        );
     }
 
     async fn handle_subagent_token_usage_updated(
@@ -2120,6 +3499,9 @@ impl CodexInner {
     ) -> Option<(Arc<TurnEmitter>, PendingCodexMessageMetadata, Value, Value)> {
         let mut state = self.state.lock().await;
         let stream = state.subagent_streams.get_mut(stream_key)?;
+        if stream.quarantined {
+            return None;
+        }
         stream
             .token_usage_by_turn
             .insert(turn_id.clone(), token_usage.clone());
@@ -2217,72 +3599,155 @@ impl CodexInner {
                 context_breakdown,
             );
         }
-        let Some(emitter) = self
-            .update_codex_subagent_stream(stream_key, |stream| {
+        let Some((emitter, quarantined, open_item, partial_idless_reasoning)) = ({
+            let mut state = self.state.lock().await;
+            state.subagent_streams.get_mut(stream_key).map(|stream| {
+                let open_item = stream.current_message_id.is_some();
+                let mut partial_idless_reasoning = None;
                 if extract_turn_id(params)
                     .as_ref()
                     .is_none_or(|turn_id| stream.active_turn_id.as_ref() == Some(turn_id))
                 {
+                    let durable_idless_reasoning = stream.current_reasoning_only
+                        && stream
+                            .current_generated_identity
+                            .as_ref()
+                            .is_some_and(|identity| {
+                                identity.origin
+                                    == ServerGeneratedChatMessageIdOrigin::IdlessReasoning
+                            })
+                        && contains_non_whitespace(&stream.current_reasoning);
+                    if durable_idless_reasoning
+                        && let Some(message_id) = stream.current_message_id.clone()
+                    {
+                        let reasoning = stream.current_reasoning.clone();
+                        stream.completed_agent_messages.insert(
+                            message_id.clone(),
+                            CompletedCodexAgentMessage {
+                                completion_text: String::new(),
+                                completion_reasoning: Some(reasoning.clone()),
+                                generated_identity: stream.current_generated_identity.clone(),
+                            },
+                        );
+                        partial_idless_reasoning = Some((message_id, reasoning));
+                    }
                     stream.active_turn_id = None;
                     stream.current_message_id = None;
+                    stream.current_generated_identity = None;
+                    stream.current_reasoning_only = false;
+                    stream.current_text.clear();
+                    stream.current_reasoning.clear();
+                    if open_item {
+                        stream.quarantined = true;
+                        stream.quarantined_turn_id = extract_turn_id(params);
+                    }
                 }
+                (
+                    Arc::clone(&stream.emitter),
+                    stream.quarantined,
+                    open_item,
+                    partial_idless_reasoning,
+                )
             })
-            .await
-        else {
+        }) else {
             return;
         };
 
-        if turn_status == "interrupted" {
-            emitter.operation_cancelled("Operation cancelled");
+        if let Some((message_id, reasoning)) = partial_idless_reasoning {
+            emitter.stream_end_with_id(
+                message_id,
+                StreamEndPayload {
+                    content: String::new(),
+                    agent: Some(AgentName(CODEX_AGENT_NAME)),
+                    model: Some(model.to_string()),
+                    request_usage: None,
+                    turn_usage: None,
+                    cumulative_usage: None,
+                    token_usage_unavailable_reason: None,
+                    reasoning: Some(reasoning),
+                    tool_calls: Vec::new(),
+                    context_breakdown: None,
+                },
+            );
+            emitter.operation_cancelled("Codex child turn ended before reasoning item completion");
             return;
         }
 
-        emitter.typing_status_changed(false);
-
-        if turn_status == "failed" {
-            let message = params
-                .get("turn")
-                .and_then(|v| v.get("error"))
-                .and_then(|v| v.get("message"))
-                .and_then(Value::as_str)
-                .unwrap_or("Codex turn failed")
-                .to_string();
-            emitter.backend_error(&message);
+        if quarantined {
+            if open_item {
+                emitter.discard_open_stream_with_identity_violation(
+                    StreamIdentityViolation::MismatchedEndMessageId,
+                );
+            }
+            return;
         }
+
+        if turn_status == "interrupted" {
+            emitter.operation_cancelled("Operation cancelled");
+        } else {
+            emitter.typing_status_changed(false);
+            if turn_status == "failed" {
+                let message = params
+                    .get("turn")
+                    .and_then(|v| v.get("error"))
+                    .and_then(|v| v.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("Codex turn failed")
+                    .to_string();
+                emitter.backend_error(&message);
+            }
+        }
+        tracing::debug!(
+            thread_id = stream_key,
+            status = turn_status,
+            "Codex child turn completed; retaining ownership for possible follow-up"
+        );
     }
 
     async fn handle_legacy_codex_event(&self, method: &str, params: &Value) {
         let Some(delta) = extract_reasoning_delta_from_legacy_codex_event(method, params) else {
             return;
         };
-        self.emit_reasoning_delta(params, delta).await;
+        self.emit_reasoning_delta(delta).await;
     }
 
-    async fn emit_reasoning_delta(&self, params: &Value, delta: String) {
-        if delta.is_empty() {
-            return;
+    async fn emit_reasoning_delta(&self, delta: String) {
+        match self.open_reasoning_message_item(None).await {
+            CodexAgentMessageOpen::Open {
+                message_id,
+                generated_identity,
+                model,
+            } => {
+                self.emitter.typing_status_changed(true);
+                Self::emit_stream_start(
+                    self.emitter.as_ref(),
+                    message_id,
+                    generated_identity.as_ref(),
+                    &model,
+                );
+            }
+            CodexAgentMessageOpen::Existing => {}
+            CodexAgentMessageOpen::Quarantined => return,
+            CodexAgentMessageOpen::Terminal => {
+                self.reject_agent_message_identity(
+                    StreamIdentityViolation::DuplicateTerminalMessageId,
+                    "codex/event/reasoning",
+                    None,
+                )
+                .await;
+                return;
+            }
+            CodexAgentMessageOpen::Foreign => {
+                self.reject_agent_message_identity(
+                    StreamIdentityViolation::ForeignActiveMessageId,
+                    "codex/event/reasoning",
+                    None,
+                )
+                .await;
+                return;
+            }
         }
-        let message_id = {
-            let state = self.state.lock().await;
-            codex_reasoning_delta_message_id(&state, params)
-        };
-        if let Some((stream_message_id, model)) =
-            self.ensure_active_stream_for_message(&message_id).await
-        {
-            self.emitter.typing_status_changed(true);
-            self.emitter.stream_start(
-                &stream_message_id,
-                AgentName(CODEX_AGENT_NAME),
-                Some(&model),
-            );
-        }
-        let emission = {
-            let mut state = self.state.lock().await;
-            apply_reasoning_delta_to_state(&mut state, params, &delta)
-        };
-        if let Some((message_id, text)) = emission {
-            self.emitter.stream_reasoning_delta(&message_id, &text);
-        }
+        self.append_reasoning_to_active_stream(&delta).await;
     }
 
     async fn handle_error_notification(&self, params: &Value) {
@@ -2308,6 +3773,40 @@ impl CodexInner {
     }
 
     async fn handle_server_request(&self, id: Value, method: &str, params: &Value) {
+        let inference_only =
+            self.state.lock().await.execution_mode == BackendExecutionMode::InferenceOnly;
+        if inference_only && is_codex_tool_server_request(method) {
+            let response = match method {
+                "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+                    json!({ "decision": "decline" })
+                }
+                "execCommandApproval" | "applyPatchApproval" => {
+                    json!({ "decision": "denied" })
+                }
+                "mcpServer/elicitation/request" => json!({ "action": "cancel" }),
+                "item/tool/requestUserInput" => json!({ "answers": {} }),
+                "item/tool/call" => json!({
+                    "success": false,
+                    "contentItems": [{
+                        "type": "inputText",
+                        "text": "Transient inference does not permit tools."
+                    }]
+                }),
+                _ => json!({ "decision": "decline" }),
+            };
+            if let Err(err) = self.rpc.respond(id, response).await {
+                self.emitter.backend_error(&format!(
+                    "Codex transient inference failed to reject tool request '{method}': {err}"
+                ));
+            } else {
+                self.emitter.backend_error(&format!(
+                    "Codex transient inference rejected tool request '{method}'"
+                ));
+            }
+            self.emitter.typing_status_changed(false);
+            return;
+        }
+
         match method {
             "item/commandExecution/requestApproval" => {
                 let item_id = params
@@ -2608,14 +4107,105 @@ impl CodexInner {
             return;
         };
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
-        let item_id = item
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or("tool-call")
-            .to_string();
+        let item_id = item.get("id").and_then(Value::as_str);
+
+        if self.state.lock().await.quarantined_turn_id.is_some() {
+            return;
+        }
 
         match item_type {
+            "agentMessage" => {
+                let Some(item_id) = item_id.filter(|item_id| !item_id.trim().is_empty()) else {
+                    self.reject_agent_message_identity(
+                        StreamIdentityViolation::MissingMessageId,
+                        "item/started",
+                        None,
+                    )
+                    .await;
+                    return;
+                };
+                let message_id = ChatMessageId(item_id.to_string());
+                match self.open_agent_message_item(message_id.clone()).await {
+                    CodexAgentMessageOpen::Open {
+                        message_id,
+                        generated_identity,
+                        model,
+                    } => {
+                        self.emitter.typing_status_changed(true);
+                        Self::emit_stream_start(
+                            self.emitter.as_ref(),
+                            message_id,
+                            generated_identity.as_ref(),
+                            &model,
+                        );
+                    }
+                    CodexAgentMessageOpen::Existing => {}
+                    CodexAgentMessageOpen::Terminal => {
+                        self.reject_agent_message_identity(
+                            StreamIdentityViolation::DuplicateTerminalMessageId,
+                            "item/started",
+                            Some(&message_id.0),
+                        )
+                        .await;
+                    }
+                    CodexAgentMessageOpen::Quarantined => (),
+                    CodexAgentMessageOpen::Foreign => {
+                        self.reject_agent_message_identity(
+                            StreamIdentityViolation::ForeignActiveMessageId,
+                            "item/started",
+                            Some(&message_id.0),
+                        )
+                        .await;
+                    }
+                }
+            }
+            "reasoning" => {
+                let provider_message_id = item_id
+                    .filter(|item_id| !item_id.trim().is_empty())
+                    .map(|item_id| ChatMessageId(item_id.to_string()));
+                match self
+                    .open_reasoning_message_item(provider_message_id.clone())
+                    .await
+                {
+                    CodexAgentMessageOpen::Open {
+                        message_id,
+                        generated_identity,
+                        model,
+                    } => {
+                        self.emitter.typing_status_changed(true);
+                        Self::emit_stream_start(
+                            self.emitter.as_ref(),
+                            message_id,
+                            generated_identity.as_ref(),
+                            &model,
+                        );
+                    }
+                    CodexAgentMessageOpen::Existing => {}
+                    CodexAgentMessageOpen::Terminal => {
+                        self.reject_agent_message_identity(
+                            StreamIdentityViolation::DuplicateTerminalMessageId,
+                            "item/started",
+                            provider_message_id
+                                .as_ref()
+                                .map(|message_id| message_id.0.as_str()),
+                        )
+                        .await;
+                    }
+                    CodexAgentMessageOpen::Quarantined => {}
+                    CodexAgentMessageOpen::Foreign => {
+                        self.reject_agent_message_identity(
+                            StreamIdentityViolation::ForeignActiveMessageId,
+                            "item/started",
+                            provider_message_id
+                                .as_ref()
+                                .map(|message_id| message_id.0.as_str()),
+                        )
+                        .await;
+                    }
+                }
+            }
             "commandExecution" => {
+                let item_id = item_id.unwrap_or("tool-call").to_string();
                 let command = item
                     .get("command")
                     .and_then(Value::as_str)
@@ -2639,6 +4229,7 @@ impl CodexInner {
                 );
             }
             "fileChange" => {
+                let item_id = item_id.unwrap_or("tool-call").to_string();
                 let file_changes = parse_codex_file_changes(item);
                 if file_changes.is_empty() {
                     return;
@@ -2669,6 +4260,7 @@ impl CodexInner {
                 }
             }
             "collabToolCall" | "collabAgentToolCall" => {
+                let item_id = item_id.unwrap_or("tool-call").to_string();
                 let tool_name = item
                     .get("tool")
                     .and_then(Value::as_str)
@@ -2676,18 +4268,16 @@ impl CodexInner {
                     .to_string();
                 self.track_tool_requests(std::iter::once(item_id.clone()))
                     .await;
-                self.emitter.tool_request(
-                    &item_id,
-                    &tool_name,
-                    json!({
-                        "kind": "Other",
-                        "args": item
-                    }),
-                );
+                emit_codex_tool_request(&self.emitter, &item_id, &tool_name, item);
                 self.emit_agent_control_await_progress_if_needed(&item_id, &tool_name, item);
-                self.spawn_codex_subagent_if_needed(item).await;
+                self.record_codex_subagent_spawn_metadata_if_needed(item)
+                    .await;
+            }
+            "subAgentActivity" | "sub_agent_activity" => {
+                self.register_codex_subagent_activity_if_needed(item).await;
             }
             "mcpToolCall" | "dynamicToolCall" => {
+                let item_id = item_id.unwrap_or("tool-call").to_string();
                 let tool_name = item
                     .get("tool")
                     .and_then(Value::as_str)
@@ -2695,16 +4285,8 @@ impl CodexInner {
                     .to_string();
                 self.track_tool_requests(std::iter::once(item_id.clone()))
                     .await;
-                self.emitter.tool_request(
-                    &item_id,
-                    &tool_name,
-                    json!({
-                        "kind": "Other",
-                        "args": item
-                    }),
-                );
+                emit_codex_tool_request(&self.emitter, &item_id, &tool_name, item);
                 self.emit_agent_control_await_progress_if_needed(&item_id, &tool_name, item);
-                self.spawn_codex_subagent_if_needed(item).await;
             }
             _ => {}
         }
@@ -2715,135 +4297,312 @@ impl CodexInner {
             return;
         };
 
+        if self.state.lock().await.quarantined_turn_id.is_some() {
+            return;
+        }
+
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
-        let item_id = item
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or("item")
-            .to_string();
+        let item_id = item.get("id").and_then(Value::as_str);
 
         match item_type {
             "agentMessage" => {
+                let Some(item_id) = item_id.filter(|item_id| !item_id.trim().is_empty()) else {
+                    self.reject_agent_message_identity(
+                        StreamIdentityViolation::MissingMessageId,
+                        "item/completed",
+                        None,
+                    )
+                    .await;
+                    return;
+                };
+                let message_id = ChatMessageId(item_id.to_string());
                 let text = item
                     .get("text")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                let (content, reasoning, model, stream_start) = {
+                let completion_reasoning = extract_codex_item_reasoning(item);
+                let completion = CompletedCodexAgentMessage {
+                    completion_text: text.clone(),
+                    completion_reasoning: completion_reasoning.clone(),
+                    generated_identity: None,
+                };
+                let result = {
                     let mut state = self.state.lock().await;
-                    let should_open_stream = state.active_stream.is_none();
-                    let stream = state
-                        .active_stream
-                        .take()
-                        .unwrap_or_else(|| ActiveStreamState {
-                            turn_id: state
-                                .active_turn_id
-                                .clone()
-                                .unwrap_or_else(|| "turn".to_string()),
-                            message_id: item_id.clone(),
-                            text: text.clone(),
-                            reasoning: String::new(),
-                        });
+                    if let Some(previous) = state.completed_agent_messages.get(&message_id) {
+                        if previous == &completion {
+                            None
+                        } else {
+                            Some(Err(StreamIdentityViolation::ConflictingDuplicateCompletion))
+                        }
+                    } else if let Some(active) = state.active_stream.as_ref() {
+                        if active.message_id != message_id || active.reasoning_only {
+                            Some(Err(StreamIdentityViolation::ForeignActiveMessageId))
+                        } else {
+                            let stream = state
+                                .active_stream
+                                .take()
+                                .expect("active Codex stream disappeared while completing item");
+                            Some(Ok((stream, false)))
+                        }
+                    } else {
+                        Some(Ok((
+                            ActiveStreamState {
+                                turn_id: state
+                                    .active_turn_id
+                                    .clone()
+                                    .unwrap_or_else(|| "turn".to_string()),
+                                message_id: message_id.clone(),
+                                generated_identity: None,
+                                text: String::new(),
+                                reasoning: String::new(),
+                                reasoning_only: false,
+                            },
+                            true,
+                        )))
+                    }
+                };
+                let Some(result) = result else {
+                    tracing::debug!(
+                        provider_item_id = message_id.0.as_str(),
+                        "Ignoring idempotent duplicate Codex agentMessage completion"
+                    );
+                    return;
+                };
+                let (stream, synthetic_start) = match result {
+                    Ok(stream) => stream,
+                    Err(violation) => {
+                        self.reject_agent_message_identity(
+                            violation,
+                            "item/completed",
+                            Some(&message_id.0),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                let content = if text.is_empty() { stream.text } else { text };
+                let reasoning = if stream.reasoning.trim().is_empty() {
+                    completion_reasoning
+                } else {
+                    Some(stream.reasoning)
+                }
+                .filter(|reasoning| contains_non_whitespace(reasoning));
+                let model = {
+                    let mut state = self.state.lock().await;
                     state.close_active_stream_when_tools_idle = false;
+                    state.conversation_bytes_total = state
+                        .conversation_bytes_total
+                        .saturating_add(content.len() as u64);
                     let model = state.model.clone().unwrap_or_else(|| "codex".to_string());
                     let turn_context = state
                         .turn_context_by_turn
                         .get(&stream.turn_id)
                         .cloned()
                         .unwrap_or_default();
-                    let content = if text.is_empty() { stream.text } else { text };
-                    state.conversation_bytes_total = state
-                        .conversation_bytes_total
-                        .saturating_add(content.len() as u64);
-                    let turn_id = stream.turn_id.clone();
-                    let message_id = stream.message_id.clone();
-                    let reasoning = if stream.reasoning.trim().is_empty() {
-                        extract_codex_item_reasoning(item).unwrap_or(stream.reasoning)
-                    } else {
-                        stream.reasoning
-                    };
-                    let reasoning = contains_non_whitespace(&reasoning).then_some(reasoning);
                     let metadata = metadata_target_for_visible_message(
-                        turn_id,
-                        message_id.clone(),
+                        stream.turn_id,
+                        stream.message_id.clone(),
                         &content,
                         reasoning.as_deref(),
                         model.clone(),
                         turn_context,
                     );
-                    if let Some(metadata) = metadata.clone() {
+                    if let Some(metadata) = metadata {
                         state.pending_message_metadata = Some(metadata);
                     }
-                    let stream_start = should_open_stream.then_some(message_id);
-                    (content, reasoning, model, stream_start)
+                    state
+                        .completed_agent_messages
+                        .insert(message_id.clone(), completion);
+                    model
                 };
-                if let Some(message_id) = stream_start.as_deref() {
-                    self.emitter.stream_start(
-                        message_id,
-                        AgentName(CODEX_AGENT_NAME),
-                        Some(&model),
+                if synthetic_start {
+                    Self::emit_stream_start(
+                        self.emitter.as_ref(),
+                        message_id.clone(),
+                        None,
+                        &model,
                     );
+                    if let Some(reasoning) = reasoning.as_deref() {
+                        self.emitter
+                            .stream_reasoning_delta_with_id(message_id.clone(), reasoning);
+                    }
                 }
-                self.emitter.stream_end(StreamEndPayload {
-                    content,
-                    agent: Some(AgentName(CODEX_AGENT_NAME)),
-                    model: Some(model),
-                    request_usage: None,
-                    turn_usage: None,
-                    cumulative_usage: None,
-                    token_usage_unavailable_reason: None,
-                    reasoning,
-                    tool_calls: Vec::new(),
-                    context_breakdown: None,
-                });
+                self.emitter.stream_end_with_id(
+                    message_id,
+                    StreamEndPayload {
+                        content,
+                        agent: Some(AgentName(CODEX_AGENT_NAME)),
+                        model: Some(model),
+                        request_usage: None,
+                        turn_usage: None,
+                        cumulative_usage: None,
+                        token_usage_unavailable_reason: None,
+                        reasoning,
+                        tool_calls: Vec::new(),
+                        context_breakdown: None,
+                    },
+                );
+            }
+            "subAgentActivity" | "sub_agent_activity" => {
+                self.register_codex_subagent_activity_if_needed(item).await;
             }
             "userMessage" => {
                 // User messages are emitted synchronously when sent to keep ordering stable.
-                // Codex may also inject subagent notifications as synthetic user messages.
-                let text = extract_codex_item_text(item);
-                self.complete_codex_subagent_from_notification_if_needed(&text)
-                    .await;
             }
             "reasoning" => {
-                let Some(reasoning_text) = extract_codex_item_reasoning(item) else {
+                let completion_reasoning = extract_codex_item_reasoning(item)
+                    .filter(|reasoning| contains_non_whitespace(reasoning));
+                let raw_completion_reasoning = completion_reasoning.clone();
+                let provider_message_id = item_id
+                    .filter(|item_id| !item_id.trim().is_empty())
+                    .map(|item_id| ChatMessageId(item_id.to_string()));
+                let result = {
+                    let mut state = self.state.lock().await;
+                    let matches_active = |stream: &ActiveStreamState| {
+                        if !stream.reasoning_only {
+                            return false;
+                        }
+                        match provider_message_id.as_ref() {
+                            Some(message_id) => stream.message_id == *message_id,
+                            None => stream.generated_identity.as_ref().is_some_and(|identity| {
+                                identity.origin
+                                    == ServerGeneratedChatMessageIdOrigin::IdlessReasoning
+                            }),
+                        }
+                    };
+                    if let Some(message_id) = provider_message_id.as_ref()
+                        && let Some(previous) = state.completed_agent_messages.get(message_id)
+                    {
+                        let completion = CompletedCodexAgentMessage {
+                            completion_text: String::new(),
+                            completion_reasoning: completion_reasoning.clone(),
+                            generated_identity: None,
+                        };
+                        if previous == &completion {
+                            None
+                        } else {
+                            Some(Err(StreamIdentityViolation::ConflictingDuplicateCompletion))
+                        }
+                    } else if let Some(active) = state.active_stream.as_ref() {
+                        if matches_active(active) {
+                            let stream = state
+                                .active_stream
+                                .take()
+                                .expect("active Codex reasoning stream disappeared");
+                            Some(Ok((stream, false)))
+                        } else {
+                            Some(Err(StreamIdentityViolation::ForeignActiveMessageId))
+                        }
+                    } else {
+                        let generated_identity = provider_message_id.is_none().then(|| {
+                            let identity = ServerGeneratedChatMessageIdentity {
+                                origin: ServerGeneratedChatMessageIdOrigin::IdlessReasoning,
+                                stream_epoch: state.generated_identity_epoch,
+                                item_ordinal: state.next_generated_identity_ordinal,
+                            };
+                            state.next_generated_identity_ordinal =
+                                state.next_generated_identity_ordinal.saturating_add(1);
+                            identity
+                        });
+                        let message_id = provider_message_id.clone().unwrap_or_else(|| {
+                            generated_identity
+                                .as_ref()
+                                .expect("generated reasoning identity")
+                                .message_id()
+                        });
+                        Some(Ok((
+                            ActiveStreamState {
+                                turn_id: state
+                                    .active_turn_id
+                                    .clone()
+                                    .unwrap_or_else(|| "turn".to_string()),
+                                message_id,
+                                generated_identity,
+                                text: String::new(),
+                                reasoning: String::new(),
+                                reasoning_only: true,
+                            },
+                            true,
+                        )))
+                    }
+                };
+                let Some(result) = result else {
                     return;
                 };
-                if !contains_non_whitespace(&reasoning_text) {
-                    return;
-                }
-
-                let mut should_emit = false;
-                {
+                let (stream, synthetic_start) = match result {
+                    Ok(result) => result,
+                    Err(violation) => {
+                        self.reject_agent_message_identity(
+                            violation,
+                            "item/completed",
+                            provider_message_id
+                                .as_ref()
+                                .map(|message_id| message_id.0.as_str()),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                let reasoning = completion_reasoning.or_else(|| {
+                    contains_non_whitespace(&stream.reasoning).then_some(stream.reasoning.clone())
+                });
+                let completion = CompletedCodexAgentMessage {
+                    completion_text: String::new(),
+                    completion_reasoning: raw_completion_reasoning,
+                    generated_identity: stream.generated_identity.clone(),
+                };
+                let model = {
                     let mut state = self.state.lock().await;
-                    if let Some(stream) = state.active_stream.as_mut() {
-                        let duplicate = stream
-                            .reasoning
-                            .split('\n')
-                            .any(|line| line == reasoning_text.as_str());
-                        if !duplicate {
-                            stream.message_id = item_id.clone();
-                            if !stream.reasoning.is_empty() && !stream.reasoning.ends_with('\n') {
-                                stream.reasoning.push('\n');
-                            }
-                            stream.reasoning.push_str(&reasoning_text);
-                            should_emit = true;
-                        }
-                    }
-                    if should_emit && let Some(turn_id) = state.active_turn_id.as_ref().cloned() {
-                        let estimate = state.turn_context_by_turn.entry(turn_id).or_default();
-                        estimate.reasoning_bytes = estimate
-                            .reasoning_bytes
-                            .saturating_add(reasoning_text.len() as u64);
+                    let model = state.model.clone().unwrap_or_else(|| "codex".to_string());
+                    let turn_context = state
+                        .turn_context_by_turn
+                        .get(&stream.turn_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    state.pending_message_metadata = metadata_target_for_visible_message(
+                        stream.turn_id,
+                        stream.message_id.clone(),
+                        "",
+                        reasoning.as_deref(),
+                        model.clone(),
+                        turn_context,
+                    );
+                    state
+                        .completed_agent_messages
+                        .insert(stream.message_id.clone(), completion);
+                    model
+                };
+                if synthetic_start {
+                    Self::emit_stream_start(
+                        self.emitter.as_ref(),
+                        stream.message_id.clone(),
+                        stream.generated_identity.as_ref(),
+                        &model,
+                    );
+                    if let Some(reasoning) = reasoning.as_deref() {
+                        self.emitter
+                            .stream_reasoning_delta_with_id(stream.message_id.clone(), reasoning);
                     }
                 }
-
-                if should_emit {
-                    self.emitter
-                        .stream_reasoning_delta(&item_id, &reasoning_text);
-                }
-                self.finish_stream_after_reasoning_item().await;
+                self.emitter.stream_end_with_id(
+                    stream.message_id,
+                    StreamEndPayload {
+                        content: String::new(),
+                        agent: Some(AgentName(CODEX_AGENT_NAME)),
+                        model: Some(model),
+                        request_usage: None,
+                        turn_usage: None,
+                        cumulative_usage: None,
+                        token_usage_unavailable_reason: None,
+                        reasoning,
+                        tool_calls: Vec::new(),
+                        context_breakdown: None,
+                    },
+                );
             }
             "commandExecution" => {
+                let item_id = item_id.unwrap_or("item").to_string();
                 self.add_active_turn_tool_bytes(estimate_command_execution_tool_bytes(item))
                     .await;
                 let exit_code = item.get("exitCode").and_then(Value::as_i64).unwrap_or(-1) as i32;
@@ -2872,6 +4631,7 @@ impl CodexInner {
                 .await;
             }
             "fileChange" => {
+                let item_id = item_id.unwrap_or("item").to_string();
                 self.add_active_turn_tool_bytes(estimate_file_change_tool_bytes(item))
                     .await;
                 let success = item.get("status").and_then(Value::as_str) == Some("completed");
@@ -2934,6 +4694,7 @@ impl CodexInner {
                 .await;
             }
             "mcpToolCall" | "dynamicToolCall" => {
+                let item_id = item_id.unwrap_or("item").to_string();
                 self.add_active_turn_tool_bytes(estimate_generic_tool_bytes(item))
                     .await;
                 let tool_name = item
@@ -2960,20 +4721,9 @@ impl CodexInner {
                     },
                 )
                 .await;
-                if codex_item_looks_like_spawn_tool(item) {
-                    self.spawn_codex_subagent_if_needed(item).await;
-                    self.record_codex_subagent_spawn_result_if_needed(&item_id, item)
-                        .await;
-                    if !success {
-                        self.complete_codex_subagent_if_needed(&item_id).await;
-                    }
-                } else {
-                    self.complete_codex_subagent_if_needed(&item_id).await;
-                }
-                self.complete_codex_subagents_from_wait_if_needed(item)
-                    .await;
             }
             "collabToolCall" | "collabAgentToolCall" => {
+                let item_id = item_id.unwrap_or("item").to_string();
                 self.add_active_turn_tool_bytes(estimate_generic_tool_bytes(item))
                     .await;
                 let tool_name = item
@@ -2999,160 +4749,270 @@ impl CodexInner {
                     },
                 )
                 .await;
-                if codex_item_looks_like_spawn_tool(item) {
-                    self.spawn_codex_subagent_if_needed(item).await;
-                    self.record_codex_subagent_spawn_result_if_needed(&item_id, item)
-                        .await;
-                    if !success {
-                        self.complete_codex_subagent_if_needed(&item_id).await;
-                    }
-                } else {
-                    self.complete_codex_subagent_if_needed(&item_id).await;
-                }
-                self.complete_codex_subagents_from_wait_if_needed(item)
+                self.record_codex_subagent_spawn_metadata_if_needed(item)
                     .await;
             }
             _ => {}
         }
     }
 
-    async fn spawn_codex_subagent_if_needed(&self, item: &Value) {
-        let Some(spawn) = parse_codex_subagent_spawn(item) else {
+    async fn record_codex_subagent_spawn_metadata_if_needed(&self, item: &Value) {
+        let Some(spawn) = parse_codex_subagent_collab(item) else {
+            return;
+        };
+        let receiver_thread_id = spawn.receiver_thread_id.clone();
+        let conflict = {
+            let mut state = self.state.lock().await;
+            if spawn.sender_thread_id != state.thread_id {
+                let message = format!(
+                    "Codex ownership invariant failed: spawn metadata for child thread '{}' names sender '{}' instead of parent thread '{}'",
+                    receiver_thread_id, spawn.sender_thread_id, state.thread_id
+                );
+                state
+                    .conflicting_subagent_threads
+                    .insert(receiver_thread_id.clone(), message.clone());
+                Some(message)
+            } else if let Some(existing) = state.pending_subagent_spawns.get(&receiver_thread_id) {
+                if existing.item_id == spawn.item_id
+                    && existing.sender_thread_id == spawn.sender_thread_id
+                {
+                    tracing::debug!(
+                        receiver_thread_id = receiver_thread_id.as_str(),
+                        "Repeated authoritative Codex child spawn metadata"
+                    );
+                    None
+                } else {
+                    Some(format!(
+                        "Codex ownership invariant failed: child thread '{}' has contradictory pending spawn metadata ('{}' and '{}')",
+                        receiver_thread_id, existing.item_id, spawn.item_id
+                    ))
+                }
+            } else {
+                tracing::debug!(
+                    item_id = spawn.item_id.as_str(),
+                    sender_thread_id = spawn.sender_thread_id.as_str(),
+                    receiver_thread_id = receiver_thread_id.as_str(),
+                    "Recorded authoritative Codex child spawn metadata"
+                );
+                state
+                    .pending_subagent_spawns
+                    .insert(receiver_thread_id.clone(), spawn);
+                None
+            }
+        };
+        if let Some(message) = conflict {
+            tracing::error!(
+                receiver_thread_id = receiver_thread_id.as_str(),
+                "{message}"
+            );
+            self.emitter.backend_error(&message);
+        }
+    }
+
+    async fn register_codex_subagent_activity_if_needed(&self, item: &Value) {
+        let Some(activity) = parse_codex_subagent_activity(item) else {
+            return;
+        };
+        if activity.kind != "started" {
+            tracing::debug!(
+                kind = activity.kind.as_str(),
+                agent_thread_id = activity.agent_thread_id.as_str(),
+                agent_path = activity.agent_path.as_str(),
+                "Observed non-start Codex sub-agent activity"
+            );
+            return;
+        }
+
+        let thread_id = activity.agent_thread_id.clone();
+        let (spawn, subagent_sink, rejection, idempotent) = {
+            let mut state = self.state.lock().await;
+            if let Some(message) = state.conflicting_subagent_threads.get(&thread_id) {
+                (None, None, Some(message.clone()), false)
+            } else if let Some(stream) = state.subagent_streams.get(&thread_id) {
+                if stream.agent_path == activity.agent_path
+                    && stream.sender_thread_id == state.thread_id
+                    && !stream.spawn_item_id.is_empty()
+                    && (stream.activity_item_id.is_none()
+                        || activity.item_id.is_none()
+                        || stream.activity_item_id == activity.item_id)
+                {
+                    (None, None, None, true)
+                } else {
+                    (
+                        None,
+                        None,
+                        Some(format!(
+                            "Codex ownership invariant failed: child thread '{}' was re-registered with contradictory activity metadata",
+                            thread_id
+                        )),
+                        false,
+                    )
+                }
+            } else if let Some(stream) = state.completed_subagent_streams.get(&thread_id) {
+                if stream.agent_path == activity.agent_path
+                    && stream.sender_thread_id == state.thread_id
+                    && !stream.spawn_item_id.is_empty()
+                    && (stream.activity_item_id.is_none()
+                        || activity.item_id.is_none()
+                        || stream.activity_item_id == activity.item_id)
+                {
+                    (None, None, None, true)
+                } else {
+                    (
+                        None,
+                        None,
+                        Some(format!(
+                            "Codex ownership invariant failed: completed child thread '{}' was re-registered with contradictory activity metadata",
+                            thread_id
+                        )),
+                        false,
+                    )
+                }
+            } else if !state.registering_subagent_threads.insert(thread_id.clone()) {
+                (
+                    None,
+                    None,
+                    Some(format!(
+                        "Codex ownership invariant failed: child thread '{}' has concurrent duplicate registration activity",
+                        thread_id
+                    )),
+                    false,
+                )
+            } else {
+                let spawn = state
+                    .pending_subagent_spawns
+                    .remove(&thread_id)
+                    .unwrap_or_else(|| CodexSubAgentSpawnInfo {
+                        item_id: thread_id.clone(),
+                        name: activity.agent_path.clone(),
+                        description: activity.agent_path.clone(),
+                        agent_type: "sub-agent".to_string(),
+                        receiver_thread_id: thread_id.clone(),
+                        sender_thread_id: state.thread_id.clone(),
+                    });
+                (Some(spawn), state.subagent_emitter.clone(), None, false)
+            }
+        };
+        if idempotent {
+            tracing::debug!(
+                agent_thread_id = thread_id.as_str(),
+                agent_path = activity.agent_path.as_str(),
+                "Repeated Codex child activity is idempotent"
+            );
+            return;
+        }
+        if let Some(message) = rejection {
+            tracing::error!(agent_thread_id = thread_id.as_str(), "{message}");
+            self.emitter.backend_error(&message);
+            return;
+        }
+        let (Some(spawn), Some(subagent_sink)) = (spawn, subagent_sink) else {
+            let message = format!(
+                "Codex ownership invariant failed: child thread '{}' started before its sub-agent emitter was installed",
+                thread_id
+            );
+            let mut state = self.state.lock().await;
+            state.registering_subagent_threads.remove(&thread_id);
+            tracing::error!(agent_thread_id = thread_id.as_str(), "{message}");
+            self.emitter.backend_error(&message);
             return;
         };
 
-        let subagent_sink = {
-            let state = self.state.lock().await;
-            if state.subagent_streams.contains_key(&spawn.item_id) {
+        let spawn_item_id = spawn.item_id.clone();
+        let sender_thread_id = spawn.sender_thread_id.clone();
+        let handle = match subagent_sink
+            .on_subagent_spawned(
+                spawn.item_id,
+                spawn.name,
+                spawn.description,
+                spawn.agent_type,
+                Some(SessionId(thread_id.clone())),
+            )
+            .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                let message = format!(
+                    "Codex child relay registration failed for thread '{}': {error}",
+                    thread_id
+                );
+                {
+                    let mut state = self.state.lock().await;
+                    state.registering_subagent_threads.remove(&thread_id);
+                }
+                tracing::error!(agent_thread_id = thread_id.as_str(), "{message}");
+                self.complete_all_codex_subagents().await;
+                self.emitter.backend_error(&message);
+                self.emitter.typing_status_changed(false);
                 return;
             }
-            state.subagent_emitter.clone()
         };
-        let Some(subagent_sink) = subagent_sink else {
-            return;
-        };
-
-        let handle = subagent_sink
-            .on_subagent_spawned(
-                spawn.item_id.clone(),
-                spawn.name,
-                spawn.description.clone(),
-                spawn.agent_type,
-                spawn.receiver_thread_id.clone().map(SessionId),
-            )
-            .await;
         let (raw_event_tx, raw_event_rx) = mpsc::unbounded_channel();
-        spawn_codex_subagent_event_bridge(raw_event_rx, handle.event_tx.clone());
+        spawn_codex_subagent_event_bridge(raw_event_rx, handle.event_tx);
         let emitter = Arc::new(TurnEmitter::new_for_agent(
             raw_event_tx,
             AgentName(CODEX_AGENT_NAME),
         ));
 
-        let mut state = self.state.lock().await;
-        tracing::info!(
-            "Codex sub-agent spawn detected: item_id={}, tool={}",
-            spawn.item_id,
-            spawn.tool_name
-        );
-        state
-            .subagent_streams
-            .entry(spawn.item_id)
-            .or_insert(CodexSubAgentStream {
-                emitter,
-                receiver_thread_id: spawn.receiver_thread_id,
-                external_agent_id: None,
-                active_turn_id: None,
-                current_message_id: None,
-                pending_message_metadata: None,
-                token_usage_by_turn: HashMap::new(),
-            });
-    }
-
-    async fn complete_codex_subagent_if_needed(&self, item_id: &str) {
-        let mut state = self.state.lock().await;
-        if let Some(stream) = state.subagent_streams.remove(item_id) {
-            state
-                .completed_subagent_streams
-                .insert(item_id.to_string(), completed_codex_subagent_stream(stream));
-        }
-    }
-
-    async fn record_codex_subagent_spawn_result_if_needed(&self, item_id: &str, item: &Value) {
-        let Some(external_agent_id) = extract_codex_spawned_agent_id(item) else {
-            return;
-        };
-
-        let mut state = self.state.lock().await;
-        if let Some(stream) = state.subagent_streams.get_mut(item_id) {
-            stream.external_agent_id = Some(external_agent_id);
-            tracing::info!(
-                "Codex sub-agent mapped: item_id={} -> external_agent_id={}",
-                item_id,
-                stream.external_agent_id.as_deref().unwrap_or("")
-            );
-        }
-    }
-
-    async fn complete_codex_subagents_from_wait_if_needed(&self, item: &Value) {
-        let completions = extract_codex_wait_agent_completions(item);
-        if completions.is_empty() {
-            return;
-        }
-        tracing::info!(
-            "Codex wait-agent completion payload parsed: {} entrie(s)",
-            completions.len()
-        );
-        for completion in completions {
-            self.complete_codex_subagent_by_external_id(&completion.external_agent_id)
-                .await;
-        }
-    }
-
-    async fn complete_codex_subagent_from_notification_if_needed(&self, text: &str) {
-        let Some(completion) = extract_codex_subagent_notification_completion(text) else {
-            return;
-        };
-        tracing::info!(
-            "Codex subagent notification parsed for external_agent_id={}",
-            completion.external_agent_id
-        );
-        self.complete_codex_subagent_by_external_id(&completion.external_agent_id)
-            .await;
-    }
-
-    async fn complete_codex_subagent_by_external_id(&self, external_agent_id: &str) {
-        let mut state = self.state.lock().await;
-
-        let direct_match = state.subagent_streams.iter().find_map(|(item_id, stream)| {
-            (stream.external_agent_id.as_deref() == Some(external_agent_id))
-                .then(|| item_id.clone())
-        });
-
-        let fallback_single_unknown = if direct_match.is_none() {
-            let mut unknown = state
-                .subagent_streams
-                .iter()
-                .filter(|(_, stream)| stream.external_agent_id.is_none())
-                .map(|(item_id, _)| item_id.clone());
-            let first = unknown.next();
-            if first.is_some() && unknown.next().is_none() {
-                first
+        let duplicate_after_spawn = {
+            let mut state = self.state.lock().await;
+            state.registering_subagent_threads.remove(&thread_id);
+            if state.subagent_streams.contains_key(&thread_id)
+                || state.completed_subagent_streams.contains_key(&thread_id)
+            {
+                true
             } else {
-                None
+                tracing::info!(
+                    agent_thread_id = thread_id.as_str(),
+                    agent_path = activity.agent_path.as_str(),
+                    spawn_item_id = spawn_item_id.as_str(),
+                    sender_thread_id = sender_thread_id.as_str(),
+                    "Registered authoritative Codex child thread"
+                );
+                state.subagent_streams.insert(
+                    thread_id.clone(),
+                    CodexSubAgentStream {
+                        emitter,
+                        spawn_item_id,
+                        activity_item_id: activity.item_id.clone(),
+                        agent_path: activity.agent_path.clone(),
+                        sender_thread_id,
+                        active_turn_id: None,
+                        current_message_id: None,
+                        current_generated_identity: None,
+                        current_reasoning_only: false,
+                        current_text: String::new(),
+                        current_reasoning: String::new(),
+                        completed_agent_messages: HashMap::new(),
+                        quarantined_turn_id: None,
+                        quarantined: false,
+                        generated_identity_epoch: codex_generated_identity_epoch(&thread_id),
+                        next_generated_identity_ordinal: 1,
+                        pending_message_metadata: None,
+                        token_usage_by_turn: HashMap::new(),
+                    },
+                );
+                false
             }
-        } else {
-            None
         };
+        if duplicate_after_spawn {
+            let message = format!(
+                "Codex ownership invariant failed: child relay was created twice for thread '{}'",
+                thread_id
+            );
+            tracing::error!(agent_thread_id = thread_id.as_str(), "{message}");
+            self.emitter.backend_error(&message);
+        }
+    }
 
-        if let Some(item_id) = direct_match.or(fallback_single_unknown)
-            && let Some(mut stream) = state.subagent_streams.remove(&item_id)
-        {
-            if stream.external_agent_id.is_none() {
-                stream.external_agent_id = Some(external_agent_id.to_string());
-            }
-            state
-                .completed_subagent_streams
-                .insert(item_id, completed_codex_subagent_stream(stream));
+    #[cfg(test)]
+    async fn complete_codex_subagent_if_needed(&self, thread_id: &str) {
+        let mut state = self.state.lock().await;
+        if let Some(stream) = state.subagent_streams.remove(thread_id) {
+            state.completed_subagent_streams.insert(
+                thread_id.to_string(),
+                completed_codex_subagent_stream(stream),
+            );
         }
     }
 
@@ -3160,6 +5020,20 @@ impl CodexInner {
         let mut state = self.state.lock().await;
         let streams = state.subagent_streams.drain().collect::<Vec<_>>();
         for (item_id, stream) in streams {
+            if stream.current_message_id.is_some() {
+                stream.emitter.discard_open_stream_with_identity_violation(
+                    StreamIdentityViolation::MismatchedEndMessageId,
+                );
+            } else if stream.active_turn_id.is_some() {
+                stream
+                    .emitter
+                    .operation_cancelled("Parent agent turn ended before the sub-agent completed");
+            } else {
+                tracing::debug!(
+                    thread_id = item_id.as_str(),
+                    "Retaining completed Codex child without cancellation during parent teardown"
+                );
+            }
             state
                 .completed_subagent_streams
                 .insert(item_id, completed_codex_subagent_stream(stream));
@@ -3197,6 +5071,10 @@ impl CodexInner {
     }
 
     async fn handle_turn_completed(&self, params: &Value) {
+        let completed_turn_id = extract_turn_id(params);
+        if self.state.lock().await.quarantined_turn_id.as_ref() == completed_turn_id.as_ref() {
+            return;
+        }
         let turn_status = params
             .get("turn")
             .and_then(|v| v.get("status"))
@@ -3210,7 +5088,7 @@ impl CodexInner {
         let turn_usage = extract_turn_token_usage(params, model_hint.as_deref());
         let model_usage = extract_model_request_token_usage(params, model_hint.as_deref());
 
-        let (stream_to_close, metadata_update, model_usage) = {
+        let (open_item_without_completion, partial_idless_reasoning, metadata_update, model_usage) = {
             let mut state = self.state.lock().await;
             if let Some((turn_id, token_usage)) = turn_usage {
                 state.token_usage_by_turn.insert(turn_id, token_usage);
@@ -3229,38 +5107,45 @@ impl CodexInner {
             let completed_turn_id =
                 extract_turn_id(params).or_else(|| state.active_turn_id.clone());
             state.active_turn_id = None;
-            let mut stream_to_close = None;
+            let mut open_item_without_completion = false;
+            let mut partial_idless_reasoning = None;
             let mut metadata_update = None;
             if let Some(turn_id) = completed_turn_id {
-                if turn_status != "interrupted" {
-                    let stream_open_for_turn = state
-                        .active_stream
-                        .as_ref()
-                        .map(|stream| stream.turn_id == turn_id)
-                        .unwrap_or(false);
-                    if stream_open_for_turn && let Some(stream) = state.active_stream.take() {
-                        let model = state.model.clone().unwrap_or_else(|| "codex".to_string());
-                        let turn_context = state
-                            .turn_context_by_turn
-                            .get(&stream.turn_id)
-                            .cloned()
-                            .unwrap_or_default();
-                        let reasoning =
-                            contains_non_whitespace(&stream.reasoning).then_some(stream.reasoning);
-                        let segment = CodexStreamSegment {
-                            turn_id: stream.turn_id,
-                            message_id: stream.message_id,
-                            content: stream.text,
-                            reasoning,
-                            model,
-                            turn_context,
-                        };
-                        if let Some(metadata) = metadata_target_from_segment(&segment) {
-                            state.pending_message_metadata = Some(metadata);
-                        }
-                        stream_to_close = Some(segment);
+                let has_open_stream = state
+                    .active_stream
+                    .as_ref()
+                    .is_some_and(|stream| stream.turn_id == turn_id);
+                let open_stream = has_open_stream
+                    .then(|| state.active_stream.take())
+                    .flatten();
+                if let Some(stream) = open_stream {
+                    state.pending_message_metadata = None;
+                    state.quarantined_turn_id = Some(turn_id.clone());
+                    let durable_idless_reasoning = stream.reasoning_only
+                        && stream.generated_identity.as_ref().is_some_and(|identity| {
+                            identity.origin == ServerGeneratedChatMessageIdOrigin::IdlessReasoning
+                        })
+                        && contains_non_whitespace(&stream.reasoning);
+                    if durable_idless_reasoning {
+                        let reasoning = stream.reasoning.clone();
+                        state.completed_agent_messages.insert(
+                            stream.message_id.clone(),
+                            CompletedCodexAgentMessage {
+                                completion_text: String::new(),
+                                completion_reasoning: Some(reasoning.clone()),
+                                generated_identity: stream.generated_identity.clone(),
+                            },
+                        );
+                        partial_idless_reasoning = Some((stream.message_id, reasoning));
+                    } else {
+                        open_item_without_completion = true;
                     }
+                }
 
+                if turn_status != "interrupted"
+                    && partial_idless_reasoning.is_none()
+                    && !open_item_without_completion
+                {
                     if state
                         .pending_message_metadata
                         .as_ref()
@@ -3283,10 +5168,11 @@ impl CodexInner {
                         metadata_update =
                             Some((pending, token_usage, model_token_usage, context_breakdown));
                     }
-                } else if state
-                    .pending_message_metadata
-                    .as_ref()
-                    .is_some_and(|pending| pending.turn_id == turn_id)
+                } else if turn_status == "interrupted"
+                    && state
+                        .pending_message_metadata
+                        .as_ref()
+                        .is_some_and(|pending| pending.turn_id == turn_id)
                 {
                     state.pending_message_metadata = None;
                     state.completed_message_metadata_by_turn.remove(&turn_id);
@@ -3300,25 +5186,48 @@ impl CodexInner {
             state.pending_tool_call_ids.clear();
             state.close_active_stream_when_tools_idle = false;
             state.pending_user_input_bytes = 0;
-            (stream_to_close, metadata_update, model_usage)
+            (
+                open_item_without_completion,
+                partial_idless_reasoning,
+                metadata_update,
+                model_usage,
+            )
         };
 
         if let Some(usage) = model_usage {
             self.emitter.model_request_token_usage(&usage);
         }
-        if let Some(segment) = stream_to_close {
-            self.emitter.stream_end(StreamEndPayload {
-                content: segment.content,
-                agent: Some(AgentName(CODEX_AGENT_NAME)),
-                model: Some(segment.model),
-                request_usage: None,
-                turn_usage: None,
-                cumulative_usage: None,
-                token_usage_unavailable_reason: None,
-                reasoning: segment.reasoning,
-                tool_calls: Vec::new(),
-                context_breakdown: None,
-            });
+        if let Some((message_id, reasoning)) = partial_idless_reasoning {
+            if matches!(turn_status.as_str(), "interrupted" | "failed") {
+                self.complete_all_codex_subagents().await;
+            }
+            self.emitter.stream_end_with_id(
+                message_id,
+                StreamEndPayload {
+                    content: String::new(),
+                    agent: Some(AgentName(CODEX_AGENT_NAME)),
+                    model: Some(model_hint.unwrap_or_else(|| "codex".to_string())),
+                    request_usage: None,
+                    turn_usage: None,
+                    cumulative_usage: None,
+                    token_usage_unavailable_reason: None,
+                    reasoning: Some(reasoning),
+                    tool_calls: Vec::new(),
+                    context_breakdown: None,
+                },
+            );
+            self.emitter
+                .operation_cancelled("Codex turn ended before reasoning item completion");
+            return;
+        }
+        if open_item_without_completion {
+            if matches!(turn_status.as_str(), "interrupted" | "failed") {
+                self.complete_all_codex_subagents().await;
+            }
+            self.emitter.discard_open_stream_with_identity_violation(
+                StreamIdentityViolation::MismatchedEndMessageId,
+            );
+            return;
         }
         if let Some((pending, token_usage, model_token_usage, context_breakdown)) = metadata_update
         {
@@ -3362,13 +5271,26 @@ impl CodexInner {
         tool_result: Value,
         error: Option<String>,
     ) {
-        self.emitter.tool_completed(ToolCompletedPayload {
+        let (tool_result, normalization_failure) = normalize_codex_tool_result(
+            &self.emitter,
+            tool_call_id,
+            tool_name,
+            tool_result,
+            success,
+        );
+        let completed = ToolCompletedPayload {
             tool_call_id,
             tool_name,
             tool_result,
             success,
             error: error.as_deref(),
-        });
+        };
+        if let Some(normalization_failure) = normalization_failure {
+            self.emitter
+                .tool_completed_with_normalization_failure(completed, normalization_failure);
+        } else {
+            self.emitter.tool_completed(completed);
+        }
         self.mark_tool_completed(tool_call_id).await;
     }
 
@@ -3470,53 +5392,30 @@ fn extract_notification_thread_id(params: &Value) -> Option<String> {
         .map(|id| id.to_string())
 }
 
-fn find_subagent_stream_key_for_thread(state: &CodexState, thread_id: &str) -> Option<String> {
-    let thread_id = thread_id.trim();
-    if thread_id.is_empty() {
-        return None;
-    }
-
-    if let Some((stream_key, _)) = state.subagent_streams.iter().find(|(_, stream)| {
-        stream.receiver_thread_id.as_deref() == Some(thread_id)
-            || stream.external_agent_id.as_deref() == Some(thread_id)
-    }) {
-        return Some(stream_key.clone());
-    }
-
-    // Early in a spawn, Codex may start emitting sub-agent notifications before
-    // the receiver thread id is recorded. If exactly one sub-agent stream is
-    // unresolved, route to that stream.
-    let mut unresolved = state
-        .subagent_streams
-        .iter()
-        .filter(|(_, stream)| {
-            stream.receiver_thread_id.is_none() && stream.external_agent_id.is_none()
-        })
-        .map(|(stream_key, _)| stream_key.clone());
-    let first = unresolved.next()?;
-    if unresolved.next().is_some() {
-        return None;
-    }
-    Some(first)
+fn is_thread_scoped_codex_notification(method: &str) -> bool {
+    matches!(
+        method,
+        "turn/started" | "turn/completed" | "turn/plan/updated" | "thread/tokenUsage/updated"
+    ) || method.starts_with("item/")
+        || is_reasoning_notification_method(method)
 }
 
-fn find_completed_subagent_stream_key_for_thread(
-    state: &CodexState,
-    thread_id: &str,
-) -> Option<String> {
-    let thread_id = thread_id.trim();
-    if thread_id.is_empty() {
-        return None;
+fn classify_codex_notification_owner(state: &CodexState, params: &Value) -> CodexNotificationOwner {
+    let Some(thread_id) = extract_notification_thread_id(params) else {
+        return CodexNotificationOwner::Unknown { thread_id: None };
+    };
+    if thread_id == state.thread_id {
+        return CodexNotificationOwner::Parent { thread_id };
     }
-
-    state
-        .completed_subagent_streams
-        .iter()
-        .find_map(|(key, stream)| {
-            (stream.receiver_thread_id.as_deref() == Some(thread_id)
-                || stream.external_agent_id.as_deref() == Some(thread_id))
-            .then(|| key.clone())
-        })
+    if state.subagent_streams.contains_key(&thread_id) {
+        return CodexNotificationOwner::LiveChild { thread_id };
+    }
+    if state.completed_subagent_streams.contains_key(&thread_id) {
+        return CodexNotificationOwner::CompletedChild { thread_id };
+    }
+    CodexNotificationOwner::Unknown {
+        thread_id: Some(thread_id),
+    }
 }
 
 fn codex_plan_update_task_list_from_params(params: &Value) -> Option<protocol::TaskList> {
@@ -3627,388 +5526,96 @@ fn codex_item_success(item: &Value) -> bool {
     }
 }
 
-fn parse_codex_subagent_spawn(item: &Value) -> Option<CodexSubAgentSpawnInfo> {
-    let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
-    if !matches!(
-        item_type,
-        "collabToolCall" | "collabAgentToolCall" | "dynamicToolCall" | "mcpToolCall"
-    ) {
+fn parse_codex_subagent_collab(item: &Value) -> Option<CodexSubAgentSpawnInfo> {
+    if item.get("type").and_then(Value::as_str) != Some("collabAgentToolCall")
+        || item.get("agentsStates").is_some()
+    {
         return None;
     }
-
-    let tool_name = codex_item_tool_name(item).unwrap_or_else(|| "collab_tool".to_string());
-    let looks_like_spawn = if matches!(item_type, "collabToolCall" | "collabAgentToolCall") {
-        codex_collab_item_looks_like_spawn(item) || codex_tool_name_is_spawn(&tool_name)
-    } else {
-        codex_tool_name_is_spawn(&tool_name)
-    };
-    if !looks_like_spawn {
+    let has_spawn_shape = item.get("prompt").and_then(Value::as_str).is_some()
+        && (item
+            .get("receiverAgentType")
+            .and_then(Value::as_str)
+            .is_some()
+            || item
+                .get("receiverAgentName")
+                .and_then(Value::as_str)
+                .is_some());
+    if !has_spawn_shape {
         return None;
     }
-
     let item_id = item
         .get("id")
         .and_then(Value::as_str)
-        .or_else(|| item.get("callId").and_then(Value::as_str))
-        .or_else(|| item.get("toolCallId").and_then(Value::as_str))?
+        .or_else(|| item.get("callId").and_then(Value::as_str))?
         .to_string();
-    let description = codex_find_string(
-        item,
-        &["prompt", "task", "instruction", "message", "description"],
-        5,
-    )
-    .unwrap_or_default();
-    let agent_type = codex_find_string(
-        item,
-        &[
-            "receiverAgentType",
-            "agentType",
-            "subagentType",
-            "subagent_type",
-            "agent_type",
-        ],
-        5,
-    )
-    .unwrap_or_default();
-
-    let name = codex_find_string(
-        item,
-        &[
-            "description",
-            "receiverAgentName",
-            "receiverName",
-            "name",
-            "subagent_type",
-            "agent_type",
-        ],
-        5,
-    )
-    .unwrap_or_else(|| {
-        if !agent_type.is_empty() {
-            agent_type.clone()
-        } else if codex_tool_name_is_spawn(&tool_name) {
-            "Sub-agent".to_string()
-        } else {
-            tool_name.clone()
-        }
-    });
-
-    let receiver_thread_id = codex_find_string(
-        item,
-        &["newThreadId", "receiverThreadId", "receiverThreadIds"],
-        5,
-    );
-
+    let receiver_thread_id = item
+        .get("receiverThreadId")
+        .and_then(Value::as_str)?
+        .to_string();
+    let sender_thread_id = item
+        .get("senderThreadId")
+        .and_then(Value::as_str)?
+        .to_string();
+    if receiver_thread_id.trim().is_empty() || sender_thread_id.trim().is_empty() {
+        return None;
+    }
+    let agent_type = item
+        .get("receiverAgentType")
+        .and_then(Value::as_str)
+        .unwrap_or("sub-agent")
+        .to_string();
+    let description = item
+        .get("prompt")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let name = item
+        .get("receiverAgentName")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("Sub-agent")
+        .to_string();
     Some(CodexSubAgentSpawnInfo {
         item_id,
         name,
         description,
         agent_type,
         receiver_thread_id,
-        tool_name,
+        sender_thread_id,
     })
 }
 
-fn codex_item_looks_like_spawn_tool(item: &Value) -> bool {
-    codex_item_tool_name(item)
-        .map(|name| codex_tool_name_is_spawn(&name))
-        .unwrap_or(false)
-}
-
-fn codex_item_looks_like_wait_tool(item: &Value) -> bool {
-    codex_item_tool_name(item)
-        .map(|name| codex_tool_name_is_wait(&name))
-        .unwrap_or(false)
-}
-
-fn codex_item_tool_name(item: &Value) -> Option<String> {
-    codex_find_string(item, &["tool", "name"], 3)
-}
-
-fn codex_normalize_tool_name(tool_name: &str) -> String {
-    tool_name
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .map(|ch| ch.to_ascii_lowercase())
-        .collect::<String>()
-}
-
-fn codex_tool_name_is_spawn(tool_name: &str) -> bool {
-    // Tyde's own `tyde-agent-control` MCP spawn tool (`tyde_spawn_agent`) is
-    // already handled by the agent-control spawn path, which creates the child
-    // Tyde session. The Codex *native* sub-agent detector must NOT also fire on
-    // it: the broad `ends_with("spawnagent")` rule below would otherwise match
-    // `tyde_spawn_agent`, producing a duplicate `backend_native` session
-    // alongside the real `agent_control` one for every MCP spawn. See the
-    // `tyde_spawn_agent_is_not_a_native_codex_spawn` regression test.
-    if codex_tool_name_is_tyde_agent_control_spawn(tool_name) {
-        return false;
-    }
-    let normalized = codex_normalize_tool_name(tool_name);
-    normalized == "spawnagent"
-        || normalized == "spawnsubagent"
-        || normalized == "delegate"
-        || normalized.ends_with("spawnagent")
-        || normalized.ends_with("spawnsubagent")
-        || normalized.contains("delegate")
-}
-
-/// Whether `tool_name` is Tyde's `tyde-agent-control` `tyde_spawn_agent` MCP
-/// tool. Matches the bare name as well as any MCP namespacing (e.g.
-/// `mcp__tyde-agent-control__tyde_spawn_agent`), since normalization strips the
-/// separators.
-fn codex_tool_name_is_tyde_agent_control_spawn(tool_name: &str) -> bool {
-    is_tyde_agent_control_spawn_tool_name(tool_name)
-}
-
-fn codex_tool_name_is_wait(tool_name: &str) -> bool {
-    let normalized = codex_normalize_tool_name(tool_name);
-    normalized == "wait"
-        || normalized == "waitagent"
-        || normalized == "awaitagent"
-        || normalized.ends_with("waitagent")
-        || normalized.ends_with("awaitagent")
-}
-
-fn codex_collab_item_looks_like_spawn(item: &Value) -> bool {
-    if codex_find_string(item, &["newThreadId"], 3).is_some() {
-        return true;
-    }
-
-    let tool = codex_find_string(item, &["tool"], 3).unwrap_or_default();
-    let normalized_tool = codex_normalize_tool_name(&tool);
-    if codex_tool_name_is_spawn(&tool)
-        || normalized_tool.contains("delegate")
-        || normalized_tool.contains("subagent")
-    {
-        return true;
-    }
-
-    let source_kind = codex_find_string(item, &["sourceKind", "source_kind"], 3)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    source_kind.contains("spawn")
-}
-
-fn extract_codex_spawned_agent_id(item: &Value) -> Option<String> {
-    let mut found: Option<String> = None;
-    codex_visit_value_and_embedded_json(item, 6, &mut |candidate| {
-        if found.is_some() {
-            return;
-        }
-        found = codex_find_string(
-            candidate,
-            &[
-                "spawnedAgentId",
-                "spawned_agent_id",
-                "agentId",
-                "agent_id",
-                "newThreadId",
-                "receiverThreadId",
-                "receiverThreadIds",
-            ],
-            3,
-        );
-    });
-    found
-}
-
-fn extract_codex_wait_agent_completions(item: &Value) -> Vec<CodexWaitAgentCompletion> {
-    if !codex_item_looks_like_wait_tool(item) {
-        return Vec::new();
-    }
-
-    let mut by_id: HashMap<String, CodexWaitAgentCompletion> = HashMap::new();
-    codex_visit_value_and_embedded_json(item, 6, &mut |candidate| {
-        if let Some(status_map) = candidate.get("status").and_then(Value::as_object) {
-            for (external_agent_id, status_entry) in status_map {
-                if let Some(completion) =
-                    codex_parse_wait_agent_status_entry(external_agent_id, status_entry)
-                {
-                    by_id.insert(completion.external_agent_id.clone(), completion);
-                }
-            }
-        }
-
-        if let Some(states) = candidate.get("agentsStates").and_then(Value::as_object) {
-            for (external_agent_id, state_entry) in states {
-                if let Some(completion) =
-                    codex_parse_collab_agent_state_entry(external_agent_id, state_entry)
-                {
-                    by_id.insert(completion.external_agent_id.clone(), completion);
-                }
-            }
-        }
-    });
-
-    by_id.into_values().collect()
-}
-
-fn codex_parse_collab_agent_state_entry(
-    external_agent_id: &str,
-    state_entry: &Value,
-) -> Option<CodexWaitAgentCompletion> {
-    let external_agent_id = external_agent_id.trim();
-    if external_agent_id.is_empty() {
+fn parse_codex_subagent_activity(item: &Value) -> Option<CodexSubAgentActivity> {
+    if !matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("subAgentActivity" | "sub_agent_activity")
+    ) {
         return None;
     }
-
-    let status = state_entry
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-
-    match status.as_str() {
-        "completed" | "errored" | "error" | "failed" | "interrupted" | "shutdown" | "notfound" => {
-            Some(CodexWaitAgentCompletion {
-                external_agent_id: external_agent_id.to_string(),
-            })
-        }
-        _ => None,
-    }
-}
-
-fn codex_parse_wait_agent_status_entry(
-    external_agent_id: &str,
-    status_entry: &Value,
-) -> Option<CodexWaitAgentCompletion> {
-    let external_agent_id = external_agent_id.trim();
-    if external_agent_id.is_empty() {
+    let agent_thread_id = item
+        .get("agentThreadId")
+        .or_else(|| item.get("agent_thread_id"))
+        .and_then(Value::as_str)?
+        .to_string();
+    if agent_thread_id.trim().is_empty() {
         return None;
     }
-
-    let is_running = match status_entry {
-        Value::Object(map) => {
-            if map.get("completed").is_some()
-                || map.get("failed").is_some()
-                || map.get("error").is_some()
-                || map.get("cancelled").is_some()
-                || map.get("canceled").is_some()
-                || map.get("interrupted").is_some()
-                || map.get("success").and_then(Value::as_bool).is_some()
-            {
-                false
-            } else if let Some(status) = map.get("status").and_then(Value::as_str) {
-                let normalized = status.trim().to_ascii_lowercase();
-                matches!(normalized.as_str(), "running" | "pendinginit")
-            } else {
-                false
-            }
-        }
-        _ => false,
-    };
-
-    if is_running {
-        return None;
-    }
-
-    Some(CodexWaitAgentCompletion {
-        external_agent_id: external_agent_id.to_string(),
+    Some(CodexSubAgentActivity {
+        item_id: item.get("id").and_then(Value::as_str).map(str::to_string),
+        agent_thread_id,
+        agent_path: item
+            .get("agentPath")
+            .or_else(|| item.get("agent_path"))
+            .and_then(Value::as_str)
+            .unwrap_or("Sub-agent")
+            .to_string(),
+        kind: item
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
     })
-}
-
-fn extract_codex_subagent_notification_completion(text: &str) -> Option<CodexWaitAgentCompletion> {
-    let payload = codex_extract_tagged_payload_json(text, "subagent_notification")?;
-    let external_agent_id = codex_find_string(&payload, &["agent_id", "agentId"], 3)?;
-    let status_entry = payload.get("status").cloned().unwrap_or(Value::Null);
-    if let Some(parsed) = codex_parse_wait_agent_status_entry(&external_agent_id, &status_entry) {
-        return Some(parsed);
-    }
-    Some(CodexWaitAgentCompletion { external_agent_id })
-}
-
-fn codex_extract_tagged_payload_json(text: &str, tag: &str) -> Option<Value> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = text.find(&open)?;
-    let end = text.find(&close)?;
-    if end <= start + open.len() {
-        return None;
-    }
-    let payload = text[start + open.len()..end].trim();
-    serde_json::from_str(payload).ok()
-}
-
-fn codex_visit_value_and_embedded_json<F>(value: &Value, depth: usize, visitor: &mut F)
-where
-    F: FnMut(&Value),
-{
-    if depth == 0 {
-        return;
-    }
-
-    visitor(value);
-
-    match value {
-        Value::Object(map) => {
-            for child in map.values() {
-                codex_visit_value_and_embedded_json(child, depth - 1, visitor);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                codex_visit_value_and_embedded_json(item, depth - 1, visitor);
-            }
-        }
-        Value::String(raw) => {
-            let trimmed = raw.trim();
-            if !trimmed.is_empty()
-                && (trimmed.starts_with('{') || trimmed.starts_with('['))
-                && trimmed.len() <= 2_000_000
-                && let Ok(parsed) = serde_json::from_str::<Value>(trimmed)
-            {
-                codex_visit_value_and_embedded_json(&parsed, depth - 1, visitor);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn codex_find_string(value: &Value, keys: &[&str], depth: usize) -> Option<String> {
-    if depth == 0 {
-        return None;
-    }
-
-    match value {
-        Value::Object(map) => {
-            for key in keys {
-                if let Some(candidate) = map.get(*key) {
-                    if let Some(found) = candidate.as_str() {
-                        let trimmed = found.trim();
-                        if !trimmed.is_empty() {
-                            return Some(trimmed.to_string());
-                        }
-                    }
-                    if let Some(items) = candidate.as_array() {
-                        for item in items {
-                            if let Some(found) = item.as_str() {
-                                let trimmed = found.trim();
-                                if !trimmed.is_empty() {
-                                    return Some(trimmed.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            for child in map.values() {
-                if let Some(found) = codex_find_string(child, keys, depth - 1) {
-                    return Some(found);
-                }
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                if let Some(found) = codex_find_string(item, keys, depth - 1) {
-                    return Some(found);
-                }
-            }
-        }
-        _ => {}
-    }
-    None
 }
 
 fn extract_codex_item_text(item: &Value) -> String {
@@ -4143,82 +5750,15 @@ fn extract_reasoning_delta_from_legacy_codex_event(method: &str, params: &Value)
     extract_codex_reasoning_delta_text(params)
 }
 
-fn codex_reasoning_delta_message_id(state: &CodexState, params: &Value) -> String {
-    params
-        .get("itemId")
-        .and_then(Value::as_str)
-        .or_else(|| params.get("item_id").and_then(Value::as_str))
-        .or_else(|| params.get("id").and_then(Value::as_str))
-        .map(|id| id.to_string())
-        .or_else(|| {
-            state
-                .active_stream
-                .as_ref()
-                .map(|stream| stream.message_id.clone())
-                .filter(|id| !id.is_empty())
-        })
-        .or_else(|| {
-            state
-                .active_turn_id
-                .as_ref()
-                .filter(|id| !id.is_empty())
-                .cloned()
-        })
-        .unwrap_or_else(|| "assistant".to_string())
-}
-
-fn take_codex_stream_segment_if_ready(state: &mut CodexState) -> Option<CodexStreamSegment> {
-    if !state.close_active_stream_when_tools_idle || !state.pending_tool_call_ids.is_empty() {
-        return None;
-    }
-
-    let Some(stream) = state.active_stream.take() else {
-        state.close_active_stream_when_tools_idle = false;
-        return None;
-    };
-    state.close_active_stream_when_tools_idle = false;
-    let reasoning = contains_non_whitespace(&stream.reasoning).then_some(stream.reasoning);
-    if !contains_non_whitespace(&stream.text) && reasoning.is_none() {
-        return None;
-    }
-    let turn_context = state
-        .turn_context_by_turn
-        .get(&stream.turn_id)
-        .cloned()
-        .unwrap_or_default();
-
-    Some(CodexStreamSegment {
-        turn_id: stream.turn_id,
-        message_id: stream.message_id,
-        content: stream.text,
-        reasoning,
-        model: state.model.clone().unwrap_or_else(|| "codex".to_string()),
-        turn_context,
-    })
-}
-
-fn metadata_target_from_segment(
-    segment: &CodexStreamSegment,
-) -> Option<PendingCodexMessageMetadata> {
-    metadata_target_for_visible_message(
-        segment.turn_id.clone(),
-        segment.message_id.clone(),
-        &segment.content,
-        segment.reasoning.as_deref(),
-        segment.model.clone(),
-        segment.turn_context.clone(),
-    )
-}
-
 fn metadata_target_for_visible_message(
     turn_id: String,
-    message_id: String,
+    message_id: ChatMessageId,
     content: &str,
     reasoning: Option<&str>,
     model: String,
     turn_context: TurnContextEstimate,
 ) -> Option<PendingCodexMessageMetadata> {
-    if message_id.trim().is_empty() {
+    if message_id.0.trim().is_empty() {
         return None;
     }
     if !contains_non_whitespace(content) && !reasoning.is_some_and(contains_non_whitespace) {
@@ -4242,7 +5782,7 @@ fn emit_codex_message_metadata_update(
     let (request_usage, turn_usage, cumulative_usage) =
         codex_message_usage_values(token_usage, model_token_usage);
     emitter.message_metadata_updated(MessageMetadataUpdatePayload {
-        message_id: pending.message_id,
+        message_id: pending.message_id.0,
         model_info: Some(json!({ "model": pending.model })),
         request_usage,
         turn_usage,
@@ -4267,88 +5807,6 @@ fn codex_message_usage_values(
 
 fn codex_token_usage_value(usage: &TokenUsage) -> Value {
     serde_json::to_value(usage).expect("Codex token usage must serialize")
-}
-
-fn apply_reasoning_delta_to_state(
-    state: &mut CodexState,
-    params: &Value,
-    delta: &str,
-) -> Option<(String, String)> {
-    if delta.is_empty() {
-        return None;
-    }
-
-    let delta = if let Some(stream) = state.active_stream.as_ref() {
-        merge_reasoning_delta(&stream.reasoning, delta)
-    } else {
-        delta.to_string()
-    };
-    if delta.is_empty() {
-        return None;
-    }
-
-    let message_id = codex_reasoning_delta_message_id(state, params);
-
-    if let Some(stream) = state.active_stream.as_mut() {
-        stream.message_id = message_id.clone();
-        stream.reasoning.push_str(&delta);
-    }
-    if let Some(turn_id) = state.active_turn_id.as_ref().cloned() {
-        let estimate = state.turn_context_by_turn.entry(turn_id).or_default();
-        estimate.reasoning_bytes = estimate.reasoning_bytes.saturating_add(delta.len() as u64);
-    }
-
-    Some((message_id, delta))
-}
-
-fn merge_reasoning_delta(existing: &str, incoming: &str) -> String {
-    if incoming.is_empty() {
-        return String::new();
-    }
-    if existing.is_empty() {
-        return incoming.to_string();
-    }
-    if incoming.len() >= 8 && existing.contains(incoming) {
-        return String::new();
-    }
-    if incoming == existing {
-        return String::new();
-    }
-    if let Some(suffix) = incoming.strip_prefix(existing) {
-        return suffix.to_string();
-    }
-    if existing.ends_with(incoming) {
-        return String::new();
-    }
-
-    let overlap = longest_suffix_prefix_overlap(existing, incoming);
-    if overlap > 0 {
-        incoming[overlap..].to_string()
-    } else {
-        incoming.to_string()
-    }
-}
-
-fn longest_suffix_prefix_overlap(existing: &str, incoming: &str) -> usize {
-    let mut boundaries = incoming
-        .char_indices()
-        .map(|(idx, _)| idx)
-        .collect::<Vec<_>>();
-    boundaries.push(incoming.len());
-
-    for len in boundaries.into_iter().rev() {
-        if len == 0 || len > existing.len() {
-            continue;
-        }
-        let start = existing.len() - len;
-        if !existing.is_char_boundary(start) {
-            continue;
-        }
-        if existing[start..] == incoming[..len] {
-            return len;
-        }
-    }
-    0
 }
 
 fn extract_codex_event_type(method: &str, params: &Value) -> Option<String> {
@@ -4463,6 +5921,14 @@ fn is_reasoning_notification_method(method: &str) -> bool {
         || normalized.starts_with("item/reasoning")
         || normalized.starts_with("item/thinking/")
         || normalized.starts_with("item/thinking")
+}
+
+fn is_codex_response_side_notification(method: &str) -> bool {
+    method.starts_with("item/")
+        || method.starts_with("turn/")
+        || method == "thread/tokenUsage/updated"
+        || method == "model/rerouted"
+        || method == "error"
 }
 
 fn is_terminal_codex_error_notification(state: &CodexState, params: &Value) -> bool {
@@ -5099,41 +6565,12 @@ fn codex_mcp_elicitation_result(params: &Value) -> Value {
     })
 }
 
+#[cfg(test)]
 fn codex_server_request_result(method: &str, params: &Value) -> Value {
     match method {
         "mcpServer/elicitation/request" => codex_mcp_elicitation_result(params),
         _ => json!({"ignored": true, "reason": "unsupported_server_request"}),
     }
-}
-
-async fn respond_codex_spawn_server_request(
-    stdin: &Arc<Mutex<ChildStdin>>,
-    id: Value,
-    method: &str,
-    params: &Value,
-) {
-    let result = codex_server_request_result(method, params);
-    if let Err(err) = codex_rpc_respond_stdin(stdin, id, result).await {
-        tracing::warn!("Failed to resolve Codex server request {method}: {err}");
-    }
-}
-
-async fn codex_rpc_respond_stdin(
-    stdin: &Arc<Mutex<ChildStdin>>,
-    id: Value,
-    result: Value,
-) -> Result<(), String> {
-    let payload = json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": result
-    });
-    let mut writer = stdin.lock().await;
-    let line = format!("{payload}\n");
-    writer
-        .write_all(line.as_bytes())
-        .await
-        .map_err(|err| format!("Failed to write to Codex stdin: {err}"))
 }
 
 fn parse_approval_decision(message: &str) -> &'static str {
@@ -5152,6 +6589,19 @@ fn parse_approval_decision(message: &str) -> &'static str {
         return "acceptForSession";
     }
     "accept"
+}
+
+fn is_codex_tool_server_request(method: &str) -> bool {
+    matches!(
+        method,
+        "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "execCommandApproval"
+            | "applyPatchApproval"
+            | "item/tool/requestUserInput"
+            | "mcpServer/elicitation/request"
+            | "item/tool/call"
+    )
 }
 
 fn parse_review_decision(message: &str) -> &'static str {
@@ -5177,10 +6627,23 @@ fn codex_has_http_mcp_servers(startup_mcp_servers: &[StartupMcpServer]) -> bool 
     })
 }
 
-fn codex_sandbox_mode(access_mode: BackendAccessMode) -> &'static str {
+fn codex_sandbox_mode(
+    access_mode: BackendAccessMode,
+    execution_mode: BackendExecutionMode,
+) -> &'static str {
+    if execution_mode == BackendExecutionMode::InferenceOnly {
+        return CODEX_INFERENCE_SANDBOX;
+    }
     match access_mode {
         BackendAccessMode::Unrestricted => CODEX_UNRESTRICTED_SANDBOX,
         BackendAccessMode::ReadOnly => CODEX_READ_ONLY_SANDBOX,
+    }
+}
+
+fn codex_approval_policy(execution_mode: BackendExecutionMode) -> &'static str {
+    match execution_mode {
+        BackendExecutionMode::Agent => CODEX_FORCED_APPROVAL_POLICY,
+        BackendExecutionMode::InferenceOnly => CODEX_INFERENCE_APPROVAL_POLICY,
     }
 }
 
@@ -5195,20 +6658,154 @@ fn codex_workspace_write_sandbox_policy(network_access: bool) -> Value {
     })
 }
 
-fn codex_sandbox_policy(access_mode: BackendAccessMode, network_access: bool) -> Value {
+fn codex_inference_sandbox_policy() -> Value {
+    json!({
+        "type": "readOnly",
+        "networkAccess": false,
+    })
+}
+
+fn codex_sandbox_policy(
+    access_mode: BackendAccessMode,
+    network_access: bool,
+    execution_mode: BackendExecutionMode,
+) -> Value {
+    if execution_mode == BackendExecutionMode::InferenceOnly {
+        return codex_inference_sandbox_policy();
+    }
     match access_mode {
         BackendAccessMode::Unrestricted => codex_danger_full_access_sandbox_policy(network_access),
         BackendAccessMode::ReadOnly => codex_workspace_write_sandbox_policy(network_access),
     }
 }
 
+fn codex_inference_config_overrides() -> Vec<String> {
+    [
+        "features.shell_tool=false",
+        "features.unified_exec=false",
+        "features.js_repl=false",
+        "features.code_mode=false",
+        "features.code_mode_host=false",
+        "features.code_mode_only=false",
+        "features.multi_agent=false",
+        "features.multi_agent_v2=false",
+        "features.multi_agent_mode=false",
+        "features.web_search_request=false",
+        "features.web_search_cached=false",
+        "features.standalone_web_search=false",
+        "features.search_tool=false",
+        "features.image_generation=false",
+        "features.apps=false",
+        "features.enable_mcp_apps=false",
+        "features.tool_search=false",
+        "features.plugins=false",
+        "features.tool_suggest=false",
+        "features.request_permissions_tool=false",
+        "features.default_mode_request_user_input=false",
+        "features.in_app_browser=false",
+        "features.browser_use=false",
+        "features.browser_use_full_cdp_access=false",
+        "features.browser_use_external=false",
+        "features.computer_use=false",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn codex_native_home() -> Result<std::path::PathBuf, String> {
+    #[cfg(test)]
+    if let Some(path) = codex_test_native_home_override()
+        .lock()
+        .expect("codex test native home mutex poisoned")
+        .clone()
+    {
+        return Ok(path);
+    }
+
+    if let Some(path) = std::env::var_os("CODEX_HOME")
+        && !path.is_empty()
+    {
+        return Ok(path.into());
+    }
+    Ok(crate::paths::home_dir()?.join(".codex"))
+}
+
+fn create_codex_inference_home() -> Result<tempfile::TempDir, String> {
+    let isolated_home = tempfile::Builder::new()
+        .prefix("tyde-codex-inference-")
+        .tempdir()
+        .map_err(|err| format!("Failed to create isolated Codex inference home: {err}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(isolated_home.path(), std::fs::Permissions::from_mode(0o700))
+            .map_err(|err| format!("Failed to secure isolated Codex inference home: {err}"))?;
+    }
+
+    let source_auth = codex_native_home()?.join("auth.json");
+    match std::fs::metadata(&source_auth) {
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                return Err("Codex authentication source is not a regular file".to_owned());
+            }
+            let mut source = std::fs::File::open(&source_auth)
+                .map_err(|err| format!("Failed to open Codex authentication source: {err}"))?;
+            let destination = isolated_home.path().join("auth.json");
+            let mut options = std::fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut isolated = options
+                .open(destination)
+                .map_err(|err| format!("Failed to create isolated Codex authentication: {err}"))?;
+            std::io::copy(&mut source, &mut isolated)
+                .map_err(|err| format!("Failed to copy Codex authentication securely: {err}"))?;
+            isolated
+                .sync_all()
+                .map_err(|err| format!("Failed to persist isolated Codex authentication: {err}"))?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(format!(
+                "Failed to inspect Codex authentication source: {err}"
+            ));
+        }
+    }
+
+    let config_path = isolated_home.path().join("config.toml");
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut config = options
+        .open(config_path)
+        .map_err(|err| format!("Failed to create isolated Codex configuration: {err}"))?;
+    use std::io::Write as _;
+    config
+        .write_all(b"cli_auth_credentials_store = \"file\"\n")
+        .map_err(|err| format!("Failed to write isolated Codex configuration: {err}"))?;
+    config
+        .sync_all()
+        .map_err(|err| format!("Failed to persist isolated Codex configuration: {err}"))?;
+
+    Ok(isolated_home)
+}
+
 fn codex_app_server_args(
     access_mode: BackendAccessMode,
+    execution_mode: BackendExecutionMode,
     config_overrides: &[String],
 ) -> Vec<String> {
     let mut args = vec![
         "--sandbox".to_string(),
-        codex_sandbox_mode(access_mode).to_string(),
+        codex_sandbox_mode(access_mode, execution_mode).to_string(),
         "app-server".to_string(),
         "--listen".to_string(),
         "stdio://".to_string(),
@@ -5450,6 +7047,7 @@ struct CodexRpc {
     child: Arc<Mutex<Option<AsyncGroupChild>>>,
     stdout_task: JoinHandle<()>,
     stderr_task: JoinHandle<()>,
+    _isolated_codex_home: Option<tempfile::TempDir>,
 }
 
 impl CodexRpc {
@@ -5458,12 +7056,14 @@ impl CodexRpc {
         startup_mcp_servers: &[StartupMcpServer],
         steering_tempfile: Option<&std::path::Path>,
         access_mode: BackendAccessMode,
+        execution_mode: BackendExecutionMode,
     ) -> Result<(Self, mpsc::UnboundedReceiver<CodexInbound>), String> {
         Self::spawn_with_local_program(
             ssh_host,
             startup_mcp_servers,
             steering_tempfile,
             access_mode,
+            execution_mode,
             None,
         )
         .await
@@ -5474,9 +7074,23 @@ impl CodexRpc {
         startup_mcp_servers: &[StartupMcpServer],
         steering_tempfile: Option<&std::path::Path>,
         access_mode: BackendAccessMode,
+        execution_mode: BackendExecutionMode,
         local_program: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<CodexInbound>), String> {
+        if execution_mode == BackendExecutionMode::InferenceOnly && ssh_host.is_some() {
+            return Err(
+                "Codex transient inference requires a local isolated configuration".to_owned(),
+            );
+        }
+        let isolated_codex_home = if execution_mode == BackendExecutionMode::InferenceOnly {
+            Some(create_codex_inference_home()?)
+        } else {
+            None
+        };
         let mut config_overrides = codex_mcp_config_overrides(startup_mcp_servers);
+        if execution_mode == BackendExecutionMode::InferenceOnly {
+            config_overrides.extend(codex_inference_config_overrides());
+        }
         if let Some(path) = steering_tempfile {
             config_overrides.push(format!(
                 "model_instructions_file={}",
@@ -5484,18 +7098,30 @@ impl CodexRpc {
             ));
         }
         let mut child = if let Some(host) = ssh_host {
-            let remote_args = codex_app_server_args(access_mode, &config_overrides);
+            let remote_args = codex_app_server_args(access_mode, execution_mode, &config_overrides);
             crate::remote::spawn_remote_process(host, "codex", &remote_args, None).await?
         } else {
             let mut cmd = match local_program {
                 Some(program) => Command::new(program),
                 None => codex_command(),
             };
-            for arg in codex_app_server_args(access_mode, &config_overrides) {
+            for arg in codex_app_server_args(access_mode, execution_mode, &config_overrides) {
                 cmd.arg(arg);
             }
             if let Some(path) = process_env::resolved_child_process_path() {
                 cmd.env("PATH", path);
+            }
+            if let Some(home) = isolated_codex_home.as_ref() {
+                cmd.env("CODEX_HOME", home.path());
+            }
+            #[cfg(test)]
+            if execution_mode == BackendExecutionMode::Agent
+                && let Some(home) = codex_test_native_home_override()
+                    .lock()
+                    .expect("codex test native home mutex poisoned")
+                    .clone()
+            {
+                cmd.env("CODEX_HOME", home);
             }
             cmd.stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
@@ -5607,6 +7233,7 @@ impl CodexRpc {
                 child: child_ref,
                 stdout_task,
                 stderr_task,
+                _isolated_codex_home: isolated_codex_home,
             },
             inbound_rx,
         ))
@@ -5628,6 +7255,7 @@ impl CodexRpc {
             let _ = self.pending.lock().await.remove(&id);
             return Err(err);
         }
+        observe_codex_request_sent(method);
 
         match tokio::time::timeout(CODEX_REQUEST_TIMEOUT, rx).await {
             Ok(Ok(result)) => result,
@@ -5786,8 +7414,367 @@ struct CodexSettingsUpdate {
 }
 
 impl CodexBackend {
-    pub(crate) async fn set_subagent_emitter(&self, emitter: Arc<dyn SubAgentEmitter>) {
-        let _ = self.subagent_emitter_tx.send(Some(emitter));
+    pub(crate) async fn set_subagent_emitter(
+        &self,
+        emitter: Arc<dyn SubAgentEmitter>,
+    ) -> Result<(), String> {
+        self.subagent_emitter_tx.send(Some(emitter)).map_err(|_| {
+            "Codex sub-agent emitter update failed: backend event loop is not running".to_string()
+        })
+    }
+
+    pub(crate) async fn spawn_with_subagent_emitter(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        initial_input: protocol::SendMessagePayload,
+        emitter: Arc<dyn SubAgentEmitter>,
+    ) -> Result<(Self, EventStream), String> {
+        Self::spawn_with_initial_emitter(workspace_roots, config, initial_input, Some(emitter))
+            .await
+    }
+
+    async fn spawn_with_initial_emitter(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        initial_input: protocol::SendMessagePayload,
+        initial_emitter: Option<Arc<dyn SubAgentEmitter>>,
+    ) -> Result<(Self, EventStream), String> {
+        let inference_only = config.execution_mode == BackendExecutionMode::InferenceOnly;
+        let initial_emitter = (!inference_only).then_some(initial_emitter).flatten();
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
+        let (settings_tx, mut settings_rx) = mpsc::unbounded_channel::<CodexSettingsUpdate>();
+        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
+        let (subagent_emitter_tx, mut subagent_emitter_rx) =
+            watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(initial_emitter.clone());
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<SessionId, String>>();
+        let (startup_cancel_tx, startup_cancel_rx) = oneshot::channel();
+        let mut startup_cancel_guard = CodexStartupCancelGuard(Some(startup_cancel_tx));
+
+        tokio::spawn(async move {
+            let combined_instructions = (!inference_only)
+                .then(|| render_combined_spawn_instructions(&config.resolved_spawn_config))
+                .flatten();
+            let startup_mcp_servers = if inference_only {
+                &[][..]
+            } else {
+                config.startup_mcp_servers.as_slice()
+            };
+            let session_result = CodexSession::spawn_with_mode(
+                &workspace_roots,
+                None,
+                startup_mcp_servers,
+                combined_instructions.as_deref(),
+                CodexSessionSpawnOptions {
+                    ephemeral: false,
+                    access_mode: config.resolved_spawn_config.access_mode,
+                    subagent_emitter: initial_emitter,
+                    execution_mode: config.execution_mode,
+                },
+            )
+            .await;
+            let (session, mut raw_events) = match session_result {
+                Ok(value) => value,
+                Err(err) => {
+                    let _ = ready_tx.send(Err(format!("Failed to start Codex session: {err}")));
+                    return;
+                }
+            };
+
+            // `thread/start` has already supplied the authoritative ID. Publish
+            // it before doing any further startup work: Codex may announce a
+            // native child before the initial turn RPC responds.
+            let session_id = session.session_id();
+            if ready_tx.send(Ok(session_id)).is_err() {
+                session.shutdown().await;
+                return;
+            }
+            observe_codex_spawn_ready();
+            if startup_cancel_rx.await.is_ok() {
+                session.shutdown().await;
+                observe_codex_spawn_startup_cancelled();
+                return;
+            }
+
+            let handle = session.command_handle();
+            let resolved_settings = if inference_only {
+                protocol::SessionSettingsValues::default()
+            } else {
+                resolve_session_settings(&config)
+            };
+            let model_override = match resolved_settings.0.get("model") {
+                Some(SessionSettingValue::String(value)) => Some(value.clone()),
+                _ => None,
+            };
+            let effort_override = match resolved_settings.0.get("reasoning_effort") {
+                Some(SessionSettingValue::String(value)) => Some(value.clone()),
+                _ => None,
+            };
+            tracing::debug!(
+                inference_only,
+                has_model_override = model_override.is_some(),
+                has_effort_override = effort_override.is_some(),
+                "Codex startup settings resolved"
+            );
+            let mut normalization_failures = HashMap::new();
+            let mut pending_initial_input_cancelled = false;
+            if model_override.is_some() || effort_override.is_some() {
+                tracing::debug!("Codex startup dispatching thread/update");
+                let settings = json!({
+                    "model": model_override,
+                    "reasoning_effort": effort_override,
+                    "approval_policy": CODEX_FORCED_APPROVAL_POLICY,
+                });
+                let settings_handle = handle.clone();
+                let settings_request = settings_handle.update_runtime_settings(settings);
+                tokio::pin!(settings_request);
+
+                enum StartupSettingsPhase {
+                    Configured,
+                    Terminated,
+                    Failed(String),
+                }
+
+                let settings_phase = loop {
+                    tokio::select! {
+                        biased;
+                        interrupt = interrupt_rx.recv() => {
+                            let Some(()) = interrupt else {
+                                break StartupSettingsPhase::Terminated;
+                            };
+                            if !pending_initial_input_cancelled {
+                                // No initial turn exists yet, so Codex cannot cancel it.
+                                pending_initial_input_cancelled = true;
+                                let _ = events_tx.send(BackendEvent::Chat(
+                                    ChatEvent::OperationCancelled(
+                                        protocol::OperationCancelledData {
+                                            message: "Operation cancelled".to_string(),
+                                        },
+                                    ),
+                                ));
+                                let _ = events_tx
+                                    .send(BackendEvent::Chat(ChatEvent::TypingStatusChanged(false)));
+                            }
+                        }
+                        result = &mut settings_request => {
+                            while interrupt_rx.try_recv().is_ok() {
+                                if !pending_initial_input_cancelled {
+                                    pending_initial_input_cancelled = true;
+                                    let _ = events_tx.send(BackendEvent::Chat(
+                                        ChatEvent::OperationCancelled(
+                                            protocol::OperationCancelledData {
+                                                message: "Operation cancelled".to_string(),
+                                            },
+                                        ),
+                                    ));
+                                    let _ = events_tx
+                                        .send(BackendEvent::Chat(ChatEvent::TypingStatusChanged(false)));
+                                }
+                            }
+                            break match result {
+                                Ok(()) => StartupSettingsPhase::Configured,
+                                Err(err) => StartupSettingsPhase::Failed(format!(
+                                    "Failed to configure Codex session: {err}"
+                                )),
+                            };
+                        }
+                        incoming = raw_events.recv() => {
+                            let Some(raw) = incoming else {
+                                break StartupSettingsPhase::Failed(
+                                    "Codex event stream ended while applying startup settings"
+                                        .to_string(),
+                                );
+                            };
+                            if !forward_codex_backend_stream_event(
+                                raw,
+                                &events_tx,
+                                &mut normalization_failures,
+                            ) {
+                                break StartupSettingsPhase::Terminated;
+                            }
+                        }
+                        changed = subagent_emitter_rx.changed() => {
+                            if changed.is_err() {
+                                break StartupSettingsPhase::Terminated;
+                            }
+                            let maybe_emitter = subagent_emitter_rx.borrow().clone();
+                            if let Some(emitter) = maybe_emitter
+                                && let Err(err) = session.set_subagent_emitter(emitter).await
+                            {
+                                break StartupSettingsPhase::Failed(format!(
+                                    "Codex sub-agent emitter update failed while applying startup settings: {err}"
+                                ));
+                            }
+                        }
+                    }
+                };
+
+                match settings_phase {
+                    StartupSettingsPhase::Configured => {}
+                    StartupSettingsPhase::Terminated => {
+                        drop(events_tx);
+                        session.shutdown().await;
+                        return;
+                    }
+                    StartupSettingsPhase::Failed(message) => {
+                        tracing::error!(
+                            %message,
+                            "Codex startup settings failed after session publication"
+                        );
+                        let _ = events_tx.send(BackendEvent::Chat(backend_error_message(message)));
+                        let _ = events_tx
+                            .send(BackendEvent::Chat(ChatEvent::TypingStatusChanged(false)));
+                        drop(events_tx);
+                        session.shutdown().await;
+                        return;
+                    }
+                }
+            } else {
+                let local_settings = json!({
+                    "model": Value::Null,
+                    "reasoning_effort": Value::Null,
+                });
+                if let Err(err) = handle
+                    .execute(SessionCommand::UpdateSettings {
+                        settings: local_settings,
+                        persist: false,
+                    })
+                    .await
+                {
+                    let message = format!("Failed to apply Codex startup settings: {err}");
+                    tracing::error!(
+                        %message,
+                        "Codex startup settings failed after session publication"
+                    );
+                    let _ = events_tx.send(BackendEvent::Chat(backend_error_message(message)));
+                    let _ =
+                        events_tx.send(BackendEvent::Chat(ChatEvent::TypingStatusChanged(false)));
+                    drop(events_tx);
+                    session.shutdown().await;
+                    return;
+                }
+            }
+
+            let images = protocol_images_to_attachments(initial_input.images);
+            let (initial_turn_tx, mut initial_turn_rx) = oneshot::channel();
+            let mut initial_turn_pending = !pending_initial_input_cancelled;
+            if initial_turn_pending {
+                let initial_turn_handle = handle.clone();
+                tokio::spawn(async move {
+                    let result = initial_turn_handle
+                        .execute(SessionCommand::SendMessage {
+                            message: initial_input.message,
+                            images,
+                        })
+                        .await;
+                    let _ = initial_turn_tx.send(result);
+                });
+            } else {
+                drop(initial_turn_tx);
+            }
+
+            loop {
+                tokio::select! {
+                    result = &mut initial_turn_rx, if initial_turn_pending => {
+                        initial_turn_pending = false;
+                        match result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(err)) => {
+                                let message = format!("Failed to send initial Codex prompt: {err}");
+                                tracing::error!(%err, "Codex initial prompt failed after session registration");
+                                let _ = events_tx.send(BackendEvent::Chat(backend_error_message(message)));
+                                break;
+                            }
+                            Err(_) => {
+                                let _ = events_tx.send(BackendEvent::Chat(backend_error_message(
+                                    "Codex initial prompt task ended before reporting its result".to_string(),
+                                )));
+                                break;
+                            }
+                        }
+                    }
+                    incoming = raw_events.recv() => {
+                        let Some(raw) = incoming else { break; };
+                        if !forward_codex_backend_stream_event(
+                            raw,
+                            &events_tx,
+                            &mut normalization_failures,
+                        ) {
+                            break;
+                        }
+                    }
+                    input = input_rx.recv() => {
+                        let Some(input) = input else { break; };
+                        match input {
+                            AgentInput::SendMessage(payload) => {
+                                let images = protocol_images_to_attachments(payload.images);
+                                if let Err(err) = handle.execute(SessionCommand::SendMessage {
+                                    message: payload.message,
+                                    images,
+                                }).await {
+                                    tracing::error!(%err, "Failed to send Codex follow-up");
+                                    break;
+                                }
+                            }
+                            AgentInput::UpdateSessionSettings(_) => {}
+                            AgentInput::EditQueuedMessage(_)
+                            | AgentInput::CancelQueuedMessage(_)
+                            | AgentInput::SendQueuedMessageNow(_) => {
+                                panic!("queued-message inputs must be handled by the agent actor before reaching the backend");
+                            }
+                        }
+                    }
+                    update = settings_rx.recv() => {
+                        let Some(update) = update else { break; };
+                        let result = handle
+                            .update_runtime_settings(session_settings_to_json(&update.payload.values))
+                            .await
+                            .map_err(|err| format!("Codex session settings update failed: {err}"));
+                        let _ = update.reply.send(result);
+                    }
+                    interrupt = interrupt_rx.recv() => {
+                        let Some(()) = interrupt else { break; };
+                        if let Err(err) = handle.execute(SessionCommand::CancelConversation).await {
+                            tracing::error!(%err, "Failed to interrupt Codex turn");
+                            break;
+                        }
+                    }
+                    changed = subagent_emitter_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let maybe_emitter = subagent_emitter_rx.borrow().clone();
+                        if let Some(emitter) = maybe_emitter
+                            && let Err(err) = session.set_subagent_emitter(emitter).await
+                        {
+                            tracing::error!(%err, "Codex sub-agent emitter update failed");
+                            break;
+                        }
+                    }
+                }
+            }
+
+            session.shutdown().await;
+        });
+
+        let session_id = match ready_rx.await {
+            Ok(Ok(session_id)) => session_id,
+            Ok(Err(err)) => return Err(err),
+            Err(_) => return Err("Codex spawn initialization task ended early".to_string()),
+        };
+        startup_cancel_guard.disarm();
+        let backend_session_id = Arc::new(std::sync::Mutex::new(Some(session_id)));
+
+        Ok((
+            Self {
+                input_tx,
+                settings_tx,
+                interrupt_tx,
+                session_id: backend_session_id,
+                subagent_emitter_tx,
+            },
+            EventStream::new_backend(events_rx),
+        ))
     }
 }
 
@@ -5903,35 +7890,6 @@ pub(crate) fn resolve_session_settings(
     )
 }
 
-fn apply_codex_runtime_settings(
-    values: &protocol::SessionSettingsValues,
-    model: &mut Option<String>,
-    effort: &mut Option<String>,
-) {
-    if let Some(value) = values.0.get("model") {
-        *model = match value {
-            SessionSettingValue::String(value) => Some(value.clone()),
-            SessionSettingValue::Null => None,
-            SessionSettingValue::Bool(_) | SessionSettingValue::Integer(_) => return,
-        };
-    }
-    if let Some(value) = values.0.get("reasoning_effort") {
-        *effort = match value {
-            SessionSettingValue::String(value) => Some(value.clone()),
-            SessionSettingValue::Null => None,
-            SessionSettingValue::Bool(_) | SessionSettingValue::Integer(_) => return,
-        };
-    }
-}
-
-fn backend_user_image_values(images: Option<Vec<protocol::ImageData>>) -> Vec<Value> {
-    images
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|image| serde_json::to_value(image).ok())
-        .collect()
-}
-
 fn backend_error_message(content: String) -> ChatEvent {
     ChatEvent::MessageAdded(ChatMessage {
         message_id: None,
@@ -5995,72 +7953,6 @@ fn codex_ssh_fork_unsupported_error(workspace_roots: &[String]) -> Option<Backen
     )))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CodexAgentMessageCompletionDisposition {
-    EmitOnOpenStream,
-    EmitWithSyntheticStart,
-    SkipDuplicateEmpty,
-    SkipDuplicateCompleted,
-}
-
-#[derive(Clone)]
-struct CodexLoopPendingMessageMetadata {
-    turn_id: String,
-    message_id: String,
-    turn_context: TurnContextEstimate,
-}
-
-fn codex_agent_message_completion_disposition(
-    has_open_stream: bool,
-    saw_agent_message_completed: bool,
-    stream_closed_by_turn_completion: bool,
-    text: &str,
-) -> CodexAgentMessageCompletionDisposition {
-    if saw_agent_message_completed {
-        return CodexAgentMessageCompletionDisposition::SkipDuplicateCompleted;
-    }
-
-    if has_open_stream {
-        return CodexAgentMessageCompletionDisposition::EmitOnOpenStream;
-    }
-
-    if stream_closed_by_turn_completion && text.trim().is_empty() {
-        return CodexAgentMessageCompletionDisposition::SkipDuplicateEmpty;
-    }
-
-    CodexAgentMessageCompletionDisposition::EmitWithSyntheticStart
-}
-
-fn add_codex_loop_turn_tool_bytes(
-    turn_context_by_turn: &mut HashMap<String, TurnContextEstimate>,
-    active_turn_id: Option<&str>,
-    bytes: u64,
-) {
-    if bytes == 0 {
-        return;
-    }
-    let Some(turn_id) = active_turn_id else {
-        return;
-    };
-    let estimate = turn_context_by_turn.entry(turn_id.to_string()).or_default();
-    estimate.tool_io_bytes = estimate.tool_io_bytes.saturating_add(bytes);
-}
-
-fn add_codex_loop_turn_reasoning_bytes(
-    turn_context_by_turn: &mut HashMap<String, TurnContextEstimate>,
-    active_turn_id: Option<&str>,
-    bytes: u64,
-) {
-    if bytes == 0 {
-        return;
-    }
-    let Some(turn_id) = active_turn_id else {
-        return;
-    };
-    let estimate = turn_context_by_turn.entry(turn_id.to_string()).or_default();
-    estimate.reasoning_bytes = estimate.reasoning_bytes.saturating_add(bytes);
-}
-
 fn emit_agent_control_await_progress_to(
     emitter: &TurnEmitter,
     tool_call_id: &str,
@@ -6069,6 +7961,79 @@ fn emit_agent_control_await_progress_to(
 ) {
     if let Some(progress) = await_progress_data_for_tool(tool_call_id, tool_name, arguments) {
         emitter.tool_progress(&progress);
+    }
+}
+
+fn emit_codex_tool_request(
+    emitter: &TurnEmitter,
+    tool_call_id: &str,
+    tool_name: &str,
+    arguments: &Value,
+) {
+    let (tool_type, normalization_failure) = match tyde_tool_request_type(tool_name, arguments) {
+        Ok(Some(typed)) => (
+            serde_json::to_value(typed).expect("serialize tool request"),
+            None,
+        ),
+        Ok(None) => (json!({ "kind": "Other", "args": arguments }), None),
+        Err(error) => {
+            tracing::error!(
+                tool = %tool_name,
+                tool_call_id = %tool_call_id,
+                detail = %error.detail,
+                "Canonical Tyde tool request normalization failed"
+            );
+            emitter.backend_error(&format!(
+                "Failed to normalize canonical tool request '{}' ({}): {}",
+                tool_name, tool_call_id, error
+            ));
+            (
+                json!({ "kind": "Other", "args": arguments }),
+                Some(error.normalization_failure),
+            )
+        }
+    };
+    if let Some(normalization_failure) = normalization_failure {
+        emitter.tool_request_with_normalization_failure(
+            tool_call_id,
+            tool_name,
+            tool_type,
+            normalization_failure,
+        );
+    } else {
+        emitter.tool_request(tool_call_id, tool_name, tool_type);
+    }
+}
+
+fn normalize_codex_tool_result(
+    emitter: &TurnEmitter,
+    tool_call_id: &str,
+    tool_name: &str,
+    tool_result: Value,
+    success: bool,
+) -> (Value, Option<ToolExecutionNormalizationFailure>) {
+    if !success {
+        return (tool_result, None);
+    }
+    match tyde_tool_result(tool_name, &tool_result) {
+        Ok(Some(typed)) => (
+            serde_json::to_value(typed).expect("serialize tool result"),
+            None,
+        ),
+        Ok(None) => (tool_result, None),
+        Err(error) => {
+            tracing::error!(
+                tool = %tool_name,
+                tool_call_id = %tool_call_id,
+                detail = %error.detail,
+                "Canonical Tyde tool result normalization failed"
+            );
+            emitter.backend_error(&format!(
+                "Failed to normalize canonical tool result '{}' ({}): {}",
+                tool_name, tool_call_id, error
+            ));
+            (tool_result, Some(error.normalization_failure))
+        }
     }
 }
 
@@ -6085,164 +8050,14 @@ fn emit_agent_control_spawn_progress_to(
     }
 }
 
-fn codex_loop_reasoning_message_id(
-    params: &Value,
-    current_message_id: Option<&str>,
-    active_turn_id: Option<&str>,
-) -> String {
-    params
-        .get("itemId")
-        .and_then(Value::as_str)
-        .or_else(|| params.get("item_id").and_then(Value::as_str))
-        .or_else(|| params.get("id").and_then(Value::as_str))
-        .or(current_message_id)
-        .or(active_turn_id)
-        .unwrap_or("assistant")
-        .to_string()
-}
-
-struct CodexLoopAgentMessageDeltaState<'a> {
-    current_message_id: &'a mut Option<String>,
-    accumulated_text: &'a mut String,
-    stream_closed_by_turn_completion: &'a mut bool,
-    typing_status_active: &'a mut bool,
-}
-
-fn emit_codex_loop_agent_message_delta(
-    emitter: &TurnEmitter,
-    state: CodexLoopAgentMessageDeltaState<'_>,
-    params: &Value,
-    delta: &str,
-    model_name: &str,
-) -> String {
-    let message_id = params
-        .get("itemId")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| state.current_message_id.as_ref().cloned())
-        .unwrap_or_else(|| "assistant".to_string());
-
-    if state.current_message_id.is_none() {
-        *state.stream_closed_by_turn_completion = false;
-        state.accumulated_text.clear();
-        if !*state.typing_status_active {
-            emitter.typing_status_changed(true);
-            *state.typing_status_active = true;
-        }
-        emitter.stream_start(&message_id, AgentName(CODEX_AGENT_NAME), Some(model_name));
-    }
-
-    *state.current_message_id = Some(message_id.clone());
-    state.accumulated_text.push_str(delta);
-    emitter.stream_delta(&message_id, delta);
-    message_id
-}
-
-struct CodexLoopSegmentState<'a> {
-    current_message_id: &'a mut Option<String>,
-    accumulated_text: &'a mut String,
-    accumulated_reasoning: &'a mut String,
-    close_stream_when_tools_idle: &'a mut bool,
-    pending_message_metadata: &'a mut Option<CodexLoopPendingMessageMetadata>,
-}
-
-struct CodexLoopSegmentContext<'a> {
-    pending_tool_call_ids: &'a HashSet<String>,
-    active_turn_id: Option<&'a str>,
-    turn_context_by_turn: &'a HashMap<String, TurnContextEstimate>,
-    model_name: &'a str,
-}
-
-fn maybe_finish_codex_loop_segment(
-    emitter: &TurnEmitter,
-    state: CodexLoopSegmentState<'_>,
-    context: CodexLoopSegmentContext<'_>,
-) {
-    let CodexLoopSegmentState {
-        current_message_id,
-        accumulated_text,
-        accumulated_reasoning,
-        close_stream_when_tools_idle,
-        pending_message_metadata,
-    } = state;
-    let CodexLoopSegmentContext {
-        pending_tool_call_ids,
-        active_turn_id,
-        turn_context_by_turn,
-        model_name,
-    } = context;
-
-    if !*close_stream_when_tools_idle || !pending_tool_call_ids.is_empty() {
-        return;
-    }
-    if current_message_id.is_none() {
-        *close_stream_when_tools_idle = false;
-        return;
-    }
-    if !contains_non_whitespace(accumulated_text) && !contains_non_whitespace(accumulated_reasoning)
-    {
-        return;
-    }
-
-    let message_id = current_message_id.clone().unwrap_or_default();
-    let reasoning = contains_non_whitespace(accumulated_reasoning)
-        .then(|| std::mem::take(accumulated_reasoning));
-    let content = std::mem::take(accumulated_text);
-    if let Some(turn_id) = active_turn_id
-        && let Some(metadata) = metadata_target_for_visible_message(
-            turn_id.to_string(),
-            message_id,
-            &content,
-            reasoning.as_deref(),
-            model_name.to_string(),
-            turn_context_by_turn
-                .get(turn_id)
-                .cloned()
-                .unwrap_or_default(),
-        )
-    {
-        *pending_message_metadata = Some(CodexLoopPendingMessageMetadata {
-            turn_id: metadata.turn_id,
-            message_id: metadata.message_id,
-            turn_context: metadata.turn_context,
-        });
-    }
-    emitter.stream_end(StreamEndPayload {
-        content,
-        agent: Some(AgentName(CODEX_AGENT_NAME)),
-        model: Some(model_name.to_string()),
-        request_usage: None,
-        turn_usage: None,
-        cumulative_usage: None,
-        token_usage_unavailable_reason: None,
-        reasoning,
-        tool_calls: Vec::new(),
-        context_breakdown: None,
-    });
-    *current_message_id = None;
-    *close_stream_when_tools_idle = false;
-}
-
 fn spawn_codex_subagent_event_bridge(
     mut raw_rx: mpsc::UnboundedReceiver<Value>,
     event_tx: mpsc::UnboundedSender<ChatEvent>,
 ) {
     tokio::spawn(async move {
+        let mut normalization_failures = HashMap::new();
         while let Some(raw) = raw_rx.recv().await {
-            if !forward_codex_backend_event(raw, &event_tx) {
-                break;
-            }
-        }
-    });
-}
-
-fn spawn_codex_backend_event_bridge(
-    mut raw_rx: mpsc::UnboundedReceiver<Value>,
-    event_tx: mpsc::UnboundedSender<BackendEvent>,
-) {
-    tokio::spawn(async move {
-        while let Some(raw) = raw_rx.recv().await {
-            if !forward_codex_backend_stream_event(raw, &event_tx) {
+            if !forward_codex_backend_event(raw, &event_tx, &mut normalization_failures) {
                 break;
             }
         }
@@ -6252,15 +8067,21 @@ fn spawn_codex_backend_event_bridge(
 fn forward_codex_backend_stream_event(
     raw: Value,
     events_tx: &mpsc::UnboundedSender<BackendEvent>,
+    normalization_failures: &mut HashMap<String, ToolExecutionNormalizationFailure>,
 ) -> bool {
     if let Some(usage) = model_request_token_usage_from_raw(&raw) {
         return events_tx
             .send(BackendEvent::ModelRequestTokenUsage(usage))
             .is_ok();
     }
-    let Some(event) = codex_backend_event_from_raw(&raw) else {
+    let Some(event) = codex_backend_event_from_raw(&raw, normalization_failures) else {
         return true;
     };
+    if let Some(error) = event.normalization_error
+        && events_tx.send(BackendEvent::Chat(error)).is_err()
+    {
+        return false;
+    }
     if events_tx
         .send(BackendEvent::Chat(event.chat_event))
         .is_err()
@@ -6270,13 +8091,22 @@ fn forward_codex_backend_stream_event(
     !event.terminal
 }
 
-fn forward_codex_backend_event(raw: Value, events_tx: &mpsc::UnboundedSender<ChatEvent>) -> bool {
+fn forward_codex_backend_event(
+    raw: Value,
+    events_tx: &mpsc::UnboundedSender<ChatEvent>,
+    normalization_failures: &mut HashMap<String, ToolExecutionNormalizationFailure>,
+) -> bool {
     if model_request_token_usage_from_raw(&raw).is_some() {
         return true;
     }
-    let Some(event) = codex_backend_event_from_raw(&raw) else {
+    let Some(event) = codex_backend_event_from_raw(&raw, normalization_failures) else {
         return true;
     };
+    if let Some(error) = event.normalization_error
+        && events_tx.send(error).is_err()
+    {
+        return false;
+    }
     if events_tx.send(event.chat_event).is_err() {
         return false;
     }
@@ -6293,14 +8123,23 @@ fn model_request_token_usage_from_raw(value: &Value) -> Option<ModelRequestToken
 struct CodexForwardedBackendEvent {
     chat_event: ChatEvent,
     terminal: bool,
+    normalization_error: Option<ChatEvent>,
 }
 
-fn codex_backend_event_from_raw(value: &Value) -> Option<CodexForwardedBackendEvent> {
+fn codex_backend_event_from_raw(
+    value: &Value,
+    normalization_failures: &mut HashMap<String, ToolExecutionNormalizationFailure>,
+) -> Option<CodexForwardedBackendEvent> {
     match serde_json::from_value::<ChatEvent>(value.clone()) {
-        Ok(event) => Some(CodexForwardedBackendEvent {
-            chat_event: event,
-            terminal: false,
-        }),
+        Ok(event) => {
+            let (chat_event, normalization_error) =
+                normalize_codex_chat_event(event, normalization_failures);
+            Some(CodexForwardedBackendEvent {
+                chat_event,
+                terminal: false,
+                normalization_error,
+            })
+        }
         Err(err) => {
             let Some(kind) = value.get("kind").and_then(Value::as_str) else {
                 tracing::warn!(raw = %value, error = %err, "Ignoring Codex raw event without kind");
@@ -6315,6 +8154,7 @@ fn codex_backend_event_from_raw(value: &Value) -> Option<CodexForwardedBackendEv
                         "Codex backend error",
                     )),
                     terminal: false,
+                    normalization_error: None,
                 }),
                 "SubprocessStderr" => {
                     let message = codex_raw_event_message(value, "Codex subprocess stderr");
@@ -6323,6 +8163,7 @@ fn codex_backend_event_from_raw(value: &Value) -> Option<CodexForwardedBackendEv
                         Some(CodexForwardedBackendEvent {
                             chat_event: backend_warning_message(message),
                             terminal: false,
+                            normalization_error: None,
                         })
                     } else {
                         None
@@ -6334,6 +8175,7 @@ fn codex_backend_event_from_raw(value: &Value) -> Option<CodexForwardedBackendEv
                     Some(CodexForwardedBackendEvent {
                         chat_event: backend_error_message(message),
                         terminal: true,
+                        normalization_error: None,
                     })
                 }
                 other => {
@@ -6350,6 +8192,100 @@ fn codex_backend_event_from_raw(value: &Value) -> Option<CodexForwardedBackendEv
     }
 }
 
+fn normalize_codex_chat_event(
+    event: ChatEvent,
+    normalization_failures: &mut HashMap<String, ToolExecutionNormalizationFailure>,
+) -> (ChatEvent, Option<ChatEvent>) {
+    match event {
+        ChatEvent::ToolRequest(mut request) => {
+            let protocol::ToolRequestType::Other { args } = &request.tool_type else {
+                return (ChatEvent::ToolRequest(request), None);
+            };
+            match tyde_tool_request_type(&request.tool_name, args) {
+                Ok(Some(typed)) => {
+                    request.tool_type = typed;
+                    (ChatEvent::ToolRequest(request), None)
+                }
+                Ok(None) => (ChatEvent::ToolRequest(request), None),
+                Err(error) => {
+                    tracing::error!(
+                        tool = %request.tool_name,
+                        tool_call_id = %request.tool_call_id,
+                        detail = %error.detail,
+                        "Canonical Tyde tool request normalization failed"
+                    );
+                    let visible = backend_error_message(format!(
+                        "Failed to normalize canonical tool request '{}' ({}): {}",
+                        request.tool_name, request.tool_call_id, error
+                    ));
+                    normalization_failures
+                        .insert(request.tool_call_id.clone(), error.normalization_failure);
+                    (ChatEvent::ToolRequest(request), Some(visible))
+                }
+            }
+        }
+        ChatEvent::ToolExecutionCompleted(mut completion) => {
+            let request_failure = normalization_failures.remove(&completion.tool_call_id);
+            let mut normalization_error = None;
+            let result_failure = if completion.success {
+                match &completion.tool_result {
+                    protocol::ToolExecutionResult::Other { .. } => match tyde_tool_result(
+                        &completion.tool_name,
+                        &serde_json::to_value(&completion.tool_result)
+                            .expect("serialize tool result"),
+                    ) {
+                        Ok(Some(typed)) => {
+                            completion.tool_result = typed;
+                            None
+                        }
+                        Ok(None) => None,
+                        Err(error) => {
+                            tracing::error!(
+                                tool = %completion.tool_name,
+                                tool_call_id = %completion.tool_call_id,
+                                detail = %error.detail,
+                                "Canonical Tyde tool result normalization failed"
+                            );
+                            normalization_error = Some(backend_error_message(format!(
+                                "Failed to normalize canonical tool result '{}' ({}): {}",
+                                completion.tool_name, completion.tool_call_id, error
+                            )));
+                            Some(error.normalization_failure)
+                        }
+                    },
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            completion.normalization_failure = merge_completion_normalization_failure(
+                completion.normalization_failure,
+                request_failure,
+            );
+            completion.normalization_failure = merge_completion_normalization_failure(
+                completion.normalization_failure,
+                result_failure,
+            );
+            (
+                ChatEvent::ToolExecutionCompleted(completion),
+                normalization_error,
+            )
+        }
+        event => (event, None),
+    }
+}
+
+fn merge_completion_normalization_failure(
+    existing: Option<ToolExecutionNormalizationFailure>,
+    incoming: Option<ToolExecutionNormalizationFailure>,
+) -> Option<ToolExecutionNormalizationFailure> {
+    match (existing, incoming) {
+        (None, None) => None,
+        (Some(failure), None) | (None, Some(failure)) => Some(failure),
+        (Some(existing), Some(incoming)) => Some(existing.combined_with(incoming)),
+    }
+}
+
 fn codex_stderr_is_visible_warning(message: &str) -> bool {
     message.trim_start().starts_with("Codex warning:")
 }
@@ -6362,6 +8298,120 @@ fn codex_subprocess_exit_message(value: &Value) -> String {
     {
         Some(exit_code) => format!("Codex subprocess exited with code {exit_code}"),
         None => "Codex subprocess exited".to_string(),
+    }
+}
+
+struct CodexStartupCancelGuard(Option<oneshot::Sender<()>>);
+
+#[cfg(test)]
+struct CodexRequestObserver {
+    method: String,
+    sender: oneshot::Sender<()>,
+}
+
+#[cfg(test)]
+static CODEX_REQUEST_SENT_OBSERVER: std::sync::Mutex<Option<CodexRequestObserver>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static CODEX_SPAWN_READY_OBSERVER: std::sync::Mutex<Option<oneshot::Sender<()>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static CODEX_SPAWN_STARTUP_CANCEL_OBSERVER: std::sync::Mutex<Option<oneshot::Sender<()>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static CODEX_FORK_STARTUP_CANCEL_OBSERVER: std::sync::Mutex<Option<oneshot::Sender<()>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn install_codex_request_observer(method: &str) -> oneshot::Receiver<()> {
+    let (sender, receiver) = oneshot::channel();
+    let mut observer = CODEX_REQUEST_SENT_OBSERVER
+        .lock()
+        .expect("Codex request observer mutex poisoned");
+    assert!(
+        observer.is_none(),
+        "a Codex request observer is already installed"
+    );
+    *observer = Some(CodexRequestObserver {
+        method: method.to_string(),
+        sender,
+    });
+    receiver
+}
+
+#[cfg(test)]
+fn observe_codex_request_sent(method: &str) {
+    let mut observer = CODEX_REQUEST_SENT_OBSERVER
+        .lock()
+        .expect("Codex request observer mutex poisoned");
+    if observer
+        .as_ref()
+        .is_some_and(|expected| expected.method == method)
+        && let Some(expected) = observer.take()
+    {
+        let _ = expected.sender.send(());
+    }
+}
+
+#[cfg(not(test))]
+fn observe_codex_request_sent(_method: &str) {}
+
+#[cfg(test)]
+fn observe_codex_fork_startup_cancelled() {
+    if let Some(observer) = CODEX_FORK_STARTUP_CANCEL_OBSERVER
+        .lock()
+        .expect("Codex fork startup cancel observer mutex poisoned")
+        .take()
+    {
+        let _ = observer.send(());
+    }
+}
+
+#[cfg(not(test))]
+fn observe_codex_fork_startup_cancelled() {}
+
+#[cfg(test)]
+fn observe_codex_spawn_ready() {
+    if let Some(observer) = CODEX_SPAWN_READY_OBSERVER
+        .lock()
+        .expect("Codex spawn ready observer mutex poisoned")
+        .take()
+    {
+        let _ = observer.send(());
+    }
+}
+
+#[cfg(not(test))]
+fn observe_codex_spawn_ready() {}
+
+#[cfg(test)]
+fn observe_codex_spawn_startup_cancelled() {
+    if let Some(observer) = CODEX_SPAWN_STARTUP_CANCEL_OBSERVER
+        .lock()
+        .expect("Codex spawn startup cancel observer mutex poisoned")
+        .take()
+    {
+        let _ = observer.send(());
+    }
+}
+
+#[cfg(not(test))]
+fn observe_codex_spawn_startup_cancelled() {}
+
+impl CodexStartupCancelGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CodexStartupCancelGuard {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.0.take() {
+            let _ = cancel.send(());
+        }
     }
 }
 
@@ -6403,1230 +8453,7 @@ impl Backend for CodexBackend {
         config: BackendSpawnConfig,
         initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), String> {
-        let initial_message = initial_input.message;
-        let initial_images = initial_input.images;
-        let cwd = pick_workspace_root(&workspace_roots)?;
-        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
-        let (settings_tx, mut settings_rx) = mpsc::unbounded_channel::<CodexSettingsUpdate>();
-        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
-        let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
-        let (raw_event_tx, raw_event_rx) = mpsc::unbounded_channel();
-        spawn_codex_backend_event_bridge(raw_event_rx, events_tx);
-        let emitter = Arc::new(TurnEmitter::new_for_agent(
-            raw_event_tx,
-            AgentName(CODEX_AGENT_NAME),
-        ));
-        let session_id = Arc::new(std::sync::Mutex::new(None));
-        let session_id_task = Arc::clone(&session_id);
-        let (subagent_emitter_tx, _subagent_emitter_rx) =
-            watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
-        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
-
-        tokio::spawn(async move {
-            let mut ready_tx = Some(ready_tx);
-            let combined_instructions =
-                render_combined_spawn_instructions(&config.resolved_spawn_config);
-            let access_mode = config.resolved_spawn_config.access_mode;
-            let resolved_settings = resolve_session_settings(&config);
-            let model_override = match resolved_settings.0.get("model") {
-                Some(SessionSettingValue::String(value)) => Some(value.clone()),
-                _ => None,
-            };
-            let effort_override = match resolved_settings.0.get("reasoning_effort") {
-                Some(SessionSettingValue::String(value)) => Some(value.clone()),
-                _ => None,
-            };
-            let mut startup_mcp_config_overrides =
-                codex_mcp_config_overrides(&config.startup_mcp_servers);
-            if let Some(instructions) = combined_instructions.as_ref() {
-                let path = crate::steering::write_codex_steering_tempfile(instructions)
-                    .unwrap_or_else(|err| {
-                        panic!("failed to materialize Codex instructions: {err}")
-                    });
-                startup_mcp_config_overrides.push(format!(
-                    "model_instructions_file={}",
-                    toml_quoted(&path.display().to_string())
-                ));
-            }
-            let turn_network_access = codex_has_http_mcp_servers(&config.startup_mcp_servers);
-            // --- spawn codex CLI ------------------------------------------------
-            let mut command = codex_command();
-            for arg in codex_app_server_args(access_mode, &startup_mcp_config_overrides) {
-                command.arg(arg);
-            }
-            if let Some(path) = process_env::resolved_child_process_path() {
-                command.env("PATH", path);
-            }
-            let mut child = match command
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .group_spawn()
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!("Failed to spawn codex app-server: {e}");
-                    if let Some(tx) = ready_tx.take() {
-                        let _ = tx.send(Err(format!("Failed to spawn codex app-server: {e}")));
-                    }
-                    return;
-                }
-            };
-
-            let stdin = child.inner().stdin.take().expect("capture codex stdin");
-            let stdout = child.inner().stdout.take().expect("capture codex stdout");
-
-            let stdin = Arc::new(Mutex::new(stdin));
-            let pending: PendingRpcMap = Arc::new(Mutex::new(HashMap::new()));
-            let next_id = Arc::new(AtomicU64::new(1));
-
-            // --- stdout reader task ---------------------------------------------
-            let (notif_tx, mut notif_rx) = mpsc::unbounded_channel::<CodexInbound>();
-            {
-                let pending = Arc::clone(&pending);
-                let notif_tx = notif_tx.clone();
-                tokio::spawn(async move {
-                    let mut lines = BufReader::new(stdout).lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        let parsed: Value = match serde_json::from_str(&line) {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
-
-                        // RPC response (has result/error, no method)
-                        if let Some(id) = parsed.get("id").and_then(Value::as_u64) {
-                            let has_result_or_error =
-                                parsed.get("result").is_some() || parsed.get("error").is_some();
-                            let has_method = parsed.get("method").is_some();
-                            if has_result_or_error && !has_method {
-                                let response = if let Some(result) = parsed.get("result") {
-                                    Ok(result.clone())
-                                } else {
-                                    let err_obj =
-                                        parsed.get("error").cloned().unwrap_or(Value::Null);
-                                    Err(codex_rpc_error_message(&err_obj))
-                                };
-                                if let Some(tx) = pending.lock().await.remove(&id) {
-                                    let _ = tx.send(response);
-                                }
-                                continue;
-                            }
-                        }
-
-                        // Notification (has method, no id) or server request (has method and id).
-                        if let Some(method) = parsed.get("method").and_then(Value::as_str) {
-                            let params = parsed.get("params").cloned().unwrap_or(Value::Null);
-                            if let Some(id) = parsed.get("id").cloned() {
-                                let _ = notif_tx.send(CodexInbound::ServerRequest {
-                                    id,
-                                    method: method.to_string(),
-                                    params,
-                                });
-                            } else {
-                                let _ = notif_tx.send(CodexInbound::Notification {
-                                    method: method.to_string(),
-                                    params,
-                                });
-                            }
-                        }
-                    }
-                });
-            }
-
-            // --- helper: send a JSON-RPC request --------------------------------
-            async fn rpc_request(
-                stdin: &Arc<Mutex<ChildStdin>>,
-                pending: &PendingRpcMap,
-                next_id: &Arc<AtomicU64>,
-                method: &str,
-                params: Value,
-            ) -> Result<Value, String> {
-                let id = next_id.fetch_add(1, Ordering::Relaxed);
-                let payload = json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "method": method,
-                    "params": params
-                });
-
-                let (tx, rx) = oneshot::channel();
-                pending.lock().await.insert(id, tx);
-
-                {
-                    let mut w = stdin.lock().await;
-                    let line = format!("{payload}\n");
-                    if let Err(e) = w.write_all(line.as_bytes()).await {
-                        pending.lock().await.remove(&id);
-                        return Err(format!("Failed to write to codex stdin: {e}"));
-                    }
-                }
-
-                match tokio::time::timeout(CODEX_REQUEST_TIMEOUT, rx).await {
-                    Ok(Ok(result)) => result,
-                    Ok(Err(_)) => Err("Codex response channel closed".to_string()),
-                    Err(_) => {
-                        pending.lock().await.remove(&id);
-                        Err(format!("Codex request timed out for method '{method}'"))
-                    }
-                }
-            }
-
-            // --- initialize -----------------------------------------------------
-            if let Err(e) = rpc_request(
-                &stdin,
-                &pending,
-                &next_id,
-                "initialize",
-                json!({
-                    "clientInfo": {
-                        "name": "tyde",
-                        "title": Value::Null,
-                        "version": "0.1"
-                    },
-                    "capabilities": {
-                        "experimentalApi": true
-                    }
-                }),
-            )
-            .await
-            {
-                tracing::error!("Codex initialize failed: {e}");
-                if let Some(tx) = ready_tx.take() {
-                    let _ = tx.send(Err(format!("Codex initialize failed: {e}")));
-                }
-                return;
-            }
-
-            // --- thread/start ---------------------------------------------------
-            let thread_result = rpc_request(
-                &stdin,
-                &pending,
-                &next_id,
-                "thread/start",
-                json!({
-                    "cwd": cwd,
-                    "sandbox": codex_sandbox_mode(access_mode),
-                    "approvalPolicy": CODEX_FORCED_APPROVAL_POLICY,
-                }),
-            )
-            .await;
-
-            let thread_id = match &thread_result {
-                Ok(val) => val
-                    .get("thread")
-                    .and_then(|t| t.get("id"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("thread")
-                    .to_string(),
-                Err(e) => {
-                    tracing::error!("Codex thread/start failed: {e}");
-                    if let Some(tx) = ready_tx.take() {
-                        let _ = tx.send(Err(format!("Codex thread/start failed: {e}")));
-                    }
-                    return;
-                }
-            };
-            *session_id_task
-                .lock()
-                .expect("codex session_id mutex poisoned") = Some(SessionId(thread_id.clone()));
-
-            let model = thread_result
-                .as_ref()
-                .ok()
-                .and_then(|v| v.get("model"))
-                .and_then(Value::as_str)
-                .map(|s| s.to_string());
-
-            // --- event loop: translate notifications -> ChatEvent ----------------
-            let backend_default_model_name = model.unwrap_or_else(|| "codex".to_string());
-            let mut model_name = model_override
-                .clone()
-                .unwrap_or_else(|| backend_default_model_name.clone());
-            let mut accumulated_text = String::new();
-            let mut accumulated_reasoning = String::new();
-            let mut current_message_id: Option<String> = None;
-            let mut active_turn_id: Option<String> = None;
-            let mut pending_tool_call_ids: HashSet<String> = HashSet::new();
-            let mut close_stream_when_tools_idle = false;
-            let mut pending_message_metadata: Option<CodexLoopPendingMessageMetadata> = None;
-            let mut completed_message_metadata_by_turn: HashMap<
-                String,
-                CodexLoopPendingMessageMetadata,
-            > = HashMap::new();
-            let mut token_usage_by_turn: HashMap<String, Value> = HashMap::new();
-            let mut model_token_usage_by_turn: HashMap<String, CodexTurnTokenUsage> =
-                HashMap::new();
-            let mut turn_context_by_turn: HashMap<String, TurnContextEstimate> = HashMap::new();
-            let mut pending_user_input_bytes = initial_message.len() as u64;
-            let mut conversation_bytes_total = 0u64;
-            let mut typing_status_active = false;
-            let mut file_change_call_ids: HashMap<String, Vec<String>> = HashMap::new();
-            let mut saw_agent_message_delta = false;
-            let mut saw_agent_message_completed = false;
-            let mut stream_closed_by_turn_completion = false;
-            let mut reasoning_notification_count = 0usize;
-            let mut started_item_types: Vec<String> = Vec::new();
-            let mut completed_item_types: Vec<String> = Vec::new();
-            let stdin_for_input = Arc::clone(&stdin);
-            let pending_for_input = Arc::clone(&pending);
-            let next_id_for_input = Arc::clone(&next_id);
-            let thread_id_for_input = thread_id.clone();
-            let mut model_for_input = model_override.clone();
-            let mut effort_for_input = effort_override.clone();
-            let access_mode_for_input = access_mode;
-
-            emitter.user_message(
-                &initial_message,
-                backend_user_image_values(initial_images.clone()),
-            );
-            let mut initial_input_items = vec![json!({
-                "type": "text",
-                "text": initial_message,
-            })];
-            if let Some(imgs) = protocol_images_to_attachments(initial_images) {
-                for image in imgs {
-                    let path = match persist_temp_image(&image).await {
-                        Ok(path) => path,
-                        Err(err) => {
-                            tracing::error!(
-                                "Failed to persist Codex initial image attachment: {err}"
-                            );
-                            if let Some(tx) = ready_tx.take() {
-                                let _ = tx.send(Err(format!(
-                                    "Failed to persist Codex initial image attachment: {err}"
-                                )));
-                            }
-                            return;
-                        }
-                    };
-                    initial_input_items.push(json!({
-                        "type": "localImage",
-                        "path": path,
-                    }));
-                }
-            }
-            let mut initial_turn_params = json!({
-                "threadId": thread_id,
-                "input": initial_input_items,
-            });
-            if let Some(model) = model_override.clone() {
-                initial_turn_params["model"] = Value::String(model);
-            }
-            if let Some(effort) = effort_override.clone() {
-                initial_turn_params["effort"] = Value::String(effort);
-            }
-            initial_turn_params["summary"] =
-                Value::String(CODEX_REASONING_SUMMARY_LEVEL.to_string());
-            initial_turn_params["approvalPolicy"] =
-                Value::String(CODEX_FORCED_APPROVAL_POLICY.to_string());
-            initial_turn_params["sandboxPolicy"] =
-                codex_sandbox_policy(access_mode, turn_network_access);
-            if let Err(err) = rpc_request(
-                &stdin_for_input,
-                &pending_for_input,
-                &next_id_for_input,
-                "turn/start",
-                initial_turn_params,
-            )
-            .await
-            {
-                tracing::error!("Failed to send initial Codex prompt: {err}");
-                if let Some(tx) = ready_tx.take() {
-                    let _ = tx.send(Err(format!("Failed to send initial Codex prompt: {err}")));
-                }
-                return;
-            }
-            if let Some(tx) = ready_tx.take() {
-                let _ = tx.send(Ok(()));
-            }
-
-            loop {
-                tokio::select! {
-                    notif = notif_rx.recv() => {
-                        let Some(inbound) = notif else { break };
-                        let (method, params) = match inbound {
-                            CodexInbound::Notification { method, params } => (method, params),
-                            CodexInbound::ServerRequest { id, method, params } => {
-                                respond_codex_spawn_server_request(
-                                    &stdin_for_input,
-                                    id,
-                                    &method,
-                                    &params,
-                                )
-                                .await;
-                                continue;
-                            }
-                            CodexInbound::Stderr(line) => {
-                                tracing::warn!("Codex stderr: {line}");
-                                continue;
-                            }
-                            CodexInbound::Closed { exit_code } => {
-                                tracing::warn!(?exit_code, "Codex app-server closed");
-                                break;
-                            }
-                        };
-                        if is_reasoning_notification_method(method.as_str()) {
-                            reasoning_notification_count = reasoning_notification_count.saturating_add(1);
-                        }
-
-                        match method.as_str() {
-                            "turn/started" => {
-                                let turn_id = params
-                                    .get("turn")
-                                    .and_then(|v| v.get("id"))
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("turn")
-                                    .to_string();
-                                active_turn_id = Some(turn_id.clone());
-                                current_message_id = Some(turn_id.clone());
-                                accumulated_text.clear();
-                                accumulated_reasoning.clear();
-                                pending_tool_call_ids.clear();
-                                close_stream_when_tools_idle = false;
-                                pending_message_metadata = None;
-                                let pending_user_input = pending_user_input_bytes;
-                                pending_user_input_bytes = 0;
-                                conversation_bytes_total = conversation_bytes_total
-                                    .saturating_add(pending_user_input);
-                                turn_context_by_turn.insert(
-                                    turn_id.clone(),
-                                    TurnContextEstimate {
-                                        conversation_history_bytes: conversation_bytes_total,
-                                        ..TurnContextEstimate::default()
-                                    },
-                                );
-                                saw_agent_message_delta = false;
-                                saw_agent_message_completed = false;
-                                stream_closed_by_turn_completion = false;
-                                reasoning_notification_count = 0;
-                                started_item_types.clear();
-                                completed_item_types.clear();
-                                if !typing_status_active {
-                                    emitter.typing_status_changed(true);
-                                    typing_status_active = true;
-                                }
-                                emitter.stream_start(
-                                    &turn_id,
-                                    AgentName(CODEX_AGENT_NAME),
-                                    Some(&model_name),
-                                );
-                            }
-                            "item/agentMessage/delta" => {
-                                let delta = params
-                                    .get("delta")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_string();
-                                if delta.is_empty() {
-                                    continue;
-                                }
-                                saw_agent_message_delta = true;
-                                emit_codex_loop_agent_message_delta(
-                                    &emitter,
-                                    CodexLoopAgentMessageDeltaState {
-                                        current_message_id: &mut current_message_id,
-                                        accumulated_text: &mut accumulated_text,
-                                        stream_closed_by_turn_completion:
-                                            &mut stream_closed_by_turn_completion,
-                                        typing_status_active: &mut typing_status_active,
-                                    },
-                                    &params,
-                                    &delta,
-                                    &model_name,
-                                );
-                            }
-                            reasoning_method if is_reasoning_notification_method(reasoning_method) => {
-                                let Some(delta) = extract_codex_reasoning_delta_text(&params) else {
-                                    continue;
-                                };
-                                let delta = merge_reasoning_delta(&accumulated_reasoning, &delta);
-                                if delta.is_empty() {
-                                    continue;
-                                }
-                                let message_id = codex_loop_reasoning_message_id(
-                                    &params,
-                                    current_message_id.as_deref(),
-                                    active_turn_id.as_deref(),
-                                );
-                                if current_message_id.is_none() {
-                                    stream_closed_by_turn_completion = false;
-                                    accumulated_text.clear();
-                                    accumulated_reasoning.clear();
-                                    close_stream_when_tools_idle = false;
-                                    if !typing_status_active {
-                                        emitter.typing_status_changed(true);
-                                        typing_status_active = true;
-                                    }
-                                    emitter.stream_start(
-                                        &message_id,
-                                        AgentName(CODEX_AGENT_NAME),
-                                        Some(&model_name),
-                                    );
-                                }
-                                current_message_id = Some(message_id.clone());
-                                accumulated_reasoning.push_str(&delta);
-                                add_codex_loop_turn_reasoning_bytes(
-                                    &mut turn_context_by_turn,
-                                    active_turn_id.as_deref(),
-                                    delta.len() as u64,
-                                );
-                                emitter.stream_reasoning_delta(&message_id, &delta);
-                            }
-                            "thread/tokenUsage/updated" => {
-                                if let Some((turn_id, request, cumulative, context_window)) =
-                                    extract_model_request_token_usage(&params, Some(&model_name))
-                                    && let Some(usage) = record_model_request_token_usage(
-                                        &mut model_token_usage_by_turn,
-                                        turn_id,
-                                        request,
-                                        cumulative,
-                                        context_window,
-                                    )
-                                {
-                                    emitter.model_request_token_usage(&usage);
-                                }
-                                if let Some((turn_id, token_usage)) =
-                                    extract_turn_token_usage(&params, Some(&model_name))
-                                {
-                                    if let Some(pending) =
-                                        completed_message_metadata_by_turn.remove(&turn_id)
-                                    {
-                                        let context_breakdown = estimate_context_breakdown(
-                                            Some(&token_usage),
-                                            &pending.turn_context,
-                                            Some(&model_name),
-                                        );
-                                        let (request_usage, turn_usage, cumulative_usage) =
-                                            codex_message_usage_values(
-                                                Some(token_usage),
-                                                model_token_usage_by_turn.get(&turn_id),
-                                            );
-                                        emitter.message_metadata_updated(
-                                            MessageMetadataUpdatePayload {
-                                                message_id: pending.message_id,
-                                                model_info: Some(json!({
-                                                    "model": model_name.clone()
-                                                })),
-                                                request_usage,
-                                                turn_usage,
-                                                cumulative_usage,
-                                                context_breakdown: Some(context_breakdown),
-                                            },
-                                        );
-                                    } else {
-                                        token_usage_by_turn.insert(turn_id, token_usage);
-                                    }
-                                }
-                            }
-                            "item/completed" => {
-                                let item_type = params
-                                    .get("item")
-                                    .and_then(|v| v.get("type"))
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("");
-                                let item = params.get("item").cloned().unwrap_or(Value::Null);
-                                let item_id = item
-                                    .get("id")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("item")
-                                    .to_string();
-                                if !item_type.is_empty() && completed_item_types.len() < 8 {
-                                    completed_item_types.push(item_type.to_string());
-                                }
-                                match item_type {
-                                    "agentMessage" => {
-                                        let text = item
-                                            .get("text")
-                                            .and_then(Value::as_str)
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let disposition =
-                                            codex_agent_message_completion_disposition(
-                                                current_message_id.is_some(),
-                                                saw_agent_message_completed,
-                                                stream_closed_by_turn_completion,
-                                                &text,
-                                            );
-                                        match disposition {
-                                            CodexAgentMessageCompletionDisposition::SkipDuplicateEmpty => {
-                                                tracing::warn!(
-                                                    turn_id = ?active_turn_id,
-                                                    item_id = %item_id,
-                                                    "Codex emitted an empty agentMessage completion after the turn was already closed; skipping duplicate StreamEnd"
-                                                );
-                                                saw_agent_message_completed = true;
-                                                stream_closed_by_turn_completion = false;
-                                                continue;
-                                            }
-                                            CodexAgentMessageCompletionDisposition::SkipDuplicateCompleted => {
-                                                tracing::warn!(
-                                                    turn_id = ?active_turn_id,
-                                                    item_id = %item_id,
-                                                    text_len = text.len(),
-                                                    "Codex emitted a duplicate agentMessage completion; skipping duplicate StreamEnd"
-                                                );
-                                                continue;
-                                            }
-                                            CodexAgentMessageCompletionDisposition::EmitWithSyntheticStart => {
-                                                let start_message_id = item_id.clone();
-                                                current_message_id = Some(start_message_id.clone());
-                                                emitter.stream_start(
-                                                    &start_message_id,
-                                                    AgentName(CODEX_AGENT_NAME),
-                                                    Some(&model_name),
-                                                );
-                                            }
-                                            CodexAgentMessageCompletionDisposition::EmitOnOpenStream => {}
-                                        }
-                                        saw_agent_message_completed = true;
-                                        let final_text = if text.is_empty() {
-                                            std::mem::take(&mut accumulated_text)
-                                        } else {
-                                            accumulated_text.clear();
-                                            text
-                                        };
-                                        let reasoning = contains_non_whitespace(
-                                            &accumulated_reasoning,
-                                        )
-                                        .then(|| std::mem::take(&mut accumulated_reasoning));
-                                        conversation_bytes_total = conversation_bytes_total
-                                            .saturating_add(final_text.len() as u64);
-                                        let message_id_for_metadata = current_message_id
-                                            .clone()
-                                            .unwrap_or_else(|| item_id.clone());
-                                        if let Some(turn_id) = active_turn_id.clone() {
-                                            let turn_context = turn_context_by_turn
-                                                .get(&turn_id)
-                                                .cloned()
-                                                .unwrap_or_default();
-                                            if let Some(metadata) = metadata_target_for_visible_message(
-                                                turn_id,
-                                                message_id_for_metadata,
-                                                &final_text,
-                                                reasoning.as_deref(),
-                                                model_name.clone(),
-                                                turn_context,
-                                            ) {
-                                                pending_message_metadata =
-                                                    Some(CodexLoopPendingMessageMetadata {
-                                                        turn_id: metadata.turn_id,
-                                                        message_id: metadata.message_id,
-                                                        turn_context: metadata.turn_context,
-                                                    });
-                                            }
-                                        }
-                                        emitter.stream_end(StreamEndPayload {
-                                            content: final_text,
-                                            agent: Some(AgentName(CODEX_AGENT_NAME)),
-                                            model: Some(model_name.clone()),
-                                            request_usage: None,
-                                            turn_usage: None,
-                                            cumulative_usage: None,
-                                            token_usage_unavailable_reason: None,
-                                            reasoning,
-                                            tool_calls: Vec::new(),
-                                            context_breakdown: None,
-                                        });
-                                        current_message_id = None;
-                                        stream_closed_by_turn_completion = false;
-                                    }
-                                    "reasoning" => {
-                                        if let Some(reasoning_text) = extract_codex_item_reasoning(&item)
-                                            && contains_non_whitespace(&reasoning_text)
-                                        {
-                                            let delta = merge_reasoning_delta(
-                                                &accumulated_reasoning,
-                                                &reasoning_text,
-                                            );
-                                            if !delta.is_empty() {
-                                                let message_id = item_id.clone();
-                                                if current_message_id.is_none() {
-                                                    stream_closed_by_turn_completion = false;
-                                                    accumulated_text.clear();
-                                                    accumulated_reasoning.clear();
-                                                    if !typing_status_active {
-                                                        emitter.typing_status_changed(true);
-                                                        typing_status_active = true;
-                                                    }
-                                                    emitter.stream_start(
-                                                        &message_id,
-                                                        AgentName(CODEX_AGENT_NAME),
-                                                        Some(&model_name),
-                                                    );
-                                                }
-                                                current_message_id = Some(message_id.clone());
-                                                accumulated_reasoning.push_str(&delta);
-                                                add_codex_loop_turn_reasoning_bytes(
-                                                    &mut turn_context_by_turn,
-                                                    active_turn_id.as_deref(),
-                                                    delta.len() as u64,
-                                                );
-                                                emitter.stream_reasoning_delta(&message_id, &delta);
-                                            }
-                                            close_stream_when_tools_idle = true;
-                                            maybe_finish_codex_loop_segment(
-                                                &emitter,
-                                                CodexLoopSegmentState {
-                                                    current_message_id: &mut current_message_id,
-                                                    accumulated_text: &mut accumulated_text,
-                                                    accumulated_reasoning: &mut accumulated_reasoning,
-                                                    close_stream_when_tools_idle:
-                                                        &mut close_stream_when_tools_idle,
-                                                    pending_message_metadata:
-                                                        &mut pending_message_metadata,
-                                                },
-                                                CodexLoopSegmentContext {
-                                                    pending_tool_call_ids: &pending_tool_call_ids,
-                                                    active_turn_id: active_turn_id.as_deref(),
-                                                    turn_context_by_turn: &turn_context_by_turn,
-                                                    model_name: &model_name,
-                                                },
-                                            );
-                                        }
-                                    }
-                                    "commandExecution" => {
-                                        add_codex_loop_turn_tool_bytes(
-                                            &mut turn_context_by_turn,
-                                            active_turn_id.as_deref(),
-                                            estimate_command_execution_tool_bytes(&item),
-                                        );
-                                        let exit_code =
-                                            item.get("exitCode").and_then(Value::as_i64).unwrap_or(-1)
-                                                as i32;
-                                        let output = item
-                                            .get("aggregatedOutput")
-                                            .and_then(Value::as_str)
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let success = exit_code == 0;
-                                        let error_message = if success {
-                                            None
-                                        } else {
-                                            Some(format!("Command failed with exit code {exit_code}"))
-                                        };
-                                        emitter.tool_completed(ToolCompletedPayload {
-                                            tool_call_id: &item_id,
-                                            tool_name: "run_command",
-                                            tool_result: json!({
-                                                "kind": "RunCommand",
-                                                "exit_code": exit_code,
-                                                "stdout": output,
-                                                "stderr": "",
-                                            }),
-                                            success,
-                                            error: error_message.as_deref(),
-                                        });
-                                        pending_tool_call_ids.remove(&item_id);
-                                        maybe_finish_codex_loop_segment(
-                                            &emitter,
-                                            CodexLoopSegmentState {
-                                                current_message_id: &mut current_message_id,
-                                                accumulated_text: &mut accumulated_text,
-                                                accumulated_reasoning: &mut accumulated_reasoning,
-                                                close_stream_when_tools_idle:
-                                                    &mut close_stream_when_tools_idle,
-                                                pending_message_metadata: &mut pending_message_metadata,
-                                            },
-                                            CodexLoopSegmentContext {
-                                                pending_tool_call_ids: &pending_tool_call_ids,
-                                                active_turn_id: active_turn_id.as_deref(),
-                                                turn_context_by_turn: &turn_context_by_turn,
-                                                model_name: &model_name,
-                                            },
-                                        );
-                                    }
-                                    "fileChange" => {
-                                        add_codex_loop_turn_tool_bytes(
-                                            &mut turn_context_by_turn,
-                                            active_turn_id.as_deref(),
-                                            estimate_file_change_tool_bytes(&item),
-                                        );
-                                        let file_changes = parse_codex_file_changes(&item);
-                                        let success =
-                                            item.get("status").and_then(Value::as_str) == Some("completed");
-                                        let known_call_ids =
-                                            file_change_call_ids.remove(&item_id).unwrap_or_default();
-                                        let completions = codex_file_change_completion_plan(
-                                            &item_id,
-                                            &known_call_ids,
-                                            &file_changes,
-                                        );
-                                        if !completions.is_empty() {
-                                            for completion in completions {
-                                                if let Some(change) = completion.request.as_ref() {
-                                                    emit_modify_file_request_to(
-                                                        &emitter,
-                                                        &completion.call_id,
-                                                        &change.path,
-                                                        &change.before,
-                                                        &change.after,
-                                                    );
-                                                }
-                                                emitter.tool_completed(ToolCompletedPayload {
-                                                    tool_call_id: &completion.call_id,
-                                                    tool_name: "modify_file",
-                                                    tool_result: json!({
-                                                        "kind": "ModifyFile",
-                                                        "lines_added": completion.lines_added,
-                                                        "lines_removed": completion.lines_removed,
-                                                    }),
-                                                    success,
-                                                    error: (!success)
-                                                        .then_some("File changes were not applied"),
-                                                });
-                                                pending_tool_call_ids.remove(&completion.call_id);
-                                            }
-                                            maybe_finish_codex_loop_segment(
-                                                &emitter,
-                                                CodexLoopSegmentState {
-                                                    current_message_id: &mut current_message_id,
-                                                    accumulated_text: &mut accumulated_text,
-                                                    accumulated_reasoning: &mut accumulated_reasoning,
-                                                    close_stream_when_tools_idle:
-                                                        &mut close_stream_when_tools_idle,
-                                                    pending_message_metadata:
-                                                        &mut pending_message_metadata,
-                                                },
-                                                CodexLoopSegmentContext {
-                                                    pending_tool_call_ids: &pending_tool_call_ids,
-                                                    active_turn_id: active_turn_id.as_deref(),
-                                                    turn_context_by_turn: &turn_context_by_turn,
-                                                    model_name: &model_name,
-                                                },
-                                            );
-                                        }
-                                    }
-                                    "collabToolCall" | "collabAgentToolCall" | "mcpToolCall"
-                                    | "dynamicToolCall" => {
-                                        let tool_name = item
-                                            .get("tool")
-                                            .and_then(Value::as_str)
-                                            .unwrap_or(item_type)
-                                            .to_string();
-                                        let success =
-                                            item.get("status").and_then(Value::as_str) == Some("completed")
-                                                || item.get("success").and_then(Value::as_bool)
-                                                    == Some(true);
-                                        let error_message =
-                                            (!success).then(|| format!("{tool_name} failed"));
-                                        if success {
-                                            emit_agent_control_spawn_progress_to(
-                                                &emitter,
-                                                &item_id,
-                                                &tool_name,
-                                                &item,
-                                            );
-                                        }
-                                        emitter.tool_completed(ToolCompletedPayload {
-                                            tool_call_id: &item_id,
-                                            tool_name: &tool_name,
-                                            tool_result: json!({
-                                                "kind": "Other",
-                                                "result": item,
-                                            }),
-                                            success,
-                                            error: error_message.as_deref(),
-                                        });
-                                        pending_tool_call_ids.remove(&item_id);
-                                        maybe_finish_codex_loop_segment(
-                                            &emitter,
-                                            CodexLoopSegmentState {
-                                                current_message_id: &mut current_message_id,
-                                                accumulated_text: &mut accumulated_text,
-                                                accumulated_reasoning: &mut accumulated_reasoning,
-                                                close_stream_when_tools_idle:
-                                                    &mut close_stream_when_tools_idle,
-                                                pending_message_metadata: &mut pending_message_metadata,
-                                            },
-                                            CodexLoopSegmentContext {
-                                                pending_tool_call_ids: &pending_tool_call_ids,
-                                                active_turn_id: active_turn_id.as_deref(),
-                                                turn_context_by_turn: &turn_context_by_turn,
-                                                model_name: &model_name,
-                                            },
-                                        );
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            "item/started" => {
-                                let item = params.get("item").cloned().unwrap_or(Value::Null);
-                                let item_type = item
-                                    .get("type")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default();
-                                let item_id = item
-                                    .get("id")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("tool-call")
-                                    .to_string();
-                                if !item_type.is_empty() && started_item_types.len() < 8 {
-                                    started_item_types.push(item_type.to_string());
-                                }
-                                match item_type {
-                                    "commandExecution" => {
-                                        let command = item
-                                            .get("command")
-                                            .and_then(Value::as_str)
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let cwd = item
-                                            .get("cwd")
-                                            .and_then(Value::as_str)
-                                            .unwrap_or("")
-                                            .to_string();
-                                        pending_tool_call_ids.insert(item_id.clone());
-                                        emitter.tool_request(
-                                            &item_id,
-                                            "run_command",
-                                            json!({
-                                                "kind": "RunCommand",
-                                                "command": command,
-                                                "working_directory": cwd,
-                                            }),
-                                        );
-                                    }
-                                    "fileChange" => {
-                                        let file_changes = parse_codex_file_changes(&item);
-                                        if file_changes.is_empty() {
-                                            continue;
-                                        }
-                                        let total = file_changes.len();
-                                        let call_ids = file_changes
-                                            .iter()
-                                            .enumerate()
-                                            .map(|(idx, _)| {
-                                                codex_file_change_call_id(&item_id, idx, total)
-                                            })
-                                            .collect::<Vec<_>>();
-                                        file_change_call_ids
-                                            .insert(item_id.clone(), call_ids.clone());
-                                        pending_tool_call_ids.extend(call_ids.iter().cloned());
-                                        for (change, call_id) in
-                                            file_changes.into_iter().zip(call_ids.into_iter())
-                                        {
-                                            emit_modify_file_request_to(
-                                                &emitter,
-                                                &call_id,
-                                                &change.path,
-                                                &change.before,
-                                                &change.after,
-                                            );
-                                        }
-                                    }
-                                    "collabToolCall" | "collabAgentToolCall" | "mcpToolCall"
-                                    | "dynamicToolCall" => {
-                                        add_codex_loop_turn_tool_bytes(
-                                            &mut turn_context_by_turn,
-                                            active_turn_id.as_deref(),
-                                            estimate_generic_tool_bytes(&item),
-                                        );
-                                        let tool_name = item
-                                            .get("tool")
-                                            .and_then(Value::as_str)
-                                            .unwrap_or(item_type)
-                                            .to_string();
-                                        pending_tool_call_ids.insert(item_id.clone());
-                                        emitter.tool_request(
-                                            &item_id,
-                                            &tool_name,
-                                            json!({
-                                                "kind": "Other",
-                                                "args": item,
-                                            }),
-                                        );
-                                        emit_agent_control_await_progress_to(
-                                            &emitter, &item_id, &tool_name, &item,
-                                        );
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            "turn/completed" => {
-                                let turn_status = params
-                                    .get("turn")
-                                    .and_then(|v| v.get("status"))
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("completed");
-                                let turn_id_for_log = active_turn_id.clone();
-                                if let Some((turn_id, request, cumulative, context_window)) =
-                                    extract_model_request_token_usage(&params, Some(&model_name))
-                                    && let Some(usage) = record_model_request_token_usage(
-                                        &mut model_token_usage_by_turn,
-                                        turn_id,
-                                        request,
-                                        cumulative,
-                                        context_window,
-                                    )
-                                {
-                                    emitter.model_request_token_usage(&usage);
-                                }
-                                if let Some((turn_id, token_usage)) =
-                                    extract_turn_token_usage(&params, Some(&model_name))
-                                {
-                                    token_usage_by_turn.insert(turn_id, token_usage);
-                                }
-                                let turn_error_message = (turn_status == "failed").then(|| {
-                                    params
-                                        .get("turn")
-                                        .and_then(|v| v.get("error"))
-                                        .and_then(|v| v.get("message"))
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("Codex turn failed")
-                                        .to_string()
-                                });
-                                active_turn_id = None;
-                                if current_message_id.is_some() && turn_status != "interrupted" {
-                                    let final_text = std::mem::take(&mut accumulated_text);
-                                    let reasoning = contains_non_whitespace(&accumulated_reasoning)
-                                        .then(|| std::mem::take(&mut accumulated_reasoning));
-                                    let had_assistant_content = !final_text.trim().is_empty()
-                                        || saw_agent_message_delta
-                                        || saw_agent_message_completed;
-                                    let should_emit_empty_stream_end =
-                                        !had_assistant_content && turn_status != "failed";
-                                    if !had_assistant_content && !should_emit_empty_stream_end {
-                                        tracing::warn!(
-                                            turn_id = ?turn_id_for_log,
-                                            turn_status,
-                                            model = %model_name,
-                                            model_override = ?model_override,
-                                            reasoning_effort = ?effort_override,
-                                            reasoning_notification_count,
-                                            started_item_types = ?started_item_types,
-                                            completed_item_types = ?completed_item_types,
-                                            turn_error_message = ?turn_error_message,
-                                            "Codex turn completed without any assistant message content"
-                                        );
-                                    }
-                                    if had_assistant_content || should_emit_empty_stream_end {
-                                        if let Some(turn_id) = turn_id_for_log.as_ref() {
-                                            let turn_context = turn_context_by_turn
-                                                .get(turn_id)
-                                                .cloned()
-                                                .unwrap_or_default();
-                                            if let Some(metadata) = metadata_target_for_visible_message(
-                                                turn_id.clone(),
-                                                current_message_id.clone().unwrap_or_default(),
-                                                &final_text,
-                                                reasoning.as_deref(),
-                                                model_name.clone(),
-                                                turn_context,
-                                            ) {
-                                                pending_message_metadata =
-                                                    Some(CodexLoopPendingMessageMetadata {
-                                                        turn_id: metadata.turn_id,
-                                                        message_id: metadata.message_id,
-                                                        turn_context: metadata.turn_context,
-                                                    });
-                                            }
-                                        }
-                                        emitter.stream_end(StreamEndPayload {
-                                            content: final_text,
-                                            agent: Some(AgentName(CODEX_AGENT_NAME)),
-                                            model: Some(model_name.clone()),
-                                            request_usage: None,
-                                            turn_usage: None,
-                                            cumulative_usage: None,
-                                            token_usage_unavailable_reason: None,
-                                            reasoning,
-                                            tool_calls: Vec::new(),
-                                            context_breakdown: None,
-                                        });
-                                        stream_closed_by_turn_completion = true;
-                                    }
-                                    current_message_id = None;
-                                }
-                                if turn_status != "interrupted"
-                                    && let Some(turn_id) = turn_id_for_log.as_ref()
-                                    && pending_message_metadata
-                                        .as_ref()
-                                        .is_some_and(|pending| pending.turn_id == *turn_id)
-                                    && let Some(pending) = pending_message_metadata.take()
-                                {
-                                    let usage = token_usage_by_turn.remove(turn_id);
-                                    let context_breakdown = estimate_context_breakdown(
-                                        usage.as_ref(),
-                                        &pending.turn_context,
-                                        Some(&model_name),
-                                    );
-                                    if usage.is_none() {
-                                        completed_message_metadata_by_turn
-                                            .insert(turn_id.clone(), pending.clone());
-                                    }
-                                    let (request_usage, turn_usage, cumulative_usage) =
-                                        codex_message_usage_values(
-                                            usage,
-                                            model_token_usage_by_turn.get(turn_id),
-                                        );
-                                    emitter.message_metadata_updated(MessageMetadataUpdatePayload {
-                                        message_id: pending.message_id,
-                                        model_info: Some(json!({ "model": model_name.clone() })),
-                                        request_usage,
-                                        turn_usage,
-                                        cumulative_usage,
-                                        context_breakdown: Some(context_breakdown),
-                                    });
-                                }
-                                if turn_status == "interrupted" {
-                                    pending_message_metadata = None;
-                                    if let Some(turn_id) = turn_id_for_log.as_ref() {
-                                        completed_message_metadata_by_turn.remove(turn_id);
-                                    }
-                                    emitter.operation_cancelled("Operation cancelled");
-                                    typing_status_active = false;
-                                }
-                                if let Some(message) = turn_error_message {
-                                    emitter.error_message(&message);
-                                }
-                                if typing_status_active {
-                                    emitter.typing_status_changed(false);
-                                    typing_status_active = false;
-                                }
-                                pending_tool_call_ids.clear();
-                                close_stream_when_tools_idle = false;
-                                if let Some(turn_id) = turn_id_for_log.as_ref() {
-                                    token_usage_by_turn.remove(turn_id);
-                                    model_token_usage_by_turn.remove(turn_id);
-                                    turn_context_by_turn.remove(turn_id);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    input = input_rx.recv() => {
-                        let Some(input) = input else { break };
-                        match input {
-                            AgentInput::SendMessage(payload) => {
-                                let backend_message = payload.message;
-                                pending_user_input_bytes = backend_message.len() as u64;
-                                let visible_message = backend_message.clone();
-                                let visible_images = payload.images.clone();
-                                let images = protocol_images_to_attachments(payload.images);
-                                emitter.user_message(
-                                    &visible_message,
-                                    backend_user_image_values(visible_images),
-                                );
-                                let mut input_items = vec![json!({
-                                    "type": "text",
-                                    "text": backend_message,
-                                })];
-                                if let Some(imgs) = images {
-                                    for image in imgs {
-                                        let path = match persist_temp_image(&image).await {
-                                            Ok(path) => path,
-                                            Err(err) => {
-                                                tracing::error!(
-                                                    "Failed to persist Codex image attachment: {err}"
-                                                );
-                                                continue;
-                                            }
-                                        };
-                                        input_items.push(json!({
-                                            "type": "localImage",
-                                            "path": path,
-                                        }));
-                                    }
-                                }
-                                let mut turn_params = json!({
-                                    "threadId": thread_id_for_input,
-                                    "input": input_items,
-                                });
-                                if let Some(model) = model_for_input.clone() {
-                                    turn_params["model"] = Value::String(model);
-                                }
-                                if let Some(effort) = effort_for_input.clone() {
-                                    turn_params["effort"] = Value::String(effort);
-                                }
-                                turn_params["summary"] =
-                                    Value::String(CODEX_REASONING_SUMMARY_LEVEL.to_string());
-                                turn_params["approvalPolicy"] =
-                                    Value::String(CODEX_FORCED_APPROVAL_POLICY.to_string());
-                                turn_params["sandboxPolicy"] =
-                                    codex_sandbox_policy(
-                                        access_mode_for_input,
-                                        turn_network_access,
-                                    );
-                                let _ = rpc_request(
-                                    &stdin_for_input,
-                                    &pending_for_input,
-                                    &next_id_for_input,
-                                    "turn/start",
-                                    turn_params,
-                                )
-                                .await;
-                            }
-                            AgentInput::UpdateSessionSettings(_) => {}
-                            AgentInput::EditQueuedMessage(_)
-                            | AgentInput::CancelQueuedMessage(_)
-                            | AgentInput::SendQueuedMessageNow(_) => {
-                                panic!(
-                                    "queued-message inputs must be handled by the agent actor before reaching the backend"
-                                );
-                            }
-                        }
-                    }
-                    update = settings_rx.recv() => {
-                        let Some(update) = update else { break };
-                        let result = rpc_request(
-                            &stdin_for_input,
-                            &pending_for_input,
-                            &next_id_for_input,
-                            "thread/update",
-                            json!({
-                                "threadId": thread_id_for_input,
-                                "settings": session_settings_to_json(&update.payload.values),
-                            }),
-                        )
-                        .await
-                        .map(|_| ());
-                        if result.is_ok() {
-                            apply_codex_runtime_settings(
-                                &update.payload.values,
-                                &mut model_for_input,
-                                &mut effort_for_input,
-                            );
-                            model_name = model_for_input
-                                .clone()
-                                .unwrap_or_else(|| backend_default_model_name.clone());
-                        }
-                        let _ = update.reply.send(result);
-                    }
-                    interrupt = interrupt_rx.recv() => {
-                        let Some(()) = interrupt else { break };
-                        let Some(turn_id) = active_turn_id.clone() else { continue };
-                        let _ = rpc_request(
-                            &stdin_for_input,
-                            &pending_for_input,
-                            &next_id_for_input,
-                            "turn/interrupt",
-                            json!({
-                                "threadId": thread_id_for_input,
-                                "turnId": turn_id,
-                            }),
-                        )
-                        .await;
-                    }
-                }
-            }
-        });
-
-        match ready_rx.await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => return Err(err),
-            Err(_) => return Err("Codex spawn initialization task ended early".to_string()),
-        }
-
-        Ok((
-            Self {
-                input_tx,
-                settings_tx,
-                interrupt_tx,
-                session_id,
-                subagent_emitter_tx,
-            },
-            EventStream::new_backend(events_rx),
-        ))
+        Self::spawn_with_initial_emitter(workspace_roots, config, initial_input, None).await
     }
 
     async fn resume(
@@ -7668,8 +8495,12 @@ impl Backend for CodexBackend {
 
             let handle = session.command_handle();
             let maybe_emitter = subagent_emitter_rx.borrow().clone();
-            if let Some(emitter) = maybe_emitter {
-                session.set_subagent_emitter(emitter).await;
+            if let Some(emitter) = maybe_emitter
+                && let Err(err) = session.set_subagent_emitter(emitter).await
+            {
+                tracing::error!(%err, "Failed to install Codex sub-agent emitter for resumed session");
+                session.shutdown().await;
+                return;
             }
             let resolved_settings = resolve_session_settings(&config);
             let model_override = match resolved_settings.0.get("model") {
@@ -7708,8 +8539,10 @@ impl Backend for CodexBackend {
                 return;
             }
 
+            let mut normalization_failures = HashMap::new();
             while let Ok(raw) = raw_events.try_recv() {
-                if !forward_codex_backend_stream_event(raw, &events_tx) {
+                if !forward_codex_backend_stream_event(raw, &events_tx, &mut normalization_failures)
+                {
                     session.shutdown().await;
                     return;
                 }
@@ -7722,7 +8555,11 @@ impl Backend for CodexBackend {
                         let Some(raw) = incoming else {
                             break;
                         };
-                        if !forward_codex_backend_stream_event(raw, &events_tx) {
+                        if !forward_codex_backend_stream_event(
+                            raw,
+                            &events_tx,
+                            &mut normalization_failures,
+                        ) {
                             break;
                         }
                     }
@@ -7773,8 +8610,11 @@ impl Backend for CodexBackend {
                             break;
                         }
                         let maybe_emitter = subagent_emitter_rx.borrow().clone();
-                        if let Some(emitter) = maybe_emitter {
-                            session.set_subagent_emitter(emitter).await;
+                        if let Some(emitter) = maybe_emitter
+                            && let Err(err) = session.set_subagent_emitter(emitter).await
+                        {
+                            tracing::error!(%err, "Failed to update Codex sub-agent emitter for resumed session");
+                            break;
                         }
                     }
                 }
@@ -7816,6 +8656,8 @@ impl Backend for CodexBackend {
             watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
 
         let (ready_tx, ready_rx) = oneshot::channel::<Result<SessionId, BackendStartupError>>();
+        let (startup_cancel_tx, mut startup_cancel_rx) = oneshot::channel();
+        let mut startup_cancel_guard = CodexStartupCancelGuard(Some(startup_cancel_tx));
 
         tokio::spawn(async move {
             let mut ready_tx = Some(ready_tx);
@@ -7847,11 +8689,19 @@ impl Backend for CodexBackend {
                 }
             };
 
-            let child_session_id = session.session_id().await;
+            let child_session_id = session.session_id();
             let handle = session.command_handle();
             let maybe_emitter = subagent_emitter_rx.borrow().clone();
-            if let Some(emitter) = maybe_emitter {
-                session.set_subagent_emitter(emitter).await;
+            if let Some(emitter) = maybe_emitter
+                && let Err(err) = session.set_subagent_emitter(emitter).await
+            {
+                session.shutdown().await;
+                if let Some(tx) = ready_tx.take() {
+                    let _ = tx.send(Err(BackendStartupError::backend_failed(format!(
+                        "Failed to install Codex sub-agent emitter for forked session: {err}"
+                    ))));
+                }
+                return;
             }
 
             let resolved_settings = resolve_session_settings(&config);
@@ -7886,26 +8736,42 @@ impl Backend for CodexBackend {
                 }
             }
 
-            let images = protocol_images_to_attachments(initial_input.images);
-            if let Err(err) = handle
-                .execute(SessionCommand::SendMessage {
-                    message: initial_input.message,
-                    images,
-                })
-                .await
-            {
+            if ready_tx.as_ref().is_some_and(oneshot::Sender::is_closed) {
                 session.shutdown().await;
-                if let Some(tx) = ready_tx.take() {
-                    let _ = tx.send(Err(BackendStartupError::backend_failed(format!(
-                        "Failed to send initial Codex fork prompt: {err}"
-                    ))));
-                }
+                observe_codex_fork_startup_cancelled();
                 return;
+            }
+
+            let images = protocol_images_to_attachments(initial_input.images);
+            let initial_prompt = handle.execute(SessionCommand::SendMessage {
+                message: initial_input.message,
+                images,
+            });
+            tokio::pin!(initial_prompt);
+            tokio::select! {
+                biased;
+                _ = &mut startup_cancel_rx => {
+                    session.shutdown().await;
+                    observe_codex_fork_startup_cancelled();
+                    return;
+                }
+                result = &mut initial_prompt => {
+                    if let Err(err) = result {
+                        session.shutdown().await;
+                        if let Some(tx) = ready_tx.take() {
+                            let _ = tx.send(Err(BackendStartupError::backend_failed(format!(
+                                "Failed to send initial Codex fork prompt: {err}"
+                            ))));
+                        }
+                        return;
+                    }
+                }
             }
 
             if let Some(tx) = ready_tx.take() {
                 let _ = tx.send(Ok(child_session_id));
             }
+            let mut normalization_failures = HashMap::new();
 
             loop {
                 tokio::select! {
@@ -7913,7 +8779,11 @@ impl Backend for CodexBackend {
                         let Some(raw) = incoming else {
                             break;
                         };
-                        if !forward_codex_backend_stream_event(raw, &events_tx) {
+                        if !forward_codex_backend_stream_event(
+                            raw,
+                            &events_tx,
+                            &mut normalization_failures,
+                        ) {
                             break;
                         }
                     }
@@ -7964,8 +8834,11 @@ impl Backend for CodexBackend {
                             break;
                         }
                         let maybe_emitter = subagent_emitter_rx.borrow().clone();
-                        if let Some(emitter) = maybe_emitter {
-                            session.set_subagent_emitter(emitter).await;
+                        if let Some(emitter) = maybe_emitter
+                            && let Err(err) = session.set_subagent_emitter(emitter).await
+                        {
+                            tracing::error!(%err, "Failed to update Codex sub-agent emitter for forked session");
+                            break;
                         }
                     }
                 }
@@ -7983,6 +8856,7 @@ impl Backend for CodexBackend {
                 ));
             }
         };
+        startup_cancel_guard.disarm();
         let backend_session_id = Arc::new(std::sync::Mutex::new(Some(child_session_id)));
 
         Ok((
@@ -8062,6 +8936,11 @@ mod tests {
         binary: std::path::PathBuf,
         capture: std::path::PathBuf,
         argv_capture: std::path::PathBuf,
+        initial_turn_gate: std::path::PathBuf,
+        fork_response_marker: std::path::PathBuf,
+        startup_settings_gate: std::path::PathBuf,
+        command_execution_marker: std::path::PathBuf,
+        native_mcp_contacts: std::path::PathBuf,
     }
 
     #[derive(Clone)]
@@ -8073,15 +8952,26 @@ mod tests {
     struct CapturedCodexArgv {
         pid: u64,
         argv: Vec<String>,
+        codex_home: Option<std::path::PathBuf>,
+        auth_present: bool,
+        native_mcp_configured: bool,
     }
 
     struct CodexTestAppServerBinaryGuard {
         _serial: MutexGuard<'static, ()>,
         previous: Option<std::path::PathBuf>,
+        previous_native_home: Option<std::path::PathBuf>,
     }
 
     impl CodexTestAppServerBinaryGuard {
         fn set(binary: std::path::PathBuf) -> Self {
+            Self::set_with_native_home(binary, None)
+        }
+
+        fn set_with_native_home(
+            binary: std::path::PathBuf,
+            native_home: Option<std::path::PathBuf>,
+        ) -> Self {
             let serial = CODEX_FAKE_APP_SERVER_SERIAL
                 .get_or_init(|| std::sync::Mutex::new(()))
                 .lock()
@@ -8090,9 +8980,16 @@ mod tests {
                 .lock()
                 .expect("codex test app-server binary mutex poisoned")
                 .replace(binary);
+            let previous_native_home = std::mem::replace(
+                &mut *codex_test_native_home_override()
+                    .lock()
+                    .expect("codex test native home mutex poisoned"),
+                native_home,
+            );
             Self {
                 _serial: serial,
                 previous,
+                previous_native_home,
             }
         }
     }
@@ -8102,6 +8999,9 @@ mod tests {
             *codex_test_app_server_binary_override()
                 .lock()
                 .expect("codex test app-server binary mutex poisoned") = self.previous.take();
+            *codex_test_native_home_override()
+                .lock()
+                .expect("codex test native home mutex poisoned") = self.previous_native_home.take();
         }
     }
 
@@ -8139,9 +9039,14 @@ mod tests {
             let binary = dir.path().join("codex-fake-app-server.py");
             let capture = dir.path().join("requests.jsonl");
             let argv_capture = dir.path().join("argv.json");
+            let initial_turn_gate = dir.path().join("initial-turn-gate");
+            let fork_response_marker = dir.path().join("fork-response-sent");
+            let startup_settings_gate = dir.path().join("startup-settings-gate");
+            let command_execution_marker = dir.path().join("command-executed");
+            let native_mcp_contacts = dir.path().join("native-mcp-contacts.jsonl");
             let mut script = String::new();
             script.push_str("#!/usr/bin/env python3\n");
-            script.push_str("import json, os, sys\n");
+            script.push_str("import json, os, sys, threading, time\n");
             script.push_str(&format!(
                 "CAPTURE = {}\n",
                 serde_json::to_string(&capture.to_string_lossy()).expect("capture path JSON")
@@ -8159,16 +9064,54 @@ mod tests {
                 "CHILD_THREAD_ID = {}\n",
                 serde_json::to_string(child_thread_id).expect("child thread id JSON")
             ));
+            script.push_str(&format!(
+                "INITIAL_TURN_GATE = {}\n",
+                serde_json::to_string(&initial_turn_gate.to_string_lossy())
+                    .expect("initial turn gate path JSON")
+            ));
+            script.push_str(&format!(
+                "FORK_RESPONSE_MARKER = {}\n",
+                serde_json::to_string(&fork_response_marker.to_string_lossy())
+                    .expect("fork response marker path JSON")
+            ));
+            script.push_str(&format!(
+                "STARTUP_SETTINGS_GATE = {}\n",
+                serde_json::to_string(&startup_settings_gate.to_string_lossy())
+                    .expect("startup settings gate path JSON")
+            ));
+            script.push_str(&format!(
+                "COMMAND_EXECUTION_MARKER = {}\n",
+                serde_json::to_string(&command_execution_marker.to_string_lossy())
+                    .expect("command execution marker path JSON")
+            ));
+            script.push_str(&format!(
+                "NATIVE_MCP_CONTACTS = {}\n",
+                serde_json::to_string(&native_mcp_contacts.to_string_lossy())
+                    .expect("native MCP contacts path JSON")
+            ));
             script.push_str(
                 r#"
 def send(value):
     sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
     sys.stdout.flush()
 
+codex_home = os.environ.get("CODEX_HOME")
+auth_present = bool(codex_home) and os.path.isfile(os.path.join(codex_home, "auth.json"))
+native_mcp_configured = False
+if codex_home:
+    try:
+        with open(os.path.join(codex_home, "config.toml"), "r", encoding="utf-8") as native_config:
+            native_mcp_configured = "[mcp_servers.native-fixture]" in native_config.read()
+    except FileNotFoundError:
+        pass
+if native_mcp_configured:
+    with open(NATIVE_MCP_CONTACTS, "a", encoding="utf-8") as contacts:
+        contacts.write(json.dumps({"pid": os.getpid()}, separators=(",", ":")) + "\n")
 with open(ARGV_CAPTURE, "a", encoding="utf-8") as argv_capture:
-    argv_capture.write(json.dumps({"pid": os.getpid(), "argv": sys.argv[1:]}, separators=(",", ":")) + "\n")
+    argv_capture.write(json.dumps({"pid": os.getpid(), "argv": sys.argv[1:], "codex_home": codex_home, "auth_present": auth_present, "native_mcp_configured": native_mcp_configured}, separators=(",", ":")) + "\n")
 
 turn_count = 0
+inference_only = "features.shell_tool=false" in sys.argv
 for line in sys.stdin:
     try:
         request = json.loads(line)
@@ -8214,6 +9157,9 @@ for line in sys.stdin:
                 }
             })
         else:
+            if MODE == "fork_startup_delayed":
+                while not os.path.exists(INITIAL_TURN_GATE):
+                    time.sleep(0.005)
             send({
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -8227,13 +9173,33 @@ for line in sys.stdin:
                     "model": "fake-codex-model"
                 }
             })
+            if MODE == "fork_startup_delayed":
+                with open(FORK_RESPONSE_MARKER, "w", encoding="utf-8") as marker:
+                    marker.write("sent")
     elif method == "turn/start":
         turn_count += 1
-        if MODE == "fresh_agent_control_progress":
+        if MODE == "inference_reject_command" and inference_only:
+            send({
+                "jsonrpc": "2.0",
+                "id": 900,
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "threadId": "fresh-thread-id",
+                    "turnId": "turn-inference",
+                    "itemId": "naming-command",
+                    "command": "touch " + COMMAND_EXECUTION_MARKER
+                }
+            })
+        elif MODE == "inference_reject_command":
+            send({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"fresh-thread-id","turn":{"id":"turn-agent"}}})
+            send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"fresh-thread-id","item":{"id":"message-agent","type":"agentMessage","text":"real agent complete"}}})
+            send({"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"fresh-thread-id","turn":{"id":"turn-agent","status":"completed"}}})
+        elif MODE == "fresh_agent_control_progress":
             send({
                 "jsonrpc": "2.0",
                 "method": "turn/started",
                 "params": {
+                    "threadId": "fresh-thread-id",
                     "turn": {
                         "id": "turn-fresh"
                     }
@@ -8243,6 +9209,7 @@ for line in sys.stdin:
                 "jsonrpc": "2.0",
                 "method": "item/started",
                 "params": {
+                    "threadId": "fresh-thread-id",
                     "item": {
                         "id": "await-call-1",
                         "type": "mcpToolCall",
@@ -8257,6 +9224,7 @@ for line in sys.stdin:
                 "jsonrpc": "2.0",
                 "method": "item/completed",
                 "params": {
+                    "threadId": "fresh-thread-id",
                     "item": {
                         "id": "await-call-1",
                         "type": "mcpToolCall",
@@ -8269,6 +9237,7 @@ for line in sys.stdin:
                 "jsonrpc": "2.0",
                 "method": "item/started",
                 "params": {
+                    "threadId": "fresh-thread-id",
                     "item": {
                         "id": "spawn-call-1",
                         "type": "mcpToolCall",
@@ -8283,6 +9252,7 @@ for line in sys.stdin:
                 "jsonrpc": "2.0",
                 "method": "item/completed",
                 "params": {
+                    "threadId": "fresh-thread-id",
                     "item": {
                         "id": "spawn-call-1",
                         "type": "mcpToolCall",
@@ -8296,6 +9266,7 @@ for line in sys.stdin:
                 "jsonrpc": "2.0",
                 "method": "turn/completed",
                 "params": {
+                    "threadId": "fresh-thread-id",
                     "turn": {
                         "id": "turn-fresh",
                         "status": "completed"
@@ -8358,18 +9329,55 @@ for line in sys.stdin:
                     }
                 }
             })
+        elif MODE == "fresh_native_child_before_initial_response":
+            send({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"fresh-thread-id","turn":{"id":"turn-parent-live-order"}}})
+            send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"fresh-thread-id","item":{"id":"019f60f0-7a69-73f0-9ab3-7ddc24062e30","type":"collabAgentToolCall","tool":"spawn","senderThreadId":"fresh-thread-id","receiverThreadId":CHILD_THREAD_ID,"prompt":"reply exactly QUICK_DONE","receiverAgentType":"sub-agent","receiverAgentName":"/root/quick_child"}}})
+            send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"fresh-thread-id","item":{"id":"activity-quick-child","type":"sub_agent_activity","kind":"started","agent_thread_id":CHILD_THREAD_ID,"agent_path":"/root/quick_child"}}})
+            def delayed_initial_turn_response(response_id):
+                while not os.path.exists(INITIAL_TURN_GATE):
+                    time.sleep(0.005)
+                send({"jsonrpc":"2.0","id":response_id,"result":{"turn":{"id":"turn-fake"}}})
+            threading.Thread(target=delayed_initial_turn_response, args=(request_id,), daemon=True).start()
+            continue
+        elif MODE == "fresh_native_child_routing":
+            send({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"fresh-thread-id","turn":{"id":"turn-parent"}}})
+            send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"fresh-thread-id","item":{"id":"spawn-call","type":"collabAgentToolCall","tool":"spawn","senderThreadId":"fresh-thread-id","receiverThreadId":CHILD_THREAD_ID,"prompt":"inspect ownership","receiverAgentType":"worker","receiverAgentName":"Worker"}}})
+            send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"fresh-thread-id","item":{"id":"activity-child","type":"subAgentActivity","kind":"started","agentThreadId":CHILD_THREAD_ID,"agentPath":"/root/worker"}}})
+            send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"fresh-thread-id","item":{"id":"activity-child","type":"subAgentActivity","kind":"started","agentThreadId":CHILD_THREAD_ID,"agentPath":"/root/worker"}}})
+            send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"fresh-thread-id","item":{"id":"wait-call","type":"collabAgentToolCall","tool":"wait","senderThreadId":"fresh-thread-id","receiverThreadId":CHILD_THREAD_ID}}})
+            send({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":CHILD_THREAD_ID,"turn":{"id":"turn-child"}}})
+            send({"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":CHILD_THREAD_ID,"itemId":"message-child","delta":"child-only"}})
+            send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":CHILD_THREAD_ID,"item":{"id":"message-child","type":"agentMessage","text":"child-only"}}})
+            send({"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":CHILD_THREAD_ID,"turn":{"id":"turn-child","status":"interrupted"}}})
+            send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"fresh-thread-id","item":{"id":"wait-call","type":"collabAgentToolCall","tool":"wait","senderThreadId":"fresh-thread-id","receiverThreadId":CHILD_THREAD_ID,"agentsStates":{CHILD_THREAD_ID:{"status":"cancelled"}}}}})
+            send({"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"fresh-thread-id","turn":{"id":"turn-parent","status":"completed"}}})
+        elif MODE == "fresh_native_multi_child_routing":
+            child_a, child_b = "child-a", "child-b"
+            send({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"fresh-thread-id","turn":{"id":"turn-parent-multi"}}})
+            for child, label in ((child_a, "alpha"), (child_b, "beta")):
+                send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"fresh-thread-id","item":{"id":"spawn-"+label,"type":"collabAgentToolCall","senderThreadId":"fresh-thread-id","receiverThreadId":child,"prompt":"inspect "+label,"receiverAgentType":"worker","receiverAgentName":label}}})
+                send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"fresh-thread-id","item":{"id":"activity-"+label,"type":"sub_agent_activity","kind":"started","agent_thread_id":child,"agent_path":"/root/"+label}}})
+                send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"fresh-thread-id","item":{"id":"wait-"+label,"type":"collabAgentToolCall","tool":"wait","senderThreadId":"fresh-thread-id","receiverThreadId":child}}})
+            for child, label, status in ((child_b, "beta", "interrupted"), (child_a, "alpha", "completed")):
+                send({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":child,"turn":{"id":"turn-"+label}}})
+                send({"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":child,"itemId":"message-"+label,"delta":label+"-only"}})
+                send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":child,"item":{"id":"message-"+label,"type":"agentMessage","text":label+"-only"}}})
+                send({"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":child,"turn":{"id":"turn-"+label,"status":status}}})
+                send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"fresh-thread-id","item":{"id":"wait-"+label,"type":"collabAgentToolCall","tool":"wait","senderThreadId":"fresh-thread-id","receiverThreadId":child,"agentsStates":{child:{"status":status}}}}})
+            send({"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"fresh-thread-id","turn":{"id":"turn-parent-multi","status":"completed"}}})
         elif MODE in ("runtime_settings", "reject_runtime_settings"):
             turn_id = "turn-settings-" + str(turn_count)
             message_id = "message-settings-" + str(turn_count)
             send({
                 "jsonrpc": "2.0",
                 "method": "turn/started",
-                "params": {"turn": {"id": turn_id}}
+                "params": {"threadId": "fresh-thread-id", "turn": {"id": turn_id}}
             })
             send({
                 "jsonrpc": "2.0",
                 "method": "item/completed",
                 "params": {
+                    "threadId": "fresh-thread-id",
                     "item": {
                         "id": message_id,
                         "type": "agentMessage",
@@ -8380,7 +9388,7 @@ for line in sys.stdin:
             send({
                 "jsonrpc": "2.0",
                 "method": "turn/completed",
-                "params": {"turn": {"id": turn_id, "status": "completed"}}
+                "params": {"threadId": "fresh-thread-id", "turn": {"id": turn_id, "status": "completed"}}
             })
         send({
             "jsonrpc": "2.0",
@@ -8388,9 +9396,21 @@ for line in sys.stdin:
             "result": {"turn": {"id": "turn-fake"}}
         })
     elif method == "turn/interrupt":
+        if MODE == "fresh_native_child_before_initial_response":
+            send({"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"fresh-thread-id","turn":{"id":"turn-parent-live-order","status":"interrupted"}}})
         send({"jsonrpc": "2.0", "id": request_id, "result": {}})
     elif method == "thread/update":
-        if MODE == "reject_runtime_settings":
+        if MODE == "startup_settings_delayed":
+            def delayed_startup_settings_response(response_id):
+                while not os.path.exists(STARTUP_SETTINGS_GATE):
+                    time.sleep(0.005)
+                send({"jsonrpc":"2.0","id":response_id,"result":{}})
+            threading.Thread(target=delayed_startup_settings_response, args=(request_id,), daemon=True).start()
+            continue
+        elif MODE == "startup_settings_rejected" or (
+            MODE == "reject_runtime_settings"
+            and "approval_policy" not in params.get("settings", {})
+        ):
             send({
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -8398,6 +9418,10 @@ for line in sys.stdin:
             })
         else:
             send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method is None and request_id == 900 and MODE == "inference_reject_command":
+        if (request.get("result") or {}).get("decision") != "decline":
+            with open(COMMAND_EXECUTION_MARKER, "w", encoding="utf-8") as marker:
+                marker.write("executed")
     else:
         send({
             "jsonrpc": "2.0",
@@ -8425,7 +9449,21 @@ for line in sys.stdin:
                 binary,
                 capture,
                 argv_capture,
+                initial_turn_gate,
+                fork_response_marker,
+                startup_settings_gate,
+                command_execution_marker,
+                native_mcp_contacts,
             }
+        }
+
+        fn release_initial_turn(&self) {
+            std::fs::write(&self.initial_turn_gate, "release").expect("release fake initial turn");
+        }
+
+        fn release_startup_settings(&self) {
+            std::fs::write(&self.startup_settings_gate, "release")
+                .expect("release fake startup settings");
         }
 
         fn requests(&self) -> Vec<Value> {
@@ -8489,11 +9527,26 @@ for line in sys.stdin:
                             pid: value.get("pid").and_then(Value::as_u64).unwrap_or_default(),
                             argv: serde_json::from_value(argv.clone())
                                 .expect("fake app-server argv array"),
+                            codex_home: value
+                                .get("codex_home")
+                                .and_then(Value::as_str)
+                                .map(std::path::PathBuf::from),
+                            auth_present: value
+                                .get("auth_present")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                            native_mcp_configured: value
+                                .get("native_mcp_configured")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
                         },
                         None => CapturedCodexArgv {
                             pid: 0,
                             argv: serde_json::from_value(value)
                                 .expect("fake app-server argv array"),
+                            codex_home: None,
+                            auth_present: false,
+                            native_mcp_configured: false,
                         },
                     }
                 })
@@ -8506,6 +9559,27 @@ for line in sys.stdin:
                 .find(|captured| captured.pid == pid)
                 .map(|captured| captured.argv)
                 .expect("fake app-server argv for pid")
+        }
+
+        fn environment_for_pid(&self, pid: u64) -> CapturedCodexArgv {
+            self.captured_argv()
+                .into_iter()
+                .find(|captured| captured.pid == pid)
+                .expect("fake app-server environment for pid")
+        }
+
+        fn native_mcp_contact_pids(&self) -> Vec<u64> {
+            std::fs::read_to_string(&self.native_mcp_contacts)
+                .unwrap_or_default()
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<Value>(line)
+                        .expect("native MCP contact JSON")
+                        .get("pid")
+                        .and_then(Value::as_u64)
+                        .expect("native MCP contact pid")
+                })
+                .collect()
         }
     }
 
@@ -8636,49 +9710,6 @@ for line in sys.stdin:
                 .map(|change| change.path.as_str())
                 .collect::<Vec<_>>(),
             vec!["src/a.rs", "src/b.rs"]
-        );
-    }
-
-    #[test]
-    fn codex_agent_message_completion_skips_empty_duplicate_after_turn_close() {
-        let disposition = codex_agent_message_completion_disposition(false, false, true, "");
-
-        assert_eq!(
-            disposition,
-            CodexAgentMessageCompletionDisposition::SkipDuplicateEmpty
-        );
-    }
-
-    #[test]
-    fn codex_agent_message_completion_starts_stream_for_late_content() {
-        let disposition =
-            codex_agent_message_completion_disposition(false, false, true, "final answer");
-
-        assert_eq!(
-            disposition,
-            CodexAgentMessageCompletionDisposition::EmitWithSyntheticStart
-        );
-    }
-
-    #[test]
-    fn codex_agent_message_completion_skips_second_completed_item() {
-        let disposition =
-            codex_agent_message_completion_disposition(false, true, false, "duplicate");
-
-        assert_eq!(
-            disposition,
-            CodexAgentMessageCompletionDisposition::SkipDuplicateCompleted
-        );
-    }
-
-    #[test]
-    fn codex_agent_message_completion_skips_pending_duplicate() {
-        let disposition =
-            codex_agent_message_completion_disposition(true, true, false, "duplicate");
-
-        assert_eq!(
-            disposition,
-            CodexAgentMessageCompletionDisposition::SkipDuplicateCompleted
         );
     }
 
@@ -8952,6 +9983,291 @@ for line in sys.stdin:
         })
         .await
         .expect("fake Codex StreamEnd timeout")
+    }
+
+    async fn wait_for_codex_test_error(events: &mut EventStream) -> String {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(event) = events.recv().await {
+                if let ChatEvent::MessageAdded(message) = event
+                    && matches!(message.sender, MessageSender::Error)
+                {
+                    return message.content;
+                }
+            }
+            panic!("fake Codex event stream ended before typed error");
+        })
+        .await
+        .expect("fake Codex typed error timeout")
+    }
+
+    #[tokio::test]
+    async fn codex_naming_mode_isolates_config_and_rejects_commands() {
+        let fake = CodexFakeAppServer::new("inference_reject_command", "unused");
+        let native_home = tempfile::tempdir().expect("native Codex home fixture");
+        std::fs::write(
+            native_home.path().join("config.toml"),
+            "[mcp_servers.native-fixture]\nurl = \"https://native.invalid/mcp\"\n",
+        )
+        .expect("write native Codex MCP fixture");
+        std::fs::write(
+            native_home.path().join("auth.json"),
+            r#"{"OPENAI_API_KEY":"fixture-only","tokens":null}"#,
+        )
+        .expect("write native Codex auth fixture");
+        let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
+            fake.binary.clone(),
+            Some(native_home.path().to_path_buf()),
+        );
+        let isolated_workspace = tempfile::tempdir().expect("isolated naming workspace");
+        let isolated_root = isolated_workspace.path().to_string_lossy().to_string();
+        let configured_mcp = StartupMcpServer {
+            name: "method-not-allowed".to_owned(),
+            transport: StartupMcpTransport::Http {
+                url: "https://example.com/mcp".to_owned(),
+                headers: HashMap::new(),
+                bearer_token_env_var: None,
+            },
+        };
+        let mut configured_settings = protocol::SessionSettingsValues::default();
+        configured_settings.0.insert(
+            "model".to_owned(),
+            SessionSettingValue::String("configured-model".to_owned()),
+        );
+        configured_settings.0.insert(
+            "reasoning_effort".to_owned(),
+            SessionSettingValue::String("high".to_owned()),
+        );
+        let task = "Investigate the configured MCP endpoint";
+        let naming_prompt = crate::agent::build_name_generation_prompt(task);
+        let mut naming_config = crate::agent::agent_name_generation_spawn_config();
+        naming_config.startup_mcp_servers = vec![configured_mcp.clone()];
+        naming_config.session_settings = Some(configured_settings.clone());
+        naming_config.resolved_spawn_config.instructions =
+            Some("This configured agent instruction must not enter naming.".to_owned());
+
+        let (naming_backend, mut naming_events) = <CodexBackend as Backend>::spawn(
+            vec![isolated_root.clone()],
+            naming_config,
+            protocol::SendMessagePayload {
+                message: naming_prompt.clone(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+        )
+        .await
+        .expect("spawn production Codex naming backend against fake app-server");
+        let naming_error = wait_for_codex_test_error(&mut naming_events).await;
+        assert_eq!(
+            naming_error,
+            "Codex transient inference rejected tool request 'item/commandExecution/requestApproval'"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        naming_backend.shutdown().await;
+
+        let naming_capture = fake.captured_requests();
+        let naming_pid = naming_capture
+            .iter()
+            .find(|captured| {
+                captured
+                    .request
+                    .pointer("/params/input/0/text")
+                    .and_then(Value::as_str)
+                    == Some(naming_prompt.as_str())
+            })
+            .map(|captured| captured.pid)
+            .expect("captured naming turn");
+        let naming_requests = naming_capture
+            .iter()
+            .filter(|captured| captured.pid == naming_pid)
+            .map(|captured| &captured.request)
+            .collect::<Vec<_>>();
+        let naming_thread = naming_requests
+            .iter()
+            .find(|request| request.get("method").and_then(Value::as_str) == Some("thread/start"))
+            .expect("naming thread/start");
+        assert_eq!(
+            naming_thread.pointer("/params/cwd").and_then(Value::as_str),
+            Some(isolated_root.as_str())
+        );
+        assert_eq!(
+            naming_thread
+                .pointer("/params/sandbox")
+                .and_then(Value::as_str),
+            Some(CODEX_INFERENCE_SANDBOX)
+        );
+        assert_eq!(
+            naming_thread
+                .pointer("/params/approvalPolicy")
+                .and_then(Value::as_str),
+            Some(CODEX_INFERENCE_APPROVAL_POLICY)
+        );
+        assert_eq!(
+            naming_thread
+                .pointer("/params/ephemeral")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        let naming_turn = naming_requests
+            .iter()
+            .find(|request| request.get("method").and_then(Value::as_str) == Some("turn/start"))
+            .expect("naming turn/start");
+        assert_eq!(
+            naming_turn
+                .pointer("/params/input/0/text")
+                .and_then(Value::as_str),
+            Some(naming_prompt.as_str())
+        );
+        assert_eq!(naming_turn.pointer("/params/model"), None);
+        assert_eq!(naming_turn.pointer("/params/effort"), None);
+        assert_eq!(
+            naming_turn
+                .pointer("/params/sandboxPolicy/type")
+                .and_then(Value::as_str),
+            Some("readOnly")
+        );
+        assert_eq!(
+            naming_turn
+                .pointer("/params/sandboxPolicy/networkAccess")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            naming_turn
+                .pointer("/params/approvalPolicy")
+                .and_then(Value::as_str),
+            Some(CODEX_INFERENCE_APPROVAL_POLICY)
+        );
+        let rejection = naming_requests
+            .iter()
+            .find(|request| request.get("id").and_then(Value::as_u64) == Some(900))
+            .expect("captured naming command rejection");
+        assert_eq!(
+            rejection
+                .pointer("/result/decision")
+                .and_then(Value::as_str),
+            Some("decline")
+        );
+        let naming_argv = fake.argv_for_pid(naming_pid);
+        for disabled in codex_inference_config_overrides() {
+            assert!(naming_argv.contains(&disabled), "missing {disabled}");
+        }
+        assert!(
+            !naming_argv
+                .iter()
+                .any(|arg| arg.starts_with("mcp_servers."))
+        );
+        assert!(
+            !naming_argv
+                .iter()
+                .any(|arg| arg.starts_with("model_instructions_file="))
+        );
+        let naming_environment = fake.environment_for_pid(naming_pid);
+        assert_ne!(
+            naming_environment.codex_home.as_deref(),
+            Some(native_home.path())
+        );
+        assert!(naming_environment.auth_present);
+        assert!(!naming_environment.native_mcp_configured);
+        assert!(!fake.native_mcp_contact_pids().contains(&naming_pid));
+        assert!(!fake.command_execution_marker.exists());
+
+        let real_workspace = tempfile::tempdir().expect("real agent workspace");
+        let real_root = real_workspace.path().to_string_lossy().to_string();
+        let real_task = "Perform the full configured agent task";
+        let real_config = BackendSpawnConfig {
+            execution_mode: BackendExecutionMode::Agent,
+            startup_mcp_servers: vec![configured_mcp],
+            session_settings: Some(configured_settings),
+            resolved_spawn_config: crate::agent::customization::ResolvedSpawnConfig {
+                instructions: Some("Retain the real agent instruction.".to_owned()),
+                access_mode: BackendAccessMode::Unrestricted,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (real_backend, mut real_events) = <CodexBackend as Backend>::spawn(
+            vec![real_root.clone()],
+            real_config,
+            protocol::SendMessagePayload {
+                message: real_task.to_owned(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+        )
+        .await
+        .expect("spawn production real-agent Codex backend against fake app-server");
+        let _ = wait_for_codex_test_stream_end(&mut real_events).await;
+        real_backend.shutdown().await;
+
+        let real_capture = fake.captured_requests();
+        let real_pid = real_capture
+            .iter()
+            .find(|captured| {
+                captured
+                    .request
+                    .pointer("/params/input/0/text")
+                    .and_then(Value::as_str)
+                    == Some(real_task)
+            })
+            .map(|captured| captured.pid)
+            .expect("captured real agent turn");
+        let real_requests = real_capture
+            .iter()
+            .filter(|captured| captured.pid == real_pid)
+            .map(|captured| &captured.request)
+            .collect::<Vec<_>>();
+        let real_thread = real_requests
+            .iter()
+            .find(|request| request.get("method").and_then(Value::as_str) == Some("thread/start"))
+            .expect("real agent thread/start");
+        assert_eq!(
+            real_thread.pointer("/params/cwd").and_then(Value::as_str),
+            Some(real_root.as_str())
+        );
+        assert_eq!(
+            real_thread
+                .pointer("/params/ephemeral")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        let real_turn = real_requests
+            .iter()
+            .find(|request| request.get("method").and_then(Value::as_str) == Some("turn/start"))
+            .expect("real agent turn/start");
+        assert_eq!(
+            real_turn
+                .pointer("/params/input/0/text")
+                .and_then(Value::as_str),
+            Some(real_task)
+        );
+        assert_eq!(
+            real_turn.pointer("/params/model").and_then(Value::as_str),
+            Some("configured-model")
+        );
+        assert_eq!(
+            real_turn.pointer("/params/effort").and_then(Value::as_str),
+            Some("high")
+        );
+        let real_argv = fake.argv_for_pid(real_pid);
+        assert!(real_argv.iter().any(|arg| {
+            arg == "mcp_servers.method-not-allowed.url=\"https://example.com/mcp\""
+        }));
+        assert!(
+            real_argv
+                .iter()
+                .any(|arg| arg.starts_with("model_instructions_file="))
+        );
+        assert!(!real_argv.contains(&"features.shell_tool=false".to_owned()));
+        let real_environment = fake.environment_for_pid(real_pid);
+        assert_eq!(
+            real_environment.codex_home.as_deref(),
+            Some(native_home.path())
+        );
+        assert!(real_environment.auth_present);
+        assert!(real_environment.native_mcp_configured);
+        assert!(fake.native_mcp_contact_pids().contains(&real_pid));
     }
 
     #[tokio::test]
@@ -9359,6 +10675,137 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
+    async fn dropping_codex_spawn_after_readiness_cancels_before_initial_prompt() {
+        let fake = CodexFakeAppServer::new("ok", "unused");
+        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
+        let (ready_tx, mut ready_rx) = oneshot::channel();
+        *CODEX_SPAWN_READY_OBSERVER
+            .lock()
+            .expect("Codex spawn ready observer mutex poisoned") = Some(ready_tx);
+        let mut thread_start_request_rx = install_codex_request_observer("thread/start");
+        let (cancelled_tx, cancelled_rx) = oneshot::channel();
+        *CODEX_SPAWN_STARTUP_CANCEL_OBSERVER
+            .lock()
+            .expect("Codex spawn startup cancel observer mutex poisoned") = Some(cancelled_tx);
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut startup = Box::pin(CodexBackend::spawn(
+            vec![workspace.path().to_string_lossy().to_string()],
+            BackendSpawnConfig::default(),
+            protocol::SendMessagePayload {
+                message: "must not submit after readiness cancellation".to_owned(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+        ));
+        tokio::time::timeout(CODEX_REQUEST_TIMEOUT, async {
+            tokio::select! {
+                biased;
+                observed = &mut thread_start_request_rx => {
+                    observed.expect("Codex worker must retain the thread/start request observer");
+                }
+                result = startup.as_mut() => {
+                    match result {
+                        Ok(_) => panic!("Codex spawn completed before issuing thread/start"),
+                        Err(error) => {
+                            panic!("Codex spawn failed before issuing thread/start: {error}")
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("fixture must observe the real thread/start write before readiness");
+        tokio::time::timeout(CODEX_REQUEST_TIMEOUT, async {
+            tokio::select! {
+                biased;
+                observed = &mut ready_rx => {
+                    observed.expect("Codex worker must retain readiness observer");
+                }
+                _ = startup.as_mut() => {
+                    panic!("Codex spawn must not complete before the readiness handoff is observed");
+                }
+            }
+        })
+        .await
+        .expect("production Codex spawn must reach its readiness handoff");
+
+        drop(startup);
+
+        tokio::time::timeout(CODEX_REQUEST_TIMEOUT, cancelled_rx)
+            .await
+            .expect("detached Codex spawn worker must acknowledge startup cancellation")
+            .expect("detached Codex spawn worker must retain its cancellation observer");
+        let methods = fake
+            .requests()
+            .into_iter()
+            .filter_map(|request| {
+                request
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .collect::<Vec<_>>();
+        assert!(methods.iter().any(|method| method == "thread/start"));
+        assert!(
+            !methods.iter().any(|method| method == "turn/start"),
+            "dropping ordinary Codex startup at the readiness handoff must prevent the paid initial prompt: {methods:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_codex_fork_startup_cancels_before_initial_prompt() {
+        let fake = CodexFakeAppServer::new("fork_startup_delayed", "cancelled-child-thread");
+        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
+        let (cancelled_tx, cancelled_rx) = oneshot::channel();
+        *CODEX_FORK_STARTUP_CANCEL_OBSERVER
+            .lock()
+            .expect("Codex fork startup cancel observer mutex poisoned") = Some(cancelled_tx);
+        let mut fork_request_rx = install_codex_request_observer("thread/fork");
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut startup = Box::pin(<CodexBackend as Backend>::fork(
+            vec![workspace.path().to_string_lossy().to_string()],
+            BackendSpawnConfig::default(),
+            SessionId("cancelled-parent-thread".to_owned()),
+            protocol::SendMessagePayload {
+                message: "must not submit after actor cancellation".to_owned(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+        ));
+        tokio::time::timeout(CODEX_REQUEST_TIMEOUT, async {
+            tokio::select! {
+                observed = &mut fork_request_rx => {
+                    observed.expect("Codex worker must retain the fork request observer");
+                }
+                _ = startup.as_mut() => {
+                    panic!("fork startup completed before the fixture held its real fork request");
+                }
+            }
+        })
+        .await
+        .expect("fixture must observe the detached Codex fork request before readiness");
+        drop(startup);
+        fake.release_initial_turn();
+
+        tokio::time::timeout(CODEX_REQUEST_TIMEOUT, cancelled_rx)
+            .await
+            .expect("detached Codex fork worker must acknowledge startup cancellation")
+            .expect("detached Codex fork worker must retain its cancellation observer");
+        assert!(
+            fake.fork_response_marker.exists(),
+            "fixture must release the detached worker's real fork response before cancellation"
+        );
+        assert!(
+            !fake.requests().iter().any(|request| {
+                request.get("method").and_then(Value::as_str) == Some("turn/start")
+            }),
+            "dropping startup must explicitly cancel the detached worker before the paid initial prompt"
+        );
+    }
+
+    #[tokio::test]
     async fn codex_backend_fork_cleans_steering_tempfile_when_app_server_spawn_fails() {
         let missing_binary_dir = tempfile::tempdir().expect("missing binary tempdir");
         let _guard = CodexTestAppServerBinaryGuard::set(
@@ -9589,14 +11036,21 @@ for line in sys.stdin:
             reasoning_effort: Some("xhigh".to_string()),
             approval_policy: None,
             access_mode: BackendAccessMode::Unrestricted,
+            execution_mode: BackendExecutionMode::Agent,
             turn_network_access: false,
             active_turn_id: Some("turn-test".to_string()),
             active_stream: Some(ActiveStreamState {
                 turn_id: "turn-test".to_string(),
-                message_id: "msg-seed".to_string(),
+                message_id: ChatMessageId("msg-seed".to_string()),
+                generated_identity: None,
                 text: String::new(),
                 reasoning: String::new(),
+                reasoning_only: false,
             }),
+            completed_agent_messages: HashMap::new(),
+            quarantined_turn_id: None,
+            generated_identity_epoch: codex_generated_identity_epoch("thread-test"),
+            next_generated_identity_ordinal: 1,
             pending_tool_call_ids: HashSet::new(),
             close_active_stream_when_tools_idle: false,
             pending_message_metadata: None,
@@ -9609,6 +11063,10 @@ for line in sys.stdin:
             pending_user_input_bytes: 0,
             conversation_bytes_total: 0,
             subagent_emitter: None,
+            pending_subagent_spawns: HashMap::new(),
+            conflicting_subagent_threads: HashMap::new(),
+            registering_subagent_threads: HashSet::new(),
+            unknown_owner_notifications: HashSet::new(),
             subagent_streams: HashMap::new(),
             completed_subagent_streams: HashMap::new(),
         }
@@ -9641,6 +11099,7 @@ for line in sys.stdin:
             child: Arc::new(Mutex::new(Some(child))),
             stdout_task,
             stderr_task,
+            _isolated_codex_home: None,
         };
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(CodexInner {
@@ -9657,9 +11116,20 @@ for line in sys.stdin:
 
     fn drain_events(rx: &mut mpsc::UnboundedReceiver<Value>) -> Vec<Value> {
         let mut out = Vec::new();
+        let mut normalization_failures = HashMap::new();
         while let Ok(event) = rx.try_recv() {
-            if event.get("kind").and_then(Value::as_str) != Some("ModelRequestTokenUsage") {
-                out.push(event);
+            match event.get("kind").and_then(Value::as_str) {
+                Some("ModelRequestTokenUsage") => {}
+                Some("Error") => {
+                    let forwarded =
+                        codex_backend_event_from_raw(&event, &mut normalization_failures)
+                            .expect("raw Codex error must forward to a visible chat event");
+                    out.push(
+                        serde_json::to_value(forwarded.chat_event)
+                            .expect("serialize forwarded Codex error"),
+                    );
+                }
+                _ => out.push(event),
             }
         }
         out
@@ -9673,16 +11143,27 @@ for line in sys.stdin:
         let mut state = inner.state.lock().await;
         state.thread_id = "thread-parent".to_string();
         state.subagent_streams.insert(
-            "spawn-1".to_string(),
+            receiver_thread_id.to_string(),
             CodexSubAgentStream {
                 emitter: Arc::new(TurnEmitter::new_for_agent(
                     subagent_tx,
                     AgentName(CODEX_AGENT_NAME),
                 )),
-                receiver_thread_id: Some(receiver_thread_id.to_string()),
-                external_agent_id: Some(receiver_thread_id.to_string()),
+                spawn_item_id: receiver_thread_id.to_string(),
+                activity_item_id: None,
+                agent_path: receiver_thread_id.to_string(),
+                sender_thread_id: "thread-parent".to_string(),
                 active_turn_id: None,
                 current_message_id: None,
+                current_generated_identity: None,
+                current_reasoning_only: false,
+                current_text: String::new(),
+                current_reasoning: String::new(),
+                completed_agent_messages: HashMap::new(),
+                quarantined_turn_id: None,
+                quarantined: false,
+                generated_identity_epoch: codex_generated_identity_epoch(receiver_thread_id),
+                next_generated_identity_ordinal: 1,
                 pending_message_metadata: None,
                 token_usage_by_turn: HashMap::new(),
             },
@@ -9698,7 +11179,8 @@ for line in sys.stdin:
 
     fn forwarded_codex_event(raw: Value) -> (bool, Option<ChatEvent>) {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let keep_open = forward_codex_backend_event(raw, &tx);
+        let mut normalization_failures = HashMap::new();
+        let keep_open = forward_codex_backend_event(raw, &tx, &mut normalization_failures);
         (keep_open, rx.try_recv().ok())
     }
 
@@ -9728,6 +11210,156 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn malformed_canonical_codex_tool_request_is_visible_and_inspectable() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut normalization_failures = HashMap::new();
+        assert!(forward_codex_backend_event(
+            json!({
+                "kind": "ToolRequest",
+                "data": {
+                    "tool_call_id": "call-malformed",
+                    "tool_name": "mcp__tyde-agent-control__tyde_send_agent_message",
+                    "tool_type": {
+                        "kind": "Other",
+                        "args": { "agent_id": "agent-a" }
+                    }
+                }
+            }),
+            &tx,
+            &mut normalization_failures,
+        ));
+
+        let ChatEvent::MessageAdded(error) = rx.try_recv().expect("visible invariant error") else {
+            panic!("malformed canonical request must emit a visible error");
+        };
+        assert!(matches!(error.sender, MessageSender::Error));
+        assert!(error.content.contains("tyde_send_agent_message"));
+        assert!(error.content.contains("call-malformed"));
+
+        let ChatEvent::ToolRequest(request) = rx.try_recv().expect("inspectable raw request")
+        else {
+            panic!("malformed canonical request must remain inspectable");
+        };
+        assert!(matches!(
+            request.tool_type,
+            protocol::ToolRequestType::Other { .. }
+        ));
+    }
+
+    #[test]
+    fn malformed_codex_request_marks_its_completion_without_exposing_arguments() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut normalization_failures = HashMap::new();
+        assert!(forward_codex_backend_event(
+            json!({
+                "kind": "ToolRequest",
+                "data": {
+                    "tool_call_id": "call-normalization",
+                    "tool_name": "mcp__tyde-agent-control__tyde_send_agent_message",
+                    "tool_type": {
+                        "kind": "Other",
+                        "args": { "agent_id": "agent-a", "api_key": "request-secret" }
+                    }
+                }
+            }),
+            &tx,
+            &mut normalization_failures,
+        ));
+        let _ = rx.try_recv().expect("visible normalization diagnostic");
+        let _ = rx.try_recv().expect("inspectable fallback request");
+
+        assert!(forward_codex_backend_event(
+            json!({
+                "kind": "ToolExecutionCompleted",
+                "data": {
+                    "tool_call_id": "call-normalization",
+                    "tool_name": "mcp__tyde-agent-control__tyde_send_agent_message",
+                    "tool_result": { "kind": "Other", "result": { "ok": true } },
+                    "success": true,
+                    "error": null,
+                }
+            }),
+            &tx,
+            &mut normalization_failures,
+        ));
+        let ChatEvent::ToolExecutionCompleted(completion) =
+            rx.try_recv().expect("marked completion")
+        else {
+            panic!("expected marked tool completion");
+        };
+        assert_eq!(
+            completion.normalization_failure,
+            Some(ToolExecutionNormalizationFailure::CanonicalRequest)
+        );
+        let encoded = serde_json::to_string(&completion).expect("serialize marked completion");
+        assert!(!encoded.contains("request-secret"));
+    }
+
+    #[test]
+    fn malformed_codex_result_marks_only_its_completion() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut normalization_failures = HashMap::new();
+        assert!(forward_codex_backend_event(
+            json!({
+                "kind": "ToolRequest",
+                "data": {
+                    "tool_call_id": "call-result-normalization",
+                    "tool_name": "mcp__tyde-agent-await__tyde_await_agents",
+                    "tool_type": {
+                        "kind": "Other",
+                        "args": { "arguments": { "agent_ids": ["agent-a"] } }
+                    }
+                }
+            }),
+            &tx,
+            &mut normalization_failures,
+        ));
+        let ChatEvent::ToolRequest(request) = rx.try_recv().expect("typed request") else {
+            panic!("expected typed tool request");
+        };
+        assert!(matches!(
+            request.tool_type,
+            protocol::ToolRequestType::TydeAwaitAgents { .. }
+        ));
+
+        assert!(forward_codex_backend_event(
+            json!({
+                "kind": "ToolExecutionCompleted",
+                "data": {
+                    "tool_call_id": "call-result-normalization",
+                    "tool_name": "mcp__tyde-agent-await__tyde_await_agents",
+                    "tool_result": {
+                        "kind": "Other",
+                        "result": { "ready": [], "api_key": "result-secret" }
+                    },
+                    "success": true,
+                    "error": null,
+                }
+            }),
+            &tx,
+            &mut normalization_failures,
+        ));
+        let ChatEvent::MessageAdded(error) = rx.try_recv().expect("result diagnostic") else {
+            panic!("expected visible result diagnostic");
+        };
+        assert!(matches!(error.sender, MessageSender::Error));
+        assert!(
+            !serde_json::to_string(&error)
+                .expect("serialize result diagnostic")
+                .contains("result-secret")
+        );
+        let ChatEvent::ToolExecutionCompleted(completion) =
+            rx.try_recv().expect("marked completion")
+        else {
+            panic!("expected marked tool completion");
+        };
+        assert_eq!(
+            completion.normalization_failure,
+            Some(ToolExecutionNormalizationFailure::CanonicalResult)
+        );
+    }
+
+    #[test]
     fn model_request_usage_uses_backend_only_event_path() {
         let usage = ModelRequestTokenUsage {
             request_id: ModelRequestId {
@@ -9753,8 +11385,13 @@ for line in sys.stdin:
             "data": serde_json::to_value(&usage).expect("serialize usage"),
         });
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut normalization_failures = HashMap::new();
 
-        assert!(forward_codex_backend_stream_event(raw.clone(), &tx));
+        assert!(forward_codex_backend_stream_event(
+            raw.clone(),
+            &tx,
+            &mut normalization_failures,
+        ));
         let BackendEvent::ModelRequestTokenUsage(forwarded) =
             rx.try_recv().expect("backend usage event")
         else {
@@ -9763,7 +11400,11 @@ for line in sys.stdin:
         assert_eq!(forwarded, usage);
 
         let (chat_tx, mut chat_rx) = mpsc::unbounded_channel();
-        assert!(forward_codex_backend_event(raw, &chat_tx));
+        assert!(forward_codex_backend_event(
+            raw,
+            &chat_tx,
+            &mut normalization_failures,
+        ));
         assert!(chat_rx.try_recv().is_err());
     }
 
@@ -9827,7 +11468,7 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn codex_backend_spawn_inline_loop_emits_agent_control_progress() {
+    async fn codex_backend_fresh_spawn_emits_agent_control_progress() {
         let fake = CodexFakeAppServer::new("fresh_agent_control_progress", "unused");
         let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
         let workspace = tempfile::tempdir().expect("workspace tempdir");
@@ -9884,16 +11525,680 @@ for line in sys.stdin:
         backend.shutdown().await;
         assert!(
             saw_await,
-            "fresh Codex inline loop did not emit Await progress"
+            "fresh Codex session loop did not emit Await progress"
         );
         assert!(
             saw_spawn,
-            "fresh Codex inline loop did not emit Spawn progress"
+            "fresh Codex session loop did not emit Spawn progress"
         );
     }
 
     #[tokio::test]
-    async fn codex_backend_spawn_inline_loop_patches_late_token_usage_after_turn_completed() {
+    async fn codex_backend_fresh_spawn_routes_native_child_by_thread() {
+        let fake = CodexFakeAppServer::new("fresh_native_child_routing", "child-thread-id");
+        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let emitter = Arc::new(RecordingSubAgentEmitter::new());
+        let (backend, mut events) = CodexBackend::spawn_with_subagent_emitter(
+            vec![workspace.path().to_string_lossy().to_string()],
+            BackendSpawnConfig::default(),
+            protocol::SendMessagePayload {
+                message: "start".to_string(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+            emitter.clone() as Arc<dyn SubAgentEmitter>,
+        )
+        .await
+        .expect("production Codex spawn should start against fake app-server");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut parent_events = Vec::new();
+        let mut saw_wait_request = false;
+        let mut saw_wait_completion = false;
+        let mut saw_parent_terminal = false;
+        while tokio::time::Instant::now() < deadline && !saw_parent_terminal {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, events.recv()).await {
+                Ok(Some(event)) => {
+                    saw_wait_request |= matches!(
+                        &event,
+                        ChatEvent::ToolRequest(request) if request.tool_call_id == "wait-call"
+                    );
+                    saw_wait_completion |= matches!(
+                        &event,
+                        ChatEvent::ToolExecutionCompleted(completion)
+                            if completion.tool_call_id == "wait-call"
+                                && completion.success
+                                && completion.error.is_none()
+                    );
+                    saw_parent_terminal |= matches!(&event, ChatEvent::TypingStatusChanged(false));
+                    parent_events.push(event);
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(
+            emitter.spawn_count().await,
+            1,
+            "repeated child activity must not create another relay"
+        );
+        assert!(
+            !parent_events.iter().any(|event| matches!(
+                event,
+                ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::Error)
+            )),
+            "identical activity started/completed must not surface a parent error"
+        );
+        assert!(
+            saw_wait_request,
+            "fixture must exercise the parent's pending wait card"
+        );
+        assert!(
+            saw_wait_completion,
+            "wait must complete with Codex's result, not cancellation"
+        );
+        assert!(
+            saw_parent_terminal,
+            "fixture must drain through the parent terminal marker"
+        );
+        let child_events = emitter.events_by_agent().await;
+        assert!(child_events.values().flatten().any(|event| matches!(
+            event,
+            ChatEvent::StreamEnd(payload) if payload.message.content == "child-only"
+        )));
+        assert!(
+            child_events
+                .values()
+                .flatten()
+                .any(|event| matches!(event, ChatEvent::OperationCancelled(_)))
+        );
+        assert!(!parent_events.iter().any(|event| matches!(
+            event,
+            ChatEvent::StreamEnd(payload) if payload.message.content == "child-only"
+        )));
+        assert!(
+            !parent_events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::OperationCancelled(_))),
+            "the child interruption must not cancel the parent wait/turn"
+        );
+
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn codex_backend_publishes_parent_session_before_live_order_child_activity() {
+        let fake = CodexFakeAppServer::new(
+            "fresh_native_child_before_initial_response",
+            "native-quick-child-thread",
+        );
+        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
+        let (ready_tx, mut ready_rx) = oneshot::channel();
+        *CODEX_SPAWN_READY_OBSERVER
+            .lock()
+            .expect("Codex spawn ready observer mutex poisoned") = Some(ready_tx);
+        let mut initial_turn_request_rx = install_codex_request_observer("turn/start");
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let emitter = Arc::new(RecordingSubAgentEmitter::new());
+        let startup = CodexBackend::spawn_with_subagent_emitter(
+            vec![workspace.path().to_string_lossy().to_string()],
+            BackendSpawnConfig::default(),
+            protocol::SendMessagePayload {
+                message: "start release child routing".to_string(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+            emitter.clone() as Arc<dyn SubAgentEmitter>,
+        );
+        tokio::pin!(startup);
+        tokio::time::timeout(CODEX_REQUEST_TIMEOUT, async {
+            tokio::select! {
+                biased;
+                observed = &mut ready_rx => {
+                    observed
+                        .expect("Codex worker must retain its parent-session readiness observer");
+                }
+                result = &mut startup => {
+                    match result {
+                        Ok(_) => panic!(
+                            "Codex startup completed before its parent-session readiness handoff was observed"
+                        ),
+                        Err(error) => {
+                            panic!(
+                                "production Codex startup failed before parent-session readiness: {error}"
+                            )
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect(
+            "fixture must observe authoritative parent-session publication before the delayed initial turn response",
+        );
+        let (backend, mut events) = match tokio::time::timeout(
+            Duration::from_millis(500),
+            &mut startup,
+        )
+        .await
+        {
+            Ok(Ok(started)) => started,
+            Ok(Err(error)) => {
+                panic!("production Codex startup failed before child ordering check: {error}")
+            }
+            Err(_) => {
+                fake.release_initial_turn();
+                let _ = tokio::time::timeout(Duration::from_secs(1), &mut startup).await;
+                panic!(
+                    "Codex startup waited for the initial turn response instead of publishing the parent session before native child activity"
+                );
+            }
+        };
+        assert_eq!(
+            backend.session_id().0,
+            "fresh-thread-id",
+            "startup must publish the authoritative thread/start session before the delayed turn response"
+        );
+
+        // Ordinary spawn now deliberately waits for the caller to accept the
+        // authoritative session before it submits the paid initial turn. Claim
+        // that handoff first, then require the fixture to observe that turn.
+        tokio::time::timeout(CODEX_REQUEST_TIMEOUT, &mut initial_turn_request_rx)
+            .await
+            .expect(
+                "fixture must launch its delayed initial turn after the ordinary-spawn readiness handoff",
+            )
+            .expect("Codex worker must retain the delayed initial-turn request observer");
+
+        let registration_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while emitter.spawn_count().await == 0
+            && tokio::time::Instant::now() < registration_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            emitter.spawn_count().await,
+            1,
+            "the live-order child activity must register before the parent interrupt"
+        );
+
+        assert!(
+            backend.interrupt().await,
+            "the parent interrupt must reach Codex while the initial turn response is delayed"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut parent_events = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, events.recv()).await {
+                Ok(Some(event)) => {
+                    let terminal = matches!(&event, ChatEvent::TypingStatusChanged(false));
+                    parent_events.push(event);
+                    if terminal {
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        fake.release_initial_turn();
+
+        let spawns = emitter.spawns().await;
+        assert_eq!(
+            spawns.len(),
+            1,
+            "the live-order child must allocate exactly once"
+        );
+        assert_eq!(
+            spawns[0].tool_use_id,
+            "019f60f0-7a69-73f0-9ab3-7ddc24062e30"
+        );
+        assert_eq!(spawns[0].name, "/root/quick_child");
+        assert_eq!(spawns[0].native_thread_id, "native-quick-child-thread");
+        assert!(
+            !parent_events.iter().any(|event| matches!(
+                event,
+                ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::Error)
+            )),
+            "authoritative child activity before the initial turn response must not surface a parent error: {parent_events:?}"
+        );
+        assert!(
+            parent_events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::TypingStatusChanged(false))),
+            "the parent must reach its terminal idle marker after its interrupt"
+        );
+        assert!(
+            parent_events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::OperationCancelled(_))),
+            "the delayed initial turn must receive the full interruption tail"
+        );
+
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn codex_backend_cancels_pending_initial_input_during_startup_settings() {
+        let fake = CodexFakeAppServer::new("startup_settings_delayed", "unused");
+        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut settings = protocol::SessionSettingsValues::default();
+        settings.0.insert(
+            "model".to_string(),
+            SessionSettingValue::String("fake-startup-model".to_string()),
+        );
+        let config = BackendSpawnConfig {
+            session_settings: Some(settings),
+            ..BackendSpawnConfig::default()
+        };
+        assert_eq!(
+            resolve_session_settings(&config).0.get("model"),
+            Some(&SessionSettingValue::String(
+                "fake-startup-model".to_string()
+            )),
+            "fixture must pass an authoritative model override into Codex startup"
+        );
+        let startup = CodexBackend::spawn(
+            vec![workspace.path().to_string_lossy().to_string()],
+            config,
+            protocol::SendMessagePayload {
+                message: "wait for startup settings".to_string(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+        );
+        tokio::pin!(startup);
+        let mut startup_result = None;
+
+        let thread_start_deadline = tokio::time::Instant::now() + CODEX_REQUEST_TIMEOUT;
+        while !fake
+            .requests()
+            .iter()
+            .any(|request| request.get("method").and_then(Value::as_str) == Some("thread/start"))
+            && tokio::time::Instant::now() < thread_start_deadline
+        {
+            if let Some(Err(error)) = startup_result.as_ref() {
+                panic!("production Codex startup failed before thread/start: {error}");
+            }
+            tokio::select! {
+                result = &mut startup, if startup_result.is_none() => {
+                    startup_result = Some(result);
+                }
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+        }
+        assert!(
+            fake.requests().iter().any(|request| {
+                request.get("method").and_then(Value::as_str) == Some("thread/start")
+            }),
+            "fixture must observe the authoritative thread/start request before startup-settings dispatch"
+        );
+        let settings_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while !fake
+            .requests()
+            .iter()
+            .any(|request| request.get("method").and_then(Value::as_str) == Some("thread/update"))
+            && tokio::time::Instant::now() < settings_deadline
+        {
+            if let Some(Err(error)) = startup_result.as_ref() {
+                panic!("production Codex startup failed before delayed thread/update: {error}");
+            }
+            tokio::select! {
+                result = &mut startup, if startup_result.is_none() => {
+                    startup_result = Some(result);
+                }
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+        }
+        assert!(
+            fake.requests().iter().any(|request| {
+                request.get("method").and_then(Value::as_str) == Some("thread/update")
+            }),
+            "the fake must hold the startup thread/update request; captured methods: {:?}",
+            fake.requests()
+                .iter()
+                .filter_map(|request| request.get("method").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+        );
+        let (backend, mut events) = match startup_result {
+            Some(Ok(started)) => started,
+            Some(Err(error)) => {
+                panic!("production Codex startup failed before delayed thread/update: {error}")
+            }
+            None => tokio::time::timeout(Duration::from_millis(500), &mut startup)
+                .await
+                .expect("parent session must publish before delayed thread/update")
+                .expect("production Codex spawn should publish its parent session"),
+        };
+
+        assert!(
+            backend.interrupt().await,
+            "the published backend must accept an interrupt while thread/update is delayed"
+        );
+        fake.release_startup_settings();
+        let mut cancellation_events = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut cancellation_events = Vec::new();
+            loop {
+                let Some(event) = events.recv().await else {
+                    panic!("pending initial-input cancellation ended before its idle tail");
+                };
+                let terminal = matches!(&event, ChatEvent::TypingStatusChanged(false));
+                cancellation_events.push(event);
+                if terminal {
+                    return cancellation_events;
+                }
+            }
+        })
+        .await
+        .expect("the pending initial-input cancellation must emit its terminal idle tail");
+        assert_eq!(
+            cancellation_events
+                .iter()
+                .filter(|event| matches!(event, ChatEvent::OperationCancelled(_)))
+                .count(),
+            1,
+            "pending initial-input cancellation must emit one cancellation event"
+        );
+        assert_eq!(
+            cancellation_events
+                .iter()
+                .filter(|event| matches!(event, ChatEvent::TypingStatusChanged(false)))
+                .count(),
+            1,
+            "pending initial-input cancellation must emit one idle event"
+        );
+        assert!(
+            !fake.requests().iter().any(|request| {
+                request.get("method").and_then(Value::as_str) == Some("turn/interrupt")
+            }),
+            "pre-turn cancellation must not issue a no-op turn/interrupt request"
+        );
+
+        assert!(
+            backend
+                .send(AgentInput::SendMessage(protocol::SendMessagePayload {
+                    message: "follow up after cancelled initial".to_string(),
+                    images: None,
+                    origin: None,
+                    tool_response: None,
+                }))
+                .await,
+            "the backend must remain idle and accept a follow-up after cancelling its initial input"
+        );
+        let follow_up_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while !fake.requests().iter().any(|request| {
+            request
+                .pointer("/params/input/0/text")
+                .and_then(Value::as_str)
+                == Some("follow up after cancelled initial")
+        }) && tokio::time::Instant::now() < follow_up_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            fake.requests().iter().any(|request| {
+                request
+                    .pointer("/params/input/0/text")
+                    .and_then(Value::as_str)
+                    == Some("follow up after cancelled initial")
+            }),
+            "a follow-up after the cancelled initial input must start a real Codex turn"
+        );
+        assert_eq!(
+            fake.requests()
+                .iter()
+                .filter(|request| {
+                    request.get("method").and_then(Value::as_str) == Some("turn/start")
+                })
+                .count(),
+            1,
+            "settings completion must not resurrect the cancelled initial prompt"
+        );
+        while let Ok(event) = events.try_recv() {
+            cancellation_events.push(event);
+        }
+        assert_eq!(
+            cancellation_events
+                .iter()
+                .filter(|event| matches!(event, ChatEvent::OperationCancelled(_)))
+                .count(),
+            1,
+            "the follow-up must not duplicate the initial cancellation tail"
+        );
+        assert_eq!(
+            cancellation_events
+                .iter()
+                .filter(|event| matches!(event, ChatEvent::TypingStatusChanged(false)))
+                .count(),
+            1,
+            "the follow-up must not duplicate the initial idle tail"
+        );
+
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn codex_backend_dispatches_initial_prompt_after_startup_settings_success() {
+        let fake = CodexFakeAppServer::new("startup_settings_delayed", "unused");
+        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut settings = protocol::SessionSettingsValues::default();
+        settings.0.insert(
+            "model".to_string(),
+            SessionSettingValue::String("fake-startup-model".to_string()),
+        );
+        let (backend, _) = CodexBackend::spawn(
+            vec![workspace.path().to_string_lossy().to_string()],
+            BackendSpawnConfig {
+                session_settings: Some(settings),
+                ..BackendSpawnConfig::default()
+            },
+            protocol::SendMessagePayload {
+                message: "dispatch after settings".to_string(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+        )
+        .await
+        .expect("production Codex spawn should publish before delayed startup settings");
+
+        let settings_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while !fake
+            .requests()
+            .iter()
+            .any(|request| request.get("method").and_then(Value::as_str) == Some("thread/update"))
+            && tokio::time::Instant::now() < settings_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !fake.requests().iter().any(|request| {
+                request.get("method").and_then(Value::as_str) == Some("turn/start")
+            }),
+            "the initial prompt must not start before thread/update succeeds"
+        );
+
+        fake.release_startup_settings();
+        let prompt_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while !fake
+            .requests()
+            .iter()
+            .any(|request| request.get("method").and_then(Value::as_str) == Some("turn/start"))
+            && tokio::time::Instant::now() < prompt_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            fake.requests().iter().any(|request| {
+                request.get("method").and_then(Value::as_str) == Some("turn/start")
+            }),
+            "the initial prompt must dispatch after successful startup settings"
+        );
+
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn codex_backend_startup_settings_rejection_emits_error_then_idle() {
+        let fake = CodexFakeAppServer::new("startup_settings_rejected", "unused");
+        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut settings = protocol::SessionSettingsValues::default();
+        settings.0.insert(
+            "model".to_string(),
+            SessionSettingValue::String("fake-startup-model".to_string()),
+        );
+        let (backend, mut events) = CodexBackend::spawn(
+            vec![workspace.path().to_string_lossy().to_string()],
+            BackendSpawnConfig {
+                session_settings: Some(settings),
+                ..BackendSpawnConfig::default()
+            },
+            protocol::SendMessagePayload {
+                message: "settings must reject".to_string(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+        )
+        .await
+        .expect("parent session must publish before startup-settings rejection");
+
+        let (error_index, idle_index) = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut events_seen = Vec::new();
+            loop {
+                let Some(event) = events.recv().await else {
+                    panic!("startup settings rejection ended before typed terminal events");
+                };
+                events_seen.push(event);
+                let error_index = events_seen.iter().position(|event| {
+                    matches!(
+                        event,
+                        ChatEvent::MessageAdded(message)
+                            if matches!(message.sender, MessageSender::Error)
+                                && message.content.contains("Failed to configure Codex session")
+                    )
+                });
+                let idle_index = events_seen
+                    .iter()
+                    .position(|event| matches!(event, ChatEvent::TypingStatusChanged(false)));
+                if let (Some(error_index), Some(idle_index)) = (error_index, idle_index) {
+                    return (error_index, idle_index);
+                }
+            }
+        })
+        .await
+        .expect("startup settings rejection must surface typed error and idle terminal event");
+        assert!(
+            error_index < idle_index,
+            "startup settings failure must emit the typed error before terminal idle"
+        );
+        assert!(
+            !fake.requests().iter().any(|request| {
+                request.get("method").and_then(Value::as_str) == Some("turn/start")
+            }),
+            "a rejected startup settings update must never dispatch the initial prompt"
+        );
+        assert!(
+            matches!(
+                tokio::time::timeout(Duration::from_secs(1), events.recv()).await,
+                Ok(None)
+            ),
+            "startup settings failure must close the parent event stream after its idle terminal"
+        );
+
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn codex_backend_fresh_spawn_routes_multiple_native_children_independently() {
+        let fake = CodexFakeAppServer::new("fresh_native_multi_child_routing", "unused");
+        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let emitter = Arc::new(RecordingSubAgentEmitter::new());
+        let (backend, mut events) = CodexBackend::spawn_with_subagent_emitter(
+            vec![workspace.path().to_string_lossy().to_string()],
+            BackendSpawnConfig::default(),
+            protocol::SendMessagePayload {
+                message: "start".to_string(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+            emitter.clone() as Arc<dyn SubAgentEmitter>,
+        )
+        .await
+        .expect("production Codex spawn should start against multi-child fake app-server");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut parent_events = Vec::new();
+        let mut completed_waits = HashSet::new();
+        let mut saw_parent_terminal = false;
+        while tokio::time::Instant::now() < deadline && !saw_parent_terminal {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, events.recv()).await {
+                Ok(Some(event)) => {
+                    if let ChatEvent::ToolExecutionCompleted(completion) = &event
+                        && completion.success
+                        && (completion.tool_call_id == "wait-alpha"
+                            || completion.tool_call_id == "wait-beta")
+                    {
+                        completed_waits.insert(completion.tool_call_id.clone());
+                    }
+                    saw_parent_terminal |= matches!(&event, ChatEvent::TypingStatusChanged(false));
+                    parent_events.push(event);
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(saw_parent_terminal);
+        assert_eq!(emitter.spawn_count().await, 2);
+        assert_eq!(
+            completed_waits,
+            HashSet::from(["wait-alpha".to_string(), "wait-beta".to_string()])
+        );
+        let events_by_thread = emitter.events_by_native_thread().await;
+        let alpha_events = events_by_thread
+            .get("child-a")
+            .expect("recorded child A association");
+        let beta_events = events_by_thread
+            .get("child-b")
+            .expect("recorded child B association");
+        let has_content = |events: &[ChatEvent], content: &str| {
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    ChatEvent::StreamEnd(payload) if payload.message.content == content
+                )
+            })
+        };
+        assert!(has_content(alpha_events, "alpha-only"));
+        assert!(!has_content(alpha_events, "beta-only"));
+        assert!(has_content(beta_events, "beta-only"));
+        assert!(!has_content(beta_events, "alpha-only"));
+        assert!(
+            !parent_events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::OperationCancelled(_)))
+        );
+        assert!(!parent_events.iter().any(|event| matches!(
+            event,
+            ChatEvent::StreamEnd(payload) if payload.message.content == "alpha-only" || payload.message.content == "beta-only"
+        )));
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn codex_backend_fresh_spawn_patches_late_token_usage_after_turn_completed() {
         let fake = CodexFakeAppServer::new("fresh_late_token_usage", "unused");
         let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
         let workspace = tempfile::tempdir().expect("workspace tempdir");
@@ -9966,11 +12271,11 @@ for line in sys.stdin:
         backend.shutdown().await;
         assert!(
             saw_stream_end,
-            "fresh Codex inline loop did not emit StreamEnd"
+            "fresh Codex session loop did not emit StreamEnd"
         );
         assert!(
             saw_pre_usage_metadata,
-            "fresh Codex inline loop did not emit completed-turn metadata before late usage"
+            "fresh Codex session loop did not emit completed-turn metadata before late usage"
         );
         assert!(
             saw_late_usage_metadata,
@@ -10123,122 +12428,14 @@ for line in sys.stdin:
         }
     }
 
-    #[test]
-    fn codex_legacy_loop_metadata_tracks_agent_message_delta_item_id() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let emitter = TurnEmitter::new_for_agent(tx, AgentName(CODEX_AGENT_NAME));
-        let model_name = "codex".to_string();
-        let turn_id = "turn-started-1".to_string();
-        let item_id = "assistant-message-1".to_string();
-        let mut current_message_id = Some(turn_id.clone());
-        let mut accumulated_text = String::new();
-        let mut accumulated_reasoning = String::new();
-        let mut stream_closed_by_turn_completion = false;
-        let mut typing_status_active = true;
-        let mut pending_message_metadata: Option<CodexLoopPendingMessageMetadata> = None;
-        let mut turn_context_by_turn = HashMap::new();
-
-        turn_context_by_turn.insert(turn_id.clone(), TurnContextEstimate::default());
-        emitter.typing_status_changed(true);
-        emitter.stream_start(&turn_id, AgentName(CODEX_AGENT_NAME), Some(&model_name));
-
-        emit_codex_loop_agent_message_delta(
-            &emitter,
-            CodexLoopAgentMessageDeltaState {
-                current_message_id: &mut current_message_id,
-                accumulated_text: &mut accumulated_text,
-                stream_closed_by_turn_completion: &mut stream_closed_by_turn_completion,
-                typing_status_active: &mut typing_status_active,
-            },
-            &json!({ "itemId": item_id }),
-            "Done",
-            &model_name,
-        );
-
-        let final_text = std::mem::take(&mut accumulated_text);
-        let reasoning = contains_non_whitespace(&accumulated_reasoning)
-            .then(|| std::mem::take(&mut accumulated_reasoning));
-        let message_id_for_metadata = current_message_id
-            .clone()
-            .unwrap_or_else(|| "assistant-message-1".to_string());
-        if let Some(metadata) = metadata_target_for_visible_message(
-            turn_id.clone(),
-            message_id_for_metadata,
-            &final_text,
-            reasoning.as_deref(),
-            model_name.clone(),
-            turn_context_by_turn
-                .get(&turn_id)
-                .cloned()
-                .unwrap_or_default(),
-        ) {
-            pending_message_metadata = Some(CodexLoopPendingMessageMetadata {
-                turn_id: metadata.turn_id,
-                message_id: metadata.message_id,
-                turn_context: metadata.turn_context,
-            });
-        }
-        emitter.stream_end(StreamEndPayload {
-            content: final_text,
-            agent: Some(AgentName(CODEX_AGENT_NAME)),
-            model: Some(model_name.clone()),
-            request_usage: None,
-            turn_usage: None,
-            cumulative_usage: None,
-            token_usage_unavailable_reason: None,
-            reasoning,
-            tool_calls: Vec::new(),
-            context_breakdown: None,
-        });
-        current_message_id = None;
-
-        let pending = pending_message_metadata
-            .take()
-            .expect("visible assistant message should have pending metadata");
-        emitter.message_metadata_updated(MessageMetadataUpdatePayload {
-            message_id: pending.message_id,
-            model_info: Some(json!({ "model": model_name })),
-            request_usage: None,
-            turn_usage: None,
-            cumulative_usage: None,
-            context_breakdown: None,
-        });
-
-        let events = drain_events(&mut rx);
-        let stream_end = events
-            .iter()
-            .find(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"))
-            .unwrap_or_else(|| panic!("missing StreamEnd event: {events:?}"));
-        assert_eq!(
-            stream_end
-                .pointer("/data/message/message_id")
-                .and_then(Value::as_str),
-            Some("assistant-message-1")
-        );
-
-        let metadata_update = events
-            .iter()
-            .find(|event| {
-                event.get("kind").and_then(Value::as_str) == Some("MessageMetadataUpdated")
-            })
-            .unwrap_or_else(|| panic!("missing MessageMetadataUpdated event: {events:?}"));
-        assert_eq!(
-            metadata_update
-                .pointer("/data/message_id")
-                .and_then(Value::as_str),
-            Some("assistant-message-1")
-        );
-
-        assert!(current_message_id.is_none());
-    }
-
-    #[derive(Debug)]
+    #[derive(Clone, Debug)]
     struct RecordedSpawn {
         tool_use_id: String,
         name: String,
         description: String,
         agent_type: String,
         agent_id: AgentId,
+        native_thread_id: String,
     }
 
     struct RecordingSubAgentEmitter {
@@ -10260,8 +12457,26 @@ for line in sys.stdin:
             self.spawns.lock().await.len()
         }
 
+        async fn spawns(&self) -> Vec<RecordedSpawn> {
+            self.spawns.lock().await.clone()
+        }
+
         async fn events_by_agent(&self) -> HashMap<AgentId, Vec<ChatEvent>> {
             self.events_by_agent_id.lock().await.clone()
+        }
+
+        async fn events_by_native_thread(&self) -> HashMap<String, Vec<ChatEvent>> {
+            let spawns = self.spawns.lock().await;
+            let events = self.events_by_agent_id.lock().await;
+            spawns
+                .iter()
+                .map(|spawn| {
+                    (
+                        spawn.native_thread_id.clone(),
+                        events.get(&spawn.agent_id).cloned().unwrap_or_default(),
+                    )
+                })
+                .collect()
         }
     }
 
@@ -10272,9 +12487,10 @@ for line in sys.stdin:
             name: String,
             description: String,
             agent_type: String,
-            _session_id_hint: Option<SessionId>,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SubAgentHandle> + Send + '_>>
-        {
+            session_id_hint: Option<SessionId>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<SubAgentHandle, String>> + Send + '_>,
+        > {
             Box::pin(async move {
                 let agent_id = AgentId(format!(
                     "subagent-{}",
@@ -10296,15 +12512,36 @@ for line in sys.stdin:
                     "spawn callback: tool_use_id={tool_use_id} agent_id={} name={name:?} agent_type={agent_type:?} description={description:?}",
                     agent_id.0
                 ));
+                let native_thread_id = session_id_hint
+                    .expect("Codex child registration must carry the native thread ID")
+                    .0;
                 self.spawns.lock().await.push(RecordedSpawn {
                     tool_use_id,
                     name,
                     description,
                     agent_type,
                     agent_id: agent_id.clone(),
+                    native_thread_id,
                 });
-                SubAgentHandle { event_tx, agent_id }
+                Ok(SubAgentHandle { event_tx, agent_id })
             })
+        }
+    }
+
+    struct FailingSubAgentEmitter;
+
+    impl SubAgentEmitter for FailingSubAgentEmitter {
+        fn on_subagent_spawned(
+            &self,
+            _tool_use_id: String,
+            _name: String,
+            _description: String,
+            _agent_type: String,
+            _session_id_hint: Option<SessionId>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<SubAgentHandle, String>> + Send + '_>,
+        > {
+            Box::pin(async { Err("parent session is unavailable".to_string()) })
         }
     }
 
@@ -10461,7 +12698,8 @@ for line in sys.stdin:
             let emitter = Arc::new(RecordingSubAgentEmitter::new());
             session
                 .set_subagent_emitter(emitter.clone() as Arc<dyn SubAgentEmitter>)
-                .await;
+                .await
+                .expect("attach Codex sub-agent emitter");
             live_test_log("sub-agent emitter attached");
 
             let prompt = r#"Test harness: you MUST call spawn_agent exactly once and then wait_agent.
@@ -11102,6 +13340,247 @@ Do not describe the tool, and do not skip the tool call."#;
     }
 
     #[test]
+    fn conflicting_collab_sender_blocks_child_activity_registration() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (inner, mut parent_rx) = test_codex_inner();
+            {
+                let mut state = inner.state.lock().await;
+                state.thread_id = "parent-thread".to_string();
+            }
+            inner
+                .handle_notification(
+                    "item/started",
+                    &json!({
+                        "threadId": "parent-thread",
+                        "item": {
+                            "type": "collabAgentToolCall",
+                            "id": "conflicting-spawn",
+                            "senderThreadId": "other-parent",
+                            "receiverThreadId": "child-thread",
+                            "prompt": "inspect",
+                            "receiverAgentType": "worker"
+                        }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/started",
+                    &json!({
+                        "threadId": "parent-thread",
+                        "item": {
+                            "type": "subAgentActivity",
+                            "kind": "started",
+                            "agentThreadId": "child-thread",
+                            "agentPath": "/root/worker"
+                        }
+                    }),
+                )
+                .await;
+            assert!(
+                !inner
+                    .state
+                    .lock()
+                    .await
+                    .subagent_streams
+                    .contains_key("child-thread")
+            );
+            let events = drain_events(&mut parent_rx);
+            assert!(events.iter().any(|event| {
+                event
+                    .pointer("/data/content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| {
+                        content.contains("names sender 'other-parent'")
+                            && content.contains("child thread 'child-thread'")
+                    })
+            }));
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn child_relay_registration_failure_is_a_parent_error_without_a_phantom_child() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (inner, mut parent_rx) = test_codex_inner();
+            {
+                let mut state = inner.state.lock().await;
+                state.thread_id = "parent-thread".to_string();
+                state.subagent_emitter = Some(Arc::new(FailingSubAgentEmitter));
+            }
+            inner
+                .handle_notification(
+                    "item/started",
+                    &json!({
+                        "threadId": "parent-thread",
+                        "item": {
+                            "type": "collabAgentToolCall",
+                            "id": "019f60f0-7a69-73f0-9ab3-7ddc24062e30",
+                            "senderThreadId": "parent-thread",
+                            "receiverThreadId": "native-quick-child-thread",
+                            "prompt": "reply exactly QUICK_DONE",
+                            "receiverAgentType": "sub-agent",
+                            "receiverAgentName": "/root/quick_child"
+                        }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/started",
+                    &json!({
+                        "threadId": "parent-thread",
+                        "item": {
+                            "type": "subAgentActivity",
+                            "id": "activity-quick-child",
+                            "kind": "started",
+                            "agentThreadId": "native-quick-child-thread",
+                            "agentPath": "/root/quick_child"
+                        }
+                    }),
+                )
+                .await;
+
+            let state = inner.state.lock().await;
+            assert!(
+                !state
+                    .subagent_streams
+                    .contains_key("native-quick-child-thread")
+            );
+            assert!(
+                !state
+                    .registering_subagent_threads
+                    .contains("native-quick-child-thread")
+            );
+            drop(state);
+            let events = drain_events(&mut parent_rx);
+            assert!(events.iter().any(|event| {
+                event
+                    .pointer("/data/content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| {
+                        content.contains("Codex child relay registration failed")
+                            && content.contains("parent session is unavailable")
+                    })
+            }));
+            assert!(events.iter().any(|event| {
+                event.get("kind").and_then(Value::as_str) == Some("TypingStatusChanged")
+                    && event.get("data").and_then(Value::as_bool) == Some(false)
+            }));
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn connection_scoped_notifications_preserve_global_semantics_without_thread_id() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (inner, mut parent_rx) = test_codex_inner();
+            inner
+                .handle_notification(
+                    "mcpServer/startupStatus/updated",
+                    &json!({"serverName": "tyde-agent-control", "status": "ready"}),
+                )
+                .await;
+            inner
+                .handle_notification("account/rateLimits/updated", &json!({"rateLimits": []}))
+                .await;
+            assert!(drain_events(&mut parent_rx).is_empty());
+
+            inner
+                .handle_notification(
+                    "error",
+                    &json!({"message": "connection failed", "fatal": true}),
+                )
+                .await;
+            let events = drain_events(&mut parent_rx);
+            assert!(events.iter().any(|event| {
+                event.pointer("/data/content").and_then(Value::as_str) == Some("connection failed")
+            }));
+            assert!(events.iter().any(|event| {
+                event.get("kind").and_then(Value::as_str) == Some("TypingStatusChanged")
+                    && event.get("data").and_then(Value::as_bool) == Some(false)
+            }));
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn thread_scoped_notification_without_thread_id_is_an_ownership_invariant() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (inner, mut parent_rx) = test_codex_inner();
+            inner
+                .handle_notification("turn/started", &json!({"turn": {"id": "missing-owner"}}))
+                .await;
+            let events = drain_events(&mut parent_rx);
+            assert!(events.iter().any(|event| {
+                event
+                    .pointer("/data/content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| {
+                        content.contains("thread-scoped notification 'turn/started'")
+                            && content.contains("<missing>")
+                    })
+            }));
+            assert!(
+                !events.iter().any(|event| {
+                    event.get("kind").and_then(Value::as_str) == Some("StreamStart")
+                })
+            );
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn unknown_child_thread_surfaces_ownership_error_without_parent_content() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (inner, mut parent_rx) = test_codex_inner();
+            inner
+                .handle_notification(
+                    "item/agentMessage/delta",
+                    &json!({
+                        "threadId": "unknown-child-thread",
+                        "itemId": "unknown-message",
+                        "delta": "must not reach parent"
+                    }),
+                )
+                .await;
+            let events = drain_events(&mut parent_rx);
+            assert!(events.iter().any(|event| {
+                event.get("kind").and_then(Value::as_str) == Some("MessageAdded")
+                    && event
+                        .pointer("/data/content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|content| content.contains("ownership invariant failed"))
+            }));
+            assert!(!events.iter().any(|event| {
+                event.pointer("/data/content").and_then(Value::as_str)
+                    == Some("must not reach parent")
+            }));
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
     fn subagent_thread_notifications_route_to_subagent_channel_not_parent() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -11120,6 +13599,18 @@ Do not describe the tool, and do not skip the tool call."#;
                     &json!({
                         "threadId": "thread-sub-1",
                         "turn": { "id": "turn-sub-1" }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/started",
+                    &json!({
+                        "threadId": "thread-sub-1",
+                        "item": {
+                            "type": "agentMessage",
+                            "id": "msg-sub-1"
+                        }
                     }),
                 )
                 .await;
@@ -11184,42 +13675,183 @@ Do not describe the tool, and do not skip the tool call."#;
             );
 
             let subagent_events = drain_events(&mut subagent_rx);
-            assert!(
-                subagent_events.iter().any(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("ToolRequest")
-                        && event
-                            .get("data")
-                            .and_then(|d| d.get("tool_name"))
-                            .and_then(Value::as_str)
-                            == Some("run_command")
-                }),
-                "expected sub-agent ToolRequest(run_command), got events={subagent_events:?}"
+            assert_eq!(
+                event_kinds(&subagent_events),
+                vec![
+                    "TypingStatusChanged",
+                    "StreamStart",
+                    "ToolRequest",
+                    "ToolExecutionCompleted",
+                    "StreamEnd",
+                    "TypingStatusChanged"
+                ],
+                "child routing must retain the provider message boundary through its tool lifecycle: {subagent_events:?}"
             );
-            assert!(
-                subagent_events.iter().any(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
-                        && event
-                            .get("data")
-                            .and_then(|d| d.get("tool_name"))
-                            .and_then(Value::as_str)
-                            == Some("run_command")
-                }),
-                "expected sub-agent ToolExecutionCompleted(run_command), got events={subagent_events:?}"
+            assert_eq!(
+                subagent_events[1]
+                    .pointer("/data/message_id")
+                    .and_then(Value::as_str),
+                Some("msg-sub-1")
             );
-            assert!(
-                subagent_events.iter().any(|event| {
-                    event.get("kind").and_then(Value::as_str) == Some("StreamEnd")
-                        && event
-                            .get("data")
-                            .and_then(|d| d.get("message"))
-                            .and_then(|m| m.get("content"))
-                            .and_then(Value::as_str)
-                            == Some("LIVE_SUBAGENT_OK")
-                }),
-                "expected sub-agent StreamEnd with final message, got events={subagent_events:?}"
+            assert_eq!(
+                subagent_events[2]
+                    .pointer("/data/tool_call_id")
+                    .and_then(Value::as_str),
+                Some("cmd-sub-1")
+            );
+            assert_eq!(
+                subagent_events[2]
+                    .pointer("/data/tool_name")
+                    .and_then(Value::as_str),
+                Some("run_command")
+            );
+            assert_eq!(
+                subagent_events[3]
+                    .pointer("/data/tool_call_id")
+                    .and_then(Value::as_str),
+                Some("cmd-sub-1")
+            );
+            assert_eq!(
+                subagent_events[3]
+                    .pointer("/data/tool_name")
+                    .and_then(Value::as_str),
+                Some("run_command")
+            );
+            assert_eq!(
+                subagent_events[4]
+                    .pointer("/data/message/message_id")
+                    .and_then(Value::as_str),
+                Some("msg-sub-1")
+            );
+            assert_eq!(
+                subagent_events[4]
+                    .pointer("/data/message/content")
+                    .and_then(Value::as_str),
+                Some("LIVE_SUBAGENT_OK")
             );
 
             inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn parent_interruption_does_not_cancel_idle_completed_child_turn() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (inner, _parent_rx) = test_codex_inner();
+            let (subagent_tx, mut subagent_rx) = mpsc::unbounded_channel::<Value>();
+            attach_test_codex_subagent(&inner, subagent_tx, "thread-sub-idle").await;
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({"threadId":"thread-sub-idle","turn":{"id":"turn-sub-idle"}}),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({"threadId":"thread-sub-idle","item":{"id":"message-idle","type":"agentMessage","text":"done"}}),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "turn/completed",
+                    &json!({"threadId":"thread-sub-idle","turn":{"id":"turn-sub-idle","status":"completed"}}),
+                )
+                .await;
+            let completed_events = drain_events(&mut subagent_rx);
+            assert!(
+                completed_events.iter().any(|event| {
+                    event.get("kind").and_then(Value::as_str) == Some("StreamEnd")
+                        && event
+                            .get("data")
+                            .and_then(|data| data.get("message"))
+                            .and_then(|message| message.get("content"))
+                            .and_then(Value::as_str)
+                            == Some("done")
+                }),
+                "the child must retain its clean terminal content before the parent ends: {completed_events:?}"
+            );
+            assert!(
+                !completed_events.iter().any(|event| {
+                    event.get("kind").and_then(Value::as_str) == Some("OperationCancelled")
+                }),
+                "a clean child turn must not be labelled cancelled before parent teardown: {completed_events:?}"
+            );
+
+            inner
+                .handle_notification(
+                    "turn/completed",
+                    &json!({"threadId":"thread-parent","turn":{"id":"parent-turn","status":"interrupted"}}),
+                )
+                .await;
+            let events = drain_events(&mut subagent_rx);
+            assert!(
+                !events.iter().any(|event| {
+                    event.get("kind").and_then(Value::as_str) == Some("OperationCancelled")
+                }),
+                "a completed child must never be retroactively cancelled: {events:?}"
+            );
+            let state = inner.state.lock().await;
+            assert!(!state.subagent_streams.contains_key("thread-sub-idle"));
+            assert!(state.completed_subagent_streams.contains_key("thread-sub-idle"));
+            drop(state);
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn abandoning_parent_terminally_cancels_live_subagents() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, _parent_rx) = test_codex_inner();
+            let (subagent_tx, mut subagent_rx) = mpsc::unbounded_channel::<Value>();
+            attach_test_codex_subagent(&inner, subagent_tx, "thread-sub-cancel").await;
+            inner
+                .update_codex_subagent_stream("thread-sub-cancel", |stream| {
+                    stream.active_turn_id = Some("turn-sub-cancel".to_string());
+                    stream.current_message_id = Some(ChatMessageId("child-message".to_string()));
+                })
+                .await
+                .expect("active child stream");
+            let emitter = inner
+                .codex_subagent_emitter("thread-sub-cancel")
+                .await
+                .expect("sub-agent emitter");
+            emitter.typing_status_changed(true);
+            emitter.stream_start_with_id(
+                ChatMessageId("child-message".to_string()),
+                AgentName(CODEX_AGENT_NAME),
+                Some("test-model"),
+            );
+            emitter.stream_delta_with_id(ChatMessageId("child-message".to_string()), "working");
+
+            inner.complete_all_codex_subagents().await;
+
+            let events = drain_events(&mut subagent_rx);
+            assert_eq!(
+                event_kinds(&events),
+                vec![
+                    "TypingStatusChanged",
+                    "StreamStart",
+                    "StreamDelta",
+                    "MessageAdded",
+                    "OperationCancelled",
+                    "TypingStatusChanged"
+                ]
+            );
+            assert_eq!(
+                events.last().and_then(|event| event.get("data")),
+                Some(&Value::Bool(false))
+            );
+            assert!(inner.state.lock().await.subagent_streams.is_empty());
         });
     }
 
@@ -11283,6 +13915,40 @@ Do not describe the tool, and do not skip the tool call."#;
                 .await;
 
             let events = drain_events(&mut rx);
+            assert_eq!(
+                event_kinds(&events),
+                vec![
+                    "TypingStatusChanged",
+                    "StreamStart",
+                    "StreamEnd",
+                    "MessageMetadataUpdated",
+                    "TypingStatusChanged",
+                    "MessageMetadataUpdated"
+                ],
+                "late usage must patch the completed provider item without creating another message: {events:?}"
+            );
+            let response_message_ids = events
+                .iter()
+                .filter_map(|event| match event.get("kind").and_then(Value::as_str) {
+                    Some("StreamStart") | Some("MessageMetadataUpdated") => event
+                        .pointer("/data/message_id")
+                        .and_then(Value::as_str),
+                    Some("StreamEnd") => event
+                        .pointer("/data/message/message_id")
+                        .and_then(Value::as_str),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                response_message_ids,
+                vec![
+                    "msg-root-late-usage",
+                    "msg-root-late-usage",
+                    "msg-root-late-usage",
+                    "msg-root-late-usage"
+                ],
+                "the provider item start, end, initial metadata, and late metadata patch must retain one immutable message identity"
+            );
             let metadata_updates = events
                 .iter()
                 .filter(|event| {
@@ -11312,7 +13978,7 @@ Do not describe the tool, and do not skip the tool call."#;
                 known_updates[0]
                     .pointer("/data/message_id")
                     .and_then(Value::as_str),
-                Some("turn-root-late-usage")
+                Some("msg-root-late-usage")
             );
             {
                 let state = inner.state.lock().await;
@@ -11520,7 +14186,9 @@ Do not describe the tool, and do not skip the tool call."#;
                     }),
                 )
                 .await;
-            inner.complete_codex_subagent_if_needed("spawn-1").await;
+            inner
+                .complete_codex_subagent_if_needed("thread-sub-removed-usage")
+                .await;
             inner
                 .handle_notification(
                     "thread/tokenUsage/updated",
@@ -11618,7 +14286,9 @@ Do not describe the tool, and do not skip the tool call."#;
                     }),
                 )
                 .await;
-            inner.complete_codex_subagent_if_needed("spawn-1").await;
+            inner
+                .complete_codex_subagent_if_needed("thread-sub-removed-turn")
+                .await;
             inner
                 .handle_notification(
                     "turn/completed",
@@ -11774,191 +14444,7 @@ Do not describe the tool, and do not skip the tool call."#;
     }
 
     #[test]
-    fn apply_reasoning_delta_to_state_emits_event_and_updates_state() {
-        let mut state = test_codex_state();
-        let params = json!({ "itemId": "reason-item-1" });
-
-        let (message_id, text) =
-            apply_reasoning_delta_to_state(&mut state, &params, "Inspecting constraints.")
-                .expect("reasoning event");
-
-        assert_eq!(message_id, "reason-item-1");
-        assert_eq!(text, "Inspecting constraints.");
-
-        let stream = state.active_stream.as_ref().expect("active stream");
-        assert_eq!(stream.message_id, "reason-item-1");
-        assert_eq!(stream.reasoning, "Inspecting constraints.");
-
-        let ctx = state
-            .turn_context_by_turn
-            .get("turn-test")
-            .expect("turn context");
-        assert_eq!(ctx.reasoning_bytes, "Inspecting constraints.".len() as u64);
-    }
-
-    #[test]
-    fn apply_reasoning_delta_to_state_falls_back_to_assistant_message_id() {
-        let mut state = test_codex_state();
-        state.active_stream = None;
-        state.active_turn_id = None;
-        let params = json!({});
-
-        let (message_id, _) =
-            apply_reasoning_delta_to_state(&mut state, &params, "No item id present.")
-                .expect("reasoning event");
-
-        assert_eq!(message_id, "assistant");
-    }
-
-    #[test]
-    fn emit_reasoning_delta_reopens_stream_before_reasoning() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let (inner, mut rx) = test_codex_inner();
-            {
-                let mut state = inner.state.lock().await;
-                state.active_stream = None;
-            }
-
-            inner
-                .emit_reasoning_delta(
-                    &json!({ "itemId": "reason-item-1" }),
-                    "Inspecting constraints.".to_string(),
-                )
-                .await;
-
-            let events = drain_events(&mut rx);
-            let kinds = events
-                .iter()
-                .filter_map(|event| event.get("kind").and_then(Value::as_str))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                kinds,
-                vec!["TypingStatusChanged", "StreamStart", "StreamReasoningDelta"],
-                "reasoning deltas must be ordered after a synthetic StreamStart: {events:?}"
-            );
-            assert_eq!(
-                events[1]
-                    .get("data")
-                    .and_then(|data| data.get("message_id"))
-                    .and_then(Value::as_str),
-                Some("reason-item-1")
-            );
-            assert_eq!(
-                events[2]
-                    .get("data")
-                    .and_then(|data| data.get("message_id"))
-                    .and_then(Value::as_str),
-                Some("reason-item-1")
-            );
-
-            inner
-                .handle_notification(
-                    "item/agentMessage/delta",
-                    &json!({ "itemId": "assistant-message-1", "delta": "Found" }),
-                )
-                .await;
-
-            let events = drain_events(&mut rx);
-            let kinds = events
-                .iter()
-                .filter_map(|event| event.get("kind").and_then(Value::as_str))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                kinds,
-                vec!["StreamDelta"],
-                "later assistant deltas should reuse the synthetic stream: {events:?}"
-            );
-            assert_eq!(
-                events[0]
-                    .get("data")
-                    .and_then(|data| data.get("message_id"))
-                    .and_then(Value::as_str),
-                Some("assistant-message-1")
-            );
-
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "assistant-message-1",
-                            "text": "Found"
-                        }
-                    }),
-                )
-                .await;
-
-            let events = drain_events(&mut rx);
-            let kinds = events
-                .iter()
-                .filter_map(|event| event.get("kind").and_then(Value::as_str))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                kinds,
-                vec!["StreamEnd"],
-                "agentMessage completion should close the visible stream immediately: {events:?}"
-            );
-            assert_eq!(
-                events[0]
-                    .pointer("/data/message/message_id")
-                    .and_then(Value::as_str),
-                Some("assistant-message-1")
-            );
-            assert!(
-                events[0]
-                    .pointer("/data/message/token_usage")
-                    .is_none_or(Value::is_null),
-                "StreamEnd should not carry late Codex usage: {events:?}"
-            );
-
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({
-                        "turn": {
-                            "id": "turn-test",
-                            "status": "completed",
-                            "usage": {
-                                "inputTokens": 12,
-                                "outputTokens": 5,
-                                "totalTokens": 17
-                            }
-                        }
-                    }),
-                )
-                .await;
-
-            let events = drain_events(&mut rx);
-            let kinds = events
-                .iter()
-                .filter_map(|event| event.get("kind").and_then(Value::as_str))
-                .collect::<Vec<_>>();
-            assert_eq!(kinds, vec!["MessageMetadataUpdated", "TypingStatusChanged"]);
-            assert_eq!(
-                events[0]
-                    .pointer("/data/message_id")
-                    .and_then(Value::as_str),
-                Some("assistant-message-1")
-            );
-            assert_eq!(
-                events[0]
-                    .pointer("/data/token_usage/turn/usage/total_tokens")
-                    .and_then(Value::as_u64),
-                Some(17)
-            );
-
-            inner.rpc.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn completed_reasoning_item_splits_codex_turn_segments() {
+    fn idless_reasoning_streams_immediately_and_keeps_generated_identity() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -11969,49 +14455,44 @@ Do not describe the tool, and do not skip the tool call."#;
             inner
                 .handle_notification(
                     "turn/started",
-                    &json!({ "turn": { "id": "turn-segmented" } }),
+                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-idless" } }),
                 )
                 .await;
             drain_events(&mut rx);
 
             inner
                 .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "item": {
-                            "type": "reasoning",
-                            "id": "reasoning-1",
-                            "summary": "Inspecting the failure first."
-                        }
-                    }),
+                    "item/reasoning/delta",
+                    &json!({ "threadId": "thread-test", "delta": "Inspecting constraints." }),
                 )
                 .await;
-
-            let events = drain_events(&mut rx);
-            let kinds = events
-                .iter()
-                .filter_map(|event| event.get("kind").and_then(Value::as_str))
-                .collect::<Vec<_>>();
+            let reasoning_events = drain_events(&mut rx);
             assert_eq!(
-                kinds,
-                vec!["StreamReasoningDelta", "StreamEnd"],
-                "reasoning completion should close the first segment: {events:?}"
+                event_kinds(&reasoning_events),
+                vec!["TypingStatusChanged", "StreamStart", "StreamReasoningDelta"]
             );
+            let generated_id = reasoning_events[1]
+                .pointer("/data/message_id")
+                .and_then(Value::as_str)
+                .expect("generated reasoning id")
+                .to_string();
+            assert!(generated_id.starts_with("server-generated:idless_reasoning:"));
             assert_eq!(
-                events[1]
-                    .pointer("/data/message/reasoning/text")
+                reasoning_events[2]
+                    .pointer("/data/message_id")
                     .and_then(Value::as_str),
-                Some("Inspecting the failure first.")
+                Some(generated_id.as_str())
             );
 
             inner
                 .handle_notification(
                     "item/started",
                     &json!({
+                        "threadId": "thread-test",
                         "item": {
                             "type": "commandExecution",
-                            "id": "exec-1",
-                            "command": "cargo test",
+                            "id": "reasoning-tool",
+                            "command": "pwd",
                             "cwd": "/tmp"
                         }
                     }),
@@ -12021,51 +14502,58 @@ Do not describe the tool, and do not skip the tool call."#;
                 .handle_notification(
                     "item/completed",
                     &json!({
+                        "threadId": "thread-test",
                         "item": {
                             "type": "commandExecution",
-                            "id": "exec-1",
+                            "id": "reasoning-tool",
                             "exitCode": 0,
-                            "aggregatedOutput": "ok"
+                            "aggregatedOutput": "/tmp"
                         }
                     }),
                 )
                 .await;
-
-            let events = drain_events(&mut rx);
-            let kinds = events
-                .iter()
-                .filter_map(|event| event.get("kind").and_then(Value::as_str))
-                .collect::<Vec<_>>();
             assert_eq!(
-                kinds,
-                vec!["ToolRequest", "ToolExecutionCompleted"],
-                "tool events should attach after the closed reasoning segment: {events:?}"
+                event_kinds(&drain_events(&mut rx)),
+                vec!["ToolRequest", "ToolExecutionCompleted"]
             );
 
             inner
-                .emit_reasoning_delta(
-                    &json!({ "itemId": "reasoning-2" }),
-                    "Checking the next step.".to_string(),
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "item": { "type": "reasoning", "summary": "Inspecting constraints." }
+                    }),
                 )
                 .await;
-
-            let events = drain_events(&mut rx);
-            let kinds = events
-                .iter()
-                .filter_map(|event| event.get("kind").and_then(Value::as_str))
-                .collect::<Vec<_>>();
+            let end_events = drain_events(&mut rx);
+            assert_eq!(event_kinds(&end_events), vec!["StreamEnd"]);
             assert_eq!(
-                kinds,
-                vec!["TypingStatusChanged", "StreamStart", "StreamReasoningDelta"],
-                "next reasoning block should start a fresh segment: {events:?}"
+                end_events[0]
+                    .pointer("/data/message/message_id")
+                    .and_then(Value::as_str),
+                Some(generated_id.as_str())
             );
-
+            assert_eq!(
+                end_events[0]
+                    .pointer("/data/message/reasoning/text")
+                    .and_then(Value::as_str),
+                Some("Inspecting constraints.")
+            );
+            inner
+                .handle_notification(
+                    "turn/completed",
+                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-idless", "status": "completed" } }),
+                )
+                .await;
+            drain_events(&mut rx);
+            assert!(drain_events(&mut rx).is_empty());
             inner.rpc.shutdown().await;
         });
     }
 
     #[test]
-    fn completed_reasoning_only_turn_metadata_targets_reasoning_item_id() {
+    fn idless_reasoning_interrupt_persists_partial_message_before_cancel() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -12073,91 +14561,76 @@ Do not describe the tool, and do not skip the tool call."#;
 
         rt.block_on(async {
             let (inner, mut rx) = test_codex_inner();
-            let mut all_events = Vec::new();
-
             inner
                 .handle_notification(
                     "turn/started",
-                    &json!({ "turn": { "id": "turn-reasoning-only" } }),
+                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-cancel" } }),
                 )
                 .await;
-            all_events.extend(drain_events(&mut rx));
+            drain_events(&mut rx);
+            inner
+                .handle_notification(
+                    "item/reasoning/delta",
+                    &json!({ "threadId": "thread-test", "delta": "Still thinking" }),
+                )
+                .await;
+            let open_events = drain_events(&mut rx);
+            let generated_id = open_events
+                .iter()
+                .find(|event| event.get("kind").and_then(Value::as_str) == Some("StreamStart"))
+                .and_then(|event| event.pointer("/data/message_id"))
+                .and_then(Value::as_str)
+                .expect("generated reasoning id")
+                .to_string();
+
+            inner
+                .handle_notification(
+                    "turn/completed",
+                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-cancel", "status": "interrupted" } }),
+                )
+                .await;
+            let terminal = drain_events(&mut rx);
+            assert_eq!(
+                event_kinds(&terminal),
+                vec!["StreamEnd", "OperationCancelled", "TypingStatusChanged"]
+            );
+            assert_eq!(
+                terminal[0]
+                    .pointer("/data/message/message_id")
+                    .and_then(Value::as_str),
+                Some(generated_id.as_str())
+            );
+            assert_eq!(
+                terminal[0]
+                    .pointer("/data/message/reasoning/text")
+                    .and_then(Value::as_str),
+                Some("Still thinking")
+            );
+            assert_eq!(
+                terminal[0]
+                    .pointer("/data/message/content")
+                    .and_then(Value::as_str),
+                Some("")
+            );
+            assert_codex_protocol_valid(&[open_events, terminal.clone()].concat());
 
             inner
                 .handle_notification(
                     "item/completed",
                     &json!({
-                        "item": {
-                            "type": "reasoning",
-                            "id": "reasoning-only-1",
-                            "summary": "Checking constraints."
-                        }
+                        "threadId": "thread-test",
+                        "item": { "type": "reasoning", "summary": "late" }
                     }),
                 )
                 .await;
-            let reasoning_events = drain_events(&mut rx);
-            assert_eq!(
-                event_kinds(&reasoning_events),
-                vec!["StreamReasoningDelta", "StreamEnd"],
-                "reasoning completion should emit and close the visible row: {reasoning_events:?}"
-            );
-            assert_eq!(
-                reasoning_events[0]
-                    .pointer("/data/message_id")
-                    .and_then(Value::as_str),
-                Some("reasoning-only-1")
-            );
-            assert_eq!(
-                reasoning_events[1]
-                    .pointer("/data/message/message_id")
-                    .and_then(Value::as_str),
-                Some("reasoning-only-1")
-            );
-            all_events.extend(reasoning_events);
-
-            inner
-                .handle_notification(
-                    "turn/completed",
-                    &json!({
-                        "turn": {
-                            "id": "turn-reasoning-only",
-                            "status": "completed",
-                            "usage": {
-                                "inputTokens": 10,
-                                "outputTokens": 3,
-                                "totalTokens": 13
-                            }
-                        }
-                    }),
-                )
-                .await;
-            let completion_events = drain_events(&mut rx);
-            assert_eq!(
-                event_kinds(&completion_events),
-                vec!["MessageMetadataUpdated", "TypingStatusChanged"],
-                "turn completion should patch reasoning-only row metadata: {completion_events:?}"
-            );
-            assert_eq!(
-                completion_events[0]
-                    .pointer("/data/message_id")
-                    .and_then(Value::as_str),
-                Some("reasoning-only-1")
-            );
-            assert_eq!(
-                completion_events[0]
-                    .pointer("/data/token_usage/turn/usage/total_tokens")
-                    .and_then(Value::as_u64),
-                Some(13)
-            );
-            all_events.extend(completion_events);
-
-            assert_codex_protocol_valid(&all_events);
+            assert!(drain_events(&mut rx).is_empty());
+            assert!(generated_id.starts_with("server-generated:idless_reasoning:"));
             inner.rpc.shutdown().await;
         });
     }
 
     #[test]
-    fn completion_only_agent_message_after_closed_reasoning_uses_item_id_metadata() {
+    fn idless_reasoning_turn_completion_persists_partial_message_before_cancel() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -12165,93 +14638,71 @@ Do not describe the tool, and do not skip the tool call."#;
 
         rt.block_on(async {
             let (inner, mut rx) = test_codex_inner();
-            let mut all_events = Vec::new();
-
             inner
                 .handle_notification(
                     "turn/started",
-                    &json!({ "turn": { "id": "turn-completion-only" } }),
+                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-partial" } }),
                 )
                 .await;
-            all_events.extend(drain_events(&mut rx));
-
+            let mut replay_shaped_events = drain_events(&mut rx);
             inner
                 .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "item": {
-                            "type": "reasoning",
-                            "id": "reasoning-before-answer",
-                            "summary": "Thinking before the answer."
-                        }
-                    }),
+                    "item/reasoning/delta",
+                    &json!({ "threadId": "thread-test", "delta": "Partial reasoning" }),
                 )
                 .await;
-            all_events.extend(drain_events(&mut rx));
-
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "item": {
-                            "type": "agentMessage",
-                            "id": "answer-completion-only",
-                            "text": "Done"
-                        }
-                    }),
-                )
-                .await;
-            let answer_events = drain_events(&mut rx);
-            assert_eq!(
-                event_kinds(&answer_events),
-                vec!["StreamStart", "StreamEnd"],
-                "completion-only answer should synthesize a stream for its item id: {answer_events:?}"
-            );
-            assert_eq!(
-                answer_events[0]
-                    .pointer("/data/message_id")
-                    .and_then(Value::as_str),
-                Some("answer-completion-only")
-            );
-            assert_eq!(
-                answer_events[1]
-                    .pointer("/data/message/message_id")
-                    .and_then(Value::as_str),
-                Some("answer-completion-only")
-            );
-            all_events.extend(answer_events);
+            let live = drain_events(&mut rx);
+            let generated_id = live
+                .iter()
+                .find(|event| event.get("kind").and_then(Value::as_str) == Some("StreamStart"))
+                .and_then(|event| event.pointer("/data/message_id"))
+                .and_then(Value::as_str)
+                .expect("generated reasoning id")
+                .to_string();
+            replay_shaped_events.extend(live);
 
             inner
                 .handle_notification(
                     "turn/completed",
+                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-partial", "status": "completed" } }),
+                )
+                .await;
+            let terminal = drain_events(&mut rx);
+            assert_eq!(
+                event_kinds(&terminal),
+                vec!["StreamEnd", "OperationCancelled", "TypingStatusChanged"]
+            );
+            assert_eq!(
+                terminal[0]
+                    .pointer("/data/message/message_id")
+                    .and_then(Value::as_str),
+                Some(generated_id.as_str())
+            );
+            assert_eq!(
+                terminal[0]
+                    .pointer("/data/message/reasoning/text")
+                    .and_then(Value::as_str),
+                Some("Partial reasoning")
+            );
+            assert_eq!(
+                terminal[0]
+                    .pointer("/data/message/content")
+                    .and_then(Value::as_str),
+                Some("")
+            );
+            replay_shaped_events.extend(terminal);
+            assert_codex_protocol_valid(&replay_shaped_events);
+
+            inner
+                .handle_notification(
+                    "item/completed",
                     &json!({
-                        "turn": {
-                            "id": "turn-completion-only",
-                            "status": "completed",
-                            "usage": {
-                                "inputTokens": 14,
-                                "outputTokens": 4,
-                                "totalTokens": 18
-                            }
-                        }
+                        "threadId": "thread-test",
+                        "item": { "type": "reasoning", "summary": "late" }
                     }),
                 )
                 .await;
-            let completion_events = drain_events(&mut rx);
-            assert_eq!(
-                event_kinds(&completion_events),
-                vec!["MessageMetadataUpdated", "TypingStatusChanged"],
-                "turn completion should patch the completion-only answer row: {completion_events:?}"
-            );
-            assert_eq!(
-                completion_events[0]
-                    .pointer("/data/message_id")
-                    .and_then(Value::as_str),
-                Some("answer-completion-only")
-            );
-            all_events.extend(completion_events);
-
-            assert_codex_protocol_valid(&all_events);
+            assert!(drain_events(&mut rx).is_empty());
             inner.rpc.shutdown().await;
         });
     }
@@ -12268,7 +14719,7 @@ Do not describe the tool, and do not skip the tool call."#;
             inner
                 .handle_notification(
                     "turn/started",
-                    &json!({ "turn": { "id": "turn-segmented" } }),
+                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-segmented" } }),
                 )
                 .await;
             drain_events(&mut rx);
@@ -12277,6 +14728,7 @@ Do not describe the tool, and do not skip the tool call."#;
                 .handle_notification(
                     "item/completed",
                     &json!({
+                        "threadId": "thread-test",
                         "item": {
                             "type": "reasoning",
                             "id": "reasoning-1",
@@ -12287,17 +14739,14 @@ Do not describe the tool, and do not skip the tool call."#;
                 .await;
             let events = drain_events(&mut rx);
             assert_eq!(
-                events
-                    .iter()
-                    .filter_map(|event| event.get("kind").and_then(Value::as_str))
-                    .collect::<Vec<_>>(),
-                vec!["StreamReasoningDelta", "StreamEnd"]
+                event_kinds(&events),
+                vec!["StreamStart", "StreamReasoningDelta", "StreamEnd"]
             );
 
             inner
                 .handle_notification(
                     "item/agentMessage/delta",
-                    &json!({ "itemId": "answer-1", "delta": "Done" }),
+                    &json!({ "threadId": "thread-test", "itemId": "answer-1", "delta": "Done" }),
                 )
                 .await;
             drain_events(&mut rx);
@@ -12305,6 +14754,7 @@ Do not describe the tool, and do not skip the tool call."#;
                 .handle_notification(
                     "item/completed",
                     &json!({
+                        "threadId": "thread-test",
                         "item": {
                             "type": "agentMessage",
                             "id": "answer-1",
@@ -12326,6 +14776,7 @@ Do not describe the tool, and do not skip the tool call."#;
                 .handle_notification(
                     "turn/completed",
                     &json!({
+                        "threadId": "thread-test",
                         "turn": {
                             "id": "turn-segmented",
                             "status": "completed",
@@ -12364,7 +14815,7 @@ Do not describe the tool, and do not skip the tool call."#;
     }
 
     #[test]
-    fn reasoning_segment_waits_for_pending_tool_completion() {
+    fn wrong_completed_item_id_discards_once_without_typed_end() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -12375,113 +14826,647 @@ Do not describe the tool, and do not skip the tool call."#;
             inner
                 .handle_notification(
                     "turn/started",
-                    &json!({ "turn": { "id": "turn-segmented" } }),
+                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-wrong-end" } }),
+                )
+                .await;
+            drain_events(&mut rx);
+            inner
+                .handle_notification(
+                    "item/agentMessage/delta",
+                    &json!({ "threadId": "thread-test", "itemId": "open-item", "delta": "partial" }),
                 )
                 .await;
             drain_events(&mut rx);
 
             inner
                 .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "item": { "type": "agentMessage", "id": "wrong-item", "text": "wrong" }
+                    }),
+                )
+                .await;
+            let terminal = drain_events(&mut rx);
+            assert_eq!(
+                event_kinds(&terminal),
+                vec!["MessageAdded", "OperationCancelled", "TypingStatusChanged"]
+            );
+            assert!(terminal.iter().all(|event| {
+                event.get("kind").and_then(Value::as_str) != Some("StreamEnd")
+            }));
+
+            for item_id in ["open-item", "wrong-item", "another-late-item"] {
+                inner
+                    .handle_notification(
+                        "item/completed",
+                        &json!({
+                            "threadId": "thread-test",
+                            "item": { "type": "agentMessage", "id": item_id, "text": "late" }
+                        }),
+                    )
+                    .await;
+            }
+            for (method, params) in [
+                (
+                    "turn/plan/updated",
+                    json!({
+                        "threadId": "thread-test",
+                        "explanation": "late plan",
+                        "plan": [{ "step": "must not render", "status": "pending" }]
+                    }),
+                ),
+                (
+                    "model/rerouted",
+                    json!({ "threadId": "thread-test", "toModel": "late-model" }),
+                ),
+                (
+                    "error",
+                    json!({ "threadId": "thread-test", "message": "late error", "fatal": true }),
+                ),
+                (
+                    "thread/tokenUsage/updated",
+                    json!({
+                        "threadId": "thread-test",
+                        "turnId": "turn-wrong-end",
+                        "tokenUsage": { "inputTokens": 1, "outputTokens": 1, "totalTokens": 2 }
+                    }),
+                ),
+                (
+                    "item/reasoning/delta",
+                    json!({ "threadId": "thread-test", "delta": "late reasoning" }),
+                ),
+                (
                     "item/started",
-                    &json!({
-                        "item": {
-                            "type": "commandExecution",
-                            "id": "exec-1",
-                            "command": "cargo test",
-                            "cwd": "/tmp"
-                        }
+                    json!({
+                        "threadId": "thread-test",
+                        "item": { "type": "agentMessage", "id": "late-start" }
                     }),
-                )
-                .await;
-            drain_events(&mut rx);
-
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "item": {
-                            "type": "reasoning",
-                            "id": "reasoning-1",
-                            "summary": "Waiting for the command result."
-                        }
+                ),
+                (
+                    "item/agentMessage/delta",
+                    json!({
+                        "threadId": "thread-test",
+                        "itemId": "late-start",
+                        "delta": "late text"
                     }),
-                )
-                .await;
-            let events = drain_events(&mut rx);
-            let kinds = events
-                .iter()
-                .filter_map(|event| event.get("kind").and_then(Value::as_str))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                kinds,
-                vec!["StreamReasoningDelta"],
-                "reasoning should stay open while its tool is pending: {events:?}"
+                ),
+                (
+                    "turn/completed",
+                    json!({
+                        "threadId": "thread-test",
+                        "turn": { "id": "turn-wrong-end", "status": "completed" }
+                    }),
+                ),
+                (
+                    "turn/started",
+                    json!({
+                        "threadId": "thread-test",
+                        "turn": { "id": "turn-wrong-end" }
+                    }),
+                ),
+            ] {
+                inner.handle_notification(method, &params).await;
+            }
+            assert!(
+                drain_events(&mut rx).is_empty(),
+                "quarantine must suppress every later root response notification"
             );
-
-            inner
-                .handle_notification(
-                    "item/completed",
-                    &json!({
-                        "item": {
-                            "type": "commandExecution",
-                            "id": "exec-1",
-                            "exitCode": 0,
-                            "aggregatedOutput": "ok"
-                        }
-                    }),
-                )
-                .await;
-            let events = drain_events(&mut rx);
-            let kinds = events
-                .iter()
-                .filter_map(|event| event.get("kind").and_then(Value::as_str))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                kinds,
-                vec!["ToolExecutionCompleted", "StreamEnd"],
-                "reasoning segment should close after pending tools finish: {events:?}"
-            );
-
+            assert_eq!(inner.state.lock().await.model.as_deref(), Some("codex"));
             inner.rpc.shutdown().await;
         });
     }
 
     #[test]
-    fn apply_reasoning_delta_to_state_ignores_duplicate_delta_payloads() {
-        let mut state = test_codex_state();
-        let params = json!({ "itemId": "reason-item-1" });
+    fn codex_agent_message_items_keep_distinct_stream_boundaries() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
 
-        let (_, first_text) =
-            apply_reasoning_delta_to_state(&mut state, &params, "Planning targeted web search")
-                .expect("first reasoning event");
-        assert_eq!(first_text, "Planning targeted web search");
+        rt.block_on(async {
+            let (inner, mut rx) = test_codex_inner();
+            let mut all_events = Vec::new();
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-items" } }),
+                )
+                .await;
+            all_events.extend(drain_events(&mut rx));
 
-        let second =
-            apply_reasoning_delta_to_state(&mut state, &params, "Planning targeted web search");
-        assert!(
-            second.is_none(),
-            "duplicate deltas should not emit a second event"
-        );
+            for (item_id, delta, text) in [
+                ("item-alpha", "alpha delta", "alpha complete"),
+                ("item-beta", "beta delta", "beta complete"),
+                ("item-gamma", "gamma delta", "gamma complete"),
+            ] {
+                inner
+                    .handle_notification(
+                        "item/started",
+                        &json!({
+                            "threadId": "thread-test",
+                            "item": { "type": "agentMessage", "id": item_id }
+                        }),
+                    )
+                    .await;
+                inner
+                    .handle_notification(
+                        "item/agentMessage/delta",
+                        &json!({ "threadId": "thread-test", "item_id": item_id, "delta": delta }),
+                    )
+                    .await;
+                inner
+                    .handle_notification(
+                        "item/completed",
+                        &json!({
+                            "threadId": "thread-test",
+                            "item": { "type": "agentMessage", "id": item_id, "text": text }
+                        }),
+                )
+                .await;
+                all_events.extend(drain_events(&mut rx));
+            }
+            inner
+                .handle_notification(
+                    "turn/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turn": { "id": "turn-items", "status": "completed" }
+                    }),
+                )
+                .await;
+            all_events.extend(drain_events(&mut rx));
 
-        let stream = state.active_stream.as_ref().expect("active stream");
-        assert_eq!(stream.reasoning, "Planning targeted web search");
+            assert_eq!(
+                all_events
+                    .iter()
+                    .filter(|event| event.get("kind").and_then(Value::as_str) == Some("StreamStart"))
+                    .map(|event| event.pointer("/data/message_id").and_then(Value::as_str))
+                    .collect::<Vec<_>>(),
+                vec![Some("item-alpha"), Some("item-beta"), Some("item-gamma")]
+            );
+            assert_eq!(
+                all_events
+                    .iter()
+                    .filter(|event| event.get("kind").and_then(Value::as_str) == Some("StreamDelta"))
+                    .map(|event| event.pointer("/data/message_id").and_then(Value::as_str))
+                    .collect::<Vec<_>>(),
+                vec![Some("item-alpha"), Some("item-beta"), Some("item-gamma")]
+            );
+            assert_eq!(
+                all_events
+                    .iter()
+                    .filter(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"))
+                    .map(|event| event.pointer("/data/message/message_id").and_then(Value::as_str))
+                    .collect::<Vec<_>>(),
+                vec![Some("item-alpha"), Some("item-beta"), Some("item-gamma")]
+            );
+            assert_codex_protocol_valid(&all_events);
+            inner.rpc.shutdown().await;
+        });
     }
 
     #[test]
-    fn apply_reasoning_delta_to_state_appends_only_new_suffix_for_snapshot_payloads() {
-        let mut state = test_codex_state();
-        let params = json!({ "itemId": "reason-item-1" });
+    fn codex_completion_only_items_and_duplicate_completion_are_item_scoped() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
 
-        let _ = apply_reasoning_delta_to_state(&mut state, &params, "Planning targeted")
-            .expect("first reasoning event");
-        let (_, second_text) =
-            apply_reasoning_delta_to_state(&mut state, &params, "Planning targeted web search")
-                .expect("second reasoning event");
+        rt.block_on(async {
+            let (inner, mut rx) = test_codex_inner();
+            {
+                let mut state = inner.state.lock().await;
+                state.active_stream = None;
+            }
+            let mut all_events = Vec::new();
+            for (item_id, text) in [
+                ("complete-alpha", "alpha"),
+                ("complete-beta", "beta"),
+                ("complete-gamma", "gamma"),
+            ] {
+                let event = json!({
+                    "threadId": "thread-test",
+                    "item": { "type": "agentMessage", "id": item_id, "text": text }
+                });
+                inner.handle_notification("item/completed", &event).await;
+                all_events.extend(drain_events(&mut rx));
+                if item_id == "complete-alpha" {
+                    inner.handle_notification("item/completed", &event).await;
+                    assert!(
+                        drain_events(&mut rx).is_empty(),
+                        "byte-equivalent completion must not create another relay"
+                    );
+                }
+            }
 
-        assert_eq!(second_text, " web search");
+            assert_eq!(
+                all_events
+                    .iter()
+                    .filter(|event| event.get("kind").and_then(Value::as_str) == Some("StreamStart"))
+                    .count(),
+                3
+            );
+            assert_eq!(
+                all_events
+                    .iter()
+                    .filter(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"))
+                    .map(|event| event.pointer("/data/message/content").and_then(Value::as_str))
+                    .collect::<Vec<_>>(),
+                vec![Some("alpha"), Some("beta"), Some("gamma")]
+            );
+            assert_codex_protocol_valid(&all_events);
+            inner.rpc.shutdown().await;
+        });
+    }
 
-        let stream = state.active_stream.as_ref().expect("active stream");
-        assert_eq!(stream.reasoning, "Planning targeted web search");
+    #[test]
+    fn codex_child_agent_messages_use_provider_item_ids_without_turn_streams() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut parent_rx) = test_codex_inner();
+            let (child_tx, mut child_rx) = mpsc::unbounded_channel();
+            attach_test_codex_subagent(&inner, child_tx, "child-thread").await;
+
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({ "threadId": "child-thread", "turn": { "id": "child-turn" } }),
+                )
+                .await;
+            assert!(drain_events(&mut parent_rx).is_empty());
+            drain_events(&mut child_rx);
+
+            inner
+                .handle_notification(
+                    "item/agentMessage/delta",
+                    &json!({ "threadId": "child-thread", "itemId": "child-alpha", "delta": "alpha" }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "child-thread",
+                        "item": { "type": "agentMessage", "id": "child-alpha", "text": "alpha" }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "child-thread",
+                        "item": { "type": "agentMessage", "id": "child-beta", "text": "" }
+                    }),
+                )
+                .await;
+
+            let events = drain_events(&mut child_rx);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.get("kind").and_then(Value::as_str) == Some("StreamStart"))
+                    .map(|event| event.pointer("/data/message_id").and_then(Value::as_str))
+                    .collect::<Vec<_>>(),
+                vec![Some("child-alpha"), Some("child-beta")]
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"))
+                    .map(|event| event.pointer("/data/message/message_id").and_then(Value::as_str))
+                    .collect::<Vec<_>>(),
+                vec![Some("child-alpha"), Some("child-beta")]
+            );
+            assert!(
+                events.iter().all(|event| event.get("kind").and_then(Value::as_str) != Some("Error")),
+                "child item streams must not emit identity errors: {events:?}"
+            );
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn child_wrong_completion_id_is_quarantined_once() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut parent_rx) = test_codex_inner();
+            let (child_tx, mut child_rx) = mpsc::unbounded_channel();
+            attach_test_codex_subagent(&inner, child_tx, "child-quarantine").await;
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({ "threadId": "child-quarantine", "turn": { "id": "child-turn" } }),
+                )
+                .await;
+            assert!(drain_events(&mut parent_rx).is_empty());
+            drain_events(&mut child_rx);
+            inner
+                .handle_notification(
+                    "item/agentMessage/delta",
+                    &json!({ "threadId": "child-quarantine", "itemId": "child-open", "delta": "partial" }),
+                )
+                .await;
+            drain_events(&mut child_rx);
+
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "child-quarantine",
+                        "item": { "type": "agentMessage", "id": "child-wrong", "text": "wrong" }
+                    }),
+                )
+                .await;
+            let terminal = drain_events(&mut child_rx);
+            assert_eq!(
+                event_kinds(&terminal),
+                vec!["MessageAdded", "OperationCancelled", "TypingStatusChanged"]
+            );
+            assert!(terminal.iter().all(|event| {
+                event.get("kind").and_then(Value::as_str) != Some("StreamEnd")
+            }));
+
+            for (method, params) in [
+                (
+                    "item/completed",
+                    json!({
+                        "threadId": "child-quarantine",
+                        "item": { "type": "agentMessage", "id": "child-open", "text": "late" }
+                    }),
+                ),
+                (
+                    "item/started",
+                    json!({
+                        "threadId": "child-quarantine",
+                        "item": { "type": "agentMessage", "id": "child-late" }
+                    }),
+                ),
+                (
+                    "item/reasoning/delta",
+                    json!({ "threadId": "child-quarantine", "delta": "late reasoning" }),
+                ),
+                (
+                    "turn/plan/updated",
+                    json!({
+                        "threadId": "child-quarantine",
+                        "explanation": "late plan",
+                        "plan": [{ "step": "must not render", "status": "pending" }]
+                    }),
+                ),
+                (
+                    "model/rerouted",
+                    json!({ "threadId": "child-quarantine", "toModel": "late-model" }),
+                ),
+                (
+                    "error",
+                    json!({
+                        "threadId": "child-quarantine",
+                        "message": "late child error",
+                        "fatal": true
+                    }),
+                ),
+                (
+                    "thread/tokenUsage/updated",
+                    json!({
+                        "threadId": "child-quarantine",
+                        "turnId": "child-turn",
+                        "tokenUsage": { "inputTokens": 1, "outputTokens": 1, "totalTokens": 2 }
+                    }),
+                ),
+                (
+                    "turn/completed",
+                    json!({
+                        "threadId": "child-quarantine",
+                        "turn": { "id": "child-turn", "status": "completed" }
+                    }),
+                ),
+                (
+                    "turn/started",
+                    json!({
+                        "threadId": "child-quarantine",
+                        "turn": { "id": "child-turn" }
+                    }),
+                ),
+            ] {
+                inner.handle_notification(method, &params).await;
+            }
+            assert!(
+                drain_events(&mut child_rx).is_empty(),
+                "quarantine must suppress every later child response notification"
+            );
+            assert!(drain_events(&mut parent_rx).is_empty());
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn conflicting_duplicate_completion_is_quarantined_once() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut rx) = test_codex_inner();
+            {
+                let mut state = inner.state.lock().await;
+                state.active_stream = None;
+            }
+            let first = json!({
+                "threadId": "thread-test",
+                "item": { "type": "agentMessage", "id": "conflict-id", "text": "first" }
+            });
+            inner.handle_notification("item/completed", &first).await;
+            let completed = drain_events(&mut rx);
+            assert_eq!(event_kinds(&completed), vec!["StreamStart", "StreamEnd"]);
+
+            let conflicting = json!({
+                "threadId": "thread-test",
+                "item": { "type": "agentMessage", "id": "conflict-id", "text": "second" }
+            });
+            inner
+                .handle_notification("item/completed", &conflicting)
+                .await;
+            let terminal = drain_events(&mut rx);
+            assert_eq!(
+                event_kinds(&terminal),
+                vec!["MessageAdded", "OperationCancelled", "TypingStatusChanged"]
+            );
+            assert!(
+                terminal.iter().all(|event| {
+                    event.get("kind").and_then(Value::as_str) != Some("StreamEnd")
+                })
+            );
+
+            inner
+                .handle_notification("item/completed", &conflicting)
+                .await;
+            inner.handle_notification("item/completed", &first).await;
+            assert!(
+                drain_events(&mut rx).is_empty(),
+                "a quarantined duplicate must have zero extra tails"
+            );
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn codex_turn_completed_quarantines_an_uncompleted_root_item() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut rx) = test_codex_inner();
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-open" } }),
+                )
+                .await;
+            drain_events(&mut rx);
+            inner
+                .handle_notification(
+                    "item/agentMessage/delta",
+                    &json!({ "threadId": "thread-test", "itemId": "open-item", "delta": "partial" }),
+                )
+                .await;
+            drain_events(&mut rx);
+            inner
+                .handle_notification(
+                    "turn/completed",
+                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-open", "status": "completed" } }),
+                )
+                .await;
+            let terminal = drain_events(&mut rx);
+            assert_eq!(
+                event_kinds(&terminal),
+                vec!["MessageAdded", "OperationCancelled", "TypingStatusChanged"],
+                "uncompleted item needs exactly one discard tail: {terminal:?}"
+            );
+            assert!(
+                terminal.iter().all(|event| event.get("kind").and_then(Value::as_str) != Some("StreamEnd")),
+                "turn completion must not fabricate an item completion: {terminal:?}"
+            );
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "item": { "type": "agentMessage", "id": "open-item", "text": "late" }
+                    }),
+                )
+                .await;
+            assert!(
+                drain_events(&mut rx).is_empty(),
+                "late completion must not resurrect a quarantined turn"
+            );
+            inner
+                .handle_notification(
+                    "item/agentMessage/delta",
+                    &json!({ "threadId": "thread-test", "itemId": "another-late", "delta": "late" }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "turn/completed",
+                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-open", "status": "completed" } }),
+                )
+                .await;
+            assert!(
+                drain_events(&mut rx).is_empty(),
+                "late notifications must have zero extra discard tails"
+            );
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn codex_reasoning_item_and_assistant_item_keep_separate_ids() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (inner, mut rx) = test_codex_inner();
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-reasoning" } }),
+                )
+                .await;
+            drain_events(&mut rx);
+            inner
+                .handle_notification(
+                    "item/reasoning/delta",
+                    &json!({ "threadId": "thread-test", "itemId": "reasoning-item", "delta": "thinking" }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "item": { "type": "reasoning", "id": "reasoning-item", "summary": "thinking" }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/agentMessage/delta",
+                    &json!({ "threadId": "thread-test", "itemId": "answer-item", "delta": "answer" }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "item": { "type": "agentMessage", "id": "answer-item", "text": "answer" }
+                    }),
+                )
+                .await;
+            let events = drain_events(&mut rx);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.get("kind").and_then(Value::as_str) == Some("StreamStart"))
+                    .map(|event| event.pointer("/data/message_id").and_then(Value::as_str))
+                    .collect::<Vec<_>>(),
+                vec![Some("reasoning-item"), Some("answer-item")]
+            );
+            assert!(
+                events.iter().any(|event| {
+                    event.get("kind").and_then(Value::as_str) == Some("StreamEnd")
+                        && event.pointer("/data/message/message_id").and_then(Value::as_str)
+                            == Some("reasoning-item")
+                }),
+                "provider reasoning completion must close its own response: {events:?}"
+            );
+            assert!(events.iter().any(|event| {
+                event.get("kind").and_then(Value::as_str) == Some("StreamEnd")
+                    && event
+                        .pointer("/data/message/message_id")
+                        .and_then(Value::as_str)
+                        == Some("answer-item")
+            }));
+            assert!(
+                events.iter().all(|event| event.get("kind").and_then(Value::as_str) != Some("MessageAdded")),
+                "distinct provider boundaries must not raise a foreign-ID error: {events:?}"
+            );
+            inner.rpc.shutdown().await;
+        });
     }
 
     #[test]
@@ -12507,19 +15492,6 @@ Do not describe the tool, and do not skip the tool call."#;
         assert_eq!(
             extract_codex_reasoning_delta_text(&payload),
             Some("Need to inspect parser edge-cases.".to_string())
-        );
-    }
-
-    #[test]
-    fn merge_reasoning_delta_handles_overlap_and_duplicates() {
-        assert_eq!(merge_reasoning_delta("", "Plan"), "Plan");
-        assert_eq!(merge_reasoning_delta("Plan", "Plan"), "");
-        assert_eq!(merge_reasoning_delta("Plan", "Plan more"), " more");
-        assert_eq!(merge_reasoning_delta("Planning", "ing details"), " details");
-        assert_eq!(merge_reasoning_delta("Planning details", "details"), "");
-        assert_eq!(
-            merge_reasoning_delta("Planning targeted web search", "targeted"),
-            ""
         );
     }
 
@@ -12964,150 +15936,61 @@ Do not describe the tool, and do not skip the tool call."#;
     }
 
     #[test]
-    fn parse_codex_subagent_spawn_reads_collab_shape() {
+    fn parse_codex_subagent_collab_reads_authoritative_thread_ids() {
         let item = json!({
-            "type": "collabToolCall",
+            "type": "collabAgentToolCall",
             "id": "collab-1",
-            "tool": "spawn_agent",
-            "newThreadId": "thread_sub_1",
-            "prompt": "Review src/auth.ts for race conditions",
+            "senderThreadId": "thread-parent",
+            "receiverThreadId": "thread-child",
+            "prompt": "Review src/auth.ts",
             "receiverAgentType": "reviewer",
-            "description": "Auth Reviewer"
+            "receiverAgentName": "Auth Reviewer"
         });
 
-        let parsed = parse_codex_subagent_spawn(&item).expect("spawn item");
+        let parsed = parse_codex_subagent_collab(&item).expect("collab item");
         assert_eq!(parsed.item_id, "collab-1");
-        assert_eq!(parsed.tool_name, "spawn_agent");
+        assert_eq!(parsed.sender_thread_id, "thread-parent");
+        assert_eq!(parsed.receiver_thread_id, "thread-child");
         assert_eq!(parsed.name, "Auth Reviewer");
-        assert_eq!(parsed.description, "Review src/auth.ts for race conditions");
-        assert_eq!(parsed.agent_type, "reviewer");
-        assert_eq!(parsed.receiver_thread_id.as_deref(), Some("thread_sub_1"));
     }
 
     #[test]
-    fn parse_codex_subagent_spawn_reads_collab_agent_shape() {
+    fn parse_codex_subagent_activity_reads_authoritative_child_thread() {
         let item = json!({
-            "type": "collabAgentToolCall",
-            "id": "collab-agent-1",
-            "tool": "spawnAgent",
-            "receiverThreadIds": ["thread_sub_42"],
-            "prompt": "Read hello.txt and reply exactly: LIVE_SUBAGENT_OK",
-            "model": "gpt-5.3-codex"
+            "type": "subAgentActivity",
+            "kind": "started",
+            "agentThreadId": "thread-child",
+            "agentPath": "/root/reviewer"
         });
-
-        let parsed = parse_codex_subagent_spawn(&item).expect("collab agent spawn");
-        assert_eq!(parsed.item_id, "collab-agent-1");
-        assert_eq!(parsed.tool_name, "spawnAgent");
-        assert_eq!(
-            parsed.description,
-            "Read hello.txt and reply exactly: LIVE_SUBAGENT_OK"
-        );
-        assert_eq!(parsed.receiver_thread_id.as_deref(), Some("thread_sub_42"));
+        let parsed = parse_codex_subagent_activity(&item).expect("activity item");
+        assert_eq!(parsed.kind, "started");
+        assert_eq!(parsed.agent_thread_id, "thread-child");
+        assert_eq!(parsed.agent_path, "/root/reviewer");
     }
 
     #[test]
-    fn parse_codex_subagent_spawn_ignores_non_spawn_collab_calls() {
+    fn parse_captured_rollout_subagent_activity_shape() {
         let item = json!({
-            "type": "collabToolCall",
-            "id": "collab-2",
-            "tool": "wait_agent",
-            "receiverThreadId": "thread_sub_1"
+            "type": "sub_agent_activity",
+            "kind": "started",
+            "agent_thread_id": "019f5938-c06a-actual-child",
+            "agent_path": "/root/map_planner"
         });
-        assert!(parse_codex_subagent_spawn(&item).is_none());
+        let parsed = parse_codex_subagent_activity(&item).expect("captured rollout activity");
+        assert_eq!(parsed.kind, "started");
+        assert_eq!(parsed.agent_thread_id, "019f5938-c06a-actual-child");
+        assert_eq!(parsed.agent_path, "/root/map_planner");
     }
 
     #[test]
-    fn parse_codex_subagent_spawn_reads_dynamic_spawn_call() {
-        let item = json!({
-            "type": "dynamicToolCall",
-            "id": "dyn-1",
-            "tool": "spawn_agent",
-            "arguments": {
-                "agent_type": "worker",
-                "message": "Read hello.py and add a greeting"
-            }
-        });
-
-        let parsed = parse_codex_subagent_spawn(&item).expect("dynamic spawn");
-        assert_eq!(parsed.item_id, "dyn-1");
-        assert_eq!(parsed.tool_name, "spawn_agent");
-        assert_eq!(parsed.agent_type, "worker");
-        assert_eq!(parsed.description, "Read hello.py and add a greeting");
-    }
-
-    #[test]
-    fn extract_codex_spawned_agent_id_reads_stringified_result_payload() {
-        let item = json!({
-            "type": "dynamicToolCall",
-            "tool": "spawn_agent",
-            "output": "{\"agent_id\":\"agent_123\"}"
-        });
-        assert_eq!(
-            extract_codex_spawned_agent_id(&item),
-            Some("agent_123".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_codex_wait_agent_completions_reads_status_map() {
-        let item = json!({
-            "type": "dynamicToolCall",
-            "tool": "wait_agent",
-            "output": "{\"status\":{\"agent_123\":{\"completed\":\"done\"},\"agent_456\":{\"failed\":\"boom\"}},\"timed_out\":false}"
-        });
-
-        let completions = extract_codex_wait_agent_completions(&item);
-        let ids: HashSet<String> = completions
-            .into_iter()
-            .map(|entry| entry.external_agent_id)
-            .collect();
-
-        assert!(ids.contains("agent_123"));
-        assert!(ids.contains("agent_456"));
-    }
-
-    #[test]
-    fn extract_codex_wait_agent_completions_reads_collab_agent_states() {
-        let item = json!({
-            "type": "collabAgentToolCall",
-            "id": "collab-wait-1",
-            "tool": "wait",
-            "agentsStates": {
-                "thread_sub_ok": { "status": "completed", "message": "LIVE_SUBAGENT_OK" },
-                "thread_sub_err": { "status": "errored", "message": "boom" },
-                "thread_sub_running": { "status": "running", "message": "still running" }
-            }
-        });
-
-        let completions = extract_codex_wait_agent_completions(&item);
-        let ids: HashSet<String> = completions
-            .into_iter()
-            .map(|entry| entry.external_agent_id)
-            .collect();
-
-        assert!(ids.contains("thread_sub_ok"));
-        assert!(ids.contains("thread_sub_err"));
-        assert!(
-            !ids.contains("thread_sub_running"),
-            "running state should not be treated as a completed wait result"
-        );
-    }
-
-    #[test]
-    fn codex_tool_name_matchers_handle_camel_case_collab_tools() {
-        assert!(codex_tool_name_is_spawn("spawnAgent"));
-        assert!(codex_tool_name_is_wait("wait"));
-    }
-
-    #[test]
-    fn extract_codex_subagent_notification_completion_reads_wrapped_payload() {
-        let text = r#"<subagent_notification>
-{"agent_id":"agent_123","status":{"completed":"worker finished"}}
-</subagent_notification>"#;
-
-        let completion =
-            extract_codex_subagent_notification_completion(text).expect("subagent notification");
-        assert_eq!(completion.external_agent_id, "agent_123");
+    fn collab_wait_followup_and_interrupt_do_not_become_spawn_metadata() {
+        for item in [
+            json!({"type":"collabAgentToolCall","id":"wait","senderThreadId":"parent","receiverThreadId":"child","agentsStates":{},"prompt":"wait","receiverAgentType":"worker"}),
+            json!({"type":"collabAgentToolCall","id":"followup","senderThreadId":"parent","receiverThreadId":"child","prompt":"continue"}),
+            json!({"type":"collabToolCall","id":"interrupt","senderThreadId":"parent","receiverThreadId":"child","prompt":"stop","receiverAgentType":"worker"}),
+        ] {
+            assert!(parse_codex_subagent_collab(&item).is_none(), "{item}");
+        }
     }
 
     #[test]
@@ -13192,7 +16075,11 @@ Do not describe the tool, and do not skip the tool call."#;
 
     #[test]
     fn codex_read_only_access_mode_sets_writable_cli_and_turn_sandbox() {
-        let args = codex_app_server_args(BackendAccessMode::ReadOnly, &[]);
+        let args = codex_app_server_args(
+            BackendAccessMode::ReadOnly,
+            BackendExecutionMode::Agent,
+            &[],
+        );
         assert_eq!(
             args.iter().map(String::as_str).collect::<Vec<_>>()[..3],
             ["--sandbox", "workspace-write", "app-server"]
@@ -13200,7 +16087,11 @@ Do not describe the tool, and do not skip the tool call."#;
 
         // Intentional behavior change: read-only is best-effort guidance, so
         // Codex must allow workspace writes for build/test outputs like target/.
-        let policy = codex_sandbox_policy(BackendAccessMode::ReadOnly, true);
+        let policy = codex_sandbox_policy(
+            BackendAccessMode::ReadOnly,
+            true,
+            BackendExecutionMode::Agent,
+        );
         assert_eq!(
             policy.get("type").and_then(Value::as_str),
             Some("workspaceWrite")
@@ -13213,13 +16104,21 @@ Do not describe the tool, and do not skip the tool call."#;
 
     #[test]
     fn codex_unrestricted_access_mode_keeps_danger_full_sandbox() {
-        let args = codex_app_server_args(BackendAccessMode::Unrestricted, &[]);
+        let args = codex_app_server_args(
+            BackendAccessMode::Unrestricted,
+            BackendExecutionMode::Agent,
+            &[],
+        );
         assert_eq!(
             args.iter().map(String::as_str).collect::<Vec<_>>()[..3],
             ["--sandbox", "danger-full-access", "app-server"]
         );
 
-        let policy = codex_sandbox_policy(BackendAccessMode::Unrestricted, true);
+        let policy = codex_sandbox_policy(
+            BackendAccessMode::Unrestricted,
+            true,
+            BackendExecutionMode::Agent,
+        );
         assert_eq!(
             policy.get("type").and_then(Value::as_str),
             Some("dangerFullAccess")
@@ -13303,61 +16202,5 @@ Do not describe the tool, and do not skip the tool call."#;
                     "mcp_servers.{AGENT_CONTROL_AWAIT_MCP_SERVER_NAME}.tool_timeout_sec={CODEX_AGENT_AWAIT_TOOL_TIMEOUT_SECS}"
                 )
         }));
-    }
-
-    /// Regression: a Codex agent calling Tyde's `tyde_spawn_agent` MCP tool must
-    /// NOT be picked up by the *native* Codex sub-agent detector. The tool call
-    /// is rendered to the UI separately (via `emitter.tool_request`); the native
-    /// detector creating a second session would duplicate every MCP-spawned
-    /// sub-agent (one `agent_control` session + one phantom `backend_native`
-    /// session inheriting the parent's backend/project). See the
-    /// `Antigravity Cli Migration` orchestrator that spawned 2 children but
-    /// produced 4 sessions.
-    #[test]
-    fn tyde_spawn_agent_is_not_a_native_codex_spawn() {
-        // The name classifier excludes Tyde's tool, bare and MCP-namespaced.
-        assert!(!codex_tool_name_is_spawn("tyde_spawn_agent"));
-        assert!(!codex_tool_name_is_spawn(
-            "mcp__tyde-agent-control__tyde_spawn_agent"
-        ));
-
-        // The full parse path (used by `spawn_codex_subagent_if_needed`) returns
-        // None for a real `mcpToolCall` item, so no phantom session is spawned.
-        for tool in [
-            "tyde_spawn_agent",
-            "mcp__tyde-agent-control__tyde_spawn_agent",
-        ] {
-            let tyde_mcp_item = json!({
-                "id": "item_tyde_0",
-                "type": "mcpToolCall",
-                "tool": tool,
-                "args": { "name": "Codex RCA", "prompt": "do the thing" },
-            });
-            assert!(
-                parse_codex_subagent_spawn(&tyde_mcp_item).is_none(),
-                "{tool} must not be treated as a native Codex sub-agent spawn"
-            );
-            assert!(!codex_item_looks_like_spawn_tool(&tyde_mcp_item));
-        }
-    }
-
-    /// Companion guard: the exclusion above must not blind the detector to
-    /// Codex's genuine native spawn/delegate tools.
-    #[test]
-    fn genuine_native_codex_spawn_is_still_detected() {
-        assert!(codex_tool_name_is_spawn("spawn_agent"));
-        assert!(codex_tool_name_is_spawn("spawn_subagent"));
-        assert!(codex_tool_name_is_spawn("delegate"));
-
-        let native_item = json!({
-            "id": "item_native_0",
-            "type": "mcpToolCall",
-            "tool": "spawn_subagent",
-            "prompt": "investigate the regression",
-        });
-        let parsed = parse_codex_subagent_spawn(&native_item)
-            .expect("a genuine native spawn tool must still be detected");
-        assert_eq!(parsed.item_id, "item_native_0");
-        assert!(codex_item_looks_like_spawn_tool(&native_item));
     }
 }

@@ -68,6 +68,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::SessionSchemas
                 | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
+                | FrameKind::BackendCapacity
                 | FrameKind::BackendConfigSchemas
                 | FrameKind::BackendConfigSnapshots
                 | FrameKind::QueuedMessages
@@ -319,6 +320,7 @@ async fn expect_no_event(client: &mut client::Connection, duration: Duration, co
                             | FrameKind::SessionSchemas
                             | FrameKind::LaunchProfileCatalogNotify
                             | FrameKind::BackendSetup
+                            | FrameKind::BackendCapacity
                             | FrameKind::BackendConfigSchemas
                             | FrameKind::BackendConfigSnapshots
                             | FrameKind::QueuedMessages
@@ -736,6 +738,10 @@ async fn wait_for_ready_launch_profile(
                 let _: protocol::BackendConfigSchemasPayload =
                     env.parse_payload().expect("BackendConfigSchemas payload");
             }
+            FrameKind::BackendCapacity => {
+                let _: protocol::BackendCapacityPayload =
+                    env.parse_payload().expect("BackendCapacity payload");
+            }
             FrameKind::BackendConfigSnapshots => {
                 let _: BackendConfigSnapshotsPayload =
                     env.parse_payload().expect("BackendConfigSnapshots payload");
@@ -932,9 +938,11 @@ fn chat_event_contains(event: &Envelope, expected_text: &str) -> bool {
 
 const MOCK_NATIVE_CHILD_SENTINEL: &str = "__mock_spawn_native_child__";
 const MOCK_NATIVE_CHILD_AND_DROP_SENTINEL: &str = "__mock_spawn_native_child_and_drop__";
+const MOCK_LIVE_NATIVE_CHILD_SENTINEL: &str = "__mock_spawn_live_native_child__";
 const MOCK_ERROR_WITHOUT_IDLE_SENTINEL: &str = "__mock_error_without_idle__";
 const MOCK_TOOL_FAILURE_WITHOUT_IDLE_SENTINEL: &str = "__mock_tool_failure_without_idle__";
 const MOCK_AGENT_CONTROL_AWAIT_SENTINEL: &str = "__mock_agent_control_await__";
+const MOCK_AGENT_CONTROL_SEND_MESSAGE_SENTINEL: &str = "__mock_agent_control_send_message__";
 const MOCK_LATE_USAGE_SENTINEL: &str = "__mock_late_usage__";
 const MOCK_NO_USAGE_SENTINEL: &str = "__mock_no_usage__";
 const MOCK_ORCHESTRATION_SENTINEL: &str = "__mock_orchestration__";
@@ -2205,6 +2213,22 @@ async fn subagent_turn_token_usage_is_strictly_self() {
         MOCK_NATIVE_CHILD_TOKEN_TOTAL,
         MOCK_NATIVE_CHILD_TOKEN_TOTAL,
     );
+    let task_usage = expect_task_token_usage_matching(
+        &mut fixture.client,
+        &parent_new.agent_id,
+        "native child known task usage",
+        |payload| {
+            payload.breakdown.iter().any(|agent| {
+                agent.agent_id == child_new.agent_id
+                    && agent
+                        .usage
+                        .known_usage()
+                        .is_some_and(|usage| usage.total_tokens == MOCK_NATIVE_CHILD_TOKEN_TOTAL)
+            })
+        },
+    )
+    .await;
+    assert_known_task_status(&task_usage.total.status);
 }
 
 #[tokio::test]
@@ -4585,15 +4609,11 @@ async fn agent_control_await_tool_call_emits_correlated_completion_when_child_be
         tool_type,
     } = await_request;
     assert_eq!(tool_name, "tyde_await_agents");
-    let ToolRequestType::Other { args } = tool_type else {
-        panic!("expected tyde_await_agents ToolRequest to use Other args");
-    };
     assert_eq!(
-        args.get("agent_ids")
-            .and_then(Value::as_array)
-            .and_then(|agent_ids| agent_ids.first())
-            .and_then(Value::as_str),
-        Some(child_new.agent_id.0.as_str())
+        tool_type,
+        ToolRequestType::TydeAwaitAgents {
+            agent_ids: vec![child_new.agent_id.clone()],
+        }
     );
 
     fixture
@@ -4623,10 +4643,17 @@ async fn agent_control_await_tool_call_emits_correlated_completion_when_child_be
         completion.success,
         "await completion failed: {completion:?}"
     );
-    let ToolExecutionResult::Other { result } = completion.tool_result else {
-        panic!("expected await completion to carry MCP result JSON");
+    let ToolExecutionResult::TydeAwaitAgents {
+        ready,
+        still_thinking,
+    } = completion.tool_result
+    else {
+        panic!("expected typed await completion");
     };
-    assert_await_result_ready(&result, &child_new.agent_id);
+    assert!(still_thinking.is_empty());
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].agent_id, child_new.agent_id);
+    assert_eq!(ready[0].status, protocol::AgentControlStatus::Idle);
 
     expect_stream_end_on_stream(
         &mut fixture.client,
@@ -4635,6 +4662,115 @@ async fn agent_control_await_tool_call_emits_correlated_completion_when_child_be
     )
     .await;
     expect_typing_false_on_stream(&mut fixture.client, &parent_new.instance_stream).await;
+
+    let (mut late_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    let replayed_parent = bootstrapped_agent(&bootstrap, &parent_new.agent_id);
+    let replay = expect_raw_agent_bootstrap_on_stream(
+        &mut late_client,
+        &replayed_parent.instance_stream,
+        "typed await replay",
+    )
+    .await;
+    assert!(replay.events.iter().any(|event| matches!(
+        event,
+        AgentBootstrapEvent::ChatEvent(ChatEvent::ToolRequest(ToolRequest {
+            tool_call_id: replayed_call_id,
+            tool_type: ToolRequestType::TydeAwaitAgents { agent_ids },
+            ..
+        })) if replayed_call_id == &tool_call_id && agent_ids == &vec![child_new.agent_id.clone()]
+    )));
+    assert!(replay.events.iter().any(|event| matches!(
+        event,
+        AgentBootstrapEvent::ChatEvent(ChatEvent::ToolExecutionCompleted(completion))
+            if completion.tool_call_id == tool_call_id
+                && matches!(
+                    &completion.tool_result,
+                    ToolExecutionResult::TydeAwaitAgents { ready, still_thinking }
+                        if still_thinking.is_empty()
+                            && ready.len() == 1
+                            && ready[0].agent_id == child_new.agent_id
+                            && ready[0].status == protocol::AgentControlStatus::Idle
+                )
+    )));
+}
+
+#[tokio::test]
+async fn agent_control_send_message_is_typed_live_and_on_replay() {
+    let mut fixture = Fixture::new().await;
+    let parent = spawn_agent_control_parent(&mut fixture, "typed-send-parent").await;
+    let recipient = protocol::AgentId("typed-send-recipient".to_owned());
+    let message = "# Follow up\n\n- preserve `markdown`\n- keep exact bytes";
+
+    fixture
+        .client
+        .send_message(
+            &parent.instance_stream,
+            format!(
+                "{MOCK_AGENT_CONTROL_SEND_MESSAGE_SENTINEL} {} {message}",
+                recipient.0
+            ),
+        )
+        .await
+        .expect("send typed agent-control message fixture");
+
+    let request = expect_tool_request_on_stream(
+        &mut fixture.client,
+        &parent.instance_stream,
+        "tyde_send_agent_message",
+    )
+    .await;
+    assert_eq!(request.tool_name, "tyde_send_agent_message");
+    assert_eq!(
+        request.tool_type,
+        ToolRequestType::TydeSendAgentMessage {
+            agent_id: recipient.clone(),
+            message: message.to_owned(),
+        }
+    );
+    let completion = expect_tool_completion_on_stream(
+        &mut fixture.client,
+        &parent.instance_stream,
+        &request.tool_call_id,
+    )
+    .await;
+    assert!(completion.success);
+    assert_eq!(
+        completion.tool_result,
+        ToolExecutionResult::TydeSendAgentMessage
+    );
+    expect_stream_end_on_stream(
+        &mut fixture.client,
+        &parent.instance_stream,
+        "mock agent-control message delivered",
+    )
+    .await;
+    expect_typing_false_on_stream(&mut fixture.client, &parent.instance_stream).await;
+
+    let (mut late_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    let replayed_parent = bootstrapped_agent(&bootstrap, &parent.agent_id);
+    let replay = expect_raw_agent_bootstrap_on_stream(
+        &mut late_client,
+        &replayed_parent.instance_stream,
+        "typed send-message replay",
+    )
+    .await;
+    assert!(replay.events.iter().any(|event| matches!(
+        event,
+        AgentBootstrapEvent::ChatEvent(ChatEvent::ToolRequest(ToolRequest {
+            tool_call_id,
+            tool_type: ToolRequestType::TydeSendAgentMessage { agent_id, message: replayed },
+            ..
+        })) if tool_call_id == &request.tool_call_id
+            && agent_id == &recipient
+            && replayed == message
+    )));
+    assert!(replay.events.iter().any(|event| matches!(
+        event,
+        AgentBootstrapEvent::ChatEvent(ChatEvent::ToolExecutionCompleted(completion))
+            if completion.tool_call_id == request.tool_call_id
+                && completion.success
+                && completion.tool_result == ToolExecutionResult::TydeSendAgentMessage
+    )));
 }
 
 #[tokio::test]
@@ -4691,7 +4827,7 @@ async fn agent_control_http_respects_explicit_parent_agent_id_in_tool_arguments(
     let child_agent_id = mcp_spawn_agent_as(
         &caller,
         json!({
-            "workspace_roots": ["/tmp/explicit-parent-child"],
+            "workspace_roots": project_roots(&parent_project),
             "prompt": "child with explicit parent",
             "backend_kind": "claude",
             "name": "explicit-child",
@@ -4826,11 +4962,10 @@ async fn agent_control_http_inherits_project_id_from_parent_unless_overridden() 
     .await;
 
     let caller = fixture.agent_control_caller(&parent_new.agent_id).await;
-    let inherited_child_root = "/tmp/agent-control-inherited-child";
     let inherited_child_id = mcp_spawn_agent_as(
         &caller,
         json!({
-            "workspace_roots": [inherited_child_root],
+            "workspace_roots": project_roots(&parent_project),
             "prompt": "child inherits project",
             "backend_kind": "claude",
             "name": "inherited-project-child"
@@ -4874,11 +5009,10 @@ async fn agent_control_http_inherits_project_id_from_parent_unless_overridden() 
     )
     .await;
 
-    let override_child_root = "/tmp/agent-control-override-child";
     let override_child_id = mcp_spawn_agent_as(
         &caller,
         json!({
-            "workspace_roots": [override_child_root],
+            "workspace_roots": project_roots(&override_project),
             "prompt": "child overrides project",
             "backend_kind": "claude",
             "name": "override-project-child",
@@ -4941,7 +5075,7 @@ async fn agent_control_http_inherits_project_id_from_parent_unless_overridden() 
     let inherited_session = fresh_bootstrap
         .sessions
         .iter()
-        .find(|session| session.workspace_roots == vec![inherited_child_root.to_owned()])
+        .find(|session| session.workspace_roots == project_roots(&parent_project))
         .expect("inherited child session missing from fresh host bootstrap");
     assert_eq!(
         inherited_session.project_id.as_ref(),
@@ -4950,7 +5084,7 @@ async fn agent_control_http_inherits_project_id_from_parent_unless_overridden() 
     let override_session = fresh_bootstrap
         .sessions
         .iter()
-        .find(|session| session.workspace_roots == vec![override_child_root.to_owned()])
+        .find(|session| session.workspace_roots == project_roots(&override_project))
         .expect("override child session missing from fresh host bootstrap");
     assert_eq!(
         override_session.project_id.as_ref(),
@@ -5272,6 +5406,106 @@ async fn backend_native_child_with_closed_event_stream_still_replays_to_late_cli
     )
     .await;
     assert_eq!(replayed_child_start.origin, AgentOrigin::BackendNative);
+}
+
+#[tokio::test]
+async fn cancelling_parent_terminally_closes_live_native_child_and_replays_idle() {
+    let mut fixture = Fixture::new().await;
+    let prompt = format!("__mock_hold_until_interrupt__ {MOCK_LIVE_NATIVE_CHILD_SENTINEL}");
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("parent-with-live-native-child".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/live-native-child-parent".to_owned()],
+                prompt,
+                images: None,
+                backend_kind: BackendKind::Codex,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn parent with live native child");
+
+    let parent_env = expect_kind(&mut fixture.client, FrameKind::NewAgent, "parent NewAgent").await;
+    let parent: NewAgentPayload = parent_env.parse_payload().expect("parse parent NewAgent");
+    expect_agent_start_on_stream(&mut fixture.client, &parent.instance_stream, "parent start")
+        .await;
+    for context in [
+        "parent typing",
+        "parent stream start",
+        "parent stream delta",
+    ] {
+        let _ = expect_chat_event_on_stream(&mut fixture.client, &parent.instance_stream, context)
+            .await;
+    }
+
+    let child_env = expect_kind(&mut fixture.client, FrameKind::NewAgent, "child NewAgent").await;
+    let child: NewAgentPayload = child_env.parse_payload().expect("parse child NewAgent");
+    expect_agent_start_on_stream(&mut fixture.client, &child.instance_stream, "child start").await;
+    for context in ["child typing", "child stream start", "child stream delta"] {
+        let _ =
+            expect_chat_event_on_stream(&mut fixture.client, &child.instance_stream, context).await;
+    }
+
+    fixture
+        .client
+        .interrupt(&parent.instance_stream)
+        .await
+        .expect("interrupt parent");
+    let stream_end = expect_chat_event_on_stream(
+        &mut fixture.client,
+        &child.instance_stream,
+        "child StreamEnd",
+    )
+    .await;
+    assert!(matches!(
+        stream_end
+            .parse_payload::<ChatEvent>()
+            .expect("child StreamEnd"),
+        ChatEvent::StreamEnd(_)
+    ));
+    expect_operation_cancelled_on_stream(
+        &mut fixture.client,
+        &child.instance_stream,
+        "Parent agent turn ended",
+    )
+    .await;
+
+    let caller = fixture.agent_control_caller(&parent.agent_id).await;
+    wait_for_agent_control_status(&caller, &child.agent_id, "idle", Duration::from_secs(2)).await;
+
+    let (mut late_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    let replayed_child = bootstrapped_agent(&bootstrap, &child.agent_id);
+    let replay = expect_raw_agent_bootstrap_on_stream(
+        &mut late_client,
+        &replayed_child.instance_stream,
+        "late child bootstrap",
+    )
+    .await;
+    let replayed_chat = replay
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            AgentBootstrapEvent::ChatEvent(event) => Some(event),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let cancel_index = replayed_chat
+        .iter()
+        .position(|event| matches!(event, ChatEvent::OperationCancelled(_)))
+        .expect("late replay must contain child cancellation");
+    assert!(
+        !replayed_chat[cancel_index + 1..]
+            .iter()
+            .any(|event| matches!(event, ChatEvent::TypingStatusChanged(true)))
+    );
 }
 
 #[tokio::test]

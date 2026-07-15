@@ -946,8 +946,8 @@ mod wasm_tests {
 
     /// Mount an `Auto`-aligned menu (one ready profile + a custom agent so the
     /// flyout has content) inside a container placed by `container_style`, hover
-    /// the row, and report `(row_left, submenu_left, row_button_text)`.
-    async fn auto_hover_geometry(container_style: &str) -> (f64, f64, String) {
+    /// the row, and report its geometry plus the row button text.
+    async fn auto_hover_geometry(container_style: &str) -> (f64, f64, f64, f64, String) {
         let container = make_container_styled(container_style);
         let state = AppState::new();
         set_catalog(
@@ -989,11 +989,21 @@ mod wasm_tests {
             .expect("submenu must be visible after hover")
             .dyn_into::<HtmlElement>()
             .unwrap();
-        (
-            row.get_bounding_client_rect().left(),
+        let row_rect = row.get_bounding_client_rect();
+        let result = (
+            row_rect.left(),
+            row_rect.right(),
             submenu.get_bounding_client_rect().left(),
+            web_sys::window()
+                .unwrap()
+                .inner_width()
+                .unwrap()
+                .as_f64()
+                .unwrap(),
             row_button_text(&container),
-        )
+        );
+        container.remove();
+        result
     }
 
     /// `Auto` opens the natural right-side flyout when the row has room to its
@@ -1001,8 +1011,13 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn auto_flyout_prefers_right_when_room() {
         // Narrow menu pinned to the left edge → lots of room on the right.
-        let (row_left, submenu_left, text) =
-            auto_hover_geometry("position:absolute;top:0;left:0;width:160px;").await;
+        let (row_left, row_right, submenu_left, viewport_width, text) =
+            auto_hover_geometry("position:fixed;top:0;left:0;width:160px;").await;
+        assert!(
+            row_left.abs() < 1.0 && viewport_width - row_right >= SUBMENU_ESTIMATED_WIDTH,
+            "fixture row must hug the viewport's left edge with enough room for the flyout \
+             (row_left={row_left}, row_right={row_right}, viewport_width={viewport_width})"
+        );
         assert!(
             submenu_left >= row_left,
             "with room, Auto must open the flyout to the right \
@@ -1020,8 +1035,13 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn auto_flyout_flips_left_near_right_edge() {
         // Narrow menu pinned to the right edge → no room on the right.
-        let (row_left, submenu_left, text) =
-            auto_hover_geometry("position:absolute;top:0;right:0;width:160px;").await;
+        let (row_left, row_right, submenu_left, viewport_width, text) =
+            auto_hover_geometry("position:fixed;top:0;right:0;width:160px;").await;
+        assert!(
+            (viewport_width - row_right).abs() < 1.0,
+            "fixture row must hug the viewport's right edge before testing Auto \
+             (viewport_width={viewport_width}, row_right={row_right})"
+        );
         assert!(
             submenu_left < row_left,
             "near the right edge, Auto must flip the flyout to the left \

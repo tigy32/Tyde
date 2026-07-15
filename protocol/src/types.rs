@@ -1139,6 +1139,7 @@ pub enum FrameKind {
     SessionSettings,
     BackendConfigSchemas,
     BackendConfigSnapshots,
+    BackendCapacity,
     LaunchProfileCatalogNotify,
     MobileAccessState,
     MobilePairingOffer,
@@ -1307,6 +1308,7 @@ impl fmt::Display for FrameKind {
             Self::SessionSettings => f.write_str("session_settings"),
             Self::BackendConfigSchemas => f.write_str("backend_config_schemas"),
             Self::BackendConfigSnapshots => f.write_str("backend_config_snapshots"),
+            Self::BackendCapacity => f.write_str("backend_capacity"),
             Self::LaunchProfileCatalogNotify => f.write_str("launch_profile_catalog_notify"),
             Self::MobileAccessState => f.write_str("mobile_access_state"),
             Self::MobilePairingOffer => f.write_str("mobile_pairing_offer"),
@@ -2344,10 +2346,84 @@ pub enum HostSettingValue {
         backend: BackendKind,
         settings: Value,
     },
+    /// Acknowledge the one-time notice for a specific server-owned Tycode
+    /// managed-settings projection. A mismatched projection id is a typed
+    /// `CommandErrorCode::Conflict`, never an acknowledgement of a newer
+    /// projection.
+    AcknowledgeTycodeProjectionNotice {
+        backend: BackendKind,
+        projection_id: TycodeProjectionId,
+    },
+    /// Clear only the server-owned Tycode managed projection after an explicit
+    /// recovery-required state. Both tokens must exactly match the state the
+    /// server reported; a stale token is a typed `CommandErrorCode::Conflict`.
+    ResetTycodeManagedProjection {
+        backend: BackendKind,
+        expected_projection_id: TycodeProjectionId,
+        expected_state_hash: TycodeProjectionStateHash,
+    },
     /// Replace all explicit server-owned Launch Profiles.
     LaunchProfiles {
         profiles: Vec<HostLaunchProfileConfig>,
     },
+}
+
+impl HostSettingValue {
+    /// Returns the value-free target clients use to correlate a failed setting
+    /// command with its pending save.
+    pub fn error_target(&self) -> HostSettingErrorTarget {
+        match self {
+            Self::EnabledBackends { .. } => HostSettingErrorTarget::EnabledBackends,
+            Self::DefaultBackend { .. } => HostSettingErrorTarget::DefaultBackend,
+            Self::EnableMobileConnections { .. } => HostSettingErrorTarget::EnableMobileConnections,
+            Self::MobileBrokerUrl { .. } => HostSettingErrorTarget::MobileBrokerUrl,
+            Self::TydeDebugMcpEnabled { .. } => HostSettingErrorTarget::TydeDebugMcpEnabled,
+            Self::TydeAgentControlMcpEnabled { .. } => {
+                HostSettingErrorTarget::TydeAgentControlMcpEnabled
+            }
+            Self::ComplexityTiersEnabled { .. } => HostSettingErrorTarget::ComplexityTiersEnabled,
+            Self::BackendTiers { .. } => HostSettingErrorTarget::BackendTiers,
+            Self::BackgroundAgentFeatureEnabled { .. } => {
+                HostSettingErrorTarget::BackgroundAgentFeatureEnabled
+            }
+            Self::CodeIntelLanguageServerPath { .. } => {
+                HostSettingErrorTarget::CodeIntelLanguageServerPath
+            }
+            Self::BackendConfig { .. } => HostSettingErrorTarget::BackendConfig,
+            Self::BackendNativeSettings { .. } => HostSettingErrorTarget::BackendNativeSettings,
+            Self::AcknowledgeTycodeProjectionNotice { .. } => {
+                HostSettingErrorTarget::AcknowledgeTycodeProjectionNotice
+            }
+            Self::ResetTycodeManagedProjection { .. } => {
+                HostSettingErrorTarget::ResetTycodeManagedProjection
+            }
+            Self::LaunchProfiles { .. } => HostSettingErrorTarget::LaunchProfiles,
+        }
+    }
+}
+
+/// Identifies the setting affected by a [`FrameKind::SetSetting`] command
+/// error without echoing a submitted value, credential, path, or stale token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostSettingErrorTarget {
+    /// The command payload was not a valid typed host-setting value.
+    Malformed,
+    EnabledBackends,
+    DefaultBackend,
+    EnableMobileConnections,
+    MobileBrokerUrl,
+    TydeDebugMcpEnabled,
+    TydeAgentControlMcpEnabled,
+    ComplexityTiersEnabled,
+    BackendTiers,
+    BackgroundAgentFeatureEnabled,
+    CodeIntelLanguageServerPath,
+    BackendConfig,
+    BackendNativeSettings,
+    AcknowledgeTycodeProjectionNotice,
+    ResetTycodeManagedProjection,
+    LaunchProfiles,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2474,6 +2550,237 @@ pub struct BackendConfigSnapshotsPayload {
     pub native_settings: Vec<BackendNativeSettingsSnapshot>,
 }
 
+/// Server-owned, host-scoped subscription-capacity state. Capacity is advisory
+/// data reported by a backend; it is never an input to agent routing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendCapacityPayload {
+    pub snapshots: Vec<BackendCapacitySnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendCapacitySnapshot {
+    pub backend_kind: BackendKind,
+    pub state: BackendCapacityState,
+    /// Host time when the server received the current report or state.
+    pub retrieved_at_ms: u64,
+    pub freshness: CapacityFreshness,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BackendCapacityState {
+    Known {
+        report: CapacityReport,
+    },
+    Stale {
+        report: CapacityReport,
+        stale_since_ms: u64,
+    },
+    Unavailable {
+        reason: CapacityUnavailableReason,
+    },
+    Unsupported {
+        reason: CapacityUnsupportedReason,
+    },
+    AuthError {
+        detail: CapacityErrorDetail,
+    },
+    RateLimited {
+        detail: CapacityErrorDetail,
+        retry_at_ms: Option<u64>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityUnavailableReason {
+    AwaitingFirstReport,
+    MalformedReport,
+    SourceUnreachable,
+    SourceTimedOut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityUnsupportedReason {
+    BackendHasNoCapacitySource,
+    BackendVersionTooOld,
+    AccountTypeNotReported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapacityErrorDetail {
+    pub summary: String,
+    pub code: CapacityErrorCode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityErrorCode {
+    NotAuthenticated,
+    SourceRejected,
+    RateLimited,
+    MalformedResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CapacityFreshness {
+    Fresh { age_ms: u64 },
+    Stale { age_ms: u64, threshold_ms: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapacityReport {
+    pub source: CapacitySource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<CapacityPlanLabel>,
+    pub buckets: Vec<CapacityBucket>,
+    pub coverage: CapacityCoverage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacitySource {
+    CodexAccountRateLimitsUpdated,
+    ClaudeRateLimitEvent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityCoverage {
+    AllVendorBuckets,
+    RepresentativeBucketOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapacityPlanLabel {
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapacityBucket {
+    pub id: CapacityBucketId,
+    pub label: String,
+    pub measure: CapacityMeasure,
+    pub scope: CapacityScope,
+    pub window: CapacityWindow,
+    pub reset: CapacityReset,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<CapacityBucketStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "vendor", rename_all = "snake_case")]
+pub enum CapacityBucketId {
+    Codex { slot: CodexLimitSlot },
+    Claude { limit: ClaudeLimitType },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexLimitSlot {
+    Primary,
+    Secondary,
+    Credits,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeLimitType {
+    FiveHour,
+    SevenDay,
+    SevenDayOpus,
+    SevenDaySonnet,
+    SevenDayOverageIncluded,
+    Overage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CapacityMeasure {
+    UsedPercent {
+        used_percent: u8,
+        remaining_percent: u8,
+        provenance: ValueProvenance,
+    },
+    Credits {
+        has_credits: bool,
+        unlimited: bool,
+        balance: Option<String>,
+    },
+    ReportedWithoutMagnitude,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValueProvenance {
+    pub vendor_reported: bool,
+}
+
+/// Provenance is per displayed value, not per bucket. `used_percent` comes
+/// directly from the passive vendor notification; `remaining_percent` is its
+/// safe complement. `ValueProvenance` remains the wire-compatible description
+/// of the used value for existing clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PercentValueProvenance {
+    VendorReported,
+    DerivedFromVendorTotals,
+    DerivedComplement,
+}
+
+impl CapacityMeasure {
+    pub fn used_percent_provenance(&self) -> Option<PercentValueProvenance> {
+        match self {
+            Self::UsedPercent { provenance, .. } if provenance.vendor_reported => {
+                Some(PercentValueProvenance::VendorReported)
+            }
+            Self::UsedPercent { .. } => Some(PercentValueProvenance::DerivedFromVendorTotals),
+            _ => None,
+        }
+    }
+
+    pub fn remaining_percent_provenance(&self) -> Option<PercentValueProvenance> {
+        matches!(self, Self::UsedPercent { .. })
+            .then_some(PercentValueProvenance::DerivedComplement)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CapacityScope {
+    Account,
+    Workspace,
+    Individual,
+    ModelFamily { name: String },
+    OrganizationSpend,
+    NotReported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CapacityWindow {
+    Rolling { duration_minutes: u32 },
+    NotReported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CapacityReset {
+    At { at_ms: u64 },
+    NotReported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityBucketStatus {
+    Allowed,
+    AllowedWarning,
+    Rejected,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendNativeSettingsGroupKind {
@@ -2507,6 +2814,83 @@ pub struct BackendNativeSettingsSnapshot {
     pub groups: Vec<BackendNativeSettingsGroup>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Ownership/provenance for a server-managed native-settings projection.
+    /// Omitted for backends and snapshots that do not use a managed projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<BackendNativeSettingsProvenance>,
+    /// Non-fatal diagnostics from a ready backend-native settings operation.
+    /// They remain typed so renderers never infer settings safety from text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub advisories: Vec<BackendNativeSettingsAdvisory>,
+    /// Server-owned recovery state for a managed native-settings projection.
+    /// It is absent during normal operation and never inferred by clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_projection_recovery: Option<TycodeManagedProjectionRecoveryState>,
+}
+
+/// Server-owned provenance for a backend-native settings snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BackendNativeSettingsProvenance {
+    TycodeManagedProjection {
+        managed_settings_path: HostAbsPath,
+        source_settings_path: HostAbsPath,
+        source: TycodeProjectionSource,
+        tycode_version: Version,
+        projection_id: TycodeProjectionId,
+        created_at_ms: u64,
+        source_digest: TycodeProjectionSourceDigest,
+        original_unchanged: bool,
+        notice_pending: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TycodeProjectionSource {
+    SharedSettings,
+    Defaults,
+}
+
+/// Stable identity for one managed Tycode settings projection. The server
+/// compares this exact value before acknowledging a one-time notice.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TycodeProjectionId(pub String);
+
+/// Digest of the original source bytes used when the managed projection was
+/// created. It is opaque to clients; only the server establishes its value.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TycodeProjectionSourceDigest(pub String);
+
+/// Opaque hash of the server-observed managed projection and its transaction
+/// artifacts. It is compared exactly before an explicit managed reset.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TycodeProjectionStateHash(pub String);
+
+/// Explicit recovery state for a managed Tycode projection. The UI may offer a
+/// reset only for this server-emitted state; it never reconstructs recovery
+/// needs from paths, files, or message text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TycodeManagedProjectionRecoveryState {
+    ManagedProjectionResetRequired {
+        reason: String,
+        expected_projection_id: TycodeProjectionId,
+        expected_state_hash: TycodeProjectionStateHash,
+    },
+}
+
+/// Non-fatal, server-classified advisory associated with a native settings
+/// snapshot. A `Ready` snapshot may carry one or more advisories.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BackendNativeSettingsAdvisory {
+    NoProviderConfigured { message: String },
+    UnsupportedActiveProvider { provider: String, message: String },
+    BackendReported { message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5678,6 +6062,11 @@ pub enum CommandErrorCode {
 pub struct CommandErrorPayload {
     pub stream: StreamPath,
     pub request_kind: FrameKind,
+    /// Present only for [`FrameKind::SetSetting`] errors. The target is
+    /// intentionally value-free so command errors cannot expose submitted
+    /// settings, credentials, paths, or projection tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setting_target: Option<HostSettingErrorTarget>,
     pub operation: String,
     pub code: CommandErrorCode,
     pub message: String,
@@ -5997,6 +6386,12 @@ pub enum OrchestrationWorkflowPhase {
 /// This matches `tycode-core::chat::protocol::TurnProtocol::abort`.
 /// Without step 1, the next turn's `StreamStart` violates the stream
 /// pairing invariant above.
+///
+/// An identity-violation discard is the sole exception: because its active
+/// stream is untrusted, the backend must not fabricate `StreamEnd` content.
+/// It emits one visible error followed by `OperationCancelled` and
+/// `TypingStatusChanged(false)`; validators discard the active stream at the
+/// cancellation boundary and retain its id as terminal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data")]
 pub enum ChatEvent {
@@ -6199,6 +6594,9 @@ pub struct ImageData {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamStartData {
+    /// Required for valid assistant stream frames. Kept optional in the wire
+    /// type only so older persisted frames can still deserialize; validators
+    /// reject a missing or empty value.
     pub message_id: Option<String>,
     pub agent: String,
     pub model: Option<String>,
@@ -6206,13 +6604,111 @@ pub struct StreamStartData {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamTextDeltaData {
+    /// Required for valid assistant stream frames. It must equal the id from
+    /// the matching `StreamStart`.
     pub message_id: Option<String>,
     pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamEndData {
+    /// `message.message_id` is required for valid assistant stream frames and
+    /// must equal the id from the matching `StreamStart`.
     pub message: ChatMessage,
+}
+
+/// A value-free classification for an assistant stream identity violation.
+///
+/// The category is safe to surface across protocol boundaries: it carries no
+/// provider payload, message text, or identifier value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamIdentityViolation {
+    MissingMessageId,
+    ForeignActiveMessageId,
+    MismatchedEndMessageId,
+    DuplicateTerminalMessageId,
+    ConflictingDuplicateCompletion,
+}
+
+/// A server-authored contract for an assistant message whose provider response
+/// does not expose a stable item identifier. Generation is explicit: callers
+/// must persist and replay the same contract fields rather than infer an id
+/// from text or stream timing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerGeneratedChatMessageIdentity {
+    pub origin: ServerGeneratedChatMessageIdOrigin,
+    pub stream_epoch: u64,
+    pub item_ordinal: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerGeneratedChatMessageIdOrigin {
+    IdlessProviderResponseItem,
+    IdlessReasoning,
+    LegacyReplay,
+}
+
+impl ServerGeneratedChatMessageIdentity {
+    /// Produces a deterministic, value-free message id from the persisted
+    /// server contract.
+    pub fn message_id(&self) -> ChatMessageId {
+        let origin = match self.origin {
+            ServerGeneratedChatMessageIdOrigin::IdlessProviderResponseItem => {
+                "idless_provider_response_item"
+            }
+            ServerGeneratedChatMessageIdOrigin::IdlessReasoning => "idless_reasoning",
+            ServerGeneratedChatMessageIdOrigin::LegacyReplay => "legacy_replay",
+        };
+        ChatMessageId(format!(
+            "server-generated:{origin}:{}:{}",
+            self.stream_epoch, self.item_ordinal
+        ))
+    }
+}
+
+impl StreamStartData {
+    /// Converts the compatibility wire field into the required runtime
+    /// assistant-stream identity.
+    pub fn required_message_id(&self) -> Result<ChatMessageId, StreamIdentityViolation> {
+        required_stream_message_id(&self.message_id)
+    }
+}
+
+impl StreamTextDeltaData {
+    /// Converts the compatibility wire field into the required runtime
+    /// assistant-stream identity.
+    pub fn required_message_id(&self) -> Result<ChatMessageId, StreamIdentityViolation> {
+        required_stream_message_id(&self.message_id)
+    }
+}
+
+impl StreamEndData {
+    /// Returns the required immutable assistant-stream completion identity.
+    pub fn required_message_id(&self) -> Result<ChatMessageId, StreamIdentityViolation> {
+        let Some(message_id) = self
+            .message
+            .message_id
+            .as_ref()
+            .filter(|message_id| !message_id.0.trim().is_empty())
+        else {
+            return Err(StreamIdentityViolation::MissingMessageId);
+        };
+        Ok(message_id.clone())
+    }
+}
+
+fn required_stream_message_id(
+    message_id: &Option<String>,
+) -> Result<ChatMessageId, StreamIdentityViolation> {
+    let Some(message_id) = message_id
+        .as_ref()
+        .filter(|message_id| !message_id.trim().is_empty())
+    else {
+        return Err(StreamIdentityViolation::MissingMessageId);
+    };
+    Ok(ChatMessageId(message_id.clone()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -6256,9 +6752,31 @@ pub enum ToolRequestType {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         plan_path: Option<String>,
     },
+    /// `tyde_send_agent_message`: a follow-up message delivered to a direct
+    /// child agent. The message is human-authored prose, so it is carried as
+    /// canonical typed data rather than an opaque args blob — the UI renders it
+    /// as Markdown instead of escaped JSON.
+    TydeSendAgentMessage {
+        agent_id: AgentId,
+        message: String,
+    },
+    /// `tyde_await_agents`: the watched child agents. Everything else the await
+    /// card shows (live name, status, usage) is resolved from server-owned agent
+    /// state, so the id list is the whole request.
+    TydeAwaitAgents {
+        agent_ids: Vec<AgentId>,
+    },
     Other {
         args: Value,
     },
+}
+
+/// One watched agent's terminal status in a `tyde_await_agents` completion.
+/// Mirrors the MCP tool's own result shape — status only, never output text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TydeAgentWaitStatus {
+    pub agent_id: AgentId,
+    pub status: AgentControlStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -6392,6 +6910,34 @@ pub enum WorkflowAgentStatus {
     Unknown,
 }
 
+/// Identifies a canonical agent-control contract failure without exposing the
+/// rejected request or result payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolExecutionNormalizationFailure {
+    CanonicalRequest,
+    CanonicalResult,
+    CanonicalRequestAndResult,
+}
+
+impl ToolExecutionNormalizationFailure {
+    pub fn combined_with(self, other: Self) -> Self {
+        use ToolExecutionNormalizationFailure::{
+            CanonicalRequest, CanonicalRequestAndResult, CanonicalResult,
+        };
+
+        match (self, other) {
+            (CanonicalRequestAndResult, _) | (_, CanonicalRequestAndResult) => {
+                CanonicalRequestAndResult
+            }
+            (CanonicalRequest, CanonicalResult) | (CanonicalResult, CanonicalRequest) => {
+                CanonicalRequestAndResult
+            }
+            (failure, _) => failure,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolExecutionCompletedData {
     pub tool_call_id: String,
@@ -6399,6 +6945,8 @@ pub struct ToolExecutionCompletedData {
     pub tool_result: ToolExecutionResult,
     pub success: bool,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalization_failure: Option<ToolExecutionNormalizationFailure>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -6425,6 +6973,16 @@ pub enum ToolExecutionResult {
     Error {
         short_message: String,
         detailed_message: String,
+    },
+    /// Delivery acknowledgement for `tyde_send_agent_message`. The MCP tool
+    /// returns `{"ok": true}` and nothing else, so there is no result body to
+    /// render — the card's header status carries the whole outcome.
+    TydeSendAgentMessage,
+    /// `tyde_await_agents` verdict: which watched agents finished their turn and
+    /// which were still thinking when the wait returned.
+    TydeAwaitAgents {
+        ready: Vec<TydeAgentWaitStatus>,
+        still_thinking: Vec<TydeAgentWaitStatus>,
     },
     Other {
         result: Value,
@@ -6598,6 +7156,124 @@ mod token_usage_serde_tests {
             serde_json::from_value::<MessageTokenUsage>(json).expect("deserialize"),
             usage
         );
+    }
+}
+
+#[cfg(test)]
+mod command_error_serde_tests {
+    use super::*;
+
+    #[test]
+    fn set_setting_error_targets_round_trip_without_echoing_setting_values() {
+        let legacy = serde_json::json!({
+            "stream": "/host/settings",
+            "request_kind": "set_setting",
+            "operation": "set_setting",
+            "code": "conflict",
+            "message": "setting changed",
+            "fatal": false,
+        });
+        let legacy_payload: CommandErrorPayload =
+            serde_json::from_value(legacy).expect("deserialize legacy command error");
+        assert_eq!(legacy_payload.setting_target, None);
+        let legacy_encoded =
+            serde_json::to_value(&legacy_payload).expect("serialize legacy command error");
+        assert!(legacy_encoded.get("setting_target").is_none());
+
+        let setting = HostSettingValue::ResetTycodeManagedProjection {
+            backend: BackendKind::Tycode,
+            expected_projection_id: TycodeProjectionId("projection-01J-secret".to_owned()),
+            expected_state_hash: TycodeProjectionStateHash("sha256:state-secret".to_owned()),
+        };
+        let payload = CommandErrorPayload {
+            stream: StreamPath("/host/settings".to_owned()),
+            request_kind: FrameKind::SetSetting,
+            setting_target: Some(setting.error_target()),
+            operation: "set_setting".to_owned(),
+            code: CommandErrorCode::Conflict,
+            message: "projection changed".to_owned(),
+            fatal: false,
+        };
+        let encoded = serde_json::to_value(&payload).expect("serialize typed command error");
+        assert_eq!(
+            encoded["setting_target"],
+            serde_json::json!("reset_tycode_managed_projection")
+        );
+        let encoded_text = encoded.to_string();
+        assert!(!encoded_text.contains("projection-01J-secret"));
+        assert!(!encoded_text.contains("sha256:state-secret"));
+
+        let decoded: CommandErrorPayload =
+            serde_json::from_value(encoded).expect("deserialize typed command error");
+        assert_eq!(
+            decoded.setting_target,
+            Some(HostSettingErrorTarget::ResetTycodeManagedProjection)
+        );
+    }
+
+    #[test]
+    fn host_setting_error_targets_distinguish_native_legacy_and_host_saves() {
+        assert_eq!(
+            HostSettingValue::BackendNativeSettings {
+                backend: BackendKind::Tycode,
+                settings: serde_json::json!({"api_key": "native-secret"}),
+            }
+            .error_target(),
+            HostSettingErrorTarget::BackendNativeSettings
+        );
+        assert_eq!(
+            HostSettingValue::BackendConfig {
+                backend: BackendKind::Tycode,
+                values: BackendConfigValues::default(),
+            }
+            .error_target(),
+            HostSettingErrorTarget::BackendConfig
+        );
+        assert_eq!(
+            HostSettingValue::EnableMobileConnections { enabled: true }.error_target(),
+            HostSettingErrorTarget::EnableMobileConnections
+        );
+    }
+
+    #[test]
+    fn tool_completion_normalization_failure_is_typed_and_backward_compatible() {
+        let completion = ToolExecutionCompletedData {
+            tool_call_id: "tool-normalization".to_owned(),
+            tool_name: "tyde_send_agent_message".to_owned(),
+            tool_result: ToolExecutionResult::TydeSendAgentMessage,
+            success: false,
+            error: Some("request could not be normalized".to_owned()),
+            normalization_failure: Some(ToolExecutionNormalizationFailure::CanonicalRequest),
+        };
+        let encoded = serde_json::to_value(&completion).expect("serialize marked completion");
+        assert_eq!(
+            encoded["normalization_failure"],
+            serde_json::json!("canonical_request")
+        );
+        let decoded: ToolExecutionCompletedData =
+            serde_json::from_value(encoded).expect("deserialize marked completion");
+        assert_eq!(
+            decoded.normalization_failure,
+            Some(ToolExecutionNormalizationFailure::CanonicalRequest)
+        );
+
+        let legacy = ToolExecutionCompletedData {
+            tool_call_id: "tool-unrelated-error".to_owned(),
+            tool_name: "run_command".to_owned(),
+            tool_result: ToolExecutionResult::Error {
+                short_message: "command failed".to_owned(),
+                detailed_message: "exit status 1".to_owned(),
+            },
+            success: false,
+            error: Some("exit status 1".to_owned()),
+            normalization_failure: None,
+        };
+        let legacy_encoded =
+            serde_json::to_value(&legacy).expect("serialize unrelated completion error");
+        assert!(legacy_encoded.get("normalization_failure").is_none());
+        let legacy_decoded: ToolExecutionCompletedData =
+            serde_json::from_value(legacy_encoded).expect("deserialize legacy completion");
+        assert_eq!(legacy_decoded.normalization_failure, None);
     }
 }
 
@@ -6816,6 +7492,162 @@ mod search_serde_tests {
         assert!(settings.background_agent_features.auto_generate_agent_names);
         assert!(!settings.background_agent_features.agent_activity_summaries);
         assert!(settings.code_intel.language_server_paths.is_empty());
+    }
+
+    #[test]
+    fn tycode_managed_projection_snapshot_round_trips_typed_provenance_and_advisories() {
+        let provenance = BackendNativeSettingsProvenance::TycodeManagedProjection {
+            managed_settings_path: HostAbsPath(
+                "/Users/alice/.tycode/tyde-settings.toml".to_owned(),
+            ),
+            source_settings_path: HostAbsPath("/Users/alice/.tycode/settings.toml".to_owned()),
+            source: TycodeProjectionSource::SharedSettings,
+            tycode_version: Version {
+                major: 0,
+                minor: 10,
+                patch: 0,
+            },
+            projection_id: TycodeProjectionId("projection-01J".to_owned()),
+            created_at_ms: 1_760_000_000_000,
+            source_digest: TycodeProjectionSourceDigest("sha256:abc123".to_owned()),
+            original_unchanged: true,
+            notice_pending: true,
+        };
+        let snapshot = BackendNativeSettingsSnapshot {
+            backend_kind: BackendKind::Tycode,
+            status: BackendConfigSnapshotStatus::Ready,
+            settings: Some(serde_json::json!({"active_provider": "anthropic"})),
+            groups: Vec::new(),
+            message: None,
+            provenance: Some(provenance.clone()),
+            advisories: vec![
+                BackendNativeSettingsAdvisory::NoProviderConfigured {
+                    message: "Configure a provider to continue.".to_owned(),
+                },
+                BackendNativeSettingsAdvisory::UnsupportedActiveProvider {
+                    provider: "legacy-provider".to_owned(),
+                    message: "Choose a supported provider in Tyde's copy.".to_owned(),
+                },
+                BackendNativeSettingsAdvisory::BackendReported {
+                    message: "Tycode reported a recoverable settings diagnostic.".to_owned(),
+                },
+            ],
+            managed_projection_recovery: None,
+        };
+
+        let json = serde_json::to_value(&snapshot).expect("serialize native settings snapshot");
+        assert_eq!(json["provenance"]["kind"], "tycode_managed_projection");
+        assert_eq!(json["provenance"]["source"], "shared_settings");
+        assert_eq!(json["provenance"]["projection_id"], "projection-01J");
+        assert_eq!(json["provenance"]["source_digest"], "sha256:abc123");
+        assert_eq!(json["advisories"][0]["kind"], "no_provider_configured");
+        assert_eq!(json["advisories"][1]["kind"], "unsupported_active_provider");
+        assert_eq!(json["advisories"][2]["kind"], "backend_reported");
+        assert_eq!(round_trip(&snapshot), snapshot);
+        assert_eq!(round_trip(&provenance), provenance);
+        assert_eq!(
+            round_trip(&TycodeProjectionSource::Defaults),
+            TycodeProjectionSource::Defaults
+        );
+    }
+
+    #[test]
+    fn native_settings_snapshot_defaults_new_projection_fields_for_legacy_hosts() {
+        let legacy = serde_json::json!({
+            "backend_kind": "tycode",
+            "status": "ready",
+            "settings": {"active_provider": "anthropic"},
+            "groups": [],
+        });
+        let snapshot: BackendNativeSettingsSnapshot =
+            serde_json::from_value(legacy).expect("deserialize legacy native settings snapshot");
+        assert_eq!(snapshot.provenance, None);
+        assert!(snapshot.advisories.is_empty());
+        assert_eq!(snapshot.managed_projection_recovery, None);
+
+        let encoded = serde_json::to_value(snapshot).expect("serialize legacy-compatible snapshot");
+        assert!(encoded.get("provenance").is_none());
+        assert!(encoded.get("advisories").is_none());
+        assert!(encoded.get("managed_projection_recovery").is_none());
+    }
+
+    #[test]
+    fn tycode_projection_notice_acknowledgement_round_trips_with_typed_id() {
+        let payload = SetSettingPayload {
+            setting: HostSettingValue::AcknowledgeTycodeProjectionNotice {
+                backend: BackendKind::Tycode,
+                projection_id: TycodeProjectionId("projection-01J".to_owned()),
+            },
+        };
+        let json = serde_json::to_value(&payload).expect("serialize notice acknowledgement");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "setting": {
+                    "kind": "acknowledge_tycode_projection_notice",
+                    "backend": "tycode",
+                    "projection_id": "projection-01J",
+                },
+            })
+        );
+        assert_eq!(round_trip(&payload), payload);
+    }
+
+    #[test]
+    fn managed_projection_recovery_and_reset_round_trip_with_exact_tokens() {
+        let recovery = TycodeManagedProjectionRecoveryState::ManagedProjectionResetRequired {
+            reason: "The managed settings and transaction journal do not form a proven pair."
+                .to_owned(),
+            expected_projection_id: TycodeProjectionId("projection-recovery-01J".to_owned()),
+            expected_state_hash: TycodeProjectionStateHash("sha256:state-abc123".to_owned()),
+        };
+        let snapshot = BackendNativeSettingsSnapshot {
+            backend_kind: BackendKind::Tycode,
+            status: BackendConfigSnapshotStatus::Unavailable,
+            settings: None,
+            groups: Vec::new(),
+            message: Some("Managed projection recovery is required.".to_owned()),
+            provenance: None,
+            advisories: Vec::new(),
+            managed_projection_recovery: Some(recovery.clone()),
+        };
+        let snapshot_json =
+            serde_json::to_value(&snapshot).expect("serialize recovery native settings snapshot");
+        assert_eq!(
+            snapshot_json["managed_projection_recovery"]["kind"],
+            "managed_projection_reset_required"
+        );
+        assert_eq!(
+            snapshot_json["managed_projection_recovery"]["expected_projection_id"],
+            "projection-recovery-01J"
+        );
+        assert_eq!(
+            snapshot_json["managed_projection_recovery"]["expected_state_hash"],
+            "sha256:state-abc123"
+        );
+        assert_eq!(round_trip(&snapshot), snapshot);
+        assert_eq!(round_trip(&recovery), recovery);
+
+        let reset = SetSettingPayload {
+            setting: HostSettingValue::ResetTycodeManagedProjection {
+                backend: BackendKind::Tycode,
+                expected_projection_id: TycodeProjectionId("projection-recovery-01J".to_owned()),
+                expected_state_hash: TycodeProjectionStateHash("sha256:state-abc123".to_owned()),
+            },
+        };
+        let reset_json = serde_json::to_value(&reset).expect("serialize managed projection reset");
+        assert_eq!(
+            reset_json,
+            serde_json::json!({
+                "setting": {
+                    "kind": "reset_tycode_managed_projection",
+                    "backend": "tycode",
+                    "expected_projection_id": "projection-recovery-01J",
+                    "expected_state_hash": "sha256:state-abc123",
+                },
+            })
+        );
+        assert_eq!(round_trip(&reset), reset);
     }
 
     #[test]
@@ -7604,6 +8436,147 @@ mod tool_progress_serde_tests {
     }
 }
 
+/// Wire contract for the typed Tyde orchestration tool calls. These variants are
+/// what let the UI render a sent message as Markdown and an await verdict as a
+/// status list instead of dumping the MCP envelope as raw JSON, so their shape is
+/// pinned here rather than left to whichever backend normalizes them.
+#[cfg(test)]
+mod tyde_orchestration_tool_serde_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn send_agent_message_request_round_trips() {
+        let request = ToolRequest {
+            tool_call_id: "toolu_send".to_owned(),
+            tool_name: "tyde_send_agent_message".to_owned(),
+            tool_type: ToolRequestType::TydeSendAgentMessage {
+                agent_id: AgentId("agent-123".to_owned()),
+                message: "**Fix the rerun**\n\n- start with `mock.rs`".to_owned(),
+            },
+        };
+
+        let encoded = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(
+            encoded,
+            json!({
+                "tool_call_id": "toolu_send",
+                "tool_name": "tyde_send_agent_message",
+                "tool_type": {
+                    "kind": "TydeSendAgentMessage",
+                    "agent_id": "agent-123",
+                    "message": "**Fix the rerun**\n\n- start with `mock.rs`"
+                }
+            })
+        );
+
+        let decoded: ToolRequest = serde_json::from_value(encoded).expect("deserialize");
+        let ToolRequestType::TydeSendAgentMessage { agent_id, message } = decoded.tool_type else {
+            panic!("expected TydeSendAgentMessage request");
+        };
+        assert_eq!(agent_id, AgentId("agent-123".to_owned()));
+        // The Markdown source survives verbatim — newlines stay newlines, not
+        // the escaped `\n` the raw-JSON panel used to show.
+        assert_eq!(message, "**Fix the rerun**\n\n- start with `mock.rs`");
+    }
+
+    /// The send tool's real result is `{"ok": true}` — a pure ack. The typed
+    /// completion is a unit variant so there is nothing to render but status.
+    #[test]
+    fn send_agent_message_result_round_trips_as_bare_ack() {
+        let result = ToolExecutionResult::TydeSendAgentMessage;
+        let encoded = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(encoded, json!({ "kind": "TydeSendAgentMessage" }));
+
+        let decoded: ToolExecutionResult = serde_json::from_value(encoded).expect("deserialize");
+        assert_eq!(decoded, ToolExecutionResult::TydeSendAgentMessage);
+    }
+
+    #[test]
+    fn await_agents_request_round_trips() {
+        let request = ToolRequest {
+            tool_call_id: "toolu_await".to_owned(),
+            tool_name: "tyde_await_agents".to_owned(),
+            tool_type: ToolRequestType::TydeAwaitAgents {
+                agent_ids: vec![AgentId("agent-1".to_owned()), AgentId("agent-2".to_owned())],
+            },
+        };
+
+        let encoded = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(
+            encoded,
+            json!({
+                "tool_call_id": "toolu_await",
+                "tool_name": "tyde_await_agents",
+                "tool_type": {
+                    "kind": "TydeAwaitAgents",
+                    "agent_ids": ["agent-1", "agent-2"]
+                }
+            })
+        );
+
+        let decoded: ToolRequest = serde_json::from_value(encoded).expect("deserialize");
+        let ToolRequestType::TydeAwaitAgents { agent_ids } = decoded.tool_type else {
+            panic!("expected TydeAwaitAgents request");
+        };
+        assert_eq!(
+            agent_ids,
+            vec![AgentId("agent-1".to_owned()), AgentId("agent-2".to_owned())]
+        );
+    }
+
+    /// Mirrors the MCP tool's `AwaitAgentsResult` exactly: `ready` /
+    /// `still_thinking`, each carrying `{agent_id, status}` and nothing else.
+    #[test]
+    fn await_agents_result_round_trips() {
+        let result = ToolExecutionResult::TydeAwaitAgents {
+            ready: vec![TydeAgentWaitStatus {
+                agent_id: AgentId("agent-1".to_owned()),
+                status: AgentControlStatus::Idle,
+            }],
+            still_thinking: vec![TydeAgentWaitStatus {
+                agent_id: AgentId("agent-2".to_owned()),
+                status: AgentControlStatus::Thinking,
+            }],
+        };
+
+        let encoded = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(
+            encoded,
+            json!({
+                "kind": "TydeAwaitAgents",
+                "ready": [{ "agent_id": "agent-1", "status": "idle" }],
+                "still_thinking": [{ "agent_id": "agent-2", "status": "thinking" }]
+            })
+        );
+
+        let decoded: ToolExecutionResult = serde_json::from_value(encoded).expect("deserialize");
+        assert_eq!(decoded, result);
+    }
+
+    /// A failed watched agent surfaces as `failed` in `ready` — the wait is over
+    /// for it. The status enum, not a string, is what crosses the wire.
+    #[test]
+    fn await_agents_result_carries_failed_status() {
+        let json = json!({
+            "kind": "TydeAwaitAgents",
+            "ready": [{ "agent_id": "agent-9", "status": "failed" }],
+            "still_thinking": []
+        });
+        let decoded: ToolExecutionResult = serde_json::from_value(json).expect("deserialize");
+        let ToolExecutionResult::TydeAwaitAgents {
+            ready,
+            still_thinking,
+        } = decoded
+        else {
+            panic!("expected TydeAwaitAgents result");
+        };
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].status, AgentControlStatus::Failed);
+        assert!(still_thinking.is_empty());
+    }
+}
+
 #[cfg(test)]
 mod release_version_back_compat_tests {
     use super::*;
@@ -7829,5 +8802,55 @@ mod agent_control_output_tests {
         let error = serde_json::from_value::<AgentBootstrapPayload>(json!({ "events": [] }))
             .expect_err("bootstrap without latest_output must be rejected");
         assert!(error.to_string().contains("latest_output"));
+    }
+}
+
+#[cfg(test)]
+mod stream_identity_tests {
+    use super::*;
+
+    #[test]
+    fn stream_identity_violation_round_trips_as_a_value_free_tag() {
+        let violation = StreamIdentityViolation::ForeignActiveMessageId;
+        let encoded = serde_json::to_value(violation).expect("serialize stream identity violation");
+        assert_eq!(encoded, serde_json::json!("foreign_active_message_id"));
+        let decoded: StreamIdentityViolation =
+            serde_json::from_value(encoded).expect("deserialize stream identity violation");
+        assert_eq!(decoded, violation);
+    }
+
+    #[test]
+    fn legacy_stream_wire_frame_decodes_but_cannot_enter_runtime_without_an_identity() {
+        let start: StreamStartData = serde_json::from_value(serde_json::json!({
+            "agent": "assistant",
+            "model": null,
+        }))
+        .expect("legacy frame remains decodable");
+        assert_eq!(
+            start.required_message_id(),
+            Err(StreamIdentityViolation::MissingMessageId)
+        );
+    }
+
+    #[test]
+    fn server_generated_identity_is_deterministic_and_origin_tagged() {
+        let origin =
+            serde_json::to_value(ServerGeneratedChatMessageIdOrigin::IdlessProviderResponseItem)
+                .expect("serialize origin");
+        assert_eq!(origin, serde_json::json!("idless_provider_response_item"));
+        let identity = ServerGeneratedChatMessageIdentity {
+            origin: ServerGeneratedChatMessageIdOrigin::LegacyReplay,
+            stream_epoch: 7,
+            item_ordinal: 3,
+        };
+        assert_eq!(
+            identity.message_id(),
+            ChatMessageId("server-generated:legacy_replay:7:3".to_owned())
+        );
+        let round_trip: ServerGeneratedChatMessageIdentity = serde_json::from_value(
+            serde_json::to_value(&identity).expect("serialize identity contract"),
+        )
+        .expect("deserialize identity contract");
+        assert_eq!(round_trip, identity);
     }
 }

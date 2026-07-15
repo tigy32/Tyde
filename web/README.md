@@ -1,7 +1,7 @@
 # Tyde web — loader shell + PWA packaging
 
 This directory holds the **browser-served** artifacts for the Tyde mobile→PWA
-conversion (design: `docs/plans/mobile-web-pwa.md`). It is intentionally
+conversion (design: `dev-docs/mobile-web-pwa.md`). It is intentionally
 separate from the Rust crates and from `mobile-frontend/` (the Leptos/WASM app
 that compiles into the *versioned* bundles).
 

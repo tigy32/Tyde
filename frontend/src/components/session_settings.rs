@@ -8,6 +8,7 @@ use protocol::{
 };
 
 use crate::components::agents_panel::backend_label;
+use crate::components::backend_capacity::CapacityCompactRow;
 use crate::components::chat_message::{format_compact, token_badge_data};
 use crate::state::AppState;
 
@@ -468,11 +469,15 @@ pub fn SessionSettingsBar() -> impl IntoView {
     // A schema-status text row (pending/unavailable/missing) with the task
     // token usage on the right. These rows keep rendering even without a
     // rollup — the usage display just renders nothing then.
-    fn status_row(text: String, rollup: Memo<Option<TaskTokenUsagePayload>>) -> AnyView {
+    fn status_row(
+        text: String,
+        rollup: Memo<Option<TaskTokenUsagePayload>>,
+        binding: Memo<Option<(String, BackendKind)>>,
+    ) -> AnyView {
         view! {
             <div class="session-settings-accordion session-settings-unavailable">
                 <span class="session-settings-unavailable-text">{text}</span>
-                <TaskUsageBadge rollup=rollup />
+                <TaskUsageBadge rollup=rollup binding=binding />
             </div>
         }
         .into_any()
@@ -484,12 +489,13 @@ pub fn SessionSettingsBar() -> impl IntoView {
     fn badge_only_row(
         has_rollup: bool,
         rollup: Memo<Option<TaskTokenUsagePayload>>,
+        binding: Memo<Option<(String, BackendKind)>>,
     ) -> Option<AnyView> {
         has_rollup.then(|| {
             view! {
                 <div class="session-settings-accordion">
                     <div class="session-settings-header">
-                        <TaskUsageBadge rollup=rollup />
+                        <TaskUsageBadge rollup=rollup binding=binding />
                     </div>
                 </div>
             }
@@ -517,7 +523,7 @@ pub fn SessionSettingsBar() -> impl IntoView {
                                     </span>
                                     {label}
                                 </button>
-                                <TaskUsageBadge rollup=task_rollup />
+                                <TaskUsageBadge rollup=task_rollup binding=current_binding />
                             </div>
                             <Show when=move || expanded.get()>
                                 <SessionSettingsControls
@@ -530,24 +536,27 @@ pub fn SessionSettingsBar() -> impl IntoView {
                     }.into_any())
                 }
                 Some((_, Some(SessionSchemaEntry::Ready { .. }))) => {
-                    badge_only_row(has_rollup, task_rollup)
+                    badge_only_row(has_rollup, task_rollup, current_binding)
                 }
-                Some((backend_kind, Some(SessionSchemaEntry::Pending { .. }))) => Some(
-                    status_row(pending_schema_message(backend_kind).to_string(), task_rollup),
-                ),
+                Some((backend_kind, Some(SessionSchemaEntry::Pending { .. }))) => Some(status_row(
+                    pending_schema_message(backend_kind).to_string(),
+                    task_rollup,
+                    current_binding,
+                )),
                 Some((backend_kind, Some(SessionSchemaEntry::Unavailable { message, .. }))) => {
                     let text = if message.trim().is_empty() {
                         missing_schema_message(backend_kind).to_string()
                     } else {
                         message
                     };
-                    Some(status_row(text, task_rollup))
+                    Some(status_row(text, task_rollup, current_binding))
                 }
                 Some((backend_kind, None)) => Some(status_row(
                     missing_schema_message(backend_kind).to_string(),
                     task_rollup,
+                    current_binding,
                 )),
-                None => badge_only_row(has_rollup, task_rollup),
+                None => badge_only_row(has_rollup, task_rollup, current_binding),
             }
         }}
     }
@@ -644,8 +653,17 @@ const HOVER_CLOSE_DELAY_MS: u64 = 250;
 /// Click/Enter toggles the per-agent breakdown popover; mouse hover also
 /// reveals it (with a close delay so the pointer can travel into it); touch
 /// pointers never latch hover state. Escape and pointer-down outside dismiss it.
+///
+/// The popover also carries the compact subscription-capacity row for the
+/// current agent's backend, in a *separate* labelled region below the task
+/// breakdown. Task tokens are this task; subscription capacity is the account's
+/// quota. They are not summable, so nothing in the layout or the accessible
+/// text combines them, and capacity is never derived from these token figures.
 #[component]
-fn TaskUsageBadge(rollup: Memo<Option<TaskTokenUsagePayload>>) -> impl IntoView {
+fn TaskUsageBadge(
+    rollup: Memo<Option<TaskTokenUsagePayload>>,
+    binding: Memo<Option<(String, BackendKind)>>,
+) -> impl IntoView {
     let open = RwSignal::new(false);
     let hovering = RwSignal::new(false);
     let visible = Memo::new(move |_| open.get() || hovering.get());
@@ -796,7 +814,11 @@ fn TaskUsageBadge(rollup: Memo<Option<TaskTokenUsagePayload>>) -> impl IntoView 
                                     <span class="session-task-popover-status">{note}</span>
                                 })}
                             </div>
-                            <div class="session-task-popover-rows">
+                            <div
+                                class="session-task-popover-rows"
+                                role="group"
+                                aria-label="Task token usage by agent"
+                            >
                                 {breakdown.iter().map(|entry| {
                                     let indent = 6 + entry.depth.min(12) * 14;
                                     let meta = match &entry.model {
@@ -819,6 +841,7 @@ fn TaskUsageBadge(rollup: Memo<Option<TaskTokenUsagePayload>>) -> impl IntoView 
                                     }
                                 }).collect_view()}
                             </div>
+                            <CapacityCompactRow binding=binding />
                         </div>
                     </Show>
                 </span>
@@ -1651,6 +1674,140 @@ mod wasm_tests {
         assert!(
             query(&container, ".session-task-popover").is_none(),
             "the badge must still close the popover after agent churn"
+        );
+    }
+
+    /// Mirrors what `claude.rs` `map_passive_rate_limit_event` actually emits:
+    /// one representative bucket, no scope, no window, always a vendor status,
+    /// no plan label, and `vendor_reported: true` — the vendor supplied the used
+    /// magnitude, while the remaining percentage is Tyde's derived complement.
+    fn dispatch_capacity(state: &AppState, host_id: &str, seq: u64, used_percent: u8) {
+        let snapshot = protocol::BackendCapacitySnapshot {
+            backend_kind: BackendKind::Claude,
+            state: protocol::BackendCapacityState::Known {
+                report: protocol::CapacityReport {
+                    source: protocol::CapacitySource::ClaudeRateLimitEvent,
+                    observed_at_ms: None,
+                    plan: None,
+                    buckets: vec![protocol::CapacityBucket {
+                        id: protocol::CapacityBucketId::Claude {
+                            limit: protocol::ClaudeLimitType::SevenDay,
+                        },
+                        label: "weekly limit".to_owned(),
+                        measure: protocol::CapacityMeasure::UsedPercent {
+                            used_percent,
+                            remaining_percent: 100 - used_percent,
+                            provenance: protocol::ValueProvenance {
+                                vendor_reported: true,
+                            },
+                        },
+                        scope: protocol::CapacityScope::NotReported,
+                        window: protocol::CapacityWindow::NotReported,
+                        reset: protocol::CapacityReset::NotReported,
+                        status: Some(protocol::CapacityBucketStatus::AllowedWarning),
+                    }],
+                    coverage: protocol::CapacityCoverage::RepresentativeBucketOnly,
+                },
+            },
+            retrieved_at_ms: 0,
+            freshness: protocol::CapacityFreshness::Fresh { age_ms: 0 },
+        };
+        let envelope = Envelope::from_payload(
+            StreamPath(format!("/host/{host_id}")),
+            FrameKind::BackendCapacity,
+            seq,
+            &protocol::BackendCapacityPayload {
+                snapshots: vec![snapshot],
+            },
+        )
+        .expect("envelope serialize");
+        crate::dispatch::dispatch_envelope(state, host_id, envelope);
+    }
+
+    /// Subscription capacity and task token usage are different measurements of
+    /// different things — this task's tokens versus the account's quota — and
+    /// they are not summable. They must therefore live in separate labelled
+    /// regions inside the popup, with neither region's text containing the
+    /// other's figures. A layout that invites the arithmetic is the bug.
+    #[wasm_bindgen_test]
+    async fn capacity_row_is_separate_from_task_token_usage() {
+        let container = make_container();
+        let state = make_state_with_active_agent("h-cap-popup", "root");
+        dispatch_task_usage(&state, "h-cap-popup", 0, &partial_rollup("root", 500, 100));
+        dispatch_capacity(&state, "h-cap-popup", 1, 82);
+        let _handle = mount_bar(&container, state);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        // Capacity lives in the popup, not on the always-visible badge — the
+        // badge is the task figure and must not grow a quota number.
+        let badge = query(&container, ".session-task-toggle").expect("task badge renders");
+        let badge_text = badge.text_content().unwrap_or_default();
+        assert!(
+            !badge_text.contains("82%") && !badge_text.contains("Subscription"),
+            "the task badge must not carry subscription capacity, got: {badge_text}"
+        );
+
+        badge.click();
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let capacity = query(&container, ".capacity-compact")
+            .expect("the popup carries the compact capacity row");
+        let task_rows = query(&container, ".session-task-popover-rows")
+            .expect("the popup carries the task breakdown");
+
+        // Two distinct labelled regions, neither nested in the other.
+        assert_eq!(capacity.get_attribute("role").as_deref(), Some("group"));
+        assert_eq!(task_rows.get_attribute("role").as_deref(), Some("group"));
+        let capacity_label = capacity.get_attribute("aria-label").unwrap_or_default();
+        let task_label = task_rows.get_attribute("aria-label").unwrap_or_default();
+        assert!(
+            capacity_label.contains("Subscription capacity"),
+            "capacity region must name itself, got: {capacity_label}"
+        );
+        assert!(
+            task_label.contains("Task token usage"),
+            "task region must name itself, got: {task_label}"
+        );
+        assert!(
+            !task_rows.contains(Some(&capacity)) && !capacity.contains(Some(&task_rows)),
+            "capacity and task usage must not nest inside one another"
+        );
+
+        // Neither region's text carries the other's figures.
+        let capacity_text = capacity.text_content().unwrap_or_default();
+        let task_text = task_rows.text_content().unwrap_or_default();
+        assert!(
+            capacity_text.contains("82% used") && capacity_text.contains("weekly limit"),
+            "capacity region shows the quota figure, got: {capacity_text}"
+        );
+        assert!(
+            capacity_text.contains("Subscription") && capacity_text.contains("Claude"),
+            "capacity region names the reporting vendor, got: {capacity_text}"
+        );
+        assert!(
+            !capacity_text.contains('\u{2191}') && !capacity_text.contains('\u{2193}'),
+            "capacity region must not carry task token figures, got: {capacity_text}"
+        );
+        assert!(
+            !task_text.contains("82%") && !task_text.contains("Subscription"),
+            "task region must not carry subscription capacity, got: {task_text}"
+        );
+
+        // The coverage caveat is text in the popup, not a hover-only tooltip:
+        // Claude reports only the binding limit, and the user must be told.
+        assert!(
+            capacity_text.contains("only the binding limit is reported"),
+            "RepresentativeBucketOnly coverage must be stated in the popup, got: {capacity_text}"
+        );
+
+        // Passive sources: nothing to refresh, so no refresh control.
+        assert!(
+            query(&container, ".capacity-compact button").is_none(),
+            "phase 1 capacity must not offer a refresh button"
         );
     }
 

@@ -158,11 +158,10 @@ registers.
 
 The emitter must be attached when the parent agent backend is created.
 
-In `server/src/agent/mod.rs`, after a Claude or Codex backend is successfully
-spawned or resumed, Tyde attaches a `HostSubAgentEmitter` before the backend is
-hidden behind `BackendHandle`.
-
-This is the right place because:
+In `server/src/agent/mod.rs`, Codex receives `HostSubAgentEmitter` as an
+argument to fresh backend construction. Resume/fork install it before command
+processing and surface any installation failure. This is the right place
+because:
 
 - the concrete backend type is still known
 - the parent `AgentId` is known
@@ -293,20 +292,22 @@ agent entry and the UI learns about it through the normal event flow.
 
 ### 4.4 Emitter Wiring in `agent/mod.rs`
 
-The current bug is that Claude and Codex already know how to detect sub-agents
-but never receive a real emitter in production.
+Codex must receive `HostSubAgentEmitter` at fresh-session construction,
+before its initial prompt starts. Attaching it after `CodexBackend::spawn`
+creates a registration race with the native child thread.
 
-Fix that in `server/src/agent/mod.rs`:
+Codex uses `subAgentActivity.agentThreadId` as the child identity. A
+`collabAgentToolCall` supplies the associated `senderThreadId` and
+`receiverThreadId` parent-tool metadata; the thread ID is the routing key.
+Only thread-scoped notifications are classified as parent, live child, completed
+child, or unknown before event semantics run. Connection/account/MCP notifications
+without a thread ID retain their global handlers. Unknown/missing ownership for a
+thread-scoped notification is a surfaced server invariant error, never parent
+content. `wait` results do not alter child lifecycle; a child turn terminal only
+ends that turn, while parent terminal lifecycle owns permanent relay teardown.
 
-- after `ClaudeBackend::spawn` / `ClaudeBackend::resume`, attach
-  `HostSubAgentEmitter`
-- after `CodexBackend::spawn` / `CodexBackend::resume`, attach
-  `HostSubAgentEmitter`
-- do not attach an emitter for other backends
-- do not attach an emitter to relay agents in v1
-
-This is the minimal change that turns the existing detection code into a real
-feature.
+Emitter updates on resume/fork return contextual errors. Do not attach an
+emitter to relay agents in v1.
 
 ### 4.5 Cascade Termination
 
@@ -481,9 +482,16 @@ stored `resumable = false` value.
 
 User-spawned children cascade from the parent.
 
-Backend-native children do not need a separate cascade mechanism. The parent
-backend owns their lifetime, and the relay actor exits when its event channel
-closes.
+The parent backend owns backend-native children, but ending the parent turn
+must close every live child's typed emitter lifecycle. Cancellation and
+abandonment emit the child's ordered terminal tail on the child's own stream:
+`StreamEnd`, pending tool completions, `OperationCancelled`, then
+`TypingStatusChanged(false)`. Dropping an emitter or removing bookkeeping is
+not a lifecycle transition; terminal state must remain replayable.
+
+When `run_in_background` is absent, Tyde keeps the child live until the CLI's
+task lifecycle reports completion rather than guessing foreground execution.
+An explicit `run_in_background: false` remains synchronous.
 
 ### 7.6 One-Level Nesting
 

@@ -1,5 +1,6 @@
 pub mod agent_monitor_view;
 pub mod agents_panel;
+pub mod backend_capacity;
 pub mod center_zone;
 pub mod chat_input;
 pub mod chat_message;

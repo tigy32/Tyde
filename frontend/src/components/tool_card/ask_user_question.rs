@@ -19,7 +19,7 @@ use protocol::{
 use wasm_bindgen_futures::spawn_local;
 
 use crate::send::send_frame;
-use crate::state::{AppState, ToolOutputMode};
+use crate::state::{ActiveAgentRef, AppState, ToolOutputMode};
 
 /// Compose the chosen answers into the message sent back to the agent. One line
 /// per answered question: `"{header}: {answers}"`, answers comma-joined.
@@ -50,6 +50,7 @@ fn format_answer(questions: &[AskUserQuestion], responses: &[(Vec<usize>, String
 }
 
 pub(crate) fn render(
+    agent_ref: Signal<Option<ActiveAgentRef>>,
     req: &ToolRequestType,
     _result: Option<&ToolExecutionResult>,
     _mode: ToolOutputMode,
@@ -58,7 +59,7 @@ pub(crate) fn render(
         unreachable!("ask_user_question::render dispatched on non-AskUserQuestion request");
     };
 
-    view! { <AskUserQuestionCard questions=questions.clone() /> }.into_any()
+    view! { <AskUserQuestionCard agent_ref=agent_ref questions=questions.clone() /> }.into_any()
 }
 
 #[derive(Clone, Copy)]
@@ -68,7 +69,10 @@ struct QuestionState {
 }
 
 #[component]
-fn AskUserQuestionCard(questions: Vec<AskUserQuestion>) -> impl IntoView {
+fn AskUserQuestionCard(
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+    questions: Vec<AskUserQuestion>,
+) -> impl IntoView {
     let state = expect_context::<AppState>();
 
     let questions = Arc::new(questions);
@@ -116,7 +120,14 @@ fn AskUserQuestionCard(questions: Vec<AskUserQuestion>) -> impl IntoView {
             if message.is_empty() {
                 return;
             }
-            let (host_id, stream) = match answer_target(&state) {
+            let Some(agent_ref) = agent_ref.get_untracked() else {
+                log::error!("ask_user_question: rendered chat has no agent target");
+                send_error.set(Some(
+                    "No active agent is available. Reopen the chat and try again.".to_owned(),
+                ));
+                return;
+            };
+            let (host_id, stream) = match answer_target(&state, &agent_ref) {
                 Ok(target) => target,
                 Err(message) => {
                     send_error.set(Some(message.to_owned()));
@@ -261,20 +272,25 @@ fn render_question(
     .into_any()
 }
 
-fn answer_target(state: &AppState) -> Result<(String, StreamPath), &'static str> {
-    let Some(active) = state.active_agent.get_untracked() else {
-        log::error!("ask_user_question: no active agent to answer");
-        return Err("No active agent is available. Reopen the chat and try again.");
-    };
+fn answer_target(
+    state: &AppState,
+    agent_ref: &ActiveAgentRef,
+) -> Result<(String, StreamPath), &'static str> {
     let stream = state.agents.get_untracked().iter().find_map(|a| {
-        (a.host_id == active.host_id && a.agent_id == active.agent_id)
+        (a.host_id == agent_ref.host_id && a.agent_id == agent_ref.agent_id)
             .then(|| a.instance_stream.clone())
     });
     let Some(stream) = stream else {
-        log::error!("ask_user_question: active agent has no instance stream");
-        return Err("The active agent stream is not available yet. Try again after reconnecting.");
+        log::error!(
+            "ask_user_question: rendered agent {} on host {} has no instance stream",
+            agent_ref.agent_id,
+            agent_ref.host_id
+        );
+        return Err(
+            "The rendered agent stream is not available yet. Try again after reconnecting.",
+        );
     };
-    Ok((active.host_id, stream))
+    Ok((agent_ref.host_id.clone(), stream))
 }
 
 fn send_answer(
@@ -409,7 +425,7 @@ mod tests {
 mod wasm_tests {
     use super::*;
     use crate::components::tool_card::{ToolCardView, test_utils::*};
-    use crate::state::{ActiveAgentRef, AgentInfo, AppState, TabContent, ToolRequestEntry};
+    use crate::state::{AgentInfo, AppState, TabContent, ToolRequestEntry};
     use leptos::mount::mount_to;
     use protocol::{
         AgentId, AgentOrigin, AskUserQuestionOption, BackendKind, StreamPath,
@@ -428,6 +444,10 @@ mod wasm_tests {
                 agent_id: AgentId("agent-1".to_owned()),
             })
         })
+    }
+
+    fn no_agent_ref() -> Signal<Option<ActiveAgentRef>> {
+        Signal::derive(|| None)
     }
 
     fn opt(label: &str, desc: &str) -> AskUserQuestionOption {
@@ -461,8 +481,8 @@ mod wasm_tests {
         }
     }
 
-    /// Mount a renderer fn with an `AppState` in context so the card can read
-    /// the active agent on submit.
+    /// Mount a renderer fn with the `AppState` that owns the explicitly
+    /// supplied rendered agent's stream.
     fn mount_with_state<F>(view_fn: F) -> HtmlElement
     where
         F: FnOnce() -> AnyView + 'static,
@@ -514,6 +534,110 @@ mod wasm_tests {
             "Claude".to_owned(),
             true,
         );
+    }
+
+    fn rendered_agent_a() -> ActiveAgentRef {
+        ActiveAgentRef {
+            host_id: "host-a".to_owned(),
+            agent_id: AgentId("agent-a".to_owned()),
+        }
+    }
+
+    fn rendered_agent_a_signal() -> Signal<Option<ActiveAgentRef>> {
+        Signal::derive(|| Some(rendered_agent_a()))
+    }
+
+    fn agent_info(agent_ref: ActiveAgentRef, stream: &str) -> AgentInfo {
+        AgentInfo {
+            host_id: agent_ref.host_id,
+            agent_id: agent_ref.agent_id,
+            name: "Agent".to_owned(),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Claude,
+            workspace_roots: Vec::new(),
+            project_id: None,
+            parent_agent_id: None,
+            session_id: None,
+            custom_agent_id: None,
+            workflow: None,
+            created_at_ms: 0,
+            instance_stream: StreamPath(stream.to_owned()),
+            started: true,
+            fatal_error: None,
+            activity_summary: Default::default(),
+        }
+    }
+
+    fn configure_agent_a_while_b_owns_composer(state: &AppState) {
+        let agent_a = rendered_agent_a();
+        let agent_b = ActiveAgentRef {
+            host_id: "host-b".to_owned(),
+            agent_id: AgentId("agent-b".to_owned()),
+        };
+        state.agents.set(vec![
+            agent_info(agent_a.clone(), "/agent/a/stream"),
+            agent_info(agent_b.clone(), "/agent/b/stream"),
+        ]);
+        state.open_tab(
+            TabContent::chat_with_agent(agent_a),
+            "Agent A".to_owned(),
+            true,
+        );
+        state.open_tab(
+            TabContent::chat_with_agent(agent_b),
+            "Agent B".to_owned(),
+            true,
+        );
+    }
+
+    fn install_send_capture_stub() -> js_sys::Array {
+        let code = r#"
+            (function() {
+                window.__test_send_calls = [];
+                window.__TAURI__ = window.__TAURI__ || {};
+                window.__TAURI__.core = window.__TAURI__.core || {};
+                window.__TAURI__.core.invoke = function(cmd, args) {
+                    window.__test_send_calls.push([cmd, JSON.stringify(args || {})]);
+                    return Promise.resolve();
+                };
+                window.__TAURI__.event = window.__TAURI__.event || {};
+                window.__TAURI__.event.listen = function() { return Promise.resolve(null); };
+                return window.__test_send_calls;
+            })();
+        "#;
+        js_sys::eval(code)
+            .expect("install send capture stub")
+            .dyn_into::<js_sys::Array>()
+            .expect("array")
+    }
+
+    fn last_send_route(calls: &js_sys::Array) -> (String, String) {
+        assert_eq!(calls.length(), 1, "one control activation must send once");
+        let entry = calls
+            .get(0)
+            .dyn_into::<js_sys::Array>()
+            .expect("call entry");
+        assert_eq!(entry.get(0).as_string().as_deref(), Some("send_host_line"));
+        let args: serde_json::Value =
+            serde_json::from_str(&entry.get(1).as_string().expect("serialized invoke args"))
+                .expect("invoke args JSON");
+        let host_id = args
+            .get("hostId")
+            .and_then(|value| value.as_str())
+            .expect("hostId")
+            .to_owned();
+        let envelope: serde_json::Value = serde_json::from_str(
+            args.get("line")
+                .and_then(|value| value.as_str())
+                .expect("serialized envelope"),
+        )
+        .expect("envelope JSON");
+        let stream = envelope
+            .get("stream")
+            .and_then(|value| value.as_str())
+            .expect("stream")
+            .to_owned();
+        (host_id, stream)
     }
 
     fn install_deferred_send_stub() -> js_sys::Array {
@@ -639,7 +763,8 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn renders_question_text_and_all_options() {
         let req = single_select_req();
-        let container = mount_with_state(move || render(&req, None, ToolOutputMode::Summary));
+        let container =
+            mount_with_state(move || render(test_agent_ref(), &req, None, ToolOutputMode::Summary));
         next_tick().await;
 
         let body = text(&container);
@@ -665,6 +790,7 @@ mod wasm_tests {
                 },
                 success: true,
                 error: None,
+                normalization_failure: None,
             }),
         };
         let container = mount_with_state(move || {
@@ -702,6 +828,7 @@ mod wasm_tests {
                 },
                 success: false,
                 error: Some("question failed".to_owned()),
+                normalization_failure: None,
             }),
         };
         let container = mount_with_state(move || {
@@ -732,7 +859,8 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn submit_disabled_until_an_option_is_chosen() {
         let req = single_select_req();
-        let container = mount_with_state(move || render(&req, None, ToolOutputMode::Summary));
+        let container =
+            mount_with_state(move || render(test_agent_ref(), &req, None, ToolOutputMode::Summary));
         next_tick().await;
 
         assert!(
@@ -752,7 +880,8 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn single_select_replaces_previous_choice() {
         let req = single_select_req();
-        let container = mount_with_state(move || render(&req, None, ToolOutputMode::Summary));
+        let container =
+            mount_with_state(move || render(test_agent_ref(), &req, None, ToolOutputMode::Summary));
         next_tick().await;
 
         let buttons = option_buttons(&container);
@@ -770,7 +899,8 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn multi_select_keeps_multiple_choices() {
         let req = multi_select_req();
-        let container = mount_with_state(move || render(&req, None, ToolOutputMode::Summary));
+        let container =
+            mount_with_state(move || render(test_agent_ref(), &req, None, ToolOutputMode::Summary));
         next_tick().await;
 
         let buttons = option_buttons(&container);
@@ -791,7 +921,8 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn submit_without_active_agent_shows_retryable_error() {
         let req = single_select_req();
-        let container = mount_with_state(move || render(&req, None, ToolOutputMode::Summary));
+        let container =
+            mount_with_state(move || render(no_agent_ref(), &req, None, ToolOutputMode::Summary));
         next_tick().await;
 
         option_buttons(&container)[0].click();
@@ -815,7 +946,7 @@ mod wasm_tests {
         let calls = install_deferred_send_stub();
         let req = single_select_req();
         let container = mount_with_state_setup(configure_active_agent, move || {
-            render(&req, None, ToolOutputMode::Summary)
+            render(test_agent_ref(), &req, None, ToolOutputMode::Summary)
         });
         next_tick().await;
 
@@ -852,7 +983,7 @@ mod wasm_tests {
         install_failing_send_stub();
         let req = single_select_req();
         let container = mount_with_state_setup(configure_active_agent, move || {
-            render(&req, None, ToolOutputMode::Summary)
+            render(test_agent_ref(), &req, None, ToolOutputMode::Summary)
         });
         next_tick().await;
 
@@ -869,6 +1000,66 @@ mod wasm_tests {
         assert!(
             !submit_button(&container).disabled(),
             "answer should remain retryable after send failure"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn answer_routes_to_rendered_agent_while_other_agent_owns_composer() {
+        let calls = install_send_capture_stub();
+        let state = AppState::new();
+        configure_agent_a_while_b_owns_composer(&state);
+        let composer_before = state
+            .center_zone
+            .with_untracked(|center| center.composer_owner());
+        let active_before = state.active_agent.get_untracked();
+        assert_eq!(
+            active_before
+                .as_ref()
+                .map(|agent| agent.agent_id.0.as_str()),
+            Some("agent-b"),
+            "agent B must own the composer before activating agent A's control"
+        );
+
+        let entry = ToolRequestEntry {
+            request: ToolRequest {
+                tool_call_id: "toolu_ask_agent_a".to_owned(),
+                tool_name: "AskUserQuestion".to_owned(),
+                tool_type: single_select_req(),
+            },
+            result: None,
+        };
+        let container = make_container();
+        let mount_state = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! {
+                <ToolCardView agent_ref=rendered_agent_a_signal() entry=entry />
+            }
+        });
+        handle.forget();
+        next_tick().await;
+
+        option_buttons(&container)[0].click();
+        next_tick().await;
+        submit_button(&container).click();
+        next_tick().await;
+
+        assert_eq!(
+            last_send_route(&calls),
+            ("host-a".to_owned(), "/agent/a/stream".to_owned()),
+            "AskUserQuestion must route through rendered agent A"
+        );
+        assert_eq!(
+            state
+                .center_zone
+                .with_untracked(|center| center.composer_owner()),
+            composer_before,
+            "answering agent A must not focus its chat or move composer ownership"
+        );
+        assert_eq!(
+            state.active_agent.get_untracked(),
+            active_before,
+            "agent B must remain composer owner after agent A's answer"
         );
     }
 }

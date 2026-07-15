@@ -7,21 +7,21 @@ use protocol::{
     AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentBootstrapEvent,
     AgentBootstrapPayload, AgentClosedPayload, AgentErrorPayload, AgentId, AgentOrigin,
     AgentRenamedPayload, AgentStartPayload, AgentsViewPreferencesNotifyPayload,
-    BackendConfigSchemasPayload, BackendConfigSnapshotsPayload, BackendSetupPayload,
-    BrowseBootstrapListing, BrowseBootstrapPayload, ByteRange, ChatEvent,
+    BackendCapacityPayload, BackendConfigSchemasPayload, BackendConfigSnapshotsPayload,
+    BackendSetupPayload, BrowseBootstrapListing, BrowseBootstrapPayload, ByteRange, ChatEvent,
     CodeIntelDiagnosticsPayload, CodeIntelErrorContext, CodeIntelErrorPayload,
     CodeIntelFileModelPayload, CodeIntelHoverResultPayload, CodeIntelLocation,
     CodeIntelNavigateResultPayload, CodeIntelOverviewPayload, CodeIntelReferenceLine,
     CodeIntelReferencesCompletePayload, CodeIntelReferencesFileResult,
     CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CodeIntelStatusScope,
     CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FrameKind, HostBootstrapPayload,
-    HostBrowseEntriesPayload, HostBrowseErrorPayload, HostBrowseOpenedPayload, HostSettingsPayload,
-    LaunchProfileCatalogPayload, McpServerNotifyPayload, MobileAccessStatePayload,
-    MobilePairingOfferPayload, MobilePairingState, NewAgentPayload, NewTerminalPayload,
-    ProjectBootstrapPayload, ProjectEventPayload, ProjectFileContentsPayload,
-    ProjectFileListPayload, ProjectGitCommitResultPayload, ProjectGitDiffPayload,
-    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectPath,
-    ProjectSearchCompletePayload, ProjectSearchResultsPayload, ProtocolValidator,
+    HostBrowseEntriesPayload, HostBrowseErrorPayload, HostBrowseOpenedPayload,
+    HostSettingErrorTarget, HostSettingsPayload, LaunchProfileCatalogPayload,
+    McpServerNotifyPayload, MobileAccessStatePayload, MobilePairingOfferPayload,
+    MobilePairingState, NewAgentPayload, NewTerminalPayload, ProjectBootstrapPayload,
+    ProjectEventPayload, ProjectFileContentsPayload, ProjectFileListPayload,
+    ProjectGitCommitResultPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
+    ProjectNotifyPayload, ProjectPath, ProjectSearchCompletePayload, ProjectSearchResultsPayload,
     QueuedMessagesPayload, RejectCode, RejectPayload, ReviewBootstrapPayload, ReviewCommentSource,
     ReviewErrorContext, ReviewEventPayload, ReviewId, ReviewSuggestionState, SessionHistoryPayload,
     SessionId, SessionListPayload, SessionSchemasPayload, SessionSettingsPayload,
@@ -34,12 +34,13 @@ use protocol::{
 
 use crate::line_source::FileLines;
 use crate::state::{
-    ActiveAgentRef, ActiveProjectRef, ActiveTerminalRef, AgentInfo, AppState, ChatMessageEntry,
-    CodeIntelKey, ConnectionStatus, NativeSettingsSaveState, OpenFile, OrchestrationRecord,
-    ProjectInfo, ProjectReferencesMode, ProjectReferencesUiState, ReviewActionTarget,
-    SessionHistoryState, SessionInfo, StreamingState, StreamingToolRequest, TabContent,
-    TerminalInfo, ToolCallId, ToolRequestEntry, TransientEvent, WorkflowPanelError,
-    reduce_diff_response, root_display_name, sort_project_infos,
+    ActiveAgentRef, ActiveProjectRef, ActiveTerminalRef, AgentInfo, AppState, CenterZoneState,
+    ChatMessageEntry, CodeIntelKey, ConnectionStatus, FileResourceKey, ManagedProjectionResetState,
+    NativeSettingsSaveState, OpenFile, OrchestrationRecord, PaneId, PendingFileNavigation,
+    PendingFileOpen, ProjectInfo, ProjectReferencesMode, ProjectReferencesUiState,
+    ReviewActionTarget, SessionHistoryState, SessionInfo, StreamingState, StreamingToolRequest,
+    TabContent, TabId, TerminalInfo, ToolCallId, ToolRequestEntry, TransientEvent,
+    WorkflowPanelError, reduce_diff_response, root_display_name, sort_project_infos,
 };
 
 struct FrontendSeqValidator {
@@ -81,29 +82,6 @@ impl FrontendSeqValidator {
     }
 }
 
-struct PerHostProtocolValidators {
-    by_host: HashMap<String, ProtocolValidator>,
-}
-
-impl PerHostProtocolValidators {
-    fn new() -> Self {
-        Self {
-            by_host: HashMap::new(),
-        }
-    }
-
-    fn validate(&mut self, host_id: &str, envelope: &Envelope) -> Result<(), String> {
-        let validator = self.by_host.entry(host_id.to_string()).or_default();
-        validator
-            .validate_envelope(envelope)
-            .map_err(|error| error.to_string())
-    }
-
-    fn reset_host(&mut self, host_id: &str) {
-        self.by_host.remove(host_id);
-    }
-}
-
 /// Drop per-host inbound sequence state only. Tests use this to rewind seq
 /// counters while preserving protocol bootstrap state.
 pub fn clear_host_seqs(host_id: &str) {
@@ -115,7 +93,6 @@ pub fn clear_host_seqs(host_id: &str) {
 /// fresh connection.
 pub fn reset_inbound_state_for_host(host_id: &str) {
     INBOUND_SEQ.with(|validator| validator.borrow_mut().forget_host(host_id));
-    INBOUND_PROTOCOL.with(|validator| validator.borrow_mut().reset_host(host_id));
 }
 
 /// Test helper: drop the seq counter for a single `(host_id, stream)`
@@ -128,26 +105,13 @@ pub fn clear_stream_seq_for_tests(host_id: &str, stream: &StreamPath) {
     });
 }
 
-/// Reset the inbound `ProtocolValidator`. The validator carries per-stream
-/// state (registered agent streams, recent-frame history) which persists for
-/// the lifetime of the wasm thread. Production code never calls this; it
-/// exists so wasm tests, which reuse stream paths (`/agents/a-new`, etc.)
-/// across independent test cases, can start each test with a clean validator.
-#[allow(dead_code)]
-pub fn reset_inbound_protocol() {
-    INBOUND_PROTOCOL.with(|validator| *validator.borrow_mut() = PerHostProtocolValidators::new());
-}
-
 /// Test helper: prime the inbound validators for `host_id` so subsequent
 /// dispatch calls behave as if the server had already delivered a
 /// `Welcome` (seq 0) + `HostBootstrap` (seq 1) pair on the
 /// `/host/<host_id>` stream.
 ///
-/// After priming, the `ProtocolValidator` considers the host stream to
-/// have observed a bootstrap (so non-bootstrap frames will not be
-/// rejected as "before HostBootstrap"), but the `FrontendSeqValidator`
-/// has been rewound so tests can dispatch their first envelope at seq
-/// `0` without a seq-mismatch error.
+/// After priming, the `FrontendSeqValidator` is rewound so tests can
+/// dispatch their first envelope at seq `0` without a seq-mismatch error.
 ///
 /// The synthetic `HostBootstrap` is empty, so any host-keyed slice the
 /// test populated via `AppState` setters survives — the bootstrap only
@@ -165,7 +129,7 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
 
     let host_stream = StreamPath(format!("/host/{host_id}"));
 
-    // Reset both validators so we start from a known state.
+    // Reset sequence state so we start from a known state.
     reset_inbound_state_for_host(host_id);
 
     let welcome = BootstrapWelcome {
@@ -234,22 +198,17 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
             .expect("synthetic HostBootstrap");
     dispatch_envelope(state, host_id, bootstrap_env);
 
-    // Rewind only the FrontendSeqValidator. The ProtocolValidator keeps
-    // the saw_welcome/saw_bootstrap state from the synthetic frames, so
-    // a follow-up test envelope at seq 0 passes the bootstrap-first
-    // check while the seq counter restarts at 0.
+    // Let the test's next envelope start a fresh sequence.
     clear_host_seqs(host_id);
 }
 
 /// Test helper: dispatch a synthetic `AgentBootstrap` on
-/// `instance_stream` so subsequent dispatches on that agent stream pass
-/// the bootstrap-first check, and rewind the per-stream seq counter so
-/// the test's first envelope can use seq 0.
+/// `instance_stream`, then rewind the per-stream seq counter so the test's
+/// first envelope can use seq 0.
 ///
 /// Use after seeding the agent into `state.agents` (e.g. via a
 /// `NewAgent` dispatch on the host stream). The bootstrap payload
-/// includes an `AgentStart` so the validator's `chat_event` checks pass
-/// for follow-up `ChatEvent` frames.
+/// includes an `AgentStart` to represent the server bootstrap shape.
 #[allow(dead_code)]
 pub fn prime_agent_stream_for_tests(
     state: &AppState,
@@ -277,8 +236,6 @@ pub fn prime_agent_stream_for_tests(
 
 thread_local! {
     static INBOUND_SEQ: RefCell<FrontendSeqValidator> = RefCell::new(FrontendSeqValidator::new());
-    static INBOUND_PROTOCOL: RefCell<PerHostProtocolValidators> =
-        RefCell::new(PerHostProtocolValidators::new());
 }
 
 fn report_dispatch_error(
@@ -342,19 +299,6 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 .borrow_mut()
                 .forget_host_except_stream(host_id, &envelope.stream);
         });
-        INBOUND_PROTOCOL.with(|validator| validator.borrow_mut().reset_host(host_id));
-    }
-    if let Err(error) =
-        INBOUND_PROTOCOL.with(|validator| validator.borrow_mut().validate(host_id, &envelope))
-    {
-        report_dispatch_error(
-            state,
-            host_id,
-            &envelope.stream,
-            envelope.kind,
-            format!("protocol violation: {error}"),
-        );
-        return;
     }
 
     match envelope.kind {
@@ -552,6 +496,11 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     errors.insert(host_id.to_string(), message);
                 });
                 clear_session_history_loading_on_error(state, host_id, &payload);
+                // The two routes below both correlate on the typed `setting_target`,
+                // never on "a SetSetting failed while something was in flight". A
+                // native save and a projection reset are *both* `SetSetting`, so a
+                // heuristic here reports each one's failure against the other.
+                //
                 // A backend-native settings save is a `SetSetting` whose result
                 // only lands via a refreshed native snapshot. If the server
                 // rejects it (e.g. Tycode SaveSettings fails), no snapshot is
@@ -559,6 +508,12 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 // settings page stuck in "Saving…" forever. Flip it to `Failed`
                 // so controls unlock and the server's reason is shown.
                 fail_native_settings_pending_on_error(state, host_id, &payload);
+                // The reset is the one destructive action in settings, and it is
+                // offered from a card on a page with no other controls. A refusal
+                // that lands only in the global host status line reads, from the
+                // point of action, as a button that did nothing — so route it to
+                // the card.
+                refuse_managed_projection_reset_on_error(state, host_id, &payload);
                 // Release any review-side pending gate the rejected
                 // command was holding. Without this, a server-side
                 // failure (unknown project, git error, malformed
@@ -821,6 +776,18 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         .iter()
                         .map(|snapshot| snapshot.backend_kind)
                         .collect();
+                    // A snapshot that no longer carries a recovery state is the
+                    // server saying the wedge is gone — the reset landed, or the
+                    // projection was rebuilt. Any reset outcome described *that*
+                    // state, so it goes with it. A snapshot that still carries
+                    // recovery leaves a refusal exactly where it is: a Conflict
+                    // removed nothing, and the card has to keep saying so.
+                    let backends_without_recovery: Vec<_> = payload
+                        .native_settings
+                        .iter()
+                        .filter(|snapshot| snapshot.managed_projection_recovery.is_none())
+                        .map(|snapshot| snapshot.backend_kind)
+                        .collect();
                     state.backend_native_settings.update(|snapshots_by_host| {
                         let host_snapshots =
                             snapshots_by_host.entry(host_id.to_string()).or_default();
@@ -841,6 +808,18 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                             }
                         });
                     }
+                    if !backends_without_recovery.is_empty() {
+                        state.managed_projection_reset.update(|by_host| {
+                            if let Some(by_kind) = by_host.get_mut(host_id) {
+                                for kind in &backends_without_recovery {
+                                    by_kind.remove(kind);
+                                }
+                                if by_kind.is_empty() {
+                                    by_host.remove(host_id);
+                                }
+                            }
+                        });
+                    }
                 }
                 Err(error) => report_dispatch_error(
                     state,
@@ -851,6 +830,27 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 ),
             }
         }
+        FrameKind::BackendCapacity => match envelope.parse_payload::<BackendCapacityPayload>() {
+            Ok(payload) => {
+                // Full replacement for this host: the server owns the canonical
+                // per-(host, backend) snapshot and re-emits it on every change,
+                // so the frontend holds no history and merges nothing.
+                state.backend_capacity.update(|capacity_by_host| {
+                    let host_capacity = capacity_by_host.entry(host_id.to_string()).or_default();
+                    host_capacity.clear();
+                    for snapshot in payload.snapshots {
+                        host_capacity.insert(snapshot.backend_kind, snapshot);
+                    }
+                });
+            }
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse backend_capacity payload: {error}"),
+            ),
+        },
         FrameKind::SessionSettings => {
             let Some(agent_id) = resolve_agent_id(state, host_id, &envelope.stream) else {
                 log::warn!("session_settings on unknown stream {}", envelope.stream);
@@ -937,11 +937,9 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 };
                 let project_id = info.project_id.clone();
                 let agent_name_for_upgrade = info.name.clone();
-                // User-origin and SideQuestion (BTW) agents auto-open a chat
-                // tab and steal focus — a side question is something the user
-                // just asked for, so it should surface like a user agent.
-                // AgentControl and BackendNative agents appear in the sidebar
-                // but must not disrupt the user's current view.
+                // User-origin and SideQuestion agents may resolve an exact
+                // draft intent. Programmatic agents only appear in state and
+                // never create or select a tab from a server event.
                 let is_programmatic =
                     !matches!(origin, AgentOrigin::User | AgentOrigin::SideQuestion);
                 state.agents.update(|agents| {
@@ -970,10 +968,9 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     state.compaction_pending_completion.update(|map| {
                         map.remove(&(host_id.to_string(), agent_id.clone()));
                     });
-                    // Completed-early ordering: the retarget already
-                    // happened. Skip the auto-tab-open below — the
-                    // user's existing chat tab is already retargeted to
-                    // this agent.
+                    // Completed-early ordering: the retarget already happened.
+                    // The user's existing chat tab already points at this
+                    // agent, so there is no draft intent left to resolve.
                     return;
                 }
 
@@ -984,9 +981,8 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 // compaction-start time. If this is the replacement,
                 // the user's existing chat tab is still pointing at
                 // the (alive) old agent — `Completed` will retarget
-                // it when it lands. Skip the auto-tab-open path here
-                // so the replacement does not steal focus into a
-                // duplicate tab.
+                // it when it lands. Skip draft resolution here so the
+                // replacement cannot create a duplicate tab.
                 let likely_replacement = state.find_compaction_replacement(
                     host_id,
                     team_member_id.as_ref(),
@@ -1004,113 +1000,60 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     return;
                 }
 
+                let target_project = project_id.as_ref().map(|project_id| ActiveProjectRef {
+                    host_id: host_id.to_string(),
+                    project_id: project_id.clone(),
+                });
+                let new_active_agent = ActiveAgentRef {
+                    host_id: host_id.to_string(),
+                    agent_id,
+                };
+
                 // Team-member upgrade: a `pending_team_member` chat tab was
                 // opened when the user clicked the team or a report row and
                 // is waiting for this spawn echo. Match against
                 // `team_member_id` rather than the host/origin so the
-                // upgrade works for both User-initiated (via
-                // `TeamMemberActivate`) and manager-initiated (via
-                // `tyde_team_message_member`) team-member spawns that
-                // happen to coincide with a draft tab.
+                // upgrade works for both user activation and manager
+                // messaging paths that produce a TeamMember-origin spawn
+                // while an exact pending tab exists.
                 if let Some(team_member_id) = team_member_id.clone() {
-                    let upgraded = upgrade_pending_team_member_tab(
+                    let result = upgrade_pending_team_member_tab(
                         state,
                         host_id,
                         &team_member_id,
-                        &ActiveAgentRef {
-                            host_id: host_id.to_string(),
-                            agent_id: agent_id.clone(),
-                        },
+                        &new_active_agent,
                         &agent_name_for_upgrade,
                     );
-                    if upgraded {
-                        return;
+                    if result != TabUpgradeResult::Updated {
+                        log::warn!(
+                            "NewAgent team-member upgrade did not find one exact intent host={} member={} agent={}: {:?}",
+                            host_id,
+                            team_member_id.0,
+                            new_active_agent.agent_id.0,
+                            result,
+                        );
                     }
+                    return;
                 }
 
                 if is_programmatic {
                     return;
                 }
 
-                let target_project =
-                    project_id
-                        .as_ref()
-                        .map(|pid| crate::state::ActiveProjectRef {
-                            host_id: host_id.to_string(),
-                            project_id: pid.clone(),
-                        });
-                let active_project = state.active_project.get_untracked();
-                let new_active_agent = ActiveAgentRef {
-                    host_id: host_id.to_string(),
-                    agent_id,
-                };
-
-                let agent_name = state
-                    .agents
-                    .with_untracked(|agents| {
-                        agents
-                            .iter()
-                            .find(|a| {
-                                a.host_id == host_id && a.agent_id == new_active_agent.agent_id
-                            })
-                            .map(|a| a.name.clone())
-                    })
-                    .unwrap_or_else(|| "Chat".to_string());
-
-                if target_project == active_project {
-                    // active_agent is now a Memo over center_zone — the update
-                    // below drives it.
-                    state.center_zone.update(|cz| {
-                        let new_chat = TabContent::empty_chat();
-                        if let Some(tab) = cz.tabs.iter_mut().find(|t| t.content == new_chat) {
-                            tab.content = TabContent::chat_with_agent(new_active_agent.clone());
-                            tab.label = agent_name.clone();
-                            cz.active_tab_id = Some(tab.id);
-                        } else {
-                            cz.open(
-                                TabContent::chat_with_agent(new_active_agent.clone()),
-                                agent_name.clone(),
-                                true,
-                            );
-                        }
-                    });
-                } else if let Some(target) = target_project {
-                    // Spawned for a project the user isn't currently viewing.
-                    // Stash into that project's memory so switching over shows it.
-                    state.project_view_memory.update(|map| {
-                        let slot = map.entry(target).or_default();
-                        let cz = slot.center_zone.get_or_insert_with(Default::default);
-                        let new_chat = TabContent::empty_chat();
-                        if let Some(tab) = cz.tabs.iter_mut().find(|t| t.content == new_chat) {
-                            tab.content = TabContent::chat_with_agent(new_active_agent);
-                            tab.label = agent_name;
-                            cz.active_tab_id = Some(tab.id);
-                        } else {
-                            cz.open(
-                                TabContent::chat_with_agent(new_active_agent),
-                                agent_name,
-                                true,
-                            );
-                        }
-                    });
-                } else {
-                    // No project context — fall through to global behavior.
-                    // active_agent is a Memo over center_zone; the update below
-                    // drives it.
-                    state.center_zone.update(|cz| {
-                        let new_chat = TabContent::empty_chat();
-                        if let Some(tab) = cz.tabs.iter_mut().find(|t| t.content == new_chat) {
-                            tab.content = TabContent::chat_with_agent(new_active_agent.clone());
-                            tab.label = agent_name.clone();
-                            cz.active_tab_id = Some(tab.id);
-                        } else {
-                            cz.open(
-                                TabContent::chat_with_agent(new_active_agent),
-                                agent_name,
-                                true,
-                            );
-                        }
-                    });
+                let result = upgrade_draft_chat_tab(
+                    state,
+                    target_project.as_ref(),
+                    &new_active_agent,
+                    &agent_name_for_upgrade,
+                );
+                if result != TabUpgradeResult::Updated {
+                    log::warn!(
+                        "NewAgent user upgrade did not find one exact draft intent host={} agent={} project={:?}: {:?}",
+                        host_id,
+                        new_active_agent.agent_id.0,
+                        project_id,
+                        result,
+                    );
                 }
             }
             Err(error) => report_dispatch_error(
@@ -1334,13 +1277,18 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     // re-triggers) — that bounds it to one outstanding re-read
                     // per file during a burst of writes.
                     for change in files {
+                        let key = FileResourceKey {
+                            host_id: host_id.to_owned(),
+                            project_id: project_id.clone(),
+                            path: change.path.clone(),
+                        };
                         let needs_refresh = state.open_files.with_untracked(|open| {
-                            open.get(&change.path)
+                            open.get(&key)
                                 .is_some_and(|file| change.version > file.version)
                         });
                         let already_pending = state
-                            .pending_file_refreshes
-                            .with_untracked(|pending| pending.contains(&change.path));
+                            .pending_file_opens
+                            .with_untracked(|pending| pending.contains_key(&key));
                         if needs_refresh && !already_pending {
                             crate::actions::refresh_open_file(
                                 state,
@@ -1591,9 +1539,56 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
         FrameKind::ProjectFileContents => {
             match envelope.parse_payload::<ProjectFileContentsPayload>() {
                 Ok(payload) => {
+                    let Some(project_id) = resolve_project_id(&envelope.stream) else {
+                        report_dispatch_error(
+                            state,
+                            host_id,
+                            &envelope.stream,
+                            envelope.kind,
+                            "project_file_contents arrived outside a project stream".to_string(),
+                        );
+                        return;
+                    };
                     let path = payload.path.clone();
+                    let key = FileResourceKey {
+                        host_id: host_id.to_owned(),
+                        project_id: project_id.clone(),
+                        path: path.clone(),
+                    };
+                    let intent = state.take_pending_file_open(&key);
+                    let active_matches =
+                        state.active_project_ref_untracked().is_some_and(|active| {
+                            active.host_id == key.host_id && active.project_id == key.project_id
+                        });
+                    if !active_matches {
+                        log::debug!(
+                            "dropping superseded ProjectFileContents for host={} project={} path={}",
+                            key.host_id,
+                            key.project_id.0,
+                            key.path.relative_path,
+                        );
+                        return;
+                    }
+
+                    let already_open = state
+                        .open_files
+                        .with_untracked(|files| files.contains_key(&key));
+                    if intent.is_none() && !already_open {
+                        log::error!(
+                            "unsolicited ProjectFileContents for unopened file host={} project={} path={}",
+                            key.host_id,
+                            key.project_id.0,
+                            key.path.relative_path,
+                        );
+                        return;
+                    }
+
                     let perf_key = format!("file:{}", path.relative_path);
-                    let bytes = payload.contents.as_ref().map(|s| s.len()).unwrap_or(0);
+                    let bytes = payload
+                        .contents
+                        .as_ref()
+                        .map(|contents| contents.len())
+                        .unwrap_or(0);
                     crate::perf::log_phase(
                         "file_open",
                         "response",
@@ -1617,7 +1612,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     let version = payload.version;
                     state.open_files.update(|files| {
                         files.insert(
-                            path.clone(),
+                            key.clone(),
                             OpenFile {
                                 path: payload.path,
                                 version,
@@ -1626,49 +1621,39 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                             },
                         );
                     });
-                    // Record the rendered version so code-intel frames apply
-                    // only against this text (version-equals-rendered rule).
-                    // §M4: when this is a *reload* to a newer version of an
-                    // already-open file (external edit / branch switch / agent
-                    // write), `set_rendered_version` drops the now-stale
-                    // older-version decorations, and we send a fresh
-                    // `code_intel_subscribe_file` so the server re-pushes the
-                    // semantic model + diagnostics at the new version. The
-                    // subscribe carries no version; the server peeks the same
-                    // centralized counter that stamped these contents, so the
-                    // re-push lands at exactly this rendered version.
-                    if let Some(project_id) = resolve_project_id(&envelope.stream) {
-                        let key = CodeIntelKey {
-                            host_id: host_id.to_owned(),
-                            project_id: project_id.clone(),
-                            path: path.clone(),
-                        };
-                        let mut version_advanced = false;
-                        state.code_intel.update(|map| {
-                            let entry = map.entry(key).or_default();
-                            let prior = entry.rendered_version;
-                            entry.set_rendered_version(version);
-                            version_advanced = matches!(prior, Some(prior) if version > prior);
-                        });
-                        if version_advanced {
-                            refresh_code_intel_subscription(host_id, &project_id, &path);
-                        }
+
+                    let code_intel_key = CodeIntelKey {
+                        host_id: key.host_id.clone(),
+                        project_id: key.project_id.clone(),
+                        path: key.path.clone(),
+                    };
+                    let mut version_advanced = false;
+                    state.code_intel.update(|map| {
+                        let entry = map.entry(code_intel_key).or_default();
+                        let prior = entry.rendered_version;
+                        entry.set_rendered_version(version);
+                        version_advanced = matches!(prior, Some(prior) if version > prior);
+                    });
+                    if version_advanced {
+                        refresh_code_intel_subscription(host_id, &project_id, &path);
                     }
-                    // A background refresh (server reported this already-open
-                    // file's version advanced, see `ProjectEventPayload::
-                    // FilesChanged`) updates contents + code-intel in place;
-                    // opening a tab here would steal focus (or hijack the active
-                    // pane in single-pane mode). A normal user open has no
-                    // pending-refresh marker and falls through to `open_tab`.
-                    let was_refresh = state
-                        .pending_file_refreshes
-                        .with_untracked(|pending| pending.contains(&path));
-                    if was_refresh {
-                        state.pending_file_refreshes.update(|pending| {
-                            pending.remove(&path);
-                        });
-                    } else {
-                        state.open_tab(TabContent::File { path }, label, true);
+
+                    match intent {
+                        Some(PendingFileOpen::RefreshInPlace) | None => {}
+                        Some(PendingFileOpen::Open {
+                            destination,
+                            navigation,
+                        }) => {
+                            if let Some(tab) = state.open_tab_in(
+                                destination.pane(),
+                                TabContent::File { key },
+                                label,
+                                true,
+                            ) && let Some(navigation) = navigation
+                            {
+                                state.target_file_navigation(tab, navigation);
+                            }
+                        }
                     }
                 }
                 Err(error) => report_dispatch_error(
@@ -2553,9 +2538,13 @@ fn refresh_code_intel_subscription(_host_id: &str, _project_id: &ProjectId, _pat
 /// after a tab closed (and was unsubscribed) instead of resurrecting state.
 fn code_intel_file_is_open(state: &AppState, key: &CodeIntelKey) -> bool {
     state.code_intel.with_untracked(|map| map.contains_key(key))
-        || state
-            .open_files
-            .with_untracked(|files| files.contains_key(&key.path))
+        || state.open_files.with_untracked(|files| {
+            files.contains_key(&FileResourceKey {
+                host_id: key.host_id.clone(),
+                project_id: key.project_id.clone(),
+                path: key.path.clone(),
+            })
+        })
 }
 
 fn record_code_intel_error_for_path(
@@ -2581,9 +2570,14 @@ fn record_code_intel_error_for_path(
         .code_intel
         .with_untracked(|map| map.get(&key).and_then(|file| file.rendered_version))
         .or_else(|| {
+            let file_key = FileResourceKey {
+                host_id: host_id.to_owned(),
+                project_id: project_id.clone(),
+                path: path.clone(),
+            };
             state
                 .open_files
-                .with_untracked(|files| files.get(&path).map(|file| file.version))
+                .with_untracked(|files| files.get(&file_key).map(|file| file.version))
         });
     let Some(version) = version else {
         return;
@@ -2597,23 +2591,32 @@ fn record_code_intel_error_for_path(
 
 fn references_context_matches(
     state: &ProjectReferencesUiState,
-    active_project: Option<&crate::state::ActiveProjectRef>,
     host_id: &str,
     project_id: &ProjectId,
     references_id: u64,
 ) -> bool {
+    let Some((_, key, _)) = state.source() else {
+        return false;
+    };
     state.active_references_id == references_id
-        && state.host_id.as_deref() == Some(host_id)
-        && state.project_id.as_ref() == Some(project_id)
-        && active_project
-            .map(|active| active.host_id == host_id && &active.project_id == project_id)
-            .unwrap_or(false)
+        && key.host_id == host_id
+        && &key.project_id == project_id
 }
 
-fn definition_target_line(state: &AppState, target: &CodeIntelLocation) -> CodeIntelReferenceLine {
+fn definition_target_line(
+    state: &AppState,
+    host_id: &str,
+    project_id: &ProjectId,
+    target: &CodeIntelLocation,
+) -> CodeIntelReferenceLine {
+    let key = FileResourceKey {
+        host_id: host_id.to_owned(),
+        project_id: project_id.clone(),
+        path: target.path.clone(),
+    };
     let contents = state.open_files.with_untracked(|files| {
         files
-            .get(&target.path)
+            .get(&key)
             .and_then(|file| file.contents.as_ref().cloned())
     });
     let Some(contents) = contents else {
@@ -2662,11 +2665,13 @@ fn definition_target_line(state: &AppState, target: &CodeIntelLocation) -> CodeI
 
 fn definition_target_results(
     state: &AppState,
+    host_id: &str,
+    project_id: &ProjectId,
     targets: &[CodeIntelLocation],
 ) -> (Vec<CodeIntelReferencesFileResult>, Vec<CodeIntelLocation>) {
     let mut grouped: Vec<(CodeIntelReferencesFileResult, Vec<CodeIntelLocation>)> = Vec::new();
     for target in targets {
-        let line = definition_target_line(state, target);
+        let line = definition_target_line(state, host_id, project_id, target);
         if let Some((file, row_targets)) = grouped
             .iter_mut()
             .find(|(file, _)| file.path == target.path)
@@ -2709,16 +2714,17 @@ fn apply_code_intel_error(
             references_id,
             path,
         } => {
-            record_code_intel_error_for_path(state, host_id, &project_id, path, payload.clone());
-            let active = state.active_project_ref_untracked();
+            record_code_intel_error_for_path(
+                state,
+                host_id,
+                &project_id,
+                path.clone(),
+                payload.clone(),
+            );
             state.references_state.update(|s| {
-                if !references_context_matches(
-                    s,
-                    active.as_ref(),
-                    host_id,
-                    &project_id,
-                    references_id,
-                ) {
+                if !references_context_matches(s, host_id, &project_id, references_id)
+                    || s.source_key.as_ref().is_none_or(|key| key.path != path)
+                {
                     return;
                 }
                 s.in_flight = false;
@@ -2756,36 +2762,29 @@ pub(crate) fn apply_code_intel_navigate_result(
     payload: CodeIntelNavigateResultPayload,
 ) {
     // The result must still match the full context we recorded when sending:
-    // same navigate id, same owning host/project (no project switch), and the
-    // source file still open at the same rendered version. Otherwise the user
-    // has moved on and navigating would be a surprise jump — drop it.
+    // same navigate id and the exact initiating occurrence still rendering the
+    // same resource/version. Otherwise the user has moved on and navigating
+    // would be a surprise jump — drop it.
     let Some(ctx) = state.code_intel_navigate_ctx.get_untracked() else {
         return;
     };
     if payload.navigate_id != ctx.navigate_id {
         return; // superseded by a newer navigate request
     }
-    let Some(active) = state.active_project_ref_untracked() else {
+    if payload.path != ctx.key.path {
         return;
-    };
-    if active.host_id != ctx.host_id || active.project_id != ctx.project_id {
-        return; // project switched since the request
     }
     let source_key = CodeIntelKey {
-        host_id: ctx.host_id.clone(),
-        project_id: ctx.project_id.clone(),
-        path: payload.path.clone(),
+        host_id: ctx.key.host_id.clone(),
+        project_id: ctx.key.project_id.clone(),
+        path: ctx.key.path.clone(),
     };
-    let source_current = state.open_files.with_untracked(|files| {
-        files
-            .get(&payload.path)
-            .map(|file| file.version == payload.version)
-            .unwrap_or(false)
-    }) && state.code_intel.with_untracked(|map| {
-        map.get(&source_key)
-            .map(|file| file.rendered_version == Some(payload.version))
-            .unwrap_or(false)
-    });
+    let source_current = state.file_occurrence_is_current(ctx.tab, &ctx.key, payload.version)
+        && state.code_intel.with_untracked(|map| {
+            map.get(&source_key)
+                .map(|file| file.rendered_version == Some(payload.version))
+                .unwrap_or(false)
+        });
     if !source_current {
         return; // source file closed or changed version since the request
     }
@@ -2799,21 +2798,32 @@ pub(crate) fn apply_code_intel_navigate_result(
     }
     if targets.len() == 1 {
         let target = targets.remove(0);
-        state
-            .pending_goto_offset
-            .set(Some((target.path.clone(), target.range.start)));
-        crate::actions::open_project_path(state, target.path);
+        if target.path == ctx.key.path {
+            state.activate_tab(ctx.tab);
+            state
+                .target_file_navigation(ctx.tab, PendingFileNavigation::Offset(target.range.start));
+        } else if let Some(destination) = state
+            .center_zone
+            .with_untracked(|center_zone| center_zone.locate_tab(ctx.tab))
+        {
+            crate::actions::open_project_path_in(
+                state,
+                target.path,
+                destination,
+                Some(PendingFileNavigation::Offset(target.range.start)),
+            );
+        }
         return;
     }
 
-    let (results, row_targets) = definition_target_results(state, &targets);
+    let (results, row_targets) =
+        definition_target_results(state, &ctx.key.host_id, &ctx.key.project_id, &targets);
     let total_files = results.len() as u32;
     let total_references = row_targets.len() as u32;
     state.references_state.set(ProjectReferencesUiState {
         mode: ProjectReferencesMode::DefinitionTargets,
-        host_id: Some(ctx.host_id),
-        project_id: Some(ctx.project_id),
-        source_path: Some(ctx.path),
+        source_tab: Some(ctx.tab),
+        source_key: Some(ctx.key),
         source_version: Some(ctx.version),
         active_references_id: 0,
         in_flight: false,
@@ -2843,13 +2853,28 @@ fn apply_code_intel_hover_result(
     if payload.hover_id != state.code_intel_active_hover.get_untracked() {
         return; // superseded
     }
-    let key = CodeIntelKey {
-        host_id: host_id.to_owned(),
-        project_id,
-        path: payload.path.clone(),
+    let Some(context) = state.code_intel_hover.with_untracked(|hover| {
+        hover
+            .as_ref()
+            .filter(|popover| {
+                popover.hover_id == payload.hover_id
+                    && popover.key.host_id == host_id
+                    && popover.key.project_id == project_id
+                    && popover.key.path == payload.path
+                    && popover.version == payload.version
+                    && state.file_occurrence_is_current(popover.tab, &popover.key, popover.version)
+            })
+            .cloned()
+    }) else {
+        return;
+    };
+    let code_intel_key = CodeIntelKey {
+        host_id: context.key.host_id.clone(),
+        project_id: context.key.project_id.clone(),
+        path: context.key.path.clone(),
     };
     let version_matches = state.code_intel.with_untracked(|map| {
-        map.get(&key)
+        map.get(&code_intel_key)
             .map(|file| file.rendered_version == Some(payload.version))
             .unwrap_or(false)
     });
@@ -2861,7 +2886,12 @@ fn apply_code_intel_hover_result(
         // Only fill the popover we seeded for this exact hover id.
         let matches = hover
             .as_ref()
-            .map(|popover| popover.hover_id == payload.hover_id)
+            .map(|popover| {
+                popover.hover_id == payload.hover_id
+                    && popover.tab == context.tab
+                    && popover.key == context.key
+                    && popover.version == payload.version
+            })
             .unwrap_or(false);
         if !matches {
             return;
@@ -2887,16 +2917,9 @@ fn apply_code_intel_references_results(
     project_id: ProjectId,
     payload: CodeIntelReferencesResultsPayload,
 ) {
-    let active = state.active_project_ref_untracked();
     state.references_state.update(|s| {
-        if !references_context_matches(
-            s,
-            active.as_ref(),
-            host_id,
-            &project_id,
-            payload.references_id,
-        ) {
-            return; // superseded / cleared / inactive project
+        if !references_context_matches(s, host_id, &project_id, payload.references_id) {
+            return; // superseded, cleared, or a different exact resource
         }
         s.results.push(payload.file);
         s.total_files = s.results.len() as u32;
@@ -2923,16 +2946,9 @@ fn apply_code_intel_references_complete(
     project_id: ProjectId,
     payload: CodeIntelReferencesCompletePayload,
 ) {
-    let active = state.active_project_ref_untracked();
     state.references_state.update(|s| {
-        if !references_context_matches(
-            s,
-            active.as_ref(),
-            host_id,
-            &project_id,
-            payload.references_id,
-        ) {
-            return; // superseded / cleared / inactive project
+        if !references_context_matches(s, host_id, &project_id, payload.references_id) {
+            return; // superseded, cleared, or a different exact resource
         }
         s.in_flight = false;
         s.total_files = payload.total_files;
@@ -3499,12 +3515,96 @@ fn clear_workflow_error_for_kinds(state: &AppState, host_id: &str, kinds: &[Fram
 /// every `Pending` native save on this host `Failed` with the server's message —
 /// conservative and scoped to native settings (existing `Failed` entries and
 /// non-native command errors are left untouched).
+/// Attach a rejected reset to the recovery card that offered it.
+///
+/// Correlation is exact and typed. A `SetSetting` error now carries a value-free
+/// `setting_target`, and only `ResetTycodeManagedProjection` is *this* command's
+/// answer. Nothing else may be read as one:
+///
+/// - **An absent target** is an older host that predates the field. That is the
+///   absence of correlation, not a weak signal in favour of one — inferring "it was
+///   probably ours" is exactly the guess the protocol added this field to remove.
+/// - **`Malformed`** says the payload was not a valid host-setting value at all, so
+///   it identifies no setting.
+/// - **Any other target** — a native save, a legacy backend config, a launch
+///   profile — is a different command that happened to fail while a reset was in
+///   flight.
+///
+/// This used to be a heuristic: *any* `SetSetting` error arriving while a reset was
+/// pending was taken as that reset's answer. A native-settings save failing at the
+/// same moment would have been reported on the recovery card as the reset's refusal
+/// — the wrong message against the wrong action, and, for a non-`Conflict` code,
+/// stripped of the "nothing was deleted" guarantee the user actually needed.
+///
+/// The pending marker still names the **backend**, because the target is
+/// deliberately value-free and carries no `BackendKind`; the dispatch host id names
+/// the host, so a reset refused on one host cannot answer another's.
+///
+/// The refusal is recorded, never acted on. A `Conflict` means the server compared
+/// the tokens against what it holds, found them stale, and **removed nothing** — so
+/// no local state may change on the strength of it.
+fn refuse_managed_projection_reset_on_error(
+    state: &AppState,
+    host_id: &str,
+    payload: &CommandErrorPayload,
+) {
+    if !matches!(payload.request_kind, FrameKind::SetSetting) {
+        return;
+    }
+    if payload.setting_target != Some(HostSettingErrorTarget::ResetTycodeManagedProjection) {
+        return;
+    }
+    let has_pending = state.managed_projection_reset.with_untracked(|by_host| {
+        by_host.get(host_id).is_some_and(|by_kind| {
+            by_kind
+                .values()
+                .any(|reset| matches!(reset, ManagedProjectionResetState::Pending))
+        })
+    });
+    if !has_pending {
+        return;
+    }
+    state.managed_projection_reset.update(|by_host| {
+        if let Some(by_kind) = by_host.get_mut(host_id) {
+            for reset in by_kind.values_mut() {
+                if matches!(reset, ManagedProjectionResetState::Pending) {
+                    *reset = ManagedProjectionResetState::Refused {
+                        code: payload.code,
+                        message: payload.message.clone(),
+                    };
+                }
+            }
+        }
+    });
+}
+
+/// Release an in-flight native-settings save that the server rejected.
+///
+/// Correlation is exact and typed, symmetrically with
+/// `refuse_managed_projection_reset_on_error`: only a `SetSetting` error whose
+/// `setting_target` is `BackendNativeSettings` is *this* save's answer.
+///
+/// It used to match on `request_kind` alone, which is the same heuristic — and the
+/// same bug — in mirror image. A rejected managed-projection **reset** arriving while
+/// a native save was in flight would have failed the save and shown the reset's error
+/// text on the settings page, against a save the server never even refused. A
+/// `Malformed` payload denotes no setting; an absent target is an older host that
+/// cannot correlate at all, which is the absence of a signal rather than a weak one
+/// in favour. Neither may fail a save that is still waiting for its own answer.
+///
+/// (An absent target therefore leaves the save gated. That is the correct trade: a
+/// current server sets the target on *every* `SetSetting` error — `Malformed` when
+/// the payload did not even parse — so the absent case is a host that predates the
+/// field, and guessing on its behalf is exactly what this field exists to stop.)
 fn fail_native_settings_pending_on_error(
     state: &AppState,
     host_id: &str,
     payload: &CommandErrorPayload,
 ) {
     if !matches!(payload.request_kind, FrameKind::SetSetting) {
+        return;
+    }
+    if payload.setting_target != Some(HostSettingErrorTarget::BackendNativeSettings) {
         return;
     }
     let has_pending = state.native_settings_save_state.with_untracked(|states| {
@@ -3894,34 +3994,233 @@ fn apply_agent_closed(state: &AppState, host_id: &str, agent_id: AgentId) {
 
     // active_agent is a Memo over center_zone — closing the chat tabs below
     // drives it to None for this agent.
-    state
-        .center_zone
-        .update(|cz| close_agent_tabs(cz, host_id, &agent_id));
+    let doomed = state.center_zone.with_untracked(|center_zone| {
+        center_zone
+            .all_tabs()
+            .filter(|(_, tab)| {
+                matches!(
+                    &tab.content,
+                    TabContent::Chat { agent_ref: Some(agent_ref), .. }
+                        if agent_ref.host_id == host_id && agent_ref.agent_id == agent_id
+                )
+            })
+            .map(|(_, tab)| tab.id)
+            .collect()
+    });
+    state.close_tabs(doomed);
+    let mut removed_from_memory = HashSet::new();
     state.project_view_memory.update(|memories| {
         for memory in memories.values_mut() {
             if let Some(center_zone) = memory.center_zone.as_mut() {
-                close_agent_tabs(center_zone, host_id, &agent_id);
+                removed_from_memory.extend(close_agent_tabs(center_zone, host_id, &agent_id));
             }
         }
     });
-    // The center_zone update above can remove tab ids that are still in
-    // `tab_lru`. Prune so we don't keep mounting references to vanished
-    // tabs.
-    state.prune_tab_lru();
+    state.forget_removed_tab_occurrence_state(&removed_from_memory);
 }
 
-/// Find a draft chat tab opened against `(host_id, member_id)` and replace its
-/// content with a live `agent_ref`. Searches the current center zone first,
-/// then each stored `project_view_memory` snapshot — a team click that
-/// happened in another project's view still upgrades when the agent finally
-/// spawns. Returns `true` if a tab was upgraded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TabViewLocation {
+    Current {
+        pane: PaneId,
+        tab: TabId,
+    },
+    ProjectMemory {
+        project: ActiveProjectRef,
+        pane: PaneId,
+        tab: TabId,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TabUpgradeResult {
+    Updated,
+    MissingIntent,
+    AmbiguousIntent,
+    ResourceAlreadyOpen,
+}
+
+fn matching_tabs(
+    center_zone: &CenterZoneState,
+    matches: &impl Fn(&TabContent) -> bool,
+) -> Vec<(PaneId, TabId)> {
+    center_zone
+        .all_tabs()
+        .filter(|(_, tab)| matches(&tab.content))
+        .map(|(pane, tab)| (pane, tab.id))
+        .collect()
+}
+
+fn unique_location(
+    mut locations: Vec<TabViewLocation>,
+) -> Result<TabViewLocation, TabUpgradeResult> {
+    match locations.len() {
+        0 => Err(TabUpgradeResult::MissingIntent),
+        1 => locations.pop().ok_or(TabUpgradeResult::MissingIntent),
+        _ => Err(TabUpgradeResult::AmbiguousIntent),
+    }
+}
+
+fn find_unique_tab_for_project(
+    state: &AppState,
+    project: Option<&ActiveProjectRef>,
+    matches: &impl Fn(&TabContent) -> bool,
+) -> Result<TabViewLocation, TabUpgradeResult> {
+    let active_project = state.active_project.get_untracked();
+    let mut locations = Vec::new();
+    if active_project.as_ref() == project {
+        state.center_zone.with_untracked(|center_zone| {
+            locations.extend(
+                matching_tabs(center_zone, matches)
+                    .into_iter()
+                    .map(|(pane, tab)| TabViewLocation::Current { pane, tab }),
+            );
+        });
+    } else if let Some(project) = project {
+        state.project_view_memory.with_untracked(|memories| {
+            if let Some(center_zone) = memories
+                .get(project)
+                .and_then(|memory| memory.center_zone.as_ref())
+            {
+                locations.extend(matching_tabs(center_zone, matches).into_iter().map(
+                    |(pane, tab)| TabViewLocation::ProjectMemory {
+                        project: project.clone(),
+                        pane,
+                        tab,
+                    },
+                ));
+            }
+        });
+    }
+    unique_location(locations)
+}
+
+fn find_unique_tab_across_views(
+    state: &AppState,
+    matches: &impl Fn(&TabContent) -> bool,
+) -> Result<TabViewLocation, TabUpgradeResult> {
+    let active_project = state.active_project.get_untracked();
+    let mut locations = state.center_zone.with_untracked(|center_zone| {
+        matching_tabs(center_zone, matches)
+            .into_iter()
+            .map(|(pane, tab)| TabViewLocation::Current { pane, tab })
+            .collect::<Vec<_>>()
+    });
+    state.project_view_memory.with_untracked(|memories| {
+        for (project, memory) in memories {
+            if active_project.as_ref() == Some(project) {
+                continue;
+            }
+            let Some(center_zone) = memory.center_zone.as_ref() else {
+                continue;
+            };
+            locations.extend(
+                matching_tabs(center_zone, matches)
+                    .into_iter()
+                    .map(|(pane, tab)| TabViewLocation::ProjectMemory {
+                        project: project.clone(),
+                        pane,
+                        tab,
+                    }),
+            );
+        }
+    });
+    unique_location(locations)
+}
+
+fn update_tab_at_location(
+    state: &AppState,
+    location: &TabViewLocation,
+    content: TabContent,
+    label: String,
+) -> bool {
+    match location {
+        TabViewLocation::Current { pane, tab } => {
+            if state
+                .center_zone
+                .with_untracked(|center_zone| center_zone.locate_tab(*tab) == Some(*pane))
+            {
+                state.update_tab(*tab, content, label)
+            } else {
+                false
+            }
+        }
+        TabViewLocation::ProjectMemory { project, pane, tab } => {
+            let mut updated = false;
+            state.project_view_memory.update(|memories| {
+                if let Some(center_zone) = memories
+                    .get_mut(project)
+                    .and_then(|memory| memory.center_zone.as_mut())
+                    && center_zone.locate_tab(*tab) == Some(*pane)
+                {
+                    updated = center_zone.update_tab(*tab, content, label);
+                }
+            });
+            updated
+        }
+    }
+}
+
+fn live_agent_location(
+    state: &AppState,
+    agent_ref: &ActiveAgentRef,
+) -> Result<TabViewLocation, TabUpgradeResult> {
+    let live = TabContent::chat_with_agent(agent_ref.clone());
+    find_unique_tab_across_views(state, &|content| content == &live)
+}
+
+fn apply_tab_upgrade(
+    state: &AppState,
+    location: Result<TabViewLocation, TabUpgradeResult>,
+    agent_ref: &ActiveAgentRef,
+    agent_name: &str,
+) -> TabUpgradeResult {
+    let location = match location {
+        Ok(location) => location,
+        Err(result) => return result,
+    };
+    match live_agent_location(state, agent_ref) {
+        Ok(_) => return TabUpgradeResult::ResourceAlreadyOpen,
+        Err(TabUpgradeResult::MissingIntent) => {}
+        Err(result) => return result,
+    }
+    if update_tab_at_location(
+        state,
+        &location,
+        TabContent::chat_with_agent(agent_ref.clone()),
+        agent_name.to_owned(),
+    ) {
+        TabUpgradeResult::Updated
+    } else {
+        TabUpgradeResult::MissingIntent
+    }
+}
+
+fn upgrade_draft_chat_tab(
+    state: &AppState,
+    project: Option<&ActiveProjectRef>,
+    agent_ref: &ActiveAgentRef,
+    agent_name: &str,
+) -> TabUpgradeResult {
+    let draft = TabContent::empty_chat();
+    apply_tab_upgrade(
+        state,
+        find_unique_tab_for_project(state, project, &|content| content == &draft),
+        agent_ref,
+        agent_name,
+    )
+}
+
+/// Find the one draft chat tab opened against `(host_id, member_id)` and
+/// replace its content with a live `agent_ref` without changing either pane's
+/// selection, pane focus, tab order, or TabId.
 fn upgrade_pending_team_member_tab(
     state: &AppState,
     host_id: &str,
     member_id: &TeamMemberId,
     agent_ref: &ActiveAgentRef,
     agent_name: &str,
-) -> bool {
+) -> TabUpgradeResult {
     let matches_pending = |content: &TabContent| -> bool {
         matches!(
             content,
@@ -3932,64 +4231,42 @@ fn upgrade_pending_team_member_tab(
         )
     };
 
-    let mut upgraded = false;
-    state.center_zone.update(|cz| {
-        if let Some(tab) = cz.tabs.iter_mut().find(|t| matches_pending(&t.content)) {
-            tab.content = TabContent::chat_with_agent(agent_ref.clone());
-            tab.label = agent_name.to_string();
-            cz.active_tab_id = Some(tab.id);
-            upgraded = true;
-        }
-    });
-    if upgraded {
-        return true;
-    }
-    state.project_view_memory.update(|map| {
-        for memory in map.values_mut() {
-            let Some(cz) = memory.center_zone.as_mut() else {
-                continue;
-            };
-            if let Some(tab) = cz.tabs.iter_mut().find(|t| matches_pending(&t.content)) {
-                tab.content = TabContent::chat_with_agent(agent_ref.clone());
-                tab.label = agent_name.to_string();
-                cz.active_tab_id = Some(tab.id);
-                upgraded = true;
-                break;
-            }
-        }
-    });
-    upgraded
+    apply_tab_upgrade(
+        state,
+        find_unique_tab_across_views(state, &|content| matches_pending(content)),
+        agent_ref,
+        agent_name,
+    )
 }
 
 fn close_agent_tabs(
     center_zone: &mut crate::state::CenterZoneState,
     host_id: &str,
     agent_id: &AgentId,
-) {
+) -> HashSet<TabId> {
     let remove_ids: Vec<_> = center_zone
-        .tabs
-        .iter()
-        .filter(|tab| {
+        .all_tabs()
+        .filter(|(_, tab)| {
             matches!(
                 &tab.content,
                 TabContent::Chat { agent_ref: Some(ar), .. }
                     if ar.host_id == host_id && ar.agent_id == *agent_id
             )
         })
-        .map(|tab| tab.id)
+        .map(|(_, tab)| tab.id)
         .collect();
+    let mut removed = HashSet::new();
     for id in remove_ids {
         // Preserve non-closeable tabs (shouldn't exist for chats, but be safe).
-        let closeable = center_zone
-            .tabs
-            .iter()
-            .find(|t| t.id == id)
-            .map(|t| t.closeable)
-            .unwrap_or(true);
+        let closeable = center_zone.tab(id).map(|tab| tab.closeable).unwrap_or(true);
         if closeable {
             center_zone.close(id);
+            if center_zone.tab(id).is_none() {
+                removed.insert(id);
+            }
         }
     }
+    removed
 }
 
 fn rename_agent_tabs(
@@ -3998,7 +4275,7 @@ fn rename_agent_tabs(
     agent_id: &AgentId,
     name: &str,
 ) {
-    for tab in &mut center_zone.tabs {
+    center_zone.for_each_tab_mut(|_, tab| {
         let matches_agent = matches!(
             &tab.content,
             TabContent::Chat {
@@ -4009,7 +4286,7 @@ fn rename_agent_tabs(
         if matches_agent {
             tab.label = name.to_string();
         }
-    }
+    });
 }
 
 fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, envelope: &Envelope) {
@@ -4075,26 +4352,13 @@ fn clear_session_history_loading_for_host(state: &AppState, host_id: &str) {
 fn apply_session_history(
     state: &AppState,
     host_id: &str,
-    stream: &StreamPath,
+    _stream: &StreamPath,
     payload: SessionHistoryPayload,
 ) {
-    let Some(agent_id) = resolve_agent_id(state, host_id, stream) else {
-        log::warn!("session_history on unknown stream {stream}");
-        return;
-    };
-    if payload.agent_id != agent_id {
-        log::error!(
-            "session_history agent mismatch host={} stream={} payload_agent_id={} stream_agent_id={}",
-            host_id,
-            stream,
-            payload.agent_id,
-            agent_id
-        );
-        return;
-    }
+    let agent_id = payload.agent_id.clone();
 
     let mut replay = HistoryReplay::default();
-    for event in payload.events.into_iter().rev() {
+    for event in payload.events {
         replay.apply(event, host_id, &agent_id);
     }
 
@@ -4108,7 +4372,7 @@ fn apply_session_history(
         state.chat_message_rows.update(|map| {
             let agent_index = map.entry(agent_id.clone()).or_default();
             for (message_id, row_id) in replay.message_rows {
-                agent_index.insert(message_id, row_id);
+                agent_index.entry(message_id).or_insert(row_id);
             }
         });
         state.chat_tool_rows.update(|map| {
@@ -4175,6 +4439,59 @@ fn is_root_orchestration_record(record: &OrchestrationRecord) -> bool {
     )
 }
 
+/// Whether `message` declares `tool_call_id` in its own `tool_calls` list.
+///
+/// A `StreamEnd` message carries `tool_calls: Vec<ToolUseData>` — the exact
+/// `tool_call_id`s that message issued. This association comes straight from
+/// the typed payload; it never looks at a tool's *name*.
+fn message_declares_tool_call(message: &protocol::ChatMessage, tool_call_id: &str) -> bool {
+    message
+        .tool_calls
+        .iter()
+        .any(|call| call.id == tool_call_id)
+}
+
+/// The already-materialized row whose message issued this tool call.
+///
+/// **Why this exists.** Claude emits every `ToolRequest` *after* the `StreamEnd`
+/// that declares it (`server/src/backend/claude.rs`: `emit_stream_end(…)` and then
+/// `for tool_call in &phase.tool_calls { emit_tool_request_with_tracking(…) }`, at
+/// :2501-2513 and :5129-5147). The frontend drops the streaming buffer at
+/// `StreamEnd`, so by the time a request arrives its issuing row already exists and
+/// the requests must be attached to it after the fact.
+///
+/// That attachment used to be "whatever row is last". It is correct only while
+/// nothing is pushed between the `StreamEnd` and its requests — and the server does
+/// push something, precisely in the case that matters: when a canonical Tyde payload
+/// fails to normalize, `emit_tool_request` raises a visible `MessageAdded(Error)`
+/// **before** emitting the request (`claude.rs:2241-2248`). The error becomes a new
+/// row, so `last` is no longer the row that issued the call: the tool card was
+/// attached to the error message, and the assistant row that actually made the call
+/// was left with `tool_calls` non-empty and zero tool cards — the empty bubble and
+/// the missing fallback card in QA D1.
+///
+/// Matching on the server-declared `tool_call_id` rather than row position keeps
+/// an interleaved message of any kind from stealing a card.
+/// Searched newest-first: ids are unique per turn and the issuing row is almost
+/// always the last or second-to-last.
+fn chat_row_declaring_tool_call(
+    state: &AppState,
+    agent_id: &AgentId,
+    tool_call_id: &str,
+) -> Option<crate::state::ChatRowHandle> {
+    state.chat_rows.with_untracked(|rows| {
+        rows.get(agent_id)?
+            .iter()
+            .rev()
+            .find(|row| {
+                row.entry.with_untracked(|entry| {
+                    message_declares_tool_call(&entry.message, tool_call_id)
+                })
+            })
+            .cloned()
+    })
+}
+
 #[derive(Default)]
 struct HistoryReplay {
     rows: Vec<crate::state::ChatRowHandle>,
@@ -4212,12 +4529,10 @@ impl HistoryReplay {
                 });
             }
             ChatEvent::StreamEnd(data) => {
-                if history_message_has_renderable_content(&data.message) {
-                    self.push_entry(ChatMessageEntry {
-                        message: data.message,
-                        tool_requests: Vec::new(),
-                    });
-                }
+                self.push_entry(ChatMessageEntry {
+                    message: present_completed_message(data.message, false),
+                    tool_requests: Vec::new(),
+                });
             }
             ChatEvent::ToolRequest(request) => {
                 let tool_name = request.tool_name.clone();
@@ -4226,7 +4541,22 @@ impl HistoryReplay {
                     request,
                     result: None,
                 };
-                if let Some(row) = self.rows.last() {
+                // Replay sees the same event order as the live stream — including the
+                // `MessageAdded(Error)` a failed normalization pushes between the
+                // `StreamEnd` and its request — so it needs the same identity-based
+                // attachment, or a reloaded transcript would misplace the card the
+                // live session placed correctly.
+                let row = self
+                    .rows
+                    .iter()
+                    .rev()
+                    .find(|row| {
+                        row.entry.with_untracked(|entry| {
+                            message_declares_tool_call(&entry.message, &tool_call_id)
+                        })
+                    })
+                    .or_else(|| self.rows.last());
+                if let Some(row) = row {
                     row.entry.update(|entry| {
                         entry.tool_requests.push(tool_entry);
                     });
@@ -4293,7 +4623,7 @@ impl HistoryReplay {
             )
         });
         if let Some(message_id) = message_id {
-            self.message_rows.insert(message_id, handle.id);
+            self.message_rows.entry(message_id).or_insert(handle.id);
         }
         for tool_call_id in tool_call_ids {
             self.tool_rows.insert(ToolCallId(tool_call_id), handle.id);
@@ -4313,6 +4643,18 @@ fn history_message_has_renderable_content(message: &protocol::ChatMessage) -> bo
             .images
             .as_ref()
             .is_some_and(|images| !images.is_empty())
+}
+
+const EMPTY_RESPONSE_PLACEHOLDER: &str = "_Empty response._";
+
+fn present_completed_message(
+    mut message: protocol::ChatMessage,
+    has_attached_tools: bool,
+) -> protocol::ChatMessage {
+    if !history_message_has_renderable_content(&message) && !has_attached_tools {
+        message.content = EMPTY_RESPONSE_PLACEHOLDER.to_owned();
+    }
+    message
 }
 
 /// Apply an already-parsed `ChatEvent` to the per-agent state.
@@ -4411,16 +4753,11 @@ pub fn apply_chat_event(state: &AppState, host_id: &str, agent_id: &AgentId, eve
                 data.message_id,
                 data.text.len()
             );
-            // Pull out only the text-signal handle, not the entire
-            // StreamingState — cloning the latter copies the
-            // `agent_name`/`model` Strings on every delta. With ~50
-            // deltas/sec from a fast model that's a steady drip of
-            // small allocations the GC has to manage.
-            let text_signal = state
+            if let Some(streaming) = state
                 .streaming_text
-                .with_untracked(|map| map.get(&agent_id).map(|s| s.text.clone()));
-            if let Some(text_signal) = text_signal {
-                text_signal.update(|text| text.push_str(&data.text));
+                .with_untracked(|map| map.get(&agent_id).cloned())
+            {
+                streaming.text.update(|text| text.push_str(&data.text));
             }
         }
         ChatEvent::StreamReasoningDelta(data) => {
@@ -4431,11 +4768,13 @@ pub fn apply_chat_event(state: &AppState, host_id: &str, agent_id: &AgentId, eve
                 data.message_id,
                 data.text.len()
             );
-            let reasoning_signal = state
+            if let Some(streaming) = state
                 .streaming_text
-                .with_untracked(|map| map.get(&agent_id).map(|s| s.reasoning.clone()));
-            if let Some(reasoning_signal) = reasoning_signal {
-                reasoning_signal.update(|reasoning| reasoning.push_str(&data.text));
+                .with_untracked(|map| map.get(&agent_id).cloned())
+            {
+                streaming
+                    .reasoning
+                    .update(|reasoning| reasoning.push_str(&data.text));
             }
         }
         ChatEvent::StreamEnd(data) => {
@@ -4449,40 +4788,24 @@ pub fn apply_chat_event(state: &AppState, host_id: &str, agent_id: &AgentId, eve
             // Read the stream's tool_requests without cloning the
             // surrounding StreamingState (which carries `agent_name`
             // and `model` strings we don't need here).
-            let tool_requests = state
+            let active_stream = state
                 .streaming_text
-                .with_untracked(|map| {
-                    map.get(&agent_id).map(|s| {
-                        s.tool_requests.with_untracked(|tools| {
-                            tools
-                                .iter()
-                                .map(|tool| tool.entry.get_untracked())
-                                .collect::<Vec<_>>()
-                        })
+                .with_untracked(|map| map.get(&agent_id).cloned());
+            let tool_requests = active_stream
+                .map(|streaming| {
+                    streaming.tool_requests.with_untracked(|tools| {
+                        tools
+                            .iter()
+                            .map(|tool| tool.entry.get_untracked())
+                            .collect::<Vec<_>>()
                     })
                 })
                 .unwrap_or_default();
             state.streaming_text.update(|map| {
                 map.remove(&agent_id);
             });
-            let has_renderable_content = !data.message.content.trim().is_empty()
-                || data
-                    .message
-                    .reasoning
-                    .as_ref()
-                    .is_some_and(|reasoning| !reasoning.text.trim().is_empty())
-                || !data.message.tool_calls.is_empty()
-                || data
-                    .message
-                    .images
-                    .as_ref()
-                    .is_some_and(|images| !images.is_empty())
-                || !tool_requests.is_empty();
-            if !has_renderable_content {
-                return;
-            }
             let entry = ChatMessageEntry {
-                message: data.message,
+                message: present_completed_message(data.message, !tool_requests.is_empty()),
                 tool_requests,
             };
             state.push_chat_entry(agent_id.clone(), entry);
@@ -4513,7 +4836,16 @@ pub fn apply_chat_event(state: &AppState, host_id: &str, agent_id: &AgentId, eve
                 });
                 return;
             }
-            if let Some(row) = state.last_chat_row_untracked(&agent_id) {
+            // Attach to the row whose message *declared* this call, falling back to
+            // the last row only when no row claims it (backends that don't populate
+            // `tool_calls` — the mock among them — still land where they always did).
+            // Position alone is not enough: the server pushes a visible
+            // `MessageAdded(Error)` between the `StreamEnd` and the request when a
+            // canonical payload fails to normalize, and "last row" then means the
+            // error row rather than the row that made the call.
+            let row = chat_row_declaring_tool_call(state, &agent_id, &tool_call_id)
+                .or_else(|| state.last_chat_row_untracked(&agent_id));
+            if let Some(row) = row {
                 row.entry.update(|entry| {
                     entry.tool_requests.push(tool_entry);
                 });
@@ -5254,7 +5586,145 @@ fn apply_terminal_bootstrap(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::{FileEntryOp, ProjectFileEntry, ProjectFileKind, ProjectRootPath};
+    use protocol::{
+        FileEntryOp, ProjectFileEntry, ProjectFileKind, ProjectFileVersion, ProjectRootPath,
+    };
+
+    fn install_code_intel_source(
+        state: &AppState,
+        host_id: &str,
+        project_id: &ProjectId,
+    ) -> (crate::state::TabId, FileResourceKey) {
+        let path = ProjectPath {
+            root: ProjectRootPath("/repo".to_owned()),
+            relative_path: "src/main.rs".to_owned(),
+        };
+        let key = FileResourceKey {
+            host_id: host_id.to_owned(),
+            project_id: project_id.clone(),
+            path: path.clone(),
+        };
+        state.open_files.update(|files| {
+            files.insert(
+                key.clone(),
+                OpenFile {
+                    path: path.clone(),
+                    version: ProjectFileVersion(1),
+                    contents: Some("fn main() {}".to_owned()),
+                    is_binary: false,
+                },
+            );
+        });
+        state.code_intel.update(|files| {
+            files
+                .entry(CodeIntelKey {
+                    host_id: host_id.to_owned(),
+                    project_id: project_id.clone(),
+                    path,
+                })
+                .or_default()
+                .set_rendered_version(ProjectFileVersion(1));
+        });
+        let tab = state
+            .open_tab_in(
+                crate::state::PaneId::Primary,
+                TabContent::File { key: key.clone() },
+                "main.rs".to_owned(),
+                true,
+            )
+            .expect("source occurrence");
+        (tab, key)
+    }
+
+    #[test]
+    fn hover_result_uses_seeded_occurrence_without_active_project_lookup() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let project_id = ProjectId("project".to_owned());
+            let (tab, key) = install_code_intel_source(&state, "host", &project_id);
+            state.code_intel_active_hover.set(7);
+            state.code_intel_hover.set(Some(crate::state::HoverPopover {
+                hover_id: 7,
+                tab,
+                key: key.clone(),
+                version: ProjectFileVersion(1),
+                offset: 3,
+                anchor_left: 1.0,
+                anchor_top: 2.0,
+                anchor_bottom: 3.0,
+                contents: None,
+            }));
+
+            apply_code_intel_hover_result(
+                &state,
+                "other-host",
+                project_id.clone(),
+                CodeIntelHoverResultPayload {
+                    hover_id: 7,
+                    path: key.path.clone(),
+                    version: ProjectFileVersion(1),
+                    contents: Some("wrong".to_owned()),
+                    range: None,
+                },
+            );
+            assert_eq!(
+                state
+                    .code_intel_hover
+                    .with_untracked(|hover| hover.as_ref()?.contents.clone()),
+                None
+            );
+
+            apply_code_intel_hover_result(
+                &state,
+                "host",
+                project_id,
+                CodeIntelHoverResultPayload {
+                    hover_id: 7,
+                    path: key.path,
+                    version: ProjectFileVersion(1),
+                    contents: Some("exact".to_owned()),
+                    range: None,
+                },
+            );
+            assert_eq!(
+                state
+                    .code_intel_hover
+                    .with_untracked(|hover| hover.as_ref()?.contents.clone()),
+                Some("exact".to_owned())
+            );
+        });
+    }
+
+    #[test]
+    fn references_context_is_bound_to_exact_initiating_resource() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let project_id = ProjectId("project".to_owned());
+            let (tab, key) = install_code_intel_source(&state, "host", &project_id);
+            let references = ProjectReferencesUiState {
+                source_tab: Some(tab),
+                source_key: Some(key.clone()),
+                source_version: Some(ProjectFileVersion(1)),
+                active_references_id: 9,
+                ..Default::default()
+            };
+
+            assert!(references_context_matches(
+                &references,
+                "host",
+                &project_id,
+                9
+            ));
+            assert!(!references_context_matches(
+                &references,
+                "host",
+                &ProjectId("other".to_owned()),
+                9
+            ));
+        });
+    }
 
     fn file_entry(relative_path: &str, op: FileEntryOp) -> ProjectFileEntry {
         ProjectFileEntry {
@@ -5496,6 +5966,297 @@ mod tests {
         assert_eq!(roots[1].entries[0].relative_path, "same.txt");
     }
 
+    // ── Tool cards attach to the message that issued them ────────────────
+    //
+    // Claude emits `StreamEnd` (whose message declares its `tool_calls`) and
+    // *then* the `ToolRequest`s (`server/src/backend/claude.rs:2501-2513`,
+    // `:5129-5147`). The frontend drops the streaming buffer at `StreamEnd`, so
+    // requests are attached to an existing row after the fact.
+    //
+    // When a canonical Tyde payload fails to normalize, `emit_tool_request` raises
+    // a visible `MessageAdded(Error)` **before** emitting the request
+    // (`claude.rs:2241-2248`). That error becomes a new row — so attaching by
+    // "last row" put the tool card on the *error* message and left the assistant
+    // row that made the call with `tool_calls` non-empty and zero tool cards. That
+    // is QA D1: the empty assistant bubble and the missing fallback card.
+
+    fn tool_use(id: &str, name: &str) -> protocol::ToolUseData {
+        protocol::ToolUseData {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            arguments: serde_json::json!({}),
+        }
+    }
+
+    fn assistant_message_with_tool_calls(
+        content: &str,
+        tool_calls: Vec<protocol::ToolUseData>,
+    ) -> protocol::ChatMessage {
+        protocol::ChatMessage {
+            message_id: None,
+            timestamp: 1,
+            sender: protocol::MessageSender::Assistant {
+                agent: "claude".to_owned(),
+            },
+            content: content.to_owned(),
+            reasoning: None,
+            tool_calls,
+            model_info: None,
+            token_usage: None,
+            context_breakdown: None,
+            images: None,
+        }
+    }
+
+    fn error_message(content: &str) -> protocol::ChatMessage {
+        protocol::ChatMessage {
+            message_id: None,
+            timestamp: 2,
+            sender: protocol::MessageSender::Error,
+            content: content.to_owned(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            model_info: None,
+            token_usage: None,
+            context_breakdown: None,
+            images: None,
+        }
+    }
+
+    fn tool_request(tool_call_id: &str, tool_name: &str) -> ChatEvent {
+        ChatEvent::ToolRequest(protocol::ToolRequest {
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: tool_name.to_owned(),
+            tool_type: protocol::ToolRequestType::Other {
+                args: serde_json::json!({ "tool": tool_name }),
+            },
+        })
+    }
+
+    /// Row tool-call ids, in row order.
+    fn rows_tool_call_ids(state: &AppState, agent_id: &AgentId) -> Vec<Vec<String>> {
+        state.chat_rows.with_untracked(|map| {
+            map.get(agent_id)
+                .map(|rows| {
+                    rows.iter()
+                        .map(|row| {
+                            row.entry.with_untracked(|entry| {
+                                entry
+                                    .tool_requests
+                                    .iter()
+                                    .map(|tool| tool.request.tool_call_id.clone())
+                                    .collect::<Vec<_>>()
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+    }
+
+    /// Regression lock for QA D1. An error message pushed between the `StreamEnd`
+    /// and its `ToolRequest` must not steal the tool card: the card belongs to the
+    /// assistant message that declared the call.
+    #[test]
+    fn malformed_call_tool_card_attaches_to_the_issuing_message_not_the_error_row() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let agent_id = AgentId("a-malformed".to_owned());
+
+            // The assistant turn declares the call it is about to issue.
+            apply_chat_event(
+                &state,
+                "host-1",
+                &agent_id,
+                ChatEvent::StreamEnd(protocol::StreamEndData {
+                    message: assistant_message_with_tool_calls(
+                        "",
+                        vec![tool_use("toolu_send_3", "tyde_send_agent_message")],
+                    ),
+                }),
+            );
+
+            // Normalization fails: the backend raises a visible error message …
+            apply_chat_event(
+                &state,
+                "host-1",
+                &agent_id,
+                ChatEvent::MessageAdded(error_message(
+                    "Failed to normalize canonical tool request 'tyde_send_agent_message'",
+                )),
+            );
+
+            // … and only then emits the request, as the raw `Other` fallback.
+            apply_chat_event(
+                &state,
+                "host-1",
+                &agent_id,
+                tool_request("toolu_send_3", "tyde_send_agent_message"),
+            );
+
+            let rows = rows_tool_call_ids(&state, &agent_id);
+            assert_eq!(rows.len(), 2, "assistant row + error row");
+            assert_eq!(
+                rows[0],
+                vec!["toolu_send_3".to_owned()],
+                "the card belongs to the assistant message that declared the call — \
+                 not to whatever row happened to be last"
+            );
+            assert!(
+                rows[1].is_empty(),
+                "the error message must not adopt the tool card"
+            );
+
+            // The error itself stays visible — that half was never broken.
+            let error_visible = state.chat_rows.with_untracked(|map| {
+                map.get(&agent_id).is_some_and(|rows| {
+                    rows.iter().any(|row| {
+                        row.entry.with_untracked(|entry| {
+                            matches!(entry.message.sender, protocol::MessageSender::Error)
+                                && entry.message.content.contains("Failed to normalize")
+                        })
+                    })
+                })
+            });
+            assert!(error_visible, "the typed diagnostic remains visible");
+        });
+    }
+
+    /// The completion must follow the request onto the same row, so the card can
+    /// render its result rather than being indexed to the error row.
+    #[test]
+    fn malformed_call_completion_lands_on_the_issuing_row() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let agent_id = AgentId("a-malformed-result".to_owned());
+
+            apply_chat_event(
+                &state,
+                "host-1",
+                &agent_id,
+                ChatEvent::StreamEnd(protocol::StreamEndData {
+                    message: assistant_message_with_tool_calls(
+                        "",
+                        vec![tool_use("toolu_send_3", "tyde_send_agent_message")],
+                    ),
+                }),
+            );
+            apply_chat_event(
+                &state,
+                "host-1",
+                &agent_id,
+                ChatEvent::MessageAdded(error_message("Failed to normalize")),
+            );
+            apply_chat_event(
+                &state,
+                "host-1",
+                &agent_id,
+                tool_request("toolu_send_3", "tyde_send_agent_message"),
+            );
+            apply_chat_event(
+                &state,
+                "host-1",
+                &agent_id,
+                ChatEvent::ToolExecutionCompleted(protocol::ToolExecutionCompletedData {
+                    tool_call_id: "toolu_send_3".to_owned(),
+                    tool_name: "tyde_send_agent_message".to_owned(),
+                    tool_result: protocol::ToolExecutionResult::TydeSendAgentMessage,
+                    success: true,
+                    error: None,
+                    normalization_failure: Some(
+                        protocol::ToolExecutionNormalizationFailure::CanonicalRequest,
+                    ),
+                }),
+            );
+
+            let has_result = state.chat_rows.with_untracked(|map| {
+                map.get(&agent_id).and_then(|rows| {
+                    rows.first().map(|row| {
+                        row.entry.with_untracked(|entry| {
+                            entry
+                                .tool_requests
+                                .first()
+                                .is_some_and(|tool| tool.result.is_some())
+                        })
+                    })
+                })
+            });
+            assert_eq!(
+                has_result,
+                Some(true),
+                "the completion pairs with the request on the issuing row, so the card \
+                 can render the malformed payload alongside its typed result"
+            );
+        });
+    }
+
+    /// Ordinary turns are untouched: several calls declared by one message all land
+    /// on it, in emission order.
+    #[test]
+    fn well_formed_calls_all_attach_to_their_issuing_message_in_order() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let agent_id = AgentId("a-normal".to_owned());
+
+            apply_chat_event(
+                &state,
+                "host-1",
+                &agent_id,
+                ChatEvent::StreamEnd(protocol::StreamEndData {
+                    message: assistant_message_with_tool_calls(
+                        "working",
+                        vec![tool_use("toolu_1", "Read"), tool_use("toolu_2", "Grep")],
+                    ),
+                }),
+            );
+            apply_chat_event(&state, "host-1", &agent_id, tool_request("toolu_1", "Read"));
+            apply_chat_event(&state, "host-1", &agent_id, tool_request("toolu_2", "Grep"));
+
+            assert_eq!(
+                rows_tool_call_ids(&state, &agent_id),
+                vec![vec!["toolu_1".to_owned(), "toolu_2".to_owned()]],
+                "both cards attach to their issuing message, in emission order"
+            );
+        });
+    }
+
+    /// A backend that does not declare `tool_calls` on its message (the mock, and
+    /// any backend that streams tools without listing them) keeps the previous
+    /// last-row behavior. The fix adds an identity match; it does not remove the
+    /// positional fallback.
+    #[test]
+    fn undeclared_tool_call_still_falls_back_to_the_last_row() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let agent_id = AgentId("a-undeclared".to_owned());
+
+            apply_chat_event(
+                &state,
+                "host-1",
+                &agent_id,
+                ChatEvent::StreamEnd(protocol::StreamEndData {
+                    message: assistant_message_with_tool_calls("no declarations", Vec::new()),
+                }),
+            );
+            apply_chat_event(
+                &state,
+                "host-1",
+                &agent_id,
+                tool_request("toolu_x", "SomeTool"),
+            );
+
+            assert_eq!(
+                rows_tool_call_ids(&state, &agent_id),
+                vec![vec!["toolu_x".to_owned()]],
+                "an undeclared call still lands on the last row"
+            );
+        });
+    }
+
     #[test]
     fn stream_end_then_metadata_updated_patches_existing_row() {
         let owner = leptos::reactive::owner::Owner::new();
@@ -5633,7 +6394,7 @@ mod tests {
 
             let message =
                 |content: String, sender: protocol::MessageSender| protocol::ChatMessage {
-                    message_id: None,
+                    message_id: Some(protocol::ChatMessageId("midturn-message".to_owned())),
                     timestamp: 0,
                     sender,
                     content,
@@ -5813,8 +6574,8 @@ mod tests {
             assert_eq!(
                 contents,
                 vec![
-                    "older row 1".to_owned(),
                     "older row 2".to_owned(),
+                    "older row 1".to_owned(),
                     "live row".to_owned()
                 ]
             );
@@ -5823,6 +6584,62 @@ mod tests {
                     .session_history
                     .with_untracked(|map| !map.contains_key(&agent_id)),
                 "final page should remove the load-older affordance"
+            );
+        });
+    }
+
+    #[test]
+    fn session_history_uses_payload_owner_and_server_order() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let payload_agent = AgentId("payload-agent".to_owned());
+            let message = |id: &str, content: &str| protocol::ChatMessage {
+                message_id: Some(protocol::ChatMessageId(id.to_owned())),
+                timestamp: 0,
+                sender: protocol::MessageSender::Assistant {
+                    agent: "History Agent".to_owned(),
+                },
+                content: content.to_owned(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            };
+
+            apply_session_history(
+                &state,
+                "history-host",
+                &StreamPath("/agent/different-stream-owner/inst".to_owned()),
+                SessionHistoryPayload {
+                    agent_id: payload_agent.clone(),
+                    events: vec![
+                        ChatEvent::MessageAdded(message("first", "first delivered")),
+                        ChatEvent::MessageAdded(message("second", "second delivered")),
+                    ],
+                    has_more_before: false,
+                    oldest_seq: None,
+                },
+            );
+
+            let rows = state
+                .chat_rows
+                .with_untracked(|map| map.get(&payload_agent).cloned())
+                .expect("payload-owned history rows");
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.entry.get_untracked().message.content)
+                    .collect::<Vec<_>>(),
+                vec!["first delivered".to_owned(), "second delivered".to_owned()]
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter_map(|row| row.entry.get_untracked().message.message_id)
+                    .map(|id| id.0)
+                    .collect::<Vec<_>>(),
+                vec!["first".to_owned(), "second".to_owned()]
             );
         });
     }
@@ -5847,7 +6664,11 @@ mod tests {
             );
             state.open_files.update(|files| {
                 files.insert(
-                    path.clone(),
+                    FileResourceKey {
+                        host_id: host_id.to_owned(),
+                        project_id: project_id.clone(),
+                        path: path.clone(),
+                    },
                     OpenFile {
                         path: path.clone(),
                         version: protocol::ProjectFileVersion(1),
@@ -5942,6 +6763,477 @@ mod tests {
         assert!(root_a.entries.is_empty());
         assert_eq!(root_b.entries[0].relative_path, "same.txt");
     }
+
+    fn new_agent_envelope(
+        host_id: &str,
+        agent_id: &str,
+        name: &str,
+        project_id: Option<ProjectId>,
+        team_member_id: Option<TeamMemberId>,
+    ) -> Envelope {
+        let origin = if team_member_id.is_some() {
+            AgentOrigin::TeamMember
+        } else {
+            AgentOrigin::User
+        };
+        let team_id = team_member_id
+            .as_ref()
+            .map(|_| protocol::TeamId("fixture-team".to_owned()));
+        Envelope::from_payload(
+            StreamPath(format!("/host/{host_id}")),
+            FrameKind::NewAgent,
+            0,
+            &NewAgentPayload {
+                agent_id: AgentId(agent_id.to_owned()),
+                name: name.to_owned(),
+                origin,
+                backend_kind: protocol::BackendKind::Claude,
+                launch_profile_id: None,
+                workspace_roots: Vec::new(),
+                custom_agent_id: None,
+                team_id,
+                team_member_id,
+                project_id,
+                parent_agent_id: None,
+                session_id: None,
+                workflow: None,
+                created_at_ms: 1,
+                instance_stream: StreamPath(format!("/agent/{agent_id}/instance")),
+                activity_summary: Default::default(),
+            },
+        )
+        .expect("synthetic NewAgent")
+    }
+
+    type PaneSelectionSnapshot = (PaneId, Option<TabId>, Vec<TabId>);
+    type CenterSelectionSnapshot = (PaneId, Vec<PaneSelectionSnapshot>);
+
+    fn center_selection_snapshot(center_zone: &CenterZoneState) -> CenterSelectionSnapshot {
+        (
+            center_zone.focused_id(),
+            center_zone
+                .panes()
+                .map(|(pane, state)| {
+                    (
+                        pane,
+                        state.active_tab_id,
+                        state.tabs.iter().map(|tab| tab.id).collect(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn agent_closed_cleans_exact_current_and_remembered_occurrence_state() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host_id = "agent-close-host";
+            let agent_id = AgentId("closed-agent".to_owned());
+            let agent_ref = ActiveAgentRef {
+                host_id: host_id.to_owned(),
+                agent_id: agent_id.clone(),
+            };
+            let current_survivor = state
+                .center_zone
+                .with_untracked(|center_zone| center_zone.active_tab_id())
+                .expect("current home tab");
+            let current_removed = state
+                .center_zone
+                .try_update(|center_zone| {
+                    center_zone.open(
+                        TabContent::chat_with_agent(agent_ref.clone()),
+                        "Current agent".to_owned(),
+                        true,
+                    )
+                })
+                .expect("current agent tab");
+
+            let mut remembered_center = CenterZoneState::default();
+            let remembered_survivor = remembered_center
+                .active_tab_id()
+                .expect("remembered home tab");
+            let remembered_removed = remembered_center.open(
+                TabContent::chat_with_agent(agent_ref),
+                "Remembered agent".to_owned(),
+                true,
+            );
+            let remembered_project = ActiveProjectRef {
+                host_id: host_id.to_owned(),
+                project_id: ProjectId("remembered-project".to_owned()),
+            };
+            state.project_view_memory.update(|memories| {
+                memories.insert(
+                    remembered_project.clone(),
+                    crate::state::ProjectViewMemory {
+                        center_zone: Some(remembered_center),
+                        ..Default::default()
+                    },
+                );
+            });
+
+            state.tab_lru.set(vec![
+                current_removed,
+                remembered_removed,
+                current_survivor,
+                remembered_survivor,
+            ]);
+            for (tab, scroll_top) in [
+                (current_removed, 10),
+                (remembered_removed, 20),
+                (current_survivor, 30),
+                (remembered_survivor, 40),
+            ] {
+                state.save_tab_scroll_state(
+                    tab,
+                    crate::state::TabScrollState {
+                        scroll_top,
+                        scroll_height: 100,
+                        client_height: 20,
+                        user_scrolled_up: true,
+                    },
+                );
+            }
+
+            apply_agent_closed(&state, host_id, agent_id);
+
+            assert!(
+                state
+                    .center_zone
+                    .with_untracked(|center_zone| center_zone.tab(current_removed).is_none())
+            );
+            assert!(state.project_view_memory.with_untracked(|memories| {
+                memories
+                    .get(&remembered_project)
+                    .and_then(|memory| memory.center_zone.as_ref())
+                    .is_some_and(|center_zone| {
+                        center_zone.tab(remembered_removed).is_none()
+                            && center_zone.tab(remembered_survivor).is_some()
+                    })
+            }));
+            assert_eq!(
+                state.tab_lru.get_untracked(),
+                vec![current_survivor, remembered_survivor]
+            );
+            assert_eq!(state.tab_scroll_state_untracked(current_removed), None);
+            assert_eq!(state.tab_scroll_state_untracked(remembered_removed), None);
+            assert_eq!(
+                state
+                    .tab_scroll_state_untracked(current_survivor)
+                    .map(|scroll| scroll.scroll_top),
+                Some(30)
+            );
+            assert_eq!(
+                state
+                    .tab_scroll_state_untracked(remembered_survivor)
+                    .map(|scroll| scroll.scroll_top),
+                Some(40)
+            );
+        });
+    }
+
+    #[test]
+    fn server_driven_tab_upgrade_does_not_move_pane_focus() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host_id = "upgrade-focus-host";
+            let project_id = ProjectId("upgrade-focus-project".to_owned());
+            prime_host_for_tests(&state, host_id);
+            state.active_project.set(Some(ActiveProjectRef {
+                host_id: host_id.to_owned(),
+                project_id: project_id.clone(),
+            }));
+            let (file, _) = install_code_intel_source(&state, host_id, &project_id);
+            let draft = state
+                .open_tab_in(
+                    PaneId::Secondary,
+                    TabContent::empty_chat(),
+                    "New Chat".to_owned(),
+                    true,
+                )
+                .expect("draft opens in the other pane");
+            assert!(state.reveal_tab(file));
+            let before = state.center_zone.with_untracked(center_selection_snapshot);
+
+            dispatch_envelope(
+                &state,
+                host_id,
+                new_agent_envelope(
+                    host_id,
+                    "draft-agent",
+                    "Draft Agent",
+                    Some(project_id),
+                    None,
+                ),
+            );
+
+            assert_eq!(
+                state.center_zone.with_untracked(center_selection_snapshot),
+                before,
+                "a server upgrade preserves both selections, pane focus, and strip order"
+            );
+            state.center_zone.with_untracked(|center_zone| {
+                let tab = center_zone.tab(draft).expect("same draft TabId remains");
+                assert_eq!(tab.label, "Draft Agent");
+                assert_eq!(
+                    tab.content,
+                    TabContent::chat_with_agent(ActiveAgentRef {
+                        host_id: host_id.to_owned(),
+                        agent_id: AgentId("draft-agent".to_owned()),
+                    })
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn team_member_upgrade_does_not_move_pane_focus() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host_id = "team-upgrade-focus-host";
+            let project_id = ProjectId("team-upgrade-focus-project".to_owned());
+            let member_id = TeamMemberId("member".to_owned());
+            prime_host_for_tests(&state, host_id);
+            state.active_project.set(Some(ActiveProjectRef {
+                host_id: host_id.to_owned(),
+                project_id: project_id.clone(),
+            }));
+            let (file, _) = install_code_intel_source(&state, host_id, &project_id);
+            let pending = state
+                .open_tab_in(
+                    PaneId::Secondary,
+                    TabContent::team_member_draft(host_id.to_owned(), member_id.clone()),
+                    "Pending".to_owned(),
+                    true,
+                )
+                .expect("pending team member opens in the other pane");
+            assert!(state.reveal_tab(file));
+            let before = state.center_zone.with_untracked(center_selection_snapshot);
+
+            let envelope = new_agent_envelope(
+                host_id,
+                "team-agent",
+                "Team Agent",
+                Some(project_id),
+                Some(member_id.clone()),
+            );
+            let payload = envelope
+                .parse_payload::<NewAgentPayload>()
+                .expect("valid team-member NewAgent fixture");
+            assert_eq!(payload.origin, AgentOrigin::TeamMember);
+            assert!(payload.team_id.is_some());
+            assert_eq!(payload.team_member_id, Some(member_id));
+            dispatch_envelope(&state, host_id, envelope);
+
+            assert_eq!(
+                state.center_zone.with_untracked(center_selection_snapshot),
+                before
+            );
+            state.center_zone.with_untracked(|center_zone| {
+                let tab = center_zone
+                    .tab(pending)
+                    .expect("same pending TabId remains");
+                assert_eq!(tab.label, "Team Agent");
+                assert_eq!(
+                    tab.content,
+                    TabContent::chat_with_agent(ActiveAgentRef {
+                        host_id: host_id.to_owned(),
+                        agent_id: AgentId("team-agent".to_owned()),
+                    })
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn new_agent_without_exact_draft_intent_opens_no_tab() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host_id = "missing-draft-host";
+            let project_id = ProjectId("missing-draft-project".to_owned());
+            prime_host_for_tests(&state, host_id);
+            state.active_project.set(Some(ActiveProjectRef {
+                host_id: host_id.to_owned(),
+                project_id: project_id.clone(),
+            }));
+            install_code_intel_source(&state, host_id, &project_id);
+            let before = state.center_zone.with_untracked(center_selection_snapshot);
+
+            dispatch_envelope(
+                &state,
+                host_id,
+                new_agent_envelope(
+                    host_id,
+                    "unmatched-agent",
+                    "Unmatched Agent",
+                    Some(project_id),
+                    None,
+                ),
+            );
+
+            assert_eq!(
+                state.center_zone.with_untracked(center_selection_snapshot),
+                before,
+                "a server echo with no exact pending intent must not guess or open a tab"
+            );
+        });
+    }
+
+    #[test]
+    fn inactive_project_draft_upgrade_mutates_same_tab_without_selection_changes() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host_id = "inactive-upgrade-host";
+            let active_project = ActiveProjectRef {
+                host_id: host_id.to_owned(),
+                project_id: ProjectId("active-project".to_owned()),
+            };
+            let inactive_project = ActiveProjectRef {
+                host_id: host_id.to_owned(),
+                project_id: ProjectId("inactive-project".to_owned()),
+            };
+            prime_host_for_tests(&state, host_id);
+            state.active_project.set(Some(active_project));
+
+            let mut remembered_center = CenterZoneState::default();
+            let draft =
+                remembered_center.open(TabContent::empty_chat(), "New Chat".to_owned(), true);
+            remembered_center.open_in(
+                PaneId::Secondary,
+                TabContent::AgentMonitor,
+                "Agents".to_owned(),
+                true,
+                crate::state::SplitRatio::default(),
+            );
+            let before_memory = center_selection_snapshot(&remembered_center);
+            let before_current = state.center_zone.with_untracked(center_selection_snapshot);
+            state.project_view_memory.update(|memories| {
+                memories.insert(
+                    inactive_project.clone(),
+                    crate::state::ProjectViewMemory {
+                        center_zone: Some(remembered_center),
+                        ..Default::default()
+                    },
+                );
+            });
+
+            dispatch_envelope(
+                &state,
+                host_id,
+                new_agent_envelope(
+                    host_id,
+                    "inactive-agent",
+                    "Inactive Agent",
+                    Some(inactive_project.project_id.clone()),
+                    None,
+                ),
+            );
+
+            assert_eq!(
+                state.center_zone.with_untracked(center_selection_snapshot),
+                before_current,
+                "upgrading inactive memory must not alter the rendered project"
+            );
+            state.project_view_memory.with_untracked(|memories| {
+                let center_zone = memories
+                    .get(&inactive_project)
+                    .and_then(|memory| memory.center_zone.as_ref())
+                    .expect("inactive center memory");
+                assert_eq!(center_selection_snapshot(center_zone), before_memory);
+                let tab = center_zone
+                    .tab(draft)
+                    .expect("same remembered TabId remains");
+                assert_eq!(tab.label, "Inactive Agent");
+                assert_eq!(
+                    tab.content,
+                    TabContent::chat_with_agent(ActiveAgentRef {
+                        host_id: host_id.to_owned(),
+                        agent_id: AgentId("inactive-agent".to_owned()),
+                    })
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn ambiguous_team_member_intent_is_not_guessed() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host_id = "ambiguous-team-host";
+            let member_id = TeamMemberId("member".to_owned());
+            let active_project = ActiveProjectRef {
+                host_id: host_id.to_owned(),
+                project_id: ProjectId("active".to_owned()),
+            };
+            let inactive_project = ActiveProjectRef {
+                host_id: host_id.to_owned(),
+                project_id: ProjectId("inactive".to_owned()),
+            };
+            prime_host_for_tests(&state, host_id);
+            state.active_project.set(Some(active_project));
+            let current = state
+                .open_tab_in(
+                    PaneId::Primary,
+                    TabContent::team_member_draft(host_id.to_owned(), member_id.clone()),
+                    "Current pending".to_owned(),
+                    true,
+                )
+                .expect("current pending tab");
+            let mut remembered_center = CenterZoneState::default();
+            let remembered = remembered_center.open(
+                TabContent::team_member_draft(host_id.to_owned(), member_id.clone()),
+                "Remembered pending".to_owned(),
+                true,
+            );
+            state.project_view_memory.update(|memories| {
+                memories.insert(
+                    inactive_project.clone(),
+                    crate::state::ProjectViewMemory {
+                        center_zone: Some(remembered_center),
+                        ..Default::default()
+                    },
+                );
+            });
+
+            dispatch_envelope(
+                &state,
+                host_id,
+                new_agent_envelope(
+                    host_id,
+                    "ambiguous-agent",
+                    "Ambiguous Agent",
+                    Some(inactive_project.project_id.clone()),
+                    Some(member_id.clone()),
+                ),
+            );
+
+            assert_eq!(
+                state.center_zone.with_untracked(|center_zone| {
+                    center_zone.tab(current).map(|tab| tab.content.clone())
+                }),
+                Some(TabContent::team_member_draft(
+                    host_id.to_owned(),
+                    member_id.clone()
+                ))
+            );
+            state.project_view_memory.with_untracked(|memories| {
+                assert_eq!(
+                    memories
+                        .get(&inactive_project)
+                        .and_then(|memory| memory.center_zone.as_ref())
+                        .and_then(|center_zone| center_zone.tab(remembered))
+                        .map(|tab| tab.content.clone()),
+                    Some(TabContent::team_member_draft(host_id.to_owned(), member_id))
+                );
+            });
+        });
+    }
 }
 
 /// §M4 frontend external-change correctness, exercised end-to-end through the
@@ -5950,9 +7242,14 @@ mod tests {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
+    use crate::components::chat_message::ChatMessageView;
     use crate::state::{AppState, CodeIntelKey};
+    use leptos::mount::mount_to;
+    use leptos::prelude::*;
     use protocol::{CodeIntelDiagnostic, ProjectFileVersion, ProjectPath, ProjectRootPath};
+    use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
+    use web_sys::HtmlElement;
 
     wasm_bindgen_test_configure!(run_in_browser);
 
@@ -5965,6 +7262,345 @@ mod wasm_tests {
                 .unwrap();
         });
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn malformed_canonical_event_renders_a_diagnostic_card_without_an_empty_bubble() {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document
+            .create_element("div")
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+
+        let state = AppState::new();
+        let agent_id = AgentId("malformed-canonical-agent".to_owned());
+        let tool_name = "mcp__tyde-agent-control__tyde_send_agent_message";
+        let malformed_arguments = serde_json::json!({
+            "agent_id": "",
+            "message": "",
+        });
+
+        apply_chat_event(
+            &state,
+            "host-1",
+            &agent_id,
+            ChatEvent::StreamEnd(protocol::StreamEndData {
+                message: protocol::ChatMessage {
+                    message_id: None,
+                    timestamp: 1,
+                    sender: protocol::MessageSender::Assistant {
+                        agent: "claude".to_owned(),
+                    },
+                    content: String::new(),
+                    reasoning: None,
+                    tool_calls: vec![protocol::ToolUseData {
+                        id: "toolu_send_3".to_owned(),
+                        name: tool_name.to_owned(),
+                        arguments: malformed_arguments.clone(),
+                    }],
+                    model_info: None,
+                    token_usage: None,
+                    context_breakdown: None,
+                    images: None,
+                },
+            }),
+        );
+        apply_chat_event(
+            &state,
+            "host-1",
+            &agent_id,
+            ChatEvent::MessageAdded(protocol::ChatMessage {
+                message_id: None,
+                timestamp: 2,
+                sender: protocol::MessageSender::Error,
+                content: "Failed to normalize canonical tool request \
+                    'mcp__tyde-agent-control__tyde_send_agent_message' (toolu_send_3): \
+                    canonical tool violated its typed contract: expected non-empty \
+                    agent_id/agentId and message in canonical arguments"
+                    .to_owned(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            }),
+        );
+        apply_chat_event(
+            &state,
+            "host-1",
+            &agent_id,
+            ChatEvent::ToolRequest(protocol::ToolRequest {
+                tool_call_id: "toolu_send_3".to_owned(),
+                tool_name: tool_name.to_owned(),
+                tool_type: protocol::ToolRequestType::Other {
+                    args: serde_json::json!({
+                        "tool": tool_name,
+                        "arguments": malformed_arguments,
+                    }),
+                },
+            }),
+        );
+        apply_chat_event(
+            &state,
+            "host-1",
+            &agent_id,
+            ChatEvent::ToolExecutionCompleted(protocol::ToolExecutionCompletedData {
+                tool_call_id: "toolu_send_3".to_owned(),
+                tool_name: tool_name.to_owned(),
+                tool_result: protocol::ToolExecutionResult::TydeSendAgentMessage,
+                success: true,
+                error: None,
+                normalization_failure: Some(
+                    protocol::ToolExecutionNormalizationFailure::CanonicalRequest,
+                ),
+            }),
+        );
+
+        let rows = state
+            .chat_rows
+            .with_untracked(|rows| rows.get(&agent_id).cloned())
+            .expect("assistant and error rows");
+        let state_for_mount = state.clone();
+        mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            let agent_ref: Signal<Option<ActiveAgentRef>> = RwSignal::new(None).into();
+            view! {
+                <div>
+                    {rows.clone().into_iter().map(|row| {
+                        view! { <ChatMessageView agent_ref=agent_ref row=row /> }
+                    }).collect_view()}
+                </div>
+            }
+        })
+        .forget();
+        next_tick().await;
+
+        let assistant = container
+            .query_selector(".chat-card-assistant")
+            .unwrap()
+            .expect("assistant row");
+        assert!(
+            assistant.query_selector(".tool-card").unwrap().is_some(),
+            "the malformed request must remain attached to its issuing assistant row"
+        );
+        assert!(
+            assistant
+                .query_selector(".chat-card-body, .tool-card")
+                .unwrap()
+                .is_some(),
+            "the assistant row must never render as an empty bubble"
+        );
+        let disclosure = assistant
+            .query_selector("details.tool-malformed-payload")
+            .unwrap()
+            .expect("sanitized raw request disclosure");
+        let diagnostic = disclosure.text_content().unwrap_or_default();
+        assert!(
+            diagnostic.contains("agent_id") && diagnostic.contains(tool_name),
+            "the malformed request remains inspectable: {diagnostic}"
+        );
+
+        let error = container
+            .query_selector(".chat-card-error")
+            .unwrap()
+            .expect("normalization error row");
+        assert_eq!(error.get_attribute("role").as_deref(), Some("alert"));
+        assert_eq!(
+            error.get_attribute("aria-label").as_deref(),
+            Some("Error message")
+        );
+        assert!(
+            error
+                .text_content()
+                .unwrap_or_default()
+                .contains("expected non-empty agent_id/agentId and message"),
+            "the server-owned typed-contract diagnostic stays visible"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn newest_first_history_replay_keeps_malformed_card_on_issuing_row() {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document
+            .create_element("div")
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+
+        let state = AppState::new();
+        let host_id = "history-malformed-host";
+        let agent_id = AgentId("history-malformed-agent".to_owned());
+        let stream = StreamPath("/agent/history-malformed-agent/inst".to_owned());
+        state.agents.update(|agents| {
+            agents.push(AgentInfo {
+                host_id: host_id.to_owned(),
+                agent_id: agent_id.clone(),
+                name: "History malformed".to_owned(),
+                origin: protocol::AgentOrigin::User,
+                backend_kind: protocol::BackendKind::Claude,
+                workspace_roots: Vec::new(),
+                project_id: None,
+                parent_agent_id: None,
+                session_id: None,
+                custom_agent_id: None,
+                workflow: None,
+                created_at_ms: 0,
+                instance_stream: stream.clone(),
+                started: true,
+                fatal_error: None,
+                activity_summary: Default::default(),
+            });
+        });
+        let tool_name = "mcp__tyde-agent-control__tyde_send_agent_message";
+        let malformed_arguments = serde_json::json!({ "agent_id": "", "message": "" });
+        let assistant = protocol::ChatMessage {
+            message_id: None,
+            timestamp: 1,
+            sender: protocol::MessageSender::Assistant {
+                agent: "claude".to_owned(),
+            },
+            content: String::new(),
+            reasoning: None,
+            tool_calls: vec![protocol::ToolUseData {
+                id: "toolu_send_3".to_owned(),
+                name: tool_name.to_owned(),
+                arguments: malformed_arguments.clone(),
+            }],
+            model_info: None,
+            token_usage: None,
+            context_breakdown: None,
+            images: None,
+        };
+        let error = protocol::ChatMessage {
+            message_id: None,
+            timestamp: 2,
+            sender: protocol::MessageSender::Error,
+            content: "Failed to normalize canonical tool request: expected non-empty \
+                agent_id/agentId and message"
+                .to_owned(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            model_info: None,
+            token_usage: None,
+            context_breakdown: None,
+            images: None,
+        };
+        let request = protocol::ToolRequest {
+            tool_call_id: "toolu_send_3".to_owned(),
+            tool_name: tool_name.to_owned(),
+            tool_type: protocol::ToolRequestType::Other {
+                args: serde_json::json!({
+                    "tool": tool_name,
+                    "arguments": malformed_arguments,
+                }),
+            },
+        };
+        let completion = protocol::ToolExecutionCompletedData {
+            tool_call_id: "toolu_send_3".to_owned(),
+            tool_name: tool_name.to_owned(),
+            tool_result: protocol::ToolExecutionResult::TydeSendAgentMessage,
+            success: true,
+            error: None,
+            normalization_failure: Some(
+                protocol::ToolExecutionNormalizationFailure::CanonicalRequest,
+            ),
+        };
+
+        apply_session_history(
+            &state,
+            host_id,
+            &stream,
+            SessionHistoryPayload {
+                agent_id: agent_id.clone(),
+                events: vec![
+                    ChatEvent::StreamEnd(protocol::StreamEndData { message: assistant }),
+                    ChatEvent::MessageAdded(error),
+                    ChatEvent::ToolRequest(request),
+                    ChatEvent::ToolExecutionCompleted(completion),
+                ],
+                has_more_before: false,
+                oldest_seq: Some(1),
+            },
+        );
+
+        let rows = state
+            .chat_rows
+            .with_untracked(|rows| rows.get(&agent_id).cloned())
+            .expect("history rows");
+        assert_eq!(rows.len(), 2, "assistant row and normalization error row");
+        assert_eq!(
+            rows[0]
+                .entry
+                .with_untracked(|entry| entry.tool_requests.len()),
+            1,
+            "the replayed request belongs to its declaring assistant row"
+        );
+        assert!(
+            rows[1]
+                .entry
+                .with_untracked(|entry| entry.tool_requests.is_empty()),
+            "the replayed error row must not steal the request"
+        );
+
+        let state_for_mount = state.clone();
+        mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            let agent_ref: Signal<Option<ActiveAgentRef>> = RwSignal::new(None).into();
+            view! {
+                <div>
+                    {rows.clone().into_iter().map(|row| {
+                        view! { <ChatMessageView agent_ref=agent_ref row=row /> }
+                    }).collect_view()}
+                </div>
+            }
+        })
+        .forget();
+        next_tick().await;
+
+        let assistant = container
+            .query_selector(".chat-card-assistant")
+            .unwrap()
+            .expect("assistant row");
+        assert!(assistant.query_selector(".tool-card").unwrap().is_some());
+        assert!(
+            assistant
+                .query_selector(".chat-card-body, .tool-card")
+                .unwrap()
+                .is_some(),
+            "history replay must not produce an empty assistant bubble"
+        );
+        let outer = assistant
+            .query_selector("details.tool-card")
+            .unwrap()
+            .expect("malformed tool shell")
+            .dyn_into::<web_sys::HtmlDetailsElement>()
+            .expect("details element");
+        assert!(outer.open(), "replayed malformed card is visibly open");
+        assert_eq!(
+            outer.get_attribute("aria-label").as_deref(),
+            Some("Tool failed: canonical data could not be normalized")
+        );
+        assert_eq!(
+            assistant
+                .query_selector(".tool-typed-mismatch")
+                .unwrap()
+                .expect("visible alert")
+                .get_attribute("role")
+                .as_deref(),
+            Some("alert")
+        );
+        assert_eq!(
+            assistant
+                .query_selector(".tool-status-text")
+                .unwrap()
+                .and_then(|element| element.text_content())
+                .as_deref(),
+            Some("Failed")
+        );
     }
 
     /// Install a Tauri `invoke` stub that records every outbound call into
@@ -6076,6 +7712,23 @@ mod wasm_tests {
 
         prime_host_for_tests(&state, host_id);
         dispatch_envelope(&state, host_id, project_bootstrap_envelope(&project_id, 0));
+        state.switch_active_project(Some(ActiveProjectRef {
+            host_id: host_id.to_owned(),
+            project_id: project_id.clone(),
+        }));
+        state.record_pending_file_open(
+            FileResourceKey {
+                host_id: host_id.to_owned(),
+                project_id: project_id.clone(),
+                path: path.clone(),
+            },
+            PendingFileOpen::Open {
+                destination: crate::state::PendingOpenDestination::new(
+                    crate::state::PaneId::Primary,
+                ),
+                navigation: None,
+            },
+        );
 
         // First contents at v1: this is the initial open, not a reload (no
         // prior rendered version), so no refresh subscribe fires.
@@ -6255,9 +7908,34 @@ mod wasm_tests {
             root: ProjectRootPath("/repo".to_owned()),
             relative_path: "src/main.rs".to_owned(),
         };
+        let key = FileResourceKey {
+            host_id: host_id.to_owned(),
+            project_id: project_id.clone(),
+            path: path.clone(),
+        };
+        state.open_files.update(|files| {
+            files.insert(
+                key.clone(),
+                OpenFile {
+                    path: path.clone(),
+                    version: ProjectFileVersion(1),
+                    contents: Some("fn main() {}".to_owned()),
+                    is_binary: false,
+                },
+            );
+        });
+        let tab = state
+            .open_tab_in(
+                crate::state::PaneId::Primary,
+                TabContent::File { key: key.clone() },
+                "main.rs".to_owned(),
+                true,
+            )
+            .expect("source occurrence");
         crate::actions::start_find_references(
             &state,
-            path,
+            tab,
+            key,
             ProjectFileVersion(1),
             12,
             Some("foo".to_owned()),
@@ -6308,14 +7986,41 @@ mod wasm_tests {
                 project_id: project_id.clone(),
             }));
 
+        let source = ProjectPath {
+            root: ProjectRootPath("/repo".to_owned()),
+            relative_path: "src/main.rs".to_owned(),
+        };
+        let source_key = FileResourceKey {
+            host_id: host_id.to_owned(),
+            project_id: project_id.clone(),
+            path: source.clone(),
+        };
+        state.open_files.update(|files| {
+            files.insert(
+                source_key.clone(),
+                OpenFile {
+                    path: source,
+                    version: ProjectFileVersion(1),
+                    contents: Some("fn main() {}".to_owned()),
+                    is_binary: false,
+                },
+            );
+        });
+        let source_tab = state
+            .open_tab_in(
+                crate::state::PaneId::Primary,
+                TabContent::File {
+                    key: source_key.clone(),
+                },
+                "main.rs".to_owned(),
+                true,
+            )
+            .expect("source occurrence");
+
         // The newest query has id 2 active and is in flight for this project.
         state.references_state.update(|s| {
-            s.host_id = Some(host_id.to_owned());
-            s.project_id = Some(project_id.clone());
-            s.source_path = Some(ProjectPath {
-                root: ProjectRootPath("/repo".to_owned()),
-                relative_path: "src/main.rs".to_owned(),
-            });
+            s.source_tab = Some(source_tab);
+            s.source_key = Some(source_key);
             s.source_version = Some(ProjectFileVersion(1));
             s.active_references_id = 2;
             s.in_flight = true;
@@ -6384,10 +8089,35 @@ mod wasm_tests {
                 host_id: host_id.to_owned(),
                 project_id: project_a.clone(),
             }));
+        let source_key = FileResourceKey {
+            host_id: host_id.to_owned(),
+            project_id: project_a.clone(),
+            path: source.clone(),
+        };
+        state.open_files.update(|files| {
+            files.insert(
+                source_key.clone(),
+                OpenFile {
+                    path: source,
+                    version: ProjectFileVersion(1),
+                    contents: Some("fn main() {}".to_owned()),
+                    is_binary: false,
+                },
+            );
+        });
+        let source_tab = state
+            .open_tab_in(
+                crate::state::PaneId::Primary,
+                TabContent::File {
+                    key: source_key.clone(),
+                },
+                "main.rs".to_owned(),
+                true,
+            )
+            .expect("source occurrence");
         state.references_state.set(ProjectReferencesUiState {
-            host_id: Some(host_id.to_owned()),
-            project_id: Some(project_a.clone()),
-            source_path: Some(source),
+            source_tab: Some(source_tab),
+            source_key: Some(source_key),
             source_version: Some(ProjectFileVersion(1)),
             active_references_id: 9,
             in_flight: true,
@@ -6418,5 +8148,221 @@ mod wasm_tests {
             );
             assert_eq!(s.total_references, 0);
         });
+    }
+
+    #[wasm_bindgen_test]
+    fn ordered_stream_events_render_without_client_identity_ownership() {
+        let state = AppState::new();
+        let agent_id = AgentId("desktop-server-ordered-stream".to_owned());
+        apply_chat_event(
+            &state,
+            "host",
+            &agent_id,
+            ChatEvent::StreamStart(protocol::StreamStartData {
+                message_id: Some("start-id".to_owned()),
+                agent: "codex".to_owned(),
+                model: None,
+            }),
+        );
+        apply_chat_event(
+            &state,
+            "host",
+            &agent_id,
+            ChatEvent::StreamDelta(protocol::StreamTextDeltaData {
+                message_id: Some("delta-id".to_owned()),
+                text: "server text".to_owned(),
+            }),
+        );
+        apply_chat_event(
+            &state,
+            "host",
+            &agent_id,
+            ChatEvent::StreamReasoningDelta(protocol::StreamTextDeltaData {
+                message_id: None,
+                text: "server reasoning".to_owned(),
+            }),
+        );
+
+        let preview = state
+            .streaming_text
+            .with_untracked(|map| map.get(&agent_id).cloned())
+            .expect("server Start owns the live preview");
+        assert_eq!(preview.text.get_untracked(), "server text");
+        assert_eq!(preview.reasoning.get_untracked(), "server reasoning");
+
+        apply_chat_event(
+            &state,
+            "host",
+            &agent_id,
+            ChatEvent::StreamEnd(protocol::StreamEndData {
+                message: protocol::ChatMessage {
+                    message_id: Some(protocol::ChatMessageId("end-id".to_owned())),
+                    timestamp: 1,
+                    sender: protocol::MessageSender::Assistant {
+                        agent: "codex".to_owned(),
+                    },
+                    content: "server completion".to_owned(),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    model_info: None,
+                    token_usage: None,
+                    context_breakdown: None,
+                    images: None,
+                },
+            }),
+        );
+
+        let rows = state
+            .chat_rows
+            .with_untracked(|map| map.get(&agent_id).cloned())
+            .expect("authoritative completion row");
+        assert_eq!(rows.len(), 1);
+        rows[0].entry.with_untracked(|entry| {
+            assert_eq!(entry.message.content, "server completion");
+            assert_eq!(
+                entry.message.message_id,
+                Some(protocol::ChatMessageId("end-id".to_owned()))
+            );
+            assert!(matches!(
+                entry.message.sender,
+                protocol::MessageSender::Assistant { .. }
+            ));
+        });
+        assert!(
+            state
+                .streaming_text
+                .with_untracked(|map| !map.contains_key(&agent_id))
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn empty_completion_and_repeated_server_rows_match_history() {
+        let state = AppState::new();
+        let agent_id = AgentId("desktop-empty-completion".to_owned());
+        let assistant_message = |id: &str, content: &str| protocol::ChatMessage {
+            message_id: Some(protocol::ChatMessageId(id.to_owned())),
+            timestamp: 1,
+            sender: protocol::MessageSender::Assistant {
+                agent: "codex".to_owned(),
+            },
+            content: content.to_owned(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            model_info: None,
+            token_usage: None,
+            context_breakdown: None,
+            images: None,
+        };
+
+        apply_chat_event(
+            &state,
+            "host",
+            &agent_id,
+            ChatEvent::StreamStart(protocol::StreamStartData {
+                message_id: Some("empty-item".to_owned()),
+                agent: "codex".to_owned(),
+                model: None,
+            }),
+        );
+        apply_chat_event(
+            &state,
+            "host",
+            &agent_id,
+            ChatEvent::StreamEnd(protocol::StreamEndData {
+                message: assistant_message("empty-item", ""),
+            }),
+        );
+
+        let live_empty = state
+            .chat_rows
+            .with_untracked(|rows| rows.get(&agent_id).cloned())
+            .expect("empty completion row");
+        assert_eq!(live_empty.len(), 1);
+        live_empty[0].entry.with_untracked(|entry| {
+            assert_eq!(
+                entry.message.message_id,
+                Some(protocol::ChatMessageId("empty-item".to_owned()))
+            );
+            assert_eq!(entry.message.content, EMPTY_RESPONSE_PLACEHOLDER);
+            assert!(!entry.message.content.trim().is_empty());
+        });
+
+        let mut replay = HistoryReplay::default();
+        replay.apply(
+            ChatEvent::StreamEnd(protocol::StreamEndData {
+                message: assistant_message("empty-history", ""),
+            }),
+            "host",
+            &agent_id,
+        );
+        assert_eq!(replay.rows.len(), 1);
+        replay.rows[0].entry.with_untracked(|entry| {
+            assert_eq!(entry.message.content, EMPTY_RESPONSE_PLACEHOLDER);
+        });
+
+        let original = assistant_message("message-added", "original");
+        let repeated = assistant_message("message-added", "server second row");
+        apply_chat_event(
+            &state,
+            "host",
+            &agent_id,
+            ChatEvent::MessageAdded(original.clone()),
+        );
+        apply_chat_event(
+            &state,
+            "host",
+            &agent_id,
+            ChatEvent::MessageAdded(repeated.clone()),
+        );
+        let live_rows = state
+            .chat_rows
+            .with_untracked(|rows| rows.get(&agent_id).cloned())
+            .expect("live rows");
+        assert_eq!(
+            live_rows
+                .iter()
+                .filter(|row| row.entry.with_untracked(|entry| {
+                    entry.message.message_id
+                        == Some(protocol::ChatMessageId("message-added".to_owned()))
+                }))
+                .count(),
+            2,
+            "server rows render in order even when they carry the same metadata key"
+        );
+        assert_eq!(
+            live_rows
+                .iter()
+                .filter_map(|row| row.entry.with_untracked(|entry| {
+                    (entry.message.message_id
+                        == Some(protocol::ChatMessageId("message-added".to_owned())))
+                    .then(|| entry.message.content.clone())
+                }))
+                .collect::<Vec<_>>(),
+            vec!["original".to_owned(), "server second row".to_owned()]
+        );
+
+        let mut replay = HistoryReplay::default();
+        replay.apply(ChatEvent::MessageAdded(original), "host", &agent_id);
+        replay.apply(ChatEvent::MessageAdded(repeated), "host", &agent_id);
+        assert_eq!(replay.rows.len(), 2);
+        assert_eq!(
+            replay
+                .rows
+                .iter()
+                .filter(|row| row.entry.with_untracked(|entry| {
+                    entry.message.message_id
+                        == Some(protocol::ChatMessageId("message-added".to_owned()))
+                }))
+                .count(),
+            2
+        );
+        assert!(
+            !replay
+                .rows
+                .iter()
+                .any(|row| row.entry.with_untracked(|entry| {
+                    matches!(entry.message.sender, protocol::MessageSender::Error)
+                }))
+        );
     }
 }

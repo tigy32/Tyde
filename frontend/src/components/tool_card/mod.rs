@@ -18,8 +18,9 @@ use leptos::prelude::*;
 use protocol::{
     AgentActivityStats, AgentActivitySummary, AgentActivitySummaryStaleReason,
     AgentActivitySummaryState, AgentControlAgentRef, AgentControlProgress,
-    AgentControlProgressKind, SubAgentProgress, ToolExecutionResult, ToolProgressData,
-    ToolProgressUpdate, ToolRequestType, WorkflowRunState, WorkflowRunStatus,
+    AgentControlProgressKind, SubAgentProgress, ToolExecutionCompletedData,
+    ToolExecutionNormalizationFailure, ToolExecutionResult, ToolProgressData, ToolProgressUpdate,
+    ToolRequestType, WorkflowRunState, WorkflowRunStatus,
 };
 use wasm_bindgen::JsCast;
 
@@ -39,10 +40,114 @@ mod other;
 mod read_files;
 mod run_command;
 mod search_types;
+mod tyde_await_agents;
+mod tyde_send_agent_message;
 
 const TOOL_LIST_INLINE_LIMIT: usize = 80;
 const TOOL_LIST_HEAD_COUNT: usize = 8;
 const TOOL_LIST_TAIL_COUNT: usize = 32;
+const SANITIZE_MAX_DEPTH: usize = 8;
+const EMBEDDED_JSON_WRAPPER_KEYS: &[&str] = &[
+    "arguments",
+    "args",
+    "input",
+    "input_data",
+    "inputData",
+    "tool_input",
+    "toolInput",
+    "parameters",
+    "params",
+];
+
+fn malformed_request_payload<'a>(
+    request: &'a ToolRequestType,
+    completion: Option<&ToolExecutionCompletedData>,
+) -> Option<&'a serde_json::Value> {
+    let ToolRequestType::Other { args } = request else {
+        return None;
+    };
+    request_normalization_failed(completion?).then_some(args)
+}
+
+fn request_normalization_failed(completion: &ToolExecutionCompletedData) -> bool {
+    matches!(
+        completion.normalization_failure,
+        Some(ToolExecutionNormalizationFailure::CanonicalRequest)
+            | Some(ToolExecutionNormalizationFailure::CanonicalRequestAndResult)
+    )
+}
+
+fn sanitized_request_payload_json(value: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(&sanitize_request_payload(value, 0))
+        .unwrap_or_else(|_| "\"[SANITIZATION FAILED]\"".to_owned())
+}
+
+fn sanitize_request_payload(value: &serde_json::Value, depth: usize) -> serde_json::Value {
+    if depth > SANITIZE_MAX_DEPTH {
+        return serde_json::Value::String("[REDACTED: MAX DEPTH]".to_owned());
+    }
+    match value {
+        serde_json::Value::Object(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| {
+                    let sanitized = if is_secret_key(key) {
+                        serde_json::Value::String("[REDACTED]".to_owned())
+                    } else if is_embedded_json_wrapper(key) {
+                        sanitize_embedded_json(value, depth + 1)
+                    } else {
+                        sanitize_request_payload(value, depth + 1)
+                    };
+                    (key.clone(), sanitized)
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(|value| sanitize_request_payload(value, depth + 1))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn sanitize_embedded_json(value: &serde_json::Value, depth: usize) -> serde_json::Value {
+    let serde_json::Value::String(text) = value else {
+        return sanitize_request_payload(value, depth);
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) else {
+        return value.clone();
+    };
+    serde_json::Value::String(
+        serde_json::to_string(&sanitize_request_payload(&parsed, depth))
+            .unwrap_or_else(|_| "[SANITIZATION FAILED]".to_owned()),
+    )
+}
+
+fn is_embedded_json_wrapper(key: &str) -> bool {
+    EMBEDDED_JSON_WRAPPER_KEYS.contains(&key)
+}
+
+fn is_secret_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    normalized == "auth"
+        || normalized.contains("authorization")
+        || normalized.contains("bearer")
+        || normalized.contains("cookie")
+        || normalized.contains("apikey")
+        || normalized.contains("token")
+        || normalized.contains("password")
+        || normalized.contains("passwd")
+        || normalized.contains("secret")
+        || normalized.contains("privatekey")
+        || normalized.contains("credential")
+        || normalized.contains("psk")
+}
 
 #[cfg(all(test, target_arch = "wasm32"))]
 pub(crate) mod test_utils;
@@ -230,6 +335,10 @@ fn is_important_tool(entry: &ToolRequestEntry) -> bool {
         &entry.request.tool_type,
         ToolRequestType::AskUserQuestion { .. } | ToolRequestType::ExitPlanMode { .. }
     ) || entry.result.as_ref().is_none_or(|result| !result.success)
+        || entry
+            .result
+            .as_ref()
+            .is_some_and(|result| result.normalization_failure.is_some())
 }
 
 #[component]
@@ -247,6 +356,11 @@ pub fn ToolCardView(
     let tool_call_id = entry.request.tool_call_id.clone();
     let tool_type = entry.request.tool_type;
     let result = entry.result;
+    let malformed_payload = malformed_request_payload(&tool_type, result.as_ref()).cloned();
+    let normalization_failure = result
+        .as_ref()
+        .and_then(|result| result.normalization_failure);
+    let normalization_failed = normalization_failure.is_some();
 
     // Live progress is read reactively from the central store — never
     // from the entry — so the card keeps updating inside keyed `<For>`
@@ -301,7 +415,8 @@ pub fn ToolCardView(
     let is_workflow = Memo::new(move |_| workflow_run.with(|run| run.is_some()));
 
     let has_result = result.is_some();
-    let result_success = result.as_ref().map(|r| r.success).unwrap_or(false);
+    let result_success =
+        result.as_ref().map(|r| r.success).unwrap_or(false) && !normalization_failed;
     let result_failed = has_result && !result_success;
 
     let status_class = move || {
@@ -325,6 +440,23 @@ pub fn ToolCardView(
     };
 
     let (icon, header_detail) = tool_icon_and_detail(&tool_name, &tool_type);
+
+    // A send-message card names its recipient in the header, so "who was
+    // messaged" is answerable while the card is collapsed. The name has to be
+    // resolved here rather than in `tool_icon_and_detail` because it comes from
+    // server-owned agent state; the request alone carries only a uuid.
+    let send_recipient_id = match &tool_type {
+        ToolRequestType::TydeSendAgentMessage { agent_id, .. } => Some(agent_id.clone()),
+        _ => None,
+    };
+    let recipient_detail: Signal<Option<String>> = Signal::derive({
+        let state = state.clone();
+        move || {
+            let agent_id = send_recipient_id.clone()?;
+            Some(agent_display_name(&state, agent_ref.get(), &agent_id, None))
+        }
+    });
+
     let header_detail = move || {
         workflow_run
             .get()
@@ -334,29 +466,47 @@ pub fn ToolCardView(
                     .get()
                     .map(|progress| agent_control_header_detail(&progress))
             })
+            .or_else(|| recipient_detail.get())
             .or_else(|| header_detail.clone())
     };
 
-    let completion_summary = result
-        .as_ref()
-        .map(|r| completion_header_summary(&tool_type, &r.tool_result));
+    let completion_summary = if let Some(failure) = normalization_failure {
+        Some(match failure {
+            ToolExecutionNormalizationFailure::CanonicalRequest => {
+                "request normalization failed".to_owned()
+            }
+            ToolExecutionNormalizationFailure::CanonicalResult => {
+                "result normalization failed".to_owned()
+            }
+            ToolExecutionNormalizationFailure::CanonicalRequestAndResult => {
+                "request and result normalization failed".to_owned()
+            }
+        })
+    } else {
+        result
+            .as_ref()
+            .map(|r| completion_header_summary(&tool_type, &r.tool_result))
+    };
 
     let is_ask_user_question = matches!(tool_type, ToolRequestType::AskUserQuestion { .. });
     let body_tool_type = tool_type.clone();
     let body_result = result.as_ref().map(|r| r.tool_result.clone());
     let body_tool_type_slot = StoredValue::new_local(body_tool_type);
     let body_result_slot = StoredValue::new_local(body_result);
+    let malformed_payload_slot = StoredValue::new_local(malformed_payload);
     let tool_call_id_slot = StoredValue::new_local(tool_call_id);
     let details_open = RwSignal::new(
         is_ask_user_question
             || !has_result
             || !result_success
+            || normalization_failed
             || background_running.get_untracked(),
     );
     let default_open_for_body = move || {
         is_ask_user_question
             || !has_result
             || !result_success
+            || normalization_failed
             || background_running.get()
             || tool_output_mode.get() != ToolOutputMode::Summary
     };
@@ -364,6 +514,7 @@ pub fn ToolCardView(
         is_ask_user_question
             || !has_result
             || !result_success
+            || normalization_failed
             || background_running.get()
             || tool_output_mode.get() != ToolOutputMode::Summary
     };
@@ -371,18 +522,24 @@ pub fn ToolCardView(
 
     view! {
         <details
-            class="tool-card"
+            class=if normalization_failed { "tool-card tool-card-malformed" } else { "tool-card" }
+            aria-label=normalization_failed.then_some("Tool failed: canonical data could not be normalized")
             prop:open=default_open_for_prop
             on:toggle=move |ev: leptos::ev::Event| {
                 if let Some(target) = ev.target()
                     && let Ok(el) = target.dyn_into::<web_sys::HtmlDetailsElement>()
                 {
+                    if normalization_failed && !el.open() {
+                        el.set_open(true);
+                    }
                     details_open.set(el.open());
                 }
             }
         >
             <summary class="tool-card-header">
-                <span class="tool-card-icon">{icon}</span>
+                // Purely decorative: the tool name beside it is the accessible
+                // label, so a screen reader announcing the emoji adds only noise.
+                <span class="tool-card-icon" aria-hidden="true">{icon}</span>
                 <span class="tool-card-name">{tool_name}</span>
                 {move || header_detail().map(|d| view! {
                     <span class="tool-card-detail">{d}</span>
@@ -391,7 +548,9 @@ pub fn ToolCardView(
                     <span class="tool-completion-summary">{s}</span>
                 })}
                 <span class=status_class>{status_label}</span>
-                <span class="tool-chevron">"\u{25b6}"</span>
+                // The native <details>/<summary> already announces its own
+                // expanded state; the glyph is decoration on top of that.
+                <span class="tool-chevron" aria-hidden="true">"\u{25b6}"</span>
             </summary>
             <Show when=render_body_when>
                 <div class="tool-card-body">
@@ -405,6 +564,13 @@ pub fn ToolCardView(
                         }
                         view! {
                             <div>
+                                {(normalization_failure == Some(
+                                    ToolExecutionNormalizationFailure::CanonicalResult,
+                                )).then(|| view! {
+                                    <div class="tool-typed-mismatch" role="alert">
+                                        "The canonical tool result could not be normalized."
+                                    </div>
+                                })}
                                 {move || {
                                     agent_control_progress.get().map(|progress| {
                                         agent_control_status_list(agent_ref, progress)
@@ -420,13 +586,17 @@ pub fn ToolCardView(
                                     tool_call_id_slot.with_value(|tool_call_id| {
                                         body_tool_type_slot.with_value(|body_tool_type| {
                                             body_result_slot.with_value(|body_result| {
-                                                render_body(
-                                                    tool_call_id,
-                                                    body_tool_type,
-                                                    body_result.as_ref(),
-                                                    mode,
-                                                    result_failed,
-                                                )
+                                                malformed_payload_slot.with_value(|malformed_payload| {
+                                                    render_body(
+                                                        agent_ref,
+                                                        tool_call_id,
+                                                        body_tool_type,
+                                                        body_result.as_ref(),
+                                                        malformed_payload.as_ref(),
+                                                        mode,
+                                                        result_failed,
+                                                    )
+                                                })
                                             })
                                         })
                                     })
@@ -449,14 +619,16 @@ pub fn ToolCardView(
 /// `Error` renders via `error_result`, regardless of which request kind issued
 /// it.
 fn render_body(
+    agent_ref: Signal<Option<ActiveAgentRef>>,
     tool_call_id: &str,
     req: &ToolRequestType,
     result: Option<&ToolExecutionResult>,
+    malformed_payload: Option<&serde_json::Value>,
     mode: ToolOutputMode,
     result_failed: bool,
 ) -> AnyView {
     if let Some(ToolExecutionResult::Error { .. }) = result {
-        return error_result::render(result.unwrap(), mode).into_any();
+        return error_result::render(result.unwrap(), malformed_payload, mode).into_any();
     }
 
     match req {
@@ -465,6 +637,17 @@ fn render_body(
         ToolRequestType::ReadFiles { .. } => read_files::render(req, result, mode).into_any(),
         ToolRequestType::SearchTypes { .. } => search_types::render(req, result, mode).into_any(),
         ToolRequestType::GetTypeDocs { .. } => get_type_docs::render(req, result, mode).into_any(),
+        // The Tyde orchestration tools own their presentation end to end: a sent
+        // message renders as Markdown, an await renders its agent list. Because
+        // they are typed variants, they never reach `other::render`, so the raw
+        // args/`Result JSON` panels that used to duplicate them are gone by
+        // construction rather than suppressed by a flag.
+        ToolRequestType::TydeSendAgentMessage { .. } => {
+            tyde_send_agent_message::render(agent_ref, tool_call_id, req, result, mode)
+        }
+        ToolRequestType::TydeAwaitAgents { .. } => {
+            tyde_await_agents::render(agent_ref, req, result, mode)
+        }
         // A failed completion for a question is no longer answerable: render the
         // raw result instead of the interactive card, mirroring the mobile tool
         // card. The realistic failure carries `ToolExecutionResult::Error`, which
@@ -474,12 +657,14 @@ fn render_body(
             failed_result_body(result).into_any()
         }
         ToolRequestType::AskUserQuestion { .. } => {
-            ask_user_question::render(req, result, mode).into_any()
+            ask_user_question::render(agent_ref, req, result, mode).into_any()
         }
         ToolRequestType::ExitPlanMode { .. } => {
-            exit_plan_mode::render(tool_call_id, req, result, mode).into_any()
+            exit_plan_mode::render(agent_ref, tool_call_id, req, result, mode).into_any()
         }
-        ToolRequestType::Other { .. } => other::render(req, result, mode).into_any(),
+        ToolRequestType::Other { .. } => {
+            other::render(req, result, malformed_payload, mode).into_any()
+        }
     }
 }
 
@@ -616,6 +801,31 @@ fn agent_control_status_list(
     }
 }
 
+/// An agent's live human name, resolved reactively from server-owned state on
+/// the parent's host. Falls back to the name the event carried, then to the raw
+/// id — never to an invented label. Shared by every card that has to refer to a
+/// child agent (agent-control rows, the send-message recipient, the await
+/// verdict), so they can't drift apart on what an agent is called.
+pub(crate) fn agent_display_name(
+    state: &AppState,
+    parent_ref: Option<ActiveAgentRef>,
+    agent_id: &protocol::AgentId,
+    fallback_name: Option<&str>,
+) -> String {
+    let state_name = parent_ref.and_then(|parent| {
+        state.agents.with(|agents| {
+            agents
+                .iter()
+                .find(|agent| agent.host_id == parent.host_id && agent.agent_id == *agent_id)
+                .map(|agent| agent.name.clone())
+        })
+    });
+    state_name
+        .or_else(|| fallback_name.map(str::to_owned))
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| agent_id.0.clone())
+}
+
 #[derive(Clone)]
 enum AgentControlDerivedStatus {
     Starting,
@@ -662,18 +872,12 @@ fn AgentControlAgentRow(
         let agent_id = agent_id.clone();
         let fallback_name = fallback_name.clone();
         move || {
-            let state_name = parent_ref.get().and_then(|parent| {
-                state.agents.with(|agents| {
-                    agents
-                        .iter()
-                        .find(|agent| agent.host_id == parent.host_id && agent.agent_id == agent_id)
-                        .map(|agent| agent.name.clone())
-                })
-            });
-            state_name
-                .or_else(|| fallback_name.clone())
-                .filter(|name| !name.trim().is_empty())
-                .unwrap_or_else(|| agent_id.0.clone())
+            agent_display_name(
+                &state,
+                parent_ref.get(),
+                &agent_id,
+                fallback_name.as_deref(),
+            )
         }
     });
 
@@ -1104,6 +1308,20 @@ fn tool_icon_and_detail(name: &str, tool_type: &ToolRequestType) -> (&'static st
             "\u{1f4dd}",
             plan_path.clone().or_else(|| Some("Plan".to_owned())),
         ),
+        // The recipient's live name needs app state, so the shell resolves it
+        // (see `recipient_detail`). The request alone carries only a uuid, which
+        // would be a worse header than none.
+        ToolRequestType::TydeSendAgentMessage { .. } => ("\u{1f4ac}", None),
+        // Mirrors `agent_control_header_detail`, so the label reads the same
+        // whether it comes from the typed request or from live progress.
+        ToolRequestType::TydeAwaitAgents { agent_ids } => {
+            let detail = if agent_ids.len() == 1 {
+                "Awaiting agent".to_owned()
+            } else {
+                format!("Awaiting {} agents", agent_ids.len())
+            };
+            ("\u{1f916}", Some(detail))
+        }
         ToolRequestType::Other { .. } => {
             let icon = match name {
                 n if n.contains("spawn") || n.contains("agent") => "\u{1f916}",
@@ -1184,6 +1402,22 @@ pub(crate) fn completion_header_summary(
                 format!("error \u{b7} {trimmed}")
             }
         }
+        // The send tool's result is a bare ack, so the header carries the whole
+        // outcome: the message reached the agent.
+        ToolExecutionResult::TydeSendAgentMessage => "delivered".to_owned(),
+        ToolExecutionResult::TydeAwaitAgents {
+            ready,
+            still_thinking,
+        } => {
+            let mut parts = Vec::with_capacity(2);
+            if !ready.is_empty() {
+                parts.push(format!("{} ready", ready.len()));
+            }
+            if !still_thinking.is_empty() {
+                parts.push(format!("{} still thinking", still_thinking.len()));
+            }
+            parts.join(" \u{b7} ")
+        }
         ToolExecutionResult::Other { .. } => String::new(),
     }
 }
@@ -1257,6 +1491,7 @@ mod tool_visibility_tests {
                 tool_result: ToolExecutionResult::Other { result: json!({}) },
                 success: true,
                 error: None,
+                normalization_failure: None,
             }),
         }
     }
@@ -1583,6 +1818,7 @@ mod live_card_wasm_tests {
                 },
                 success: true,
                 error: None,
+                normalization_failure: None,
             }),
         }
     }
@@ -2484,6 +2720,392 @@ mod live_card_wasm_tests {
                 .expect("query stats")
                 .is_none(),
             "spawn card must not contain a stats line element"
+        );
+    }
+
+    // ── Typed Tyde orchestration cards ──────────────────────────────────
+    //
+    // These exercise the whole `ToolCardView` shell, not just a renderer,
+    // because the raw-JSON duplication they lock out was a property of the
+    // shell: the agent-control card rendered and then *fell through* to the
+    // generic body.
+
+    fn typed_send_entry(
+        message: &str,
+        result: Option<ToolExecutionResult>,
+        success: bool,
+    ) -> ToolRequestEntry {
+        ToolRequestEntry {
+            request: ToolRequest {
+                tool_call_id: "toolu_send".to_owned(),
+                tool_name: "tyde_send_agent_message".to_owned(),
+                tool_type: ToolRequestType::TydeSendAgentMessage {
+                    agent_id: AgentId("agent-sub".to_owned()),
+                    message: message.to_owned(),
+                },
+            },
+            result: result.map(|tool_result| ToolExecutionCompletedData {
+                tool_call_id: "toolu_send".to_owned(),
+                tool_name: "tyde_send_agent_message".to_owned(),
+                tool_result,
+                success,
+                error: (!success).then(|| "send failed".to_owned()),
+                normalization_failure: None,
+            }),
+        }
+    }
+
+    fn typed_await_entry() -> ToolRequestEntry {
+        ToolRequestEntry {
+            request: ToolRequest {
+                tool_call_id: "toolu_agent_control".to_owned(),
+                tool_name: "tyde_await_agents".to_owned(),
+                tool_type: ToolRequestType::TydeAwaitAgents {
+                    agent_ids: vec![AgentId("agent-sub".to_owned())],
+                },
+            },
+            result: Some(ToolExecutionCompletedData {
+                tool_call_id: "toolu_agent_control".to_owned(),
+                tool_name: "tyde_await_agents".to_owned(),
+                tool_result: ToolExecutionResult::TydeAwaitAgents {
+                    ready: vec![protocol::TydeAgentWaitStatus {
+                        agent_id: AgentId("agent-sub".to_owned()),
+                        status: protocol::AgentControlStatus::Idle,
+                    }],
+                    still_thinking: Vec::new(),
+                },
+                success: true,
+                error: None,
+                normalization_failure: None,
+            }),
+        }
+    }
+
+    /// Force the card's disclosure open. In `Summary` a completed, successful
+    /// card is collapsed by default (true of every tool), so the body has to be
+    /// opened before its contents can be asserted on.
+    fn open_card(container: &HtmlElement) {
+        let details = container
+            .query_selector("details.tool-card")
+            .expect("query card")
+            .expect("tool card present")
+            .dyn_into::<web_sys::HtmlDetailsElement>()
+            .expect("details element");
+        details.set_open(true);
+        details
+            .dispatch_event(&web_sys::Event::new("toggle").expect("toggle event"))
+            .expect("dispatch toggle");
+    }
+
+    /// Regression lock for the screenshot's defect B. The await card's live rows
+    /// are the complete presentation: no raw JSON below them, in any output mode
+    /// — Full included.
+    #[wasm_bindgen_test]
+    async fn await_card_renders_no_raw_json_in_any_mode() {
+        for mode in [
+            ToolOutputMode::Summary,
+            ToolOutputMode::Compact,
+            ToolOutputMode::Full,
+        ] {
+            let (container, state) = mount_card(
+                typed_await_entry(),
+                Some(agent_control_progress_data(AgentControlProgressKind::Await)),
+            );
+            state.tool_output_mode.set(mode);
+            state.agents.update(|agents| {
+                agents.push(agent_info("agent-sub", "Awaited Worker", true));
+            });
+            next_tick().await;
+            open_card(&container);
+            next_tick().await;
+
+            assert_eq!(
+                count(&container, "pre.tool-raw-args"),
+                0,
+                "await card shows no raw args in {mode:?}"
+            );
+            assert_eq!(
+                count(&container, "pre.tool-raw-result"),
+                0,
+                "await card shows no raw result in {mode:?}"
+            );
+
+            let body = text(&container);
+            assert!(
+                !body.contains("Result JSON"),
+                "no Result JSON panel in {mode:?}: {body}"
+            );
+            // The useful card survives, intact.
+            assert!(
+                body.contains("Awaited Worker"),
+                "agent name still shown in {mode:?}: {body}"
+            );
+            assert!(
+                body.contains("Open agent"),
+                "open-agent action still reachable in {mode:?}: {body}"
+            );
+        }
+    }
+
+    /// Regression lock for the screenshot's defect A, through the full shell: the
+    /// message renders as Markdown exactly once, the recipient is named by their
+    /// human name in the header (so a collapsed card still answers "who was
+    /// messaged"), and no JSON envelope appears.
+    #[wasm_bindgen_test]
+    async fn send_message_card_renders_markdown_and_names_recipient() {
+        let (container, state) = mount_card(
+            typed_send_entry(
+                "## Fixing exact rerun behavior\n\n- check `mock.rs`\n- then rerun",
+                Some(ToolExecutionResult::TydeSendAgentMessage),
+                true,
+            ),
+            None,
+        );
+        state.agents.update(|agents| {
+            agents.push(agent_info("agent-sub", "Agent state bugs", true));
+        });
+        next_tick().await;
+
+        let header = container
+            .query_selector(".tool-card-detail")
+            .expect("query header detail")
+            .expect("send card names its recipient in the header")
+            .text_content()
+            .unwrap_or_default();
+        assert_eq!(
+            header, "Agent state bugs",
+            "collapsed header names the recipient by their live human name"
+        );
+
+        open_card(&container);
+        next_tick().await;
+
+        assert_eq!(count(&container, "h2"), 1, "message renders as Markdown");
+        assert_eq!(count(&container, "li"), 2, "bullets render as list items");
+        assert_eq!(count(&container, "pre.tool-raw-args"), 0, "no raw args");
+        assert_eq!(count(&container, "pre.tool-raw-result"), 0, "no raw result");
+
+        let body = text(&container);
+        assert_eq!(
+            body.matches("Fixing exact rerun behavior").count(),
+            1,
+            "the message appears exactly once: {body}"
+        );
+        assert!(
+            !body.contains("agent_id"),
+            "no JSON keys in the default view: {body}"
+        );
+    }
+
+    /// A failed orchestration call still renders its full error body — a pretty
+    /// card must never hide a failure.
+    #[wasm_bindgen_test]
+    async fn send_message_failure_renders_error_body() {
+        let (container, _state) = mount_card(
+            typed_send_entry(
+                "please pick this up",
+                Some(ToolExecutionResult::Error {
+                    short_message: "unknown agent_id".to_owned(),
+                    detailed_message: "agent-sub is not a direct child".to_owned(),
+                }),
+                false,
+            ),
+            None,
+        );
+        next_tick().await;
+
+        let body = text(&container);
+        assert_eq!(tool_header_status(&container), "Failed");
+        assert!(
+            body.contains("agent-sub is not a direct child"),
+            "the error detail stays visible: {body}"
+        );
+        assert!(
+            !body.contains("please pick this up"),
+            "a failed send renders the error, not the Markdown card: {body}"
+        );
+    }
+
+    fn malformed_entry(result: ToolExecutionResult, success: bool) -> ToolRequestEntry {
+        ToolRequestEntry {
+            request: ToolRequest {
+                tool_call_id: "toolu_send_3".to_owned(),
+                tool_name: "mcp__tyde-agent-control__tyde_send_agent_message".to_owned(),
+                tool_type: ToolRequestType::Other {
+                    args: json!({
+                        "tool": "mcp__tyde-agent-control__tyde_send_agent_message",
+                        "arguments": { "agent_id": "", "message": "" },
+                    }),
+                },
+            },
+            result: Some(ToolExecutionCompletedData {
+                tool_call_id: "toolu_send_3".to_owned(),
+                tool_name: "mcp__tyde-agent-control__tyde_send_agent_message".to_owned(),
+                tool_result: result,
+                success,
+                error: None,
+                normalization_failure: Some(ToolExecutionNormalizationFailure::CanonicalRequest),
+            }),
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn malformed_drift_forces_open_failed_accessible_shell() {
+        let (container, _state) = mount_card(
+            malformed_entry(ToolExecutionResult::TydeSendAgentMessage, true),
+            None,
+        );
+        next_tick().await;
+
+        let outer = container
+            .query_selector("details.tool-card")
+            .unwrap()
+            .expect("outer tool disclosure")
+            .dyn_into::<web_sys::HtmlDetailsElement>()
+            .expect("details element");
+        assert!(outer.open(), "malformed drift is visibly open");
+        assert_eq!(tool_header_status(&container), "Failed");
+        assert_eq!(
+            outer.get_attribute("aria-label").as_deref(),
+            Some("Tool failed: canonical data could not be normalized")
+        );
+        let alert = container
+            .query_selector(".tool-typed-mismatch")
+            .unwrap()
+            .expect("normalization alert");
+        assert_eq!(alert.get_attribute("role").as_deref(), Some("alert"));
+
+        let nested = container
+            .query_selector("details.tool-malformed-payload")
+            .unwrap()
+            .expect("sanitized nested disclosure")
+            .dyn_into::<web_sys::HtmlDetailsElement>()
+            .expect("details element");
+        assert!(!nested.open(), "only the sanitized payload stays closed");
+
+        outer.set_open(false);
+        outer
+            .dispatch_event(&web_sys::Event::new("toggle").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert!(outer.open(), "malformed outer detail cannot be collapsed");
+    }
+
+    #[wasm_bindgen_test]
+    async fn result_only_marker_fails_shell_without_request_diagnostic() {
+        let mut entry = typed_send_entry(
+            "message remains semantic",
+            Some(ToolExecutionResult::TydeSendAgentMessage),
+            true,
+        );
+        entry.result.as_mut().unwrap().normalization_failure =
+            Some(ToolExecutionNormalizationFailure::CanonicalResult);
+        let (container, _state) = mount_card(entry, None);
+        next_tick().await;
+
+        let outer = container
+            .query_selector("details.tool-card")
+            .unwrap()
+            .expect("tool shell")
+            .dyn_into::<web_sys::HtmlDetailsElement>()
+            .expect("details element");
+        assert!(outer.open());
+        assert_eq!(tool_header_status(&container), "Failed");
+        assert!(text(&container).contains("result normalization failed"));
+        assert_eq!(count(&container, ".tool-typed-mismatch[role='alert']"), 1);
+        assert_eq!(count(&container, ".tool-malformed-payload"), 0);
+    }
+
+    #[wasm_bindgen_test]
+    async fn combined_marker_keeps_request_diagnostic_and_combined_header() {
+        let mut entry = malformed_entry(ToolExecutionResult::Other { result: json!({}) }, true);
+        entry.result.as_mut().unwrap().normalization_failure =
+            Some(ToolExecutionNormalizationFailure::CanonicalRequestAndResult);
+        let (container, _state) = mount_card(entry, None);
+        next_tick().await;
+
+        assert_eq!(tool_header_status(&container), "Failed");
+        assert!(text(&container).contains("request and result normalization failed"));
+        assert_eq!(count(&container, ".tool-malformed-payload"), 1);
+    }
+
+    #[wasm_bindgen_test]
+    async fn normalization_error_completion_keeps_sanitized_request() {
+        let mut entry = malformed_entry(
+            ToolExecutionResult::Error {
+                short_message: "worker launch failed".to_owned(),
+                detailed_message: "request rejected before execution".to_owned(),
+            },
+            false,
+        );
+        let ToolRequestType::Other { args } = &mut entry.request.tool_type else {
+            unreachable!();
+        };
+        args["arguments"]["OPENAI_API_KEY"] = json!("sk-never-render");
+
+        let (container, _state) = mount_card(entry, None);
+        next_tick().await;
+
+        assert_eq!(tool_header_status(&container), "Failed");
+        let text = text(&container);
+        assert!(text.contains("Sanitized raw request"));
+        assert!(text.contains("OPENAI_API_KEY") && text.contains("[REDACTED]"));
+        assert!(!text.contains("sk-never-render"));
+    }
+
+    #[wasm_bindgen_test]
+    async fn matching_error_prose_without_marker_does_not_trigger_diagnostic() {
+        let mut entry = completed_other_request("toolu_spawn_error", "tyde_spawn_agent");
+        entry.result = Some(ToolExecutionCompletedData {
+            tool_call_id: "toolu_spawn_error".to_owned(),
+            tool_name: "tyde_spawn_agent".to_owned(),
+            tool_result: ToolExecutionResult::Error {
+                short_message: "worker launch failed".to_owned(),
+                detailed_message: "process exited before ready".to_owned(),
+            },
+            success: false,
+            error: Some("Failed to normalize canonical tool request".to_owned()),
+            normalization_failure: None,
+        });
+        let (container, _state) = mount_card(entry, None);
+        next_tick().await;
+
+        assert_eq!(count(&container, ".tool-malformed-payload"), 0);
+        assert_eq!(count(&container, ".tool-card-malformed"), 0);
+        assert_eq!(tool_header_status(&container), "Failed");
+        assert!(text(&container).contains("process exited before ready"));
+    }
+
+    /// The `tyde_spawn_agent` prompt must stay visible.
+    ///
+    /// Spawn is deliberately *not* typed in this change, so it still routes to
+    /// the generic `Other` renderer and its prompt still shows exactly as it did
+    /// before. This test is the guard against a future "simplification" that
+    /// turns the orchestration rule into a blanket "agent-control cards hide
+    /// raw" — which would silently delete the spawn prompt, the one place the
+    /// task brief is visible at all.
+    #[wasm_bindgen_test]
+    async fn spawn_card_keeps_prompt_visible() {
+        const PROMPT: &str = "Implement the typed orchestration cards and lock them with tests";
+        let mut entry = completed_other_request("toolu_agent_control", "tyde_spawn_agent");
+        entry.request.tool_type = ToolRequestType::Other {
+            args: json!({ "prompt": PROMPT, "name": "Worker" }),
+        };
+        let (container, _state) = mount_card(
+            entry,
+            Some(agent_control_progress_data(AgentControlProgressKind::Spawn)),
+        );
+        next_tick().await;
+
+        let body = text(&container);
+        assert!(
+            body.contains(PROMPT),
+            "the spawn prompt must remain visible in the default view: {body}"
+        );
+        assert_eq!(
+            count(&container, "pre.tool-raw-args"),
+            1,
+            "spawn still routes to the generic renderer, unchanged"
         );
     }
 

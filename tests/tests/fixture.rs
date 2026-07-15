@@ -78,19 +78,43 @@ impl Fixture {
             server::HostRuntimeConfig::default(),
             false,
             Some(enabled_backends),
+            true,
+        )
+        .await
+    }
+
+    #[allow(dead_code)]
+    pub async fn new_with_real_tycode_backend() -> Self {
+        Self::new_with_runtime_config_inner(
+            server::HostRuntimeConfig::default(),
+            false,
+            Some(vec![BackendKind::Tycode]),
+            false,
+        )
+        .await
+    }
+
+    #[allow(dead_code)]
+    pub async fn new_with_test_backend(backend_kind: BackendKind) -> Self {
+        Self::new_with_runtime_config_inner(
+            server::HostRuntimeConfig::default(),
+            true,
+            Some(vec![backend_kind]),
+            false,
         )
         .await
     }
 
     #[allow(dead_code)]
     pub async fn new_with_runtime_config(runtime_config: server::HostRuntimeConfig) -> Self {
-        Self::new_with_runtime_config_inner(runtime_config, true, None).await
+        Self::new_with_runtime_config_inner(runtime_config, true, None, true).await
     }
 
     async fn new_with_runtime_config_inner(
         mut runtime_config: server::HostRuntimeConfig,
         skip_real_backend_probe: bool,
         enabled_backends: Option<Vec<BackendKind>>,
+        use_mock_backend: bool,
     ) -> Self {
         init_tracing();
 
@@ -115,13 +139,22 @@ impl Fixture {
                 .apply(HostSettingValue::EnabledBackends { enabled_backends })
                 .expect("seed fixture enabled backends");
         }
-        let host = server::spawn_host_with_mock_backend_and_runtime_config(
-            session_path,
-            project_path,
-            settings_path,
-            runtime_config,
-        )
-        .expect("initialize host with mock backend");
+        let host = if use_mock_backend {
+            server::spawn_host_with_mock_backend_and_runtime_config(
+                session_path,
+                project_path,
+                settings_path,
+                runtime_config,
+            )
+        } else {
+            server::spawn_host_with_store_paths_and_runtime_config(
+                session_path,
+                project_path,
+                settings_path,
+                runtime_config,
+            )
+        }
+        .expect("initialize fixture host");
         let (client, bootstrap) = connect_client_with_bootstrap(host.clone()).await;
 
         Self {
@@ -193,6 +226,11 @@ impl Fixture {
             .agent_control_mcp_caller(agent_id)
             .await
             .expect("active agent should receive agent-control credentials")
+    }
+
+    #[allow(dead_code)]
+    pub fn install_workbench_remove_test_hook(&self) -> server::InstalledWorkbenchRemoveHook {
+        self.host.install_workbench_remove_test_hook()
     }
 
     #[allow(dead_code)]

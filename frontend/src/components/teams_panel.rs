@@ -146,14 +146,8 @@ pub fn TeamsPanel() -> impl IntoView {
             });
         }
 
-        active_team_state.center_zone.with(|cz| {
-            let pending = match &cz.active_tab()?.content {
-                TabContent::Chat {
-                    agent_ref: None,
-                    pending_team_member: Some(pending),
-                } => pending.clone(),
-                _ => return None,
-            };
+        active_team_state.center_zone.with(|_| {
+            let pending = active_team_state.composer_pending_team_member_untracked()?;
             active_team_state.team_members.with(|members_map| {
                 let member = members_map.get(&pending.host_id)?.get(&pending.member_id)?;
                 Some((
@@ -2475,15 +2469,15 @@ fn delete_member(state: &AppState, host_id: String, member_id: TeamMemberId) {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
-    use crate::state::ConnectionStatus;
+    use crate::state::{ConnectionStatus, FileResourceKey, OpenTarget};
     use leptos::mount::mount_to;
     use protocol::{
-        AgentControlStatus, AgentId, CustomAgent, CustomAgentId, FrameKind, SessionId, StreamPath,
-        Team, TeamDraft, TeamDraftId, TeamDraftMember, TeamDraftMemberId, TeamId, TeamMember,
-        TeamMemberBindingPayload, TeamMemberId, TeamMemberPresetProfile, TeamMemberRole,
-        TeamMemberShuffleSuggestion, TeamMemberShuffleSuggestionNotifyPayload, TeamMemberState,
-        TeamPersonalityPresetId, TeamPersonalityTrait, TeamRolePresetId, TeamTemplateId,
-        ToolPolicy,
+        AgentControlStatus, AgentId, CustomAgent, CustomAgentId, FrameKind, ProjectId, ProjectPath,
+        ProjectRootPath, SessionId, StreamPath, Team, TeamDraft, TeamDraftId, TeamDraftMember,
+        TeamDraftMemberId, TeamId, TeamMember, TeamMemberBindingPayload, TeamMemberId,
+        TeamMemberPresetProfile, TeamMemberRole, TeamMemberShuffleSuggestion,
+        TeamMemberShuffleSuggestionNotifyPayload, TeamMemberState, TeamPersonalityPresetId,
+        TeamPersonalityTrait, TeamRolePresetId, TeamTemplateId, ToolPolicy,
     };
     use std::collections::HashMap;
     use wasm_bindgen::JsCast;
@@ -3339,7 +3333,7 @@ mod wasm_tests {
         );
         assert_eq!(
             state
-                .active_pending_team_member_untracked()
+                .composer_pending_team_member_untracked()
                 .map(|p| p.member_id),
             Some(manager_id.clone()),
             "active tab should be a draft team-member tab keyed to the manager"
@@ -3417,7 +3411,7 @@ mod wasm_tests {
         );
         assert_eq!(
             state
-                .active_pending_team_member_untracked()
+                .composer_pending_team_member_untracked()
                 .map(|p| p.member_id),
             Some(manager_id),
             "active tab should be a draft team-member tab keyed to the manager"
@@ -3439,7 +3433,7 @@ mod wasm_tests {
     /// Some(_) }` instead of `SpawnAgent`. The `NewAgent` echo from the
     /// server would then upgrade the tab — covered in dispatch tests.
     #[wasm_bindgen_test]
-    async fn first_message_in_fresh_draft_sends_activate_with_prompt() {
+    async fn file_beside_fresh_draft_sends_activate_with_prompt() {
         let calls = install_send_stub();
 
         let host_id = "host-a";
@@ -3465,6 +3459,32 @@ mod wasm_tests {
         open_member_chat(&state, host_id.to_owned(), manager_id.clone());
         next_tick().await;
 
+        // Put a file beside the pending chat and focus the file. The pending
+        // member must still come from composer_owner(), not active_tab().
+        state.tabs_enabled.set(true);
+        state.open_tab_at(
+            OpenTarget::Beside,
+            TabContent::File {
+                key: FileResourceKey {
+                    host_id: host_id.to_owned(),
+                    project_id: ProjectId("p-1".to_owned()),
+                    path: ProjectPath {
+                        root: ProjectRootPath("/repo".to_owned()),
+                        relative_path: "notes.rs".to_owned(),
+                    },
+                },
+            },
+            "notes.rs".to_owned(),
+            true,
+        );
+        assert_eq!(
+            state
+                .composer_pending_team_member_untracked()
+                .map(|target| target.member_id),
+            Some(manager_id.clone()),
+            "a focused file beside the draft must not retarget its composer"
+        );
+
         // No team activation yet (this is the fresh case — case 3). Opening
         // the draft switches project context, which now sends the intentional
         // ProjectAccessed warmup before any user message.
@@ -3482,25 +3502,34 @@ mod wasm_tests {
             "opening the draft should send exactly one ProjectAccessed warmup: {frames_before_message:?}"
         );
 
-        // Type a message and submit via the chat input's submit path.
-        state.chat_input.set("hello".to_owned());
-        // submit_chat_input is private; route through the public Effect by
-        // pumping the helper directly. We call `team_member_activate` via
-        // the same path: read the pending member, then send.
+        // Mount the real composer with the pending target supplied by its
+        // owner, then submit through the same button a user clicks.
         let pending = state
-            .active_pending_team_member_untracked()
-            .expect("active tab should be draft team-member");
-        let stream = state
-            .host_stream_untracked(&pending.host_id)
-            .expect("host stream installed");
-        let _ = crate::send::team_member_activate(
-            &pending.host_id,
-            stream,
-            pending.member_id,
-            Some("hello".to_owned()),
-            None,
-        )
-        .await;
+            .composer_pending_team_member_untracked()
+            .expect("composer owner should be draft team-member");
+        state.chat_input.set("hello".to_owned());
+        let container = make_container();
+        let state_for_mount = state.clone();
+        let pending_for_mount = pending.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            let agent_ref = Signal::derive(|| None);
+            let pending_team_member = Signal::derive(move || Some(pending_for_mount.clone()));
+            view! {
+                <crate::components::chat_input::ChatInput
+                    agent_ref=agent_ref
+                    pending_team_member=pending_team_member
+                />
+            }
+        });
+        next_tick().await;
+        let send: HtmlElement = container
+            .query_selector("[data-test='chat-send-primary']")
+            .unwrap()
+            .expect("team-member composer send button")
+            .dyn_into()
+            .unwrap();
+        send.click();
         next_tick().await;
 
         let frames = recorded_frames(&calls);
@@ -3555,7 +3584,7 @@ mod wasm_tests {
         );
         assert_eq!(
             state
-                .active_pending_team_member_untracked()
+                .composer_pending_team_member_untracked()
                 .map(|p| p.member_id),
             Some(report_id),
             "active tab should be a draft team-member tab keyed to the report"

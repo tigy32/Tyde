@@ -2173,32 +2173,12 @@ mod wasm_tests {
         );
     }
 
-    fn record_bridge() {
-        let _ = js_sys::eval(
-            "(function(){ \
-               window.__sent_lines = []; \
-               window.__TAURI__ = window.__TAURI__ || {}; \
-               window.__TAURI__.core = window.__TAURI__.core || {}; \
-               window.__TAURI__.core.invoke = function(cmd, args){ \
-                 try { \
-                   if (cmd === 'send_host_line' && args) { \
-                     var line = (args.line !== undefined) ? args.line \
-                       : (args.get ? args.get('line') : undefined); \
-                     if (line !== undefined) { window.__sent_lines.push(line); } \
-                   } \
-                 } catch (e) {} \
-                 return Promise.resolve(); }; \
-               window.__TAURI__.event = window.__TAURI__.event || {}; \
-               window.__TAURI__.event.listen = function(){ return Promise.resolve(function(){}); }; \
-             })();",
-        );
+    fn record_bridge() -> crate::bridge::TestSendGuard {
+        crate::bridge::test_capture_sends()
     }
 
     fn sent_lines_joined() -> String {
-        js_sys::eval("(window.__sent_lines||[]).join('\\n')")
-            .ok()
-            .and_then(|v| v.as_string())
-            .unwrap_or_default()
+        crate::bridge::test_sent_lines().join("\n")
     }
 
     /// Mobile "AI review" delegates the backend to the server: it sends
@@ -2206,7 +2186,7 @@ mod wasm_tests {
     /// client-side default resolution).
     #[wasm_bindgen_test]
     async fn mobile_ai_review_sends_none_backend() {
-        record_bridge();
+        let _send_guard = record_bridge();
         let host = LocalHostId("host-1".to_owned());
         let project = make_project(&host, "p-1");
         let key = ProjectDiffRef {
@@ -2297,18 +2277,10 @@ mod wasm_tests {
         );
     }
 
-    /// Rejecting bridge: every `invoke` fails, so `send_review_action`
-    /// returns an error (simulating a send failure).
-    fn reject_bridge() {
-        let _ = js_sys::eval(
-            "(function(){ \
-               window.__TAURI__ = window.__TAURI__ || {}; \
-               window.__TAURI__.core = window.__TAURI__.core || {}; \
-               window.__TAURI__.core.invoke = function(){ return Promise.reject('boom'); }; \
-               window.__TAURI__.event = window.__TAURI__.event || {}; \
-               window.__TAURI__.event.listen = function(){ return Promise.resolve(function(){}); }; \
-             })();",
-        );
+    /// Rejecting web connection seam: every send fails, so
+    /// `send_review_action` returns an error.
+    fn reject_bridge() -> crate::bridge::TestSendGuard {
+        crate::bridge::test_reject_sends()
     }
 
     fn review_without_comments(review_id: &ReviewId) -> Review {
@@ -2389,7 +2361,7 @@ mod wasm_tests {
     /// comment at the anchor) lands.
     #[wasm_bindgen_test]
     async fn mobile_composer_closes_only_on_confirmed_echo() {
-        record_bridge();
+        let _send_guard = record_bridge();
         let container = make_container();
         let (composer, state, location) = mount_composer(container.clone(), 2);
 
@@ -2437,7 +2409,7 @@ mod wasm_tests {
     /// (no optimistic close/clear).
     #[wasm_bindgen_test]
     async fn mobile_composer_retains_text_on_send_failure() {
-        reject_bridge();
+        let _send_guard = reject_bridge();
         let container = make_container();
         let (composer, _state, _location) = mount_composer(container.clone(), 2);
 
@@ -2466,7 +2438,7 @@ mod wasm_tests {
     /// `AddComment` — the pending gate blocks the second tap.
     #[wasm_bindgen_test]
     async fn mobile_composer_prevents_duplicate_sends() {
-        record_bridge();
+        let _send_guard = record_bridge();
         let container = make_container();
         let (_composer, _state, _location) = mount_composer(container.clone(), 2);
 
@@ -2492,11 +2464,8 @@ mod wasm_tests {
         );
     }
 
-    fn invoke_count() -> i32 {
-        js_sys::eval("window.__invoke_count")
-            .ok()
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0) as i32
+    fn send_attempt_count() -> i32 {
+        crate::bridge::test_send_attempts() as i32
     }
 
     /// A failed `ReviewSubscribe` must NOT latch a stream registration (which
@@ -2504,18 +2473,8 @@ mod wasm_tests {
     /// later reactive change re-runs it.
     #[wasm_bindgen_test]
     async fn subscribe_failure_does_not_latch_and_retries() {
-        // Rejecting recording bridge: every send fails; count invokes.
-        let _ = js_sys::eval(
-            "(function(){ \
-               window.__invoke_count = 0; \
-               window.__TAURI__ = window.__TAURI__ || {}; \
-               window.__TAURI__.core = window.__TAURI__.core || {}; \
-               window.__TAURI__.core.invoke = function(){ \
-                 window.__invoke_count++; return Promise.reject('boom'); }; \
-               window.__TAURI__.event = window.__TAURI__.event || {}; \
-               window.__TAURI__.event.listen = function(){ return Promise.resolve(null); }; \
-             })();",
-        );
+        // Rejecting web connection seam: every send fails; count attempts.
+        let _send_guard = reject_bridge();
         let host = LocalHostId("host-1".to_owned());
         let project = make_project(&host, "p-1");
         let diff_key = ProjectDiffRef {
@@ -2577,16 +2536,16 @@ mod wasm_tests {
                 .with_untracked(|s| s.contains_key(&review_key)),
             "a failed subscribe must not register the review stream (it would block retry)"
         );
-        let after_first = invoke_count();
+        let after_first = send_attempt_count();
         assert!(after_first >= 1, "a subscribe must have been attempted");
 
         // A reactive change re-runs the effect ⇒ it retries (not latched).
         state.reviews.update(|_| {});
         next_tick().await;
         assert!(
-            invoke_count() > after_first,
+            send_attempt_count() > after_first,
             "the subscribe must retry after a reactive change (was {after_first}, now {})",
-            invoke_count()
+            send_attempt_count()
         );
     }
 

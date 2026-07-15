@@ -114,6 +114,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::SessionSchemas
                 | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
+                | FrameKind::BackendCapacity
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
@@ -158,6 +159,7 @@ async fn expect_raw_event_on_stream(
                 | FrameKind::SessionSchemas
                 | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
+                | FrameKind::BackendCapacity
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
@@ -399,6 +401,7 @@ async fn wait_for_session_list(
                 | FrameKind::SessionSchemas
                 | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
+                | FrameKind::BackendCapacity
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
@@ -471,6 +474,7 @@ async fn expect_no_event(client: &mut client::Connection, duration: Duration, co
                             | FrameKind::SessionSchemas
                             | FrameKind::LaunchProfileCatalogNotify
                             | FrameKind::BackendSetup
+                            | FrameKind::BackendCapacity
                             | FrameKind::QueuedMessages
                             | FrameKind::SessionSettings
                             | FrameKind::TeamPresetCatalogNotify

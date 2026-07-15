@@ -1,6 +1,10 @@
-use protocol::{Envelope, FrameError, FrameKind, read_envelope};
+use std::sync::Arc;
+
+use protocol::{
+    Envelope, FrameError, FrameKind, HostSettingErrorTarget, SetSettingPayload, read_envelope,
+};
 use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::Connection;
@@ -13,6 +17,19 @@ use crate::stream::Stream;
 enum ConnectionOrigin {
     Desktop,
     Mobile,
+}
+
+const BOOTSTRAP_REPLAY_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
+
+struct AppLoopResources {
+    host: HostHandle,
+    host_stream: protocol::StreamPath,
+    host_output_stream: Stream,
+    inbound_rx: mpsc::UnboundedReceiver<Envelope>,
+    incoming_seq: protocol::SeqValidator,
+    cancel: CancellationToken,
+    origin: ConnectionOrigin,
+    first_request: Arc<Notify>,
 }
 
 pub async fn run_connection(connection: Connection, host: HostHandle) -> Result<(), FrameError> {
@@ -76,13 +93,15 @@ async fn run_connection_with_origin(
         let cancel = cancel.clone();
         tokio::spawn(writer_loop(writer, output_rx, outgoing_seq, cancel))
     };
+    let first_request = Arc::new(Notify::new());
     let app_task = {
         let cancel = cancel.clone();
         let host = host.clone();
         let host_stream = host_stream.clone();
         let host_output_stream = host_output_stream.clone();
+        let app_first_request = Arc::clone(&first_request);
         tokio::spawn(async move {
-            app_loop(
+            app_loop(AppLoopResources {
                 host,
                 host_stream,
                 host_output_stream,
@@ -90,10 +109,25 @@ async fn run_connection_with_origin(
                 incoming_seq,
                 cancel,
                 origin,
-            )
+                first_request: app_first_request,
+            })
             .await
         })
     };
+
+    let capacity_replay_host = host.clone();
+    let capacity_replay_stream = host_stream.clone();
+    let capacity_replay_cancel = cancel.clone();
+    let capacity_replay_task = tokio::spawn(async move {
+        tokio::select! {
+            _ = capacity_replay_cancel.cancelled() => return,
+            _ = first_request.notified() => {}
+            _ = tokio::time::sleep(BOOTSTRAP_REPLAY_GRACE) => {}
+        }
+        capacity_replay_host
+            .replay_backend_capacity_for_host_stream(&capacity_replay_stream)
+            .await;
+    });
 
     // Wait for the first task to finish, then tear the scope down.
     // Drain only the two losers — re-polling a JoinHandle that tokio::select!
@@ -142,6 +176,8 @@ async fn run_connection_with_origin(
             let _ = writer_task.await;
         }
     }
+    capacity_replay_task.abort();
+    let _ = capacity_replay_task.await;
 
     host.unregister_host_stream(&host_stream).await;
     result
@@ -235,15 +271,17 @@ where
     Ok(())
 }
 
-async fn app_loop(
-    host: HostHandle,
-    host_stream: protocol::StreamPath,
-    host_output_stream: Stream,
-    mut inbound_rx: mpsc::UnboundedReceiver<Envelope>,
-    mut incoming_seq: protocol::SeqValidator,
-    cancel: CancellationToken,
-    origin: ConnectionOrigin,
-) -> Result<(), FrameError> {
+async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
+    let AppLoopResources {
+        host,
+        host_stream,
+        host_output_stream,
+        mut inbound_rx,
+        mut incoming_seq,
+        cancel,
+        origin,
+        first_request,
+    } = resources;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
@@ -283,6 +321,7 @@ async fn app_loop(
 
                 let request_stream = envelope.stream.clone();
                 let request_kind = envelope.kind;
+                let setting_target = set_setting_error_target(&envelope);
                 if origin == ConnectionOrigin::Mobile
                     && is_terminal_control_command(request_kind)
                 {
@@ -294,8 +333,10 @@ async fn app_loop(
                         &host_output_stream,
                         request_stream,
                         request_kind,
+                        setting_target,
                         &error,
                     );
+                    first_request.notify_one();
                     continue;
                 }
 
@@ -307,6 +348,7 @@ async fn app_loop(
                         &host_output_stream,
                         request_stream,
                         request_kind,
+                        setting_target,
                         &error,
                     );
 
@@ -314,6 +356,7 @@ async fn app_loop(
                         return Ok(());
                     }
                 }
+                first_request.notify_one();
             }
         }
     }
@@ -354,6 +397,7 @@ fn emit_command_error(
     host_output_stream: &Stream,
     request_stream: protocol::StreamPath,
     request_kind: FrameKind,
+    setting_target: Option<HostSettingErrorTarget>,
     error: &AppError,
 ) {
     if let Some(source) = error.source.as_ref() {
@@ -379,7 +423,7 @@ fn emit_command_error(
         );
     }
 
-    let payload = error.to_payload(request_stream, request_kind);
+    let payload = command_error_payload(request_stream, request_kind, setting_target, error);
     let payload = match serde_json::to_value(&payload) {
         Ok(value) => value,
         Err(err) => {
@@ -388,6 +432,33 @@ fn emit_command_error(
         }
     };
     let _ = host_output_stream.send_value(FrameKind::CommandError, payload);
+}
+
+fn command_error_payload(
+    request_stream: protocol::StreamPath,
+    request_kind: FrameKind,
+    setting_target: Option<HostSettingErrorTarget>,
+    error: &AppError,
+) -> protocol::CommandErrorPayload {
+    let mut payload = error.to_payload(request_stream, request_kind);
+    if request_kind == FrameKind::SetSetting {
+        payload.setting_target = Some(setting_target.unwrap_or(HostSettingErrorTarget::Malformed));
+    }
+    payload
+}
+
+fn set_setting_error_target(envelope: &Envelope) -> Option<HostSettingErrorTarget> {
+    if envelope.kind != FrameKind::SetSetting {
+        return None;
+    }
+
+    Some(
+        envelope
+            .parse_payload::<SetSettingPayload>()
+            .map_or(HostSettingErrorTarget::Malformed, |payload| {
+                payload.setting.error_target()
+            }),
+    )
 }
 
 #[cfg(test)]
@@ -410,5 +481,115 @@ mod tests {
 
         assert!(!is_terminal_control_command(FrameKind::SendMessage));
         assert!(!is_terminal_control_command(FrameKind::HostBrowseStart));
+    }
+
+    #[test]
+    fn set_setting_command_errors_have_value_free_typed_targets() {
+        let reset_projection_id = "projection-reset-01J";
+        let reset_state_hash = "sha256:reset-state";
+        let cases = [
+            (
+                protocol::HostSettingValue::ResetTycodeManagedProjection {
+                    backend: protocol::BackendKind::Tycode,
+                    expected_projection_id: protocol::TycodeProjectionId(
+                        reset_projection_id.to_owned(),
+                    ),
+                    expected_state_hash: protocol::TycodeProjectionStateHash(
+                        reset_state_hash.to_owned(),
+                    ),
+                },
+                HostSettingErrorTarget::ResetTycodeManagedProjection,
+            ),
+            (
+                protocol::HostSettingValue::BackendNativeSettings {
+                    backend: protocol::BackendKind::Tycode,
+                    settings: serde_json::json!({"api_key": "native-secret"}),
+                },
+                HostSettingErrorTarget::BackendNativeSettings,
+            ),
+            (
+                protocol::HostSettingValue::BackendConfig {
+                    backend: protocol::BackendKind::Tycode,
+                    values: protocol::BackendConfigValues::default(),
+                },
+                HostSettingErrorTarget::BackendConfig,
+            ),
+            (
+                protocol::HostSettingValue::EnableMobileConnections { enabled: true },
+                HostSettingErrorTarget::EnableMobileConnections,
+            ),
+        ];
+
+        for (setting, expected_target) in cases {
+            let envelope = Envelope::from_payload(
+                protocol::StreamPath("/host/error-target".to_owned()),
+                FrameKind::SetSetting,
+                1,
+                &protocol::SetSettingPayload { setting },
+            )
+            .expect("encode typed setting command");
+            let payload = command_error_payload(
+                envelope.stream.clone(),
+                envelope.kind,
+                set_setting_error_target(&envelope),
+                &AppError::invalid("set_setting", "setting save failed"),
+            );
+            assert_eq!(payload.setting_target, Some(expected_target));
+            let encoded = serde_json::to_value(&payload).expect("serialize setting error");
+            assert_eq!(
+                encoded["setting_target"],
+                serde_json::to_value(expected_target).expect("serialize setting target")
+            );
+            let encoded = encoded.to_string();
+            assert!(!encoded.contains(reset_projection_id));
+            assert!(!encoded.contains(reset_state_hash));
+            assert!(!encoded.contains("native-secret"));
+        }
+
+        let reset_error = command_error_payload(
+            protocol::StreamPath("/host/error-target".to_owned()),
+            FrameKind::SetSetting,
+            Some(HostSettingErrorTarget::ResetTycodeManagedProjection),
+            &AppError::conflict("set_setting", "reset token is stale"),
+        );
+        let encoded = serde_json::to_string(&reset_error).expect("serialize reset error");
+        assert!(encoded.contains("reset_tycode_managed_projection"));
+    }
+
+    #[test]
+    fn malformed_set_setting_errors_are_typed_and_other_errors_remain_compatible() {
+        let malformed = Envelope {
+            stream: protocol::StreamPath("/host/error-target".to_owned()),
+            kind: FrameKind::SetSetting,
+            seq: 1,
+            payload: serde_json::json!({
+                "setting": {
+                    "kind": "reset_tycode_managed_projection",
+                    "expected_projection_id": {"unexpected": "raw-token"},
+                },
+            }),
+        };
+        let malformed_error = command_error_payload(
+            malformed.stream.clone(),
+            malformed.kind,
+            set_setting_error_target(&malformed),
+            &AppError::invalid("set_setting", "invalid setting payload"),
+        );
+        assert_eq!(
+            malformed_error.setting_target,
+            Some(HostSettingErrorTarget::Malformed)
+        );
+        let encoded = serde_json::to_string(&malformed_error).expect("serialize malformed error");
+        assert!(!encoded.contains("raw-token"));
+
+        let other_error = command_error_payload(
+            protocol::StreamPath("/host/error-target".to_owned()),
+            FrameKind::SpawnAgent,
+            None,
+            &AppError::invalid("spawn_agent", "invalid agent"),
+        );
+        assert_eq!(other_error.setting_target, None);
+        let encoded = serde_json::to_value(&other_error).expect("serialize other command error");
+        assert!(encoded.get("setting_target").is_none());
     }
 }

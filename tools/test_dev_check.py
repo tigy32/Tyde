@@ -140,6 +140,13 @@ case "$*" in
 esac
 echo "successful cargo output that must stay in the stage log"
 echo "cargo $* toolchain=${RUSTUP_TOOLCHAIN-unset} real-ai=${TYDE_RUN_REAL_AI_TESTS-unset}/${TYDE_LIVE_CODEX_TEST-unset}/${TYDE_RUN_CLAUDE_INTEGRATION-unset}" >> "$DEV_CHECK_TEST_LOG"
+if [[ "${DEV_CHECK_NATIVE_MULTI_FAILURE:-0}" == 1 && "cargo $*" == "cargo nextest run" ]]; then
+  echo "FAIL [0.010s] tests::native first_independent_failure" >&2
+  echo "first independent failure diagnostics" >&2
+  echo "FAIL [0.020s] tests::native second_independent_failure" >&2
+  echo "second independent failure diagnostics" >&2
+  exit 9
+fi
 if [[ "${DEV_CHECK_FAIL_COMMAND:-}" == "cargo $*" ]]; then
   if [[ -n "${DEV_CHECK_FAIL_ON_RUN:-}" ]]; then
     count_file="$DEV_CHECK_TEST_LOG.fail-count"
@@ -500,6 +507,40 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
             [],
         )
 
+    def test_native_failure_retains_all_diagnostics_and_gates_later_work(self) -> None:
+        env = self.env.copy()
+        env["DEV_CHECK_NATIVE_MULTI_FAILURE"] = "1"
+
+        failed = self._run("--no-cache", env=env, check=False)
+
+        self.assertEqual(failed.returncode, 9)
+        self.assertIn("FAIL  cargo nextest run (1/1", failed.stderr)
+        for diagnostic in (
+            "first_independent_failure",
+            "first independent failure diagnostics",
+            "second_independent_failure",
+            "second independent failure diagnostics",
+        ):
+            self.assertIn(diagnostic, failed.stderr)
+        self.assertIn("Complete stage log:", failed.stderr)
+        lines = self._log_lines()
+        self.assertEqual(sum(line.startswith("cargo nextest run ") for line in lines), 1)
+        self.assertNotIn("wasm", lines)
+        self.assertFalse(any(line.startswith("node --test ") for line in lines))
+        run_dir = max((self.root / "target" / "dev-check-logs").glob("run-*"))
+        nextest_log = next(run_dir.glob("*-cargo-nextest-run.log"))
+        full_log = nextest_log.read_text(encoding="utf-8")
+        self.assertLess(
+            full_log.index("first_independent_failure"),
+            full_log.index("second_independent_failure"),
+        )
+        repetition_log = run_dir / ".repetition-10-1.log"
+        repetition_output = repetition_log.read_text(encoding="utf-8")
+        self.assertIn("first_independent_failure", repetition_output)
+        self.assertIn("second_independent_failure", repetition_output)
+        metadata = (run_dir / "metadata.txt").read_text(encoding="utf-8")
+        self.assertIn(f"failure_log={repetition_log}", metadata)
+
     def test_toolchain_update_failure_precedes_cache_evaluation_and_checks(self) -> None:
         self._run()
         before = self._log_lines()
@@ -702,22 +743,28 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
 
 
 class TestingBehaviorContractTests(unittest.TestCase):
-    def test_nextest_profiles_keep_source_output_concise(self) -> None:
+    def test_nextest_profiles_preserve_failure_and_output_policy(self) -> None:
         source = (REPO_ROOT / ".config" / "nextest.toml").read_text(
             encoding="utf-8"
         )
-        expected = {
+        shared = {
+            'global-timeout = "5m"',
+            'fail-fast = false',
             'status-level = "slow"',
             'final-status-level = "slow"',
             'success-output = "never"',
             'failure-output = "final"',
+        }
+        profile_specific = {
+            "default": {'slow-timeout = "30s"', "retries = 0"},
+            "ci": {'slow-timeout = "60s"', "retries = 2"},
         }
         for profile in ("default", "ci"):
             body = source.split(f"[profile.{profile}]\n", 1)[1].split(
                 f"\n[[profile.{profile}.scripts]]", 1
             )[0]
             lines = [line.strip() for line in body.splitlines()]
-            for setting in expected:
+            for setting in shared | profile_specific[profile]:
                 self.assertEqual(
                     lines.count(setting),
                     1,

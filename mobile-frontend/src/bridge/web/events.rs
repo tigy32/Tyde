@@ -1,12 +1,8 @@
 //! In-process event hub for the browser (PWA) backend.
 //!
-//! The Tauri shell delivers `tyde://host-line`, `tyde://host-disconnected`,
-//! etc. over Tauri's JS event bus because the connection manager lives in a
-//! separate native process from the webview. In the browser the manager and the
-//! Leptos app are the *same* wasm context, so there is no bus to cross — the web
-//! connection manager calls the registered Rust callbacks directly through this
-//! hub. The hub mirrors the Tauri event names/payloads exactly so the Leptos
-//! app's listener wiring (`app.rs`) is unchanged.
+//! The connection manager and Leptos app share one wasm context, so the manager
+//! calls registered Rust callbacks directly through this hub. The payloads
+//! preserve the mobile connection contract consumed by `app.rs`.
 
 use std::cell::RefCell;
 use std::rc::Rc;

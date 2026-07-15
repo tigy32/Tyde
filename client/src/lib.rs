@@ -10,19 +10,20 @@ use protocol::types::{AgentClosedPayload, CloseAgentPayload};
 use protocol::{
     AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentBootstrapPayload,
     AgentErrorPayload, AgentId, AgentRenamedPayload, AgentStartPayload,
-    AgentsViewPreferencesNotifyPayload, BackendConfigSchemasPayload, BackendConfigSnapshotsPayload,
-    BackendSetupPayload, BrowseBootstrapPayload, CancelQueuedMessagePayload, CancelWorkflowPayload,
-    CodeIntelDiagnosticsPayload, CodeIntelErrorPayload, CodeIntelFileModelPayload,
-    CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload, CodeIntelOverviewPayload,
-    CodeIntelReferencesCompletePayload, CodeIntelReferencesResultsPayload, CodeIntelStatusPayload,
-    CommandErrorPayload, CustomAgentDeletePayload, CustomAgentNotifyPayload,
-    CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FetchSessionHistoryPayload,
-    FrameError, FrameKind, HelloPayload, HostBootstrapPayload, HostBrowseStartPayload,
-    HostSettingsPayload, InterruptPayload, LaunchProfileCatalogPayload, ListSessionsPayload,
-    McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
-    MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload,
-    PROTOCOL_VERSION, ProjectAccessedPayload, ProjectAddRootPayload, ProjectBootstrapPayload,
-    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
+    AgentsViewPreferencesNotifyPayload, BackendCapacityPayload, BackendConfigSchemasPayload,
+    BackendConfigSnapshotsPayload, BackendSetupPayload, BrowseBootstrapPayload,
+    CancelQueuedMessagePayload, CancelWorkflowPayload, CodeIntelDiagnosticsPayload,
+    CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelHoverResultPayload,
+    CodeIntelNavigateResultPayload, CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
+    CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
+    CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
+    DeleteSessionPayload, Envelope, FetchSessionHistoryPayload, FrameError, FrameKind,
+    HelloPayload, HostBootstrapPayload, HostBrowseStartPayload, HostSettingsPayload,
+    InterruptPayload, LaunchProfileCatalogPayload, ListSessionsPayload, McpServerDeletePayload,
+    McpServerNotifyPayload, McpServerUpsertPayload, MobileAccessStatePayload,
+    MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload, PROTOCOL_VERSION,
+    ProjectAccessedPayload, ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload,
+    ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
     ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
     ProjectGitStatusPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload,
     ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
@@ -952,6 +953,10 @@ impl Connection {
                 }
                 FrameKind::BackendConfigSnapshots => {
                     let _: BackendConfigSnapshotsPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::BackendCapacity => {
+                    let _: BackendCapacityPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 FrameKind::SessionSchemas => {

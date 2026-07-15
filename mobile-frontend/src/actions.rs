@@ -1,7 +1,8 @@
 use leptos::prelude::{GetUntracked, Set, Update, WithUntracked};
 use protocol::types::AgentCompactPayload;
 
-use crate::send::send_frame;
+use crate::bridge::{Accepted, SendRejected};
+use crate::send::{SendFrameError, send_frame};
 use crate::state::{
     AgentRef, AppState, HostBrowseSession, LocalHostId, ProjectDiffRef, ProjectDiffState,
 };
@@ -10,12 +11,14 @@ pub async fn spawn_new_chat(
     state: &AppState,
     message: String,
     images: Vec<protocol::ImageData>,
-) -> Result<(), String> {
+) -> Result<Accepted, SendFrameError> {
     let host = state
         .active_local_host_id
         .get_untracked()
-        .ok_or("no active host")?;
-    let host_stream = state.host_stream_untracked(&host).ok_or("no host stream")?;
+        .ok_or(SendFrameError::Rejected(SendRejected::NotConnected))?;
+    let host_stream = state
+        .host_stream_untracked(&host)
+        .ok_or(SendFrameError::Rejected(SendRejected::NotConnected))?;
 
     let host_settings = state.active_host_settings_untracked();
 
@@ -28,7 +31,7 @@ pub async fn spawn_new_chat(
                 .as_ref()
                 .and_then(|s| s.enabled_backends.first().copied())
         })
-        .ok_or("no backend available")?;
+        .ok_or_else(|| frame_preparation_error("no backend available"))?;
 
     let custom_agent_id = state.draft_custom_agent_id.get_untracked();
     let session_settings = state.draft_session_settings.get_untracked();
@@ -51,7 +54,7 @@ pub async fn spawn_new_chat(
                             .collect()
                     })
             })
-            .ok_or("active project not found")?
+            .ok_or_else(|| frame_preparation_error("active project not found"))?
     } else {
         Vec::new()
     };
@@ -85,7 +88,7 @@ pub async fn spawn_new_chat(
         },
     };
 
-    send_frame(
+    let accepted = send_frame(
         &host,
         host_stream,
         protocol::FrameKind::SpawnAgent,
@@ -99,7 +102,7 @@ pub async fn spawn_new_chat(
         .draft_session_settings
         .set(protocol::SessionSettingsValues::default());
 
-    Ok(())
+    Ok(accepted)
 }
 
 /// Spawn a BTW / side question fork from the currently active agent. Mirrors
@@ -112,16 +115,16 @@ pub async fn spawn_side_question(
     state: &AppState,
     prompt: String,
     images: Vec<protocol::ImageData>,
-) -> Result<(), String> {
+) -> Result<Accepted, SendFrameError> {
     let prompt = prompt.trim().to_owned();
     if prompt.is_empty() && images.is_empty() {
-        return Err("prompt or images required".into());
+        return Err(frame_preparation_error("prompt or images required"));
     }
 
     let active = state
         .active_agent
         .get_untracked()
-        .ok_or("no active agent to fork from")?;
+        .ok_or_else(|| frame_preparation_error("no active agent to fork from"))?;
 
     let agent_info = state
         .agents
@@ -131,15 +134,17 @@ pub async fn spawn_side_question(
                 .find(|a| a.local_host_id == active.local_host_id && a.agent_id == active.agent_id)
                 .cloned()
         })
-        .ok_or("active agent not found")?;
+        .ok_or_else(|| frame_preparation_error("active agent not found"))?;
 
     let from_session_id = agent_info
         .session_id
         .clone()
-        .ok_or("active agent has no session id yet")?;
+        .ok_or_else(|| frame_preparation_error("active agent has no session id yet"))?;
 
     let host = active.local_host_id.clone();
-    let host_stream = state.host_stream_untracked(&host).ok_or("no host stream")?;
+    let host_stream = state
+        .host_stream_untracked(&host)
+        .ok_or(SendFrameError::Rejected(SendRejected::NotConnected))?;
 
     let payload = protocol::SpawnAgentPayload {
         name: None,
@@ -164,9 +169,7 @@ pub async fn spawn_side_question(
         protocol::FrameKind::SpawnAgent,
         &payload,
     )
-    .await?;
-
-    Ok(())
+    .await
 }
 
 /// Locate the agent's `instance_stream` so an outbound frame can be sent
@@ -189,9 +192,25 @@ fn host_stream(state: &AppState, host: &LocalHostId) -> Result<protocol::StreamP
         .ok_or("no host stream".to_owned())
 }
 
+fn frame_preparation_error(message: impl Into<String>) -> SendFrameError {
+    SendFrameError::Encoding(message.into())
+}
+
+async fn send_action<T: serde::Serialize>(
+    host: &LocalHostId,
+    stream: protocol::StreamPath,
+    kind: protocol::FrameKind,
+    payload: &T,
+) -> Result<(), String> {
+    send_frame(host, stream, kind, payload)
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 pub async fn load_agent(state: &AppState, agent_ref: &AgentRef) -> Result<(), String> {
     let stream = agent_instance_stream(state, agent_ref).ok_or("agent not found")?;
-    send_frame(
+    send_action(
         &agent_ref.local_host_id,
         stream,
         protocol::FrameKind::LoadAgent,
@@ -225,7 +244,7 @@ pub async fn rename_agent(
 ) -> Result<(), String> {
     let stream = agent_instance_stream(state, agent_ref).ok_or("agent not found")?;
     let payload = protocol::SetAgentNamePayload { name: new_name };
-    send_frame(
+    send_action(
         &agent_ref.local_host_id,
         stream,
         protocol::FrameKind::SetAgentName,
@@ -238,7 +257,7 @@ pub async fn rename_agent(
 /// which the dispatcher consumes and clears UI state.
 pub async fn close_agent(state: &AppState, agent_ref: &AgentRef) -> Result<(), String> {
     let stream = agent_instance_stream(state, agent_ref).ok_or("agent not found")?;
-    send_frame(
+    send_action(
         &agent_ref.local_host_id,
         stream,
         protocol::FrameKind::CloseAgent,
@@ -255,7 +274,7 @@ pub async fn cancel_queued_message(
     id: protocol::QueuedMessageId,
 ) -> Result<(), String> {
     let stream = agent_instance_stream(state, agent_ref).ok_or("agent not found")?;
-    send_frame(
+    send_action(
         &agent_ref.local_host_id,
         stream,
         protocol::FrameKind::CancelQueuedMessage,
@@ -270,7 +289,7 @@ pub async fn send_queued_message_now(
     id: protocol::QueuedMessageId,
 ) -> Result<(), String> {
     let stream = agent_instance_stream(state, agent_ref).ok_or("agent not found")?;
-    send_frame(
+    send_action(
         &agent_ref.local_host_id,
         stream,
         protocol::FrameKind::SendQueuedMessageNow,
@@ -281,7 +300,7 @@ pub async fn send_queued_message_now(
 
 pub async fn interrupt_agent(state: &AppState, agent_ref: &AgentRef) -> Result<(), String> {
     let stream = agent_instance_stream(state, agent_ref).ok_or("agent not found")?;
-    send_frame(
+    send_action(
         &agent_ref.local_host_id,
         stream,
         protocol::FrameKind::Interrupt,
@@ -297,7 +316,7 @@ pub async fn compact_agent(
     max_summary_bytes: Option<u32>,
 ) -> Result<(), String> {
     let stream = agent_instance_stream(state, agent_ref).ok_or("agent not found")?;
-    send_frame(
+    send_action(
         &agent_ref.local_host_id,
         stream,
         protocol::FrameKind::AgentCompact,
@@ -334,7 +353,7 @@ pub async fn request_project_file(
     project: &crate::state::ActiveProjectRef,
     path: protocol::ProjectPath,
 ) -> Result<(), String> {
-    send_frame(
+    send_action(
         &project.local_host_id,
         project_stream(&project.project_id),
         protocol::FrameKind::ProjectReadFile,
@@ -374,7 +393,7 @@ pub async fn request_project_diff(
         );
     });
 
-    send_frame(
+    send_action(
         &project.local_host_id,
         project_stream(&project.project_id),
         protocol::FrameKind::ProjectReadDiff,
@@ -394,10 +413,10 @@ pub async fn subscribe_review(
     review_id: protocol::ReviewId,
 ) -> Result<(), String> {
     let stream = review_stream(&review_id);
-    // Send first; only record the stream once the subscribe actually went
-    // out. Registering before the send would latch "already subscribed" even
-    // on a send failure, blocking the subscribe Effect from ever retrying.
-    send_frame(
+    // Admit first; only record the stream once the subscribe is queued locally.
+    // Registering before admission would latch "already subscribed" after a
+    // rejection, blocking the subscribe Effect from ever retrying.
+    send_action(
         host,
         stream.clone(),
         protocol::FrameKind::ReviewSubscribe,
@@ -438,7 +457,7 @@ pub async fn send_review_action(
                 .cloned()
         })
         .unwrap_or_else(|| review_stream(&review_id));
-    send_frame(host, stream, protocol::FrameKind::ReviewAction, &action).await
+    send_action(host, stream, protocol::FrameKind::ReviewAction, &action).await
 }
 
 pub async fn create_team(
@@ -447,7 +466,7 @@ pub async fn create_team(
     name: String,
     manager: protocol::TeamMemberCreateSpec,
 ) -> Result<(), String> {
-    send_frame(
+    send_action(
         host,
         host_stream(state, host)?,
         protocol::FrameKind::TeamCreate,
@@ -462,7 +481,7 @@ pub async fn rename_team(
     id: protocol::TeamId,
     name: String,
 ) -> Result<(), String> {
-    send_frame(
+    send_action(
         host,
         host_stream(state, host)?,
         protocol::FrameKind::TeamRename,
@@ -476,7 +495,7 @@ pub async fn delete_team(
     host: &LocalHostId,
     id: protocol::TeamId,
 ) -> Result<(), String> {
-    send_frame(
+    send_action(
         host,
         host_stream(state, host)?,
         protocol::FrameKind::TeamDelete,
@@ -491,7 +510,7 @@ pub async fn set_team_manager(
     team_id: protocol::TeamId,
     new_manager_member_id: protocol::TeamMemberId,
 ) -> Result<(), String> {
-    send_frame(
+    send_action(
         host,
         host_stream(state, host)?,
         protocol::FrameKind::TeamSetManager,
@@ -510,7 +529,7 @@ pub async fn create_team_member(
     member: protocol::TeamMemberCreateSpec,
     session_id: Option<protocol::SessionId>,
 ) -> Result<(), String> {
-    send_frame(
+    send_action(
         host,
         host_stream(state, host)?,
         protocol::FrameKind::TeamMemberCreate,
@@ -528,7 +547,7 @@ pub async fn update_team_member(
     host: &LocalHostId,
     payload: protocol::TeamMemberUpdatePayload,
 ) -> Result<(), String> {
-    send_frame(
+    send_action(
         host,
         host_stream(state, host)?,
         protocol::FrameKind::TeamMemberUpdate,
@@ -542,7 +561,7 @@ pub async fn delete_team_member(
     host: &LocalHostId,
     id: protocol::TeamMemberId,
 ) -> Result<(), String> {
-    send_frame(
+    send_action(
         host,
         host_stream(state, host)?,
         protocol::FrameKind::TeamMemberDelete,
@@ -558,7 +577,7 @@ pub async fn activate_team_member(
     prompt: Option<String>,
     images: Option<Vec<protocol::ImageData>>,
 ) -> Result<(), String> {
-    send_frame(
+    send_action(
         host,
         host_stream(state, host)?,
         protocol::FrameKind::TeamMemberActivate,
@@ -578,7 +597,7 @@ pub async fn compact_team(
     summary_prompt: Option<String>,
     max_summary_bytes: Option<u32>,
 ) -> Result<(), String> {
-    send_frame(
+    send_action(
         host,
         host_stream(state, host)?,
         protocol::FrameKind::TeamCompact,
@@ -596,7 +615,7 @@ pub async fn shuffle_team_member(
     host: &LocalHostId,
     team_id: protocol::TeamId,
 ) -> Result<(), String> {
-    send_frame(
+    send_action(
         host,
         host_stream(state, host)?,
         protocol::FrameKind::TeamMemberShuffle,
@@ -610,7 +629,7 @@ pub async fn create_team_draft(
     host: &LocalHostId,
     template_id: Option<protocol::TeamTemplateId>,
 ) -> Result<(), String> {
-    send_frame(
+    send_action(
         host,
         host_stream(state, host)?,
         protocol::FrameKind::TeamDraftCreate,
@@ -624,7 +643,7 @@ pub async fn update_team_draft(
     host: &LocalHostId,
     update: protocol::TeamDraftUpdatePayload,
 ) -> Result<(), String> {
-    send_frame(
+    send_action(
         host,
         host_stream(state, host)?,
         protocol::FrameKind::TeamDraftUpdate,
@@ -638,7 +657,7 @@ pub async fn shuffle_team_draft(
     host: &LocalHostId,
     payload: protocol::TeamDraftShufflePayload,
 ) -> Result<(), String> {
-    send_frame(
+    send_action(
         host,
         host_stream(state, host)?,
         protocol::FrameKind::TeamDraftShuffle,
@@ -653,7 +672,7 @@ pub async fn apply_team_draft_template(
     draft_id: protocol::TeamDraftId,
     template_id: protocol::TeamTemplateId,
 ) -> Result<(), String> {
-    send_frame(
+    send_action(
         host,
         host_stream(state, host)?,
         protocol::FrameKind::TeamDraftApplyTemplate,
@@ -670,7 +689,7 @@ pub async fn commit_team_draft(
     host: &LocalHostId,
     draft_id: protocol::TeamDraftId,
 ) -> Result<(), String> {
-    send_frame(
+    send_action(
         host,
         host_stream(state, host)?,
         protocol::FrameKind::TeamDraftCommit,
@@ -684,7 +703,7 @@ pub async fn discard_team_draft(
     host: &LocalHostId,
     draft_id: protocol::TeamDraftId,
 ) -> Result<(), String> {
-    send_frame(
+    send_action(
         host,
         host_stream(state, host)?,
         protocol::FrameKind::TeamDraftDiscard,
@@ -712,7 +731,7 @@ pub async fn start_host_browse(
             },
         );
     });
-    send_frame(
+    send_action(
         host,
         host_stream(state, host)?,
         protocol::FrameKind::HostBrowseStart,
@@ -732,7 +751,7 @@ pub async fn list_host_browse_path(
     path: protocol::HostAbsPath,
     include_hidden: bool,
 ) -> Result<(), String> {
-    send_frame(
+    send_action(
         host,
         browse_stream,
         protocol::FrameKind::HostBrowseList,
@@ -749,7 +768,7 @@ pub async fn close_host_browse(
     host: &LocalHostId,
     browse_stream: protocol::StreamPath,
 ) -> Result<(), String> {
-    send_frame(
+    send_action(
         host,
         browse_stream.clone(),
         protocol::FrameKind::HostBrowseClose,

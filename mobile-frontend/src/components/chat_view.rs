@@ -4,13 +4,92 @@ use std::rc::Rc;
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
+use crate::bridge;
 use crate::components::chat_input::ChatInput;
 use crate::components::chat_message::ChatMessageView;
+use crate::components::pending_submissions::AgentPendingSubmissions;
 use crate::components::ui::{Button, ButtonSize, ButtonVariant, EmptyState, Spinner};
-use crate::state::{AgentRef, AppState};
+use crate::state::{AgentRef, AppState, LocalHostId};
 
 const CHAT_STICKY_BOTTOM_THRESHOLD_PX: i32 = 80;
 const SESSION_HISTORY_PAGE_LIMIT: u32 = 50;
+
+/// Minimum touch-target size, inline so the recovery control stays tappable
+/// independently of the stylesheet.
+const RECOVERY_TOUCH_TARGET: &str = "min-width:44px;min-height:44px;";
+
+/// Surface a failed interrupt.
+///
+/// An `Interrupt` carries no user text, so there is nothing to hold and nothing
+/// to recover — it is not a `PendingSubmission`. What it does have is a
+/// consequence: if the frame never went out, the agent is **still running**. That
+/// has to be said, not swallowed.
+///
+/// Routed through `mobile_shell_error`, which renders as a dismissible
+/// `role="alert"` banner — the same surface every other rejected admission uses,
+/// and one that sits above whatever the user navigates to next.
+fn report_interrupt_error(state: &AppState, message: String) {
+    log::error!("{message}");
+    state
+        .mobile_shell_error
+        .set(Some(crate::state::MobileShellError {
+            code: protocol::MobileAccessErrorCode::TransportFailed,
+            message,
+        }));
+}
+
+/// The terminal state of a conversation that could not be loaded.
+///
+/// This is what the spinner turns into. It is an `alert`, not a status: the
+/// screen reader was told "Loading conversation" and must be told how that
+/// ended, rather than being left on an unbounded live region forever.
+///
+/// The only recovery offered is a reconnect. There is deliberately no in-place
+/// "try again": the server rejects a second `LoadAgent` on an already-attached
+/// stream as a conflict, so retrying in place is guaranteed to fail. Dropping
+/// the connection and coming back clears the load latch and re-loads the agent
+/// on a fresh instance stream, which actually works.
+#[component]
+fn ChatLoadFailed(host: LocalHostId, message: String) -> impl IntoView {
+    let reconnecting = RwSignal::new(false);
+
+    let on_reconnect = move |_| {
+        // The host is passed in from the agent's own `AgentRef`, not read back
+        // out of `active_local_host_id`. Reconnecting "whatever host is currently
+        // selected" is a different action from reconnecting the host this
+        // conversation belongs to.
+        let host = host.clone();
+        reconnecting.set(true);
+        spawn_local(async move {
+            if let Err(error) = bridge::disconnect_paired_host(&host).await {
+                log::error!("reconnect: disconnect_paired_host({host}) failed: {error}");
+            }
+            if let Err(error) = bridge::connect_paired_host(&host).await {
+                log::error!("reconnect: connect_paired_host({host}) failed: {error}");
+            }
+            reconnecting.set(false);
+        });
+    };
+
+    view! {
+        <div class="chat-load-failed" role="alert" data-mobile-test="chat-load-failed">
+            <p class="chat-load-failed-message" data-mobile-test="chat-load-failed-message">
+                {message}
+            </p>
+            <button
+                type="button"
+                class="chat-load-failed-reconnect"
+                style=RECOVERY_TOUCH_TARGET
+                data-mobile-test="chat-load-failed-reconnect"
+                aria-label="Reconnect to this host and load the conversation again"
+                disabled=move || reconnecting.get()
+                on:click=on_reconnect
+            >
+                {move || if reconnecting.get() { "Reconnecting…" } else { "Reconnect" }}
+            </button>
+        </div>
+    }
+}
 
 /// Edge-swipe-to-go-back tuning. The gesture fires the same action as the
 /// back button: a horizontal swipe that *starts* within `EDGE_ZONE_PX` of a
@@ -159,27 +238,50 @@ pub fn ChatView() -> impl IntoView {
 
     let s_interrupt = state.clone();
     let on_interrupt = Callback::new(move |_: ()| {
-        let active = s_interrupt.active_agent.get_untracked();
-        if let Some(ar) = active {
-            let agent_stream = s_interrupt.agents.with_untracked(|agents| {
-                agents
-                    .iter()
-                    .find(|a| a.local_host_id == ar.local_host_id && a.agent_id == ar.agent_id)
-                    .map(|a| a.instance_stream.clone())
-            });
-            if let Some(stream) = agent_stream {
-                let host_id = ar.local_host_id.clone();
-                spawn_local(async move {
-                    let _ = crate::send::send_frame(
-                        &host_id,
-                        stream,
-                        protocol::FrameKind::Interrupt,
-                        &protocol::InterruptPayload {},
-                    )
-                    .await;
-                });
+        let Some(ar) = s_interrupt.active_agent.get_untracked() else {
+            return;
+        };
+        let agent_stream = s_interrupt.agents.with_untracked(|agents| {
+            agents
+                .iter()
+                .find(|a| a.local_host_id == ar.local_host_id && a.agent_id == ar.agent_id)
+                .map(|a| a.instance_stream.clone())
+        });
+        let Some(stream) = agent_stream else {
+            report_interrupt_error(
+                &s_interrupt,
+                "Could not stop the turn: this agent's stream is no longer available.".to_owned(),
+            );
+            return;
+        };
+        let host_id = ar.local_host_id.clone();
+        let state = s_interrupt.clone();
+        spawn_local(async move {
+            // The result used to be dropped with `let _ =`. A rejected admission
+            // is exactly the case that matters here: the user taps Stop, the
+            // frame never enters the outbound queue, the turn keeps running — and
+            // nothing at all appears on screen. They are left believing they
+            // stopped an agent that is still spending money.
+            //
+            // Admission is also *only* admission. Nothing here claims the turn
+            // was interrupted: the agent stops when the server says it stopped,
+            // which the UI already reflects through `agent_turn_active`. There is
+            // no success message to make, so the success arm is silent — the
+            // failure arm is the whole point.
+            if let Err(error) = crate::send::send_frame(
+                &host_id,
+                stream,
+                protocol::FrameKind::Interrupt,
+                &protocol::InterruptPayload {},
+            )
+            .await
+            {
+                report_interrupt_error(
+                    &state,
+                    format!("Could not stop the turn: {error}. The agent is still running."),
+                );
             }
-        }
+        });
     });
 
     let s_turn = state.clone();
@@ -311,6 +413,7 @@ pub fn ChatView() -> impl IntoView {
         }
     };
 
+    let s_pending = state.clone();
     let s_body = state.clone();
     let scroll_ref = NodeRef::<leptos::html::Div>::new();
     let user_scrolled_up = RwSignal::new(false);
@@ -365,8 +468,19 @@ pub fn ChatView() -> impl IntoView {
                             key_for_load.agent_id,
                             error
                         );
-                        state_for_load.agent_load_requests.update(|loads| {
-                            loads.remove(&key_for_load);
+                        // Record the failure and *keep* the latch. Clearing it
+                        // would let this effect re-send `LoadAgent` on its next
+                        // run, and the server rejects a duplicate load on an
+                        // already-attached stream as a conflict — so an in-place
+                        // retry cannot succeed. The typed error is what ends the
+                        // spinner; recovery is a deliberate reconnect, which
+                        // clears both the latch and the error and loads again on
+                        // a fresh instance stream.
+                        state_for_load.agent_load_errors.update(|errors| {
+                            errors.insert(
+                                key_for_load.clone(),
+                                format!("Could not open this conversation: {error}"),
+                            );
                         });
                     }
                 });
@@ -637,17 +751,62 @@ pub fn ChatView() -> impl IntoView {
                         // `agent_load_requests` the moment it's sent and only
                         // lands in `agent_loaded` once the bootstrap snapshot
                         // arrives; the gap is where a blank flash would
-                        // otherwise read as an empty conversation. If the local
-                        // `LoadAgent` send itself fails, this effect clears the
-                        // request so the spinner falls back to the empty state
-                        // rather than hanging. A server `CommandError(LoadAgent)`
-                        // is different: it keeps the latch set and pushes an
-                        // error row, so `no_content` is false and that path
-                        // never reaches this spinner branch.
+                        // otherwise read as an empty conversation.
+                        //
+                        // The spinner needs a *terminal* state, or it spins
+                        // forever: `agent_loaded` is only ever written by a
+                        // successful `AgentBootstrap`, so every failure mode —
+                        // a rejected send, a dropped connection, a server
+                        // `CommandError` — leaves the latch set and the
+                        // transcript empty.
+                        //
+                        // Liveness is asked of **this agent's own host**, taken
+                        // from the key. Reading `active_local_host_id` instead
+                        // would infer the agent's host from wherever the user is
+                        // currently pointing — a different question, and one that
+                        // can have a different answer.
+                        let host = &key.local_host_id;
+                        let load_error = s_body
+                            .agent_load_errors
+                            .with(|errors| errors.get(&key).cloned());
+                        let can_deliver = s_body.host_can_deliver(host);
                         let load_pending = s_body
                             .agent_load_requests
                             .with(|loads| loads.contains(&key))
                             && !s_body.agent_loaded.with(|loaded| loaded.contains(&key));
+
+                        if let Some(message) = load_error {
+                            return view! {
+                                <ChatLoadFailed host=host.clone() message=message />
+                            }.into_any();
+                        }
+                        // A disconnect drops every server snapshot for this host,
+                        // including the transcript and the load latch. Without
+                        // this branch the emptied chat renders as "Conversation is
+                        // empty", which is a lie: it is not empty, we simply no
+                        // longer know what is in it. Say what actually happened,
+                        // and offer the only thing that fixes it.
+                        if !can_deliver {
+                            return view! {
+                                <ChatLoadFailed
+                                    host=host.clone()
+                                    message="The connection to this host dropped, so this conversation could not be loaded.".to_owned()
+                                />
+                            }.into_any();
+                        }
+                        // KNOWN RESIDUAL: a host that stays `Connected` and simply
+                        // never answers `LoadAgent` — and never errors — leaves
+                        // this spinner running with no time bound. Every
+                        // *transport* path out is now covered (rejected send,
+                        // dropped connection, typed `CommandError`); what remains
+                        // needs a genuine server fault.
+                        //
+                        // Deliberately not "fixed" with a timeout here. Any
+                        // duration would be invented: too short and a slow link
+                        // shows a false failure, too long and it is theatre. The
+                        // honest fix is a server-side answer — an ack, or a
+                        // protocol-level deadline — and it is not this change.
+                        // Left visible rather than papered over.
                         if load_pending {
                             return view! {
                                 <div class="chat-loading" data-mobile-test="chat-loading">
@@ -722,12 +881,27 @@ pub fn ChatView() -> impl IntoView {
                             })}
 
                             // Messages
+                            //
+                            // `key` is this chat's map key: the agent whose stream
+                            // produced these rows, on the host that owns it. Tool
+                            // cards need that ownership to resolve child agents, and
+                            // it must travel with the row — not be read back from
+                            // `active_agent`, which is navigation state that moves the
+                            // moment the user opens another chat.
                             {shown.into_iter().map(|entry| {
-                                view! { <ChatMessageView entry=entry /> }
+                                let owner_agent_ref = key.clone();
+                                view! {
+                                    <ChatMessageView owner_agent_ref=owner_agent_ref entry=entry />
+                                }
                             }).collect::<Vec<_>>()}
 
                             // Streaming message
                             {streaming.map(|s| {
+                                // Same ownership rule as the completed rows above:
+                                // the in-flight tool cards belong to the stream that
+                                // is producing them, not to whatever chat the user
+                                // happens to be looking at by the time they resolve.
+                                let streaming_key = key.clone();
                                 let text = s.text;
                                 let reasoning = s.reasoning;
                                 let tool_requests = s.tool_requests;
@@ -775,7 +949,13 @@ pub fn ChatView() -> impl IntoView {
                                             view! {
                                                 <div class="tool-cards">
                                                     {tools.into_iter().map(|t| {
-                                                        view! { <crate::components::tool_card::ToolCardView entry=t /> }
+                                                        let owner_agent_ref = streaming_key.clone();
+                                                        view! {
+                                                            <crate::components::tool_card::ToolCardView
+                                                                owner_agent_ref=owner_agent_ref
+                                                                entry=t
+                                                            />
+                                                        }
                                                     }).collect::<Vec<_>>()}
                                                 </div>
                                             }.into_any()
@@ -810,6 +990,20 @@ pub fn ChatView() -> impl IntoView {
                     }.into_any()
                 }}
             </div>
+            // Submissions addressed to *this* agent that the transport could not
+            // account for. Ownership is known — this is the agent we sent to —
+            // so they belong in the conversation rather than on the host-scoped
+            // surface. Directly above the composer, so they stay reachable with
+            // the keyboard open. New-chat records never appear here: they have
+            // no agent, and the client does not guess one.
+            {move || {
+                s_pending
+                    .active_agent
+                    .get()
+                    .map(|active| view! {
+                        <AgentPendingSubmissions agent_ref=active.as_agent_ref() />
+                    })
+            }}
             <ChatInput />
         </div>
     }
@@ -850,7 +1044,8 @@ fn scroll_chat_to_bottom(el: &web_sys::HtmlElement) {
 mod wasm_tests {
     use super::*;
     use crate::state::{
-        AgentInfo, AgentRef, AppState, ChatMessageEntry, LocalHostId, TransientEvent,
+        AgentInfo, AgentRef, AppState, ChatMessageEntry, LocalHostId, StreamingState,
+        TransientEvent,
     };
     use leptos::mount::mount_to;
     use protocol::{
@@ -926,6 +1121,31 @@ mod wasm_tests {
         next_tick().await;
     }
 
+    /// Seed the state an agent's chat cannot exist without.
+    ///
+    /// An agent only reaches the client on a `HostBootstrap`, which only arrives over
+    /// a live connection — so "this host has agents, but no connection status at all"
+    /// is a world the real lifecycle never produces. `ChatView` (correctly) treats a
+    /// host that cannot deliver a bootstrap as a terminal, actionable failure rather
+    /// than an empty conversation, because calling an un-loadable chat "empty" is a
+    /// lie the user would act on.
+    ///
+    /// A fixture that skipped the status was therefore asking the product to render a
+    /// conversation for a host it had no evidence was reachable. Establishing the
+    /// connection here, once, is what makes these tests model the lifecycle instead of
+    /// an impossible state.
+    fn seed_connected_agent(state: &AppState, host: &LocalHostId) {
+        state.active_local_host_id.set(Some(host.clone()));
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(host.clone(), crate::state::ConnectionStatus::Connected);
+        });
+        state.agents.set(vec![make_agent(host, "Coder")]);
+        state.active_agent.set(Some(crate::state::ActiveAgentRef {
+            local_host_id: host.clone(),
+            agent_id: AgentId("agent-1".to_owned()),
+        }));
+    }
+
     fn mount_active_chat(container: HtmlElement) -> AppState {
         let host = LocalHostId("host-1".to_owned());
         let host_for_mount = host.clone();
@@ -934,18 +1154,290 @@ mod wasm_tests {
         let state_handle_for_mount = state_handle.clone();
         let handle = mount_to(container, move || {
             let state = AppState::new();
-            state.active_local_host_id.set(Some(host_for_mount.clone()));
-            state.agents.set(vec![make_agent(&host_for_mount, "Coder")]);
-            state.active_agent.set(Some(crate::state::ActiveAgentRef {
-                local_host_id: host_for_mount.clone(),
-                agent_id: AgentId("agent-1".to_owned()),
-            }));
+            seed_connected_agent(&state, &host_for_mount);
             *state_handle_for_mount.borrow_mut() = Some(state.clone());
             provide_context(state);
             view! { <ChatView /> }
         });
         std::mem::forget(handle);
         state_handle.borrow().as_ref().unwrap().clone()
+    }
+
+    fn stop_button(container: &HtmlElement) -> HtmlElement {
+        container
+            .query_selector("[data-mobile-test='chat-stop']")
+            .unwrap()
+            .expect("the stop control must render while a turn is running")
+            .dyn_into()
+            .unwrap()
+    }
+
+    #[wasm_bindgen_test]
+    async fn typed_live_reasoning_is_visible_in_the_active_stream() {
+        let container = make_container();
+        let state = mount_active_chat(container.clone());
+        let agent_ref = state
+            .active_agent
+            .get_untracked()
+            .expect("active agent")
+            .as_agent_ref();
+        let reasoning = ArcRwSignal::new(String::new());
+        state.streaming_text.update(|streams| {
+            streams.insert(
+                agent_ref,
+                StreamingState {
+                    agent_name: "codex".to_owned(),
+                    model: Some("gpt-test".to_owned()),
+                    text: ArcRwSignal::new(String::new()),
+                    reasoning: reasoning.clone(),
+                    tool_requests: ArcRwSignal::new(Vec::new()),
+                },
+            );
+        });
+
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".reasoning-text")
+                .unwrap()
+                .is_none(),
+            "an empty stream has no reasoning block"
+        );
+
+        reasoning.set("inspect the first item".to_owned());
+        next_tick().await;
+        let streaming = container
+            .query_selector("[data-mobile-test='chat-streaming']")
+            .unwrap()
+            .expect("active streaming message");
+        let reasoning_text = streaming
+            .query_selector(".reasoning-text")
+            .unwrap()
+            .expect("visible typed reasoning preview");
+        assert_eq!(
+            reasoning_text.text_content().as_deref(),
+            Some("inspect the first item")
+        );
+        assert!(
+            streaming
+                .query_selector(".message-content")
+                .unwrap()
+                .expect("streaming body")
+                .text_content()
+                .is_none_or(|text| text.is_empty()),
+            "reasoning-only preview must not create a second empty bubble"
+        );
+
+        reasoning.set("inspect the eventual assistant item".to_owned());
+        next_tick().await;
+        assert_eq!(
+            reasoning_text.text_content().as_deref(),
+            Some("inspect the eventual assistant item"),
+            "the same preview updates without rebinding"
+        );
+    }
+
+    /// **A stop that never left the client must not look like a stop that worked.**
+    ///
+    /// The result of the `Interrupt` send used to be thrown away with `let _ =`.
+    /// A rejected admission is exactly the case that matters: the user taps Stop,
+    /// the frame never enters the outbound queue, the agent keeps running and
+    /// keeps spending money — and absolutely nothing appears on screen. They walk
+    /// away believing they stopped it.
+    #[wasm_bindgen_test]
+    async fn a_rejected_interrupt_is_surfaced_and_says_the_agent_is_still_running() {
+        let _guard = crate::bridge::test_reject_sends();
+        let container = make_container();
+        let state = mount_active_chat(container.clone());
+        let agent_ref = state
+            .active_agent
+            .get_untracked()
+            .expect("active agent")
+            .as_agent_ref();
+        state.agent_turn_active.update(|m| {
+            m.insert(agent_ref, true);
+        });
+        settle_autoscroll().await;
+
+        assert!(
+            state.mobile_shell_error.get_untracked().is_none(),
+            "precondition: nothing surfaced yet"
+        );
+
+        stop_button(&container).click();
+        settle_autoscroll().await;
+
+        let surfaced = state
+            .mobile_shell_error
+            .get_untracked()
+            .expect("a stop that was never admitted must not fail silently");
+        assert!(
+            surfaced.message.contains("still running"),
+            "the user must be told the agent did not stop, got: {}",
+            surfaced.message
+        );
+        assert!(
+            !surfaced.message.to_lowercase().contains("stopped")
+                && !surfaced.message.to_lowercase().contains("interrupted"),
+            "nothing may claim the turn was interrupted: {}",
+            surfaced.message
+        );
+    }
+
+    /// Admission is not interruption. A successfully *queued* Interrupt says
+    /// nothing at all — the agent stops when the server says it stopped, which the
+    /// UI already reflects through `agent_turn_active`. Inventing a "Stopped!"
+    /// message here would be the same false-success claim the whole model bans.
+    #[wasm_bindgen_test]
+    async fn an_admitted_interrupt_claims_nothing() {
+        let _guard = crate::bridge::test_capture_sends();
+        let container = make_container();
+        let state = mount_active_chat(container.clone());
+        let agent_ref = state
+            .active_agent
+            .get_untracked()
+            .expect("active agent")
+            .as_agent_ref();
+        state.agent_turn_active.update(|m| {
+            m.insert(agent_ref.clone(), true);
+        });
+        settle_autoscroll().await;
+
+        stop_button(&container).click();
+        settle_autoscroll().await;
+
+        assert_eq!(
+            crate::bridge::test_send_attempts(),
+            1,
+            "the interrupt must actually be sent"
+        );
+        assert!(
+            state.mobile_shell_error.get_untracked().is_none(),
+            "an admitted interrupt is not an error and must not surface one"
+        );
+        assert!(
+            state
+                .agent_turn_active
+                .with_untracked(|m| m.get(&agent_ref).copied().unwrap_or(false)),
+            "the turn is still active until the *server* says otherwise — admission \
+             is not interruption, and the client must not pretend it is"
+        );
+        assert!(
+            state.pending_submissions.get_untracked().is_empty(),
+            "an interrupt carries no user text, so there is nothing to hold or recover"
+        );
+    }
+
+    /// The spinner must have a way to end that is not "success".
+    ///
+    /// `agent_loaded` is only ever written by a successful `AgentBootstrap`, so
+    /// a spinner gated on it alone spins forever on every failure — which is
+    /// exactly what an opened agent did. A typed load error is the terminal
+    /// state, and it must replace the spinner with something the user can act on.
+    #[wasm_bindgen_test]
+    async fn a_failed_load_replaces_the_spinner_with_a_recovery_action() {
+        let container = make_container();
+        let state = mount_active_chat(container.clone());
+        let agent_ref = state
+            .active_agent
+            .get_untracked()
+            .expect("active agent")
+            .as_agent_ref();
+
+        // The load has been sent and no snapshot has arrived: this is the
+        // spinner window.
+        state.agent_load_requests.update(|loads| {
+            loads.insert(agent_ref.clone());
+        });
+        state.connection_statuses.update(|m| {
+            m.insert(
+                agent_ref.local_host_id.clone(),
+                crate::state::ConnectionStatus::Connected,
+            );
+        });
+        settle_autoscroll().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-loading-spinner']")
+                .unwrap()
+                .is_some(),
+            "an in-flight load must show a spinner"
+        );
+
+        // The load fails. The spinner must not survive it.
+        state.agent_load_errors.update(|errors| {
+            errors.insert(agent_ref, "host said no".to_owned());
+        });
+        settle_autoscroll().await;
+
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-loading-spinner']")
+                .unwrap()
+                .is_none(),
+            "a failed load must end the spinner, not spin forever"
+        );
+        let failed = container
+            .query_selector("[data-mobile-test='chat-load-failed']")
+            .unwrap()
+            .expect("a failed load must render a visible terminal state");
+        assert_eq!(
+            failed.get_attribute("role").as_deref(),
+            Some("alert"),
+            "a screen reader told 'Loading conversation' must be told how it ended"
+        );
+        let text = failed.text_content().unwrap_or_default();
+        assert!(
+            text.contains("host said no"),
+            "the terminal state must carry the real reason, got: {text}"
+        );
+        let reconnect = container
+            .query_selector("[data-mobile-test='chat-load-failed-reconnect']")
+            .unwrap()
+            .expect("the user must be offered a way out, not just told it broke");
+        assert!(
+            !reconnect.has_attribute("disabled"),
+            "the recovery action must be reachable"
+        );
+    }
+
+    /// A connection that can no longer deliver a bootstrap ends the spinner too,
+    /// even though no per-agent error was ever attributed.
+    #[wasm_bindgen_test]
+    async fn a_dropped_connection_ends_the_spinner() {
+        let container = make_container();
+        let state = mount_active_chat(container.clone());
+        let agent_ref = state
+            .active_agent
+            .get_untracked()
+            .expect("active agent")
+            .as_agent_ref();
+
+        state.agent_load_requests.update(|loads| {
+            loads.insert(agent_ref.clone());
+        });
+        state.connection_statuses.update(|m| {
+            m.insert(
+                agent_ref.local_host_id.clone(),
+                crate::state::ConnectionStatus::Disconnected,
+            );
+        });
+        settle_autoscroll().await;
+
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-loading-spinner']")
+                .unwrap()
+                .is_none(),
+            "a bootstrap that can never arrive must not be rendered as still loading"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-load-failed-reconnect']")
+                .unwrap()
+                .is_some(),
+            "the user must be offered a reconnect"
+        );
     }
 
     fn chat_scroller(container: &HtmlElement) -> HtmlElement {
@@ -1130,16 +1622,11 @@ mod wasm_tests {
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
-            state.active_local_host_id.set(Some(host_clone.clone()));
-            state.agents.set(vec![make_agent(&host_clone, "Coder")]);
+            seed_connected_agent(&state, &host_clone);
             let agent_ref = AgentRef {
                 local_host_id: host_clone.clone(),
                 agent_id: AgentId("agent-1".to_owned()),
             };
-            state.active_agent.set(Some(crate::state::ActiveAgentRef {
-                local_host_id: host_clone.clone(),
-                agent_id: AgentId("agent-1".to_owned()),
-            }));
             // Load latched, but the bootstrap snapshot has not arrived yet.
             state.agent_load_requests.update(|m| {
                 m.insert(agent_ref);
@@ -1173,16 +1660,11 @@ mod wasm_tests {
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
-            state.active_local_host_id.set(Some(host_clone.clone()));
-            state.agents.set(vec![make_agent(&host_clone, "Coder")]);
+            seed_connected_agent(&state, &host_clone);
             let agent_ref = AgentRef {
                 local_host_id: host_clone.clone(),
                 agent_id: AgentId("agent-1".to_owned()),
             };
-            state.active_agent.set(Some(crate::state::ActiveAgentRef {
-                local_host_id: host_clone.clone(),
-                agent_id: AgentId("agent-1".to_owned()),
-            }));
             state.agent_load_requests.update(|m| {
                 m.insert(agent_ref.clone());
             });
@@ -1317,12 +1799,7 @@ mod wasm_tests {
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
-            state.active_local_host_id.set(Some(host_clone.clone()));
-            state.agents.set(vec![make_agent(&host_clone, "Coder")]);
-            state.active_agent.set(Some(crate::state::ActiveAgentRef {
-                local_host_id: host_clone.clone(),
-                agent_id: AgentId("agent-1".to_owned()),
-            }));
+            seed_connected_agent(&state, &host_clone);
             provide_context(state);
             view! { <ChatView /> }
         });
@@ -1355,16 +1832,11 @@ mod wasm_tests {
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
-            state.active_local_host_id.set(Some(host_clone.clone()));
-            state.agents.set(vec![make_agent(&host_clone, "Coder")]);
+            seed_connected_agent(&state, &host_clone);
             let agent_ref = AgentRef {
                 local_host_id: host_clone.clone(),
                 agent_id: AgentId("agent-1".to_owned()),
             };
-            state.active_agent.set(Some(crate::state::ActiveAgentRef {
-                local_host_id: host_clone.clone(),
-                agent_id: AgentId("agent-1".to_owned()),
-            }));
             // One sent message + two queued.
             state.chat_messages.update(|m| {
                 m.insert(
@@ -1431,12 +1903,7 @@ mod wasm_tests {
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
-            state.active_local_host_id.set(Some(host_clone.clone()));
-            state.agents.set(vec![make_agent(&host_clone, "Coder")]);
-            state.active_agent.set(Some(crate::state::ActiveAgentRef {
-                local_host_id: host_clone.clone(),
-                agent_id: AgentId("agent-1".to_owned()),
-            }));
+            seed_connected_agent(&state, &host_clone);
             provide_context(state);
             view! { <ChatView /> }
         });
@@ -1526,12 +1993,7 @@ mod wasm_tests {
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
-            state.active_local_host_id.set(Some(host_clone.clone()));
-            state.agents.set(vec![make_agent(&host_clone, "Coder")]);
-            state.active_agent.set(Some(crate::state::ActiveAgentRef {
-                local_host_id: host_clone.clone(),
-                agent_id: AgentId("agent-1".to_owned()),
-            }));
+            seed_connected_agent(&state, &host_clone);
             provide_context(state);
             view! { <ChatView /> }
         });
@@ -1596,16 +2058,11 @@ mod wasm_tests {
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
-            state.active_local_host_id.set(Some(host_clone.clone()));
-            state.agents.set(vec![make_agent(&host_clone, "Coder")]);
+            seed_connected_agent(&state, &host_clone);
             let agent_ref = AgentRef {
                 local_host_id: host_clone.clone(),
                 agent_id: AgentId("agent-1".to_owned()),
             };
-            state.active_agent.set(Some(crate::state::ActiveAgentRef {
-                local_host_id: host_clone.clone(),
-                agent_id: AgentId("agent-1".to_owned()),
-            }));
             state.agent_message_queue.update(|m| {
                 m.insert(
                     agent_ref,
@@ -1680,16 +2137,11 @@ mod wasm_tests {
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
-            state.active_local_host_id.set(Some(host_clone.clone()));
-            state.agents.set(vec![make_agent(&host_clone, "Coder")]);
+            seed_connected_agent(&state, &host_clone);
             let agent_ref = AgentRef {
                 local_host_id: host_clone.clone(),
                 agent_id: AgentId("agent-1".to_owned()),
             };
-            state.active_agent.set(Some(crate::state::ActiveAgentRef {
-                local_host_id: host_clone.clone(),
-                agent_id: AgentId("agent-1".to_owned()),
-            }));
             state.transient_events.update(|m| {
                 m.insert(
                     agent_ref,

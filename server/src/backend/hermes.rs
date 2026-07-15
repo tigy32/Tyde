@@ -748,6 +748,7 @@ impl HermesSessionActor {
                                 tool_result: ToolExecutionResult::Other { result },
                                 success: true,
                                 error: None,
+                                normalization_failure: None,
                             },
                         ));
                         self.emit(ChatEvent::TypingStatusChanged(true));
@@ -1734,6 +1735,7 @@ impl HermesEventMapper {
                 tool_result: ToolExecutionResult::Other { result },
                 success,
                 error,
+                normalization_failure: None,
             },
         )])
     }
@@ -1862,6 +1864,7 @@ impl HermesEventMapper {
                     },
                     success: false,
                     error: Some("Cancelled".to_string()),
+                    normalization_failure: None,
                 },
             ));
         }

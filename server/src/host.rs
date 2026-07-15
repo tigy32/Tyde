@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow};
 use protocol::types::{
@@ -17,7 +17,8 @@ use protocol::{
     AgentId, AgentInput, AgentOrderKey, AgentOrigin, AgentPinsUpdate, AgentStartPayload,
     AgentSystemTagAssignment, AgentSystemTagDescriptor, AgentSystemTagId, AgentTagsSnapshot,
     AgentTagsUpdate, AgentWorkflowMetadata, AgentsViewPreferencesNotifyPayload,
-    AgentsViewPreferencesSnapshot, AgentsViewPreferencesUpdate, BackendConfigSnapshot,
+    AgentsViewPreferencesSnapshot, AgentsViewPreferencesUpdate, BackendCapacityPayload,
+    BackendCapacitySnapshot, BackendCapacityState, BackendConfigSnapshot,
     BackendConfigSnapshotsPayload, BackendKind, BackendNativeSettingsSnapshot, BackendSetupPayload,
     BrowseBootstrapListing, BrowseBootstrapPayload, CancelWorkflowPayload,
     CodeIntelCancelReferencesPayload, CodeIntelFindReferencesPayload, CodeIntelHoverPayload,
@@ -88,6 +89,22 @@ use crate::backend::{
     sanitize_session_settings_values, session_settings_schema_for_backend,
     validate_session_settings_values,
 };
+
+#[derive(Clone, Debug)]
+pub(crate) struct BaseRevision(pub(crate) String);
+
+#[derive(Clone, Debug)]
+pub(crate) struct CreatedWorkbenchRoot {
+    pub(crate) root: WorkbenchRoot,
+    pub(crate) base_commit: String,
+    pub(crate) parent_root_dirty: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CreatedWorkbench {
+    pub(crate) project: Project,
+    pub(crate) roots: Vec<CreatedWorkbenchRoot>,
+}
 use crate::browse_stream;
 use crate::code_intel::CodeIntelRouter;
 use crate::config_mcp::ConfigMcpHandle;
@@ -129,11 +146,26 @@ use crate::sub_agent::{
     HostSubAgentSpawnRequest, HostSubAgentSpawnRx, HostSubAgentSpawnTx, SubAgentEmitter,
     SubAgentHandle,
 };
+
+pub(crate) type HostCapacityTx = mpsc::UnboundedSender<HostCapacityUpdate>;
+type HostCapacityRx = mpsc::UnboundedReceiver<HostCapacityUpdate>;
+
+pub(crate) enum HostCapacityUpdate {
+    Report {
+        backend_kind: BackendKind,
+        state: BackendCapacityState,
+    },
+    #[cfg(feature = "test-support")]
+    Barrier(oneshot::Sender<()>),
+}
+
 use crate::team_registry::{
     TeamDescribeData, TeamMemberActivation, TeamMessagePlan, TeamRegistryEvents,
     TeamRegistryHandle, TeamRegistrySnapshot, team_preset_validation_refs,
 };
-use crate::terminal_stream::{TerminalHandle, TerminalLaunchInfo, create_terminal};
+use crate::terminal_stream::{
+    TerminalHandle, TerminalLaunchCommand, TerminalLaunchInfo, create_terminal,
+};
 use crate::workflows::mcp::{
     WORKFLOW_PROGRESS_MCP_SERVER_NAME, WorkflowFinishToolInput, WorkflowMcpHandle,
     WorkflowReportStepToolInput,
@@ -160,6 +192,8 @@ struct HostSubscriber {
     last_backend_config_schemas: Option<Vec<protocol::BackendConfigSchema>>,
     last_backend_config_snapshots: Option<Vec<BackendConfigSnapshot>>,
     last_backend_native_settings_snapshots: Option<Vec<BackendNativeSettingsSnapshot>>,
+    last_backend_capacity: Option<Vec<BackendCapacitySnapshot>>,
+    capacity_replay_ready: bool,
     last_launch_profile_catalog: Option<LaunchProfileCatalog>,
 }
 
@@ -169,6 +203,73 @@ struct PendingNewAgentFanout {
     instance_stream: StreamPath,
     attach_eagerly: bool,
     activity_summary: AgentActivitySummaryState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendSetupRefreshStep {
+    Setup,
+    SessionSchemas,
+    BackendConfigSnapshots,
+}
+
+const BACKEND_SETUP_REFRESH_ORDER: [BackendSetupRefreshStep; 3] = [
+    BackendSetupRefreshStep::Setup,
+    BackendSetupRefreshStep::SessionSchemas,
+    BackendSetupRefreshStep::BackendConfigSnapshots,
+];
+
+fn tycode_projection_acknowledgement_app_error(
+    error: crate::backend::tycode::TycodeProjectionNoticeAcknowledgementError,
+) -> AppError {
+    const OPERATION: &str = "set_setting";
+    match error {
+        crate::backend::tycode::TycodeProjectionNoticeAcknowledgementError::Conflict(message) => {
+            AppError::conflict(OPERATION, message)
+        }
+        crate::backend::tycode::TycodeProjectionNoticeAcknowledgementError::Failed(message) => {
+            AppError::internal(OPERATION, anyhow!(message))
+        }
+    }
+}
+
+fn tycode_managed_projection_reset_app_error(
+    error: crate::backend::tycode::TycodeManagedProjectionResetError,
+) -> AppError {
+    const OPERATION: &str = "set_setting";
+    match error {
+        crate::backend::tycode::TycodeManagedProjectionResetError::Conflict(message) => {
+            AppError::conflict(OPERATION, message)
+        }
+        crate::backend::tycode::TycodeManagedProjectionResetError::Failed(message) => {
+            AppError::internal(OPERATION, anyhow!(message))
+        }
+    }
+}
+
+async fn run_tycode_runtime_setting_operation<
+    Token,
+    Error,
+    Operation,
+    OperationFuture,
+    MapError,
+    Refresh,
+    RefreshFuture,
+>(
+    token: Token,
+    operation: Operation,
+    map_error: MapError,
+    refresh: Refresh,
+) -> AppResult<()>
+where
+    Operation: FnOnce(Token) -> OperationFuture,
+    OperationFuture: Future<Output = Result<(), Error>>,
+    MapError: FnOnce(Error) -> AppError,
+    Refresh: FnOnce() -> RefreshFuture,
+    RefreshFuture: Future<Output = ()>,
+{
+    let result = operation(token).await.map_err(map_error);
+    refresh().await;
+    result
 }
 
 pub(crate) struct DeferredAgentAttachment {
@@ -399,11 +500,14 @@ pub(crate) struct HostState {
     pub steering_store: Arc<Mutex<SteeringStore>>,
     pub skill_store: Arc<Mutex<SkillStore>>,
     pub agent_sessions: HashMap<AgentId, SessionId>,
+    pending_agent_sessions: HashMap<AgentId, SessionId>,
+    agent_visibility: AgentVisibilityRegistry,
     pub agent_activity_summaries: HashMap<AgentId, AgentActivitySummaryState>,
     closed_agent_usage_snapshots: HashMap<AgentId, AgentUsageSnapshot>,
     activity_summary_epoch: u64,
     activity_summary_settings_tx: watch::Sender<ActivitySummarySettingsSignal>,
     pub sub_agent_spawn_tx: HostSubAgentSpawnTx,
+    pub capacity_tx: HostCapacityTx,
     pub use_mock_backend: bool,
     pub debug_mcp: DebugMcpHandle,
     pub agent_control_mcp: AgentControlMcpHandle,
@@ -420,6 +524,7 @@ pub(crate) struct HostState {
     hermes_session_schema: HermesSessionSchemaState,
     backend_config_snapshots: Vec<BackendConfigSnapshot>,
     backend_native_settings_snapshots: Vec<BackendNativeSettingsSnapshot>,
+    backend_capacity: HashMap<BackendKind, BackendCapacitySnapshot>,
     antigravity_conversations_dir: PathBuf,
     codex_probe_program: Option<String>,
     kiro_probe_program: Option<String>,
@@ -459,6 +564,483 @@ impl Drop for HostState {
 pub struct HostHandle {
     state: Arc<Mutex<HostState>>,
     workflow_save_lock: Arc<Mutex<()>>,
+    backend_setup_refresh_lock: Arc<Mutex<()>>,
+}
+
+struct PendingAgentSessionPublication {
+    agent_id: AgentId,
+    publish_tx: Option<mpsc::UnboundedSender<()>>,
+}
+
+#[derive(Clone, Default)]
+struct AgentVisibilityRegistry {
+    inner: Arc<std::sync::Mutex<HashMap<AgentId, AgentVisibilityEntry>>>,
+}
+
+struct AgentVisibilityEntry {
+    phase: AgentVisibilityPhase,
+    fanout_active: bool,
+    host_streams: HashSet<StreamPath>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AgentVisibilityPhase {
+    Pending,
+    Fanout,
+    Visible,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StartupFailureVisibility {
+    CleanupUnpublished,
+    AwaitPublication,
+}
+
+impl Default for AgentVisibilityEntry {
+    fn default() -> Self {
+        Self {
+            phase: AgentVisibilityPhase::Visible,
+            fanout_active: false,
+            host_streams: HashSet::new(),
+        }
+    }
+}
+
+impl AgentVisibilityRegistry {
+    fn begin_pending(&self, agent_id: AgentId) {
+        self.inner
+            .lock()
+            .expect("agent visibility mutex poisoned")
+            .insert(
+                agent_id,
+                AgentVisibilityEntry {
+                    phase: AgentVisibilityPhase::Pending,
+                    fanout_active: false,
+                    host_streams: HashSet::new(),
+                },
+            );
+    }
+
+    fn begin_fanout(&self, agent_id: &AgentId) -> bool {
+        let mut visibility = self.inner.lock().expect("agent visibility mutex poisoned");
+        let Some(entry) = visibility.get_mut(agent_id) else {
+            return false;
+        };
+        if entry.phase != AgentVisibilityPhase::Pending {
+            return false;
+        }
+        entry.phase = AgentVisibilityPhase::Fanout;
+        entry.fanout_active = true;
+        true
+    }
+
+    fn claim_startup_failure(&self, agent_id: &AgentId) -> StartupFailureVisibility {
+        let mut visibility = self.inner.lock().expect("agent visibility mutex poisoned");
+        let Some(entry) = visibility.get_mut(agent_id) else {
+            return StartupFailureVisibility::CleanupUnpublished;
+        };
+        match entry.phase {
+            AgentVisibilityPhase::Pending => {
+                entry.phase = AgentVisibilityPhase::Cancelled;
+                entry.fanout_active = false;
+                StartupFailureVisibility::CleanupUnpublished
+            }
+            AgentVisibilityPhase::Fanout | AgentVisibilityPhase::Visible => {
+                StartupFailureVisibility::AwaitPublication
+            }
+            AgentVisibilityPhase::Cancelled => StartupFailureVisibility::CleanupUnpublished,
+        }
+    }
+
+    fn may_emit_new_agent(&self, agent_id: &AgentId) -> bool {
+        self.inner
+            .lock()
+            .expect("agent visibility mutex poisoned")
+            .get(agent_id)
+            .is_some_and(|entry| entry.phase == AgentVisibilityPhase::Fanout && entry.fanout_active)
+    }
+
+    fn record_new_agent_during_fanout(&self, agent_id: AgentId, host_stream: StreamPath) -> bool {
+        let mut visibility = self.inner.lock().expect("agent visibility mutex poisoned");
+        let entry = visibility.entry(agent_id).or_default();
+        entry.host_streams.insert(host_stream);
+        entry.phase == AgentVisibilityPhase::Fanout && entry.fanout_active
+    }
+
+    fn finish_fanout(&self, agent_id: &AgentId) -> bool {
+        let mut visibility = self.inner.lock().expect("agent visibility mutex poisoned");
+        let Some(entry) = visibility.get_mut(agent_id) else {
+            return true;
+        };
+        entry.fanout_active = false;
+        if entry.phase == AgentVisibilityPhase::Fanout {
+            entry.phase = AgentVisibilityPhase::Visible;
+            false
+        } else {
+            true
+        }
+    }
+
+    fn cancel_outer_spawn(&self, agent_id: &AgentId) {
+        if let Some(entry) = self
+            .inner
+            .lock()
+            .expect("agent visibility mutex poisoned")
+            .get_mut(agent_id)
+        {
+            entry.phase = AgentVisibilityPhase::Cancelled;
+            entry.fanout_active = false;
+        }
+    }
+
+    fn request_cleanup(&self, agent_id: &AgentId) -> bool {
+        let mut visibility = self.inner.lock().expect("agent visibility mutex poisoned");
+        let Some(entry) = visibility.get_mut(agent_id) else {
+            return false;
+        };
+        entry.phase = AgentVisibilityPhase::Cancelled;
+        entry.fanout_active
+    }
+
+    fn cleanup_is_requested(&self, agent_id: &AgentId) -> bool {
+        self.inner
+            .lock()
+            .expect("agent visibility mutex poisoned")
+            .get(agent_id)
+            .is_some_and(|entry| entry.phase == AgentVisibilityPhase::Cancelled)
+    }
+
+    fn bootstrap_eligible(&self, agent_id: &AgentId, publicly_bound: bool) -> bool {
+        match self
+            .inner
+            .lock()
+            .expect("agent visibility mutex poisoned")
+            .get(agent_id)
+        {
+            Some(entry) => entry.phase == AgentVisibilityPhase::Visible,
+            None => publicly_bound,
+        }
+    }
+
+    fn record_new_agent(&self, agent_id: AgentId, host_stream: StreamPath) {
+        self.inner
+            .lock()
+            .expect("agent visibility mutex poisoned")
+            .entry(agent_id)
+            .or_default()
+            .host_streams
+            .insert(host_stream);
+    }
+
+    fn visible_host_streams(&self, agent_id: &AgentId) -> HashSet<StreamPath> {
+        self.inner
+            .lock()
+            .expect("agent visibility mutex poisoned")
+            .get(agent_id)
+            .map(|entry| entry.host_streams.clone())
+            .unwrap_or_default()
+    }
+
+    fn remove_agent(&self, agent_id: &AgentId) {
+        self.inner
+            .lock()
+            .expect("agent visibility mutex poisoned")
+            .remove(agent_id);
+    }
+
+    fn remove_host_stream(&self, host_stream: &StreamPath) {
+        let mut visibility = self.inner.lock().expect("agent visibility mutex poisoned");
+        for entry in visibility.values_mut() {
+            entry.host_streams.remove(host_stream);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SpawnVisibility {
+    changed: Arc<tokio::sync::Notify>,
+    agent_id: AgentId,
+    agent_visibility: AgentVisibilityRegistry,
+}
+
+struct SpawnVisibilityGuard {
+    visibility: SpawnVisibility,
+    armed: bool,
+}
+
+impl SpawnVisibility {
+    fn new(agent_id: AgentId, agent_visibility: AgentVisibilityRegistry) -> Self {
+        agent_visibility.begin_pending(agent_id.clone());
+        Self {
+            changed: Arc::new(tokio::sync::Notify::new()),
+            agent_id,
+            agent_visibility,
+        }
+    }
+
+    fn begin_fanout(&self) -> bool {
+        self.agent_visibility.begin_fanout(&self.agent_id)
+    }
+
+    fn may_emit_new_agent(&self) -> bool {
+        self.agent_visibility.may_emit_new_agent(&self.agent_id)
+    }
+
+    /// Records every successful send, even if cancellation raced after the
+    /// send began. That is the exact set which is entitled to AgentClosed.
+    fn record_new_agent_delivery(&self, host_stream: StreamPath) -> bool {
+        self.agent_visibility
+            .record_new_agent_during_fanout(self.agent_id.clone(), host_stream)
+    }
+
+    /// Returns true when outer cancellation asked the fanout to stop.
+    fn finish_new_agent_fanout(&self) -> bool {
+        let cleanup_requested = self.agent_visibility.finish_fanout(&self.agent_id);
+        self.changed.notify_one();
+        cleanup_requested
+    }
+
+    fn cancel_outer_spawn(&self) {
+        self.agent_visibility.cancel_outer_spawn(&self.agent_id);
+        self.changed.notify_one();
+    }
+
+    fn cleanup_is_requested(&self) -> bool {
+        self.agent_visibility.cleanup_is_requested(&self.agent_id)
+    }
+
+    async fn request_cleanup(&self) {
+        loop {
+            let wait_for_fanout = self.agent_visibility.request_cleanup(&self.agent_id);
+            if !wait_for_fanout {
+                return;
+            }
+            self.changed.notified().await;
+        }
+    }
+
+    fn claim_startup_failure(&self) -> StartupFailureVisibility {
+        let outcome = self.agent_visibility.claim_startup_failure(&self.agent_id);
+        if outcome == StartupFailureVisibility::CleanupUnpublished {
+            self.changed.notify_one();
+        }
+        outcome
+    }
+}
+
+impl SpawnVisibilityGuard {
+    fn new(visibility: SpawnVisibility) -> Self {
+        Self {
+            visibility,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SpawnVisibilityGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.visibility.cancel_outer_spawn();
+        }
+    }
+}
+
+impl PendingAgentSessionPublication {
+    fn publish(mut self) {
+        let Some(publish_tx) = self.publish_tx.take() else {
+            tracing::error!(
+                agent_id = %self.agent_id,
+                "agent session publication guard was consumed before publication"
+            );
+            return;
+        };
+        if publish_tx.send(()).is_err() {
+            tracing::debug!(
+                agent_id = %self.agent_id,
+                "agent session registration ended before publication gate"
+            );
+        }
+    }
+}
+
+impl Drop for PendingAgentSessionPublication {
+    fn drop(&mut self) {
+        self.publish_tx.take();
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub struct InstalledWorkbenchRemoveHook {
+    inner: Arc<WorkbenchRemoveHook>,
+}
+
+#[cfg(feature = "test-support")]
+struct WorkbenchRemoveHook {
+    host_state_ptr: usize,
+    reached: tokio::sync::Notify,
+    spawn_waiting: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-support")]
+impl InstalledWorkbenchRemoveHook {
+    pub async fn wait_until_reached(&self) {
+        self.inner.reached.notified().await;
+    }
+
+    pub fn resume(&self) {
+        self.inner.resume.notify_one();
+    }
+
+    pub async fn wait_until_spawn_waiting(&self) {
+        self.inner.spawn_waiting.notified().await;
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl Drop for InstalledWorkbenchRemoveHook {
+    fn drop(&mut self) {
+        let mut hook = workbench_remove_hook_cell()
+            .lock()
+            .expect("workbench remove hook mutex poisoned");
+        if hook
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &self.inner))
+        {
+            *hook = None;
+        }
+        self.inner.resume.notify_waiters();
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl HostHandle {
+    /// Drives the same passive adapter ingress used by a live agent, while
+    /// keeping the test fixture deterministic and host-scoped.
+    pub async fn ingest_passive_adapter_notification_for_test(
+        &self,
+        backend_kind: BackendKind,
+        payload: serde_json::Value,
+    ) -> bool {
+        let emitter = {
+            let state = self.state.lock().await;
+            HostSubAgentEmitter::new(
+                state.sub_agent_spawn_tx.clone(),
+                state.capacity_tx.clone(),
+                AgentId("passive-capacity-test-agent".to_owned()),
+                Vec::new(),
+            )
+        };
+        let forwarded = match backend_kind {
+            BackendKind::Claude => {
+                crate::backend::claude::forward_passive_rate_limit_event(&payload, &emitter)
+            }
+            BackendKind::Codex => {
+                crate::backend::codex::forward_passive_rate_limits_updated(&payload, &emitter);
+                true
+            }
+            _ => false,
+        };
+        if !forwarded {
+            return false;
+        }
+        let (barrier_tx, barrier_rx) = oneshot::channel();
+        let capacity_tx = self.state.lock().await.capacity_tx.clone();
+        if capacity_tx
+            .send(HostCapacityUpdate::Barrier(barrier_tx))
+            .is_err()
+        {
+            return false;
+        }
+        barrier_rx.await.is_ok()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn mark_backend_capacity_stale_for_test(&self, backend_kind: BackendKind) {
+        let retrieved_at_ms = self
+            .state
+            .lock()
+            .await
+            .backend_capacity
+            .get(&backend_kind)
+            .map(|snapshot| snapshot.retrieved_at_ms);
+        if let Some(retrieved_at_ms) = retrieved_at_ms {
+            self.mark_backend_capacity_stale(backend_kind, retrieved_at_ms)
+                .await;
+        }
+    }
+
+    pub async fn age_backend_capacity_for_test(&self, backend_kind: BackendKind, age_ms: u64) {
+        let mut state = self.state.lock().await;
+        let now = capacity_now_ms();
+        let snapshot = state
+            .backend_capacity
+            .get_mut(&backend_kind)
+            .expect("capacity snapshot must exist before aging it");
+        snapshot.retrieved_at_ms = now.saturating_sub(age_ms);
+    }
+
+    pub fn install_workbench_remove_test_hook(&self) -> InstalledWorkbenchRemoveHook {
+        let inner = Arc::new(WorkbenchRemoveHook {
+            host_state_ptr: Arc::as_ptr(&self.state) as usize,
+            reached: tokio::sync::Notify::new(),
+            spawn_waiting: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+        });
+        let mut hook = workbench_remove_hook_cell()
+            .lock()
+            .expect("workbench remove hook mutex poisoned");
+        assert!(hook.is_none(), "workbench remove hook already installed");
+        *hook = Some(Arc::clone(&inner));
+        InstalledWorkbenchRemoveHook { inner }
+    }
+}
+
+#[cfg(feature = "test-support")]
+async fn wait_for_workbench_remove_test_hook(host: &HostHandle) {
+    let hook = workbench_remove_hook_cell()
+        .lock()
+        .expect("workbench remove hook mutex poisoned")
+        .clone();
+    let Some(hook) = hook else {
+        return;
+    };
+    if hook.host_state_ptr != Arc::as_ptr(&host.state) as usize {
+        return;
+    }
+    hook.reached.notify_one();
+    hook.resume.notified().await;
+}
+
+#[cfg(feature = "test-support")]
+fn notify_workbench_spawn_waiting_test_hook(host: &HostHandle) {
+    let hook = workbench_remove_hook_cell()
+        .lock()
+        .expect("workbench remove hook mutex poisoned")
+        .clone();
+    if let Some(hook) = hook
+        && hook.host_state_ptr == Arc::as_ptr(&host.state) as usize
+    {
+        hook.spawn_waiting.notify_one();
+    }
+}
+
+#[cfg(not(feature = "test-support"))]
+fn notify_workbench_spawn_waiting_test_hook(_host: &HostHandle) {}
+
+#[cfg(not(feature = "test-support"))]
+async fn wait_for_workbench_remove_test_hook(_host: &HostHandle) {}
+
+#[cfg(feature = "test-support")]
+fn workbench_remove_hook_cell() -> &'static std::sync::Mutex<Option<Arc<WorkbenchRemoveHook>>> {
+    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<Arc<WorkbenchRemoveHook>>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
 }
 
 #[cfg(test)]
@@ -547,8 +1129,498 @@ fn team_mutation_after_refs_hook_cell() -> &'static TeamMutationAfterRefsHookCel
     HOOK.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+#[cfg(test)]
+struct InstalledSpawnSessionRegistrationHook {
+    inner: Arc<SpawnSessionRegistrationHook>,
+}
+
+#[cfg(test)]
+struct SpawnSessionRegistrationHook {
+    host_state_ptr: usize,
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+type SpawnSessionRegistrationHookCell = std::sync::Mutex<Option<Arc<SpawnSessionRegistrationHook>>>;
+
+#[cfg(test)]
+impl InstalledSpawnSessionRegistrationHook {
+    async fn wait_until_reached(&self) {
+        self.inner.reached.notified().await;
+    }
+
+    fn resume(&self) {
+        self.inner.resume.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for InstalledSpawnSessionRegistrationHook {
+    fn drop(&mut self) {
+        let mut hook = spawn_session_registration_hook_cell()
+            .lock()
+            .expect("spawn session registration hook mutex poisoned");
+        if hook
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &self.inner))
+        {
+            *hook = None;
+        }
+        self.inner.resume.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+fn install_spawn_session_registration_test_hook(
+    host: &HostHandle,
+) -> InstalledSpawnSessionRegistrationHook {
+    let inner = Arc::new(SpawnSessionRegistrationHook {
+        host_state_ptr: Arc::as_ptr(&host.state) as usize,
+        reached: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+    });
+    let mut hook = spawn_session_registration_hook_cell()
+        .lock()
+        .expect("spawn session registration hook mutex poisoned");
+    assert!(
+        hook.is_none(),
+        "spawn session registration hook already installed"
+    );
+    *hook = Some(Arc::clone(&inner));
+    InstalledSpawnSessionRegistrationHook { inner }
+}
+
+#[cfg(test)]
+async fn wait_for_spawn_session_registration_test_hook(host: &HostHandle) {
+    let hook = {
+        spawn_session_registration_hook_cell()
+            .lock()
+            .expect("spawn session registration hook mutex poisoned")
+            .clone()
+    };
+    let Some(hook) = hook else {
+        return;
+    };
+    if hook.host_state_ptr != Arc::as_ptr(&host.state) as usize {
+        return;
+    }
+    hook.reached.notify_one();
+    hook.resume.notified().await;
+}
+
+#[cfg(test)]
+fn spawn_session_registration_hook_cell() -> &'static SpawnSessionRegistrationHookCell {
+    static HOOK: std::sync::OnceLock<SpawnSessionRegistrationHookCell> = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+struct InstalledStartupFailureFanoutRaceHook {
+    inner: Arc<StartupFailureFanoutRaceHook>,
+}
+
+#[cfg(test)]
+struct StartupFailureFanoutRaceHook {
+    host_state_ptr: usize,
+    winner: StartupFailureFanoutRaceWinner,
+    ready: tokio::sync::Barrier,
+    fanout_claimed: tokio::sync::Notify,
+    failure_claimed: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StartupFailureFanoutRaceWinner {
+    Fanout,
+    Failure,
+}
+
+#[cfg(test)]
+type StartupFailureFanoutRaceHookCell = std::sync::Mutex<Option<Arc<StartupFailureFanoutRaceHook>>>;
+
+#[cfg(test)]
+impl InstalledStartupFailureFanoutRaceHook {
+    async fn wait_until_ready(&self) {
+        self.inner.ready.wait().await;
+    }
+}
+
+#[cfg(test)]
+impl Drop for InstalledStartupFailureFanoutRaceHook {
+    fn drop(&mut self) {
+        let mut hook = startup_failure_fanout_race_hook_cell()
+            .lock()
+            .expect("startup failure fanout race hook mutex poisoned");
+        if hook
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &self.inner))
+        {
+            *hook = None;
+        }
+        self.inner.fanout_claimed.notify_waiters();
+        self.inner.failure_claimed.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+fn install_startup_failure_fanout_race_test_hook(
+    host: &HostHandle,
+    winner: StartupFailureFanoutRaceWinner,
+) -> InstalledStartupFailureFanoutRaceHook {
+    let inner = Arc::new(StartupFailureFanoutRaceHook {
+        host_state_ptr: Arc::as_ptr(&host.state) as usize,
+        winner,
+        ready: tokio::sync::Barrier::new(3),
+        fanout_claimed: tokio::sync::Notify::new(),
+        failure_claimed: tokio::sync::Notify::new(),
+    });
+    let mut hook = startup_failure_fanout_race_hook_cell()
+        .lock()
+        .expect("startup failure fanout race hook mutex poisoned");
+    assert!(
+        hook.is_none(),
+        "startup failure fanout race hook already installed"
+    );
+    *hook = Some(Arc::clone(&inner));
+    InstalledStartupFailureFanoutRaceHook { inner }
+}
+
+#[cfg(test)]
+async fn wait_before_startup_failure_fanout_test_hook(host: &HostHandle) {
+    let hook = {
+        startup_failure_fanout_race_hook_cell()
+            .lock()
+            .expect("startup failure fanout race hook mutex poisoned")
+            .clone()
+    };
+    let Some(hook) = hook else {
+        return;
+    };
+    if hook.host_state_ptr != Arc::as_ptr(&host.state) as usize {
+        return;
+    }
+    hook.ready.wait().await;
+    if hook.winner == StartupFailureFanoutRaceWinner::Failure {
+        hook.failure_claimed.notified().await;
+    }
+}
+
+#[cfg(test)]
+fn notify_startup_failure_fanout_claimed_test_hook(host: &HostHandle) {
+    let hook = startup_failure_fanout_race_hook_cell()
+        .lock()
+        .expect("startup failure fanout race hook mutex poisoned")
+        .clone();
+    if let Some(hook) = hook
+        && hook.host_state_ptr == Arc::as_ptr(&host.state) as usize
+    {
+        hook.fanout_claimed.notify_one();
+    }
+}
+
+#[cfg(test)]
+fn notify_startup_failure_claimed_test_hook(host: &HostHandle) {
+    let hook = startup_failure_fanout_race_hook_cell()
+        .lock()
+        .expect("startup failure fanout race hook mutex poisoned")
+        .clone();
+    if let Some(hook) = hook
+        && hook.host_state_ptr == Arc::as_ptr(&host.state) as usize
+    {
+        hook.failure_claimed.notify_one();
+    }
+}
+
+#[cfg(test)]
+async fn wait_for_startup_failure_fanout_race_test_hook(host: &HostHandle) {
+    let hook = {
+        startup_failure_fanout_race_hook_cell()
+            .lock()
+            .expect("startup failure fanout race hook mutex poisoned")
+            .clone()
+    };
+    let Some(hook) = hook else {
+        return;
+    };
+    if hook.host_state_ptr != Arc::as_ptr(&host.state) as usize {
+        return;
+    }
+    hook.ready.wait().await;
+    if hook.winner == StartupFailureFanoutRaceWinner::Fanout {
+        hook.fanout_claimed.notified().await;
+    }
+}
+
+#[cfg(test)]
+fn startup_failure_fanout_race_hook_cell() -> &'static StartupFailureFanoutRaceHookCell {
+    static HOOK: std::sync::OnceLock<StartupFailureFanoutRaceHookCell> = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+struct InstalledSpawnNewAgentFanoutHook {
+    inner: Arc<SpawnNewAgentFanoutHook>,
+}
+
+#[cfg(test)]
+struct SpawnNewAgentFanoutHook {
+    host_state_ptr: usize,
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    paused_once: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+type SpawnNewAgentFanoutHookCell = std::sync::Mutex<Option<Arc<SpawnNewAgentFanoutHook>>>;
+
+#[cfg(test)]
+impl InstalledSpawnNewAgentFanoutHook {
+    async fn wait_until_reached(&self) {
+        self.inner.reached.notified().await;
+    }
+}
+
+#[cfg(test)]
+impl Drop for InstalledSpawnNewAgentFanoutHook {
+    fn drop(&mut self) {
+        let mut hook = spawn_new_agent_fanout_hook_cell()
+            .lock()
+            .expect("spawn NewAgent fanout hook mutex poisoned");
+        if hook
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &self.inner))
+        {
+            *hook = None;
+        }
+        self.inner.resume.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+fn install_spawn_new_agent_fanout_test_hook(host: &HostHandle) -> InstalledSpawnNewAgentFanoutHook {
+    let inner = Arc::new(SpawnNewAgentFanoutHook {
+        host_state_ptr: Arc::as_ptr(&host.state) as usize,
+        reached: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+        paused_once: std::sync::atomic::AtomicBool::new(false),
+    });
+    let mut hook = spawn_new_agent_fanout_hook_cell()
+        .lock()
+        .expect("spawn NewAgent fanout hook mutex poisoned");
+    assert!(
+        hook.is_none(),
+        "spawn NewAgent fanout hook already installed"
+    );
+    *hook = Some(Arc::clone(&inner));
+    InstalledSpawnNewAgentFanoutHook { inner }
+}
+
+#[cfg(test)]
+async fn wait_after_spawn_new_agent_fanout_test_hook(host: &HostHandle) {
+    let hook = {
+        spawn_new_agent_fanout_hook_cell()
+            .lock()
+            .expect("spawn NewAgent fanout hook mutex poisoned")
+            .clone()
+    };
+    let Some(hook) = hook else {
+        return;
+    };
+    if hook.host_state_ptr != Arc::as_ptr(&host.state) as usize
+        || hook.paused_once.swap(true, Ordering::SeqCst)
+    {
+        return;
+    }
+    hook.reached.notify_one();
+    hook.resume.notified().await;
+}
+
+#[cfg(test)]
+fn spawn_new_agent_fanout_hook_cell() -> &'static SpawnNewAgentFanoutHookCell {
+    static HOOK: std::sync::OnceLock<SpawnNewAgentFanoutHookCell> = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+struct InstalledSpawnVisibleBeforePublicationHook {
+    inner: Arc<SpawnVisibleBeforePublicationHook>,
+}
+
+#[cfg(test)]
+struct SpawnVisibleBeforePublicationHook {
+    host_state_ptr: usize,
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+type SpawnVisibleBeforePublicationHookCell =
+    std::sync::Mutex<Option<Arc<SpawnVisibleBeforePublicationHook>>>;
+
+#[cfg(test)]
+impl InstalledSpawnVisibleBeforePublicationHook {
+    async fn wait_until_reached(&self) {
+        self.inner.reached.notified().await;
+    }
+
+    fn resume(&self) {
+        self.inner.resume.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for InstalledSpawnVisibleBeforePublicationHook {
+    fn drop(&mut self) {
+        let mut hook = spawn_visible_before_publication_hook_cell()
+            .lock()
+            .expect("spawn visible-before-publication hook mutex poisoned");
+        if hook
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &self.inner))
+        {
+            *hook = None;
+        }
+        self.inner.resume.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+fn install_spawn_visible_before_publication_test_hook(
+    host: &HostHandle,
+) -> InstalledSpawnVisibleBeforePublicationHook {
+    let inner = Arc::new(SpawnVisibleBeforePublicationHook {
+        host_state_ptr: Arc::as_ptr(&host.state) as usize,
+        reached: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+    });
+    let mut hook = spawn_visible_before_publication_hook_cell()
+        .lock()
+        .expect("spawn visible-before-publication hook mutex poisoned");
+    assert!(
+        hook.is_none(),
+        "spawn visible-before-publication hook already installed"
+    );
+    *hook = Some(Arc::clone(&inner));
+    InstalledSpawnVisibleBeforePublicationHook { inner }
+}
+
+#[cfg(test)]
+async fn wait_for_spawn_visible_before_publication_test_hook(host: &HostHandle) {
+    let hook = {
+        spawn_visible_before_publication_hook_cell()
+            .lock()
+            .expect("spawn visible-before-publication hook mutex poisoned")
+            .clone()
+    };
+    let Some(hook) = hook else {
+        return;
+    };
+    if hook.host_state_ptr != Arc::as_ptr(&host.state) as usize {
+        return;
+    }
+    hook.reached.notify_one();
+    hook.resume.notified().await;
+}
+
+#[cfg(test)]
+fn spawn_visible_before_publication_hook_cell() -> &'static SpawnVisibleBeforePublicationHookCell {
+    static HOOK: std::sync::OnceLock<SpawnVisibleBeforePublicationHookCell> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+struct InstalledSpawnCancelledBeforeCleanupHook {
+    inner: Arc<SpawnCancelledBeforeCleanupHook>,
+}
+
+#[cfg(test)]
+struct SpawnCancelledBeforeCleanupHook {
+    host_state_ptr: usize,
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+type SpawnCancelledBeforeCleanupHookCell =
+    std::sync::Mutex<Option<Arc<SpawnCancelledBeforeCleanupHook>>>;
+
+#[cfg(test)]
+impl InstalledSpawnCancelledBeforeCleanupHook {
+    async fn wait_until_reached(&self) {
+        self.inner.reached.notified().await;
+    }
+
+    fn resume(&self) {
+        self.inner.resume.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for InstalledSpawnCancelledBeforeCleanupHook {
+    fn drop(&mut self) {
+        let mut hook = spawn_cancelled_before_cleanup_hook_cell()
+            .lock()
+            .expect("spawn cancelled-before-cleanup hook mutex poisoned");
+        if hook
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &self.inner))
+        {
+            *hook = None;
+        }
+        self.inner.resume.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+fn install_spawn_cancelled_before_cleanup_test_hook(
+    host: &HostHandle,
+) -> InstalledSpawnCancelledBeforeCleanupHook {
+    let inner = Arc::new(SpawnCancelledBeforeCleanupHook {
+        host_state_ptr: Arc::as_ptr(&host.state) as usize,
+        reached: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+    });
+    let mut hook = spawn_cancelled_before_cleanup_hook_cell()
+        .lock()
+        .expect("spawn cancelled-before-cleanup hook mutex poisoned");
+    assert!(
+        hook.is_none(),
+        "spawn cancelled-before-cleanup hook already installed"
+    );
+    *hook = Some(Arc::clone(&inner));
+    InstalledSpawnCancelledBeforeCleanupHook { inner }
+}
+
+#[cfg(test)]
+async fn wait_for_spawn_cancelled_before_cleanup_test_hook(host: &HostHandle) {
+    let hook = {
+        spawn_cancelled_before_cleanup_hook_cell()
+            .lock()
+            .expect("spawn cancelled-before-cleanup hook mutex poisoned")
+            .clone()
+    };
+    let Some(hook) = hook else {
+        return;
+    };
+    if hook.host_state_ptr != Arc::as_ptr(&host.state) as usize {
+        return;
+    }
+    hook.reached.notify_one();
+    hook.resume.notified().await;
+}
+
+#[cfg(test)]
+fn spawn_cancelled_before_cleanup_hook_cell() -> &'static SpawnCancelledBeforeCleanupHookCell {
+    static HOOK: std::sync::OnceLock<SpawnCancelledBeforeCleanupHookCell> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
 pub(crate) struct HostSubAgentEmitter {
     spawn_tx: HostSubAgentSpawnTx,
+    capacity_tx: HostCapacityTx,
     parent_agent_id: AgentId,
     workspace_roots: Vec<String>,
 }
@@ -556,11 +1628,13 @@ pub(crate) struct HostSubAgentEmitter {
 impl HostSubAgentEmitter {
     pub(crate) fn new(
         spawn_tx: HostSubAgentSpawnTx,
+        capacity_tx: HostCapacityTx,
         parent_agent_id: AgentId,
         workspace_roots: Vec<String>,
     ) -> Self {
         Self {
             spawn_tx,
+            capacity_tx,
             parent_agent_id,
             workspace_roots,
         }
@@ -584,6 +1658,12 @@ struct HostStorePaths {
 }
 
 impl SubAgentEmitter for HostSubAgentEmitter {
+    fn on_backend_capacity(&self, backend_kind: BackendKind, state: BackendCapacityState) {
+        let _ = self.capacity_tx.send(HostCapacityUpdate::Report {
+            backend_kind,
+            state,
+        });
+    }
     fn on_subagent_spawned(
         &self,
         tool_use_id: String,
@@ -591,7 +1671,7 @@ impl SubAgentEmitter for HostSubAgentEmitter {
         description: String,
         agent_type: String,
         session_id_hint: Option<SessionId>,
-    ) -> Pin<Box<dyn Future<Output = SubAgentHandle> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<SubAgentHandle, String>> + Send + '_>> {
         Box::pin(async move {
             let (reply_tx, reply_rx) = oneshot::channel();
             self.spawn_tx
@@ -605,18 +1685,18 @@ impl SubAgentEmitter for HostSubAgentEmitter {
                     session_id_hint,
                     reply: reply_tx,
                 })
-                .unwrap_or_else(|_| {
-                    panic!(
-                        "host sub-agent spawn channel closed for parent {}",
+                .map_err(|_| {
+                    format!(
+                        "backend-native child spawn channel closed for parent {}",
                         self.parent_agent_id
                     )
-                });
-            reply_rx.await.unwrap_or_else(|_| {
-                panic!(
-                    "host sub-agent spawn reply dropped for parent {}",
+                })?;
+            reply_rx.await.map_err(|_| {
+                format!(
+                    "backend-native child spawn reply dropped for parent {}",
                     self.parent_agent_id
                 )
-            })
+            })?
         })
     }
 }
@@ -648,6 +1728,8 @@ impl HostHandle {
                 last_backend_config_schemas: None,
                 last_backend_config_snapshots: None,
                 last_backend_native_settings_snapshots: None,
+                last_backend_capacity: None,
+                capacity_replay_ready: false,
                 last_launch_profile_catalog: None,
             },
         );
@@ -874,9 +1956,15 @@ impl HostHandle {
         };
 
         let agent_ids = state.registry.agent_ids();
+        let agent_visibility = state.agent_visibility.clone();
         let mut agents = Vec::new();
         let mut deferred_attachments = Vec::new();
         for agent_id in agent_ids {
+            if !agent_visibility
+                .bootstrap_eligible(&agent_id, state.agent_sessions.contains_key(&agent_id))
+            {
+                continue;
+            }
             let agent_handle = state.registry.agent_handle(&agent_id).unwrap_or_else(|| {
                 panic!(
                     "registry missing handle for listed agent {} during host stream registration",
@@ -978,6 +2066,7 @@ impl HostHandle {
             .map(|agent| agent.agent_id.clone())
             .collect::<HashSet<_>>();
         let mut state = self.state.lock().await;
+        let agent_visibility = state.agent_visibility.clone();
         let (pending_new_agents, pending_frames, bootstrap_stream) = {
             let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
                 panic!(
@@ -992,7 +2081,11 @@ impl HostHandle {
             {
                 state.mobile_access.unregister_subscriber(host_path.clone());
                 state.host_streams.remove(&host_path);
+                state.agent_visibility.remove_host_stream(&host_path);
                 return Vec::new();
+            }
+            for agent in &bootstrap.agents {
+                agent_visibility.record_new_agent(agent.agent_id.clone(), host_path.clone());
             }
             subscriber.bootstrapped = true;
             subscriber.last_session_schemas = Some(bootstrap.session_schemas.clone());
@@ -1021,11 +2114,19 @@ impl HostHandle {
             )
             .await
             {
-                Ok(Some(attachment)) => deferred_attachments.push(attachment),
-                Ok(None) => {}
+                Ok(Some(attachment)) => {
+                    agent_visibility
+                        .record_new_agent(pending.start.agent_id.clone(), host_path.clone());
+                    deferred_attachments.push(attachment);
+                }
+                Ok(None) => {
+                    agent_visibility
+                        .record_new_agent(pending.start.agent_id.clone(), host_path.clone());
+                }
                 Err(_) => {
                     state.mobile_access.unregister_subscriber(host_path.clone());
                     state.host_streams.remove(&host_path);
+                    state.agent_visibility.remove_host_stream(&host_path);
                     return Vec::new();
                 }
             }
@@ -1034,6 +2135,7 @@ impl HostHandle {
             if bootstrap_stream.send_value(kind, payload).is_err() {
                 state.mobile_access.unregister_subscriber(host_path.clone());
                 state.host_streams.remove(&host_path);
+                state.agent_visibility.remove_host_stream(&host_path);
                 return Vec::new();
             }
         }
@@ -1082,10 +2184,26 @@ impl HostHandle {
         }
     }
 
+    /// Replays the typed capacity snapshot after the canonical host bootstrap
+    /// sequence has yielded to the connection's first command or idle replay.
+    pub(crate) async fn replay_backend_capacity_for_host_stream(&self, path: &StreamPath) {
+        let mut state = self.state.lock().await;
+        let snapshots = backend_capacity_snapshots(&state);
+        let Some(subscriber) = state.host_streams.get_mut(path) else {
+            return;
+        };
+        subscriber.capacity_replay_ready = true;
+        if emit_backend_capacity_for_subscriber(&snapshots, subscriber).is_err() {
+            state.host_streams.remove(path);
+            state.agent_visibility.remove_host_stream(path);
+        }
+    }
+
     pub(crate) async fn unregister_host_stream(&self, path: &StreamPath) {
         let (project_handles, terminals, review_registry) = {
             let mut state = self.state.lock().await;
             state.host_streams.remove(path);
+            state.agent_visibility.remove_host_stream(path);
             state.mobile_access.unregister_subscriber(path.clone());
             let review_registry = state.review_registry.clone();
             let project_handles = state
@@ -2157,10 +3275,9 @@ impl HostHandle {
                             await_agent_name_generation(
                                 generate_agent_name(GenerateAgentNameRequest {
                                     backend_kind,
-                                    workspace_roots: workspace_roots.clone(),
                                     prompt: prompt.clone(),
-                                    startup_mcp_servers: startup_mcp_servers.clone(),
                                     use_mock_backend,
+                                    capacity_tx: self.state.lock().await.capacity_tx.clone(),
                                 }),
                                 AGENT_NAME_GENERATION_TIMEOUT,
                             )
@@ -2605,6 +3722,22 @@ impl HostHandle {
                         })
                         .await);
                 };
+                let parent_agent_mismatch_failure = match parent_session_id.as_ref() {
+                    Some(session_id) if session_id != &from_session_id => {
+                        Some(AgentStartupFailure::internal(format!(
+                            "fork parent_agent_id maps to session {}, not from_session_id {}",
+                            session_id, from_session_id
+                        )))
+                    }
+                    Some(_) => None,
+                    None => parent_session_lookup_failure.clone(),
+                };
+                tracing::warn!(
+                    from_session_id = %from_session_id,
+                    parent_agent_id = ?payload.parent_agent_id,
+                    parent_lookup_failed = parent_agent_mismatch_failure.is_some(),
+                    "diagnostic: side-question fork loaded source session and resolved parent"
+                );
                 if let Some(requested_custom_agent_id) = payload.custom_agent_id.as_ref() {
                     assert_eq!(
                         record.custom_agent_id.as_ref(),
@@ -2746,13 +3879,36 @@ impl HostHandle {
                     let state = self.state.lock().await;
                     session_schema_for_backend(&state, backend_kind)
                 };
+                tracing::warn!(
+                    from_session_id = %from_session_id,
+                    backend_kind = ?backend_kind,
+                    schema_present = session_settings_schema.is_some(),
+                    parent_lookup_failed = parent_agent_mismatch_failure.is_some(),
+                    "diagnostic: side-question fork reached dynamic schema decision"
+                );
                 let session_settings_schema = if backend_has_dynamic_session_schema(backend_kind)
                     && session_settings_schema.is_none()
+                    && parent_agent_mismatch_failure.is_none()
                 {
+                    tracing::warn!(
+                        from_session_id = %from_session_id,
+                        backend_kind = ?backend_kind,
+                        "diagnostic: side-question fork starting inline session schema refresh"
+                    );
                     self.refresh_session_schemas().await;
                     let state = self.state.lock().await;
                     session_schema_for_backend(&state, backend_kind)
                 } else {
+                    if parent_agent_mismatch_failure.is_some()
+                        && session_settings_schema.is_none()
+                        && backend_has_dynamic_session_schema(backend_kind)
+                    {
+                        tracing::warn!(
+                            from_session_id = %from_session_id,
+                            backend_kind = ?backend_kind,
+                            "diagnostic: side-question fork skipped inline schema refresh because startup already fails"
+                        );
+                    }
                     session_settings_schema
                 };
                 let (sanitized_settings, settings_failure) = sanitize_stored_session_settings(
@@ -2779,16 +3935,6 @@ impl HostHandle {
                             ))
                         },
                     );
-                let parent_agent_mismatch_failure = match parent_session_id.as_ref() {
-                    Some(session_id) if session_id != &from_session_id => {
-                        Some(AgentStartupFailure::internal(format!(
-                            "fork parent_agent_id maps to session {}, not from_session_id {}",
-                            session_id, from_session_id
-                        )))
-                    }
-                    Some(_) => None,
-                    None => parent_session_lookup_failure.clone(),
-                };
                 let startup_failure = startup_failure
                     .or(parent_agent_mismatch_failure)
                     .or(non_resumable_failure)
@@ -2858,6 +4004,7 @@ impl HostHandle {
         };
 
         let request = self.apply_complexity_tier_settings(request).await;
+        let diagnose_side_question_fanout = matches!(&request.origin, AgentOrigin::SideQuestion);
         tracing::info!(
             backend_kind = ?request.backend_kind,
             workspace_roots = ?request.workspace_roots,
@@ -2867,30 +4014,64 @@ impl HostHandle {
             "host spawn_agent resolved request"
         );
 
-        let (start, agent_handle, startup_rx, host_streams) = {
+        let (start, agent_handle, startup_rx, agent_visibility) = {
             let mut state = self.state.lock().await;
             let sub_agent_spawn_tx = state.sub_agent_spawn_tx.clone();
+            let capacity_tx = state.capacity_tx.clone();
             let review_registry = state.review_registry.clone();
             let agent_control_mcp = state.agent_control_mcp.clone();
             let antigravity_conversations_dir = state.antigravity_conversations_dir.clone();
             let spawned = state.registry.spawn(
                 request,
                 &agent_control_mcp,
-                Arc::clone(&session_store),
-                sub_agent_spawn_tx,
-                review_registry,
-                antigravity_conversations_dir,
+                crate::agent::AgentActorRuntimeResources {
+                    session_store: Arc::clone(&session_store),
+                    host_sub_agent_spawn_tx: sub_agent_spawn_tx,
+                    capacity_tx,
+                    review_registry,
+                    antigravity_conversations_dir,
+                },
             );
+            (
+                spawned.start,
+                spawned.handle,
+                spawned.startup_rx,
+                state.agent_visibility.clone(),
+            )
+        };
+
+        let agent_id = start.agent_id.clone();
+        let visibility = SpawnVisibility::new(agent_id.clone(), agent_visibility);
+        let mut visibility_guard = SpawnVisibilityGuard::new(visibility.clone());
+        let session_registration_publish = self.schedule_agent_session_registration(
+            agent_id.clone(),
+            startup_rx,
+            visibility.clone(),
+        );
+        #[cfg(test)]
+        wait_for_spawn_session_registration_test_hook(self).await;
+
+        #[cfg(test)]
+        wait_before_startup_failure_fanout_test_hook(self).await;
+        let fanout_started = visibility.begin_fanout();
+        #[cfg(test)]
+        notify_startup_failure_fanout_claimed_test_hook(self);
+        if !fanout_started {
+            return Ok(agent_id);
+        }
+
+        let mut host_streams = {
+            let mut state = self.state.lock().await;
             let activity_summary =
-                initial_agent_activity_summary_state(&mut state, &spawned.start.agent_id);
+                initial_agent_activity_summary_state(&mut state, &start.agent_id);
             let host_streams = state
                 .host_streams
                 .iter_mut()
                 .filter_map(|(path, subscriber)| {
                     prepare_new_agent_fanout_for_subscriber(
                         subscriber,
-                        &spawned.start,
-                        &spawned.handle,
+                        &start,
+                        &agent_handle,
                         activity_summary.clone(),
                     )
                     .map(
@@ -2906,16 +4087,34 @@ impl HostHandle {
                     )
                 })
                 .collect::<Vec<_>>();
-            (
-                spawned.start,
-                spawned.handle,
-                spawned.startup_rx,
-                host_streams,
-            )
+            if diagnose_side_question_fanout {
+                tracing::warn!(
+                    agent_id = %start.agent_id,
+                    parent_agent_id = ?start.parent_agent_id,
+                    registered = state.registry.agent_handle(&start.agent_id).is_some(),
+                    prepared_host_fanouts = host_streams.len(),
+                    total_host_subscribers = state.host_streams.len(),
+                    "diagnostic: side-question agent registered and host fanout prepared"
+                );
+            }
+            host_streams
         };
+        host_streams.sort_by(|left, right| left.0.0.cmp(&right.0.0));
 
         let mut dead_paths = Vec::new();
         for (path, stream, attach_eagerly, instance_stream, activity_summary) in host_streams {
+            if !visibility.may_emit_new_agent() {
+                break;
+            }
+            if diagnose_side_question_fanout {
+                tracing::warn!(
+                    agent_id = %start.agent_id,
+                    host_stream = %path,
+                    agent_stream = %instance_stream,
+                    attach_eagerly,
+                    "diagnostic: attempting side-question NewAgent fanout"
+                );
+            }
             match emit_new_agent_for_stream(
                 &start,
                 &agent_handle,
@@ -2927,18 +4126,62 @@ impl HostHandle {
             .await
             {
                 Ok(Some(attachment)) => {
-                    self.attach_deferred_agent_stream(attachment).await;
+                    let continue_fanout = visibility.record_new_agent_delivery(path.clone());
+                    #[cfg(test)]
+                    wait_after_spawn_new_agent_fanout_test_hook(self).await;
+                    if diagnose_side_question_fanout {
+                        tracing::warn!(
+                            agent_id = %start.agent_id,
+                            host_stream = %path,
+                            "diagnostic: side-question NewAgent fanout succeeded with attachment"
+                        );
+                    }
+                    if continue_fanout {
+                        self.attach_deferred_agent_stream(attachment).await;
+                    } else {
+                        break;
+                    }
                 }
-                Ok(None) => {}
-                Err(_) => dead_paths.push(path),
+                Ok(None) => {
+                    let continue_fanout = visibility.record_new_agent_delivery(path.clone());
+                    #[cfg(test)]
+                    wait_after_spawn_new_agent_fanout_test_hook(self).await;
+                    if diagnose_side_question_fanout {
+                        tracing::warn!(
+                            agent_id = %start.agent_id,
+                            host_stream = %path,
+                            "diagnostic: side-question NewAgent fanout succeeded without attachment"
+                        );
+                    }
+                    if !continue_fanout {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    if diagnose_side_question_fanout {
+                        tracing::warn!(
+                            agent_id = %start.agent_id,
+                            host_stream = %path,
+                            error = ?error,
+                            "diagnostic: side-question NewAgent fanout failed"
+                        );
+                    }
+                    dead_paths.push(path);
+                }
             }
         }
         if !dead_paths.is_empty() {
             let mut state = self.state.lock().await;
             for path in dead_paths {
                 state.host_streams.remove(&path);
+                state.agent_visibility.remove_host_stream(&path);
             }
         }
+        if visibility.finish_new_agent_fanout() {
+            return Ok(agent_id);
+        }
+        #[cfg(test)]
+        wait_for_spawn_visible_before_publication_test_hook(self).await;
         {
             let mut state = self.state.lock().await;
             fan_out_current_agents_view_preferences(&mut state).await;
@@ -2956,8 +4199,8 @@ impl HostHandle {
             );
         }
 
-        let agent_id = start.agent_id.clone();
-        self.schedule_agent_session_registration(agent_id.clone(), startup_rx);
+        session_registration_publish.publish();
+        visibility_guard.disarm();
         tracing::info!(
             agent_id = %agent_id,
             backend_kind = ?start.backend_kind,
@@ -3147,30 +4390,64 @@ impl HostHandle {
             let state = self.state.lock().await;
             Arc::clone(&state.session_store)
         };
-        let (start, agent_handle, startup_rx, host_streams) = {
+        let (start, agent_handle, startup_rx, agent_visibility) = {
             let mut state = self.state.lock().await;
             let sub_agent_spawn_tx = state.sub_agent_spawn_tx.clone();
+            let capacity_tx = state.capacity_tx.clone();
             let review_registry = state.review_registry.clone();
             let agent_control_mcp = state.agent_control_mcp.clone();
             let antigravity_conversations_dir = state.antigravity_conversations_dir.clone();
             let spawned = state.registry.spawn(
                 request,
                 &agent_control_mcp,
-                session_store,
-                sub_agent_spawn_tx,
-                review_registry,
-                antigravity_conversations_dir,
+                crate::agent::AgentActorRuntimeResources {
+                    session_store,
+                    host_sub_agent_spawn_tx: sub_agent_spawn_tx,
+                    capacity_tx,
+                    review_registry,
+                    antigravity_conversations_dir,
+                },
             );
+            (
+                spawned.start,
+                spawned.handle,
+                spawned.startup_rx,
+                state.agent_visibility.clone(),
+            )
+        };
+
+        let agent_id = start.agent_id.clone();
+        let visibility = SpawnVisibility::new(agent_id.clone(), agent_visibility);
+        let mut visibility_guard = SpawnVisibilityGuard::new(visibility.clone());
+        let session_registration_publish = self.schedule_agent_session_registration(
+            agent_id.clone(),
+            startup_rx,
+            visibility.clone(),
+        );
+        #[cfg(test)]
+        wait_for_spawn_session_registration_test_hook(self).await;
+
+        #[cfg(test)]
+        wait_before_startup_failure_fanout_test_hook(self).await;
+        let fanout_started = visibility.begin_fanout();
+        #[cfg(test)]
+        notify_startup_failure_fanout_claimed_test_hook(self);
+        if !fanout_started {
+            return agent_id;
+        }
+
+        let mut host_streams = {
+            let mut state = self.state.lock().await;
             let activity_summary =
-                initial_agent_activity_summary_state(&mut state, &spawned.start.agent_id);
-            let host_streams = state
+                initial_agent_activity_summary_state(&mut state, &start.agent_id);
+            state
                 .host_streams
                 .iter_mut()
                 .filter_map(|(path, subscriber)| {
                     prepare_new_agent_fanout_for_subscriber(
                         subscriber,
-                        &spawned.start,
-                        &spawned.handle,
+                        &start,
+                        &agent_handle,
                         activity_summary.clone(),
                     )
                     .map(
@@ -3185,17 +4462,15 @@ impl HostHandle {
                         },
                     )
                 })
-                .collect::<Vec<_>>();
-            (
-                spawned.start,
-                spawned.handle,
-                spawned.startup_rx,
-                host_streams,
-            )
+                .collect::<Vec<_>>()
         };
+        host_streams.sort_by(|left, right| left.0.0.cmp(&right.0.0));
 
         let mut dead_paths = Vec::new();
         for (path, stream, attach_eagerly, instance_stream, activity_summary) in host_streams {
+            if !visibility.may_emit_new_agent() {
+                break;
+            }
             match emit_new_agent_for_stream(
                 &start,
                 &agent_handle,
@@ -3207,9 +4482,23 @@ impl HostHandle {
             .await
             {
                 Ok(Some(attachment)) => {
-                    self.attach_deferred_agent_stream(attachment).await;
+                    let continue_fanout = visibility.record_new_agent_delivery(path.clone());
+                    #[cfg(test)]
+                    wait_after_spawn_new_agent_fanout_test_hook(self).await;
+                    if continue_fanout {
+                        self.attach_deferred_agent_stream(attachment).await;
+                    } else {
+                        break;
+                    }
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    let continue_fanout = visibility.record_new_agent_delivery(path.clone());
+                    #[cfg(test)]
+                    wait_after_spawn_new_agent_fanout_test_hook(self).await;
+                    if !continue_fanout {
+                        break;
+                    }
+                }
                 Err(_) => dead_paths.push(path),
             }
         }
@@ -3217,8 +4506,14 @@ impl HostHandle {
             let mut state = self.state.lock().await;
             for path in dead_paths {
                 state.host_streams.remove(&path);
+                state.agent_visibility.remove_host_stream(&path);
             }
         }
+        if visibility.finish_new_agent_fanout() {
+            return agent_id;
+        }
+        #[cfg(test)]
+        wait_for_spawn_visible_before_publication_test_hook(self).await;
 
         if let Some(project_id) = start.project_id.clone()
             && let Err(error) = self
@@ -3232,8 +4527,8 @@ impl HostHandle {
             );
         }
 
-        let agent_id = start.agent_id.clone();
-        self.schedule_agent_session_registration(agent_id.clone(), startup_rx);
+        session_registration_publish.publish();
+        visibility_guard.disarm();
         tracing::info!(
             agent_id = %agent_id,
             backend_kind = ?start.backend_kind,
@@ -3486,7 +4781,11 @@ impl HostHandle {
         Ok(())
     }
 
-    pub(crate) async fn create_workbench(&self, payload: WorkbenchCreatePayload) -> AppResult<()> {
+    pub(crate) async fn create_workbench(
+        &self,
+        payload: WorkbenchCreatePayload,
+        base: Option<BaseRevision>,
+    ) -> AppResult<CreatedWorkbench> {
         const OPERATION: &str = "workbench_create";
         let parent_lock = self.workbench_parent_lock(&payload.parent_project_id).await;
         let _parent_guard = parent_lock.lock().await;
@@ -3533,10 +4832,30 @@ impl HostHandle {
         let roots = compute_workbench_roots(parent_roots, &branch)?;
         preflight_workbench_create(&project_store, &parent, &branch, &roots).await?;
 
-        let mut created = Vec::<WorkbenchRoot>::new();
+        let mut resolved_roots = Vec::with_capacity(roots.len());
         for root in &roots {
-            if let Err(error) =
-                git_worktree_add(&root.parent_root, &root.worktree_root, &branch).await
+            resolved_roots.push(CreatedWorkbenchRoot {
+                root: root.clone(),
+                base_commit: git_resolve_base_commit(&root.parent_root, base.as_ref()).await?,
+                parent_root_dirty: !git_status_porcelain(&root.parent_root)
+                    .await
+                    .map_err(|error| {
+                        AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
+                    })?
+                    .is_empty(),
+            });
+        }
+
+        let mut created = Vec::<WorkbenchRoot>::new();
+        for resolved in &resolved_roots {
+            let root = &resolved.root;
+            if let Err(error) = git_worktree_add(
+                &root.parent_root,
+                &root.worktree_root,
+                &branch,
+                &resolved.base_commit,
+            )
+            .await
             {
                 let rollback_message = rollback_created_worktrees(&created, &branch).await;
                 let message = append_rollback_message(error, rollback_message);
@@ -3568,7 +4887,13 @@ impl HostHandle {
 
         let project_id = project.id.clone();
         let mut state = self.state.lock().await;
-        fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
+        fan_out_project_notify(
+            &mut state,
+            ProjectNotifyPayload::Upsert {
+                project: project.clone(),
+            },
+        )
+        .await;
         // The workbench record and worktrees already exist and the Upsert
         // has fanned out, so a project-actor failure here must not fail
         // the request (mirrors create_project): warn and return success.
@@ -3605,7 +4930,19 @@ impl HostHandle {
         drop(state);
         self.update_workflow_watcher_targets_and_reload("workbench_create")
             .await?;
-        Ok(())
+        Ok(CreatedWorkbench {
+            project,
+            roots: resolved_roots,
+        })
+    }
+
+    pub(crate) async fn list_projects(&self) -> Result<Vec<Project>, String> {
+        let state = self.state.lock().await;
+        state.project_store.lock().await.list().map_err(Into::into)
+    }
+
+    pub(crate) async fn project_id_for_agent(&self, agent_id: &AgentId) -> Option<ProjectId> {
+        self.agent_project_id(agent_id).await
     }
 
     pub(crate) async fn remove_workbench(&self, payload: WorkbenchRemovePayload) -> AppResult<()> {
@@ -3647,6 +4984,7 @@ impl HostHandle {
                 ));
             }
         }
+        wait_for_workbench_remove_test_hook(self).await;
         let result = self
             .remove_workbench_marked(&payload, &project, roots, &project_store)
             .await;
@@ -4997,6 +6335,56 @@ impl HostHandle {
 
     pub(crate) async fn set_setting(&self, payload: SetSettingPayload) -> AppResult<()> {
         const OPERATION: &str = "set_setting";
+        if let protocol::HostSettingValue::AcknowledgeTycodeProjectionNotice {
+            backend,
+            projection_id,
+        } = &payload.setting
+        {
+            if *backend != BackendKind::Tycode {
+                return Err(AppError::invalid(
+                    OPERATION,
+                    format!("{backend:?} does not own a Tycode projection notice"),
+                ));
+            }
+            return run_tycode_runtime_setting_operation(
+                projection_id.clone(),
+                |projection_id| async move {
+                    crate::backend::tycode::acknowledge_tycode_projection_notice(&projection_id)
+                        .await
+                },
+                tycode_projection_acknowledgement_app_error,
+                || self.refresh_backend_config_snapshots_after_native_save(),
+            )
+            .await;
+        }
+
+        if let protocol::HostSettingValue::ResetTycodeManagedProjection {
+            backend,
+            expected_projection_id,
+            expected_state_hash,
+        } = &payload.setting
+        {
+            if *backend != BackendKind::Tycode {
+                return Err(AppError::invalid(
+                    OPERATION,
+                    format!("{backend:?} does not own a Tycode managed projection"),
+                ));
+            }
+            return run_tycode_runtime_setting_operation(
+                (expected_projection_id.clone(), expected_state_hash.clone()),
+                |(expected_projection_id, expected_state_hash)| async move {
+                    crate::backend::tycode::reset_tycode_managed_projection(
+                        &expected_projection_id,
+                        &expected_state_hash,
+                    )
+                    .await
+                },
+                tycode_managed_projection_reset_app_error,
+                || self.refresh_backend_config_snapshots_after_native_save(),
+            )
+            .await;
+        }
+
         if let protocol::HostSettingValue::BackendNativeSettings { backend, settings } =
             &payload.setting
         {
@@ -5234,12 +6622,7 @@ impl HostHandle {
     ) -> Result<Vec<AgentOrderKey>, String> {
         let mut live_sessions = HashMap::<AgentId, Option<SessionId>>::new();
         for agent_id in state.registry.agent_ids() {
-            let session_id = state.agent_sessions.get(&agent_id).cloned().or_else(|| {
-                state
-                    .registry
-                    .agent_handle(&agent_id)
-                    .and_then(|agent| agent.snapshot().session_id)
-            });
+            let session_id = state.agent_sessions.get(&agent_id).cloned();
             live_sessions.insert(agent_id, session_id);
         }
 
@@ -5394,6 +6777,10 @@ impl HostHandle {
     }
 
     pub(crate) async fn refresh_session_schemas(&self) {
+        self.refresh_session_schemas_with_fanout(false).await;
+    }
+
+    async fn refresh_session_schemas_with_fanout(&self, force_emit: bool) {
         let (
             settings_store,
             codex_probe_program,
@@ -5521,9 +6908,26 @@ impl HostHandle {
         state.codex_session_schema = codex_session_schema;
         state.kiro_session_schema = kiro_session_schema;
         state.hermes_session_schema = hermes_session_schema;
-        fan_out_session_schemas(&mut state).await;
+        fan_out_session_schemas(&mut state, force_emit).await;
         fan_out_backend_config_schemas(&mut state).await;
         fan_out_launch_profile_catalog(&mut state).await;
+    }
+
+    async fn refresh_after_backend_setup(&self) {
+        let refresh_guard = self.backend_setup_refresh_lock.lock().await;
+        for step in BACKEND_SETUP_REFRESH_ORDER {
+            match step {
+                BackendSetupRefreshStep::Setup => self.fan_out_backend_setup().await,
+                BackendSetupRefreshStep::SessionSchemas => {
+                    self.refresh_session_schemas_with_fanout(true).await
+                }
+                BackendSetupRefreshStep::BackendConfigSnapshots => {
+                    self.refresh_backend_config_snapshots_with_fanout(true)
+                        .await
+                }
+            }
+        }
+        drop(refresh_guard);
     }
 
     pub(crate) async fn run_backend_setup(
@@ -5540,8 +6944,10 @@ impl HostHandle {
             action = ?payload.action,
             "host run_backend_setup requested"
         );
-        let Some(command) = setup::runnable_command(payload.backend_kind, payload.action).await
-        else {
+        let prepared = setup::prepare_runnable_command(payload.backend_kind, payload.action)
+            .await
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+        let Some(prepared) = prepared else {
             return Err(AppError::not_found(
                 OPERATION,
                 format!(
@@ -5551,48 +6957,48 @@ impl HostHandle {
             ));
         };
 
+        let cwd = std::env::current_dir()
+            .context("failed to resolve backend setup cwd")
+            .map_err(|error| AppError::internal(OPERATION, error))?
+            .display()
+            .to_string();
+        let launch = TerminalLaunchInfo {
+            project_id: None,
+            root: None,
+            cwd,
+            cols: 100,
+            rows: 28,
+            command: TerminalLaunchCommand::Trusted {
+                program: prepared.program().to_owned(),
+                arguments: prepared.arguments().to_vec(),
+            },
+        };
         let terminal = self
-            .create_terminal_internal(
-                connection_host_stream,
-                host_output_stream,
-                TerminalCreatePayload {
-                    target: TerminalLaunchTarget::HostDefault,
-                    cols: 100,
-                    rows: 28,
-                },
-            )
+            .create_resolved_terminal_internal(connection_host_stream, host_output_stream, launch)
             .await?;
 
         if let Some(terminal) = terminal {
             tracing::info!(
                 backend_kind = ?payload.backend_kind,
                 action = ?payload.action,
-                command = %command,
+                command = %prepared.display_command(),
                 "host run_backend_setup launching terminal command"
             );
-            terminal
-                .send(TerminalSendPayload {
-                    data: format!(
-                        "{command}
-"
-                    ),
-                })
-                .await;
 
             let host = self.clone();
             let backend_kind = payload.backend_kind;
             let action = payload.action;
             tokio::spawn(async move {
                 let exit = terminal.wait_for_exit().await;
+                drop(prepared);
                 tracing::info!(
                     backend_kind = ?backend_kind,
                     action = ?action,
                     exit_code = exit.exit_code,
                     signal = exit.signal.as_deref(),
-                    "host run_backend_setup terminal exited; refreshing backend setup"
+                    "host run_backend_setup terminal exited; refreshing backend state"
                 );
-                host.fan_out_backend_setup().await;
-                host.refresh_session_schemas().await;
+                host.refresh_after_backend_setup().await;
             });
         }
         Ok(())
@@ -5616,12 +7022,22 @@ impl HostHandle {
         host_output_stream: &Stream,
         payload: TerminalCreatePayload,
     ) -> AppResult<Option<TerminalHandle>> {
-        const OPERATION: &str = "terminal_create";
         let project_store = {
             let state = self.state.lock().await;
             Arc::clone(&state.project_store)
         };
         let launch = resolve_terminal_launch(&project_store, payload).await?;
+        self.create_resolved_terminal_internal(connection_host_stream, host_output_stream, launch)
+            .await
+    }
+
+    async fn create_resolved_terminal_internal(
+        &self,
+        connection_host_stream: &StreamPath,
+        host_output_stream: &Stream,
+        launch: TerminalLaunchInfo,
+    ) -> AppResult<Option<TerminalHandle>> {
+        const OPERATION: &str = "terminal_create";
         let launch_project_id = launch.project_id.clone();
         if let Some(project_id) = launch_project_id.as_ref() {
             let state = self.state.lock().await;
@@ -5663,7 +7079,7 @@ impl HostHandle {
                 ));
             }
             let previous = state.terminal_streams.insert(
-                (connection_host_stream.clone(), terminal_id),
+                (connection_host_stream.clone(), terminal_id.clone()),
                 terminal.clone(),
             );
             if previous.is_some() {
@@ -5690,10 +7106,30 @@ impl HostHandle {
             .send_value(FrameKind::NewTerminal, host_payload)
             .is_err()
         {
+            self.remove_failed_terminal(connection_host_stream, &terminal_id, &terminal)
+                .await;
             return Ok(None);
         }
-        let _ = terminal.emit_bootstrap_and_start_io().await;
+        if terminal.emit_bootstrap_and_start_io().await.is_err() {
+            self.remove_failed_terminal(connection_host_stream, &terminal_id, &terminal)
+                .await;
+            return Ok(None);
+        }
         Ok(Some(terminal))
+    }
+
+    async fn remove_failed_terminal(
+        &self,
+        connection_host_stream: &StreamPath,
+        terminal_id: &TerminalId,
+        terminal: &TerminalHandle,
+    ) {
+        let mut state = self.state.lock().await;
+        state
+            .terminal_streams
+            .remove(&(connection_host_stream.clone(), terminal_id.clone()));
+        drop(state);
+        terminal.close().await;
     }
 
     pub(crate) async fn send_terminal_input(
@@ -5901,6 +7337,37 @@ impl HostHandle {
     }
 
     pub(crate) async fn close_agent(&self, agent_id: &AgentId) -> bool {
+        self.close_agent_with_host_visibility(agent_id, None).await
+    }
+
+    async fn close_agent_for_recorded_visibility(&self, agent_id: &AgentId) -> bool {
+        let (close_ids, agent_visibility) = {
+            let state = self.state.lock().await;
+            (
+                state
+                    .registry
+                    .agent_subtree_post_order(agent_id)
+                    .into_iter()
+                    .map(|(agent_id, _)| agent_id)
+                    .collect::<Vec<_>>(),
+                state.agent_visibility.clone(),
+            )
+        };
+        let mut closed = false;
+        for close_id in close_ids {
+            let visible_host_streams = agent_visibility.visible_host_streams(&close_id);
+            closed |= self
+                .close_agent_with_host_visibility(&close_id, Some(&visible_host_streams))
+                .await;
+        }
+        closed
+    }
+
+    async fn close_agent_with_host_visibility(
+        &self,
+        agent_id: &AgentId,
+        visible_host_streams: Option<&HashSet<StreamPath>>,
+    ) -> bool {
         let (close_targets, host_streams) = {
             let state = self.state.lock().await;
             let close_targets = state.registry.agent_subtree_post_order(agent_id);
@@ -5910,6 +7377,10 @@ impl HostHandle {
             let host_streams = state
                 .host_streams
                 .iter()
+                .filter(|(path, _)| match visible_host_streams {
+                    Some(visible) => visible.contains(*path),
+                    None => true,
+                })
                 .map(|(path, subscriber)| {
                     (
                         path.clone(),
@@ -5995,10 +7466,12 @@ impl HostHandle {
         let mut state = self.state.lock().await;
         for path in dead_paths {
             state.host_streams.remove(&path);
+            state.agent_visibility.remove_host_stream(&path);
         }
 
         for closed_agent_id in close_ids {
             let removed = state.registry.remove_agent(&closed_agent_id);
+            state.agent_visibility.remove_agent(&closed_agent_id);
             if removed.is_none() {
                 tracing::debug!(
                     agent_id = %closed_agent_id,
@@ -6008,11 +7481,16 @@ impl HostHandle {
             }
 
             let removed_session_id = state.agent_sessions.remove(&closed_agent_id);
+            let removed_pending_session_id = state.pending_agent_sessions.remove(&closed_agent_id);
             state.agent_activity_summaries.remove(&closed_agent_id);
+            for subscriber in state.host_streams.values_mut() {
+                forget_agent_fanout_for_subscriber(subscriber, &closed_agent_id);
+            }
             let snapshot_session_id = removed
                 .as_ref()
                 .and_then(|agent| agent.snapshot().session_id);
-            if removed_session_id.or(snapshot_session_id).is_none()
+            if (removed_pending_session_id.is_some()
+                || removed_session_id.or(snapshot_session_id).is_none())
                 && let Some(store) = state.agents_view_preferences_store.clone()
                 && let Err(error) = store.lock().await.remove_transient_agent(
                     HostFilterId(LOCAL_HOST_ID.to_owned()),
@@ -6371,6 +7849,48 @@ impl HostHandle {
         {
             payload.project_id = Some(project_id);
         }
+        let project_parent_lock = if let Some(project_id) = payload.project_id.as_ref() {
+            let project = self
+                .list_projects()
+                .await?
+                .into_iter()
+                .find(|project| &project.id == project_id)
+                .ok_or_else(|| format!("cannot spawn agent in missing project {project_id}"))?;
+            match project.source {
+                ProjectSource::GitWorkbench {
+                    parent_project_id, ..
+                } => Some(self.workbench_parent_lock(&parent_project_id).await),
+                ProjectSource::Standalone { .. } => None,
+            }
+        } else {
+            None
+        };
+        let _project_parent_guard = match project_parent_lock.as_ref() {
+            Some(lock) => {
+                notify_workbench_spawn_waiting_test_hook(self);
+                Some(lock.lock().await)
+            }
+            None => None,
+        };
+        let requested_roots = match &payload.params {
+            SpawnAgentParams::New {
+                workspace_roots, ..
+            } => workspace_roots.clone(),
+            SpawnAgentParams::Resume { .. } | SpawnAgentParams::Fork { .. } => {
+                return Err("agent-control MCP spawn must use kind=new".to_owned());
+            }
+        };
+        let workspace_roots = self
+            .resolve_spawn_workspace_roots(payload.project_id.as_ref(), &requested_roots)
+            .await?;
+        let SpawnAgentParams::New {
+            workspace_roots: roots,
+            ..
+        } = &mut payload.params
+        else {
+            return Err("agent-control MCP spawn must use kind=new".to_owned());
+        };
+        *roots = workspace_roots;
         if let Some(workflow) = workflow {
             let backend_kind = match &payload.params {
                 SpawnAgentParams::New { backend_kind, .. } => *backend_kind,
@@ -6402,6 +7922,53 @@ impl HostHandle {
         self.spawn_agent_with_origin(payload, AgentOrigin::AgentControl)
             .await
             .map_err(|error| error.to_string())
+    }
+
+    pub(crate) async fn resolve_spawn_workspace_roots(
+        &self,
+        project_id: Option<&ProjectId>,
+        requested: &[String],
+    ) -> Result<Vec<String>, String> {
+        let Some(project_id) = project_id else {
+            if requested.is_empty() {
+                return Err(
+                    "workspace_roots must contain at least one root when project_id is omitted"
+                        .to_owned(),
+                );
+            }
+            return Ok(requested.to_vec());
+        };
+        let state = self.state.lock().await;
+        if state.removing_projects.contains(project_id) {
+            return Err(format!(
+                "cannot spawn agent in workbench {project_id} because it is being removed"
+            ));
+        }
+        let project = state
+            .project_store
+            .lock()
+            .await
+            .list()?
+            .into_iter()
+            .find(|project| &project.id == project_id)
+            .ok_or_else(|| format!("cannot spawn agent in missing project {project_id}"))?;
+        let authoritative = project
+            .root_paths()
+            .into_iter()
+            .map(|root| root.0)
+            .collect::<Vec<_>>();
+        if requested.is_empty() {
+            return Ok(authoritative);
+        }
+        let requested_set = requested.iter().collect::<HashSet<_>>();
+        let authoritative_set = authoritative.iter().collect::<HashSet<_>>();
+        if requested_set != authoritative_set {
+            return Err(format!(
+                "workspace_roots {:?} do not match authoritative roots {:?} for project {}",
+                requested, authoritative, project_id
+            ));
+        }
+        Ok(authoritative)
     }
 
     async fn workflow_metadata_for_agent(
@@ -7154,34 +8721,58 @@ impl HostHandle {
         &self,
         agent_id: AgentId,
         startup_rx: tokio::sync::oneshot::Receiver<Result<SessionId, String>>,
-    ) {
+        visibility: SpawnVisibility,
+    ) -> PendingAgentSessionPublication {
+        let (publish_tx, mut publish_rx) = mpsc::unbounded_channel::<()>();
         let host = self.clone();
+        let task_agent_id = agent_id.clone();
         tokio::spawn(async move {
-            match startup_rx.await {
-                Ok(Ok(session_id)) => {
-                    {
-                        let mut state = host.state.lock().await;
-                        state
-                            .agent_sessions
-                            .insert(agent_id.clone(), session_id.clone());
-                        if let Some(store) = state.agents_view_preferences_store.clone()
-                            && let Err(error) = store.lock().await.promote_transient_agent(
-                                HostFilterId(LOCAL_HOST_ID.to_owned()),
-                                agent_id.clone(),
-                                session_id.clone(),
-                            )
-                        {
-                            tracing::warn!(
-                                agent_id = %agent_id,
-                                session_id = %session_id,
-                                error = %error,
-                                "failed to promote agent annotations after session registration"
-                            );
-                        }
-                        fan_out_current_agents_view_preferences(&mut state).await;
+            let agent_id = task_agent_id;
+            let mut startup_rx = startup_rx;
+            let startup_result = tokio::select! {
+                startup = &mut startup_rx => Some(startup),
+                publication = publish_rx.recv() => match publication {
+                    Some(()) => None,
+                    None => {
+                        host.cleanup_unpublished_agent_session(agent_id.clone(), None, &visibility)
+                            .await;
+                        return;
                     }
-                    host.fan_out_session_lists().await;
-                    host.deliver_submitted_reviews_for_session(session_id).await;
+                },
+            };
+            let (startup_result, publication_authorized) = match startup_result {
+                Some(startup_result) => (startup_result, false),
+                None => (startup_rx.await, true),
+            };
+            let session_id = match startup_result {
+                Ok(Ok(session_id)) => {
+                    let pending_inserted = {
+                        let mut state = host.state.lock().await;
+                        if let Some(existing_session_id) =
+                            state.pending_agent_sessions.get(&agent_id)
+                        {
+                            Err(format!(
+                                "agent {agent_id} already has pending session binding {existing_session_id} before startup registration"
+                            ))
+                        } else {
+                            state
+                                .pending_agent_sessions
+                                .insert(agent_id.clone(), session_id.clone());
+                            Ok(())
+                        }
+                    };
+                    if let Err(error) = pending_inserted {
+                        tracing::error!(
+                            agent_id = %agent_id,
+                            session_id = %session_id,
+                            error = %error,
+                            "failed to register pending agent session"
+                        );
+                        host.cleanup_unpublished_agent_session(agent_id.clone(), None, &visibility)
+                            .await;
+                        return;
+                    }
+                    session_id
                 }
                 Ok(Err(err)) => {
                     tracing::warn!(
@@ -7189,36 +8780,210 @@ impl HostHandle {
                         error = %err,
                         "agent startup failed before session registration"
                     );
+                    #[cfg(test)]
+                    wait_for_startup_failure_fanout_race_test_hook(&host).await;
+                    let failure_visibility = visibility.claim_startup_failure();
+                    #[cfg(test)]
+                    notify_startup_failure_claimed_test_hook(&host);
+                    if failure_visibility == StartupFailureVisibility::AwaitPublication
+                        && (publication_authorized || publish_rx.recv().await.is_some())
+                    {
+                        tracing::debug!(
+                            agent_id = %agent_id,
+                            error = %err,
+                            "retaining published terminal startup failure for agent-stream observability"
+                        );
+                        return;
+                    }
+                    host.cleanup_unpublished_agent_session(agent_id.clone(), None, &visibility)
+                        .await;
+                    return;
                 }
                 Err(_) => {
                     tracing::warn!(
                         agent_id = %agent_id,
                         "agent startup channel dropped before session registration"
                     );
+                    host.cleanup_unpublished_agent_session(agent_id.clone(), None, &visibility)
+                        .await;
+                    return;
                 }
+            };
+            if !publication_authorized && publish_rx.recv().await.is_none() {
+                host.cleanup_unpublished_agent_session(
+                    agent_id.clone(),
+                    Some(&session_id),
+                    &visibility,
+                )
+                .await;
+                return;
+            }
+            if visibility.cleanup_is_requested() {
+                host.cleanup_unpublished_agent_session(
+                    agent_id.clone(),
+                    Some(&session_id),
+                    &visibility,
+                )
+                .await;
+                return;
+            }
+            if let Err(error) = host
+                .publish_pending_agent_session(agent_id.clone(), session_id.clone())
+                .await
+            {
+                tracing::error!(
+                    agent_id = %agent_id,
+                    session_id = %session_id,
+                    error = %error,
+                    "failed to publish pending agent session registration"
+                );
+                host.cleanup_unpublished_agent_session(agent_id, Some(&session_id), &visibility)
+                    .await;
             }
         });
+        PendingAgentSessionPublication {
+            agent_id,
+            publish_tx: Some(publish_tx),
+        }
     }
 
-    async fn wait_for_parent_session_id(&self, parent_agent_id: &AgentId) -> SessionId {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some(session_id) = self
-                .state
-                .lock()
-                .await
-                .agent_sessions
-                .get(parent_agent_id)
-                .cloned()
+    async fn publish_pending_agent_session(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().await;
+        let Some(pending_session_id) = state.pending_agent_sessions.get(&agent_id) else {
+            return Err(format!(
+                "missing pending session binding for agent {agent_id} during publication"
+            ));
+        };
+        if pending_session_id != &session_id {
+            return Err(format!(
+                "pending session binding mismatch for agent {agent_id}: expected {session_id}, found {pending_session_id}"
+            ));
+        }
+        if let Some(existing_session_id) = state.agent_sessions.get(&agent_id) {
+            return Err(format!(
+                "agent {agent_id} already has public session binding {existing_session_id} before pending publication"
+            ));
+        }
+
+        state.pending_agent_sessions.remove(&agent_id);
+        state
+            .agent_sessions
+            .insert(agent_id.clone(), session_id.clone());
+        if let Some(store) = state.agents_view_preferences_store.clone()
+            && let Err(error) = store.lock().await.promote_transient_agent(
+                HostFilterId(LOCAL_HOST_ID.to_owned()),
+                agent_id.clone(),
+                session_id.clone(),
+            )
+        {
+            state.agent_sessions.remove(&agent_id);
+            state
+                .pending_agent_sessions
+                .insert(agent_id.clone(), session_id.clone());
+            return Err(format!(
+                "failed to promote agent annotations for agent {agent_id} session {session_id}: {error}"
+            ));
+        }
+        fan_out_current_agents_view_preferences(&mut state).await;
+        drop(state);
+        self.fan_out_session_lists().await;
+        self.deliver_submitted_reviews_for_session(session_id).await;
+        Ok(())
+    }
+
+    async fn cleanup_unpublished_agent_session(
+        &self,
+        agent_id: AgentId,
+        expected_session_id: Option<&SessionId>,
+        visibility: &SpawnVisibility,
+    ) {
+        let removed_pending_session_id = {
+            let mut state = self.state.lock().await;
+            let should_remove = expected_session_id.is_some_and(|expected| {
+                state.pending_agent_sessions.get(&agent_id) == Some(expected)
+            });
+            should_remove
+                .then(|| state.pending_agent_sessions.remove(&agent_id))
+                .flatten()
+        };
+        let removed_pending = removed_pending_session_id.is_some();
+        if let Some(session_id) = &removed_pending_session_id {
+            tracing::debug!(
+                agent_id = %agent_id,
+                session_id = %session_id,
+                "cleaned pending agent session registration"
+            );
+        }
+        visibility.request_cleanup().await;
+        tracing::debug!(
+            agent_id = %agent_id,
+            "unpublished agent visibility quiesced before actor cleanup"
+        );
+        #[cfg(test)]
+        wait_for_spawn_cancelled_before_cleanup_test_hook(self).await;
+        let closed = self.close_agent_for_recorded_visibility(&agent_id).await;
+        tracing::debug!(
+            agent_id = %agent_id,
+            closed,
+            "unpublished agent actor cleanup completed"
+        );
+        if removed_pending {
+            let mut state = self.state.lock().await;
+            if let Some(store) = state.agents_view_preferences_store.clone()
+                && let Err(error) = store.lock().await.remove_transient_agent(
+                    HostFilterId(LOCAL_HOST_ID.to_owned()),
+                    agent_id.clone(),
+                )
             {
-                return session_id;
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    error = %error,
+                    "failed to remove unpublished agent annotations during cleanup"
+                );
+            }
+            fan_out_current_agents_view_preferences(&mut state).await;
+        }
+    }
+
+    async fn wait_for_parent_session_id(
+        &self,
+        parent_agent_id: &AgentId,
+    ) -> Result<SessionId, String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        tracing::debug!(
+            parent_agent_id = %parent_agent_id,
+            "waiting for backend-native child parent session registration"
+        );
+        loop {
+            let session_id = {
+                let state = self.state.lock().await;
+                state
+                    .agent_sessions
+                    .get(parent_agent_id)
+                    .cloned()
+                    .or_else(|| state.pending_agent_sessions.get(parent_agent_id).cloned())
+            };
+            if let Some(session_id) = session_id {
+                tracing::debug!(
+                    parent_agent_id = %parent_agent_id,
+                    parent_session_id = %session_id,
+                    "resolved backend-native child parent session registration"
+                );
+                return Ok(session_id);
             }
 
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "cannot resolve parent session for backend-native child {}",
-                parent_agent_id
-            );
+            if tokio::time::Instant::now() >= deadline {
+                let message = format!(
+                    "cannot resolve parent session for backend-native child {}",
+                    parent_agent_id
+                );
+                tracing::warn!(parent_agent_id = %parent_agent_id, "{message}");
+                return Err(message);
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
@@ -7226,7 +8991,7 @@ impl HostHandle {
     async fn spawn_backend_native_subagent(
         &self,
         request: &HostSubAgentSpawnRequest,
-    ) -> SubAgentHandle {
+    ) -> Result<SubAgentHandle, String> {
         tracing::info!(
             parent_agent_id = %request.parent_agent_id,
             tool_use_id = %request.tool_use_id,
@@ -7241,24 +9006,25 @@ impl HostHandle {
             let parent_handle = state
                 .registry
                 .agent_handle(&request.parent_agent_id)
-                .unwrap_or_else(|| {
-                    panic!(
+                .ok_or_else(|| {
+                    format!(
                         "cannot resolve parent agent {} for backend-native child",
                         request.parent_agent_id
                     )
-                });
+                })?;
             (Arc::clone(&state.session_store), parent_handle)
         };
         let parent_session_id = self
             .wait_for_parent_session_id(&request.parent_agent_id)
-            .await;
+            .await?;
 
         let parent_start = parent_handle.snapshot();
-        assert_eq!(
-            parent_start.workspace_roots, request.workspace_roots,
-            "backend-native child workspace roots must match parent {}",
-            request.parent_agent_id
-        );
+        if parent_start.workspace_roots != request.workspace_roots {
+            return Err(format!(
+                "backend-native child workspace roots do not match parent {}",
+                request.parent_agent_id
+            ));
+        }
 
         let session_id = request
             .session_id_hint
@@ -7277,7 +9043,7 @@ impl HostHandle {
             session_id: session_id.clone(),
         };
 
-        let (start, agent_handle, host_streams) = {
+        let (start, agent_handle, host_streams, agent_visibility) = {
             let mut state = self.state.lock().await;
             let spawned =
                 state
@@ -7311,34 +9077,44 @@ impl HostHandle {
                     )
                 })
                 .collect::<Vec<_>>();
-            (spawned.start, spawned.handle, host_streams)
+            (
+                spawned.start,
+                spawned.handle,
+                host_streams,
+                state.agent_visibility.clone(),
+            )
         };
 
-        session_store
-            .lock()
-            .await
-            .upsert_backend_session(
-                &BackendSession {
-                    id: session_id.clone(),
-                    backend_kind: start.backend_kind,
-                    workspace_roots: start.workspace_roots.clone(),
-                    title: Some(start.name.clone()),
-                    token_count: None,
-                    created_at_ms: Some(start.created_at_ms),
-                    updated_at_ms: Some(start.created_at_ms),
-                    resumable: false,
-                },
-                Some(parent_session_id),
-                start.project_id.clone(),
-                start.custom_agent_id.clone(),
-                start.launch_profile_id.clone(),
-            )
-            .unwrap_or_else(|err| {
-                panic!(
-                    "failed to persist backend-native child session {}: {err}",
-                    session_id
-                )
-            });
+        if let Err(err) = session_store.lock().await.upsert_backend_session(
+            &BackendSession {
+                id: session_id.clone(),
+                backend_kind: start.backend_kind,
+                workspace_roots: start.workspace_roots.clone(),
+                title: Some(start.name.clone()),
+                token_count: None,
+                created_at_ms: Some(start.created_at_ms),
+                updated_at_ms: Some(start.created_at_ms),
+                resumable: false,
+            },
+            Some(parent_session_id),
+            start.project_id.clone(),
+            start.custom_agent_id.clone(),
+            start.launch_profile_id.clone(),
+        ) {
+            let message = format!(
+                "failed to persist backend-native child session {}: {err}",
+                session_id
+            );
+            tracing::error!(
+                parent_agent_id = %request.parent_agent_id,
+                child_session_id = %session_id,
+                "{message}"
+            );
+            let _ = self
+                .close_agent_for_recorded_visibility(&start.agent_id)
+                .await;
+            return Err(message);
+        }
 
         let mut dead_paths = Vec::new();
         let mut deferred_attachments = Vec::new();
@@ -7353,8 +9129,13 @@ impl HostHandle {
             )
             .await
             {
-                Ok(Some(attachment)) => deferred_attachments.push(attachment),
-                Ok(None) => {}
+                Ok(Some(attachment)) => {
+                    agent_visibility.record_new_agent(start.agent_id.clone(), path.clone());
+                    deferred_attachments.push(attachment);
+                }
+                Ok(None) => {
+                    agent_visibility.record_new_agent(start.agent_id.clone(), path.clone());
+                }
                 Err(_) => dead_paths.push(path),
             }
         }
@@ -7362,6 +9143,7 @@ impl HostHandle {
             let mut state = self.state.lock().await;
             for path in dead_paths {
                 state.host_streams.remove(&path);
+                state.agent_visibility.remove_host_stream(&path);
             }
         }
         for attachment in deferred_attachments {
@@ -7374,10 +9156,10 @@ impl HostHandle {
 
         self.fan_out_session_lists().await;
 
-        SubAgentHandle {
+        Ok(SubAgentHandle {
             event_tx,
             agent_id: start.agent_id,
-        }
+        })
     }
 
     pub(crate) async fn open_browse_stream(
@@ -9198,10 +10980,18 @@ async fn git_worktree_add(
     parent_root: &ProjectRootPath,
     worktree_root: &ProjectRootPath,
     branch: &GitBranchName,
+    base_commit: &str,
 ) -> Result<(), String> {
     let output = run_git(
         parent_root,
-        &["worktree", "add", "-b", &branch.0, &worktree_root.0],
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &branch.0,
+            &worktree_root.0,
+            base_commit,
+        ],
     )
     .await?;
     if output.status.success() {
@@ -9214,6 +11004,51 @@ async fn git_worktree_add(
         worktree_root,
         git_output_message(&output)
     ))
+}
+
+async fn git_resolve_base_commit(
+    parent_root: &ProjectRootPath,
+    base: Option<&BaseRevision>,
+) -> AppResult<String> {
+    const OPERATION: &str = "workbench_create";
+    let base_ref = base.map_or("HEAD", |base| base.0.as_str());
+    if base_ref.trim().is_empty() || base_ref.starts_with('-') {
+        return Err(AppError::invalid(
+            OPERATION,
+            format!("invalid base_ref '{base_ref}' for parent root {parent_root}"),
+        ));
+    }
+    let commit_ref = format!("{base_ref}^{{commit}}");
+    let output = run_git(parent_root, &["rev-parse", "--verify", &commit_ref])
+        .await
+        .map_err(|error| AppError::internal_message(OPERATION, error.clone(), anyhow!(error)))?;
+    if !output.status.success() {
+        return Err(AppError::invalid(
+            OPERATION,
+            format!(
+                "base_ref '{}' does not resolve to a commit in parent root {}: {}",
+                base_ref,
+                parent_root,
+                git_output_message(&output)
+            ),
+        ));
+    }
+    let commit = String::from_utf8(output.stdout).map_err(|error| {
+        AppError::internal_message(
+            OPERATION,
+            format!("git rev-parse for parent root {parent_root} returned non-UTF-8 output"),
+            error,
+        )
+    })?;
+    let commit = commit.trim();
+    if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AppError::internal_message(
+            OPERATION,
+            format!("git rev-parse returned invalid commit SHA '{commit}' for {parent_root}"),
+            anyhow!("invalid full commit SHA"),
+        ));
+    }
+    Ok(commit.to_owned())
 }
 
 async fn git_worktree_remove(
@@ -9775,6 +11610,7 @@ fn spawn_host_inner(
     let skill_store = SkillStore::load(paths.skills_index, paths.skills_root_dir)?;
     let (sub_agent_spawn_tx, sub_agent_spawn_rx) =
         mpsc::unbounded_channel::<HostSubAgentSpawnRequest>();
+    let (capacity_tx, capacity_rx): (HostCapacityTx, HostCapacityRx) = mpsc::unbounded_channel();
     let (mobile_access_tx, mobile_access_rx) = mpsc::unbounded_channel::<MobileAccessCommand>();
     let mobile_access = MobileAccessHandle::new(mobile_access_tx.clone());
     let (review_delivery_tx, review_delivery_rx) = mpsc::channel::<ReviewDeliveryRequest>(64);
@@ -9826,11 +11662,14 @@ fn spawn_host_inner(
             steering_store: Arc::new(Mutex::new(steering_store)),
             skill_store: Arc::new(Mutex::new(skill_store)),
             agent_sessions: HashMap::new(),
+            pending_agent_sessions: HashMap::new(),
+            agent_visibility: AgentVisibilityRegistry::default(),
             agent_activity_summaries: HashMap::new(),
             closed_agent_usage_snapshots: HashMap::new(),
             activity_summary_epoch: 0,
             activity_summary_settings_tx,
             sub_agent_spawn_tx,
+            capacity_tx: capacity_tx.clone(),
             use_mock_backend,
             debug_mcp,
             agent_control_mcp: agent_control_mcp_placeholder,
@@ -9847,6 +11686,7 @@ fn spawn_host_inner(
             hermes_session_schema: HermesSessionSchemaState::Pending,
             backend_config_snapshots: Vec::new(),
             backend_native_settings_snapshots: Vec::new(),
+            backend_capacity: initial_backend_capacity_snapshots(),
             antigravity_conversations_dir,
             codex_probe_program: runtime_config.codex_probe_program.clone(),
             kiro_probe_program: runtime_config.kiro_probe_program.clone(),
@@ -9862,6 +11702,7 @@ fn spawn_host_inner(
             removing_projects: HashSet::new(),
         })),
         workflow_save_lock: Arc::new(Mutex::new(())),
+        backend_setup_refresh_lock: Arc::new(Mutex::new(())),
     };
 
     spawn_mobile_access_actor(
@@ -9877,6 +11718,8 @@ fn spawn_host_inner(
             managed_service_base_url: runtime_config.mobile_managed_service_base_url,
         },
     )?;
+
+    spawn_host_capacity_task(host.clone(), capacity_rx);
 
     let agent_control_mcp = match crate::agent_control_mcp::start_server(
         runtime_config.agent_control_mcp_bind_addr,
@@ -10366,6 +12209,7 @@ async fn start_due_activity_summary_calls(
             source_from_seq: history.from_seq,
             source_through_seq: history.through_seq,
             use_mock_backend: host.use_mock_backend().await,
+            capacity_tx: host.state.lock().await.capacity_tx.clone(),
         };
         let task_event_tx = task_event_tx.clone();
         let host_for_assert = host.clone();
@@ -10533,11 +12377,46 @@ async fn finish_activity_summary_call(
     }
 }
 
+fn spawn_host_capacity_task(host: HostHandle, mut rx: HostCapacityRx) {
+    let worker = async move {
+        while let Some(update) = rx.recv().await {
+            match update {
+                HostCapacityUpdate::Report {
+                    backend_kind,
+                    state,
+                } => {
+                    host.record_backend_capacity(backend_kind, state).await;
+                }
+                #[cfg(feature = "test-support")]
+                HostCapacityUpdate::Barrier(reply) => {
+                    let _ = reply.send(());
+                }
+            }
+        }
+    };
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(worker);
+        return;
+    }
+
+    std::thread::Builder::new()
+        .name("tyde-host-capacity".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build host capacity runtime");
+            runtime.block_on(worker);
+        })
+        .expect("failed to spawn host capacity task");
+}
+
 fn spawn_host_sub_agent_task(host: HostHandle, mut rx: HostSubAgentSpawnRx) {
     let worker = async move {
         while let Some(request) = rx.recv().await {
-            let handle = host.spawn_backend_native_subagent(&request).await;
-            let _ = request.reply.send(handle);
+            let result = host.spawn_backend_native_subagent(&request).await;
+            let _ = request.reply.send(result);
         }
     };
 
@@ -11135,11 +13014,7 @@ impl AnnotationTargetResolver {
                 .registry
                 .agent_handle(&agent_id)
                 .map(|agent| agent.snapshot());
-            let session_id = state
-                .agent_sessions
-                .get(&agent_id)
-                .cloned()
-                .or_else(|| snapshot.as_ref().and_then(|start| start.session_id.clone()));
+            let session_id = state.agent_sessions.get(&agent_id).cloned();
             if let Some(session_id) = session_id.clone() {
                 agent_by_session.insert(session_id, agent_id.clone());
             }
@@ -11479,12 +13354,7 @@ fn agent_annotation_target_for_start(
     start: &AgentStartPayload,
 ) -> AgentAnnotationTarget {
     let host_id = HostFilterId(LOCAL_HOST_ID.to_owned());
-    if let Some(session_id) = state
-        .agent_sessions
-        .get(&start.agent_id)
-        .cloned()
-        .or_else(|| start.session_id.clone())
-    {
+    if let Some(session_id) = state.agent_sessions.get(&start.agent_id).cloned() {
         AgentAnnotationTarget::Session {
             host_id,
             session_id,
@@ -11643,6 +13513,18 @@ fn prepare_new_agent_fanout_for_subscriber(
             });
         None
     }
+}
+
+fn forget_agent_fanout_for_subscriber(subscriber: &mut HostSubscriber, agent_id: &AgentId) {
+    let instance_stream = new_instance_stream(agent_id);
+    subscriber.known_agent_streams.remove(&instance_stream);
+    subscriber.attached_agent_streams.remove(&instance_stream);
+    subscriber
+        .bootstrapped_agent_streams
+        .remove(&instance_stream);
+    subscriber
+        .pending_bootstrap_new_agents
+        .retain(|pending| pending.start.agent_id != *agent_id);
 }
 
 async fn emit_new_agent_for_stream(
@@ -12867,7 +14749,7 @@ async fn fan_out_current_agents_view_preferences(state: &mut HostState) {
     fan_out_agents_view_preferences(state, snapshot).await;
 }
 
-async fn fan_out_session_schemas(state: &mut HostState) {
+async fn fan_out_session_schemas(state: &mut HostState, force_emit: bool) {
     let enabled_backends = state
         .settings_store
         .lock()
@@ -12883,7 +14765,7 @@ async fn fan_out_session_schemas(state: &mut HostState) {
         let Some(subscriber) = state.host_streams.get_mut(&path) else {
             continue;
         };
-        if emit_session_schemas_for_subscriber(&schemas, subscriber)
+        if emit_session_schemas_for_subscriber(&schemas, subscriber, force_emit)
             .await
             .is_err()
         {
@@ -12983,6 +14865,128 @@ async fn fan_out_backend_config_snapshots(state: &mut HostState, force_emit: boo
     for path in dead_paths {
         state.host_streams.remove(&path);
     }
+}
+
+fn initial_backend_capacity_snapshots() -> HashMap<BackendKind, BackendCapacitySnapshot> {
+    const BACKENDS: [BackendKind; 6] = [
+        BackendKind::Tycode,
+        BackendKind::Kiro,
+        BackendKind::Claude,
+        BackendKind::Codex,
+        BackendKind::Antigravity,
+        BackendKind::Hermes,
+    ];
+    BACKENDS
+        .into_iter()
+        .map(|backend_kind| {
+            let state = match backend_kind {
+                BackendKind::Claude | BackendKind::Codex => BackendCapacityState::Unavailable {
+                    reason: protocol::CapacityUnavailableReason::AwaitingFirstReport,
+                },
+                _ => BackendCapacityState::Unsupported {
+                    reason: protocol::CapacityUnsupportedReason::BackendHasNoCapacitySource,
+                },
+            };
+            (
+                backend_kind,
+                BackendCapacitySnapshot {
+                    backend_kind,
+                    state,
+                    retrieved_at_ms: capacity_now_ms(),
+                    freshness: protocol::CapacityFreshness::Fresh { age_ms: 0 },
+                },
+            )
+        })
+        .collect()
+}
+
+fn backend_capacity_snapshots(state: &HostState) -> Vec<BackendCapacitySnapshot> {
+    let now = capacity_now_ms();
+    let mut snapshots = state
+        .backend_capacity
+        .values()
+        .cloned()
+        .map(|mut snapshot| {
+            let age_ms = now.saturating_sub(snapshot.retrieved_at_ms);
+            match &snapshot.state {
+                BackendCapacityState::Known { report } if age_ms >= 60 * 60 * 1000 => {
+                    snapshot.state = BackendCapacityState::Stale {
+                        report: report.clone(),
+                        stale_since_ms: snapshot.retrieved_at_ms.saturating_add(60 * 60 * 1000),
+                    };
+                    snapshot.freshness = protocol::CapacityFreshness::Stale {
+                        age_ms,
+                        threshold_ms: 60 * 60 * 1000,
+                    };
+                }
+                BackendCapacityState::Known { .. } => {
+                    snapshot.freshness = protocol::CapacityFreshness::Fresh { age_ms };
+                }
+                BackendCapacityState::Stale { .. } => {
+                    snapshot.freshness = protocol::CapacityFreshness::Stale {
+                        age_ms,
+                        threshold_ms: 60 * 60 * 1000,
+                    };
+                }
+                _ => snapshot.freshness = protocol::CapacityFreshness::Fresh { age_ms },
+            }
+            snapshot
+        })
+        .collect::<Vec<_>>();
+    snapshots.sort_by_key(|snapshot| match snapshot.backend_kind {
+        BackendKind::Tycode => 0,
+        BackendKind::Kiro => 1,
+        BackendKind::Claude => 2,
+        BackendKind::Codex => 3,
+        BackendKind::Antigravity => 4,
+        BackendKind::Hermes => 5,
+    });
+    snapshots
+}
+
+fn fan_out_backend_capacity(state: &mut HostState) {
+    let snapshots = backend_capacity_snapshots(state);
+    let paths = state.host_streams.keys().cloned().collect::<Vec<_>>();
+    let mut dead_paths = Vec::new();
+    for path in paths {
+        let Some(subscriber) = state.host_streams.get_mut(&path) else {
+            continue;
+        };
+        if !subscriber.capacity_replay_ready {
+            continue;
+        }
+        if emit_backend_capacity_for_subscriber(&snapshots, subscriber).is_err() {
+            dead_paths.push(path);
+        }
+    }
+    for path in dead_paths {
+        state.host_streams.remove(&path);
+    }
+}
+
+fn emit_backend_capacity_for_subscriber(
+    snapshots: &[BackendCapacitySnapshot],
+    subscriber: &mut HostSubscriber,
+) -> Result<(), StreamClosed> {
+    if subscriber.last_backend_capacity.as_deref() == Some(snapshots) {
+        return Ok(());
+    }
+    let payload = serde_json::to_value(BackendCapacityPayload {
+        snapshots: snapshots.to_vec(),
+    })
+    .expect("failed to serialize BackendCapacity payload for host stream fanout");
+    emit_or_queue_host_frame(subscriber, FrameKind::BackendCapacity, payload)?;
+    subscriber.last_backend_capacity = Some(snapshots.to_vec());
+    Ok(())
+}
+
+fn capacity_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 async fn fan_out_launch_profile_catalog(state: &mut HostState) {
@@ -13263,8 +15267,9 @@ async fn emit_agent_closed_for_stream(
 async fn emit_session_schemas_for_subscriber(
     schemas: &[SessionSchemaEntry],
     subscriber: &mut HostSubscriber,
+    force_emit: bool,
 ) -> Result<(), StreamClosed> {
-    if subscriber.last_session_schemas.as_deref() == Some(schemas) {
+    if !force_emit && subscriber.last_session_schemas.as_deref() == Some(schemas) {
         return Ok(());
     }
     let payload = serde_json::to_value(SessionSchemasPayload {
@@ -13678,6 +15683,73 @@ fn send_team_compact_notify(stream: &Stream, payload: TeamCompactNotifyPayload) 
 }
 
 impl HostHandle {
+    /// Record a passive backend capacity update. The host is the sole owner of
+    /// this account-wide state; agent connections never retain capacity state.
+    pub(crate) async fn record_backend_capacity(
+        &self,
+        backend_kind: BackendKind,
+        state: BackendCapacityState,
+    ) {
+        let retrieved_at_ms = capacity_now_ms();
+        let snapshot = BackendCapacitySnapshot {
+            backend_kind,
+            state,
+            retrieved_at_ms,
+            freshness: protocol::CapacityFreshness::Fresh { age_ms: 0 },
+        };
+        let repeated = {
+            let mut host_state = self.state.lock().await;
+            if host_state
+                .backend_capacity
+                .get(&backend_kind)
+                .is_some_and(|current| current.state == snapshot.state)
+            {
+                let current = host_state
+                    .backend_capacity
+                    .get_mut(&backend_kind)
+                    .expect("checked capacity snapshot must exist");
+                current.retrieved_at_ms = retrieved_at_ms;
+                current.freshness = protocol::CapacityFreshness::Fresh { age_ms: 0 };
+                true
+            } else {
+                host_state.backend_capacity.insert(backend_kind, snapshot);
+                fan_out_backend_capacity(&mut host_state);
+                false
+            }
+        };
+        let host = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+            host.mark_backend_capacity_stale(backend_kind, retrieved_at_ms)
+                .await;
+        });
+        if repeated {
+            tracing::debug!(?backend_kind, "refreshed identical passive capacity report");
+        }
+    }
+
+    async fn mark_backend_capacity_stale(&self, backend_kind: BackendKind, retrieved_at_ms: u64) {
+        let mut state = self.state.lock().await;
+        let now = capacity_now_ms();
+        let Some(snapshot) = state.backend_capacity.get_mut(&backend_kind) else {
+            return;
+        };
+        if snapshot.retrieved_at_ms != retrieved_at_ms {
+            return;
+        }
+        let BackendCapacityState::Known { report } = &snapshot.state else {
+            return;
+        };
+        snapshot.state = BackendCapacityState::Stale {
+            report: report.clone(),
+            stale_since_ms: now,
+        };
+        snapshot.freshness = protocol::CapacityFreshness::Stale {
+            age_ms: now.saturating_sub(retrieved_at_ms),
+            threshold_ms: 60 * 60 * 1000,
+        };
+        fan_out_backend_capacity(&mut state);
+    }
     async fn refresh_after_project_mutation(
         &self,
         connection_host_stream: &StreamPath,
@@ -13740,6 +15812,7 @@ async fn resolve_terminal_launch(
                 cwd,
                 cols: payload.cols,
                 rows: payload.rows,
+                command: TerminalLaunchCommand::DefaultShell,
             })
         }
         TerminalLaunchTarget::Project {
@@ -13767,6 +15840,7 @@ async fn resolve_terminal_launch(
                 cwd,
                 cols: payload.cols,
                 rows: payload.rows,
+                command: TerminalLaunchCommand::DefaultShell,
             })
         }
         TerminalLaunchTarget::Path { cwd } => {
@@ -13789,6 +15863,7 @@ async fn resolve_terminal_launch(
                 cwd: trimmed.to_owned(),
                 cols: payload.cols,
                 rows: payload.rows,
+                command: TerminalLaunchCommand::DefaultShell,
             })
         }
     }
@@ -13849,6 +15924,1652 @@ mod tests {
         ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewStatus, TeamMemberCreateSpec,
         ToolPolicy,
     };
+
+    static STARTUP_FAILURE_FANOUT_RACE_TEST_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn passive_adapter_ingress_is_isolated_per_host_channel() {
+        let (host_one_spawn_tx, _host_one_spawn_rx) = mpsc::unbounded_channel();
+        let (host_two_spawn_tx, _host_two_spawn_rx) = mpsc::unbounded_channel();
+        let (host_one_capacity_tx, mut host_one_capacity_rx) = mpsc::unbounded_channel();
+        let (host_two_capacity_tx, mut host_two_capacity_rx) = mpsc::unbounded_channel();
+        let host_one_emitter = HostSubAgentEmitter::new(
+            host_one_spawn_tx,
+            host_one_capacity_tx,
+            AgentId("host-one-agent".to_owned()),
+            Vec::new(),
+        );
+        let host_two_emitter = HostSubAgentEmitter::new(
+            host_two_spawn_tx,
+            host_two_capacity_tx,
+            AgentId("host-two-agent".to_owned()),
+            Vec::new(),
+        );
+
+        assert!(crate::backend::claude::forward_passive_rate_limit_event(
+            &serde_json::json!({"type":"rate_limit_event","rate_limit_info":{
+                "status":"allowed","rateLimitType":"five_hour","utilization":0.25
+            }}),
+            &host_one_emitter,
+        ));
+        crate::backend::codex::forward_passive_rate_limits_updated(
+            &serde_json::json!({"rateLimits":{
+                "limitId":"subscription","limitName":"subscription",
+                "primary":{"usedPercent":50,"windowDurationMins":300,"resetsAt":1},
+                "secondary":{"usedPercent":10,"windowDurationMins":10080,"resetsAt":2},
+                "credits":{"hasCredits":true,"unlimited":false,"balance":"4"},
+                "individualLimit":true,"planType":"pro","rateLimitReachedType":null
+            }}),
+            &host_two_emitter,
+        );
+
+        assert!(matches!(
+            host_one_capacity_rx.recv().await,
+            Some(HostCapacityUpdate::Report {
+                backend_kind: BackendKind::Claude,
+                ..
+            })
+        ));
+        assert!(matches!(
+            host_two_capacity_rx.recv().await,
+            Some(HostCapacityUpdate::Report {
+                backend_kind: BackendKind::Codex,
+                ..
+            })
+        ));
+        assert!(crate::backend::claude::forward_passive_rate_limit_event(
+            &serde_json::json!({"type":"rate_limit_event","rate_limit_info":{
+                "status":"allowed","rateLimitType":"five_hour","utilization":2.0
+            }}),
+            &host_one_emitter,
+        ));
+        assert!(matches!(
+            host_one_capacity_rx.recv().await,
+            Some(HostCapacityUpdate::Report {
+                backend_kind: BackendKind::Claude,
+                state: BackendCapacityState::Unavailable {
+                    reason: protocol::CapacityUnavailableReason::MalformedReport,
+                },
+            })
+        ));
+        assert!(host_one_capacity_rx.try_recv().is_err());
+        assert!(host_two_capacity_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn backend_native_child_reply_drop_is_a_typed_error_not_a_panic() {
+        let (spawn_tx, mut spawn_rx) = mpsc::unbounded_channel();
+        let (capacity_tx, _capacity_rx) = mpsc::unbounded_channel();
+        let parent_agent_id = AgentId("cd8b1f82-a9c0-4f50-bb89-6f61fc71f2c8".to_owned());
+        let emitter = Arc::new(HostSubAgentEmitter::new(
+            spawn_tx,
+            capacity_tx,
+            parent_agent_id.clone(),
+            vec!["/Users/mike/Tyggs/Tyde".to_owned()],
+        ));
+        let waiting = {
+            let emitter = Arc::clone(&emitter);
+            tokio::spawn(async move {
+                emitter
+                    .on_subagent_spawned(
+                        "019f60f0-7a69-73f0-9ab3-7ddc24062e30".to_owned(),
+                        "/root/quick_child".to_owned(),
+                        "/root/quick_child".to_owned(),
+                        "sub-agent".to_owned(),
+                        Some(SessionId("native-quick-child-thread".to_owned())),
+                    )
+                    .await
+            })
+        };
+
+        let request = spawn_rx.recv().await.expect("native child spawn request");
+        assert_eq!(request.parent_agent_id, parent_agent_id);
+        assert_eq!(request.tool_use_id, "019f60f0-7a69-73f0-9ab3-7ddc24062e30");
+        assert_eq!(request.name, "/root/quick_child");
+        drop(request);
+
+        let error = match waiting.await.expect("child relay caller must not panic") {
+            Ok(_) => panic!("dropped host reply must be surfaced to the adapter"),
+            Err(error) => error,
+        };
+        assert!(error.contains("backend-native child spawn reply dropped"));
+        assert!(error.contains(parent_agent_id.0.as_str()));
+    }
+
+    #[tokio::test]
+    async fn session_registration_precedes_later_spawn_work_for_native_children() {
+        let fixture = compact_fixture().await;
+        let hook = install_spawn_session_registration_test_hook(&fixture.host);
+        let spawning_host = fixture.host.clone();
+        let spawn = tokio::spawn(async move {
+            spawning_host
+                .spawn_agent(SpawnAgentPayload {
+                    name: Some("Early Native Child Parent".to_owned()),
+                    custom_agent_id: None,
+                    parent_agent_id: None,
+                    project_id: None,
+                    params: SpawnAgentParams::New {
+                        workspace_roots: Vec::new(),
+                        prompt: "start parent".to_owned(),
+                        images: None,
+                        backend_kind: BackendKind::Claude,
+                        launch_profile_id: None,
+                        cost_hint: None,
+                        access_mode: Default::default(),
+                        session_settings: None,
+                    },
+                })
+                .await
+        });
+
+        hook.wait_until_reached().await;
+        let parent_agent_id = {
+            let state = fixture.host.state.lock().await;
+            let agent_ids = state.registry.agent_ids();
+            assert_eq!(agent_ids.len(), 1, "only the blocked parent is registered");
+            agent_ids
+                .into_iter()
+                .next()
+                .expect("blocked parent agent id")
+        };
+        let emitter = {
+            let state = fixture.host.state.lock().await;
+            HostSubAgentEmitter::new(
+                state.sub_agent_spawn_tx.clone(),
+                state.capacity_tx.clone(),
+                parent_agent_id.clone(),
+                Vec::new(),
+            )
+        };
+        let child_session_id = SessionId("native-quick-child-thread".to_owned());
+        let child = tokio::time::timeout(
+            Duration::from_millis(500),
+            emitter.on_subagent_spawned(
+                "019f60f0-7a69-73f0-9ab3-7ddc24062e30".to_owned(),
+                "/root/quick_child".to_owned(),
+                "/root/quick_child".to_owned(),
+                "sub-agent".to_owned(),
+                Some(child_session_id.clone()),
+            ),
+        )
+        .await
+        .expect("early child relay must not wait for the five-second parent-session poll")
+        .expect("early child relay must be created while later parent spawn work is blocked");
+
+        {
+            let state = fixture.host.state.lock().await;
+            assert_eq!(
+                state.agent_sessions.len(),
+                1,
+                "only the native child relay is publicly session-bound before parent publication"
+            );
+            assert!(
+                !state.agent_sessions.contains_key(&parent_agent_id),
+                "the parent session must remain private before the original publication point"
+            );
+            assert!(
+                state.pending_agent_sessions.contains_key(&parent_agent_id),
+                "the scheduled parent session registration must be available to native child resolution"
+            );
+            assert_eq!(
+                state.agent_sessions.get(&child.agent_id),
+                Some(&child_session_id),
+                "the real host relay must retain the authoritative native child session"
+            );
+            let child_start = state
+                .registry
+                .agent_handle(&child.agent_id)
+                .expect("registered native child relay")
+                .snapshot();
+            assert_eq!(child_start.parent_agent_id, Some(parent_agent_id.clone()));
+            assert_eq!(child_start.origin, AgentOrigin::BackendNative);
+        }
+
+        hook.resume();
+        let spawned_parent = spawn
+            .await
+            .expect("parent spawn task")
+            .expect("parent spawn succeeds after later work resumes");
+        assert_eq!(spawned_parent, parent_agent_id);
+        let public_parent_session_id = tokio::time::timeout(
+            Duration::from_millis(500),
+            fixture
+                .host
+                .wait_for_agent_session_id_result(&parent_agent_id),
+        )
+        .await
+        .expect("parent session publication must complete after fanout resumes")
+        .expect("published parent session id");
+        {
+            let state = fixture.host.state.lock().await;
+            assert_eq!(state.agent_sessions.len(), 2);
+            assert_eq!(
+                state.agent_sessions.get(&parent_agent_id),
+                Some(&public_parent_session_id)
+            );
+            assert!(!state.pending_agent_sessions.contains_key(&parent_agent_id));
+        }
+        assert!(fixture.host.close_agent(&parent_agent_id).await);
+        drop(child);
+    }
+
+    #[tokio::test]
+    async fn early_visible_native_child_closes_without_exposing_its_parent() {
+        let fixture = compact_fixture().await;
+        let (first_tx, mut first_rx) = mpsc::unbounded_channel();
+        fixture
+            .host
+            .register_host_stream(
+                Stream::new(
+                    StreamPath(format!("/host/early-child-first-{}", Uuid::new_v4())),
+                    first_tx,
+                ),
+                AgentReplayMode::Lazy,
+            )
+            .await;
+        let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+        fixture
+            .host
+            .register_host_stream(
+                Stream::new(
+                    StreamPath(format!("/host/early-child-second-{}", Uuid::new_v4())),
+                    second_tx,
+                ),
+                AgentReplayMode::Lazy,
+            )
+            .await;
+        while first_rx.try_recv().is_ok() {}
+        while second_rx.try_recv().is_ok() {}
+
+        let hook = install_spawn_session_registration_test_hook(&fixture.host);
+        let spawning_host = fixture.host.clone();
+        let spawn = tokio::spawn(async move {
+            spawning_host
+                .spawn_agent(SpawnAgentPayload {
+                    name: Some("Hidden Parent With Early Native Child".to_owned()),
+                    custom_agent_id: None,
+                    parent_agent_id: None,
+                    project_id: None,
+                    params: SpawnAgentParams::New {
+                        workspace_roots: Vec::new(),
+                        prompt: "start hidden parent".to_owned(),
+                        images: None,
+                        backend_kind: BackendKind::Claude,
+                        launch_profile_id: None,
+                        cost_hint: None,
+                        access_mode: Default::default(),
+                        session_settings: None,
+                    },
+                })
+                .await
+        });
+        hook.wait_until_reached().await;
+        let parent_agent_id = {
+            let state = fixture.host.state.lock().await;
+            state
+                .registry
+                .agent_ids()
+                .into_iter()
+                .next()
+                .expect("blocked parent agent")
+        };
+        let emitter = {
+            let state = fixture.host.state.lock().await;
+            HostSubAgentEmitter::new(
+                state.sub_agent_spawn_tx.clone(),
+                state.capacity_tx.clone(),
+                parent_agent_id.clone(),
+                Vec::new(),
+            )
+        };
+        let child = tokio::time::timeout(
+            Duration::from_millis(500),
+            emitter.on_subagent_spawned(
+                "019f60f0-7a69-73f0-9ab3-7ddc24062e30".to_owned(),
+                "/root/quick_child".to_owned(),
+                "/root/quick_child".to_owned(),
+                "sub-agent".to_owned(),
+                Some(SessionId("native-quick-child-thread".to_owned())),
+            ),
+        )
+        .await
+        .expect("early native child relay must not wait for parent publication")
+        .expect("early native child relay");
+        let child_agent_id = child.agent_id.clone();
+
+        {
+            let state = fixture.host.state.lock().await;
+            assert!(
+                state
+                    .agent_visibility
+                    .visible_host_streams(&parent_agent_id)
+                    .is_empty(),
+                "the blocked parent must have zero public NewAgent visibility"
+            );
+            assert_eq!(
+                state
+                    .agent_visibility
+                    .visible_host_streams(&child_agent_id)
+                    .len(),
+                2,
+                "the independently published native child must retain its own subscribers"
+            );
+        }
+
+        spawn.abort();
+        assert!(
+            spawn
+                .await
+                .expect_err("cancelled parent spawn")
+                .is_cancelled()
+        );
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let state = fixture.host.state.lock().await;
+                let cleaned = state.registry.agent_handle(&parent_agent_id).is_none()
+                    && state.registry.agent_handle(&child_agent_id).is_none()
+                    && !state.agent_sessions.contains_key(&parent_agent_id)
+                    && !state.agent_sessions.contains_key(&child_agent_id)
+                    && !state.pending_agent_sessions.contains_key(&parent_agent_id)
+                    && state
+                        .agent_visibility
+                        .visible_host_streams(&parent_agent_id)
+                        .is_empty()
+                    && state
+                        .agent_visibility
+                        .visible_host_streams(&child_agent_id)
+                        .is_empty();
+                drop(state);
+                if cleaned {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("parent cancellation must clean parent and independently visible child state");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for receiver in [&mut first_rx, &mut second_rx] {
+            let mut child_lifecycle = Vec::new();
+            let mut parent_lifecycle = Vec::new();
+            while let Ok(envelope) = receiver.try_recv() {
+                match envelope.kind {
+                    FrameKind::NewAgent => {
+                        let payload: NewAgentPayload =
+                            envelope.parse_payload().expect("NewAgent payload");
+                        if payload.agent_id == child_agent_id {
+                            child_lifecycle.push("new");
+                        } else if payload.agent_id == parent_agent_id {
+                            parent_lifecycle.push("new");
+                        }
+                    }
+                    FrameKind::AgentClosed => {
+                        let payload: AgentClosedPayload =
+                            envelope.parse_payload().expect("AgentClosed payload");
+                        if payload.agent_id == child_agent_id {
+                            child_lifecycle.push("closed");
+                        } else if payload.agent_id == parent_agent_id {
+                            parent_lifecycle.push("closed");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(child_lifecycle, vec!["new", "closed"]);
+            assert!(
+                parent_lifecycle.is_empty(),
+                "a zero-visibility parent must not produce orphan, reversed, or duplicate lifecycle events: {parent_lifecycle:?}"
+            );
+        }
+        drop(child);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_records_visible_native_child_but_omits_pending_parent() {
+        let fixture = compact_fixture().await;
+        let hook = install_spawn_session_registration_test_hook(&fixture.host);
+        let spawning_host = fixture.host.clone();
+        let spawn = tokio::spawn(async move {
+            spawning_host
+                .spawn_agent(SpawnAgentPayload {
+                    name: Some("Bootstrap Hidden Parent".to_owned()),
+                    custom_agent_id: None,
+                    parent_agent_id: None,
+                    project_id: None,
+                    params: SpawnAgentParams::New {
+                        workspace_roots: Vec::new(),
+                        prompt: "start hidden parent before bootstrap".to_owned(),
+                        images: None,
+                        backend_kind: BackendKind::Claude,
+                        launch_profile_id: None,
+                        cost_hint: None,
+                        access_mode: Default::default(),
+                        session_settings: None,
+                    },
+                })
+                .await
+        });
+        hook.wait_until_reached().await;
+        let parent_agent_id = {
+            let state = fixture.host.state.lock().await;
+            state
+                .registry
+                .agent_ids()
+                .into_iter()
+                .next()
+                .expect("blocked parent agent")
+        };
+        let emitter = {
+            let state = fixture.host.state.lock().await;
+            HostSubAgentEmitter::new(
+                state.sub_agent_spawn_tx.clone(),
+                state.capacity_tx.clone(),
+                parent_agent_id.clone(),
+                Vec::new(),
+            )
+        };
+        let child = tokio::time::timeout(
+            Duration::from_millis(500),
+            emitter.on_subagent_spawned(
+                "019f60f0-7a69-73f0-9ab3-7ddc24062e30".to_owned(),
+                "/root/quick_child".to_owned(),
+                "/root/quick_child".to_owned(),
+                "sub-agent".to_owned(),
+                Some(SessionId("native-quick-child-thread".to_owned())),
+            ),
+        )
+        .await
+        .expect("early child spawn before bootstrap")
+        .expect("early child relay");
+        let child_agent_id = child.agent_id.clone();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        fixture
+            .host
+            .register_host_stream(
+                Stream::new(
+                    StreamPath(format!("/host/bootstrap-child-{}", Uuid::new_v4())),
+                    tx,
+                ),
+                AgentReplayMode::Lazy,
+            )
+            .await;
+        let bootstrap = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let envelope = rx.recv().await.expect("host stream remains open");
+                if envelope.kind == FrameKind::HostBootstrap {
+                    return envelope
+                        .parse_payload::<HostBootstrapPayload>()
+                        .expect("HostBootstrap payload");
+                }
+            }
+        })
+        .await
+        .expect("bootstrap delivery");
+        assert!(
+            bootstrap
+                .agents
+                .iter()
+                .any(|agent| agent.agent_id == child_agent_id)
+        );
+        assert!(
+            !bootstrap
+                .agents
+                .iter()
+                .any(|agent| agent.agent_id == parent_agent_id)
+        );
+        {
+            let state = fixture.host.state.lock().await;
+            assert_eq!(
+                state
+                    .agent_visibility
+                    .visible_host_streams(&child_agent_id)
+                    .len(),
+                1,
+                "successful bootstrap must become the child visibility recipient"
+            );
+            assert!(
+                state
+                    .agent_visibility
+                    .visible_host_streams(&parent_agent_id)
+                    .is_empty()
+            );
+        }
+
+        spawn.abort();
+        assert!(
+            spawn
+                .await
+                .expect_err("cancelled parent spawn")
+                .is_cancelled()
+        );
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let state = fixture.host.state.lock().await;
+                let cleaned = state.registry.agent_handle(&parent_agent_id).is_none()
+                    && state.registry.agent_handle(&child_agent_id).is_none()
+                    && !state.agent_sessions.contains_key(&parent_agent_id)
+                    && !state.agent_sessions.contains_key(&child_agent_id)
+                    && !state.pending_agent_sessions.contains_key(&parent_agent_id)
+                    && state
+                        .agent_visibility
+                        .visible_host_streams(&parent_agent_id)
+                        .is_empty()
+                    && state
+                        .agent_visibility
+                        .visible_host_streams(&child_agent_id)
+                        .is_empty();
+                drop(state);
+                if cleaned {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("cancelled bootstrap parent and child cleanup");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut child_closed = 0usize;
+        let mut parent_closed = 0usize;
+        let mut child_new = 0usize;
+        let mut parent_new = 0usize;
+        while let Ok(envelope) = rx.try_recv() {
+            match envelope.kind {
+                FrameKind::NewAgent => {
+                    let payload: NewAgentPayload =
+                        envelope.parse_payload().expect("NewAgent payload");
+                    if payload.agent_id == child_agent_id {
+                        child_new += 1;
+                    } else if payload.agent_id == parent_agent_id {
+                        parent_new += 1;
+                    }
+                }
+                FrameKind::AgentClosed => {
+                    let payload: AgentClosedPayload =
+                        envelope.parse_payload().expect("AgentClosed payload");
+                    if payload.agent_id == child_agent_id {
+                        child_closed += 1;
+                    } else if payload.agent_id == parent_agent_id {
+                        parent_closed += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            child_new, 0,
+            "bootstrap must not duplicate its child as NewAgent"
+        );
+        assert_eq!(parent_new, 0, "hidden parent must not replay as NewAgent");
+        assert_eq!(
+            child_closed, 1,
+            "bootstrapped child must close exactly once"
+        );
+        assert_eq!(parent_closed, 0, "hidden parent must not emit AgentClosed");
+        drop(child);
+    }
+
+    #[tokio::test]
+    async fn cancelled_spawn_cleans_unpublished_session_registration() {
+        let fixture = compact_fixture().await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let host_stream = Stream::new(
+            StreamPath(format!("/host/cancelled-unpublished-{}", Uuid::new_v4())),
+            tx,
+        );
+        fixture
+            .host
+            .register_host_stream(host_stream, AgentReplayMode::Lazy)
+            .await;
+        while rx.try_recv().is_ok() {}
+        let hook = install_spawn_session_registration_test_hook(&fixture.host);
+        let spawning_host = fixture.host.clone();
+        let spawn = tokio::spawn(async move {
+            spawning_host
+                .spawn_agent(SpawnAgentPayload {
+                    name: Some("Cancelled Pending Parent".to_owned()),
+                    custom_agent_id: None,
+                    parent_agent_id: None,
+                    project_id: None,
+                    params: SpawnAgentParams::New {
+                        workspace_roots: Vec::new(),
+                        prompt: "start then cancel".to_owned(),
+                        images: None,
+                        backend_kind: BackendKind::Claude,
+                        launch_profile_id: None,
+                        cost_hint: None,
+                        access_mode: Default::default(),
+                        session_settings: None,
+                    },
+                })
+                .await
+        });
+
+        hook.wait_until_reached().await;
+        let agent_id = {
+            let state = fixture.host.state.lock().await;
+            state
+                .registry
+                .agent_ids()
+                .into_iter()
+                .next()
+                .expect("blocked parent agent")
+        };
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let pending = fixture
+                    .host
+                    .state
+                    .lock()
+                    .await
+                    .pending_agent_sessions
+                    .contains_key(&agent_id);
+                if pending {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("cancelled parent reaches pending private session registration");
+        spawn.abort();
+        assert!(
+            spawn
+                .await
+                .expect_err("cancelled spawn task")
+                .is_cancelled()
+        );
+
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let state = fixture.host.state.lock().await;
+                let cleaned = state.registry.agent_handle(&agent_id).is_none()
+                    && !state.agent_sessions.contains_key(&agent_id)
+                    && !state.pending_agent_sessions.contains_key(&agent_id)
+                    && state
+                        .agent_visibility
+                        .visible_host_streams(&agent_id)
+                        .is_empty();
+                drop(state);
+                if cleaned {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("cancelled spawn must not leave an agent or session binding behind");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        while let Ok(envelope) = rx.try_recv() {
+            match envelope.kind {
+                FrameKind::NewAgent => {
+                    let payload: NewAgentPayload =
+                        envelope.parse_payload().expect("NewAgent payload");
+                    assert_ne!(
+                        payload.agent_id, agent_id,
+                        "cancelled unpublished agent must never become visible"
+                    );
+                }
+                FrameKind::AgentClosed => {
+                    let payload: AgentClosedPayload =
+                        envelope.parse_payload().expect("AgentClosed payload");
+                    assert_ne!(
+                        payload.agent_id, agent_id,
+                        "cancelled unpublished agent must not emit orphan AgentClosed"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_failure_cleans_unpublished_session_registration() {
+        let fixture = compact_fixture().await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let host_stream = Stream::new(
+            StreamPath(format!("/host/failed-unpublished-{}", Uuid::new_v4())),
+            tx,
+        );
+        fixture
+            .host
+            .register_host_stream(host_stream, AgentReplayMode::Lazy)
+            .await;
+        while rx.try_recv().is_ok() {}
+        let hook = install_spawn_session_registration_test_hook(&fixture.host);
+        let cleanup_hook = install_spawn_cancelled_before_cleanup_test_hook(&fixture.host);
+        let spawning_host = fixture.host.clone();
+        let spawn = tokio::spawn(async move {
+            spawning_host
+                .spawn_agent(SpawnAgentPayload {
+                    name: Some("Failed Pending Parent".to_owned()),
+                    custom_agent_id: None,
+                    parent_agent_id: None,
+                    project_id: None,
+                    params: SpawnAgentParams::New {
+                        workspace_roots: Vec::new(),
+                        prompt: "__mock_fail_spawn__".to_owned(),
+                        images: None,
+                        backend_kind: BackendKind::Claude,
+                        launch_profile_id: None,
+                        cost_hint: None,
+                        access_mode: Default::default(),
+                        session_settings: None,
+                    },
+                })
+                .await
+        });
+        hook.wait_until_reached().await;
+        cleanup_hook.wait_until_reached().await;
+        let agent_id = {
+            let state = fixture.host.state.lock().await;
+            state
+                .registry
+                .agent_ids()
+                .into_iter()
+                .next()
+                .expect("blocked failed parent agent")
+        };
+        cleanup_hook.resume();
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let state = fixture.host.state.lock().await;
+                let cleaned = state.registry.agent_handle(&agent_id).is_none()
+                    && !state.agent_sessions.contains_key(&agent_id)
+                    && !state.pending_agent_sessions.contains_key(&agent_id)
+                    && state
+                        .agent_visibility
+                        .visible_host_streams(&agent_id)
+                        .is_empty();
+                drop(state);
+                if cleaned {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("startup failure must not leave an unpublished session binding behind");
+        hook.resume();
+        let spawned_agent_id = spawn
+            .await
+            .expect("startup-failure spawn task")
+            .expect("spawn request is accepted before asynchronous startup failure");
+        assert_eq!(spawned_agent_id, agent_id);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        while let Ok(envelope) = rx.try_recv() {
+            match envelope.kind {
+                FrameKind::NewAgent => {
+                    let payload: NewAgentPayload =
+                        envelope.parse_payload().expect("NewAgent payload");
+                    assert_ne!(
+                        payload.agent_id, agent_id,
+                        "startup failure must not resurrect an unpublished agent"
+                    );
+                }
+                FrameKind::AgentClosed => {
+                    let payload: AgentClosedPayload =
+                        envelope.parse_payload().expect("AgentClosed payload");
+                    assert_ne!(
+                        payload.agent_id, agent_id,
+                        "startup failure must not emit AgentClosed before NewAgent"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn simultaneous_startup_failure_and_fanout_publish_one_terminal_agent() {
+        let _race_guard = STARTUP_FAILURE_FANOUT_RACE_TEST_LOCK.lock().await;
+        let fixture = compact_fixture().await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let host_path = StreamPath(format!("/host/failed-fanout-race-{}", Uuid::new_v4()));
+        fixture
+            .host
+            .register_host_stream(Stream::new(host_path.clone(), tx), AgentReplayMode::Eager)
+            .await;
+        while rx.try_recv().is_ok() {}
+
+        let hook = install_startup_failure_fanout_race_test_hook(
+            &fixture.host,
+            StartupFailureFanoutRaceWinner::Fanout,
+        );
+        let spawning_host = fixture.host.clone();
+        let spawn = tokio::spawn(async move {
+            spawning_host
+                .spawn_agent(SpawnAgentPayload {
+                    name: Some("Failed Fanout Race Parent".to_owned()),
+                    custom_agent_id: None,
+                    parent_agent_id: None,
+                    project_id: None,
+                    params: SpawnAgentParams::New {
+                        workspace_roots: Vec::new(),
+                        prompt: "__mock_fail_spawn__".to_owned(),
+                        images: None,
+                        backend_kind: BackendKind::Claude,
+                        launch_profile_id: None,
+                        cost_hint: None,
+                        access_mode: Default::default(),
+                        session_settings: None,
+                    },
+                })
+                .await
+        });
+
+        hook.wait_until_ready().await;
+        let agent_id = spawn
+            .await
+            .expect("startup-failure fanout race task")
+            .expect("spawn request remains accepted when fanout wins publication");
+
+        let envelopes = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        let (new_agent_index, instance_stream) = envelopes
+            .iter()
+            .enumerate()
+            .find_map(|(index, envelope)| {
+                if envelope.kind != FrameKind::NewAgent {
+                    return None;
+                }
+                let payload: NewAgentPayload = envelope.parse_payload().expect("NewAgent payload");
+                (payload.agent_id == agent_id).then_some((index, payload.instance_stream))
+            })
+            .expect("fanout-winning startup failure must publish NewAgent");
+        let (bootstrap_index, bootstrap) = envelopes
+            .iter()
+            .enumerate()
+            .find_map(|(index, envelope)| {
+                if envelope.stream != instance_stream || envelope.kind != FrameKind::AgentBootstrap
+                {
+                    return None;
+                }
+                Some((
+                    index,
+                    envelope
+                        .parse_payload::<protocol::AgentBootstrapPayload>()
+                        .expect("terminal AgentBootstrap payload"),
+                ))
+            })
+            .expect("published failed agent must receive terminal bootstrap");
+        assert!(
+            bootstrap_index > new_agent_index,
+            "terminal bootstrap must follow NewAgent publication"
+        );
+        assert!(bootstrap.events.iter().any(|event| matches!(
+            event,
+            protocol::AgentBootstrapEvent::AgentStart(start) if start.agent_id == agent_id
+        )));
+        assert!(bootstrap.events.iter().any(|event| matches!(
+            event,
+            protocol::AgentBootstrapEvent::AgentError(error)
+                if error.fatal && error.message.contains("mock backend forced spawn failure")
+        )));
+        assert!(envelopes.iter().all(|envelope| {
+            envelope.kind != FrameKind::AgentClosed
+                || envelope
+                    .parse_payload::<AgentClosedPayload>()
+                    .expect("AgentClosed payload")
+                    .agent_id
+                    != agent_id
+        }));
+
+        let status = fixture
+            .host
+            .agent_status_snapshot(&agent_id)
+            .await
+            .expect("published terminal failed agent remains registered");
+        assert!(status.terminated);
+        assert_eq!(status.status(), AgentControlStatus::Failed);
+        let state = fixture.host.state.lock().await;
+        assert!(state.registry.agent_handle(&agent_id).is_some());
+        assert!(!state.agent_sessions.contains_key(&agent_id));
+        assert!(!state.pending_agent_sessions.contains_key(&agent_id));
+        assert_eq!(
+            state.agent_visibility.visible_host_streams(&agent_id),
+            HashSet::from([host_path])
+        );
+    }
+
+    #[tokio::test]
+    async fn simultaneous_startup_failure_claim_prevents_unpublished_fanout() {
+        let _race_guard = STARTUP_FAILURE_FANOUT_RACE_TEST_LOCK.lock().await;
+        let fixture = compact_fixture().await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        fixture
+            .host
+            .register_host_stream(
+                Stream::new(
+                    StreamPath(format!("/host/failed-unpublished-race-{}", Uuid::new_v4())),
+                    tx,
+                ),
+                AgentReplayMode::Eager,
+            )
+            .await;
+        while rx.try_recv().is_ok() {}
+
+        let race_hook = install_startup_failure_fanout_race_test_hook(
+            &fixture.host,
+            StartupFailureFanoutRaceWinner::Failure,
+        );
+        let cleanup_hook = install_spawn_cancelled_before_cleanup_test_hook(&fixture.host);
+        let spawning_host = fixture.host.clone();
+        let spawn = tokio::spawn(async move {
+            spawning_host
+                .spawn_agent(SpawnAgentPayload {
+                    name: Some("Failed Unpublished Race Parent".to_owned()),
+                    custom_agent_id: None,
+                    parent_agent_id: None,
+                    project_id: None,
+                    params: SpawnAgentParams::New {
+                        workspace_roots: Vec::new(),
+                        prompt: "__mock_fail_spawn__".to_owned(),
+                        images: None,
+                        backend_kind: BackendKind::Claude,
+                        launch_profile_id: None,
+                        cost_hint: None,
+                        access_mode: Default::default(),
+                        session_settings: None,
+                    },
+                })
+                .await
+        });
+
+        race_hook.wait_until_ready().await;
+        cleanup_hook.wait_until_reached().await;
+        let agent_id = spawn
+            .await
+            .expect("startup-failure cancellation race task")
+            .expect("spawn request remains accepted when startup failure cancels publication");
+
+        cleanup_hook.resume();
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let state = fixture.host.state.lock().await;
+                let cleaned = state.registry.agent_handle(&agent_id).is_none()
+                    && !state.agent_sessions.contains_key(&agent_id)
+                    && !state.pending_agent_sessions.contains_key(&agent_id)
+                    && state
+                        .agent_visibility
+                        .visible_host_streams(&agent_id)
+                        .is_empty();
+                drop(state);
+                if cleaned {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("failure-first atomic claim must clean unpublished state");
+        while let Ok(envelope) = rx.try_recv() {
+            match envelope.kind {
+                FrameKind::NewAgent => {
+                    let payload: NewAgentPayload =
+                        envelope.parse_payload().expect("NewAgent payload");
+                    assert_ne!(payload.agent_id, agent_id);
+                }
+                FrameKind::AgentClosed => {
+                    let payload: AgentClosedPayload =
+                        envelope.parse_payload().expect("AgentClosed payload");
+                    assert_ne!(payload.agent_id, agent_id);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_parent_visibility_closes_only_the_visible_subscriber() {
+        let fixture = compact_fixture().await;
+        let (first_tx, mut first_rx) = mpsc::unbounded_channel();
+        let first_stream = Stream::new(
+            StreamPath(format!("/host/partial-first-{}", Uuid::new_v4())),
+            first_tx,
+        );
+        fixture
+            .host
+            .register_host_stream(first_stream, AgentReplayMode::Lazy)
+            .await;
+        let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+        let second_stream = Stream::new(
+            StreamPath(format!("/host/partial-second-{}", Uuid::new_v4())),
+            second_tx,
+        );
+        fixture
+            .host
+            .register_host_stream(second_stream, AgentReplayMode::Lazy)
+            .await;
+        while first_rx.try_recv().is_ok() {}
+        while second_rx.try_recv().is_ok() {}
+
+        let fanout_hook = install_spawn_new_agent_fanout_test_hook(&fixture.host);
+        let spawning_host = fixture.host.clone();
+        let spawn = tokio::spawn(async move {
+            spawning_host
+                .spawn_agent(SpawnAgentPayload {
+                    name: Some("Partial Fanout Parent".to_owned()),
+                    custom_agent_id: None,
+                    parent_agent_id: None,
+                    project_id: None,
+                    params: SpawnAgentParams::New {
+                        workspace_roots: Vec::new(),
+                        prompt: "start then cancel during fanout".to_owned(),
+                        images: None,
+                        backend_kind: BackendKind::Claude,
+                        launch_profile_id: None,
+                        cost_hint: None,
+                        access_mode: Default::default(),
+                        session_settings: None,
+                    },
+                })
+                .await
+        });
+
+        fanout_hook.wait_until_reached().await;
+        let agent_id = {
+            let state = fixture.host.state.lock().await;
+            state
+                .registry
+                .agent_ids()
+                .into_iter()
+                .next()
+                .expect("partially visible parent agent")
+        };
+        spawn.abort();
+        assert!(
+            spawn
+                .await
+                .expect_err("cancelled fanout task")
+                .is_cancelled()
+        );
+        drop(fanout_hook);
+
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let state = fixture.host.state.lock().await;
+                let cleaned = state.registry.agent_handle(&agent_id).is_none()
+                    && !state.agent_sessions.contains_key(&agent_id)
+                    && !state.pending_agent_sessions.contains_key(&agent_id)
+                    && state
+                        .agent_visibility
+                        .visible_host_streams(&agent_id)
+                        .is_empty();
+                drop(state);
+                if cleaned {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("partial fanout cancellation must clean all agent bindings and visibility");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut first_lifecycle = Vec::new();
+        while let Ok(envelope) = first_rx.try_recv() {
+            match envelope.kind {
+                FrameKind::NewAgent => {
+                    let payload: NewAgentPayload =
+                        envelope.parse_payload().expect("first NewAgent payload");
+                    if payload.agent_id == agent_id {
+                        first_lifecycle.push("new");
+                    }
+                }
+                FrameKind::AgentClosed => {
+                    let payload: AgentClosedPayload =
+                        envelope.parse_payload().expect("first AgentClosed payload");
+                    if payload.agent_id == agent_id {
+                        first_lifecycle.push("closed");
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut second_lifecycle = Vec::new();
+        while let Ok(envelope) = second_rx.try_recv() {
+            match envelope.kind {
+                FrameKind::NewAgent => {
+                    let payload: NewAgentPayload =
+                        envelope.parse_payload().expect("second NewAgent payload");
+                    if payload.agent_id == agent_id {
+                        second_lifecycle.push("new");
+                    }
+                }
+                FrameKind::AgentClosed => {
+                    let payload: AgentClosedPayload = envelope
+                        .parse_payload()
+                        .expect("second AgentClosed payload");
+                    if payload.agent_id == agent_id {
+                        second_lifecycle.push("closed");
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            first_lifecycle,
+            vec!["new", "closed"],
+            "sorted host fanout must preserve NewAgent before AgentClosed for its visible subscriber"
+        );
+        assert!(
+            second_lifecycle.is_empty(),
+            "the not-yet-fanned-out subscriber must see neither NewAgent nor AgentClosed: {second_lifecycle:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_includes_visible_unpublished_normal_spawn_once() {
+        let fixture = compact_fixture().await;
+        let hook = install_spawn_visible_before_publication_test_hook(&fixture.host);
+        let spawning_host = fixture.host.clone();
+        let spawn = tokio::spawn(async move {
+            spawning_host
+                .spawn_agent(SpawnAgentPayload {
+                    name: Some("Visible Before Session Publication".to_owned()),
+                    custom_agent_id: None,
+                    parent_agent_id: None,
+                    project_id: None,
+                    params: SpawnAgentParams::New {
+                        workspace_roots: Vec::new(),
+                        prompt: "complete fanout before session publication".to_owned(),
+                        images: None,
+                        backend_kind: BackendKind::Claude,
+                        launch_profile_id: None,
+                        cost_hint: None,
+                        access_mode: Default::default(),
+                        session_settings: None,
+                    },
+                })
+                .await
+        });
+        hook.wait_until_reached().await;
+        let agent_id = {
+            let state = fixture.host.state.lock().await;
+            state
+                .registry
+                .agent_ids()
+                .into_iter()
+                .next()
+                .expect("visible unpublished agent")
+        };
+        {
+            let state = fixture.host.state.lock().await;
+            assert!(
+                !state.agent_sessions.contains_key(&agent_id),
+                "test hook must stop before public session promotion"
+            );
+            assert!(
+                state.agent_visibility.bootstrap_eligible(&agent_id, false),
+                "completed NewAgent fanout must make the agent bootstrap-eligible"
+            );
+        }
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        fixture
+            .host
+            .register_host_stream(
+                Stream::new(
+                    StreamPath(format!("/host/visible-before-publish-{}", Uuid::new_v4())),
+                    tx,
+                ),
+                AgentReplayMode::Lazy,
+            )
+            .await;
+        let bootstrap = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let envelope = rx.recv().await.expect("host stream remains open");
+                if envelope.kind == FrameKind::HostBootstrap {
+                    return envelope
+                        .parse_payload::<HostBootstrapPayload>()
+                        .expect("HostBootstrap payload");
+                }
+            }
+        })
+        .await
+        .expect("bootstrap delivery");
+        assert_eq!(
+            bootstrap
+                .agents
+                .iter()
+                .filter(|agent| agent.agent_id == agent_id)
+                .count(),
+            1,
+            "visible normal spawn must appear exactly once in bootstrap"
+        );
+        {
+            let state = fixture.host.state.lock().await;
+            assert_eq!(
+                state.agent_visibility.visible_host_streams(&agent_id).len(),
+                1,
+                "successful bootstrap must record its host visibility recipient"
+            );
+        }
+
+        hook.resume();
+        let spawned_agent_id = spawn
+            .await
+            .expect("visible normal spawn task")
+            .expect("visible normal spawn result");
+        assert_eq!(spawned_agent_id, agent_id);
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            fixture.host.wait_for_agent_session_id_result(&agent_id),
+        )
+        .await
+        .expect("session publication after hook resume")
+        .expect("published session");
+        assert!(fixture.host.close_agent(&agent_id).await);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut new_agent_count = 0usize;
+        let mut closed_count = 0usize;
+        while let Ok(envelope) = rx.try_recv() {
+            match envelope.kind {
+                FrameKind::NewAgent => {
+                    let payload: NewAgentPayload =
+                        envelope.parse_payload().expect("NewAgent payload");
+                    if payload.agent_id == agent_id {
+                        new_agent_count += 1;
+                    }
+                }
+                FrameKind::AgentClosed => {
+                    let payload: AgentClosedPayload =
+                        envelope.parse_payload().expect("AgentClosed payload");
+                    if payload.agent_id == agent_id {
+                        closed_count += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            new_agent_count, 0,
+            "bootstrap must deduplicate pending NewAgent replay"
+        );
+        assert_eq!(
+            closed_count, 1,
+            "visible normal spawn must close exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_visibility_excludes_even_a_publicly_bound_agent_from_bootstrap() {
+        let fixture = compact_fixture().await;
+        let visible_hook = install_spawn_visible_before_publication_test_hook(&fixture.host);
+        let cancelled_hook = install_spawn_cancelled_before_cleanup_test_hook(&fixture.host);
+        let spawning_host = fixture.host.clone();
+        let spawn = tokio::spawn(async move {
+            spawning_host
+                .spawn_agent(SpawnAgentPayload {
+                    name: Some("Cancelled Before Bootstrap".to_owned()),
+                    custom_agent_id: None,
+                    parent_agent_id: None,
+                    project_id: None,
+                    params: SpawnAgentParams::New {
+                        workspace_roots: Vec::new(),
+                        prompt: "become visible then cancel".to_owned(),
+                        images: None,
+                        backend_kind: BackendKind::Claude,
+                        launch_profile_id: None,
+                        cost_hint: None,
+                        access_mode: Default::default(),
+                        session_settings: None,
+                    },
+                })
+                .await
+        });
+        visible_hook.wait_until_reached().await;
+        let agent_id = {
+            let mut state = fixture.host.state.lock().await;
+            let agent_id = state
+                .registry
+                .agent_ids()
+                .into_iter()
+                .next()
+                .expect("visible agent before cancellation");
+            state.agent_sessions.insert(
+                agent_id.clone(),
+                SessionId("test-public-binding-before-cancellation".to_owned()),
+            );
+            agent_id
+        };
+
+        spawn.abort();
+        assert!(
+            spawn
+                .await
+                .expect_err("cancelled visible spawn")
+                .is_cancelled()
+        );
+        cancelled_hook.wait_until_reached().await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        fixture
+            .host
+            .register_host_stream(
+                Stream::new(
+                    StreamPath(format!("/host/cancelled-bootstrap-{}", Uuid::new_v4())),
+                    tx,
+                ),
+                AgentReplayMode::Lazy,
+            )
+            .await;
+        let bootstrap = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let envelope = rx.recv().await.expect("host stream remains open");
+                if envelope.kind == FrameKind::HostBootstrap {
+                    return envelope
+                        .parse_payload::<HostBootstrapPayload>()
+                        .expect("HostBootstrap payload");
+                }
+            }
+        })
+        .await
+        .expect("bootstrap delivery during cancelled cleanup");
+        assert!(
+            !bootstrap
+                .agents
+                .iter()
+                .any(|agent| agent.agent_id == agent_id),
+            "cancelled visibility must override a stale public binding"
+        );
+
+        cancelled_hook.resume();
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let state = fixture.host.state.lock().await;
+                let cleaned = state.registry.agent_handle(&agent_id).is_none()
+                    && !state.agent_sessions.contains_key(&agent_id)
+                    && !state.pending_agent_sessions.contains_key(&agent_id)
+                    && state
+                        .agent_visibility
+                        .visible_host_streams(&agent_id)
+                        .is_empty();
+                drop(state);
+                if cleaned {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("cancelled visibility cleanup");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        while let Ok(envelope) = rx.try_recv() {
+            match envelope.kind {
+                FrameKind::NewAgent => {
+                    let payload: NewAgentPayload =
+                        envelope.parse_payload().expect("NewAgent payload");
+                    assert_ne!(payload.agent_id, agent_id);
+                }
+                FrameKind::AgentClosed => {
+                    let payload: AgentClosedPayload =
+                        envelope.parse_payload().expect("AgentClosed payload");
+                    assert_ne!(payload.agent_id, agent_id);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_publication_follows_new_agent_fanout() {
+        let fixture = compact_fixture().await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let host_stream = Stream::new(
+            StreamPath(format!(
+                "/host/session-publication-order-{}",
+                Uuid::new_v4()
+            )),
+            tx,
+        );
+        let attachments = fixture
+            .host
+            .register_host_stream(host_stream, AgentReplayMode::Lazy)
+            .await;
+        assert!(
+            attachments.is_empty(),
+            "empty host has no replay attachments"
+        );
+        while rx.try_recv().is_ok() {}
+
+        let hook = install_spawn_session_registration_test_hook(&fixture.host);
+        let spawning_host = fixture.host.clone();
+        let spawn = tokio::spawn(async move {
+            spawning_host
+                .spawn_agent(SpawnAgentPayload {
+                    name: Some("Publication Ordering Parent".to_owned()),
+                    custom_agent_id: None,
+                    parent_agent_id: None,
+                    project_id: None,
+                    params: SpawnAgentParams::New {
+                        workspace_roots: Vec::new(),
+                        prompt: "start ordered parent".to_owned(),
+                        images: None,
+                        backend_kind: BackendKind::Claude,
+                        launch_profile_id: None,
+                        cost_hint: None,
+                        access_mode: Default::default(),
+                        session_settings: None,
+                    },
+                })
+                .await
+        });
+        hook.wait_until_reached().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), async {
+                loop {
+                    let envelope = rx.recv().await.expect("host stream remains open");
+                    if matches!(
+                        envelope.kind,
+                        FrameKind::NewAgent
+                            | FrameKind::AgentsViewPreferencesNotify
+                            | FrameKind::SessionList
+                    ) {
+                        return envelope;
+                    }
+                }
+            })
+            .await
+            .is_err(),
+            "pending session registration must not publish host or preference events before fanout"
+        );
+
+        hook.resume();
+        let parent_agent_id = spawn
+            .await
+            .expect("ordered parent spawn task")
+            .expect("ordered parent spawn succeeds");
+        let mut new_agent_index = None;
+        let mut preference_index = None;
+        let mut session_list_index = None;
+        let mut index = 0usize;
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while new_agent_index.is_none()
+                || preference_index.is_none()
+                || session_list_index.is_none()
+            {
+                let envelope = rx.recv().await.expect("host stream remains open");
+                match envelope.kind {
+                    FrameKind::NewAgent => {
+                        let payload: NewAgentPayload =
+                            envelope.parse_payload().expect("NewAgent payload");
+                        if payload.agent_id == parent_agent_id {
+                            new_agent_index = Some(index);
+                        }
+                    }
+                    FrameKind::AgentsViewPreferencesNotify => preference_index = Some(index),
+                    FrameKind::SessionList => session_list_index = Some(index),
+                    _ => {}
+                }
+                index += 1;
+            }
+        })
+        .await
+        .expect("parent fanout and published session events");
+        let new_agent_index = new_agent_index.expect("parent NewAgent index");
+        let preference_index = preference_index.expect("preferences publication index");
+        let session_list_index = session_list_index.expect("session-list publication index");
+        assert!(new_agent_index < preference_index);
+        assert!(preference_index < session_list_index);
+        assert!(fixture.host.close_agent(&parent_agent_id).await);
+    }
+
+    #[tokio::test]
+    async fn pending_agent_annotation_promotes_only_at_session_publication() {
+        let fixture = compact_fixture().await;
+        let hook = install_spawn_session_registration_test_hook(&fixture.host);
+        let spawning_host = fixture.host.clone();
+        let spawn = tokio::spawn(async move {
+            spawning_host
+                .spawn_agent(SpawnAgentPayload {
+                    name: Some("Pending Annotation Parent".to_owned()),
+                    custom_agent_id: None,
+                    parent_agent_id: None,
+                    project_id: None,
+                    params: SpawnAgentParams::New {
+                        workspace_roots: Vec::new(),
+                        prompt: "start annotation parent".to_owned(),
+                        images: None,
+                        backend_kind: BackendKind::Claude,
+                        launch_profile_id: None,
+                        cost_hint: None,
+                        access_mode: Default::default(),
+                        session_settings: None,
+                    },
+                })
+                .await
+        });
+        hook.wait_until_reached().await;
+        let agent_id = {
+            let state = fixture.host.state.lock().await;
+            state
+                .registry
+                .agent_ids()
+                .into_iter()
+                .next()
+                .expect("blocked parent agent")
+        };
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let pending = fixture
+                    .host
+                    .state
+                    .lock()
+                    .await
+                    .pending_agent_sessions
+                    .contains_key(&agent_id);
+                if pending {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("parent startup must create its private pending session binding");
+
+        fixture
+            .host
+            .set_agent_tags(SetAgentTagsPayload {
+                update: AgentTagsUpdate::CreateTag {
+                    name: "Pending session tag".to_owned(),
+                    color: None,
+                },
+            })
+            .await
+            .expect("create pending-session tag");
+        let tag_id = {
+            let store = fixture
+                .host
+                .state
+                .lock()
+                .await
+                .agents_view_preferences_store
+                .clone()
+                .expect("primary preferences store");
+            store
+                .lock()
+                .await
+                .snapshot()
+                .tags
+                .manual
+                .into_iter()
+                .find(|tag| tag.name == "Pending session tag")
+                .expect("created tag")
+                .id
+        };
+        let transient_target = AgentAnnotationTarget::TransientAgent {
+            host_id: HostFilterId(LOCAL_HOST_ID.to_owned()),
+            agent_id: agent_id.clone(),
+        };
+        fixture
+            .host
+            .set_agent_tags(SetAgentTagsPayload {
+                update: AgentTagsUpdate::AssignTag {
+                    target: transient_target.clone(),
+                    tag_id: tag_id.clone(),
+                },
+            })
+            .await
+            .expect("assign tag while session is pending");
+        {
+            let state = fixture.host.state.lock().await;
+            assert!(!state.agent_sessions.contains_key(&agent_id));
+            assert!(state.pending_agent_sessions.contains_key(&agent_id));
+            let snapshot = state
+                .agents_view_preferences_store
+                .as_ref()
+                .expect("primary preferences store")
+                .lock()
+                .await
+                .snapshot();
+            assert!(snapshot.tags.manual_assignments.iter().any(|assignment| {
+                assignment.target == transient_target && assignment.tag_ids.contains(&tag_id)
+            }));
+        }
+
+        hook.resume();
+        let spawned_agent_id = spawn
+            .await
+            .expect("annotation parent spawn task")
+            .expect("annotation parent spawn succeeds");
+        assert_eq!(spawned_agent_id, agent_id);
+        let session_id = tokio::time::timeout(
+            Duration::from_millis(500),
+            fixture.host.wait_for_agent_session_id_result(&agent_id),
+        )
+        .await
+        .expect("session publication completes")
+        .expect("published session");
+        let session_target = AgentAnnotationTarget::Session {
+            host_id: HostFilterId(LOCAL_HOST_ID.to_owned()),
+            session_id,
+        };
+        {
+            let state = fixture.host.state.lock().await;
+            let snapshot = state
+                .agents_view_preferences_store
+                .as_ref()
+                .expect("primary preferences store")
+                .lock()
+                .await
+                .snapshot();
+            assert!(!snapshot.tags.manual_assignments.iter().any(|assignment| {
+                assignment.target == transient_target && assignment.tag_ids.contains(&tag_id)
+            }));
+            assert!(snapshot.tags.manual_assignments.iter().any(|assignment| {
+                assignment.target == session_target && assignment.tag_ids.contains(&tag_id)
+            }));
+        }
+        assert!(fixture.host.close_agent(&agent_id).await);
+    }
 
     #[test]
     fn startup_mcp_servers_attach_config_only_to_help_agent() {
@@ -15013,10 +18734,17 @@ mod tests {
             .find_map(|agent| (agent.agent_id == agent_id).then_some(agent.instance_stream.clone()))
             .expect("existing agent advertised in HostBootstrap");
 
+        let agent_replay = tokio::time::timeout(Duration::from_millis(50), async {
+            loop {
+                let envelope = rx.recv().await?;
+                if envelope.stream == agent_stream {
+                    return Some(envelope);
+                }
+            }
+        })
+        .await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), rx.recv())
-                .await
-                .is_err(),
+            agent_replay.is_err(),
             "lazy registration must not replay agent transcripts until requested"
         );
 
@@ -15147,6 +18875,8 @@ mod tests {
             last_backend_config_schemas: None,
             last_backend_config_snapshots: None,
             last_backend_native_settings_snapshots: None,
+            last_backend_capacity: None,
+            capacity_replay_ready: false,
             last_launch_profile_catalog: None,
         };
 
@@ -15219,6 +18949,8 @@ mod tests {
             last_backend_config_schemas: None,
             last_backend_config_snapshots: None,
             last_backend_native_settings_snapshots: None,
+            last_backend_capacity: None,
+            capacity_replay_ready: true,
             last_launch_profile_catalog: None,
         };
         let native_settings = vec![BackendNativeSettingsSnapshot {
@@ -15230,6 +18962,9 @@ mod tests {
             })),
             groups: Vec::new(),
             message: None,
+            provenance: None,
+            advisories: Vec::new(),
+            managed_projection_recovery: None,
         }];
 
         emit_backend_config_snapshots_for_subscriber(&[], &native_settings, &mut subscriber, false)
@@ -15257,6 +18992,196 @@ mod tests {
             .parse_payload()
             .expect("forced BackendConfigSnapshots payload");
         assert_eq!(payload.native_settings, native_settings);
+    }
+
+    #[test]
+    fn backend_setup_refresh_order_is_authoritative() {
+        assert_eq!(
+            BACKEND_SETUP_REFRESH_ORDER,
+            [
+                BackendSetupRefreshStep::Setup,
+                BackendSetupRefreshStep::SessionSchemas,
+                BackendSetupRefreshStep::BackendConfigSnapshots,
+            ]
+        );
+    }
+
+    #[test]
+    fn stale_projection_notice_maps_to_typed_conflict() {
+        let error = tycode_projection_acknowledgement_app_error(
+            crate::backend::tycode::TycodeProjectionNoticeAcknowledgementError::Conflict(
+                "newer projection".to_owned(),
+            ),
+        );
+
+        assert_eq!(error.kind, crate::error::AppErrorKind::Conflict);
+        assert_eq!(error.message, "newer projection");
+    }
+
+    #[tokio::test]
+    async fn projection_notice_success_echoes_exact_token_and_refreshes() {
+        let projection_id = protocol::TycodeProjectionId("projection-01J".to_owned());
+        let observed = Arc::new(Mutex::new(None));
+        let observed_by_operation = Arc::clone(&observed);
+        let refreshes = Arc::new(AtomicU64::new(0));
+        let refreshes_by_callback = Arc::clone(&refreshes);
+
+        run_tycode_runtime_setting_operation(
+            projection_id.clone(),
+            move |received| async move {
+                *observed_by_operation.lock().await = Some(received);
+                Ok::<(), crate::backend::tycode::TycodeProjectionNoticeAcknowledgementError>(())
+            },
+            tycode_projection_acknowledgement_app_error,
+            move || async move {
+                refreshes_by_callback.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect("projection acknowledgement");
+
+        assert_eq!(observed.lock().await.as_ref(), Some(&projection_id));
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn managed_projection_reset_success_echoes_exact_tokens_and_refreshes() {
+        let projection_id = protocol::TycodeProjectionId("projection-recovery-01J".to_owned());
+        let state_hash = protocol::TycodeProjectionStateHash("sha256:state-abc123".to_owned());
+        let observed = Arc::new(Mutex::new(None));
+        let observed_by_operation = Arc::clone(&observed);
+        let refreshes = Arc::new(AtomicU64::new(0));
+        let refreshes_by_callback = Arc::clone(&refreshes);
+
+        run_tycode_runtime_setting_operation(
+            (projection_id.clone(), state_hash.clone()),
+            move |received| async move {
+                *observed_by_operation.lock().await = Some(received);
+                Ok::<(), crate::backend::tycode::TycodeManagedProjectionResetError>(())
+            },
+            tycode_managed_projection_reset_app_error,
+            move || async move {
+                refreshes_by_callback.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect("managed projection reset");
+
+        let expected = (projection_id, state_hash);
+        assert_eq!(observed.lock().await.as_ref(), Some(&expected));
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_managed_projection_reset_conflicts_without_fallback_and_refreshes() {
+        let projection_id = protocol::TycodeProjectionId("projection-stale".to_owned());
+        let state_hash = protocol::TycodeProjectionStateHash("sha256:stale".to_owned());
+        let managed_artifact = Arc::new(Mutex::new(b"managed bytes".to_vec()));
+        let artifact_seen_by_operation = Arc::clone(&managed_artifact);
+        let refreshes = Arc::new(AtomicU64::new(0));
+        let refreshes_by_callback = Arc::clone(&refreshes);
+
+        let error = run_tycode_runtime_setting_operation(
+            (projection_id.clone(), state_hash.clone()),
+            move |received| async move {
+                assert_eq!(received, (projection_id, state_hash));
+                assert_eq!(
+                    artifact_seen_by_operation.lock().await.as_slice(),
+                    b"managed bytes"
+                );
+                Err(
+                    crate::backend::tycode::TycodeManagedProjectionResetError::Conflict(
+                        "managed projection changed".to_owned(),
+                    ),
+                )
+            },
+            tycode_managed_projection_reset_app_error,
+            move || async move {
+                refreshes_by_callback.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect_err("stale reset must conflict");
+
+        assert_eq!(error.code(), protocol::CommandErrorCode::Conflict);
+        assert_eq!(error.message, "managed projection changed");
+        assert_eq!(managed_artifact.lock().await.as_slice(), b"managed bytes");
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_managed_projection_reset_refreshes_and_surfaces_internal_error() {
+        let refreshes = Arc::new(AtomicU64::new(0));
+        let refreshes_by_callback = Arc::clone(&refreshes);
+
+        let error = run_tycode_runtime_setting_operation(
+            (),
+            |_| async {
+                Err(
+                    crate::backend::tycode::TycodeManagedProjectionResetError::Failed(
+                        "journal fsync failed".to_owned(),
+                    ),
+                )
+            },
+            tycode_managed_projection_reset_app_error,
+            move || async move {
+                refreshes_by_callback.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect_err("failed reset must surface an error");
+
+        assert_eq!(error.code(), protocol::CommandErrorCode::Internal);
+        assert_eq!(error.message, "journal fsync failed");
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn forced_session_schema_fanout_reemits_unchanged_snapshot() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let host_path = StreamPath(format!("/host/session-schema-{}", Uuid::new_v4()));
+        let stream = Stream::new(host_path, tx);
+        let mut subscriber = HostSubscriber {
+            stream,
+            bootstrapped: true,
+            agent_replay: AgentReplayMode::Eager,
+            session_list_replay: SessionListReplayMode::Full,
+            session_list_snapshot: None,
+            known_agent_streams: HashSet::new(),
+            attached_agent_streams: HashSet::new(),
+            bootstrapped_agent_streams: HashSet::new(),
+            pending_bootstrap_new_agents: Vec::new(),
+            pending_bootstrap_frames: Vec::new(),
+            last_session_schemas: None,
+            last_backend_config_schemas: None,
+            last_backend_config_snapshots: None,
+            last_backend_native_settings_snapshots: None,
+            last_backend_capacity: None,
+            capacity_replay_ready: true,
+            last_launch_profile_catalog: None,
+        };
+
+        emit_session_schemas_for_subscriber(&[], &mut subscriber, false)
+            .await
+            .expect("initial session schema fanout");
+        let first = rx.recv().await.expect("initial session schema event");
+        assert_eq!(first.kind, FrameKind::SessionSchemas);
+
+        emit_session_schemas_for_subscriber(&[], &mut subscriber, false)
+            .await
+            .expect("unchanged session schema fanout");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "ordinary refresh should still dedupe unchanged session schemas"
+        );
+
+        emit_session_schemas_for_subscriber(&[], &mut subscriber, true)
+            .await
+            .expect("forced session schema fanout");
+        let forced = rx.recv().await.expect("forced session schema event");
+        assert_eq!(forced.kind, FrameKind::SessionSchemas);
     }
 
     async fn wait_for_agent_idle(host: &HostHandle, agent_id: &AgentId) {

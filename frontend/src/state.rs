@@ -66,6 +66,27 @@ pub enum NativeSettingsSaveState {
     Failed { message: String },
 }
 
+/// The outcome of an explicit `ResetTycodeManagedProjection`. See
+/// [`AppState::managed_projection_reset`].
+///
+/// The reset is the one action in settings that deletes data, and it is offered
+/// from a card on a page that is otherwise inert. Its refusal therefore has to be
+/// visible *where the user acted* — not only in the global host status line,
+/// where a rejected reset reads as a button that did nothing.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ManagedProjectionResetState {
+    /// Sent; the server has not answered. Nothing has happened on disk yet, and
+    /// nothing in the UI may change on its own until the server says so.
+    Pending,
+    /// The server refused it, and this is the refusal verbatim. `Conflict` is the
+    /// typed stale-token refusal: the projection moved after the reset was
+    /// offered, so the tokens no longer match and the server removed nothing.
+    Refused {
+        code: protocol::CommandErrorCode,
+        message: String,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentInfo {
     pub host_id: String,
@@ -120,6 +141,7 @@ impl AgentMonitorKey {
 /// remounts them from cached AppState (chat_rows, open_files, diff_contents)
 /// so no data is lost, only ephemeral UI state like scroll position.
 pub const TAB_LRU_CAPACITY: usize = 2;
+pub const CENTER_SPLIT_RATIO_STORAGE_KEY: &str = "tyde-center-split-ratio";
 
 /// Id of the builtin "Default" custom agent. It backs every spawn that picks
 /// no explicit agent, so pickers that already offer a "Default agent" row
@@ -173,6 +195,13 @@ pub struct PendingTeamMember {
     pub member_id: TeamMemberId,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FileResourceKey {
+    pub host_id: String,
+    pub project_id: ProjectId,
+    pub path: ProjectPath,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum TabContent {
     Home,
@@ -186,7 +215,7 @@ pub enum TabContent {
         pending_team_member: Option<PendingTeamMember>,
     },
     File {
-        path: ProjectPath,
+        key: FileResourceKey,
     },
     Diff {
         /// Explicit owning project identity. Carried so a review overlay
@@ -248,14 +277,351 @@ pub struct Tab {
     pub closeable: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum BackingResource {
+    File(FileResourceKey),
+    Diff(DiffKey),
+}
+
+impl Tab {
+    pub fn backing_resource(&self) -> Option<BackingResource> {
+        match &self.content {
+            TabContent::File { key } => Some(BackingResource::File(key.clone())),
+            TabContent::Diff {
+                host_id,
+                project_id,
+                root,
+                scope,
+                path,
+            } => Some(BackingResource::Diff(DiffKey::new(
+                host_id.clone(),
+                project_id.clone(),
+                root.clone(),
+                *scope,
+                path.clone(),
+            ))),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PaneId {
+    Primary,
+    Secondary,
+}
+
+impl PaneId {
+    pub fn other(self) -> Self {
+        match self {
+            Self::Primary => Self::Secondary,
+            Self::Secondary => Self::Primary,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SplitRatio(f64);
+
+impl SplitRatio {
+    pub const MIN: f64 = 0.2;
+    pub const MAX: f64 = 0.8;
+    pub const DEFAULT: f64 = 0.5;
+
+    pub fn new(value: f64) -> Self {
+        if value.is_finite() {
+            Self(value.clamp(Self::MIN, Self::MAX))
+        } else {
+            Self(Self::DEFAULT)
+        }
+    }
+
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl Default for SplitRatio {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenTarget {
+    Focused,
+    Beside,
+}
+
+pub const CENTER_TABS_DISABLED_REASON: &str = "Enable tabs to use split view.";
+pub const TAB_SOURCE_MISSING_REASON: &str = "This tab is no longer open.";
+pub const DUPLICATE_FILE_TABS_DISABLED_REASON: &str = CENTER_TABS_DISABLED_REASON;
+pub const DUPLICATE_FILE_SOURCE_MISSING_REASON: &str = TAB_SOURCE_MISSING_REASON;
+pub const DUPLICATE_FILE_NOT_A_FILE_REASON: &str = "Only files can be split.";
+pub const DUPLICATE_FILE_NOT_LOADED_REASON: &str = "Wait for the file to finish loading.";
+pub const OPEN_TO_SIDE_CROSS_PROJECT_REASON: &str =
+    "This resource is in another project — open that project first.";
+pub const OPEN_TO_SIDE_NOTHING_WOULD_REMAIN_REASON: &str = "Nothing would be left in this pane.";
+pub const AGENT_OPEN_TO_SIDE_CROSS_PROJECT_REASON: &str =
+    "This agent is in another project — open that project first.";
+pub const MOVE_ALREADY_IN_TARGET_PANE_REASON: &str = "This tab is already in that pane.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DuplicateFileEligibility {
+    Enabled,
+    TabsDisabled,
+    SourceTabMissing,
+    NotAFile,
+    NotLoaded,
+    TargetAlreadyContainsResource { existing: TabId },
+}
+
+impl DuplicateFileEligibility {
+    #[cfg(test)]
+    pub fn is_enabled(self) -> bool {
+        matches!(
+            self,
+            Self::Enabled | Self::TargetAlreadyContainsResource { .. }
+        )
+    }
+
+    pub fn disabled_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Enabled | Self::TargetAlreadyContainsResource { .. } => None,
+            Self::TabsDisabled => Some(DUPLICATE_FILE_TABS_DISABLED_REASON),
+            Self::SourceTabMissing => Some(DUPLICATE_FILE_SOURCE_MISSING_REASON),
+            Self::NotAFile => Some(DUPLICATE_FILE_NOT_A_FILE_REASON),
+            Self::NotLoaded => Some(DUPLICATE_FILE_NOT_LOADED_REASON),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DuplicateFileResult {
+    Duplicated {
+        source: TabId,
+        tab: TabId,
+        target: PaneId,
+    },
+    ActivatedExisting {
+        source: TabId,
+        existing: TabId,
+        target: PaneId,
+    },
+    TabsDisabled,
+    SourceTabMissing,
+    NotAFile,
+    NotLoaded,
+}
+
+impl DuplicateFileResult {
+    pub fn tab_id(self) -> Option<TabId> {
+        match self {
+            Self::Duplicated { tab, .. } => Some(tab),
+            Self::ActivatedExisting { existing, .. } => Some(existing),
+            Self::TabsDisabled | Self::SourceTabMissing | Self::NotAFile | Self::NotLoaded => None,
+        }
+    }
+
+    pub fn disabled_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Duplicated { .. } | Self::ActivatedExisting { .. } => None,
+            Self::TabsDisabled => Some(DUPLICATE_FILE_TABS_DISABLED_REASON),
+            Self::SourceTabMissing => Some(DUPLICATE_FILE_SOURCE_MISSING_REASON),
+            Self::NotAFile => Some(DUPLICATE_FILE_NOT_A_FILE_REASON),
+            Self::NotLoaded => Some(DUPLICATE_FILE_NOT_LOADED_REASON),
+        }
+    }
+}
+
+pub const MOVE_RESOURCE_ALREADY_IN_TARGET_REASON: &str =
+    "This resource is already open in the other pane.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveTabEligibility {
+    Eligible,
+    SourceTabMissing,
+    AlreadyInTargetPane,
+    ResourceAlreadyInTarget { existing: TabId },
+}
+
+impl MoveTabEligibility {
+    pub fn disabled_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Eligible => None,
+            Self::SourceTabMissing => Some(TAB_SOURCE_MISSING_REASON),
+            Self::AlreadyInTargetPane => Some(MOVE_ALREADY_IN_TARGET_PANE_REASON),
+            Self::ResourceAlreadyInTarget { .. } => Some(MOVE_RESOURCE_ALREADY_IN_TARGET_REASON),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveTabResult {
+    Moved {
+        tab: TabId,
+        source: PaneId,
+        target: PaneId,
+    },
+    SourceTabMissing,
+    AlreadyInTargetPane,
+    ResourceAlreadyInTarget {
+        existing: TabId,
+    },
+}
+
+impl MoveTabResult {
+    pub fn disabled_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Moved { .. } => None,
+            Self::SourceTabMissing => Some(TAB_SOURCE_MISSING_REASON),
+            Self::AlreadyInTargetPane => Some(MOVE_ALREADY_IN_TARGET_PANE_REASON),
+            Self::ResourceAlreadyInTarget { .. } => Some(MOVE_RESOURCE_ALREADY_IN_TARGET_REASON),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveTabRefusal {
+    SourceTabMissing,
+    AlreadyInTargetPane,
+    ResourceAlreadyInTarget { existing: TabId },
+}
+
+impl MoveTabRefusal {
+    pub fn disabled_reason(self) -> &'static str {
+        match self {
+            Self::SourceTabMissing => TAB_SOURCE_MISSING_REASON,
+            Self::AlreadyInTargetPane => MOVE_ALREADY_IN_TARGET_PANE_REASON,
+            Self::ResourceAlreadyInTarget { .. } => MOVE_RESOURCE_ALREADY_IN_TARGET_REASON,
+        }
+    }
+}
+
+impl TryFrom<MoveTabResult> for MoveTabRefusal {
+    type Error = MoveTabResult;
+
+    fn try_from(result: MoveTabResult) -> Result<Self, Self::Error> {
+        match result {
+            MoveTabResult::Moved { .. } => Err(result),
+            MoveTabResult::SourceTabMissing => Ok(Self::SourceTabMissing),
+            MoveTabResult::AlreadyInTargetPane => Ok(Self::AlreadyInTargetPane),
+            MoveTabResult::ResourceAlreadyInTarget { existing } => {
+                Ok(Self::ResourceAlreadyInTarget { existing })
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentOpenToSideResult {
+    Opened {
+        tab: TabId,
+        pane: PaneId,
+    },
+    Moved {
+        tab: TabId,
+        source: PaneId,
+        target: PaneId,
+    },
+    Revealed {
+        tab: TabId,
+        pane: PaneId,
+    },
+    TabsDisabled,
+    CrossProject,
+    NothingWouldRemain,
+    MoveRefused(MoveTabRefusal),
+}
+
+impl AgentOpenToSideResult {
+    pub fn disabled_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Opened { .. } | Self::Moved { .. } | Self::Revealed { .. } => None,
+            Self::TabsDisabled => Some(CENTER_TABS_DISABLED_REASON),
+            Self::CrossProject => Some(AGENT_OPEN_TO_SIDE_CROSS_PROJECT_REASON),
+            Self::NothingWouldRemain => Some(OPEN_TO_SIDE_NOTHING_WOULD_REMAIN_REASON),
+            Self::MoveRefused(refusal) => Some(refusal.disabled_reason()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffOpenToSideResult {
+    Opened {
+        tab: TabId,
+        pane: PaneId,
+    },
+    Moved {
+        tab: TabId,
+        source: PaneId,
+        target: PaneId,
+    },
+    Revealed {
+        tab: TabId,
+        pane: PaneId,
+    },
+    TabsDisabled,
+    CrossProject,
+    NothingWouldRemain,
+    MoveRefused(MoveTabRefusal),
+}
+
+impl DiffOpenToSideResult {
+    pub fn disabled_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Opened { .. } | Self::Moved { .. } | Self::Revealed { .. } => None,
+            Self::TabsDisabled => Some(CENTER_TABS_DISABLED_REASON),
+            Self::CrossProject => Some(OPEN_TO_SIDE_CROSS_PROJECT_REASON),
+            Self::NothingWouldRemain => Some(OPEN_TO_SIDE_NOTHING_WOULD_REMAIN_REASON),
+            Self::MoveRefused(refusal) => Some(refusal.disabled_reason()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingOpenDestination(PaneId);
+
+impl PendingOpenDestination {
+    pub fn new(pane: PaneId) -> Self {
+        Self(pane)
+    }
+
+    pub fn pane(self) -> PaneId {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingFileNavigation {
+    Line(u32),
+    Offset(u32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingFileOpen {
+    RefreshInPlace,
+    Open {
+        destination: PendingOpenDestination,
+        navigation: Option<PendingFileNavigation>,
+    },
+}
+
 #[derive(Clone, Debug)]
-pub struct CenterZoneState {
+pub struct PaneState {
     pub tabs: Vec<Tab>,
     pub active_tab_id: Option<TabId>,
 }
 
-impl CenterZoneState {
-    pub fn new_home() -> Self {
+impl PaneState {
+    fn empty() -> Self {
+        Self {
+            tabs: Vec::new(),
+            active_tab_id: None,
+        }
+    }
+
+    fn home() -> Self {
         let id = next_tab_id();
         Self {
             tabs: vec![Tab {
@@ -268,62 +634,347 @@ impl CenterZoneState {
         }
     }
 
-    pub fn find_tab(&self, content: &TabContent) -> Option<TabId> {
-        self.tabs
-            .iter()
-            .find(|t| t.content == *content)
-            .map(|t| t.id)
+    fn from_tab(tab: Tab) -> Self {
+        let id = tab.id;
+        Self {
+            tabs: vec![tab],
+            active_tab_id: Some(id),
+        }
     }
 
-    pub fn open(&mut self, content: TabContent, label: String, closeable: bool) -> TabId {
-        if let Some(id) = self.find_tab(&content) {
+    fn activate(&mut self, id: TabId) -> bool {
+        if self.tabs.iter().any(|tab| tab.id == id) {
             self.active_tab_id = Some(id);
-            return id;
-        }
-        let id = next_tab_id();
-        self.tabs.push(Tab {
-            id,
-            content,
-            label,
-            closeable,
-        });
-        self.active_tab_id = Some(id);
-        id
-    }
-
-    pub fn activate(&mut self, id: TabId) {
-        if self.tabs.iter().any(|t| t.id == id) {
-            self.active_tab_id = Some(id);
+            true
+        } else {
+            false
         }
     }
 
-    pub fn close(&mut self, id: TabId) {
-        let Some(idx) = self.tabs.iter().position(|t| t.id == id) else {
-            return;
-        };
-        if !self.tabs[idx].closeable {
-            return;
-        }
-        self.tabs.remove(idx);
-        if self.active_tab_id == Some(id) {
-            if self.tabs.is_empty() {
-                let home_id = next_tab_id();
-                self.tabs.push(Tab {
-                    id: home_id,
-                    content: TabContent::Home,
-                    label: "Home".to_string(),
-                    closeable: false,
-                });
-                self.active_tab_id = Some(home_id);
+    fn remove_tabs(&mut self, doomed: &HashSet<TabId>) {
+        let old_active = self.active_tab_id;
+        let old_active_index =
+            old_active.and_then(|id| self.tabs.iter().position(|tab| tab.id == id));
+        self.tabs.retain(|tab| !doomed.contains(&tab.id));
+        if old_active.is_none_or(|id| !self.tabs.iter().any(|tab| tab.id == id)) {
+            self.active_tab_id = if self.tabs.is_empty() {
+                None
             } else {
-                self.active_tab_id = Some(self.tabs[idx.min(self.tabs.len() - 1)].id);
+                Some(self.tabs[old_active_index.unwrap_or(0).min(self.tabs.len() - 1)].id)
+            };
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum CenterLayout {
+    Single(PaneState),
+    Split {
+        primary: PaneState,
+        secondary: PaneState,
+        focused: PaneId,
+        ratio: SplitRatio,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct CenterZoneState {
+    pub layout: CenterLayout,
+}
+
+impl CenterZoneState {
+    pub fn new_home() -> Self {
+        Self {
+            layout: CenterLayout::Single(PaneState::home()),
+        }
+    }
+
+    pub fn focused_id(&self) -> PaneId {
+        match &self.layout {
+            CenterLayout::Single(_) => PaneId::Primary,
+            CenterLayout::Split { focused, .. } => *focused,
+        }
+    }
+
+    pub fn is_split(&self) -> bool {
+        matches!(self.layout, CenterLayout::Split { .. })
+    }
+
+    pub fn split_ratio(&self) -> Option<SplitRatio> {
+        match &self.layout {
+            CenterLayout::Single(_) => None,
+            CenterLayout::Split { ratio, .. } => Some(*ratio),
+        }
+    }
+
+    pub fn set_split_ratio(&mut self, value: SplitRatio) {
+        if let CenterLayout::Split { ratio, .. } = &mut self.layout {
+            *ratio = value;
+        }
+    }
+
+    pub fn resolve(&self, target: OpenTarget) -> PaneId {
+        match target {
+            OpenTarget::Focused => self.focused_id(),
+            OpenTarget::Beside => self.focused_id().other(),
+        }
+    }
+
+    pub fn pane(&self, id: PaneId) -> Option<&PaneState> {
+        match (&self.layout, id) {
+            (CenterLayout::Single(primary), PaneId::Primary) => Some(primary),
+            (CenterLayout::Single(_), PaneId::Secondary) => None,
+            (CenterLayout::Split { primary, .. }, PaneId::Primary) => Some(primary),
+            (CenterLayout::Split { secondary, .. }, PaneId::Secondary) => Some(secondary),
+        }
+    }
+
+    pub fn pane_mut(&mut self, id: PaneId) -> Option<&mut PaneState> {
+        match (&mut self.layout, id) {
+            (CenterLayout::Single(primary), PaneId::Primary) => Some(primary),
+            (CenterLayout::Single(_), PaneId::Secondary) => None,
+            (CenterLayout::Split { primary, .. }, PaneId::Primary) => Some(primary),
+            (CenterLayout::Split { secondary, .. }, PaneId::Secondary) => Some(secondary),
+        }
+    }
+
+    pub fn focused_pane(&self) -> &PaneState {
+        match &self.layout {
+            CenterLayout::Single(primary) => primary,
+            CenterLayout::Split {
+                primary,
+                secondary,
+                focused,
+                ..
+            } => match focused {
+                PaneId::Primary => primary,
+                PaneId::Secondary => secondary,
+            },
+        }
+    }
+
+    pub fn panes(&self) -> impl Iterator<Item = (PaneId, &PaneState)> {
+        [
+            self.pane(PaneId::Primary)
+                .map(|pane| (PaneId::Primary, pane)),
+            self.pane(PaneId::Secondary)
+                .map(|pane| (PaneId::Secondary, pane)),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    pub fn all_tabs(&self) -> impl Iterator<Item = (PaneId, &Tab)> {
+        self.panes()
+            .flat_map(|(pane_id, pane)| pane.tabs.iter().map(move |tab| (pane_id, tab)))
+    }
+
+    pub fn all_tab_ids(&self) -> Vec<TabId> {
+        self.all_tabs().map(|(_, tab)| tab.id).collect()
+    }
+
+    #[cfg(test)]
+    pub fn tabs(&self) -> &[Tab] {
+        &self.focused_pane().tabs
+    }
+
+    pub fn active_tab_id(&self) -> Option<TabId> {
+        self.focused_pane().active_tab_id
+    }
+
+    pub fn pane_active_tab_id(&self, pane: PaneId) -> Option<TabId> {
+        self.pane(pane).and_then(|pane| pane.active_tab_id)
+    }
+
+    pub fn tab(&self, id: TabId) -> Option<&Tab> {
+        self.all_tabs()
+            .find_map(|(_, tab)| (tab.id == id).then_some(tab))
+    }
+
+    pub fn tab_mut(&mut self, id: TabId) -> Option<&mut Tab> {
+        match &mut self.layout {
+            CenterLayout::Single(primary) => primary.tabs.iter_mut().find(|tab| tab.id == id),
+            CenterLayout::Split {
+                primary, secondary, ..
+            } => primary
+                .tabs
+                .iter_mut()
+                .chain(secondary.tabs.iter_mut())
+                .find(|tab| tab.id == id),
+        }
+    }
+
+    pub fn for_each_tab_mut(&mut self, mut action: impl FnMut(PaneId, &mut Tab)) {
+        match &mut self.layout {
+            CenterLayout::Single(primary) => {
+                for tab in &mut primary.tabs {
+                    action(PaneId::Primary, tab);
+                }
+            }
+            CenterLayout::Split {
+                primary, secondary, ..
+            } => {
+                for tab in &mut primary.tabs {
+                    action(PaneId::Primary, tab);
+                }
+                for tab in &mut secondary.tabs {
+                    action(PaneId::Secondary, tab);
+                }
             }
         }
     }
 
+    pub fn find_tab_in(&self, pane: PaneId, content: &TabContent) -> Option<TabId> {
+        self.pane(pane)?
+            .tabs
+            .iter()
+            .find(|tab| tab.content == *content)
+            .map(|tab| tab.id)
+    }
+
+    pub fn find_tab(&self, content: &TabContent) -> Option<TabId> {
+        let focused = self.focused_id();
+        self.find_tab_in(focused, content)
+            .or_else(|| self.find_tab_in(focused.other(), content))
+    }
+
+    #[cfg(test)]
+    pub fn occurrences(&self, content: &TabContent) -> Vec<(PaneId, TabId)> {
+        self.all_tabs()
+            .filter(|(_, tab)| tab.content == *content)
+            .map(|(pane, tab)| (pane, tab.id))
+            .collect()
+    }
+
+    pub fn locate_tab(&self, id: TabId) -> Option<PaneId> {
+        self.panes()
+            .find_map(|(pane, state)| state.tabs.iter().any(|tab| tab.id == id).then_some(pane))
+    }
+
+    pub fn open(&mut self, content: TabContent, label: String, closeable: bool) -> TabId {
+        if let Some(id) = self.find_tab(&content) {
+            self.activate(id);
+            return id;
+        }
+        let target = self.focused_id();
+        self.open_in(target, content, label, closeable, SplitRatio::default())
+    }
+
+    pub fn open_in(
+        &mut self,
+        target: PaneId,
+        content: TabContent,
+        label: String,
+        closeable: bool,
+        ratio: SplitRatio,
+    ) -> TabId {
+        if let Some(id) = self.find_tab_in(target, &content) {
+            self.activate(id);
+            return id;
+        }
+        if !matches!(&content, TabContent::File { .. })
+            && let Some(id) = self.find_tab(&content)
+        {
+            self.activate(id);
+            return id;
+        }
+        let id = next_tab_id();
+        let tab = Tab {
+            id,
+            content,
+            label,
+            closeable,
+        };
+        match (&mut self.layout, target) {
+            (CenterLayout::Single(primary), PaneId::Primary) => {
+                primary.tabs.push(tab);
+                primary.active_tab_id = Some(id);
+            }
+            (CenterLayout::Single(_), PaneId::Secondary) => {
+                let old_layout =
+                    std::mem::replace(&mut self.layout, CenterLayout::Single(PaneState::empty()));
+                let primary = match old_layout {
+                    CenterLayout::Single(primary) => primary,
+                    other => {
+                        self.layout = other;
+                        return id;
+                    }
+                };
+                self.layout = CenterLayout::Split {
+                    primary,
+                    secondary: PaneState::from_tab(tab),
+                    focused: PaneId::Secondary,
+                    ratio,
+                };
+            }
+            (
+                CenterLayout::Split {
+                    primary, focused, ..
+                },
+                PaneId::Primary,
+            ) => {
+                primary.tabs.push(tab);
+                primary.active_tab_id = Some(id);
+                *focused = PaneId::Primary;
+            }
+            (
+                CenterLayout::Split {
+                    secondary, focused, ..
+                },
+                PaneId::Secondary,
+            ) => {
+                secondary.tabs.push(tab);
+                secondary.active_tab_id = Some(id);
+                *focused = PaneId::Secondary;
+            }
+        }
+        id
+    }
+
+    pub fn reveal_tab(&mut self, id: TabId) -> bool {
+        let Some(pane_id) = self.locate_tab(id) else {
+            return false;
+        };
+        if !self.set_active_tab_in_pane(pane_id, id) {
+            return false;
+        }
+        if let CenterLayout::Split { focused, .. } = &mut self.layout {
+            *focused = pane_id;
+        }
+        true
+    }
+
+    pub fn set_active_tab_in_pane(&mut self, pane: PaneId, id: TabId) -> bool {
+        self.pane_mut(pane)
+            .is_some_and(|pane_state| pane_state.activate(id))
+    }
+
+    pub fn activate(&mut self, id: TabId) {
+        self.reveal_tab(id);
+    }
+
+    pub fn update_tab(&mut self, id: TabId, content: TabContent, label: String) -> bool {
+        let Some(tab) = self.tab_mut(id) else {
+            return false;
+        };
+        tab.content = content;
+        tab.label = label;
+        true
+    }
+
+    pub fn close(&mut self, id: TabId) {
+        let Some(tab) = self.tab(id) else {
+            return;
+        };
+        if !tab.closeable {
+            return;
+        }
+        self.remove_tabs(&HashSet::from([id]));
+    }
+
     pub fn replace_active(&mut self, content: TabContent, label: String, closeable: bool) -> TabId {
-        if let Some(active_id) = self.active_tab_id
-            && let Some(tab) = self.tabs.iter_mut().find(|t| t.id == active_id)
+        if let Some(active_id) = self.active_tab_id()
+            && let Some(tab) = self.tab_mut(active_id)
         {
             tab.content = content;
             tab.label = label;
@@ -334,65 +985,327 @@ impl CenterZoneState {
     }
 
     pub fn active_tab(&self) -> Option<&Tab> {
-        self.active_tab_id
-            .and_then(|id| self.tabs.iter().find(|t| t.id == id))
+        self.active_tab_id().and_then(|id| self.tab(id))
     }
 
     pub fn active_content(&self) -> Option<&TabContent> {
         self.active_tab().map(|t| &t.content)
     }
 
+    #[cfg(test)]
     pub fn close_others(&mut self, id: TabId) {
-        self.tabs.retain(|t| t.id == id || !t.closeable);
-        if self.tabs.iter().any(|t| t.id == id) {
-            self.active_tab_id = Some(id);
-        }
-    }
-
-    pub fn close_to_right(&mut self, id: TabId) {
-        let Some(idx) = self.tabs.iter().position(|t| t.id == id) else {
+        let Some(pane_id) = self.locate_tab(id) else {
             return;
         };
-        let mut i = self.tabs.len();
-        while i > idx + 1 {
-            i -= 1;
-            if self.tabs[i].closeable {
-                self.tabs.remove(i);
-            }
-        }
-        if let Some(active) = self.active_tab_id
-            && !self.tabs.iter().any(|t| t.id == active)
-        {
-            self.active_tab_id = Some(id);
-        }
+        let doomed: HashSet<TabId> = self
+            .pane(pane_id)
+            .into_iter()
+            .flat_map(|pane| pane.tabs.iter())
+            .filter(|tab| tab.id != id && tab.closeable)
+            .map(|tab| tab.id)
+            .collect();
+        self.remove_tabs(&doomed);
+        self.activate(id);
     }
 
+    #[cfg(test)]
+    pub fn close_to_right(&mut self, id: TabId) {
+        let Some(pane_id) = self.locate_tab(id) else {
+            return;
+        };
+        let Some(pane) = self.pane(pane_id) else {
+            return;
+        };
+        let Some(index) = pane.tabs.iter().position(|tab| tab.id == id) else {
+            return;
+        };
+        let doomed = pane.tabs[index + 1..]
+            .iter()
+            .filter(|tab| tab.closeable)
+            .map(|tab| tab.id)
+            .collect();
+        self.remove_tabs(&doomed);
+    }
+
+    #[cfg(test)]
     pub fn close_all(&mut self) {
-        self.tabs.retain(|t| !t.closeable);
-        if self.tabs.is_empty() {
-            let home_id = next_tab_id();
-            self.tabs.push(Tab {
-                id: home_id,
-                content: TabContent::Home,
-                label: "Home".to_string(),
-                closeable: false,
-            });
-            self.active_tab_id = Some(home_id);
-        } else {
-            let active_exists = self
-                .active_tab_id
-                .is_some_and(|a| self.tabs.iter().any(|t| t.id == a));
-            if !active_exists {
-                self.active_tab_id = Some(self.tabs[0].id);
-            }
-        }
+        let doomed = self
+            .all_tabs()
+            .filter(|(_, tab)| tab.closeable)
+            .map(|(_, tab)| tab.id)
+            .collect();
+        self.remove_tabs(&doomed);
     }
 
     pub fn rename_tab_label(&mut self, id: TabId, new_label: String) {
-        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+        if let Some(tab) = self.tab_mut(id) {
             tab.label = new_label;
         }
     }
+
+    pub fn composer_owner(&self) -> Option<(PaneId, TabId)> {
+        let focused = self.focused_id();
+        [focused, focused.other()].into_iter().find_map(|pane_id| {
+            let pane = self.pane(pane_id)?;
+            let tab_id = pane.active_tab_id?;
+            let tab = pane.tabs.iter().find(|tab| tab.id == tab_id)?;
+            matches!(&tab.content, TabContent::Chat { .. }).then_some((pane_id, tab_id))
+        })
+    }
+
+    pub fn duplicate_file_to(
+        &mut self,
+        source: TabId,
+        target: PaneId,
+        ratio: SplitRatio,
+    ) -> Option<TabId> {
+        let tab = self.tab(source)?.clone();
+        if !matches!(&tab.content, TabContent::File { .. }) {
+            return None;
+        }
+        if let Some(existing) = self.find_tab_in(target, &tab.content) {
+            self.activate(existing);
+            return Some(existing);
+        }
+        Some(self.open_in(target, tab.content, tab.label, tab.closeable, ratio))
+    }
+
+    pub fn move_tab_eligibility(&self, target: PaneId, id: TabId) -> MoveTabEligibility {
+        let Some(source) = self.locate_tab(id) else {
+            return MoveTabEligibility::SourceTabMissing;
+        };
+        if source == target {
+            return MoveTabEligibility::AlreadyInTargetPane;
+        }
+        let Some(tab) = self.tab(id) else {
+            return MoveTabEligibility::SourceTabMissing;
+        };
+        if let Some(existing) = self.find_tab_in(target, &tab.content) {
+            return MoveTabEligibility::ResourceAlreadyInTarget { existing };
+        }
+        MoveTabEligibility::Eligible
+    }
+
+    pub fn move_tab_to(&mut self, target: PaneId, id: TabId, ratio: SplitRatio) -> MoveTabResult {
+        match self.move_tab_eligibility(target, id) {
+            MoveTabEligibility::Eligible => {}
+            MoveTabEligibility::SourceTabMissing => return MoveTabResult::SourceTabMissing,
+            MoveTabEligibility::AlreadyInTargetPane => {
+                return MoveTabResult::AlreadyInTargetPane;
+            }
+            MoveTabEligibility::ResourceAlreadyInTarget { existing } => {
+                return MoveTabResult::ResourceAlreadyInTarget { existing };
+            }
+        }
+        let Some(source) = self.locate_tab(id) else {
+            return MoveTabResult::SourceTabMissing;
+        };
+        let Some(tab) = self.tab(id).cloned() else {
+            return MoveTabResult::SourceTabMissing;
+        };
+        let mut doomed = HashSet::new();
+        doomed.insert(id);
+        if let Some(source_pane) = self.pane_mut(source) {
+            source_pane.remove_tabs(&doomed);
+        }
+        match (&mut self.layout, target) {
+            (CenterLayout::Single(primary), PaneId::Primary) => {
+                primary.tabs.push(tab);
+                primary.active_tab_id = Some(id);
+            }
+            (CenterLayout::Single(_), PaneId::Secondary) => {
+                let old_layout =
+                    std::mem::replace(&mut self.layout, CenterLayout::Single(PaneState::empty()));
+                let primary = match old_layout {
+                    CenterLayout::Single(primary) => primary,
+                    other => {
+                        self.layout = other;
+                        return MoveTabResult::SourceTabMissing;
+                    }
+                };
+                self.layout = CenterLayout::Split {
+                    primary,
+                    secondary: PaneState::from_tab(tab),
+                    focused: PaneId::Secondary,
+                    ratio,
+                };
+            }
+            (
+                CenterLayout::Split {
+                    primary, focused, ..
+                },
+                PaneId::Primary,
+            ) => {
+                primary.tabs.push(tab);
+                primary.active_tab_id = Some(id);
+                *focused = PaneId::Primary;
+            }
+            (
+                CenterLayout::Split {
+                    secondary, focused, ..
+                },
+                PaneId::Secondary,
+            ) => {
+                secondary.tabs.push(tab);
+                secondary.active_tab_id = Some(id);
+                *focused = PaneId::Secondary;
+            }
+        }
+        self.collapse_empty_pane();
+        MoveTabResult::Moved {
+            tab: id,
+            source,
+            target,
+        }
+    }
+
+    pub fn remove_tabs(&mut self, doomed: &HashSet<TabId>) {
+        match &mut self.layout {
+            CenterLayout::Single(primary) => primary.remove_tabs(doomed),
+            CenterLayout::Split {
+                primary, secondary, ..
+            } => {
+                primary.remove_tabs(doomed);
+                secondary.remove_tabs(doomed);
+            }
+        }
+        self.collapse_empty_pane();
+    }
+
+    fn collapse_empty_pane(&mut self) {
+        let replacement = match &self.layout {
+            CenterLayout::Single(primary) if primary.tabs.is_empty() => Some(PaneState::home()),
+            CenterLayout::Split {
+                primary, secondary, ..
+            } if primary.tabs.is_empty() && secondary.tabs.is_empty() => Some(PaneState::home()),
+            CenterLayout::Split {
+                primary, secondary, ..
+            } if primary.tabs.is_empty() => Some(secondary.clone()),
+            CenterLayout::Split {
+                primary, secondary, ..
+            } if secondary.tabs.is_empty() => Some(primary.clone()),
+            _ => None,
+        };
+        if let Some(pane) = replacement {
+            self.layout = CenterLayout::Single(pane);
+        }
+    }
+}
+
+fn agent_open_to_side_block_for(
+    tabs_enabled: bool,
+    active_project: Option<&ActiveProjectRef>,
+    center_zone: &CenterZoneState,
+    agent_ref: &ActiveAgentRef,
+    project: Option<&ActiveProjectRef>,
+) -> Option<AgentOpenToSideResult> {
+    if !tabs_enabled {
+        return Some(AgentOpenToSideResult::TabsDisabled);
+    }
+    if active_project != project
+        || project.is_some_and(|project| project.host_id != agent_ref.host_id)
+    {
+        return Some(AgentOpenToSideResult::CrossProject);
+    }
+
+    let content = TabContent::chat_with_agent(agent_ref.clone());
+    let focused = center_zone.focused_id();
+    let target = focused.other();
+    let (pane, tab) = center_zone
+        .find_tab(&content)
+        .and_then(|tab| center_zone.locate_tab(tab).map(|pane| (pane, tab)))?;
+    if pane == target {
+        return None;
+    }
+    let source_retains_content = center_zone
+        .pane(pane)
+        .is_some_and(|source| source.tabs.iter().any(|candidate| candidate.id != tab));
+    if !source_retains_content {
+        return Some(AgentOpenToSideResult::NothingWouldRemain);
+    }
+    match center_zone.move_tab_eligibility(target, tab) {
+        MoveTabEligibility::Eligible => None,
+        MoveTabEligibility::SourceTabMissing => Some(AgentOpenToSideResult::MoveRefused(
+            MoveTabRefusal::SourceTabMissing,
+        )),
+        MoveTabEligibility::AlreadyInTargetPane => Some(AgentOpenToSideResult::MoveRefused(
+            MoveTabRefusal::AlreadyInTargetPane,
+        )),
+        MoveTabEligibility::ResourceAlreadyInTarget { existing } => {
+            Some(AgentOpenToSideResult::MoveRefused(
+                MoveTabRefusal::ResourceAlreadyInTarget { existing },
+            ))
+        }
+    }
+}
+
+fn diff_open_to_side_block_for(
+    tabs_enabled: bool,
+    active_project: Option<&ActiveProjectRef>,
+    center_zone: &CenterZoneState,
+    key: &DiffKey,
+) -> Option<DiffOpenToSideResult> {
+    if !tabs_enabled {
+        return Some(DiffOpenToSideResult::TabsDisabled);
+    }
+    if !active_project.is_some_and(|project| {
+        project.host_id == key.host_id && project.project_id == key.project_id
+    }) {
+        return Some(DiffOpenToSideResult::CrossProject);
+    }
+
+    let content = key.tab_content();
+    let focused = center_zone.focused_id();
+    let target = focused.other();
+    let (pane, tab) = center_zone
+        .find_tab(&content)
+        .and_then(|tab| center_zone.locate_tab(tab).map(|pane| (pane, tab)))?;
+    if pane == target {
+        return None;
+    }
+    let source_retains_content = center_zone
+        .pane(pane)
+        .is_some_and(|source| source.tabs.iter().any(|candidate| candidate.id != tab));
+    if !source_retains_content {
+        return Some(DiffOpenToSideResult::NothingWouldRemain);
+    }
+    match center_zone.move_tab_eligibility(target, tab) {
+        MoveTabEligibility::Eligible => None,
+        MoveTabEligibility::SourceTabMissing => Some(DiffOpenToSideResult::MoveRefused(
+            MoveTabRefusal::SourceTabMissing,
+        )),
+        MoveTabEligibility::AlreadyInTargetPane => Some(DiffOpenToSideResult::MoveRefused(
+            MoveTabRefusal::AlreadyInTargetPane,
+        )),
+        MoveTabEligibility::ResourceAlreadyInTarget { existing } => Some(
+            DiffOpenToSideResult::MoveRefused(MoveTabRefusal::ResourceAlreadyInTarget { existing }),
+        ),
+    }
+}
+
+fn duplicate_file_eligibility_for(
+    tabs_enabled: bool,
+    center_zone: &CenterZoneState,
+    open_files: &HashMap<FileResourceKey, OpenFile>,
+    target: PaneId,
+    source: TabId,
+) -> DuplicateFileEligibility {
+    if !tabs_enabled {
+        return DuplicateFileEligibility::TabsDisabled;
+    }
+    let Some(tab) = center_zone.tab(source) else {
+        return DuplicateFileEligibility::SourceTabMissing;
+    };
+    let TabContent::File { key } = &tab.content else {
+        return DuplicateFileEligibility::NotAFile;
+    };
+    if !open_files.contains_key(key) {
+        return DuplicateFileEligibility::NotLoaded;
+    }
+    if let Some(existing) = center_zone.find_tab_in(target, &tab.content) {
+        return DuplicateFileEligibility::TargetAlreadyContainsResource { existing };
+    }
+    DuplicateFileEligibility::Enabled
 }
 
 impl Default for CenterZoneState {
@@ -472,18 +1385,20 @@ pub enum ProjectReferencesMode {
 /// `AppState` so streamed results survive the panel being display-toggled and so
 /// `dispatch` can append incoming `code_intel_references_results` frames. Mirrors
 /// [`ProjectSearchUiState`], correlated by a `references_id` domain id and the
-/// owning project context so late frames from a previously-active project cannot
-/// populate the current panel.
+/// exact initiating occurrence/resource so late frames cannot be reconstructed
+/// against whichever project or pane happens to be active at response time.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ProjectReferencesUiState {
     pub mode: ProjectReferencesMode,
-    pub host_id: Option<String>,
-    pub project_id: Option<ProjectId>,
-    pub source_path: Option<ProjectPath>,
+    /// The exact file occurrence that initiated this query or definition
+    /// chooser. Result routing can prefer this occurrence without consulting
+    /// response-time focus; the resource/version remain the request identity.
+    pub source_tab: Option<TabId>,
+    pub source_key: Option<FileResourceKey>,
     pub source_version: Option<ProjectFileVersion>,
     /// The `references_id` of the most recently issued query. Incoming result /
     /// complete frames are ignored unless they carry this id and match the stored
-    /// host/project context.
+    /// source resource context.
     pub active_references_id: u64,
     /// True between issuing a query and its terminal `complete` frame.
     pub in_flight: bool,
@@ -501,6 +1416,16 @@ pub struct ProjectReferencesUiState {
     pub truncated: bool,
     pub cancelled: bool,
     pub error: Option<String>,
+}
+
+impl ProjectReferencesUiState {
+    pub fn source(&self) -> Option<(TabId, &FileResourceKey, ProjectFileVersion)> {
+        Some((
+            self.source_tab?,
+            self.source_key.as_ref()?,
+            self.source_version?,
+        ))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -572,6 +1497,13 @@ pub struct OpenFile {
     pub version: ProjectFileVersion,
     pub contents: Option<String>,
     pub is_binary: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileFocus {
+    pub tab: TabId,
+    pub key: FileResourceKey,
+    pub version: ProjectFileVersion,
 }
 
 /// Key for the code-intelligence signal. Carries the explicit owning
@@ -745,9 +1677,8 @@ impl CodeIntelFileState {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CodeIntelNavigateContext {
     pub navigate_id: u64,
-    pub host_id: String,
-    pub project_id: ProjectId,
-    pub path: ProjectPath,
+    pub tab: TabId,
+    pub key: FileResourceKey,
     pub version: ProjectFileVersion,
 }
 
@@ -759,7 +1690,10 @@ pub struct CodeIntelNavigateContext {
 #[derive(Clone, Debug, PartialEq)]
 pub struct HoverPopover {
     pub hover_id: u64,
-    pub path: ProjectPath,
+    /// The exact occurrence that owns the anchor and request. A late response
+    /// cannot attach to another pane's occurrence of the same file.
+    pub tab: TabId,
+    pub key: FileResourceKey,
     pub version: ProjectFileVersion,
     /// Absolute file byte offset the hover targets. Used to dedupe rapid
     /// mousemoves over the same identifier so the popover doesn't flicker.
@@ -802,6 +1736,16 @@ impl DiffKey {
             root,
             scope,
             path: path.into(),
+        }
+    }
+
+    fn tab_content(&self) -> TabContent {
+        TabContent::Diff {
+            host_id: self.host_id.clone(),
+            project_id: self.project_id.clone(),
+            root: self.root.clone(),
+            scope: self.scope,
+            path: self.path.clone(),
         }
     }
 }
@@ -972,29 +1916,39 @@ pub fn sort_project_infos(projects: &mut [ProjectInfo]) {
 /// `(host_id, agent_id)`. Mirror of `dispatch::close_agent_tabs`, kept
 /// in `state` so `finalize_compaction_close` can reuse it without
 /// pulling state internals into the dispatcher.
-fn close_agent_tabs_in_cz(center_zone: &mut CenterZoneState, host_id: &str, agent_id: &AgentId) {
+fn close_agent_tabs_in_cz(
+    center_zone: &mut CenterZoneState,
+    host_id: &str,
+    agent_id: &AgentId,
+) -> HashSet<TabId> {
     let remove_ids: Vec<_> = center_zone
-        .tabs
-        .iter()
-        .filter(|tab| {
+        .all_tabs()
+        .filter(|(_, tab)| {
             matches!(
                 &tab.content,
                 TabContent::Chat { agent_ref: Some(ar), .. }
                     if ar.host_id == host_id && ar.agent_id == *agent_id
             )
         })
-        .map(|tab| tab.id)
+        .map(|(_, tab)| tab.id)
         .collect();
+    let mut removed = HashSet::new();
     for id in remove_ids {
         center_zone.close(id);
+        if center_zone.tab(id).is_none() {
+            removed.insert(id);
+        }
     }
+    removed
 }
 
-fn close_host_runtime_tabs_in_cz(center_zone: &mut CenterZoneState, host_id: &str) {
+fn close_host_runtime_tabs_in_cz(
+    center_zone: &mut CenterZoneState,
+    host_id: &str,
+) -> HashSet<TabId> {
     let remove_ids: Vec<_> = center_zone
-        .tabs
-        .iter()
-        .filter(|tab| match &tab.content {
+        .all_tabs()
+        .filter(|(_, tab)| match &tab.content {
             TabContent::Chat {
                 agent_ref,
                 pending_team_member,
@@ -1015,11 +1969,16 @@ fn close_host_runtime_tabs_in_cz(center_zone: &mut CenterZoneState, host_id: &st
             TabContent::Workflow { agent_ref, .. } => agent_ref.host_id == host_id,
             TabContent::Home | TabContent::AgentMonitor | TabContent::File { .. } => false,
         })
-        .map(|tab| tab.id)
+        .map(|(_, tab)| tab.id)
         .collect();
+    let mut removed = HashSet::new();
     for id in remove_ids {
         center_zone.close(id);
+        if center_zone.tab(id).is_none() {
+            removed.insert(id);
+        }
     }
+    removed
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1061,7 +2020,7 @@ pub struct BrowseDialogState {
 pub struct ProjectViewMemory {
     pub center_zone: Option<CenterZoneState>,
     pub active_terminal: Option<ActiveTerminalRef>,
-    pub open_files: HashMap<ProjectPath, OpenFile>,
+    pub open_files: HashMap<FileResourceKey, OpenFile>,
     pub diff_contents: HashMap<DiffKey, DiffViewState>,
 }
 
@@ -1269,11 +2228,9 @@ pub struct AppState {
     pub agents: RwSignal<Vec<AgentInfo>>,
     pub sessions: RwSignal<Vec<SessionInfo>>,
     pub active_project: RwSignal<Option<ActiveProjectRef>>,
-    /// Derived from `center_zone.active_tab_id` — when the active tab is a
-    /// `Chat`, this projects its `agent_ref`; otherwise `None`. Read-only by
-    /// design (philosophy doc rule against derived state stored as a signal):
-    /// to change which agent is "active", change the active chat tab via
-    /// `activate_tab` / `open_tab` / `close_tab`.
+    /// Derived from `center_zone.composer_owner()`. The focused pane's active
+    /// chat wins; when a file pane is focused, the other pane's active chat
+    /// remains the singleton composer owner. Read-only by design.
     pub active_agent: Memo<Option<ActiveAgentRef>>,
     pub chat_rows: RwSignal<HashMap<AgentId, Vec<ChatRowHandle>>>,
     pub chat_tool_rows: RwSignal<HashMap<AgentId, HashMap<ToolCallId, ChatRowId>>>,
@@ -1323,13 +2280,18 @@ pub struct AppState {
     /// replaces the host's full set.
     pub task_token_usage: RwSignal<HashMap<ActiveAgentRef, TaskTokenUsagePayload>>,
     pub center_zone: RwSignal<CenterZoneState>,
+    /// Window-local split ratio preference. The active project's split also
+    /// carries its own ratio inside CenterLayout; only this scalar is suitable
+    /// for cold local-storage persistence.
+    pub center_split_ratio: RwSignal<SplitRatio>,
     /// Tabs whose content components are currently mounted, MRU-first. The
     /// active tab is always at the front; the next slot (if any) is the most
     /// recently active tab before it. Tabs absent from this list have their
     /// content unmounted entirely — no DOM, no reactive subscriptions. This
     /// keeps "many tabs open" cheap: we pay for at most `TAB_LRU_CAPACITY`
     /// component trees regardless of how many tabs the user has opened.
-    /// Driven by an Effect in `App` watching `center_zone.active_tab_id`.
+    /// Driven by an Effect in `App`; `mounted_tab_ids` additionally pins every
+    /// pane's active tab so one pane cannot evict the other.
     pub tab_lru: RwSignal<Vec<TabId>>,
     pub tab_scroll_state: RwSignal<HashMap<TabId, TabScrollState>>,
     pub tabs_enabled: RwSignal<bool>,
@@ -1345,15 +2307,11 @@ pub struct AppState {
     /// Files-explorer status footer. The frontend renders this verbatim; it never
     /// infers provider state from open files or extensions.
     pub code_intel_overview: RwSignal<HashMap<ActiveProjectRef, CodeIntelOverviewPayload>>,
-    pub open_files: RwSignal<HashMap<ProjectPath, OpenFile>>,
-    /// Paths whose contents are being re-read in the background after the
-    /// server reported their version advanced (`ProjectEventPayload::
-    /// FilesChanged`). The `ProjectFileContents` handler consults this to
-    /// refresh an already-open file *in place* — updating contents and
-    /// re-subscribing code-intel — without calling `open_tab`, which would
-    /// steal focus (or, in single-pane mode, hijack the active view). Entries
-    /// are consumed when the refreshed contents arrive.
-    pub pending_file_refreshes: RwSignal<HashSet<ProjectPath>>,
+    pub open_files: RwSignal<HashMap<FileResourceKey, OpenFile>>,
+    /// Invocation-time routing for cold file opens and in-place refreshes.
+    /// Open wins over RefreshInPlace so a failed refresh marker cannot swallow
+    /// the user's next explicit open.
+    pub pending_file_opens: RwSignal<HashMap<FileResourceKey, PendingFileOpen>>,
     /// Server-pushed code-intelligence state, keyed by `(host_id, project_id,
     /// path)`. Kept separate from `Token`/syntax data on purpose (spec §6): the
     /// per-row token path has a wasm test guarding against text mangling, and
@@ -1387,15 +2345,15 @@ pub struct AppState {
     /// Bumped to request the Search panel focus (and select) its query input —
     /// e.g. on the Cmd/Ctrl+Shift+F shortcut or the "search in folder" action.
     pub search_focus_seq: RwSignal<u32>,
-    /// When set, the file view for this `ProjectPath` should scroll so the
-    /// given 1-based line is visible. Consumed (cleared) by the file view.
-    pub pending_goto_line: RwSignal<Option<(ProjectPath, u32)>>,
+    /// When set, exactly one file occurrence should scroll so the given
+    /// 1-based line is visible. Consumed by the matching TabId.
+    pub pending_goto_line: RwSignal<Option<(TabId, u32)>>,
     /// Like `pending_goto_line` but addressed by an absolute file **byte
     /// offset** (from a go-to-definition target, whose range is byte-based). The
     /// file view converts it to a line via its `FileLines` and consumes it. Kept
     /// separate so the existing line-based goto machinery and its tests are
     /// untouched.
-    pub pending_goto_offset: RwSignal<Option<(ProjectPath, u32)>>,
+    pub pending_goto_offset: RwSignal<Option<(TabId, u32)>>,
     /// Monotonic source of `navigate_id` / `hover_id` domain ids for on-demand
     /// code-intel requests (cf. `search_id`). Bumped per request.
     pub code_intel_request_seq: RwSignal<u64>,
@@ -1414,7 +2372,7 @@ pub struct AppState {
     /// The file (and rendered version) the user most recently interacted with in
     /// a file view, so the F12 keybinding (which has no file context of its own)
     /// can navigate from the current caret in that file.
-    pub code_intel_focus: RwSignal<Option<(ProjectPath, ProjectFileVersion)>>,
+    pub code_intel_focus: RwSignal<Option<FileFocus>>,
     pub host_settings_by_host: RwSignal<HashMap<String, HostSettings>>,
     pub backend_setup_by_host: RwSignal<HashMap<String, Vec<BackendSetupInfo>>>,
     pub agent_message_queue: RwSignal<HashMap<AgentId, Vec<QueuedMessageEntry>>>,
@@ -1443,6 +2401,16 @@ pub struct AppState {
     /// `HostSettings.backend_config`. Backends without deep config are absent.
     pub backend_config_snapshots:
         RwSignal<HashMap<String, HashMap<BackendKind, protocol::BackendConfigSnapshot>>>,
+    /// Server-owned subscription-capacity snapshots, keyed by host id then
+    /// backend kind. Replayed on host-stream subscribe and re-emitted on every
+    /// change, so initial state and live updates travel the same path. Capacity
+    /// is account-scoped but arrives on a per-agent pipe, so the server keys it
+    /// by (host, backend) and the frontend must never key it by agent. The
+    /// frontend renders these verbatim: it runs no freshness clock (staleness is
+    /// the server's `CapacityFreshness` verdict), keeps no cache, and never
+    /// infers capacity from Tyde's own token usage. Cleared on host disconnect.
+    pub backend_capacity:
+        RwSignal<HashMap<String, HashMap<BackendKind, protocol::BackendCapacitySnapshot>>>,
     /// Server-owned backend-native settings snapshots (JSON-schema-driven,
     /// grouped), keyed by host id then backend kind. Each snapshot carries the
     /// backend's current settings document and grouped schemas, or an explicit
@@ -1460,6 +2428,17 @@ pub struct AppState {
     /// stays a projection of server-owned state, not an invented client model.
     pub native_settings_save_state:
         RwSignal<HashMap<String, HashMap<BackendKind, NativeSettingsSaveState>>>,
+    /// Outcome of the last explicit managed-projection reset, keyed by host id then
+    /// backend kind.
+    ///
+    /// `Pending` is written when the command is sent, and resolved *only* by the
+    /// server: a typed `CommandError` makes it `Refused`, and a snapshot that no
+    /// longer carries a recovery state removes it (the reset landed and the state
+    /// it referred to is gone). Nothing here is written optimistically — a refused
+    /// reset must not look like it did anything, and a reset the server has not
+    /// answered must not look like it succeeded.
+    pub managed_projection_reset:
+        RwSignal<HashMap<String, HashMap<BackendKind, ManagedProjectionResetState>>>,
     /// Host id for which the next `NewTerminal` should steal focus. Set when the
     /// user clicks Install/Sign-in; consumed in the dispatcher so the new
     /// terminal becomes active even if another terminal was already selected.
@@ -1704,14 +2683,19 @@ impl AppState {
         // first frame paints with no mounted tab content, then the
         // tab-LRU Effect in `App` fires and adds the active tab — visible
         // as a one-frame flash of empty center zone on app boot.
-        let initial_lru: Vec<TabId> = initial_center_zone.active_tab_id.into_iter().collect();
+        let initial_lru: Vec<TabId> = initial_center_zone
+            .panes()
+            .filter_map(|(_, pane)| pane.active_tab_id)
+            .collect();
         let center_zone: RwSignal<CenterZoneState> = RwSignal::new(initial_center_zone);
         let active_agent: Memo<Option<ActiveAgentRef>> = Memo::new(move |_| {
             center_zone.with(|cz| {
-                cz.active_tab().and_then(|tab| match &tab.content {
-                    TabContent::Chat { agent_ref, .. } => agent_ref.clone(),
-                    _ => None,
-                })
+                cz.composer_owner()
+                    .and_then(|(_, tab_id)| cz.tab(tab_id))
+                    .and_then(|tab| match &tab.content {
+                        TabContent::Chat { agent_ref, .. } => agent_ref.clone(),
+                        _ => None,
+                    })
             })
         });
 
@@ -1739,6 +2723,7 @@ impl AppState {
             task_lists: RwSignal::new(HashMap::new()),
             orchestration: RwSignal::new(HashMap::new()),
             center_zone,
+            center_split_ratio: RwSignal::new(SplitRatio::default()),
             tab_lru: RwSignal::new(initial_lru),
             tab_scroll_state: RwSignal::new(HashMap::new()),
             tabs_enabled: RwSignal::new(true),
@@ -1750,7 +2735,7 @@ impl AppState {
             git_status: RwSignal::new(HashMap::new()),
             code_intel_overview: RwSignal::new(HashMap::new()),
             open_files: RwSignal::new(HashMap::new()),
-            pending_file_refreshes: RwSignal::new(HashSet::new()),
+            pending_file_opens: RwSignal::new(HashMap::new()),
             code_intel: RwSignal::new(HashMap::new()),
             diff_contents: RwSignal::new(HashMap::new()),
             terminals: RwSignal::new(Vec::new()),
@@ -1788,7 +2773,9 @@ impl AppState {
             schemas_loaded_for_host: RwSignal::new(HashMap::new()),
             backend_config_schemas: RwSignal::new(HashMap::new()),
             backend_config_snapshots: RwSignal::new(HashMap::new()),
+            backend_capacity: RwSignal::new(HashMap::new()),
             backend_native_settings: RwSignal::new(HashMap::new()),
+            managed_projection_reset: RwSignal::new(HashMap::new()),
             native_settings_save_state: RwSignal::new(HashMap::new()),
             pending_terminal_focus: RwSignal::new(None),
             agent_session_settings: RwSignal::new(HashMap::new()),
@@ -2004,7 +2991,7 @@ impl AppState {
         let label_for_memory = label.clone();
         let prev_for_cz = prev_agent_id.clone();
         self.center_zone.update(|cz| {
-            for tab in cz.tabs.iter_mut() {
+            cz.for_each_tab_mut(|_, tab| {
                 if let TabContent::Chat {
                     agent_ref: Some(ar),
                     ..
@@ -2015,7 +3002,7 @@ impl AppState {
                     tab.content = TabContent::chat_with_agent(new_ref.clone());
                     tab.label = label.clone();
                 }
-            }
+            });
         });
         let prev_for_memory = prev_agent_id.clone();
         self.project_view_memory.update(|map| {
@@ -2023,7 +3010,7 @@ impl AppState {
                 let Some(cz) = memory.center_zone.as_mut() else {
                     continue;
                 };
-                for tab in cz.tabs.iter_mut() {
+                cz.for_each_tab_mut(|_, tab| {
                     if let TabContent::Chat {
                         agent_ref: Some(ar),
                         ..
@@ -2034,7 +3021,7 @@ impl AppState {
                         tab.content = TabContent::chat_with_agent(new_ref_for_memory.clone());
                         tab.label = label_for_memory.clone();
                     }
-                }
+                });
             }
         });
         // Under the current server contract `AgentClosed` arrives
@@ -2131,18 +3118,24 @@ impl AppState {
         });
         let host_for_cz = host_id.to_owned();
         let agent_for_cz = agent_id.clone();
-        self.center_zone
-            .update(|cz| close_agent_tabs_in_cz(cz, &host_for_cz, &agent_for_cz));
+        let mut removed_tab_ids = HashSet::new();
+        self.center_zone.update(|cz| {
+            removed_tab_ids.extend(close_agent_tabs_in_cz(cz, &host_for_cz, &agent_for_cz));
+        });
         let host_for_memory = host_id.to_owned();
         let agent_for_memory = agent_id.clone();
         self.project_view_memory.update(|memories| {
             for memory in memories.values_mut() {
                 if let Some(center_zone) = memory.center_zone.as_mut() {
-                    close_agent_tabs_in_cz(center_zone, &host_for_memory, &agent_for_memory);
+                    removed_tab_ids.extend(close_agent_tabs_in_cz(
+                        center_zone,
+                        &host_for_memory,
+                        &agent_for_memory,
+                    ));
                 }
             }
         });
-        self.prune_tab_lru();
+        self.forget_removed_tab_occurrence_state(&removed_tab_ids);
     }
 
     /// Server-confirmed failure: the compaction did not produce a
@@ -2413,7 +3406,8 @@ impl AppState {
                 indexes
                     .entry(agent_id)
                     .or_default()
-                    .insert(message_id, handle.id);
+                    .entry(message_id)
+                    .or_insert(handle.id);
             });
         }
 
@@ -2670,11 +3664,21 @@ impl AppState {
         // in `App` fires).
         self.references_state
             .set(ProjectReferencesUiState::default());
+        self.code_intel_hover.set(None);
+        self.code_intel_navigate_ctx.set(None);
+        self.pending_file_opens.set(HashMap::new());
 
         match (next.is_some(), restored) {
             (true, Some(memory)) => {
                 let cz = memory.center_zone.unwrap_or_default();
-                self.tab_lru.set(cz.active_tab_id.into_iter().collect());
+                self.tab_lru.set(
+                    cz.panes()
+                        .filter_map(|(_, pane)| pane.active_tab_id)
+                        .collect(),
+                );
+                if let Some(ratio) = cz.split_ratio() {
+                    self.center_split_ratio.set(ratio);
+                }
                 self.center_zone.set(cz);
                 self.active_terminal.set(memory.active_terminal);
                 self.open_files.set(memory.open_files);
@@ -2683,7 +3687,11 @@ impl AppState {
             (true, None) => {
                 let mut cz = CenterZoneState::default();
                 cz.open(TabContent::empty_chat(), "New Chat".to_string(), true);
-                self.tab_lru.set(cz.active_tab_id.into_iter().collect());
+                self.tab_lru.set(
+                    cz.panes()
+                        .filter_map(|(_, pane)| pane.active_tab_id)
+                        .collect(),
+                );
                 self.center_zone.set(cz);
                 self.active_terminal.set(None);
                 self.open_files.set(HashMap::new());
@@ -2691,7 +3699,11 @@ impl AppState {
             }
             (false, _) => {
                 let cz = CenterZoneState::default();
-                self.tab_lru.set(cz.active_tab_id.into_iter().collect());
+                self.tab_lru.set(
+                    cz.panes()
+                        .filter_map(|(_, pane)| pane.active_tab_id)
+                        .collect(),
+                );
                 self.center_zone.set(cz);
                 self.active_terminal.set(None);
                 self.open_files.set(HashMap::new());
@@ -2701,9 +3713,15 @@ impl AppState {
     }
 
     pub fn forget_project_view_memory(&self, project: &ActiveProjectRef) {
+        let mut removed_tab_ids = HashSet::new();
         self.project_view_memory.update(|map| {
-            map.remove(project);
+            if let Some(memory) = map.remove(project)
+                && let Some(center_zone) = memory.center_zone
+            {
+                removed_tab_ids.extend(center_zone.all_tab_ids());
+            }
         });
+        self.forget_removed_tab_occurrence_state(&removed_tab_ids);
     }
 
     pub fn active_project_info_untracked(&self) -> Option<ProjectInfo> {
@@ -2766,13 +3784,18 @@ impl AppState {
                 .collect()
         });
         let drop_set: HashSet<AgentId> = agent_ids.iter().cloned().collect();
-        self.center_zone
-            .update(|center_zone| close_host_runtime_tabs_in_cz(center_zone, host_id));
-        self.prune_tab_lru();
+        let mut removed_tab_ids = HashSet::new();
+        self.center_zone.update(|center_zone| {
+            removed_tab_ids.extend(close_host_runtime_tabs_in_cz(center_zone, host_id));
+        });
         self.project_view_memory.update(|memories| {
-            for memory in memories.values_mut() {
+            for (project, memory) in memories.iter_mut() {
                 if let Some(center_zone) = memory.center_zone.as_mut() {
-                    close_host_runtime_tabs_in_cz(center_zone, host_id);
+                    if project.host_id == host_id {
+                        removed_tab_ids.extend(center_zone.all_tab_ids());
+                    } else {
+                        removed_tab_ids.extend(close_host_runtime_tabs_in_cz(center_zone, host_id));
+                    }
                 }
                 if memory
                     .active_terminal
@@ -2784,6 +3807,7 @@ impl AppState {
                 memory.diff_contents.retain(|key, _| key.host_id != host_id);
             }
         });
+        self.forget_removed_tab_occurrence_state(&removed_tab_ids);
         if !drop_set.is_empty() {
             self.chat_rows.update(|map| {
                 map.retain(|id, _| !drop_set.contains(id));
@@ -2880,12 +3904,35 @@ impl AppState {
         self.code_intel.update(|map| {
             map.retain(|key, _| key.host_id != host_id);
         });
+        self.open_files.update(|map| {
+            map.retain(|key, _| key.host_id != host_id);
+        });
+        self.pending_file_opens.update(|map| {
+            map.retain(|key, _| key.host_id != host_id);
+        });
         self.diff_contents.update(|map| {
             map.retain(|key, _| key.host_id != host_id);
         });
         self.code_intel_navigate_ctx.update(|ctx| {
-            if ctx.as_ref().is_some_and(|ctx| ctx.host_id == host_id) {
+            if ctx.as_ref().is_some_and(|ctx| ctx.key.host_id == host_id) {
                 *ctx = None;
+            }
+        });
+        self.code_intel_hover.update(|hover| {
+            if hover
+                .as_ref()
+                .is_some_and(|hover| hover.key.host_id == host_id)
+            {
+                *hover = None;
+            }
+        });
+        self.references_state.update(|references| {
+            if references
+                .source_key
+                .as_ref()
+                .is_some_and(|key| key.host_id == host_id)
+            {
+                *references = ProjectReferencesUiState::default();
             }
         });
         self.review_summaries.update(|map| {
@@ -2957,10 +4004,24 @@ impl AppState {
         self.backend_config_snapshots.update(|snapshots| {
             snapshots.remove(host_id);
         });
+        // Capacity is never carried across a connection. A rehydrated figure
+        // from a previous session would render as `Known` while being
+        // arbitrarily old — quota moves, and a stale-but-confident number is
+        // worse than an honest absence. The server replays the current snapshot
+        // on the next subscribe.
+        self.backend_capacity.update(|snapshots| {
+            snapshots.remove(host_id);
+        });
         self.backend_native_settings.update(|snapshots| {
             snapshots.remove(host_id);
         });
         self.native_settings_save_state.update(|states| {
+            states.remove(host_id);
+        });
+        // A reset outcome describes a projection on a host we are no longer
+        // connected to. Replaying it against the next connection's snapshot would
+        // be a refusal attached to state it never referred to.
+        self.managed_projection_reset.update(|states| {
             states.remove(host_id);
         });
         self.schemas_loaded_for_host.update(|loaded| {
@@ -3049,25 +4110,438 @@ impl AppState {
     // ── Tab convenience methods ─────────────────────────────────────────
 
     pub fn open_tab(&self, content: TabContent, label: String, closeable: bool) {
+        let target = self
+            .center_zone
+            .with_untracked(|center_zone| center_zone.resolve(OpenTarget::Focused));
+        self.open_tab_in(target, content, label, closeable);
+    }
+
+    #[cfg(all(test, target_arch = "wasm32"))]
+    pub fn open_tab_at(
+        &self,
+        target: OpenTarget,
+        content: TabContent,
+        label: String,
+        closeable: bool,
+    ) -> Option<TabId> {
+        let pane = self
+            .center_zone
+            .with_untracked(|center_zone| center_zone.resolve(target));
+        self.open_tab_in(pane, content, label, closeable)
+    }
+
+    pub fn open_tab_in(
+        &self,
+        pane: PaneId,
+        content: TabContent,
+        label: String,
+        closeable: bool,
+    ) -> Option<TabId> {
         let tabs_enabled = self.tabs_enabled.get_untracked();
+        let ratio = self.center_split_ratio.get_untracked();
+        let mut result = None;
         let mut replaced_id = None;
-        self.center_zone.update(|cz| {
+        self.center_zone.update(|center_zone| {
+            if let Some(existing) = center_zone.find_tab_in(pane, &content) {
+                center_zone.activate(existing);
+                result = Some(existing);
+                return;
+            }
+            if let Some(existing) = center_zone.find_tab(&content) {
+                center_zone.activate(existing);
+                result = Some(existing);
+                return;
+            }
             if tabs_enabled {
-                cz.open(content, label, closeable);
+                result = Some(center_zone.open_in(pane, content, label, closeable, ratio));
             } else {
-                replaced_id = Some(cz.replace_active(content, label, closeable));
+                let id = center_zone.replace_active(content, label, closeable);
+                replaced_id = Some(id);
+                result = Some(id);
             }
         });
         if let Some(id) = replaced_id {
             self.forget_tab_scroll_state(id);
         }
+        result
+    }
+
+    pub fn set_split_ratio(&self, ratio: SplitRatio) {
+        self.center_split_ratio.set(ratio);
+        self.center_zone
+            .update(|center_zone| center_zone.set_split_ratio(ratio));
+    }
+
+    pub fn focus_pane(&self, pane: PaneId) -> bool {
+        let active = self
+            .center_zone
+            .with_untracked(|center_zone| center_zone.pane_active_tab_id(pane));
+        let Some(active) = active else {
+            return false;
+        };
+        self.activate_tab(active);
+        true
+    }
+
+    #[cfg(test)]
+    pub fn duplicate_file_eligibility_at(
+        &self,
+        target: OpenTarget,
+        source: TabId,
+    ) -> DuplicateFileEligibility {
+        let target_pane = self
+            .center_zone
+            .with(|center_zone| center_zone.resolve(target));
+        self.duplicate_file_eligibility_in(target_pane, source)
+    }
+
+    pub fn duplicate_file_eligibility_in(
+        &self,
+        target: PaneId,
+        source: TabId,
+    ) -> DuplicateFileEligibility {
+        let tabs_enabled = self.tabs_enabled.get();
+        self.center_zone.with(|center_zone| {
+            self.open_files.with(|open_files| {
+                duplicate_file_eligibility_for(
+                    tabs_enabled,
+                    center_zone,
+                    open_files,
+                    target,
+                    source,
+                )
+            })
+        })
+    }
+
+    #[cfg(test)]
+    pub fn duplicate_file_at_result(
+        &self,
+        target: OpenTarget,
+        source: TabId,
+    ) -> DuplicateFileResult {
+        let target_pane = self
+            .center_zone
+            .with_untracked(|center_zone| center_zone.resolve(target));
+        self.duplicate_file_in_result(target_pane, source)
+    }
+
+    pub fn duplicate_file_in_result(&self, target: PaneId, source: TabId) -> DuplicateFileResult {
+        let eligibility = {
+            let tabs_enabled = self.tabs_enabled.get_untracked();
+            self.center_zone.with_untracked(|center_zone| {
+                self.open_files.with_untracked(|open_files| {
+                    duplicate_file_eligibility_for(
+                        tabs_enabled,
+                        center_zone,
+                        open_files,
+                        target,
+                        source,
+                    )
+                })
+            })
+        };
+        match eligibility {
+            DuplicateFileEligibility::Enabled => {}
+            DuplicateFileEligibility::TargetAlreadyContainsResource { existing } => {
+                self.reveal_tab(existing);
+                return DuplicateFileResult::ActivatedExisting {
+                    source,
+                    existing,
+                    target,
+                };
+            }
+            DuplicateFileEligibility::TabsDisabled => {
+                return DuplicateFileResult::TabsDisabled;
+            }
+            DuplicateFileEligibility::SourceTabMissing => {
+                return DuplicateFileResult::SourceTabMissing;
+            }
+            DuplicateFileEligibility::NotAFile => return DuplicateFileResult::NotAFile,
+            DuplicateFileEligibility::NotLoaded => return DuplicateFileResult::NotLoaded,
+        }
+
+        let ratio = self.center_split_ratio.get_untracked();
+        let mut result = None;
+        self.center_zone.update(|center_zone| {
+            result = center_zone.duplicate_file_to(source, target, ratio);
+        });
+        match result {
+            Some(tab) => DuplicateFileResult::Duplicated {
+                source,
+                tab,
+                target,
+            },
+            None => DuplicateFileResult::SourceTabMissing,
+        }
+    }
+
+    pub fn move_tab_eligibility(&self, target: PaneId, id: TabId) -> MoveTabEligibility {
+        self.center_zone
+            .with_untracked(|center_zone| center_zone.move_tab_eligibility(target, id))
+    }
+
+    pub fn move_tab_to(&self, target: PaneId, id: TabId) -> MoveTabResult {
+        match self.move_tab_eligibility(target, id) {
+            MoveTabEligibility::Eligible => {}
+            MoveTabEligibility::SourceTabMissing => return MoveTabResult::SourceTabMissing,
+            MoveTabEligibility::AlreadyInTargetPane => {
+                return MoveTabResult::AlreadyInTargetPane;
+            }
+            MoveTabEligibility::ResourceAlreadyInTarget { existing } => {
+                return MoveTabResult::ResourceAlreadyInTarget { existing };
+            }
+        }
+        let ratio = self.center_split_ratio.get_untracked();
+        let mut result = MoveTabResult::SourceTabMissing;
+        self.center_zone.update(|center_zone| {
+            result = center_zone.move_tab_to(target, id, ratio);
+        });
+        result
+    }
+
+    /// Returns `None` when the agent chat can open to the side, or the exact
+    /// typed refusal the activation API would return from the same state.
+    /// Signal reads are tracked so render-time disabled state stays reactive.
+    pub fn agent_open_to_side_eligibility(
+        &self,
+        agent_ref: &ActiveAgentRef,
+        project: Option<&ActiveProjectRef>,
+    ) -> Option<AgentOpenToSideResult> {
+        let tabs_enabled = self.tabs_enabled.get();
+        let active_project = self.active_project.get();
+        self.center_zone.with(|center_zone| {
+            agent_open_to_side_block_for(
+                tabs_enabled,
+                active_project.as_ref(),
+                center_zone,
+                agent_ref,
+                project,
+            )
+        })
+    }
+
+    pub fn open_agent_chat_to_side(
+        &self,
+        agent_ref: ActiveAgentRef,
+        project: Option<ActiveProjectRef>,
+        label: String,
+    ) -> AgentOpenToSideResult {
+        let blocked = {
+            let tabs_enabled = self.tabs_enabled.get_untracked();
+            let active_project = self.active_project.get_untracked();
+            self.center_zone.with_untracked(|center_zone| {
+                agent_open_to_side_block_for(
+                    tabs_enabled,
+                    active_project.as_ref(),
+                    center_zone,
+                    &agent_ref,
+                    project.as_ref(),
+                )
+            })
+        };
+        if let Some(blocked) = blocked {
+            return blocked;
+        }
+
+        let content = TabContent::chat_with_agent(agent_ref);
+        let (focused, existing) = self.center_zone.with_untracked(|center_zone| {
+            let focused = center_zone.focused_id();
+            let existing = center_zone
+                .find_tab(&content)
+                .and_then(|tab| center_zone.locate_tab(tab).map(|pane| (pane, tab)));
+            (focused, existing)
+        });
+        let target = focused.other();
+
+        if let Some((pane, tab)) = existing {
+            if pane == target {
+                self.reveal_tab(tab);
+                return AgentOpenToSideResult::Revealed { tab, pane };
+            }
+            let source_retains_content = self.center_zone.with_untracked(|center_zone| {
+                center_zone
+                    .pane(pane)
+                    .is_some_and(|source| source.tabs.iter().any(|candidate| candidate.id != tab))
+            });
+            if !source_retains_content {
+                return AgentOpenToSideResult::NothingWouldRemain;
+            }
+            return match self.move_tab_to(target, tab) {
+                MoveTabResult::Moved { source, target, .. } => AgentOpenToSideResult::Moved {
+                    tab,
+                    source,
+                    target,
+                },
+                MoveTabResult::SourceTabMissing => {
+                    AgentOpenToSideResult::MoveRefused(MoveTabRefusal::SourceTabMissing)
+                }
+                MoveTabResult::AlreadyInTargetPane => {
+                    AgentOpenToSideResult::MoveRefused(MoveTabRefusal::AlreadyInTargetPane)
+                }
+                MoveTabResult::ResourceAlreadyInTarget { existing } => {
+                    AgentOpenToSideResult::MoveRefused(MoveTabRefusal::ResourceAlreadyInTarget {
+                        existing,
+                    })
+                }
+            };
+        }
+
+        let Some(tab) = self.open_tab_in(target, content, label, true) else {
+            return AgentOpenToSideResult::NothingWouldRemain;
+        };
+        AgentOpenToSideResult::Opened { tab, pane: target }
+    }
+
+    /// Returns `None` when the exact diff can open to the side, or the typed
+    /// refusal the activation API would return from the same state.
+    pub fn diff_open_to_side_eligibility(&self, key: &DiffKey) -> Option<DiffOpenToSideResult> {
+        let tabs_enabled = self.tabs_enabled.get();
+        let active_project = self.active_project.get();
+        self.center_zone.with(|center_zone| {
+            diff_open_to_side_block_for(tabs_enabled, active_project.as_ref(), center_zone, key)
+        })
+    }
+
+    pub fn open_diff_to_side(&self, key: DiffKey, label: String) -> DiffOpenToSideResult {
+        let blocked = {
+            let tabs_enabled = self.tabs_enabled.get_untracked();
+            let active_project = self.active_project.get_untracked();
+            self.center_zone.with_untracked(|center_zone| {
+                diff_open_to_side_block_for(
+                    tabs_enabled,
+                    active_project.as_ref(),
+                    center_zone,
+                    &key,
+                )
+            })
+        };
+        if let Some(blocked) = blocked {
+            return blocked;
+        }
+
+        let content = key.tab_content();
+        let (focused, existing) = self.center_zone.with_untracked(|center_zone| {
+            let focused = center_zone.focused_id();
+            let existing = center_zone
+                .find_tab(&content)
+                .and_then(|tab| center_zone.locate_tab(tab).map(|pane| (pane, tab)));
+            (focused, existing)
+        });
+        let target = focused.other();
+
+        if let Some((pane, tab)) = existing {
+            if pane == target {
+                self.reveal_tab(tab);
+                return DiffOpenToSideResult::Revealed { tab, pane };
+            }
+            let source_retains_content = self.center_zone.with_untracked(|center_zone| {
+                center_zone
+                    .pane(pane)
+                    .is_some_and(|source| source.tabs.iter().any(|candidate| candidate.id != tab))
+            });
+            if !source_retains_content {
+                return DiffOpenToSideResult::NothingWouldRemain;
+            }
+            return match self.move_tab_to(target, tab) {
+                MoveTabResult::Moved { source, target, .. } => DiffOpenToSideResult::Moved {
+                    tab,
+                    source,
+                    target,
+                },
+                MoveTabResult::SourceTabMissing => {
+                    DiffOpenToSideResult::MoveRefused(MoveTabRefusal::SourceTabMissing)
+                }
+                MoveTabResult::AlreadyInTargetPane => {
+                    DiffOpenToSideResult::MoveRefused(MoveTabRefusal::AlreadyInTargetPane)
+                }
+                MoveTabResult::ResourceAlreadyInTarget { existing } => {
+                    DiffOpenToSideResult::MoveRefused(MoveTabRefusal::ResourceAlreadyInTarget {
+                        existing,
+                    })
+                }
+            };
+        }
+
+        let Some(tab) = self.open_tab_in(target, content, label, true) else {
+            return DiffOpenToSideResult::NothingWouldRemain;
+        };
+        DiffOpenToSideResult::Opened { tab, pane: target }
+    }
+
+    pub fn file_occurrence_in(&self, pane: PaneId, key: &FileResourceKey) -> Option<TabId> {
+        self.center_zone.with_untracked(|center_zone| {
+            center_zone.find_tab_in(pane, &TabContent::File { key: key.clone() })
+        })
+    }
+
+    pub fn resolve_file_occurrence(
+        &self,
+        key: &FileResourceKey,
+        preferred: PaneId,
+    ) -> Option<(PaneId, TabId)> {
+        self.center_zone.with_untracked(|center_zone| {
+            center_zone
+                .find_tab_in(preferred, &TabContent::File { key: key.clone() })
+                .map(|tab| (preferred, tab))
+                .or_else(|| {
+                    center_zone
+                        .find_tab_in(preferred.other(), &TabContent::File { key: key.clone() })
+                        .map(|tab| (preferred.other(), tab))
+                })
+        })
+    }
+
+    pub fn file_occurrence_is_current(
+        &self,
+        tab: TabId,
+        key: &FileResourceKey,
+        version: ProjectFileVersion,
+    ) -> bool {
+        let occurrence_matches = self.center_zone.with_untracked(|center_zone| {
+            center_zone.tab(tab).is_some_and(|candidate| {
+                matches!(&candidate.content, TabContent::File { key: candidate_key } if candidate_key == key)
+            })
+        });
+        occurrence_matches
+            && self
+                .open_files
+                .with_untracked(|files| files.get(key).is_some_and(|file| file.version == version))
+    }
+
+    pub fn target_file_navigation(&self, tab: TabId, navigation: PendingFileNavigation) {
+        match navigation {
+            PendingFileNavigation::Line(line) => self.pending_goto_line.set(Some((tab, line))),
+            PendingFileNavigation::Offset(offset) => {
+                self.pending_goto_offset.set(Some((tab, offset)))
+            }
+        }
+    }
+
+    pub fn record_pending_file_open(&self, key: FileResourceKey, intent: PendingFileOpen) {
+        self.pending_file_opens.update(|pending| match intent {
+            PendingFileOpen::Open { .. } => {
+                pending.insert(key, intent);
+            }
+            PendingFileOpen::RefreshInPlace => {
+                if !matches!(pending.get(&key), Some(PendingFileOpen::Open { .. })) {
+                    pending.insert(key, intent);
+                }
+            }
+        });
+    }
+
+    pub fn take_pending_file_open(&self, key: &FileResourceKey) -> Option<PendingFileOpen> {
+        let mut intent = None;
+        self.pending_file_opens.update(|pending| {
+            intent = pending.remove(key);
+        });
+        intent
     }
 
     /// Insert `id` at the MRU front of `tab_lru`, dedup, truncate to
-    /// `TAB_LRU_CAPACITY`. Called whenever a tab becomes active (via the
-    /// Effect installed in `App` watching `active_tab_id`). Tabs that fall
-    /// off the end of the list have their components unmounted by the
-    /// next `<For>` re-render in `CenterZone`.
+    /// `TAB_LRU_CAPACITY`. Visible pane actives are pinned separately by
+    /// `mounted_tab_ids`, so switching in one pane cannot evict the other.
     pub fn bump_tab_lru(&self, id: TabId) {
         self.tab_lru.update(|lru| {
             lru.retain(|existing| *existing != id);
@@ -3078,8 +4552,22 @@ impl AppState {
         });
     }
 
-    /// Remove `id` from `tab_lru` outright. Called when a tab is closed —
-    /// keeps the LRU from referencing dead tab ids.
+    pub fn mounted_tab_ids(&self) -> Vec<TabId> {
+        let lru = self.tab_lru.get();
+        self.center_zone.with(|center_zone| {
+            let pinned: HashSet<TabId> = center_zone
+                .panes()
+                .filter_map(|(_, pane)| pane.active_tab_id)
+                .collect();
+            center_zone
+                .all_tabs()
+                .filter(|(_, tab)| pinned.contains(&tab.id) || lru.contains(&tab.id))
+                .map(|(_, tab)| tab.id)
+                .collect()
+        })
+    }
+
+    #[cfg(test)]
     pub fn forget_tab_lru(&self, id: TabId) {
         self.tab_lru.update(|lru| {
             lru.retain(|existing| *existing != id);
@@ -3103,263 +4591,244 @@ impl AppState {
         });
     }
 
-    /// Drop any LRU entries for tab ids no longer present in `center_zone`.
-    /// Called after bulk-close operations (`close_others`,
-    /// `close_tabs_to_right`, `close_all`) so we don't keep mounting
-    /// references to vanished tabs.
+    pub(crate) fn forget_removed_tab_occurrence_state(&self, doomed: &HashSet<TabId>) {
+        if doomed.is_empty() {
+            return;
+        }
+        self.tab_lru.update(|lru| {
+            lru.retain(|id| !doomed.contains(id));
+        });
+        self.tab_scroll_state.update(|scroll| {
+            scroll.retain(|id, _| !doomed.contains(id));
+        });
+        self.code_intel_hover.update(|hover| {
+            if hover
+                .as_ref()
+                .is_some_and(|hover| doomed.contains(&hover.tab))
+            {
+                *hover = None;
+            }
+        });
+        self.code_intel_navigate_ctx.update(|context| {
+            if context
+                .as_ref()
+                .is_some_and(|context| doomed.contains(&context.tab))
+            {
+                *context = None;
+            }
+        });
+    }
+
+    #[cfg(test)]
     pub fn prune_tab_lru(&self) {
-        let live: Vec<TabId> = self
+        let live = self
             .center_zone
-            .with_untracked(|cz| cz.tabs.iter().map(|t| t.id).collect());
+            .with_untracked(CenterZoneState::all_tab_ids);
         self.tab_lru.update(|lru| {
             lru.retain(|id| live.contains(id));
         });
     }
 
-    /// Tear down all client state for a closing File tab: drop the cached
-    /// contents and the code-intel state, and tell the server to stop pushing
-    /// for this file. The subscribe sent on open (`actions::open_project_path`)
-    /// is matched here so the server doesn't keep a dangling subscription.
-    fn close_open_file(&self, path: &ProjectPath) {
-        self.open_files.update(|files| {
-            files.remove(path);
-        });
-        self.drop_code_intel_for_path(path);
+    pub fn backing_release_projection(
+        &self,
+        doomed: &HashSet<TabId>,
+    ) -> (HashSet<BackingResource>, HashSet<BackingResource>) {
+        self.center_zone.with_untracked(|center_zone| {
+            let survivors: HashSet<BackingResource> = center_zone
+                .all_tabs()
+                .filter(|(_, tab)| !doomed.contains(&tab.id))
+                .filter_map(|(_, tab)| tab.backing_resource())
+                .collect();
+            let released = center_zone
+                .all_tabs()
+                .filter(|(_, tab)| doomed.contains(&tab.id))
+                .filter_map(|(_, tab)| tab.backing_resource())
+                .filter(|resource| !survivors.contains(resource))
+                .collect();
+            (survivors, released)
+        })
     }
 
-    /// Remove every code-intel entry for `path` and send a matching
-    /// `code_intel_unsubscribe_file` for each owning `(host, project)`. The
-    /// signal cleanup runs everywhere (including native tests); the network
-    /// send is wasm-only since there is no transport off the browser.
-    fn drop_code_intel_for_path(&self, path: &ProjectPath) {
-        let mut removed: Vec<CodeIntelKey> = Vec::new();
-        self.code_intel.update(|map| {
-            removed = map
-                .keys()
-                .filter(|key| &key.path == path)
-                .cloned()
-                .collect();
-            for key in &removed {
-                map.remove(key);
+    fn tear_down_backing_resource(&self, resource: &BackingResource) {
+        match resource {
+            BackingResource::File(key) => {
+                self.open_files.update(|files| {
+                    files.remove(key);
+                });
+                self.pending_file_opens.update(|pending| {
+                    pending.remove(key);
+                });
+                self.drop_code_intel(key);
             }
-        });
-        #[cfg(target_arch = "wasm32")]
-        {
-            for key in removed {
-                let stream = StreamPath(format!("/project/{}", key.project_id.0));
-                let payload = protocol::CodeIntelUnsubscribeFilePayload { path: path.clone() };
-                let host_id = key.host_id.clone();
-                wasm_bindgen_futures::spawn_local(async move {
-                    if let Err(error) = crate::send::send_frame(
-                        &host_id,
-                        stream,
-                        protocol::FrameKind::CodeIntelUnsubscribeFile,
-                        &payload,
-                    )
-                    .await
-                    {
-                        log::error!("failed to send CodeIntelUnsubscribeFile: {error}");
-                    }
+            BackingResource::Diff(key) => {
+                self.diff_contents.update(|diffs| {
+                    diffs.remove(key);
                 });
             }
         }
-        // The network send is wasm-only; on the native test build there is no
-        // transport, so the signal cleanup above is the whole effect.
-        #[cfg(not(target_arch = "wasm32"))]
+    }
+
+    fn drop_code_intel(&self, file: &FileResourceKey) {
+        let key = CodeIntelKey {
+            host_id: file.host_id.clone(),
+            project_id: file.project_id.clone(),
+            path: file.path.clone(),
+        };
+        self.code_intel.update(|map| {
+            map.remove(&key);
+        });
+        #[cfg(target_arch = "wasm32")]
         {
-            let _ = removed;
+            let host_id = file.host_id.clone();
+            let stream = StreamPath(format!("/project/{}", file.project_id.0));
+            let payload = protocol::CodeIntelUnsubscribeFilePayload {
+                path: file.path.clone(),
+            };
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Err(error) = crate::send::send_frame(
+                    &host_id,
+                    stream,
+                    protocol::FrameKind::CodeIntelUnsubscribeFile,
+                    &payload,
+                )
+                .await
+                {
+                    log::error!("failed to send CodeIntelUnsubscribeFile: {error}");
+                }
+            });
         }
+    }
+
+    pub fn close_tabs(&self, doomed: HashSet<TabId>) {
+        if doomed.is_empty() {
+            return;
+        }
+        let (_, released) = self.backing_release_projection(&doomed);
+        for resource in &released {
+            self.tear_down_backing_resource(resource);
+        }
+        self.forget_removed_tab_occurrence_state(&doomed);
+        self.center_zone
+            .update(|center_zone| center_zone.remove_tabs(&doomed));
     }
 
     pub fn close_tab(&self, id: TabId) {
-        let content = self.center_zone.with_untracked(|cz| {
-            cz.tabs
-                .iter()
-                .find(|t| t.id == id)
-                .map(|t| t.content.clone())
-        });
-        if let Some(content) = content {
-            match &content {
-                TabContent::File { path } => {
-                    self.close_open_file(path);
-                }
-                TabContent::Diff {
-                    host_id,
-                    project_id,
-                    root,
-                    scope,
-                    path,
-                } => {
-                    let key = DiffKey::new(
-                        host_id.clone(),
-                        project_id.clone(),
-                        root.clone(),
-                        *scope,
-                        path.clone(),
-                    );
-                    self.diff_contents.update(|diffs| {
-                        diffs.remove(&key);
-                    });
-                }
-                _ => {}
-            }
+        let closeable = self
+            .center_zone
+            .with_untracked(|center_zone| center_zone.tab(id).is_some_and(|tab| tab.closeable));
+        if closeable {
+            self.close_tabs(HashSet::from([id]));
         }
-        self.forget_tab_lru(id);
-        self.forget_tab_scroll_state(id);
-        self.center_zone.update(|cz| cz.close(id));
+    }
+
+    pub fn reveal_tab(&self, id: TabId) -> bool {
+        let mut revealed = false;
+        self.center_zone.update(|center_zone| {
+            revealed = center_zone.reveal_tab(id);
+        });
+        revealed
+    }
+
+    #[cfg(test)]
+    pub fn set_active_tab_in_pane(&self, pane: PaneId, id: TabId) -> bool {
+        let mut selected = false;
+        self.center_zone.update(|center_zone| {
+            selected = center_zone.set_active_tab_in_pane(pane, id);
+        });
+        selected
+    }
+
+    pub fn update_tab(&self, id: TabId, content: TabContent, label: String) -> bool {
+        let mut updated = false;
+        self.center_zone.update(|center_zone| {
+            updated = center_zone.update_tab(id, content, label);
+        });
+        updated
     }
 
     pub fn activate_tab(&self, id: TabId) {
-        // active_agent derives from center_zone via a Memo, so the tab change
-        // here propagates without a manual sync.
-        self.center_zone.update(|cz| cz.activate(id));
+        self.reveal_tab(id);
     }
 
     pub fn close_other_tabs(&self, id: TabId) {
-        let exists = self
-            .center_zone
-            .with_untracked(|cz| cz.tabs.iter().any(|t| t.id == id));
-        if !exists {
-            return;
-        }
-        let to_close: Vec<_> = self.center_zone.with_untracked(|cz| {
-            cz.tabs
-                .iter()
-                .filter(|t| t.id != id && t.closeable)
-                .map(|t| (t.id, t.content.clone()))
+        let doomed = self.center_zone.with_untracked(|center_zone| {
+            let Some(pane_id) = center_zone.locate_tab(id) else {
+                return HashSet::new();
+            };
+            center_zone
+                .pane(pane_id)
+                .into_iter()
+                .flat_map(|pane| pane.tabs.iter())
+                .filter(|tab| tab.id != id && tab.closeable)
+                .map(|tab| tab.id)
                 .collect()
         });
-        for (tab_id, content) in &to_close {
-            match content {
-                TabContent::File { path } => {
-                    self.close_open_file(path);
-                }
-                TabContent::Diff {
-                    host_id,
-                    project_id,
-                    root,
-                    scope,
-                    path,
-                } => {
-                    let key = DiffKey::new(
-                        host_id.clone(),
-                        project_id.clone(),
-                        root.clone(),
-                        *scope,
-                        path.clone(),
-                    );
-                    self.diff_contents.update(|diffs| {
-                        diffs.remove(&key);
-                    });
-                }
-                _ => {}
-            }
-            self.forget_tab_scroll_state(*tab_id);
-        }
-        self.center_zone.update(|cz| cz.close_others(id));
-        self.prune_tab_lru();
+        self.close_tabs(doomed);
+        self.activate_tab(id);
     }
 
     pub fn close_tabs_to_right(&self, id: TabId) {
-        let exists = self
-            .center_zone
-            .with_untracked(|cz| cz.tabs.iter().any(|t| t.id == id));
-        if !exists {
-            return;
-        }
-        let to_close: Vec<_> = self.center_zone.with_untracked(|cz| {
-            let Some(idx) = cz.tabs.iter().position(|t| t.id == id) else {
-                return vec![];
+        let doomed = self.center_zone.with_untracked(|center_zone| {
+            let Some(pane_id) = center_zone.locate_tab(id) else {
+                return HashSet::new();
             };
-            cz.tabs[idx + 1..]
+            let Some(pane) = center_zone.pane(pane_id) else {
+                return HashSet::new();
+            };
+            let Some(index) = pane.tabs.iter().position(|tab| tab.id == id) else {
+                return HashSet::new();
+            };
+            pane.tabs[index + 1..]
                 .iter()
-                .filter(|t| t.closeable)
-                .map(|t| (t.id, t.content.clone()))
+                .filter(|tab| tab.closeable)
+                .map(|tab| tab.id)
                 .collect()
         });
-        for (tab_id, content) in &to_close {
-            match content {
-                TabContent::File { path } => {
-                    self.close_open_file(path);
-                }
-                TabContent::Diff {
-                    host_id,
-                    project_id,
-                    root,
-                    scope,
-                    path,
-                } => {
-                    let key = DiffKey::new(
-                        host_id.clone(),
-                        project_id.clone(),
-                        root.clone(),
-                        *scope,
-                        path.clone(),
-                    );
-                    self.diff_contents.update(|diffs| {
-                        diffs.remove(&key);
-                    });
-                }
-                _ => {}
-            }
-            self.forget_tab_scroll_state(*tab_id);
-        }
-        self.center_zone.update(|cz| cz.close_to_right(id));
-        self.prune_tab_lru();
+        self.close_tabs(doomed);
     }
 
     pub fn close_all_tabs(&self) {
-        let to_close: Vec<_> = self.center_zone.with_untracked(|cz| {
-            cz.tabs
-                .iter()
-                .filter(|t| t.closeable)
-                .map(|t| (t.id, t.content.clone()))
+        let doomed = self.center_zone.with_untracked(|center_zone| {
+            center_zone
+                .all_tabs()
+                .filter(|(_, tab)| tab.closeable)
+                .map(|(_, tab)| tab.id)
                 .collect()
         });
-        for (tab_id, content) in &to_close {
-            match content {
-                TabContent::File { path } => {
-                    self.close_open_file(path);
-                }
-                TabContent::Diff {
-                    host_id,
-                    project_id,
-                    root,
-                    scope,
-                    path,
-                } => {
-                    let key = DiffKey::new(
-                        host_id.clone(),
-                        project_id.clone(),
-                        root.clone(),
-                        *scope,
-                        path.clone(),
-                    );
-                    self.diff_contents.update(|diffs| {
-                        diffs.remove(&key);
-                    });
-                }
-                _ => {}
+        self.close_tabs(doomed);
+    }
+
+    pub fn close_pane(&self, pane: PaneId) {
+        let doomed = self.center_zone.with_untracked(|center_zone| {
+            if !center_zone.is_split() {
+                return HashSet::new();
             }
-            self.forget_tab_scroll_state(*tab_id);
-        }
-        self.center_zone.update(|cz| cz.close_all());
-        self.prune_tab_lru();
+            center_zone
+                .pane(pane)
+                .into_iter()
+                .flat_map(|pane| pane.tabs.iter())
+                .map(|tab| tab.id)
+                .collect()
+        });
+        self.close_tabs(doomed);
+    }
+
+    pub fn close_other_pane(&self) {
+        let other = self
+            .center_zone
+            .with_untracked(|center_zone| center_zone.focused_id().other());
+        self.close_pane(other);
     }
 
     pub fn rename_tab_label(&self, id: TabId, new_label: String) {
         self.center_zone
-            .update(|cz| cz.rename_tab_label(id, new_label));
+            .update(|center_zone| center_zone.rename_tab_label(id, new_label));
     }
 
-    /// If the currently active tab is a draft team-member chat tab (the user
-    /// clicked a team member whose live agent hasn't been spawned yet),
-    /// return the `(host_id, member_id)` pair. Used by the chat input send
-    /// path to send `TeamMemberActivate { prompt: Some(_) }` instead of the
-    /// normal `SpawnAgent::New`.
-    pub fn active_pending_team_member_untracked(&self) -> Option<PendingTeamMember> {
-        self.center_zone.with_untracked(|cz| {
-            cz.active_tab().and_then(|tab| match &tab.content {
+    pub fn composer_pending_team_member_untracked(&self) -> Option<PendingTeamMember> {
+        self.center_zone.with_untracked(|center_zone| {
+            let (_, tab_id) = center_zone.composer_owner()?;
+            center_zone.tab(tab_id).and_then(|tab| match &tab.content {
                 TabContent::Chat {
                     agent_ref: None,
                     pending_team_member: Some(pending),
@@ -3758,14 +5227,16 @@ mod tests {
         let chat2 = make_tab(TabContent::empty_chat(), "Chat 2", true);
         let target_id = chat1.id;
         let mut cz = CenterZoneState {
-            tabs: vec![home, chat1, chat2],
-            active_tab_id: None,
+            layout: CenterLayout::Single(PaneState {
+                tabs: vec![home, chat1, chat2],
+                active_tab_id: None,
+            }),
         };
         cz.close_others(target_id);
-        assert_eq!(cz.tabs.len(), 2);
-        assert!(cz.tabs.iter().any(|t| t.id == target_id));
-        assert!(cz.tabs.iter().any(|t| !t.closeable));
-        assert_eq!(cz.active_tab_id, Some(target_id));
+        assert_eq!(cz.tabs().len(), 2);
+        assert!(cz.tabs().iter().any(|t| t.id == target_id));
+        assert!(cz.tabs().iter().any(|t| !t.closeable));
+        assert_eq!(cz.active_tab_id(), Some(target_id));
     }
 
     #[test]
@@ -3776,14 +5247,16 @@ mod tests {
         let chat3 = make_tab(TabContent::empty_chat(), "Chat 3", true);
         let target_id = chat1.id;
         let mut cz = CenterZoneState {
-            tabs: vec![home, chat1, chat2, chat3],
-            active_tab_id: Some(target_id),
+            layout: CenterLayout::Single(PaneState {
+                tabs: vec![home, chat1, chat2, chat3],
+                active_tab_id: Some(target_id),
+            }),
         };
         cz.close_to_right(target_id);
-        assert_eq!(cz.tabs.len(), 2);
-        assert!(cz.tabs.iter().any(|t| !t.closeable));
-        assert!(cz.tabs.iter().any(|t| t.id == target_id));
-        assert_eq!(cz.active_tab_id, Some(target_id));
+        assert_eq!(cz.tabs().len(), 2);
+        assert!(cz.tabs().iter().any(|t| !t.closeable));
+        assert!(cz.tabs().iter().any(|t| t.id == target_id));
+        assert_eq!(cz.active_tab_id(), Some(target_id));
     }
 
     #[test]
@@ -3793,13 +5266,15 @@ mod tests {
         let chat1 = make_tab(TabContent::empty_chat(), "Chat 1", true);
         let chat2 = make_tab(TabContent::empty_chat(), "Chat 2", true);
         let mut cz = CenterZoneState {
-            tabs: vec![home, chat1, chat2],
-            active_tab_id: None,
+            layout: CenterLayout::Single(PaneState {
+                tabs: vec![home, chat1, chat2],
+                active_tab_id: None,
+            }),
         };
         cz.close_all();
-        assert_eq!(cz.tabs.len(), 1);
-        assert!(matches!(cz.tabs[0].content, TabContent::Home));
-        assert_eq!(cz.active_tab_id, Some(home_id));
+        assert_eq!(cz.tabs().len(), 1);
+        assert!(matches!(cz.tabs()[0].content, TabContent::Home));
+        assert_eq!(cz.active_tab_id(), Some(home_id));
     }
 
     #[test]
@@ -3841,7 +5316,7 @@ mod tests {
         let state = AppState::new();
         let live_id = state
             .center_zone
-            .with_untracked(|cz| cz.active_tab_id)
+            .with_untracked(|cz| cz.active_tab_id())
             .expect("default home tab is active");
         let stale = next_tab_id();
         // Manually insert a stale id alongside the live one.
@@ -3856,12 +5331,14 @@ mod tests {
         let chat = make_tab(TabContent::empty_chat(), "Old Name", true);
         let target_id = chat.id;
         let mut cz = CenterZoneState {
-            tabs: vec![home, chat],
-            active_tab_id: None,
+            layout: CenterLayout::Single(PaneState {
+                tabs: vec![home, chat],
+                active_tab_id: None,
+            }),
         };
         cz.rename_tab_label(target_id, "New Name".to_string());
-        assert_eq!(cz.tabs[0].label, "Home");
-        assert_eq!(cz.tabs[1].label, "New Name");
+        assert_eq!(cz.tabs()[0].label, "Home");
+        assert_eq!(cz.tabs()[1].label, "New Name");
     }
 
     // ── Diff reducer / request-state tests ──────────────────────────────
@@ -3993,6 +5470,14 @@ mod tests {
         }
     }
 
+    fn test_file_key(path: ProjectPath) -> FileResourceKey {
+        FileResourceKey {
+            host_id: "h".to_string(),
+            project_id: ProjectId("p".to_string()),
+            path,
+        }
+    }
+
     #[test]
     fn close_other_tabs_cleans_backing_state() {
         let owner = leptos::reactive::owner::Owner::new();
@@ -4001,10 +5486,11 @@ mod tests {
 
             // Open a File tab and a Diff tab, keep Chat as the target
             let file_path = test_path("file_a");
+            let file_key = test_file_key(file_path.clone());
             state.center_zone.update(|cz| {
                 cz.open(
                     TabContent::File {
-                        path: file_path.clone(),
+                        key: file_key.clone(),
                     },
                     "file_a.txt".to_string(),
                     true,
@@ -4015,7 +5501,7 @@ mod tests {
             });
             let target_id = state
                 .center_zone
-                .with_untracked(|cz| cz.active_tab_id.unwrap());
+                .with_untracked(|cz| cz.active_tab_id().unwrap());
             let diff_root = ProjectRootPath("/root/proj".to_string());
             let diff_scope = ProjectDiffScope::Unstaged;
             let diff_path = "src/lib.rs".to_string();
@@ -4035,7 +5521,7 @@ mod tests {
 
             state.open_files.update(|m| {
                 m.insert(
-                    file_path.clone(),
+                    file_key.clone(),
                     OpenFile {
                         path: file_path.clone(),
                         version: ProjectFileVersion(1),
@@ -4063,7 +5549,7 @@ mod tests {
             assert!(
                 !state
                     .open_files
-                    .with_untracked(|m| m.contains_key(&file_path))
+                    .with_untracked(|m| m.contains_key(&file_key))
             );
             assert!(
                 !state
@@ -4071,9 +5557,9 @@ mod tests {
                     .with_untracked(|m| m.contains_key(&diff_key))
             );
             state.center_zone.with_untracked(|cz| {
-                assert_eq!(cz.tabs.len(), 2);
-                assert!(cz.tabs.iter().any(|t| t.id == target_id));
-                assert!(cz.tabs.iter().any(|t| !t.closeable));
+                assert_eq!(cz.tabs().len(), 2);
+                assert!(cz.tabs().iter().any(|t| t.id == target_id));
+                assert!(cz.tabs().iter().any(|t| !t.closeable));
             });
         });
     }
@@ -4126,10 +5612,9 @@ mod tests {
             assert_ne!(id_a, id_b, "different paths must produce different tab ids");
             state.center_zone.with_untracked(|cz| {
                 let labels: Vec<&str> = cz
-                    .tabs
-                    .iter()
-                    .filter(|t| matches!(&t.content, TabContent::Diff { .. }))
-                    .map(|t| t.label.as_str())
+                    .all_tabs()
+                    .filter(|(_, tab)| matches!(&tab.content, TabContent::Diff { .. }))
+                    .map(|(_, tab)| tab.label.as_str())
                     .collect();
                 assert_eq!(labels, vec!["Diff: proj/a.rs", "Diff: proj/b.rs"]);
             });
@@ -4166,12 +5651,13 @@ mod tests {
             });
             let target_id = state
                 .center_zone
-                .with_untracked(|cz| cz.active_tab_id.unwrap());
+                .with_untracked(|cz| cz.active_tab_id().unwrap());
             let file_path = test_path("file_b");
+            let file_key = test_file_key(file_path.clone());
             state.center_zone.update(|cz| {
                 cz.open(
                     TabContent::File {
-                        path: file_path.clone(),
+                        key: file_key.clone(),
                     },
                     "file_b.txt".to_string(),
                     true,
@@ -4179,7 +5665,7 @@ mod tests {
             });
             state.open_files.update(|m| {
                 m.insert(
-                    file_path.clone(),
+                    file_key.clone(),
                     OpenFile {
                         path: file_path.clone(),
                         version: ProjectFileVersion(1),
@@ -4194,12 +5680,12 @@ mod tests {
             assert!(
                 !state
                     .open_files
-                    .with_untracked(|m| m.contains_key(&file_path))
+                    .with_untracked(|m| m.contains_key(&file_key))
             );
             state.center_zone.with_untracked(|cz| {
-                assert!(cz.tabs.iter().any(|t| t.id == target_id));
-                assert!(!cz.tabs.iter().any(|t| {
-                    matches!(&t.content, TabContent::File { path } if *path == file_path)
+                assert!(cz.tabs().iter().any(|t| t.id == target_id));
+                assert!(!cz.tabs().iter().any(|t| {
+                    matches!(&t.content, TabContent::File { key } if *key == file_key)
                 }));
             });
         });
@@ -4211,10 +5697,11 @@ mod tests {
         owner.with(|| {
             let state = AppState::new();
             let file_path = test_path("file_c");
+            let file_key = test_file_key(file_path.clone());
             state.center_zone.update(|cz| {
                 cz.open(
                     TabContent::File {
-                        path: file_path.clone(),
+                        key: file_key.clone(),
                     },
                     "file_c.txt".to_string(),
                     true,
@@ -4222,7 +5709,7 @@ mod tests {
             });
             state.open_files.update(|m| {
                 m.insert(
-                    file_path.clone(),
+                    file_key.clone(),
                     OpenFile {
                         path: file_path.clone(),
                         version: ProjectFileVersion(1),
@@ -4232,17 +5719,17 @@ mod tests {
                 );
             });
 
-            let tab_count_before = state.center_zone.with_untracked(|cz| cz.tabs.len());
+            let tab_count_before = state.center_zone.with_untracked(|cz| cz.tabs().len());
             state.close_other_tabs(TabId(999_999));
 
             assert_eq!(
-                state.center_zone.with_untracked(|cz| cz.tabs.len()),
+                state.center_zone.with_untracked(|cz| cz.tabs().len()),
                 tab_count_before
             );
             assert!(
                 state
                     .open_files
-                    .with_untracked(|m| m.contains_key(&file_path))
+                    .with_untracked(|m| m.contains_key(&file_key))
             );
         });
     }
@@ -4274,7 +5761,7 @@ mod tests {
 
             let a_tab_id = state
                 .center_zone
-                .with_untracked(|cz| cz.active_tab_id.expect("A tab active"));
+                .with_untracked(|cz| cz.active_tab_id().expect("A tab active"));
 
             state.open_tab(
                 TabContent::chat_with_agent(agent_b.clone()),
@@ -4287,7 +5774,7 @@ mod tests {
             // must reflect that, not stay stale on B.
             let b_tab_id = state
                 .center_zone
-                .with_untracked(|cz| cz.active_tab_id.expect("B tab active"));
+                .with_untracked(|cz| cz.active_tab_id().expect("B tab active"));
             state.close_tab(b_tab_id);
             assert_eq!(state.active_agent.get_untracked(), Some(agent_a.clone()));
 
@@ -4776,9 +6263,12 @@ mod tests {
                 .code_intel_navigate_ctx
                 .set(Some(CodeIntelNavigateContext {
                     navigate_id: 1,
-                    host_id: host_a.to_owned(),
-                    project_id: project_a.clone(),
-                    path: path_a.clone(),
+                    tab: next_tab_id(),
+                    key: FileResourceKey {
+                        host_id: host_a.to_owned(),
+                        project_id: project_a.clone(),
+                        path: path_a.clone(),
+                    },
                     version: ProjectFileVersion(1),
                 }));
             state.project_view_memory.update(|map| {
@@ -4930,6 +6420,365 @@ mod tests {
     }
 
     #[test]
+    fn forgetting_project_memory_cleans_exact_occurrences_and_keeps_survivors() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let current_survivor = state
+                .center_zone
+                .with_untracked(|center_zone| center_zone.active_tab_id())
+                .expect("current home tab");
+
+            let mut removed_center = CenterZoneState::default();
+            let removed_home = removed_center.active_tab_id().expect("remembered home tab");
+            let removed_chat =
+                removed_center.open(TabContent::empty_chat(), "Remembered chat".to_owned(), true);
+            let removed_project = ActiveProjectRef {
+                host_id: "host".to_owned(),
+                project_id: ProjectId("removed".to_owned()),
+            };
+
+            let survivor_center = CenterZoneState::default();
+            let remembered_survivor = survivor_center
+                .active_tab_id()
+                .expect("surviving remembered home tab");
+            let survivor_project = ActiveProjectRef {
+                host_id: "host".to_owned(),
+                project_id: ProjectId("survivor".to_owned()),
+            };
+            state.project_view_memory.update(|memories| {
+                memories.insert(
+                    removed_project.clone(),
+                    ProjectViewMemory {
+                        center_zone: Some(removed_center),
+                        ..ProjectViewMemory::default()
+                    },
+                );
+                memories.insert(
+                    survivor_project.clone(),
+                    ProjectViewMemory {
+                        center_zone: Some(survivor_center),
+                        ..ProjectViewMemory::default()
+                    },
+                );
+            });
+
+            state.tab_lru.set(vec![
+                removed_home,
+                removed_chat,
+                current_survivor,
+                remembered_survivor,
+            ]);
+            for (tab, scroll_top) in [
+                (removed_home, 10),
+                (removed_chat, 20),
+                (current_survivor, 30),
+                (remembered_survivor, 40),
+            ] {
+                state.save_tab_scroll_state(
+                    tab,
+                    TabScrollState {
+                        scroll_top,
+                        scroll_height: 100,
+                        client_height: 20,
+                        user_scrolled_up: true,
+                    },
+                );
+            }
+
+            state.forget_project_view_memory(&removed_project);
+
+            assert!(
+                !state
+                    .project_view_memory
+                    .with_untracked(|memories| memories.contains_key(&removed_project))
+            );
+            assert!(
+                state
+                    .project_view_memory
+                    .with_untracked(|memories| memories.contains_key(&survivor_project))
+            );
+            assert_eq!(
+                state.tab_lru.get_untracked(),
+                vec![current_survivor, remembered_survivor]
+            );
+            assert_eq!(state.tab_scroll_state_untracked(removed_home), None);
+            assert_eq!(state.tab_scroll_state_untracked(removed_chat), None);
+            assert_eq!(
+                state
+                    .tab_scroll_state_untracked(current_survivor)
+                    .map(|scroll| scroll.scroll_top),
+                Some(30)
+            );
+            assert_eq!(
+                state
+                    .tab_scroll_state_untracked(remembered_survivor)
+                    .map(|scroll| scroll.scroll_top),
+                Some(40)
+            );
+        });
+    }
+
+    #[test]
+    fn compaction_cleanup_forgets_removed_occurrences_in_current_and_memory() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host_id = "host-a";
+            let agent_id = AgentId("compacted-agent".to_owned());
+            let agent_ref = ActiveAgentRef {
+                host_id: host_id.to_owned(),
+                agent_id: agent_id.clone(),
+            };
+            let current_survivor = state
+                .center_zone
+                .with_untracked(|center_zone| center_zone.active_tab_id())
+                .expect("home tab");
+            let current_removed = state
+                .center_zone
+                .try_update(|center_zone| {
+                    center_zone.open(
+                        TabContent::chat_with_agent(agent_ref.clone()),
+                        "Current agent".to_owned(),
+                        true,
+                    )
+                })
+                .expect("current chat opens");
+
+            let mut remembered = CenterZoneState::default();
+            let memory_survivor = remembered.active_tab_id().expect("remembered home tab");
+            let memory_removed = remembered.open(
+                TabContent::chat_with_agent(agent_ref),
+                "Remembered agent".to_owned(),
+                true,
+            );
+            let remembered_project = ActiveProjectRef {
+                host_id: host_id.to_owned(),
+                project_id: ProjectId("remembered".to_owned()),
+            };
+            state.project_view_memory.update(|memories| {
+                memories.insert(
+                    remembered_project.clone(),
+                    ProjectViewMemory {
+                        center_zone: Some(remembered),
+                        ..ProjectViewMemory::default()
+                    },
+                );
+            });
+
+            state.tab_lru.set(vec![
+                current_removed,
+                memory_removed,
+                current_survivor,
+                memory_survivor,
+            ]);
+            for (tab, scroll_top) in [
+                (current_removed, 10),
+                (memory_removed, 20),
+                (current_survivor, 30),
+                (memory_survivor, 40),
+            ] {
+                state.save_tab_scroll_state(
+                    tab,
+                    TabScrollState {
+                        scroll_top,
+                        scroll_height: 100,
+                        client_height: 20,
+                        user_scrolled_up: true,
+                    },
+                );
+            }
+
+            state.finalize_compaction_close(host_id, &agent_id);
+
+            assert!(
+                state
+                    .center_zone
+                    .with_untracked(|center_zone| center_zone.tab(current_removed).is_none())
+            );
+            assert!(state.project_view_memory.with_untracked(|memories| {
+                memories
+                    .get(&remembered_project)
+                    .and_then(|memory| memory.center_zone.as_ref())
+                    .is_some_and(|center_zone| center_zone.tab(memory_removed).is_none())
+            }));
+            assert!(state.tab_lru.with_untracked(|lru| {
+                !lru.contains(&current_removed) && !lru.contains(&memory_removed)
+            }));
+            assert_eq!(state.tab_scroll_state_untracked(current_removed), None);
+            assert_eq!(state.tab_scroll_state_untracked(memory_removed), None);
+            assert_eq!(
+                state
+                    .tab_scroll_state_untracked(current_survivor)
+                    .map(|scroll| scroll.scroll_top),
+                Some(30)
+            );
+            assert_eq!(
+                state
+                    .tab_scroll_state_untracked(memory_survivor)
+                    .map(|scroll| scroll.scroll_top),
+                Some(40)
+            );
+        });
+    }
+
+    #[test]
+    fn host_cleanup_forgets_removed_occurrences_in_current_and_memory() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host_a = "host-a";
+            let host_b = "host-b";
+            let project_a = ProjectId("project-a".to_owned());
+            let project_b = ProjectId("project-b".to_owned());
+            let root = ProjectRootPath("/repo".to_owned());
+            let current_survivor = state
+                .center_zone
+                .with_untracked(|center_zone| center_zone.active_tab_id())
+                .expect("home tab");
+            let current_removed = state
+                .center_zone
+                .try_update(|center_zone| {
+                    center_zone.open(
+                        TabContent::Diff {
+                            host_id: host_a.to_owned(),
+                            project_id: project_a.clone(),
+                            root: root.clone(),
+                            scope: ProjectDiffScope::Unstaged,
+                            path: "src/current.rs".to_owned(),
+                        },
+                        "Current diff".to_owned(),
+                        true,
+                    )
+                })
+                .expect("current diff opens");
+
+            let mut remembered = CenterZoneState::default();
+            let memory_survivor = remembered.open(
+                TabContent::Diff {
+                    host_id: host_b.to_owned(),
+                    project_id: project_b.clone(),
+                    root: root.clone(),
+                    scope: ProjectDiffScope::Unstaged,
+                    path: "src/survivor.rs".to_owned(),
+                },
+                "Surviving diff".to_owned(),
+                true,
+            );
+            let memory_removed = remembered.open(
+                TabContent::Diff {
+                    host_id: host_a.to_owned(),
+                    project_id: project_a.clone(),
+                    root: root.clone(),
+                    scope: ProjectDiffScope::Staged,
+                    path: "src/remembered.rs".to_owned(),
+                },
+                "Remembered diff".to_owned(),
+                true,
+            );
+            let remembered_project = ActiveProjectRef {
+                host_id: host_b.to_owned(),
+                project_id: project_b.clone(),
+            };
+            let mut discarded_memory = CenterZoneState::default();
+            let discarded_file = discarded_memory.open(
+                TabContent::File {
+                    key: resource_key(host_a, &project_a.0, test_path("discarded-host-file")),
+                },
+                "Discarded file".to_owned(),
+                true,
+            );
+            let discarded_project = ActiveProjectRef {
+                host_id: host_a.to_owned(),
+                project_id: project_a,
+            };
+            state.project_view_memory.update(|memories| {
+                memories.insert(
+                    remembered_project.clone(),
+                    ProjectViewMemory {
+                        center_zone: Some(remembered),
+                        ..ProjectViewMemory::default()
+                    },
+                );
+                memories.insert(
+                    discarded_project.clone(),
+                    ProjectViewMemory {
+                        center_zone: Some(discarded_memory),
+                        ..ProjectViewMemory::default()
+                    },
+                );
+            });
+
+            state.tab_lru.set(vec![
+                current_removed,
+                memory_removed,
+                current_survivor,
+                memory_survivor,
+                discarded_file,
+            ]);
+            for (tab, scroll_top) in [
+                (current_removed, 11),
+                (memory_removed, 22),
+                (current_survivor, 33),
+                (memory_survivor, 44),
+                (discarded_file, 55),
+            ] {
+                state.save_tab_scroll_state(
+                    tab,
+                    TabScrollState {
+                        scroll_top,
+                        scroll_height: 100,
+                        client_height: 20,
+                        user_scrolled_up: true,
+                    },
+                );
+            }
+
+            state.clear_host_runtime(host_a);
+
+            assert!(
+                state
+                    .center_zone
+                    .with_untracked(|center_zone| center_zone.tab(current_removed).is_none())
+            );
+            assert!(state.project_view_memory.with_untracked(|memories| {
+                memories
+                    .get(&remembered_project)
+                    .and_then(|memory| memory.center_zone.as_ref())
+                    .is_some_and(|center_zone| {
+                        center_zone.tab(memory_removed).is_none()
+                            && center_zone.tab(memory_survivor).is_some()
+                    })
+            }));
+            assert!(
+                !state
+                    .project_view_memory
+                    .with_untracked(|memories| memories.contains_key(&discarded_project))
+            );
+            assert!(state.tab_lru.with_untracked(|lru| {
+                !lru.contains(&current_removed)
+                    && !lru.contains(&memory_removed)
+                    && !lru.contains(&discarded_file)
+            }));
+            assert_eq!(state.tab_scroll_state_untracked(current_removed), None);
+            assert_eq!(state.tab_scroll_state_untracked(memory_removed), None);
+            assert_eq!(state.tab_scroll_state_untracked(discarded_file), None);
+            assert_eq!(
+                state
+                    .tab_scroll_state_untracked(current_survivor)
+                    .map(|scroll| scroll.scroll_top),
+                Some(33)
+            );
+            assert_eq!(
+                state
+                    .tab_scroll_state_untracked(memory_survivor)
+                    .map(|scroll| scroll.scroll_top),
+                Some(44)
+            );
+        });
+    }
+
+    #[test]
     fn clear_host_runtime_closes_host_tabs_even_without_agent_record() {
         let owner = leptos::reactive::owner::Owner::new();
         owner.with(|| {
@@ -5014,7 +6863,7 @@ mod tests {
             state.clear_host_runtime(host_a);
 
             assert!(state.center_zone.with_untracked(|cz| {
-                cz.tabs.iter().all(|tab| match &tab.content {
+                cz.tabs().iter().all(|tab| match &tab.content {
                     TabContent::Chat {
                         agent_ref,
                         pending_team_member,
@@ -5033,11 +6882,9 @@ mod tests {
                     TabContent::Home | TabContent::AgentMonitor | TabContent::File { .. } => true,
                 })
             }));
-            assert!(
-                state.center_zone.with_untracked(|cz| {
-                    cz.tabs.iter().any(|tab| Some(tab.id) == host_b_tab_id)
-                })
-            );
+            assert!(state.center_zone.with_untracked(|cz| {
+                cz.tabs().iter().any(|tab| Some(tab.id) == host_b_tab_id)
+            }));
             assert!(state.tab_lru.with_untracked(|lru| {
                 host_a_tab_ids.iter().all(|tab_id| !lru.contains(tab_id))
             }));
@@ -5050,10 +6897,11 @@ mod tests {
         owner.with(|| {
             let state = AppState::new();
             let file_path = test_path("file_d");
+            let file_key = test_file_key(file_path.clone());
             state.center_zone.update(|cz| {
                 cz.open(
                     TabContent::File {
-                        path: file_path.clone(),
+                        key: file_key.clone(),
                     },
                     "file_d.txt".to_string(),
                     true,
@@ -5061,7 +6909,7 @@ mod tests {
             });
             state.open_files.update(|m| {
                 m.insert(
-                    file_path.clone(),
+                    file_key.clone(),
                     OpenFile {
                         path: file_path.clone(),
                         version: ProjectFileVersion(1),
@@ -5071,18 +6919,1509 @@ mod tests {
                 );
             });
 
-            let tab_count_before = state.center_zone.with_untracked(|cz| cz.tabs.len());
+            let tab_count_before = state.center_zone.with_untracked(|cz| cz.tabs().len());
             state.close_tabs_to_right(TabId(999_998));
 
             assert_eq!(
-                state.center_zone.with_untracked(|cz| cz.tabs.len()),
+                state.center_zone.with_untracked(|cz| cz.tabs().len()),
                 tab_count_before
             );
             assert!(
                 state
                     .open_files
-                    .with_untracked(|m| m.contains_key(&file_path))
+                    .with_untracked(|m| m.contains_key(&file_key))
             );
+        });
+    }
+
+    fn resource_key(host: &str, project: &str, path: ProjectPath) -> FileResourceKey {
+        FileResourceKey {
+            host_id: host.to_string(),
+            project_id: ProjectId(project.to_string()),
+            path,
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct CenterSnapshot {
+        focused: PaneId,
+        ratio: Option<SplitRatio>,
+        panes: Vec<PaneSnapshot>,
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct PaneSnapshot {
+        pane: PaneId,
+        active: Option<TabId>,
+        tabs: Vec<(TabId, TabContent, String, bool)>,
+    }
+
+    fn center_snapshot(center_zone: &CenterZoneState) -> CenterSnapshot {
+        CenterSnapshot {
+            focused: center_zone.focused_id(),
+            ratio: center_zone.split_ratio(),
+            panes: center_zone
+                .panes()
+                .map(|(pane, state)| PaneSnapshot {
+                    pane,
+                    active: state.active_tab_id,
+                    tabs: state
+                        .tabs
+                        .iter()
+                        .map(|tab| {
+                            (
+                                tab.id,
+                                tab.content.clone(),
+                                tab.label.clone(),
+                                tab.closeable,
+                            )
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+
+    fn install_loaded_file(state: &AppState, pane: PaneId, key: FileResourceKey) -> TabId {
+        state.open_files.update(|files| {
+            files.insert(
+                key.clone(),
+                OpenFile {
+                    path: key.path.clone(),
+                    version: ProjectFileVersion(1),
+                    contents: Some("one\ntwo\nthree".to_string()),
+                    is_binary: false,
+                },
+            );
+        });
+        state
+            .open_tab_in(pane, TabContent::File { key }, "main.rs".to_string(), true)
+            .expect("loaded file opens")
+    }
+
+    #[test]
+    fn split_ratio_clamps_every_constructor_input() {
+        assert_eq!(SplitRatio::new(-1.0).get(), SplitRatio::MIN);
+        assert_eq!(SplitRatio::new(2.0).get(), SplitRatio::MAX);
+        assert_eq!(SplitRatio::new(f64::NAN).get(), SplitRatio::DEFAULT);
+        assert_eq!(SplitRatio::new(f64::INFINITY).get(), SplitRatio::DEFAULT);
+    }
+
+    #[test]
+    fn duplicate_file_eligibility_distinguishes_refusals_without_mutation() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let home = state
+                .center_zone
+                .with_untracked(|center_zone| center_zone.active_tab_id())
+                .expect("home tab");
+            let before_home = state.center_zone.with_untracked(center_snapshot);
+            let not_a_file = state.duplicate_file_eligibility_at(OpenTarget::Beside, home);
+            assert_eq!(not_a_file, DuplicateFileEligibility::NotAFile);
+            assert_eq!(
+                not_a_file.disabled_reason(),
+                Some(DUPLICATE_FILE_NOT_A_FILE_REASON)
+            );
+            assert_eq!(
+                state.duplicate_file_at_result(OpenTarget::Beside, home),
+                DuplicateFileResult::NotAFile
+            );
+            assert_eq!(
+                state.center_zone.with_untracked(center_snapshot),
+                before_home
+            );
+
+            state.tabs_enabled.set(false);
+            let tabs_disabled = state.duplicate_file_eligibility_at(OpenTarget::Beside, home);
+            assert_eq!(tabs_disabled, DuplicateFileEligibility::TabsDisabled);
+            assert_eq!(
+                tabs_disabled.disabled_reason(),
+                Some(DUPLICATE_FILE_TABS_DISABLED_REASON)
+            );
+            assert_eq!(
+                state.duplicate_file_at_result(OpenTarget::Beside, home),
+                DuplicateFileResult::TabsDisabled
+            );
+            assert_eq!(
+                state.center_zone.with_untracked(center_snapshot),
+                before_home
+            );
+
+            state.tabs_enabled.set(true);
+            let missing = state.duplicate_file_eligibility_in(PaneId::Secondary, TabId(u64::MAX));
+            assert_eq!(missing, DuplicateFileEligibility::SourceTabMissing);
+            assert_eq!(
+                missing.disabled_reason(),
+                Some(DUPLICATE_FILE_SOURCE_MISSING_REASON)
+            );
+            assert_eq!(
+                state.duplicate_file_in_result(PaneId::Secondary, TabId(u64::MAX)),
+                DuplicateFileResult::SourceTabMissing
+            );
+            assert_eq!(
+                state.center_zone.with_untracked(center_snapshot),
+                before_home
+            );
+
+            let unloaded = state
+                .open_tab_in(
+                    PaneId::Primary,
+                    TabContent::File {
+                        key: resource_key("h", "p", test_path("typed-unloaded")),
+                    },
+                    "loading.rs".to_owned(),
+                    true,
+                )
+                .expect("unloaded file tab");
+            let before_unloaded = state.center_zone.with_untracked(center_snapshot);
+            let not_loaded = state.duplicate_file_eligibility_in(PaneId::Secondary, unloaded);
+            assert_eq!(not_loaded, DuplicateFileEligibility::NotLoaded);
+            assert_eq!(
+                not_loaded.disabled_reason(),
+                Some(DUPLICATE_FILE_NOT_LOADED_REASON)
+            );
+            let refused = state.duplicate_file_in_result(PaneId::Secondary, unloaded);
+            assert_eq!(refused, DuplicateFileResult::NotLoaded);
+            assert_eq!(
+                refused.disabled_reason(),
+                Some(DUPLICATE_FILE_NOT_LOADED_REASON)
+            );
+            assert_eq!(
+                state.center_zone.with_untracked(center_snapshot),
+                before_unloaded
+            );
+        });
+    }
+
+    #[test]
+    fn duplicate_file_result_duplicates_then_activates_existing_occurrence() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let key = resource_key("h", "p", test_path("typed-duplicate"));
+            let primary = install_loaded_file(&state, PaneId::Primary, key.clone());
+            let before_query = state.center_zone.with_untracked(center_snapshot);
+            assert_eq!(
+                state.duplicate_file_eligibility_in(PaneId::Secondary, primary),
+                DuplicateFileEligibility::Enabled
+            );
+            assert_eq!(
+                state.center_zone.with_untracked(center_snapshot),
+                before_query
+            );
+
+            let duplicated = state.duplicate_file_in_result(PaneId::Secondary, primary);
+            let DuplicateFileResult::Duplicated {
+                source,
+                tab: secondary,
+                target,
+            } = duplicated
+            else {
+                panic!("loaded file should duplicate: {duplicated:?}");
+            };
+            assert_eq!(source, primary);
+            assert_eq!(target, PaneId::Secondary);
+            assert_ne!(secondary, primary);
+            assert_eq!(duplicated.disabled_reason(), None);
+            assert_eq!(
+                state.center_zone.with_untracked(|center_zone| {
+                    center_zone.occurrences(&TabContent::File { key: key.clone() })
+                }),
+                vec![(PaneId::Primary, primary), (PaneId::Secondary, secondary)]
+            );
+
+            assert!(state.reveal_tab(primary));
+            let before_existing_query = state.center_zone.with_untracked(center_snapshot);
+            let already_present = state.duplicate_file_eligibility_in(PaneId::Secondary, primary);
+            assert_eq!(
+                already_present,
+                DuplicateFileEligibility::TargetAlreadyContainsResource {
+                    existing: secondary
+                }
+            );
+            assert!(already_present.is_enabled());
+            assert_eq!(already_present.disabled_reason(), None);
+            assert_eq!(
+                state.center_zone.with_untracked(center_snapshot),
+                before_existing_query
+            );
+
+            assert_eq!(
+                state.duplicate_file_in_result(PaneId::Secondary, primary),
+                DuplicateFileResult::ActivatedExisting {
+                    source: primary,
+                    existing: secondary,
+                    target: PaneId::Secondary,
+                }
+            );
+            state.center_zone.with_untracked(|center_zone| {
+                assert_eq!(center_zone.focused_id(), PaneId::Secondary);
+                assert_eq!(
+                    center_zone.pane_active_tab_id(PaneId::Secondary),
+                    Some(secondary)
+                );
+                assert_eq!(
+                    center_zone.occurrences(&TabContent::File { key }),
+                    vec![(PaneId::Primary, primary), (PaneId::Secondary, secondary)]
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn file_may_have_one_occurrence_per_pane() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let key = resource_key("h", "p", test_path("unique"));
+            let primary = install_loaded_file(&state, PaneId::Primary, key.clone());
+            let secondary = state
+                .duplicate_file_at_result(OpenTarget::Beside, primary)
+                .tab_id()
+                .expect("loaded file duplicates beside");
+
+            assert_ne!(primary, secondary);
+            assert_eq!(
+                state.center_zone.with_untracked(|center_zone| {
+                    center_zone
+                        .occurrences(&TabContent::File { key: key.clone() })
+                        .len()
+                }),
+                2
+            );
+            state.activate_tab(primary);
+            assert_eq!(
+                state.duplicate_file_at_result(OpenTarget::Beside, primary),
+                DuplicateFileResult::ActivatedExisting {
+                    source: primary,
+                    existing: secondary,
+                    target: PaneId::Secondary,
+                },
+                "a second duplicate in the same pane activates the existing occurrence"
+            );
+            assert_eq!(state.open_files.with_untracked(|files| files.len()), 1);
+            assert!(
+                state
+                    .pending_file_opens
+                    .with_untracked(|pending| pending.is_empty())
+            );
+        });
+    }
+
+    #[test]
+    fn unloaded_file_cannot_be_duplicated() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let key = resource_key("h", "p", test_path("loading"));
+            let tab = state
+                .open_tab_in(
+                    PaneId::Primary,
+                    TabContent::File { key },
+                    "loading.txt".to_string(),
+                    true,
+                )
+                .expect("first occurrence opens");
+            assert_eq!(
+                state.duplicate_file_at_result(OpenTarget::Beside, tab),
+                DuplicateFileResult::NotLoaded
+            );
+            assert!(!state.center_zone.with_untracked(CenterZoneState::is_split));
+        });
+    }
+
+    #[test]
+    fn chats_are_nonduplicable_across_panes() {
+        let mut center_zone = CenterZoneState::default();
+        let chat = TabContent::empty_chat();
+        let first = center_zone.open(chat.clone(), "Chat".to_string(), true);
+        let second = center_zone.open_in(
+            PaneId::Secondary,
+            chat.clone(),
+            "Chat".to_string(),
+            true,
+            SplitRatio::default(),
+        );
+        assert_eq!(first, second);
+        assert_eq!(center_zone.occurrences(&chat).len(), 1);
+        assert!(!center_zone.is_split());
+    }
+
+    #[test]
+    fn duplicate_occurrences_have_independent_scroll_state() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let key = resource_key("h", "p", test_path("scroll"));
+            let primary = install_loaded_file(&state, PaneId::Primary, key);
+            let secondary = state
+                .duplicate_file_at_result(OpenTarget::Beside, primary)
+                .tab_id()
+                .expect("duplicate");
+            state.save_tab_scroll_state(
+                primary,
+                TabScrollState {
+                    scroll_top: 10,
+                    scroll_height: 100,
+                    client_height: 20,
+                    user_scrolled_up: true,
+                },
+            );
+            state.save_tab_scroll_state(
+                secondary,
+                TabScrollState {
+                    scroll_top: 70,
+                    scroll_height: 100,
+                    client_height: 20,
+                    user_scrolled_up: false,
+                },
+            );
+            assert_ne!(
+                state.tab_scroll_state_untracked(primary),
+                state.tab_scroll_state_untracked(secondary)
+            );
+        });
+    }
+
+    #[test]
+    fn closing_one_of_two_occurrences_keeps_contents_and_subscription() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let key = resource_key("h", "p", test_path("shared"));
+            let primary = install_loaded_file(&state, PaneId::Primary, key.clone());
+            let secondary = state
+                .duplicate_file_at_result(OpenTarget::Beside, primary)
+                .tab_id()
+                .expect("duplicate");
+            let intel_key = CodeIntelKey {
+                host_id: key.host_id.clone(),
+                project_id: key.project_id.clone(),
+                path: key.path.clone(),
+            };
+            state.code_intel.update(|map| {
+                map.insert(intel_key.clone(), CodeIntelFileState::default());
+            });
+
+            state.close_tab(primary);
+            assert!(
+                state
+                    .open_files
+                    .with_untracked(|files| files.contains_key(&key))
+            );
+            assert!(
+                state
+                    .code_intel
+                    .with_untracked(|map| map.contains_key(&intel_key))
+            );
+            assert!(
+                state
+                    .center_zone
+                    .with_untracked(|center_zone| center_zone.tab(secondary).is_some())
+            );
+
+            state.close_tab(secondary);
+            assert!(
+                !state
+                    .open_files
+                    .with_untracked(|files| files.contains_key(&key))
+            );
+            assert!(
+                !state
+                    .code_intel
+                    .with_untracked(|map| map.contains_key(&intel_key))
+            );
+        });
+    }
+
+    #[test]
+    fn close_all_tabs_with_two_occurrences_releases_exactly_once() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let key = resource_key("h", "p", test_path("bulk"));
+            let primary = install_loaded_file(&state, PaneId::Primary, key.clone());
+            let secondary = state
+                .duplicate_file_at_result(OpenTarget::Beside, primary)
+                .tab_id()
+                .expect("duplicate");
+            let doomed = HashSet::from([primary, secondary]);
+            let (survivors, released) = state.backing_release_projection(&doomed);
+            assert!(survivors.is_empty());
+            assert_eq!(
+                released,
+                HashSet::from([BackingResource::File(key.clone())])
+            );
+            state.close_tabs(doomed);
+            assert!(
+                !state
+                    .open_files
+                    .with_untracked(|files| files.contains_key(&key))
+            );
+        });
+    }
+
+    #[test]
+    fn closing_file_in_one_project_keeps_same_path_code_intel_in_another() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let path = test_path("same");
+            let key_a = resource_key("h", "a", path.clone());
+            let key_b = resource_key("h", "b", path);
+            let tab_b = install_loaded_file(&state, PaneId::Primary, key_b.clone());
+            state.open_files.update(|files| {
+                files.insert(
+                    key_a.clone(),
+                    OpenFile {
+                        path: key_a.path.clone(),
+                        version: ProjectFileVersion(1),
+                        contents: Some("a".to_string()),
+                        is_binary: false,
+                    },
+                );
+            });
+            let intel_a = CodeIntelKey {
+                host_id: key_a.host_id.clone(),
+                project_id: key_a.project_id.clone(),
+                path: key_a.path.clone(),
+            };
+            let intel_b = CodeIntelKey {
+                host_id: key_b.host_id.clone(),
+                project_id: key_b.project_id.clone(),
+                path: key_b.path.clone(),
+            };
+            state.code_intel.update(|map| {
+                map.insert(intel_a.clone(), CodeIntelFileState::default());
+                map.insert(intel_b.clone(), CodeIntelFileState::default());
+            });
+
+            state.close_tab(tab_b);
+            assert!(
+                state
+                    .code_intel
+                    .with_untracked(|map| map.contains_key(&intel_a))
+            );
+            assert!(
+                !state
+                    .code_intel
+                    .with_untracked(|map| map.contains_key(&intel_b))
+            );
+            assert!(
+                state
+                    .open_files
+                    .with_untracked(|files| files.contains_key(&key_a))
+            );
+        });
+    }
+
+    #[test]
+    fn goto_line_and_offset_target_only_one_occurrence() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let key = resource_key("h", "p", test_path("goto"));
+            let primary = install_loaded_file(&state, PaneId::Primary, key);
+            let secondary = state
+                .duplicate_file_at_result(OpenTarget::Beside, primary)
+                .tab_id()
+                .expect("duplicate");
+            state.target_file_navigation(primary, PendingFileNavigation::Line(12));
+            assert_eq!(state.pending_goto_line.get_untracked(), Some((primary, 12)));
+            assert_ne!(
+                state.pending_goto_line.get_untracked(),
+                Some((secondary, 12))
+            );
+            state.target_file_navigation(secondary, PendingFileNavigation::Offset(44));
+            assert_eq!(
+                state.pending_goto_offset.get_untracked(),
+                Some((secondary, 44))
+            );
+        });
+    }
+
+    #[test]
+    fn current_file_occurrence_requires_exact_tab_resource_and_version() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let key = resource_key("h", "p", test_path("current"));
+            let other_project = resource_key("h", "other", key.path.clone());
+            let primary = install_loaded_file(&state, PaneId::Primary, key.clone());
+            let secondary = state
+                .duplicate_file_at_result(OpenTarget::Beside, primary)
+                .tab_id()
+                .expect("duplicate");
+
+            assert!(state.file_occurrence_is_current(primary, &key, ProjectFileVersion(1)));
+            assert!(state.file_occurrence_is_current(secondary, &key, ProjectFileVersion(1)));
+            assert!(!state.file_occurrence_is_current(
+                primary,
+                &other_project,
+                ProjectFileVersion(1)
+            ));
+            assert!(!state.file_occurrence_is_current(primary, &key, ProjectFileVersion(2)));
+        });
+    }
+
+    #[test]
+    fn duplicate_occurrence_navigation_targets_only_the_requested_side() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let key = resource_key("h", "p", test_path("side-navigation"));
+            let primary = install_loaded_file(&state, PaneId::Primary, key.clone());
+            let secondary = state
+                .duplicate_file_at_result(OpenTarget::Beside, primary)
+                .tab_id()
+                .expect("duplicate");
+
+            state.target_file_navigation(secondary, PendingFileNavigation::Offset(81));
+
+            assert_eq!(
+                state.file_occurrence_in(PaneId::Primary, &key),
+                Some(primary)
+            );
+            assert_eq!(
+                state.file_occurrence_in(PaneId::Secondary, &key),
+                Some(secondary)
+            );
+            assert_eq!(
+                state.pending_goto_offset.get_untracked(),
+                Some((secondary, 81))
+            );
+            assert_ne!(
+                state.pending_goto_offset.get_untracked(),
+                Some((primary, 81))
+            );
+        });
+    }
+
+    #[test]
+    fn closing_hover_owner_clears_only_that_occurrence_context() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let key = resource_key("h", "p", test_path("hover-owner"));
+            let primary = install_loaded_file(&state, PaneId::Primary, key.clone());
+            let secondary = state
+                .duplicate_file_at_result(OpenTarget::Beside, primary)
+                .tab_id()
+                .expect("duplicate");
+            state.code_intel_hover.set(Some(HoverPopover {
+                hover_id: 3,
+                tab: secondary,
+                key,
+                version: ProjectFileVersion(1),
+                offset: 2,
+                anchor_left: 1.0,
+                anchor_top: 2.0,
+                anchor_bottom: 3.0,
+                contents: Some("hover".to_owned()),
+            }));
+
+            state.close_tab(primary);
+            assert!(
+                state
+                    .code_intel_hover
+                    .with_untracked(|hover| hover.is_some())
+            );
+            state.close_tab(secondary);
+            assert!(
+                state
+                    .code_intel_hover
+                    .with_untracked(|hover| hover.is_none())
+            );
+        });
+    }
+
+    #[test]
+    fn user_open_supersedes_refresh_and_refresh_never_supersedes_open() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let key = resource_key("h", "p", test_path("pending"));
+            state.record_pending_file_open(key.clone(), PendingFileOpen::RefreshInPlace);
+            let open = PendingFileOpen::Open {
+                destination: PendingOpenDestination::new(PaneId::Secondary),
+                navigation: Some(PendingFileNavigation::Line(9)),
+            };
+            state.record_pending_file_open(key.clone(), open);
+            state.record_pending_file_open(key.clone(), PendingFileOpen::RefreshInPlace);
+            assert_eq!(state.take_pending_file_open(&key), Some(open));
+        });
+    }
+
+    #[test]
+    fn pending_open_destination_survives_focus_change() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let key = resource_key("h", "p", test_path("destination"));
+            state.record_pending_file_open(
+                key.clone(),
+                PendingFileOpen::Open {
+                    destination: PendingOpenDestination::new(PaneId::Secondary),
+                    navigation: None,
+                },
+            );
+            state.focus_pane(PaneId::Primary);
+            let Some(PendingFileOpen::Open { destination, .. }) =
+                state.take_pending_file_open(&key)
+            else {
+                panic!("open intent retained");
+            };
+            assert_eq!(destination.pane(), PaneId::Secondary);
+        });
+    }
+
+    #[test]
+    fn active_agent_and_pending_member_follow_composer_owner() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let file = resource_key("h", "p", test_path("composer"));
+            let file_tab = install_loaded_file(&state, PaneId::Primary, file);
+            let member_id = TeamMemberId("member".to_string());
+            let draft = state
+                .open_tab_in(
+                    PaneId::Secondary,
+                    TabContent::team_member_draft("h".to_string(), member_id.clone()),
+                    "Member".to_string(),
+                    true,
+                )
+                .expect("draft opens beside");
+            state.activate_tab(file_tab);
+            assert_eq!(
+                state
+                    .center_zone
+                    .with_untracked(CenterZoneState::composer_owner),
+                Some((PaneId::Secondary, draft))
+            );
+            assert_eq!(
+                state.composer_pending_team_member_untracked(),
+                Some(PendingTeamMember {
+                    host_id: "h".to_string(),
+                    member_id,
+                })
+            );
+        });
+    }
+
+    #[test]
+    fn project_switch_round_trips_split_layout_and_ratio() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let project_a = ActiveProjectRef {
+                host_id: "h".to_string(),
+                project_id: ProjectId("a".to_string()),
+            };
+            let project_b = ActiveProjectRef {
+                host_id: "h".to_string(),
+                project_id: ProjectId("b".to_string()),
+            };
+            state.switch_active_project(Some(project_a.clone()));
+            install_loaded_file(
+                &state,
+                PaneId::Primary,
+                resource_key("h", "a", test_path("memory")),
+            );
+            state
+                .open_tab_in(
+                    PaneId::Secondary,
+                    TabContent::chat_with_agent(ActiveAgentRef {
+                        host_id: "h".to_string(),
+                        agent_id: AgentId("memory-agent".to_string()),
+                    }),
+                    "Chat".to_string(),
+                    true,
+                )
+                .expect("split");
+            state.set_split_ratio(SplitRatio::new(0.7));
+
+            state.switch_active_project(Some(project_b));
+            assert!(!state.center_zone.with_untracked(CenterZoneState::is_split));
+            state.switch_active_project(Some(project_a));
+            assert!(state.center_zone.with_untracked(CenterZoneState::is_split));
+            assert_eq!(
+                state
+                    .center_zone
+                    .with_untracked(CenterZoneState::split_ratio)
+                    .map(SplitRatio::get),
+                Some(0.7)
+            );
+        });
+    }
+
+    #[test]
+    fn active_agent_follows_chat_pane_when_file_pane_is_focused() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let file = install_loaded_file(
+                &state,
+                PaneId::Primary,
+                resource_key("h", "p", test_path("agent-owner")),
+            );
+            let agent = ActiveAgentRef {
+                host_id: "h".to_string(),
+                agent_id: AgentId("agent".to_string()),
+            };
+            state
+                .open_tab_in(
+                    PaneId::Secondary,
+                    TabContent::chat_with_agent(agent.clone()),
+                    "Agent".to_string(),
+                    true,
+                )
+                .expect("chat opens beside");
+            state.activate_tab(file);
+            assert_eq!(state.active_agent.get_untracked(), Some(agent));
+        });
+    }
+
+    #[test]
+    fn move_to_other_pane_preserves_tab_and_scroll_state() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let file = install_loaded_file(
+                &state,
+                PaneId::Primary,
+                resource_key("h", "p", test_path("move")),
+            );
+            state.save_tab_scroll_state(
+                file,
+                TabScrollState {
+                    scroll_top: 33,
+                    scroll_height: 200,
+                    client_height: 50,
+                    user_scrolled_up: true,
+                },
+            );
+            state
+                .open_tab_in(
+                    PaneId::Secondary,
+                    TabContent::empty_chat(),
+                    "Chat".to_string(),
+                    true,
+                )
+                .expect("split");
+            assert!(matches!(
+                state.move_tab_to(PaneId::Secondary, file),
+                MoveTabResult::Moved { tab, .. } if tab == file
+            ));
+            assert_eq!(
+                state
+                    .center_zone
+                    .with_untracked(|center_zone| center_zone.locate_tab(file)),
+                Some(PaneId::Secondary)
+            );
+            assert_eq!(
+                state
+                    .tab_scroll_state_untracked(file)
+                    .map(|scroll| scroll.scroll_top),
+                Some(33)
+            );
+        });
+    }
+
+    #[test]
+    fn reveal_tab_moves_pane_focus_but_set_active_tab_in_pane_does_not() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let file = install_loaded_file(
+                &state,
+                PaneId::Primary,
+                resource_key("h", "p", test_path("focus-owner")),
+            );
+            let first_chat = state
+                .open_tab_in(
+                    PaneId::Secondary,
+                    TabContent::chat_with_agent(ActiveAgentRef {
+                        host_id: "h".to_owned(),
+                        agent_id: AgentId("first".to_owned()),
+                    }),
+                    "First".to_owned(),
+                    true,
+                )
+                .expect("first chat");
+            let second_chat = state
+                .open_tab_in(
+                    PaneId::Secondary,
+                    TabContent::chat_with_agent(ActiveAgentRef {
+                        host_id: "h".to_owned(),
+                        agent_id: AgentId("second".to_owned()),
+                    }),
+                    "Second".to_owned(),
+                    true,
+                )
+                .expect("second chat");
+            assert!(state.reveal_tab(file));
+
+            assert!(state.set_active_tab_in_pane(PaneId::Secondary, first_chat));
+            let before_update = state.center_zone.with_untracked(|center_zone| {
+                (
+                    center_zone.focused_id(),
+                    center_zone
+                        .panes()
+                        .map(|(pane, state)| {
+                            (
+                                pane,
+                                state.active_tab_id,
+                                state.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            });
+            state.center_zone.with_untracked(|center_zone| {
+                assert_eq!(center_zone.focused_id(), PaneId::Primary);
+                assert_eq!(
+                    center_zone.pane_active_tab_id(PaneId::Secondary),
+                    Some(first_chat)
+                );
+            });
+
+            assert!(state.update_tab(
+                first_chat,
+                TabContent::chat_with_agent(ActiveAgentRef {
+                    host_id: "h".to_owned(),
+                    agent_id: AgentId("upgraded".to_owned()),
+                }),
+                "Upgraded".to_owned(),
+            ));
+            state.center_zone.with_untracked(|center_zone| {
+                assert_eq!(center_zone.focused_id(), PaneId::Primary);
+                assert_eq!(center_zone.pane_active_tab_id(PaneId::Primary), Some(file));
+                assert_eq!(
+                    center_zone.pane_active_tab_id(PaneId::Secondary),
+                    Some(first_chat)
+                );
+                assert_eq!(center_zone.locate_tab(second_chat), Some(PaneId::Secondary));
+                assert_eq!(
+                    (
+                        center_zone.focused_id(),
+                        center_zone
+                            .panes()
+                            .map(|(pane, state)| {
+                                (
+                                    pane,
+                                    state.active_tab_id,
+                                    state.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    before_update,
+                    "mutation-only updates preserve focus, both selections, and strip order"
+                );
+            });
+
+            assert!(state.reveal_tab(first_chat));
+            assert_eq!(
+                state
+                    .center_zone
+                    .with_untracked(CenterZoneState::focused_id),
+                PaneId::Secondary
+            );
+        });
+    }
+
+    #[test]
+    fn move_conflict_returns_authoritative_reason_without_mutation() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let primary = install_loaded_file(
+                &state,
+                PaneId::Primary,
+                resource_key("h", "p", test_path("move-conflict")),
+            );
+            let secondary = state
+                .duplicate_file_in_result(PaneId::Secondary, primary)
+                .tab_id()
+                .expect("duplicate occurrence");
+            assert!(state.reveal_tab(primary));
+            let before = state.center_zone.with_untracked(|center_zone| {
+                (
+                    center_zone.focused_id(),
+                    center_zone
+                        .panes()
+                        .map(|(pane, state)| {
+                            (
+                                pane,
+                                state.active_tab_id,
+                                state.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            });
+
+            assert_eq!(
+                state.move_tab_eligibility(PaneId::Secondary, primary),
+                MoveTabEligibility::ResourceAlreadyInTarget {
+                    existing: secondary
+                }
+            );
+            let result = state.move_tab_to(PaneId::Secondary, primary);
+            assert_eq!(
+                result,
+                MoveTabResult::ResourceAlreadyInTarget {
+                    existing: secondary
+                }
+            );
+            assert_eq!(
+                result.disabled_reason(),
+                Some(MOVE_RESOURCE_ALREADY_IN_TARGET_REASON)
+            );
+            let after = state.center_zone.with_untracked(|center_zone| {
+                (
+                    center_zone.focused_id(),
+                    center_zone
+                        .panes()
+                        .map(|(pane, state)| {
+                            (
+                                pane,
+                                state.active_tab_id,
+                                state.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            });
+            assert_eq!(after, before);
+        });
+    }
+
+    #[test]
+    fn move_refusal_conversion_rejects_success_and_preserves_refusal_data() {
+        let moved = MoveTabResult::Moved {
+            tab: TabId(10),
+            source: PaneId::Primary,
+            target: PaneId::Secondary,
+        };
+        assert_eq!(MoveTabRefusal::try_from(moved), Err(moved));
+        assert_eq!(
+            MoveTabRefusal::try_from(MoveTabResult::SourceTabMissing),
+            Ok(MoveTabRefusal::SourceTabMissing)
+        );
+        assert_eq!(
+            MoveTabRefusal::try_from(MoveTabResult::AlreadyInTargetPane),
+            Ok(MoveTabRefusal::AlreadyInTargetPane)
+        );
+        assert_eq!(
+            MoveTabRefusal::try_from(MoveTabResult::ResourceAlreadyInTarget {
+                existing: TabId(42),
+            }),
+            Ok(MoveTabRefusal::ResourceAlreadyInTarget {
+                existing: TabId(42),
+            })
+        );
+    }
+
+    #[test]
+    fn side_open_and_move_refusal_reasons_use_canonical_constants() {
+        let refusals = [
+            (MoveTabRefusal::SourceTabMissing, TAB_SOURCE_MISSING_REASON),
+            (
+                MoveTabRefusal::AlreadyInTargetPane,
+                MOVE_ALREADY_IN_TARGET_PANE_REASON,
+            ),
+            (
+                MoveTabRefusal::ResourceAlreadyInTarget {
+                    existing: TabId(77),
+                },
+                MOVE_RESOURCE_ALREADY_IN_TARGET_REASON,
+            ),
+        ];
+        for (refusal, reason) in refusals {
+            assert_eq!(refusal.disabled_reason(), reason);
+            assert_eq!(
+                AgentOpenToSideResult::MoveRefused(refusal).disabled_reason(),
+                Some(reason)
+            );
+            assert_eq!(
+                DiffOpenToSideResult::MoveRefused(refusal).disabled_reason(),
+                Some(reason)
+            );
+        }
+        assert_eq!(
+            MoveTabEligibility::AlreadyInTargetPane.disabled_reason(),
+            Some(MOVE_ALREADY_IN_TARGET_PANE_REASON)
+        );
+        assert_eq!(
+            MoveTabResult::AlreadyInTargetPane.disabled_reason(),
+            Some(MOVE_ALREADY_IN_TARGET_PANE_REASON)
+        );
+        assert_eq!(
+            AgentOpenToSideResult::TabsDisabled.disabled_reason(),
+            Some(CENTER_TABS_DISABLED_REASON)
+        );
+        assert_eq!(
+            AgentOpenToSideResult::CrossProject.disabled_reason(),
+            Some(AGENT_OPEN_TO_SIDE_CROSS_PROJECT_REASON)
+        );
+        assert_eq!(
+            AgentOpenToSideResult::NothingWouldRemain.disabled_reason(),
+            Some(OPEN_TO_SIDE_NOTHING_WOULD_REMAIN_REASON)
+        );
+    }
+
+    #[test]
+    fn agent_open_to_side_opens_moves_and_reveals_without_duplication() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let project = ActiveProjectRef {
+                host_id: "h".to_owned(),
+                project_id: ProjectId("p".to_owned()),
+            };
+            let state = AppState::new();
+            state.active_project.set(Some(project.clone()));
+            let file = install_loaded_file(
+                &state,
+                PaneId::Primary,
+                resource_key("h", "p", test_path("agent-side")),
+            );
+            let agent = ActiveAgentRef {
+                host_id: "h".to_owned(),
+                agent_id: AgentId("agent".to_owned()),
+            };
+            let before_query = state.center_zone.with_untracked(center_snapshot);
+            assert_eq!(
+                state.agent_open_to_side_eligibility(&agent, Some(&project)),
+                None
+            );
+            assert_eq!(
+                state.center_zone.with_untracked(center_snapshot),
+                before_query
+            );
+            let opened = state.open_agent_chat_to_side(
+                agent.clone(),
+                Some(project.clone()),
+                "Agent".to_owned(),
+            );
+            let AgentOpenToSideResult::Opened {
+                tab,
+                pane: PaneId::Secondary,
+            } = opened
+            else {
+                panic!("agent should open directly beside the file: {opened:?}");
+            };
+            assert_eq!(
+                state.center_zone.with_untracked(|center_zone| {
+                    center_zone.occurrences(&TabContent::chat_with_agent(agent.clone()))
+                }),
+                vec![(PaneId::Secondary, tab)]
+            );
+
+            assert!(state.reveal_tab(file));
+            let before_reveal_query = state.center_zone.with_untracked(center_snapshot);
+            assert_eq!(
+                state.agent_open_to_side_eligibility(&agent, Some(&project)),
+                None
+            );
+            assert_eq!(
+                state.center_zone.with_untracked(center_snapshot),
+                before_reveal_query
+            );
+            assert_eq!(
+                state.open_agent_chat_to_side(agent.clone(), Some(project), "Agent".to_owned(),),
+                AgentOpenToSideResult::Revealed {
+                    tab,
+                    pane: PaneId::Secondary,
+                }
+            );
+            assert_eq!(
+                state.center_zone.with_untracked(|center_zone| {
+                    center_zone.occurrences(&TabContent::chat_with_agent(agent))
+                }),
+                vec![(PaneId::Secondary, tab)]
+            );
+        });
+    }
+
+    #[test]
+    fn agent_open_to_side_moves_existing_chat_with_same_tab_id() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let agent = ActiveAgentRef {
+                host_id: "h".to_owned(),
+                agent_id: AgentId("move-agent".to_owned()),
+            };
+            state.open_tab(
+                TabContent::chat_with_agent(agent.clone()),
+                "Agent".to_owned(),
+                true,
+            );
+            let tab = state
+                .center_zone
+                .with_untracked(|center_zone| {
+                    center_zone.find_tab(&TabContent::chat_with_agent(agent.clone()))
+                })
+                .expect("chat tab");
+
+            let before_query = state.center_zone.with_untracked(center_snapshot);
+            assert_eq!(state.agent_open_to_side_eligibility(&agent, None), None);
+            assert_eq!(
+                state.center_zone.with_untracked(center_snapshot),
+                before_query
+            );
+
+            assert_eq!(
+                state.open_agent_chat_to_side(agent.clone(), None, "Agent".to_owned()),
+                AgentOpenToSideResult::Moved {
+                    tab,
+                    source: PaneId::Primary,
+                    target: PaneId::Secondary,
+                }
+            );
+            state.center_zone.with_untracked(|center_zone| {
+                assert_eq!(center_zone.locate_tab(tab), Some(PaneId::Secondary));
+                assert_eq!(
+                    center_zone.occurrences(&TabContent::chat_with_agent(agent)),
+                    vec![(PaneId::Secondary, tab)]
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn agent_open_to_side_eligibility_is_non_mutating_and_matches_refusals() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let agent = ActiveAgentRef {
+                host_id: "h".to_owned(),
+                agent_id: AgentId("blocked-agent".to_owned()),
+            };
+            let chat = make_tab(TabContent::chat_with_agent(agent.clone()), "Agent", true);
+            let tab = chat.id;
+            state.center_zone.set(CenterZoneState {
+                layout: CenterLayout::Single(PaneState {
+                    tabs: vec![chat],
+                    active_tab_id: Some(tab),
+                }),
+            });
+
+            let before = state.center_zone.with_untracked(center_snapshot);
+            let sole = state.agent_open_to_side_eligibility(&agent, None);
+            assert_eq!(sole, Some(AgentOpenToSideResult::NothingWouldRemain));
+            assert_eq!(
+                sole.and_then(AgentOpenToSideResult::disabled_reason),
+                Some("Nothing would be left in this pane.")
+            );
+            assert_eq!(state.center_zone.with_untracked(center_snapshot), before);
+            assert_eq!(
+                state.open_agent_chat_to_side(agent.clone(), None, "Agent".to_owned()),
+                sole.expect("sole-tab refusal")
+            );
+            assert_eq!(state.center_zone.with_untracked(center_snapshot), before);
+
+            state.tabs_enabled.set(false);
+            let tabs_disabled = state.agent_open_to_side_eligibility(&agent, None);
+            assert_eq!(tabs_disabled, Some(AgentOpenToSideResult::TabsDisabled));
+            assert_eq!(
+                tabs_disabled.and_then(AgentOpenToSideResult::disabled_reason),
+                Some("Enable tabs to use split view.")
+            );
+            assert_eq!(state.center_zone.with_untracked(center_snapshot), before);
+            assert_eq!(
+                state.open_agent_chat_to_side(agent.clone(), None, "Agent".to_owned()),
+                tabs_disabled.expect("tabs-disabled refusal")
+            );
+            assert_eq!(state.center_zone.with_untracked(center_snapshot), before);
+
+            state.tabs_enabled.set(true);
+            state.active_project.set(Some(ActiveProjectRef {
+                host_id: "h".to_owned(),
+                project_id: ProjectId("active".to_owned()),
+            }));
+            let other = ActiveProjectRef {
+                host_id: "h".to_owned(),
+                project_id: ProjectId("other".to_owned()),
+            };
+            let cross_project = state.agent_open_to_side_eligibility(&agent, Some(&other));
+            assert_eq!(cross_project, Some(AgentOpenToSideResult::CrossProject));
+            assert_eq!(
+                cross_project.and_then(AgentOpenToSideResult::disabled_reason),
+                Some(AGENT_OPEN_TO_SIDE_CROSS_PROJECT_REASON)
+            );
+            assert_eq!(state.center_zone.with_untracked(center_snapshot), before);
+            assert_eq!(
+                state.open_agent_chat_to_side(agent, Some(other), "Agent".to_owned()),
+                cross_project.expect("cross-project refusal")
+            );
+            assert_eq!(state.center_zone.with_untracked(center_snapshot), before);
+        });
+    }
+
+    #[test]
+    fn agent_open_to_side_refuses_sole_tab_and_cross_project() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let agent = ActiveAgentRef {
+                host_id: "h".to_owned(),
+                agent_id: AgentId("sole-agent".to_owned()),
+            };
+            let chat = make_tab(TabContent::chat_with_agent(agent.clone()), "Agent", true);
+            let tab = chat.id;
+            state.center_zone.set(CenterZoneState {
+                layout: CenterLayout::Single(PaneState {
+                    tabs: vec![chat],
+                    active_tab_id: Some(tab),
+                }),
+            });
+            let before = state
+                .center_zone
+                .with_untracked(CenterZoneState::all_tab_ids);
+            let sole = state.open_agent_chat_to_side(agent.clone(), None, "Agent".to_owned());
+            assert_eq!(sole, AgentOpenToSideResult::NothingWouldRemain);
+            assert_eq!(
+                sole.disabled_reason(),
+                Some("Nothing would be left in this pane.")
+            );
+            assert_eq!(
+                state
+                    .center_zone
+                    .with_untracked(CenterZoneState::all_tab_ids),
+                before
+            );
+
+            let active = ActiveProjectRef {
+                host_id: "h".to_owned(),
+                project_id: ProjectId("active".to_owned()),
+            };
+            state.active_project.set(Some(active));
+            state.tabs_enabled.set(false);
+            let tabs_disabled =
+                state.open_agent_chat_to_side(agent.clone(), None, "Agent".to_owned());
+            assert_eq!(tabs_disabled, AgentOpenToSideResult::TabsDisabled);
+            assert_eq!(
+                tabs_disabled.disabled_reason(),
+                Some("Enable tabs to use split view.")
+            );
+            state.tabs_enabled.set(true);
+            let other = ActiveProjectRef {
+                host_id: "h".to_owned(),
+                project_id: ProjectId("other".to_owned()),
+            };
+            let cross_project =
+                state.open_agent_chat_to_side(agent, Some(other), "Agent".to_owned());
+            assert_eq!(cross_project, AgentOpenToSideResult::CrossProject);
+            assert_eq!(
+                cross_project.disabled_reason(),
+                Some(AGENT_OPEN_TO_SIDE_CROSS_PROJECT_REASON)
+            );
+            assert_eq!(
+                state
+                    .center_zone
+                    .with_untracked(CenterZoneState::all_tab_ids),
+                before
+            );
+        });
+    }
+
+    #[test]
+    fn diff_open_to_side_opens_reveals_and_moves_the_exact_occurrence() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let project = ActiveProjectRef {
+                host_id: "h".to_owned(),
+                project_id: ProjectId("p".to_owned()),
+            };
+            let state = AppState::new();
+            state.active_project.set(Some(project.clone()));
+            let home = state
+                .center_zone
+                .with_untracked(|center_zone| center_zone.active_tab_id())
+                .expect("home tab");
+            let key = DiffKey::new(
+                "h",
+                project.project_id,
+                ProjectRootPath("/repo".to_owned()),
+                ProjectDiffScope::Unstaged,
+                "src/lib.rs",
+            );
+            let content = key.tab_content();
+
+            let before_query = state.center_zone.with_untracked(center_snapshot);
+            assert_eq!(state.diff_open_to_side_eligibility(&key), None);
+            assert_eq!(
+                state.center_zone.with_untracked(center_snapshot),
+                before_query
+            );
+            let opened = state.open_diff_to_side(key.clone(), "Diff".to_owned());
+            let DiffOpenToSideResult::Opened {
+                tab,
+                pane: PaneId::Secondary,
+            } = opened
+            else {
+                panic!("diff should open in the opposite pane: {opened:?}");
+            };
+            assert_eq!(
+                state
+                    .center_zone
+                    .with_untracked(|center_zone| center_zone.occurrences(&content)),
+                vec![(PaneId::Secondary, tab)]
+            );
+
+            assert!(state.reveal_tab(home));
+            assert_eq!(
+                state.open_diff_to_side(key.clone(), "Ignored label".to_owned()),
+                DiffOpenToSideResult::Revealed {
+                    tab,
+                    pane: PaneId::Secondary,
+                }
+            );
+            assert_eq!(
+                state
+                    .center_zone
+                    .with_untracked(|center_zone| center_zone.occurrences(&content)),
+                vec![(PaneId::Secondary, tab)]
+            );
+
+            state
+                .open_tab_in(
+                    PaneId::Secondary,
+                    TabContent::AgentMonitor,
+                    "Agents".to_owned(),
+                    true,
+                )
+                .expect("source-pane survivor");
+            assert!(state.reveal_tab(tab));
+            let before_move_query = state.center_zone.with_untracked(center_snapshot);
+            assert_eq!(state.diff_open_to_side_eligibility(&key), None);
+            assert_eq!(
+                state.center_zone.with_untracked(center_snapshot),
+                before_move_query
+            );
+            assert_eq!(
+                state.open_diff_to_side(key, "Ignored label".to_owned()),
+                DiffOpenToSideResult::Moved {
+                    tab,
+                    source: PaneId::Secondary,
+                    target: PaneId::Primary,
+                }
+            );
+            state.center_zone.with_untracked(|center_zone| {
+                assert_eq!(center_zone.locate_tab(tab), Some(PaneId::Primary));
+                assert_eq!(
+                    center_zone.occurrences(&content),
+                    vec![(PaneId::Primary, tab)]
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn diff_open_to_side_eligibility_matches_typed_refusals_without_mutation() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let project = ActiveProjectRef {
+                host_id: "h".to_owned(),
+                project_id: ProjectId("p".to_owned()),
+            };
+            let state = AppState::new();
+            let key = DiffKey::new(
+                "h",
+                project.project_id.clone(),
+                ProjectRootPath("/repo".to_owned()),
+                ProjectDiffScope::Staged,
+                "src/lib.rs",
+            );
+
+            state.active_project.set(Some(ActiveProjectRef {
+                host_id: "h".to_owned(),
+                project_id: ProjectId("other".to_owned()),
+            }));
+            let before_cross_project = state.center_zone.with_untracked(center_snapshot);
+            let cross_project = state.diff_open_to_side_eligibility(&key);
+            assert_eq!(cross_project, Some(DiffOpenToSideResult::CrossProject));
+            assert_eq!(
+                cross_project.and_then(DiffOpenToSideResult::disabled_reason),
+                Some(OPEN_TO_SIDE_CROSS_PROJECT_REASON)
+            );
+            assert_eq!(
+                state.open_diff_to_side(key.clone(), "Diff".to_owned()),
+                cross_project.expect("cross-project refusal")
+            );
+            assert_eq!(
+                state.center_zone.with_untracked(center_snapshot),
+                before_cross_project
+            );
+
+            state.active_project.set(Some(project));
+            let diff = make_tab(key.tab_content(), "Diff", true);
+            let tab = diff.id;
+            state.center_zone.set(CenterZoneState {
+                layout: CenterLayout::Single(PaneState {
+                    tabs: vec![diff],
+                    active_tab_id: Some(tab),
+                }),
+            });
+            let before_sole = state.center_zone.with_untracked(center_snapshot);
+            let sole = state.diff_open_to_side_eligibility(&key);
+            assert_eq!(sole, Some(DiffOpenToSideResult::NothingWouldRemain));
+            assert_eq!(
+                sole.and_then(DiffOpenToSideResult::disabled_reason),
+                Some(OPEN_TO_SIDE_NOTHING_WOULD_REMAIN_REASON)
+            );
+            assert_eq!(
+                state.open_diff_to_side(key.clone(), "Diff".to_owned()),
+                sole.expect("sole-tab refusal")
+            );
+            assert_eq!(
+                state.center_zone.with_untracked(center_snapshot),
+                before_sole
+            );
+
+            state.tabs_enabled.set(false);
+            let tabs_disabled = state.diff_open_to_side_eligibility(&key);
+            assert_eq!(tabs_disabled, Some(DiffOpenToSideResult::TabsDisabled));
+            assert_eq!(
+                tabs_disabled.and_then(DiffOpenToSideResult::disabled_reason),
+                Some(CENTER_TABS_DISABLED_REASON)
+            );
+            assert_eq!(
+                state.open_diff_to_side(key, "Diff".to_owned()),
+                tabs_disabled.expect("tabs-disabled refusal")
+            );
+            assert_eq!(
+                state.center_zone.with_untracked(center_snapshot),
+                before_sole
+            );
+        });
+    }
+
+    #[test]
+    fn mounted_tabs_pin_each_panes_active_tab() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let first = install_loaded_file(
+                &state,
+                PaneId::Primary,
+                resource_key("h", "p", test_path("pin-a")),
+            );
+            let second = state
+                .open_tab_in(
+                    PaneId::Secondary,
+                    TabContent::empty_chat(),
+                    "Chat".to_string(),
+                    true,
+                )
+                .expect("second pane");
+            state.tab_lru.set(Vec::new());
+            let mounted = state.mounted_tab_ids();
+            assert!(mounted.contains(&first));
+            assert!(mounted.contains(&second));
         });
     }
 

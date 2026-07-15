@@ -177,7 +177,7 @@ pub(crate) async fn route_client_envelope(
                 )?;
                 ensure_non_empty("workbench_create", "branch", payload.branch.0.as_str())?;
                 ensure_non_empty("workbench_create", "name", payload.name.as_str())?;
-                host.create_workbench(payload).await?;
+                host.create_workbench(payload, None).await?;
             }
             FrameKind::WorkbenchRemove => {
                 let payload: WorkbenchRemovePayload = parse_payload(&envelope, "workbench_remove")?;

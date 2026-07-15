@@ -1,26 +1,10 @@
-//! Backend abstraction for the mobile client's host I/O (transport, storage,
-//! QR, dialogs), with two implementations selected **at runtime**:
-//!
-//! - [`tauri_backend`] — reaches the native `mobile-shell` Rust commands/events
-//!   through `window.__TAURI__` (the iOS app shell).
-//! - [`web`] — talks directly to the host from wasm: MQTT-over-wss transport,
-//!   IndexedDB storage, browser-camera QR scan, in-process events (the PWA).
-//!
-//! ## Why runtime-detect (not a cargo feature split)
-//!
-//! `mobile-frontend` ships as a **single** `trunk`-built wasm bundle. The same
-//! bundle runs inside the Tauri WKWebView (where `window.__TAURI__` is injected)
-//! *and* as a standalone browser PWA (where it is not). The Tauri build is
-//! produced by `trunk build` with no feature flags (see
-//! `mobile/src-tauri/tauri.conf.json`), so a feature split would force a second
-//! artifact and a second build pipeline. Branching on the presence of
-//! `window.__TAURI__` keeps one artifact and is the lowest-churn option: every
-//! call site below is unchanged, and the choice is a single cached boolean.
+//! Web/PWA bridge for the mobile client's host I/O, storage, QR scanning, and
+//! dialogs. The browser talks directly to hosts over MQTT-over-WebSocket,
+//! persists pairing data in IndexedDB, and delivers events in process.
 
-mod tauri_backend;
 mod web;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub use host_config::{HostDisconnectedEvent, HostErrorEvent, HostLineEvent};
 pub use mobile_shell_types::{
@@ -29,12 +13,98 @@ pub use mobile_shell_types::{
 
 pub use web::{AuthProvider, RedeemOutcome};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct LocalSubmissionId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Accepted {
+    pub connection_instance_id: u64,
+    pub local_submission_id: LocalSubmissionId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendRejected {
+    NotConnected,
+    QueueFull,
+    ConnectionClosed,
+}
+
+impl std::fmt::Display for SendRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotConnected => f.write_str("host is not connected"),
+            Self::QueueFull => f.write_str("host outbound queue is full"),
+            Self::ConnectionClosed => f.write_str("host connection closed"),
+        }
+    }
+}
+
+impl std::error::Error for SendRejected {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmissionTransportOutcome {
+    QueuedLocally,
+    NotSent,
+    BrokerAcknowledged,
+    DeliveryUnknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmissionTransportOutcomeEvent {
+    pub local_host_id: LocalHostId,
+    pub connection_instance_id: u64,
+    pub local_submission_id: LocalSubmissionId,
+    pub outcome: SubmissionTransportOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionInvalidation {
+    SequenceViolation { message: String },
+    ProtocolViolation { message: String },
+}
+
+impl std::fmt::Display for ConnectionInvalidation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SequenceViolation { message } => {
+                write!(f, "sequence validation failed: {message}")
+            }
+            Self::ProtocolViolation { message } => {
+                write!(f, "protocol validation failed: {message}")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidationRejected {
+    NotConnected,
+    ConnectionClosed,
+}
+
+impl std::fmt::Display for InvalidationRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotConnected => f.write_str("host is not connected"),
+            Self::ConnectionClosed => f.write_str("host connection closed"),
+        }
+    }
+}
+
+impl std::error::Error for InvalidationRejected {}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+pub(crate) use web::{
+    TestSendGuard, test_capture_sends, test_clean_sends, test_defer_sends, test_reject_sends,
+    test_resolve_next_send, test_send_attempts, test_sent_lines,
+};
+
 use crate::state::{
     LocalHostId, MobileServiceAuthState, MobileShellError, PairedHostSummary, PairingOffer,
 };
 
-/// Result of a QR scan. Shared by both backends (Tauri decodes the native
-/// barcode-scanner result into it; web fills it from `BarcodeDetector`).
+/// Result of a browser-camera QR scan.
 #[derive(Deserialize)]
 pub struct BarcodeScanResult {
     pub content: String,
@@ -43,9 +113,9 @@ pub struct BarcodeScanResult {
     pub format: Option<String>,
 }
 
-/// Opaque listener handle. Both backends produce one; `remove()` unregisters.
+/// Opaque listener handle. `remove()` unregisters the web listener.
 /// `app.rs` deliberately `std::mem::forget`s these for the app's lifetime, so
-/// the captured listener stays alive until the page/webview is torn down.
+/// the captured listener stays alive until the page is torn down.
 pub struct UnlistenHandle {
     cleanup: Box<dyn FnOnce()>,
 }
@@ -63,50 +133,10 @@ impl UnlistenHandle {
     }
 }
 
-/// True when the bundle is running as a browser PWA (no Tauri shell injected).
-/// Cached: the host environment cannot change within a page lifetime. The
-/// detected mode is logged once on first use so a future `__TAURI__`-injected-
-/// late misdetection (web chosen when Tauri was expected, or vice-versa) is
-/// visible in the console rather than silently changing every host call.
-#[cfg(not(all(test, target_arch = "wasm32")))]
-fn use_web_backend() -> bool {
-    thread_local! {
-        static IS_WEB: bool = {
-            let is_web = !tauri_present();
-            log::info!(
-                "mobile bridge backend selected: {}",
-                if is_web { "web (browser PWA)" } else { "tauri (native shell)" }
-            );
-            is_web
-        };
-    }
-    IS_WEB.with(|is_web| *is_web)
-}
-
-#[cfg(all(test, target_arch = "wasm32"))]
-fn use_web_backend() -> bool {
-    !tauri_present()
-}
-
-fn tauri_present() -> bool {
-    web_sys::window()
-        .and_then(|window| {
-            js_sys::Reflect::get(&window, &wasm_bindgen::JsValue::from_str("__TAURI__")).ok()
-        })
-        .map(|value| !value.is_undefined() && !value.is_null())
-        .unwrap_or(false)
-}
-
-/// Dispatches each bridge call to the web or Tauri backend. Kept terse: every
-/// arm is `if use_web_backend() { web::f(..) } else { tauri_backend::f(..) }`.
 macro_rules! dispatch {
     ($name:ident ( $( $arg:ident : $ty:ty ),* ) -> $ret:ty) => {
         pub async fn $name( $( $arg : $ty ),* ) -> $ret {
-            if use_web_backend() {
-                web::$name( $( $arg ),* ).await
-            } else {
-                tauri_backend::$name( $( $arg ),* ).await
-            }
+            web::$name( $( $arg ),* ).await
         }
     };
 }
@@ -119,7 +149,7 @@ dispatch!(start_pairing(qr_uri: &str) -> Result<(), String>);
 dispatch!(connect_paired_host(local_host_id: &LocalHostId) -> Result<(), String>);
 dispatch!(disconnect_paired_host(local_host_id: &LocalHostId) -> Result<(), String>);
 dispatch!(forget_paired_host(local_host_id: &LocalHostId) -> Result<(), String>);
-dispatch!(send_host_line(local_host_id: &LocalHostId, line: &str) -> Result<(), String>);
+dispatch!(send_host_line(local_host_id: &LocalHostId, line: &str) -> Result<Accepted, SendRejected>);
 dispatch!(ack_host_line(local_host_id: &LocalHostId, delivery_id: u64) -> Result<(), String>);
 dispatch!(scan_qr() -> Result<BarcodeScanResult, String>);
 dispatch!(ensure_camera_permission() -> Result<(), String>);
@@ -128,146 +158,91 @@ pub async fn set_paired_host_auto_connect(
     local_host_id: &LocalHostId,
     auto_connect: bool,
 ) -> Result<(), String> {
-    if use_web_backend() {
-        web::set_paired_host_auto_connect(local_host_id, auto_connect).await
-    } else {
-        tauri_backend::set_paired_host_auto_connect(local_host_id, auto_connect).await
-    }
+    web::set_paired_host_auto_connect(local_host_id, auto_connect).await
 }
 
-/// Web-only: consumes the pairing URI the PWA loader stashed in sessionStorage
+pub fn invalidate_host_connection(
+    local_host_id: &LocalHostId,
+    reason: ConnectionInvalidation,
+) -> Result<(), InvalidationRejected> {
+    web::invalidate_host_connection(local_host_id, reason)
+}
+
+/// Consumes the pairing URI the PWA loader stashed in sessionStorage
 /// (see [`web::take_pending_pairing_uri`]) so first-time pairing completes after
-/// the loader boots this bundle. Native shells deliver pairing URIs through
-/// their own scan/paste flow, so this is always `None` there. Synchronous: a
-/// sessionStorage read needs no await.
+/// the loader boots this bundle. Synchronous: a sessionStorage read needs no
+/// await.
 pub fn take_pending_pairing_uri() -> Option<String> {
-    if use_web_backend() {
-        web::take_pending_pairing_uri()
-    } else {
-        None
-    }
+    web::take_pending_pairing_uri()
 }
 
-/// Web-only: ask the PWA loader to reboot into the host's exact published
+/// Asks the PWA loader to reboot into the host's exact published
 /// bundle (identified by `release_version`) after an incompatible-protocol
-/// reject, so an already-paired host self-heals without a re-scan. Native
-/// shells have no loader to reboot, so this is a no-op there and the sticky
-/// `UpdateRequired` error is the surface. Synchronous: it just dispatches the
-/// DOM `tyde:repair-version` CustomEvent the loader listens for.
+/// reject, so an already-paired host self-heals without a re-scan. Synchronous:
+/// it dispatches the DOM `tyde:repair-version` CustomEvent the loader listens
+/// for.
 pub fn request_loader_repair_version(release_version: &str) {
-    if use_web_backend() {
-        web::request_loader_repair_version(release_version);
-    }
+    web::request_loader_repair_version(release_version);
 }
 
-/// Web-only: run the `tycode.dev` Tyggs auth (`POST /auth/session`) step of the
-/// managed pairing flow and return the resulting typed auth state. The native
-/// shell owns its own managed handshake and never reaches this path, so it
-/// returns a non-retryable `service_unavailable` rather than pretending to
-/// authenticate.
+/// Runs the `tycode.dev` Tyggs auth (`POST /auth/session`) step of the managed
+/// pairing flow and returns the resulting typed auth state.
 pub async fn authenticate_managed(qr_uri: &str) -> MobileServiceAuthState {
-    if use_web_backend() {
-        web::authenticate_managed(qr_uri).await
-    } else {
-        MobileServiceAuthState::ServiceUnavailable {
-            message: "Managed pairing is handled by the native app shell.".to_owned(),
-            retryable: false,
-        }
-    }
+    web::authenticate_managed(qr_uri).await
 }
 
-/// Web-only: resolve the OAuth callback that returned to this app at boot. The
+/// Resolves the OAuth callback that returned to this app at boot. The
 /// web service coordinates this with reconnect credential minting so both paths
 /// observe one exchange result instead of racing for the one-time marker.
 pub async fn complete_boot_managed_auth_callback() -> Option<MobileServiceAuthState> {
-    if use_web_backend() {
-        web::complete_boot_managed_auth_callback().await
-    } else {
-        None
-    }
+    web::complete_boot_managed_auth_callback().await
 }
 
-/// Web-only: re-probe the current cookie-backed managed session without a QR.
+/// Re-probes the current cookie-backed managed session without a QR.
 /// Used by the no-pending-QR pass/paywall and retryable-service screens.
 pub async fn probe_managed_auth() -> MobileServiceAuthState {
-    if use_web_backend() {
-        web::probe_managed_auth().await
-    } else {
-        MobileServiceAuthState::ServiceUnavailable {
-            message: "Managed authentication is handled by the native app shell.".to_owned(),
-            retryable: false,
-        }
-    }
+    web::probe_managed_auth().await
 }
 
-/// Web-only: redeem a managed offer (`POST /pairings/redeem`) and connect to the
-/// managed broker. Native shells never reach this path (they produce a
-/// `DirectPairing` offer), so it returns a terminal outcome there.
+/// Redeems a managed offer (`POST /pairings/redeem`) and connects to the
+/// managed broker.
 pub async fn redeem_managed_and_connect(qr_uri: &str) -> Result<(), RedeemOutcome> {
-    if use_web_backend() {
-        web::redeem_managed_and_connect(qr_uri).await
-    } else {
-        Err(RedeemOutcome::Terminal {
-            message: "Managed pairing is handled by the native app shell.".to_owned(),
-        })
-    }
+    web::redeem_managed_and_connect(qr_uri).await
 }
 
-/// Web-only: start the Tyggs sign-in through `tycode.dev` (see
+/// Starts Tyggs sign-in through `tycode.dev` (see
 /// [`web::begin_tyggs_sign_in`]) for an explicitly selected configured
 /// provider. Pass the scanned pairing URI to resume pairing after the redirect,
-/// or `None` to just re-authenticate an existing host. Native shells own their
-/// own sign-in, so this errors there.
+/// or `None` to just re-authenticate an existing host.
 pub fn tyggs_auth_providers() -> Result<Vec<AuthProvider>, String> {
-    if use_web_backend() {
-        web::tyggs_auth_providers()
-    } else {
-        Err("Tyggs sign-in is handled by the native app shell.".to_owned())
-    }
+    web::tyggs_auth_providers()
 }
 
 pub fn begin_tyggs_sign_in(
     provider: AuthProvider,
     resume_qr_uri: Option<&str>,
 ) -> Result<(), String> {
-    if use_web_backend() {
-        web::begin_tyggs_sign_in(provider, resume_qr_uri)
-    } else {
-        Err("Tyggs sign-in is handled by the native app shell.".to_owned())
-    }
+    web::begin_tyggs_sign_in(provider, resume_qr_uri)
 }
 
 pub async fn frontend_attached(
     known_connection_instance_ids: &[KnownConnectionInstance],
 ) -> Result<(), String> {
-    if use_web_backend() {
-        web::frontend_attached(known_connection_instance_ids).await
-    } else {
-        tauri_backend::frontend_attached(known_connection_instance_ids).await
-    }
+    web::frontend_attached(known_connection_instance_ids).await
 }
 
 #[allow(dead_code)]
 pub async fn wasm_log(level: &str, message: &str) {
-    if use_web_backend() {
-        web::wasm_log(level, message).await
-    } else {
-        tauri_backend::wasm_log(level, message).await
-    }
+    web::wasm_log(level, message).await
 }
 
-/// Generates the event-listener façade fns. Each registers the callback with
-/// whichever backend is active and returns a unified [`UnlistenHandle`].
+/// Generates the event-listener façade functions.
 macro_rules! dispatch_listen {
     ($name:ident, $payload:ty) => {
         pub async fn $name(
             callback: impl Fn($payload) + 'static,
         ) -> Result<UnlistenHandle, String> {
-            if use_web_backend() {
-                web::$name(callback).await
-            } else {
-                tauri_backend::$name(callback).await
-            }
+            web::$name(callback).await
         }
     };
 }
@@ -281,3 +256,7 @@ dispatch_listen!(
     PairedHostConnectionStatusEvent
 );
 dispatch_listen!(listen_mobile_shell_error, MobileShellError);
+dispatch_listen!(
+    listen_submission_transport_outcome,
+    SubmissionTransportOutcomeEvent
+);

@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -14,7 +13,7 @@ use uuid::Uuid;
 
 use crate::agent::customization::ResolvedSpawnConfig;
 use crate::agent::{
-    AgentActorRuntimeContext, AgentHandle, now_ms, spawn_agent_actor, spawn_relay_agent_actor,
+    AgentActorRuntimeResources, AgentHandle, now_ms, spawn_agent_actor, spawn_relay_agent_actor,
 };
 use crate::agent_control_mcp::{
     AGENT_CONTROL_AWAIT_MCP_SERVER_NAME, AGENT_CONTROL_MCP_SERVER_NAME, AgentControlMcpHandle,
@@ -22,10 +21,8 @@ use crate::agent_control_mcp::{
 use crate::backend::StartupMcpServer;
 use crate::backend::StartupMcpTransport;
 use crate::host::mcp_url_for_agent;
-use crate::review::ReviewRegistryHandle;
 use crate::review_mcp::REVIEW_FEEDBACK_MCP_SERVER_NAME;
 use crate::store::session::SessionStore;
-use crate::sub_agent::HostSubAgentSpawnTx;
 use crate::workflows::mcp::WORKFLOW_PROGRESS_MCP_SERVER_NAME;
 
 pub(crate) struct AgentRegistry {
@@ -233,10 +230,7 @@ impl AgentRegistry {
         &mut self,
         mut request: ResolvedSpawnRequest,
         agent_control_mcp: &AgentControlMcpHandle,
-        session_store: Arc<Mutex<SessionStore>>,
-        host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
-        review_registry: ReviewRegistryHandle,
-        antigravity_conversations_dir: PathBuf,
+        runtime: AgentActorRuntimeResources,
     ) -> SpawnedAgent {
         let agent_id = AgentId(Uuid::new_v4().to_string());
         for server in &mut request.startup_mcp_servers {
@@ -290,13 +284,7 @@ impl AgentRegistry {
             agent_id.clone(),
             start.clone(),
             request,
-            AgentActorRuntimeContext {
-                session_store,
-                host_sub_agent_spawn_tx,
-                review_registry,
-                status_handle: status_handle.clone(),
-                antigravity_conversations_dir,
-            },
+            runtime.with_status(status_handle.clone()),
         );
 
         let previous = self.agents.insert(

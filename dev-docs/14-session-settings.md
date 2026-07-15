@@ -293,7 +293,9 @@ Each backend implements this to declare its supported settings. Examples:
 
 **Claude:**
 - `model`: Select — haiku, sonnet, opus (default: sonnet, nullable: true)
-- `effort`: Select — low, medium, high, max (nullable: true)
+- `effort`: Select — low, medium, high, xhigh, max (nullable: true).
+  `xhigh` and `max` are distinct Claude-native levels; Tyde preserves the
+  selected level and does not invent aliases or normalize one level to another.
 
 **Codex:**
 - `model`: Dynamic Select from Codex `model/list` metadata.

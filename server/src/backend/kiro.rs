@@ -6,9 +6,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-use protocol::TokenUsageUnavailableReason;
+use protocol::{
+    ChatMessageId, ServerGeneratedChatMessageIdOrigin, ServerGeneratedChatMessageIdentity,
+    StreamIdentityViolation, TokenUsageUnavailableReason,
+};
 
 use crate::acp::{
     AcpBridge, AcpInbound, AcpSpawnSpec, acp_mcp_servers_json, extract_message_id,
@@ -345,9 +349,13 @@ impl KiroSession {
                 active_tool_contexts: HashMap::new(),
                 tool_call_aliases: HashMap::new(),
                 cancelled: false,
+                provider_turn_quarantined: false,
                 replaying_history: false,
-                replay_assistant_message_id: None,
+                replay_session_id: None,
+                replay_next_event_ordinal: 0,
+                replay_assistant_identity: None,
                 replay_assistant_text: String::new(),
+                replay_assistant_reasoning: String::new(),
                 replay_assistant_message_emitted_since_user: false,
                 replay_error: None,
             }),
@@ -390,17 +398,135 @@ struct KiroState {
     model: Option<String>,
     mode: Option<String>,
     known_models: Vec<Value>,
-    active_message_id: Option<String>,
+    active_message_id: Option<ChatMessageId>,
     active_stream_text: String,
     active_stream_tool_calls: Vec<Value>,
     active_tool_contexts: HashMap<String, KiroToolContext>,
     tool_call_aliases: HashMap<String, String>,
     cancelled: bool,
+    provider_turn_quarantined: bool,
     replaying_history: bool,
-    replay_assistant_message_id: Option<String>,
+    replay_session_id: Option<String>,
+    replay_next_event_ordinal: u64,
+    replay_assistant_identity: Option<KiroReplayMessageIdentity>,
     replay_assistant_text: String,
+    replay_assistant_reasoning: String,
     replay_assistant_message_emitted_since_user: bool,
     replay_error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct KiroReplayMessageIdentity {
+    message_id: ChatMessageId,
+    origin: KiroReplayIdentityOrigin,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum KiroReplayIdentityOrigin {
+    Provider,
+    LegacyMigration {
+        session_id: String,
+        event_ordinal: u64,
+        first_event: KiroLegacyReplayEventKind,
+        identity: ServerGeneratedChatMessageIdentity,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KiroLegacyReplayEventKind {
+    Reasoning,
+    Text,
+    ToolCall,
+}
+
+impl KiroLegacyReplayEventKind {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Reasoning => "reasoning",
+            Self::Text => "text",
+            Self::ToolCall => "tool_call",
+        }
+    }
+
+    fn ordinal(self) -> u64 {
+        match self {
+            Self::Reasoning => 0,
+            Self::Text => 1,
+            Self::ToolCall => 2,
+        }
+    }
+}
+
+impl KiroReplayMessageIdentity {
+    fn provider(message_id: ChatMessageId) -> Self {
+        Self {
+            message_id,
+            origin: KiroReplayIdentityOrigin::Provider,
+        }
+    }
+
+    fn legacy_migration(
+        session_id: String,
+        event_ordinal: u64,
+        first_event: KiroLegacyReplayEventKind,
+    ) -> Result<Self, String> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"tyde:kiro:legacy-replay:v1");
+        hasher.update([0]);
+        hasher.update(session_id.as_bytes());
+        let digest = hasher.finalize();
+        let stream_epoch = u64::from_be_bytes(
+            digest[..8]
+                .try_into()
+                .expect("SHA-256 digest has at least eight bytes"),
+        );
+        let item_ordinal = event_ordinal
+            .checked_mul(3)
+            .and_then(|ordinal| ordinal.checked_add(first_event.ordinal()))
+            .ok_or_else(|| {
+                "Kiro legacy replay item ordinal exceeded its supported range".to_string()
+            })?;
+        let identity = ServerGeneratedChatMessageIdentity {
+            origin: ServerGeneratedChatMessageIdOrigin::LegacyReplay,
+            stream_epoch,
+            item_ordinal,
+        };
+
+        Ok(Self {
+            message_id: identity.message_id(),
+            origin: KiroReplayIdentityOrigin::LegacyMigration {
+                session_id,
+                event_ordinal,
+                first_event,
+                identity,
+            },
+        })
+    }
+
+    fn origin_label(&self) -> &'static str {
+        match &self.origin {
+            KiroReplayIdentityOrigin::Provider => "provider",
+            KiroReplayIdentityOrigin::LegacyMigration { .. } => "legacy_migration",
+        }
+    }
+}
+
+impl KiroState {
+    fn new_replay_message_identity(
+        &mut self,
+        provider_message_id: Option<ChatMessageId>,
+        first_event: KiroLegacyReplayEventKind,
+        event_ordinal: u64,
+    ) -> Result<KiroReplayMessageIdentity, String> {
+        if let Some(message_id) = provider_message_id {
+            return Ok(KiroReplayMessageIdentity::provider(message_id));
+        }
+
+        let session_id = self.replay_session_id.clone().ok_or_else(|| {
+            "Kiro legacy replay identity unavailable outside session/load".to_string()
+        })?;
+        KiroReplayMessageIdentity::legacy_migration(session_id, event_ordinal, first_event)
+    }
 }
 
 #[derive(Clone)]
@@ -431,6 +557,7 @@ impl KiroInner {
     async fn execute(&self, command: SessionCommand) -> Result<(), String> {
         match command {
             SessionCommand::SendMessage { message, images } => {
+                self.state.lock().await.provider_turn_quarantined = false;
                 self.emit_user_message_added(&message, images.as_deref());
                 self.emitter.typing_status_changed(true);
 
@@ -501,6 +628,10 @@ impl KiroInner {
                 };
 
                 self.bridge.sync_inbound().await?;
+
+                if self.state.lock().await.provider_turn_quarantined {
+                    return Ok(());
+                }
 
                 if let Some(model) = extract_current_model(&response) {
                     let mut state = self.state.lock().await;
@@ -722,8 +853,12 @@ impl KiroInner {
         let (cwd, startup_mcp_servers) = {
             let mut state = self.state.lock().await;
             state.replaying_history = true;
-            state.replay_assistant_message_id = None;
+            state.provider_turn_quarantined = false;
+            state.replay_session_id = Some(session_id.clone());
+            state.replay_next_event_ordinal = 0;
+            state.replay_assistant_identity = None;
             state.replay_assistant_text.clear();
+            state.replay_assistant_reasoning.clear();
             state.replay_assistant_message_emitted_since_user = false;
             state.replay_error = None;
             (
@@ -760,8 +895,10 @@ impl KiroInner {
             Err(err) => {
                 let mut state = self.state.lock().await;
                 state.replaying_history = false;
-                state.replay_assistant_message_id = None;
+                state.replay_session_id = None;
+                state.replay_assistant_identity = None;
                 state.replay_assistant_text.clear();
+                state.replay_assistant_reasoning.clear();
                 state.replay_assistant_message_emitted_since_user = false;
                 state.replay_error = None;
                 self.emitter.typing_status_changed(false);
@@ -772,8 +909,10 @@ impl KiroInner {
         if let Err(err) = self.bridge.sync_inbound().await {
             let mut state = self.state.lock().await;
             state.replaying_history = false;
-            state.replay_assistant_message_id = None;
+            state.replay_session_id = None;
+            state.replay_assistant_identity = None;
             state.replay_assistant_text.clear();
+            state.replay_assistant_reasoning.clear();
             state.replay_assistant_message_emitted_since_user = false;
             state.replay_error = None;
             self.emitter.typing_status_changed(false);
@@ -784,8 +923,10 @@ impl KiroInner {
             let mut state = self.state.lock().await;
             if let Some(error) = state.replay_error.take() {
                 state.replaying_history = false;
-                state.replay_assistant_message_id = None;
+                state.replay_session_id = None;
+                state.replay_assistant_identity = None;
                 state.replay_assistant_text.clear();
+                state.replay_assistant_reasoning.clear();
                 state.replay_assistant_message_emitted_since_user = false;
                 self.emitter.typing_status_changed(false);
                 return Err(error);
@@ -798,8 +939,10 @@ impl KiroInner {
                     .collect::<Vec<_>>()
                     .join(", ");
                 state.replaying_history = false;
-                state.replay_assistant_message_id = None;
+                state.replay_session_id = None;
+                state.replay_assistant_identity = None;
                 state.replay_assistant_text.clear();
+                state.replay_assistant_reasoning.clear();
                 state.replay_assistant_message_emitted_since_user = false;
                 state.active_tool_contexts.clear();
                 state.tool_call_aliases.clear();
@@ -826,6 +969,7 @@ impl KiroInner {
         }
 
         self.flush_replay_assistant_message().await;
+        self.state.lock().await.replay_session_id = None;
         self.emitter.typing_status_changed(false);
         Ok(())
     }
@@ -892,12 +1036,51 @@ impl KiroInner {
     async fn handle_notification(&self, method: &str, params: &Value) {
         match method {
             "session/notification" => {
+                if !self.accept_replay_notification_session(params).await {
+                    return;
+                }
                 self.handle_kiro_notification(params).await;
             }
             "session/update" => {
+                if !self.accept_replay_notification_session(params).await {
+                    return;
+                }
                 self.handle_standard_update(params).await;
             }
             _ => {}
+        }
+    }
+
+    async fn accept_replay_notification_session(&self, params: &Value) -> bool {
+        let error = {
+            let state = self.state.lock().await;
+            if !state.replaying_history {
+                return true;
+            }
+            let expected = state.replay_session_id.as_deref();
+            let actual = params
+                .get("sessionId")
+                .or_else(|| params.get("session_id"))
+                .and_then(Value::as_str);
+            match (expected, actual) {
+                (Some(expected), Some(actual)) if expected == actual => None,
+                (Some(_), Some(_)) => Some(
+                    "Kiro session replay received an event for a different session".to_string(),
+                ),
+                (Some(_), None) => {
+                    Some("Kiro session replay event omitted its session identity".to_string())
+                }
+                (None, _) => {
+                    Some("Kiro session replay received an event outside session/load".to_string())
+                }
+            }
+        };
+
+        if let Some(error) = error {
+            self.set_replay_error(error).await;
+            false
+        } else {
+            true
         }
     }
 
@@ -907,6 +1090,12 @@ impl KiroInner {
             .and_then(Value::as_str)
             .unwrap_or_default();
         let normalized = normalize_update_type(raw_type);
+        if normalized != "error" {
+            let state = self.state.lock().await;
+            if !state.replaying_history && state.provider_turn_quarantined {
+                return;
+            }
+        }
 
         match normalized.as_str() {
             "agentmessagechunk" => {
@@ -957,6 +1146,12 @@ impl KiroInner {
             .or_else(|| update.get("session_update"))
             .and_then(Value::as_str)
             .unwrap_or_default();
+        if update_type != "error" {
+            let state = self.state.lock().await;
+            if !state.replaying_history && state.provider_turn_quarantined {
+                return;
+            }
+        }
 
         match update_type {
             "agent_message_chunk" => {
@@ -973,6 +1168,9 @@ impl KiroInner {
             }
             "tool_call_update" => {
                 self.handle_tool_call_update(update).await;
+            }
+            "error" => {
+                self.handle_error_notification(update).await;
             }
             "plan" => {
                 self.handle_plan_update(update);
@@ -1023,29 +1221,138 @@ impl KiroInner {
             return;
         }
 
-        let message_id = {
+        let provider_message_id = extract_kiro_chat_message_id(params);
+        if self.state.lock().await.replaying_history {
+            self.append_replay_assistant_chunk(
+                provider_message_id,
+                KiroLegacyReplayEventKind::Reasoning,
+                &delta,
+                true,
+            )
+            .await;
+            return;
+        }
+
+        let Some(message_id) = provider_message_id else {
+            self.reject_missing_stream_message_id().await;
+            return;
+        };
+
+        let (started, model, foreign_message_id) = {
             let mut state = self.state.lock().await;
             if state.replaying_history {
                 return;
             }
-            if let Some(id) = extract_kiro_message_id(params)
-                && state.active_message_id.is_none()
+
+            if let Some(active_id) = state.active_message_id.as_ref()
+                && active_id != &message_id
             {
-                state.active_message_id = Some(id.clone());
-                state.active_stream_text.clear();
-                state.active_stream_tool_calls.clear();
-                let model = state.model.clone().unwrap_or_else(|| "kiro".to_string());
-                self.emitter.typing_status_changed(true);
-                self.emitter
-                    .stream_start(&id, AgentName(KIRO_AGENT_NAME), Some(&model));
+                (false, String::new(), Some(message_id.clone()))
+            } else {
+                let started = state.active_message_id.is_none();
+                if started {
+                    state.active_message_id = Some(message_id.clone());
+                    state.active_stream_text.clear();
+                    state.active_stream_tool_calls.clear();
+                }
+                (
+                    started,
+                    state.model.clone().unwrap_or_else(|| "kiro".to_string()),
+                    None,
+                )
             }
-            state
-                .active_message_id
-                .clone()
-                .unwrap_or_else(|| format!("kiro-msg-{}", unix_now_ms()))
         };
 
-        self.emitter.stream_reasoning_delta(&message_id, &delta);
+        if let Some(foreign_message_id) = foreign_message_id {
+            self.reject_foreign_stream_message_id(&foreign_message_id)
+                .await;
+            return;
+        }
+
+        if started {
+            self.emitter.typing_status_changed(true);
+            self.emitter.stream_start_with_id(
+                message_id.clone(),
+                AgentName(KIRO_AGENT_NAME),
+                Some(&model),
+            );
+            if !self.emitter.is_stream_open() {
+                self.clear_active_stream().await;
+                self.emitter.typing_status_changed(false);
+                return;
+            }
+        }
+
+        self.emitter
+            .stream_reasoning_delta_with_id(message_id, &delta);
+    }
+
+    async fn append_replay_assistant_chunk(
+        &self,
+        provider_message_id: Option<ChatMessageId>,
+        first_event: KiroLegacyReplayEventKind,
+        delta: &str,
+        reasoning: bool,
+    ) {
+        let previous = {
+            let mut state = self.state.lock().await;
+            let event_ordinal = state.replay_next_event_ordinal;
+            let Some(next_event_ordinal) = event_ordinal.checked_add(1) else {
+                state.replay_error = Some(
+                    "Kiro legacy replay event ordinal exceeded its supported range".to_string(),
+                );
+                return;
+            };
+            state.replay_next_event_ordinal = next_event_ordinal;
+            let active_identity = state.replay_assistant_identity.clone();
+            let identity = match active_identity {
+                Some(active)
+                    if provider_message_id.is_none()
+                        || provider_message_id.as_ref() == Some(&active.message_id) =>
+                {
+                    active
+                }
+                _ => match state.new_replay_message_identity(
+                    provider_message_id,
+                    first_event,
+                    event_ordinal,
+                ) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        state.replay_error = Some(error);
+                        return;
+                    }
+                },
+            };
+
+            let previous = if state
+                .replay_assistant_identity
+                .as_ref()
+                .is_some_and(|active| active.message_id != identity.message_id)
+            {
+                state.replay_assistant_identity.take().map(|active| {
+                    (
+                        active,
+                        std::mem::take(&mut state.replay_assistant_text),
+                        std::mem::take(&mut state.replay_assistant_reasoning),
+                    )
+                })
+            } else {
+                None
+            };
+
+            state.replay_assistant_identity = Some(identity);
+            if reasoning {
+                state.replay_assistant_reasoning.push_str(delta);
+            } else {
+                state.replay_assistant_text.push_str(delta);
+            }
+            previous
+        };
+
+        if let Some(previous) = previous {
+            self.emit_replay_message(Some(previous)).await;
+        }
     }
 
     async fn handle_agent_message_chunk(&self, params: &Value) {
@@ -1058,43 +1365,15 @@ impl KiroInner {
             return;
         }
 
-        let chunk_message_id = extract_kiro_message_id(params);
-
-        let replay_flush = {
-            let mut state = self.state.lock().await;
-            if state.replaying_history {
-                let replay_message_id = chunk_message_id.clone().unwrap_or_else(|| {
-                    state
-                        .replay_assistant_message_id
-                        .clone()
-                        .unwrap_or_else(|| format!("history-{}", unix_now_ms()))
-                });
-
-                if let Some(active_id) = state.replay_assistant_message_id.clone() {
-                    if active_id != replay_message_id {
-                        let flushed =
-                            Some((active_id, std::mem::take(&mut state.replay_assistant_text)));
-                        state.replay_assistant_message_id = Some(replay_message_id.clone());
-                        state.replay_assistant_text.push_str(&delta);
-                        Some(flushed)
-                    } else {
-                        state.replay_assistant_text.push_str(&delta);
-                        Some(None)
-                    }
-                } else {
-                    state.replay_assistant_message_id = Some(replay_message_id.clone());
-                    state.replay_assistant_text.push_str(&delta);
-                    Some(None)
-                }
-            } else {
-                None
-            }
-        };
-
-        if let Some(flushed) = replay_flush {
-            if let Some(replay) = flushed {
-                self.emit_replay_message(Some(replay)).await;
-            }
+        let chunk_message_id = extract_kiro_chat_message_id(params);
+        if self.state.lock().await.replaying_history {
+            self.append_replay_assistant_chunk(
+                chunk_message_id,
+                KiroLegacyReplayEventKind::Text,
+                &delta,
+                false,
+            )
+            .await;
             return;
         }
 
@@ -1105,66 +1384,74 @@ impl KiroInner {
             }
         }
 
-        let (previous_stream, started_message_id, model, stream_message_id) = {
-            let mut state = self.state.lock().await;
-            let mut previous_stream: Option<(String, String, Vec<Value>)> = None;
-
-            if let Some(next_id) = chunk_message_id.clone()
-                && let Some(active_id) = state.active_message_id.clone()
-                && active_id != next_id
-            {
-                let previous_text = std::mem::take(&mut state.active_stream_text);
-                let previous_tool_calls = std::mem::take(&mut state.active_stream_tool_calls);
-                if has_renderable_stream_text(&previous_text) || !previous_tool_calls.is_empty() {
-                    previous_stream = Some((active_id, previous_text, previous_tool_calls));
-                }
-                state.active_message_id = None;
-            }
-
-            let message_id = state.active_message_id.clone().unwrap_or_else(|| {
-                chunk_message_id
-                    .clone()
-                    .unwrap_or_else(|| format!("kiro-msg-{}", unix_now_ms()))
-            });
-
-            let started = if state.active_message_id.is_none() {
-                state.active_message_id = Some(message_id.clone());
-                state.active_stream_text.clear();
-                state.active_stream_tool_calls.clear();
-                Some(message_id.clone())
-            } else {
-                None
-            };
-
-            state.active_stream_text.push_str(&delta);
-
-            (
-                previous_stream,
-                started,
-                state.model.clone().unwrap_or_else(|| "kiro".to_string()),
-                message_id,
-            )
+        let Some(chunk_message_id) = chunk_message_id else {
+            self.reject_missing_stream_message_id().await;
+            return;
         };
 
-        if let Some((prev_message_id, prev_text, prev_tool_calls)) = previous_stream {
-            self.emit_stream_end(
-                prev_message_id,
-                prev_text,
-                None,
-                prev_tool_calls,
-                false,
-                false,
-            )
-            .await;
+        let (started, model, foreign_message_id) = {
+            let mut state = self.state.lock().await;
+            if let Some(active_id) = state.active_message_id.as_ref()
+                && active_id != &chunk_message_id
+            {
+                (false, String::new(), Some(chunk_message_id.clone()))
+            } else {
+                let started = state.active_message_id.is_none();
+                if started {
+                    state.active_message_id = Some(chunk_message_id.clone());
+                    state.active_stream_text.clear();
+                    state.active_stream_tool_calls.clear();
+                }
+                state.active_stream_text.push_str(&delta);
+                (
+                    started,
+                    state.model.clone().unwrap_or_else(|| "kiro".to_string()),
+                    None,
+                )
+            }
+        };
+
+        if let Some(foreign_message_id) = foreign_message_id {
+            self.reject_foreign_stream_message_id(&foreign_message_id)
+                .await;
+            return;
         }
 
-        if let Some(start_message_id) = started_message_id {
+        if started {
             self.emitter.typing_status_changed(true);
-            self.emitter
-                .stream_start(&start_message_id, AgentName(KIRO_AGENT_NAME), Some(&model));
+            self.emitter.stream_start_with_id(
+                chunk_message_id.clone(),
+                AgentName(KIRO_AGENT_NAME),
+                Some(&model),
+            );
+            if !self.emitter.is_stream_open() {
+                self.clear_active_stream().await;
+                self.emitter.typing_status_changed(false);
+                return;
+            }
         }
 
-        self.emitter.stream_delta(&stream_message_id, &delta);
+        self.emitter.stream_delta_with_id(chunk_message_id, &delta);
+    }
+
+    async fn reject_missing_stream_message_id(&self) {
+        if self.emitter.is_stream_open() {
+            self.emitter.discard_open_stream_with_identity_violation(
+                StreamIdentityViolation::MissingMessageId,
+            );
+        } else {
+            self.emitter
+                .backend_error("Stream identity violation: missing message id");
+        }
+        self.clear_active_stream().await;
+        self.emitter.typing_status_changed(false);
+    }
+
+    async fn reject_foreign_stream_message_id(&self, message_id: &ChatMessageId) {
+        self.emitter
+            .stream_delta_with_id(message_id.clone(), "\u{200b}");
+        self.clear_active_stream().await;
+        self.emitter.typing_status_changed(false);
     }
 
     async fn set_replay_error(&self, message: String) {
@@ -1178,7 +1465,7 @@ impl KiroInner {
         self.state.lock().await.replay_error.is_some()
     }
 
-    async fn ensure_replay_assistant_message_for_tool(&self) {
+    async fn ensure_replay_assistant_message_for_tool(&self, identity: KiroReplayMessageIdentity) {
         self.flush_replay_assistant_message().await;
         let should_emit = {
             let state = self.state.lock().await;
@@ -1187,7 +1474,7 @@ impl KiroInner {
                 && !state.replay_assistant_message_emitted_since_user
         };
         if should_emit {
-            self.emit_replay_assistant_message_text(String::new(), true)
+            self.emit_replay_assistant_message(identity, String::new(), String::new(), true)
                 .await;
         }
     }
@@ -1206,7 +1493,24 @@ impl KiroInner {
         };
 
         let raw_tool_call_id = normalize_tool_call_id_fragment(&request.tool_call_id);
-        let message_id = extract_kiro_message_id(params);
+        self.append_replay_assistant_chunk(
+            extract_kiro_chat_message_id(params),
+            KiroLegacyReplayEventKind::ToolCall,
+            "",
+            false,
+        )
+        .await;
+        if self.replay_error_is_set().await {
+            return;
+        }
+        let identity = { self.state.lock().await.replay_assistant_identity.clone() };
+        let Some(identity) = identity else {
+            self.set_replay_error(
+                "Kiro replay tool identity was not retained at the decode boundary".to_string(),
+            )
+            .await;
+            return;
+        };
         let workspace_root = self.state.lock().await.workspace_root.clone();
         let tool_type = map_tool_request_type(params, &request.args, &workspace_root).await;
         let canonical_id = normalize_tool_call_id_fragment(&raw_tool_call_id);
@@ -1232,15 +1536,14 @@ impl KiroInner {
             state
                 .tool_call_aliases
                 .insert(tool_alias_raw_key(&raw_tool_call_id), canonical_id.clone());
-            if let Some(message_id) = message_id.as_deref() {
-                state.tool_call_aliases.insert(
-                    tool_alias_message_key(message_id, &raw_tool_call_id),
-                    canonical_id.clone(),
-                );
-            }
+            state.tool_call_aliases.insert(
+                tool_alias_message_key(&identity.message_id.0, &raw_tool_call_id),
+                canonical_id.clone(),
+            );
         }
 
-        self.ensure_replay_assistant_message_for_tool().await;
+        self.ensure_replay_assistant_message_for_tool(identity)
+            .await;
         if self.replay_error_is_set().await {
             return;
         }
@@ -1338,35 +1641,28 @@ impl KiroInner {
         };
         let raw_tool_call_id = normalize_tool_call_id_fragment(&request.tool_call_id);
 
-        let incoming_message_id = extract_kiro_message_id(params);
+        let Some(incoming_message_id) = extract_kiro_chat_message_id(params) else {
+            self.reject_missing_stream_message_id().await;
+            return;
+        };
+        if let Some(active_message_id) = self.state.lock().await.active_message_id.clone()
+            && active_message_id != incoming_message_id
+        {
+            self.reject_foreign_stream_message_id(&incoming_message_id)
+                .await;
+            return;
+        }
         let workspace_root = self.state.lock().await.workspace_root.clone();
 
-        let mut start_event: Option<(String, String)> = None;
-        let mut previous_stream: Option<(String, String, Vec<Value>)> = None;
+        let mut start_event: Option<(ChatMessageId, String)> = None;
         let mut should_finalize_current = false;
         let mut refresh_tool_request: Option<(String, String, Value)> = None;
         {
             let mut state = self.state.lock().await;
-
-            if let Some(next_id) = incoming_message_id.clone()
-                && let Some(active_id) = state.active_message_id.clone()
-                && active_id != next_id
-            {
-                let previous_text = std::mem::take(&mut state.active_stream_text);
-                let previous_tool_calls = std::mem::take(&mut state.active_stream_tool_calls);
-                if has_renderable_stream_text(&previous_text) || !previous_tool_calls.is_empty() {
-                    previous_stream = Some((active_id, previous_text, previous_tool_calls));
-                }
-                state.active_message_id = None;
-            }
-
-            let stream_message_id = incoming_message_id
-                .clone()
-                .or_else(|| state.active_message_id.clone())
-                .unwrap_or_else(|| format!("kiro-msg-{}", unix_now_ms()));
+            let stream_message_id = incoming_message_id.clone();
 
             let canonical_id =
-                build_canonical_tool_call_id(&mut state, &stream_message_id, &raw_tool_call_id);
+                build_canonical_tool_call_id(&mut state, &stream_message_id.0, &raw_tool_call_id);
             let duplicate_request = state.active_tool_contexts.contains_key(&canonical_id);
             let tool_type = map_tool_request_type(params, &request.args, &workspace_root).await;
 
@@ -1398,7 +1694,7 @@ impl KiroInner {
                 .tool_call_aliases
                 .insert(tool_alias_raw_key(&raw_tool_call_id), canonical_id.clone());
             state.tool_call_aliases.insert(
-                tool_alias_message_key(&stream_message_id, &raw_tool_call_id),
+                tool_alias_message_key(&stream_message_id.0, &raw_tool_call_id),
                 canonical_id.clone(),
             );
 
@@ -1426,22 +1722,15 @@ impl KiroInner {
             }
         };
 
-        if let Some((prev_message_id, prev_text, prev_tool_calls)) = previous_stream {
-            self.emit_stream_end(
-                prev_message_id,
-                prev_text,
-                None,
-                prev_tool_calls,
-                false,
-                false,
-            )
-            .await;
-        }
-
         if let Some((message_id, model)) = start_event {
             self.emitter.typing_status_changed(true);
             self.emitter
-                .stream_start(&message_id, AgentName(KIRO_AGENT_NAME), Some(&model));
+                .stream_start_with_id(message_id, AgentName(KIRO_AGENT_NAME), Some(&model));
+            if !self.emitter.is_stream_open() {
+                self.clear_active_stream().await;
+                self.emitter.typing_status_changed(false);
+                return;
+            }
         }
 
         if should_finalize_current {
@@ -1673,21 +1962,46 @@ impl KiroInner {
             return;
         }
 
+        {
+            let mut state = self.state.lock().await;
+            if state.provider_turn_quarantined {
+                return;
+            }
+            state.provider_turn_quarantined = true;
+        }
+
+        if self.emitter.is_stream_open() {
+            self.emitter.discard_open_stream_with_identity_violation(
+                StreamIdentityViolation::MissingMessageId,
+            );
+        } else {
+            self.emitter.backend_error(&message);
+            self.emitter.typing_status_changed(false);
+        }
         self.clear_active_stream().await;
-        self.emitter.typing_status_changed(false);
-        self.emitter.backend_error(&message);
     }
 
-    async fn emit_replay_message(&self, replay: Option<(String, String)>) {
-        let Some((_, text)) = replay else {
+    async fn emit_replay_message(
+        &self,
+        replay: Option<(KiroReplayMessageIdentity, String, String)>,
+    ) {
+        let Some((identity, text, reasoning)) = replay else {
             return;
         };
         let text = text.trim().to_string();
-        self.emit_replay_assistant_message_text(text, false).await;
+        let reasoning = reasoning.trim().to_string();
+        self.emit_replay_assistant_message(identity, text, reasoning, false)
+            .await;
     }
 
-    async fn emit_replay_assistant_message_text(&self, text: String, allow_empty: bool) {
-        if text.is_empty() && !allow_empty {
+    async fn emit_replay_assistant_message(
+        &self,
+        identity: KiroReplayMessageIdentity,
+        text: String,
+        reasoning: String,
+        allow_empty: bool,
+    ) {
+        if text.is_empty() && reasoning.is_empty() && !allow_empty {
             return;
         }
 
@@ -1699,13 +2013,35 @@ impl KiroInner {
                 .clone()
                 .unwrap_or_else(|| "kiro".to_string())
         };
+        match &identity.origin {
+            KiroReplayIdentityOrigin::Provider => tracing::debug!(
+                provider_message_id = %identity.message_id,
+                identity_origin = identity.origin_label(),
+                "Emitting Kiro replay assistant message"
+            ),
+            KiroReplayIdentityOrigin::LegacyMigration {
+                session_id,
+                event_ordinal,
+                first_event,
+                identity: generated_identity,
+            } => tracing::debug!(
+                provider_message_id = %identity.message_id,
+                identity_origin = identity.origin_label(),
+                replay_session_id = session_id,
+                event_ordinal,
+                first_event = first_event.tag(),
+                stream_epoch = generated_identity.stream_epoch,
+                item_ordinal = generated_identity.item_ordinal,
+                "Emitting Kiro replay assistant message"
+            ),
+        }
 
         self.emitter
             .assistant_message(crate::backend::turn_emitter::AssistantMessagePayload {
                 agent: AgentName(KIRO_AGENT_NAME),
-                message_id: None,
+                message_id: Some(&identity.message_id.0),
                 content: text,
-                reasoning: None,
+                reasoning: (!reasoning.is_empty()).then(|| json!({ "text": reasoning })),
                 tool_calls: Vec::new(),
                 model_info: Some(json!({ "model": model })),
                 request_usage: None,
@@ -1723,10 +2059,13 @@ impl KiroInner {
     async fn flush_replay_assistant_message(&self) {
         let replay = {
             let mut state = self.state.lock().await;
-            state
-                .replay_assistant_message_id
-                .take()
-                .map(|message_id| (message_id, std::mem::take(&mut state.replay_assistant_text)))
+            state.replay_assistant_identity.take().map(|identity| {
+                (
+                    identity,
+                    std::mem::take(&mut state.replay_assistant_text),
+                    std::mem::take(&mut state.replay_assistant_reasoning),
+                )
+            })
         };
         self.emit_replay_message(replay).await;
     }
@@ -1777,7 +2116,7 @@ impl KiroInner {
 
     async fn emit_stream_end(
         &self,
-        _message_id: String,
+        message_id: ChatMessageId,
         text: String,
         token_usage: Option<Value>,
         tool_calls: Vec<Value>,
@@ -1785,21 +2124,22 @@ impl KiroInner {
         end_typing: bool,
     ) {
         let cleaned_text = strip_ansi_and_controls(&text);
-        if !force_emit && !has_renderable_stream_text(&cleaned_text) && tool_calls.is_empty() {
-            if end_typing {
-                self.emitter.typing_status_changed(false);
-            }
-            return;
-        }
 
-        let model = {
-            self.state
-                .lock()
-                .await
-                .model
-                .clone()
-                .unwrap_or_else(|| "kiro".to_string())
+        let (session_id, model) = {
+            let state = self.state.lock().await;
+            (
+                state.session_id.clone(),
+                state.model.clone().unwrap_or_else(|| "kiro".to_string()),
+            )
         };
+        tracing::debug!(
+            session_id,
+            provider_message_id = %message_id,
+            forced = force_emit,
+            text_bytes = cleaned_text.len(),
+            tool_call_count = tool_calls.len(),
+            "Finalizing Kiro response stream"
+        );
         let normalized_usage = normalize_token_usage(token_usage.as_ref());
         let token_usage_unavailable_reason = normalized_usage
             .is_none()
@@ -1810,22 +2150,25 @@ impl KiroInner {
             .unwrap_or(Value::Null);
         let tool_calls_for_events = tool_calls.clone();
 
-        self.emitter.stream_end(StreamEndPayload {
-            content: cleaned_text,
-            agent: Some(AgentName(KIRO_AGENT_NAME)),
-            model: Some(model.clone()),
-            request_usage: normalized_usage.clone(),
-            turn_usage: normalized_usage,
-            cumulative_usage: None,
-            token_usage_unavailable_reason,
-            reasoning: None,
-            tool_calls: tool_calls.clone(),
-            context_breakdown: if context_breakdown.is_null() {
-                None
-            } else {
-                Some(context_breakdown)
+        self.emitter.stream_end_with_id(
+            message_id,
+            StreamEndPayload {
+                content: cleaned_text,
+                agent: Some(AgentName(KIRO_AGENT_NAME)),
+                model: Some(model.clone()),
+                request_usage: normalized_usage.clone(),
+                turn_usage: normalized_usage,
+                cumulative_usage: None,
+                token_usage_unavailable_reason,
+                reasoning: None,
+                tool_calls: tool_calls.clone(),
+                context_breakdown: if context_breakdown.is_null() {
+                    None
+                } else {
+                    Some(context_breakdown)
+                },
             },
-        });
+        );
         self.flush_tool_events_after_stream_end(&tool_calls_for_events)
             .await;
         if end_typing {
@@ -2221,6 +2564,13 @@ fn extract_kiro_message_id(value: &Value) -> Option<String> {
             ],
         )
     })
+}
+
+fn extract_kiro_chat_message_id(value: &Value) -> Option<ChatMessageId> {
+    extract_kiro_message_id(value)
+        .map(|message_id| message_id.trim().to_string())
+        .filter(|message_id| !message_id.is_empty())
+        .map(ChatMessageId)
 }
 
 fn extract_kiro_tool_call_id(value: &Value) -> Option<String> {
@@ -3761,7 +4111,11 @@ fn map_kiro_value_to_chat_event(value: &Value) -> Option<ChatEvent> {
                 .map(|s| s.to_string());
             Some(ChatEvent::StreamEnd(StreamEndData {
                 message: ChatMessage {
-                    message_id: None,
+                    message_id: msg
+                        .get("message_id")
+                        .or_else(|| msg.get("messageId"))
+                        .and_then(Value::as_str)
+                        .map(|message_id| ChatMessageId(message_id.to_string())),
                     timestamp: msg
                         .get("timestamp")
                         .and_then(Value::as_u64)
@@ -4010,7 +4364,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
 read _
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"kiro-test-session","models":{"currentModelId":"auto"}}}'
 read _
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-test-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"FAST_TURN_OK"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-test-session","update":{"sessionUpdate":"agent_message_chunk","messageId":"kiro-response-fast","content":{"type":"text","text":"FAST_TURN_OK"}}}}'
 printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
 "#;
         std::fs::write(&path, script).expect("write fake kiro acp program");
@@ -4026,6 +4380,149 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
         path
     }
 
+    fn write_fake_kiro_identity_program() -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("tyde-kiro-identity-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create fake Kiro identity tempdir");
+        let path = dir.join("fake-kiro-identity-acp");
+        let script = r#"#!/bin/sh
+read _
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+read _
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"kiro-identity-session","models":{"currentModelId":"auto"}}}'
+read _
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-identity-session","update":{"sessionUpdate":"agent_thought_chunk","messageId":"kiro-response-one","content":{"type":"text","text":"reason-one "}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-identity-session","update":{"sessionUpdate":"agent_thought_chunk","messageId":"kiro-response-one","content":{"type":"text","text":"reason-two"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-identity-session","update":{"sessionUpdate":"agent_message_chunk","messageId":"kiro-response-one","content":{"type":"text","text":"hello "}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-identity-session","update":{"sessionUpdate":"agent_message_chunk","messageId":"kiro-response-one","content":{"type":"text","text":"world"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+read _
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-identity-session","update":{"sessionUpdate":"agent_thought_chunk","messageId":"kiro-response-two","content":{"type":"text","text":"next reason"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-identity-session","update":{"sessionUpdate":"agent_message_chunk","messageId":"kiro-response-two","content":{"type":"text","text":"second"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}'
+read _
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-identity-session","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"unidentified"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn"}}'
+read _
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-identity-session","update":{"sessionUpdate":"agent_message_chunk","messageId":"kiro-response-one","content":{"type":"text","text":"reused"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":6,"result":{"stopReason":"end_turn"}}'
+"#;
+        std::fs::write(&path, script).expect("write fake Kiro identity program");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path)
+                .expect("stat fake Kiro identity program")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod fake Kiro identity program");
+        }
+        path
+    }
+
+    fn write_fake_kiro_provider_error_program() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tyde-kiro-provider-error-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create fake Kiro provider error tempdir");
+        let path = dir.join("fake-kiro-provider-error-acp");
+        let script = r#"#!/bin/sh
+emit_request_events() {
+  case "$1" in
+    *"active provider error"*)
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-provider-error-session","update":{"sessionUpdate":"agent_message_chunk","messageId":"kiro-provider-error-partial","content":{"type":"text","text":"partial response"}}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/notification","params":{"sessionId":"kiro-provider-error-session","type":"error","message":"provider exploded"}}'
+      ;;
+    *"recover active error"*)
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-provider-error-session","update":{"sessionUpdate":"agent_message_chunk","messageId":"kiro-provider-error-next","content":{"type":"text","text":"recovered"}}}}'
+      ;;
+    *"idle provider error"*)
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/notification","params":{"sessionId":"kiro-provider-error-session","type":"error","message":"idle provider failure"}}'
+      ;;
+    *"recover idle error"*)
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-provider-error-session","update":{"sessionUpdate":"agent_message_chunk","messageId":"kiro-provider-error-after-idle","content":{"type":"text","text":"idle recovered"}}}}'
+      ;;
+  esac
+}
+read _
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+read _
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"kiro-provider-error-session","models":{"currentModelId":"auto"}}}'
+read request
+emit_request_events "$request"
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+read request
+emit_request_events "$request"
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}'
+"#;
+        std::fs::write(&path, script).expect("write fake Kiro provider error program");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path)
+                .expect("stat fake Kiro provider error program")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod fake Kiro provider error program");
+        }
+        path
+    }
+
+    async fn collect_kiro_turn_events(
+        raw_events: &mut mpsc::UnboundedReceiver<Value>,
+    ) -> Vec<Value> {
+        let mut events = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(25), raw_events.recv()).await {
+                Ok(Some(value)) => events.push(value),
+                Ok(None) | Err(_) => break,
+            }
+        }
+        events
+    }
+
+    fn stream_event_message_id(event: &Value) -> Option<&str> {
+        match event.get("kind").and_then(Value::as_str) {
+            Some("StreamEnd") => event
+                .pointer("/data/message/message_id")
+                .and_then(Value::as_str),
+            Some("StreamStart") | Some("StreamDelta") | Some("StreamReasoningDelta") => {
+                event.pointer("/data/message_id").and_then(Value::as_str)
+            }
+            _ => None,
+        }
+    }
+
+    fn replay_assistant_snapshots(events: &[Value]) -> Vec<(String, String, Option<String>)> {
+        events
+            .iter()
+            .filter(|event| {
+                event.get("kind").and_then(Value::as_str) == Some("MessageAdded")
+                    && event.pointer("/data/sender/Assistant").is_some()
+            })
+            .map(|event| {
+                (
+                    event
+                        .pointer("/data/message_id")
+                        .and_then(Value::as_str)
+                        .expect("replayed assistant message must have an identity")
+                        .to_string(),
+                    event
+                        .pointer("/data/content")
+                        .and_then(Value::as_str)
+                        .expect("replayed assistant message must have content")
+                        .to_string(),
+                    event
+                        .pointer("/data/reasoning/text")
+                        .and_then(Value::as_str)
+                        .map(|reasoning| reasoning.to_string()),
+                )
+            })
+            .collect()
+    }
+
     fn write_fake_kiro_restore_program() -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("tyde-kiro-restore-test-{}", uuid::Uuid::new_v4()));
@@ -4038,11 +4535,11 @@ read _
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"kiro-bootstrap-session","models":{"currentModelId":"auto"}}}'
 read _
 printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"restore this"}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"tool_call","kind":"read","title":"read","toolCallId":"tooluse_restore_read","rawInput":{"ops":[{"path":"README.md"}]}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"tool_call","messageId":"kiro-restored-tools","kind":"read","title":"read","toolCallId":"tooluse_restore_read","rawInput":{"ops":[{"path":"README.md"}]}}}}'
 printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"tool_call_update","kind":"read","title":"read","toolCallId":"tooluse_restore_read","status":"completed","rawOutput":{"items":[{"Text":"hello"}]}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"tool_call","kind":"execute","title":"grep","toolCallId":"tooluse_restore_grep","rawInput":{"command":"grep missing README.md","working_dir":"."}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"tool_call","messageId":"kiro-restored-tools","kind":"execute","title":"grep","toolCallId":"tooluse_restore_grep","rawInput":{"command":"grep missing README.md","working_dir":"."}}}}'
 printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"tool_call_update","kind":"execute","title":"grep","toolCallId":"tooluse_restore_grep","status":"cancelled","rawOutput":{"items":[]},"error":{"message":"grep was cancelled"}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"restored done"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"agent_message_chunk","messageId":"kiro-restored-response","content":{"type":"text","text":"restored done"}}}}'
 printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"kiro-restored-session","models":{"currentModelId":"auto"}}}'
 "#;
         std::fs::write(&path, script).expect("write fake kiro restore program");
@@ -4054,6 +4551,50 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"kiro-restored-sess
                 .permissions();
             perms.set_mode(0o755);
             std::fs::set_permissions(&path, perms).expect("chmod fake kiro restore program");
+        }
+        path
+    }
+
+    fn write_fake_kiro_legacy_replay_program() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tyde-kiro-legacy-replay-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create fake Kiro legacy replay tempdir");
+        let path = dir.join("fake-kiro-legacy-replay-acp");
+        let script = r#"#!/bin/sh
+emit_history() {
+  printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-real-legacy-session","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"first request"}}}}'
+  printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-real-legacy-session","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"first reason "}}}}'
+  printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-real-legacy-session","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"continued"}}}}'
+  printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-real-legacy-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first "}}}}'
+  printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-real-legacy-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"answer"}}}}'
+  printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-real-legacy-session","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"second request"}}}}'
+  printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-real-legacy-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"second answer"}}}}'
+  printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-real-legacy-session","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"third request"}}}}'
+  printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-real-legacy-session","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"third reason"}}}}'
+  printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-real-legacy-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"third answer"}}}}'
+}
+read _
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+read _
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"kiro-bootstrap-session","models":{"currentModelId":"auto"}}}'
+read _
+emit_history
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"kiro-real-legacy-session","models":{"currentModelId":"auto"}}}'
+read _
+emit_history
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"sessionId":"kiro-real-legacy-session","models":{"currentModelId":"auto"}}}'
+"#;
+        std::fs::write(&path, script).expect("write fake Kiro legacy replay program");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path)
+                .expect("stat fake Kiro legacy replay program")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod fake Kiro legacy replay program");
         }
         path
     }
@@ -4273,6 +4814,457 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"kiro-restored-sess
                 .validate_envelope(&env)
                 .unwrap_or_else(|error| panic!("restored event violated protocol: {error}"));
         }
+
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_replay_identity_is_stable_across_repeated_resume() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "tyde-kiro-legacy-replay-workspace-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_root).expect("create fake Kiro legacy replay workspace");
+        let program = write_fake_kiro_legacy_replay_program();
+
+        let (session, mut raw_events) = KiroSession::spawn_admin_with_program_override(
+            &[workspace_root.to_string_lossy().to_string()],
+            None,
+            None,
+            &[],
+            None,
+            Some(program.to_string_lossy().to_string()),
+        )
+        .await
+        .expect("spawn fake Kiro legacy replay session");
+        let handle = session.command_handle();
+
+        handle
+            .execute(SessionCommand::ResumeSession {
+                session_id: "kiro-real-legacy-session".to_string(),
+            })
+            .await
+            .expect("first legacy Kiro replay should resume");
+        let first_events = collect_kiro_turn_events(&mut raw_events).await;
+        assert!(
+            !first_events
+                .iter()
+                .any(|event| { event.get("kind").and_then(Value::as_str) == Some("Error") })
+        );
+        let first = replay_assistant_snapshots(&first_events);
+        assert_eq!(
+            first
+                .iter()
+                .map(|(_, content, reasoning)| (content.as_str(), reasoning.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("first answer", Some("first reason continued")),
+                ("second answer", None),
+                ("third answer", Some("third reason")),
+            ]
+        );
+        assert!(first.iter().all(|(message_id, _, _)| {
+            message_id.starts_with("server-generated:legacy_replay:")
+        }));
+        assert_eq!(
+            first
+                .iter()
+                .map(|(message_id, _, _)| {
+                    message_id
+                        .rsplit(':')
+                        .next()
+                        .expect("generated identity has item ordinal")
+                })
+                .collect::<Vec<_>>(),
+            vec!["0", "13", "15"]
+        );
+        let other_session_identity = KiroReplayMessageIdentity::legacy_migration(
+            "kiro-other-legacy-session".to_string(),
+            0,
+            KiroLegacyReplayEventKind::Reasoning,
+        )
+        .expect("derive other-session legacy identity");
+        assert_ne!(
+            other_session_identity.message_id.0.as_str(),
+            first[0].0.as_str()
+        );
+        assert_eq!(
+            first
+                .iter()
+                .map(|(message_id, _, _)| message_id)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3
+        );
+
+        handle
+            .execute(SessionCommand::ResumeSession {
+                session_id: "kiro-real-legacy-session".to_string(),
+            })
+            .await
+            .expect("second legacy Kiro replay should resume");
+        let second_events = collect_kiro_turn_events(&mut raw_events).await;
+        assert!(
+            !second_events
+                .iter()
+                .any(|event| { event.get("kind").and_then(Value::as_str) == Some("Error") })
+        );
+        let second = replay_assistant_snapshots(&second_events);
+        assert_eq!(second, first);
+
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn provider_error_discards_active_partial_stream_and_accepts_next_id() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "tyde-kiro-provider-error-active-workspace-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_root)
+            .expect("create fake active provider error workspace");
+        let program = write_fake_kiro_provider_error_program();
+
+        let (session, mut raw_events) = KiroSession::spawn_admin_with_program_override(
+            &[workspace_root.to_string_lossy().to_string()],
+            None,
+            None,
+            &[],
+            None,
+            Some(program.to_string_lossy().to_string()),
+        )
+        .await
+        .expect("spawn fake active provider error session");
+        let handle = session.command_handle();
+
+        handle
+            .execute(SessionCommand::SendMessage {
+                message: "active provider error".to_string(),
+                images: None,
+            })
+            .await
+            .expect("send active provider error request");
+        let failed = collect_kiro_turn_events(&mut raw_events).await;
+        let stream_start = failed
+            .iter()
+            .position(|event| event.get("kind").and_then(Value::as_str) == Some("StreamStart"))
+            .expect("active provider error must start its identified partial stream");
+        assert_eq!(
+            failed[stream_start..]
+                .iter()
+                .filter_map(|event| event.get("kind").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec![
+                "StreamStart",
+                "StreamDelta",
+                "Error",
+                "OperationCancelled",
+                "TypingStatusChanged",
+            ],
+            "active provider error must discard with one exact terminal tail: {failed:?}"
+        );
+        assert!(failed[stream_start..stream_start + 2].iter().all(|event| {
+            stream_event_message_id(event) == Some("kiro-provider-error-partial")
+        }));
+        assert_eq!(
+            failed[stream_start + 1]
+                .pointer("/data/text")
+                .and_then(Value::as_str),
+            Some("partial response")
+        );
+        assert_eq!(
+            failed[stream_start + 2].get("data").and_then(Value::as_str),
+            Some("Stream identity violation: missing message id")
+        );
+        assert_eq!(
+            failed[stream_start + 3]
+                .pointer("/data/message")
+                .and_then(Value::as_str),
+            Some("Stream identity violation")
+        );
+        assert_eq!(
+            failed[stream_start + 4]
+                .get("data")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(
+            !failed
+                .iter()
+                .any(|event| { event.get("kind").and_then(Value::as_str) == Some("StreamEnd") })
+        );
+
+        handle
+            .execute(SessionCommand::SendMessage {
+                message: "recover active error".to_string(),
+                images: None,
+            })
+            .await
+            .expect("send recovery after active provider error");
+        let recovered = collect_kiro_turn_events(&mut raw_events).await;
+        let recovered_stream_events = recovered
+            .iter()
+            .filter(|event| stream_event_message_id(event).is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recovered_stream_events
+                .iter()
+                .map(|event| event.get("kind").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec![Some("StreamStart"), Some("StreamDelta"), Some("StreamEnd"),]
+        );
+        assert!(
+            recovered_stream_events.iter().all(|event| {
+                stream_event_message_id(event) == Some("kiro-provider-error-next")
+            })
+        );
+        assert!(
+            !recovered
+                .iter()
+                .any(|event| { event.get("kind").and_then(Value::as_str) == Some("Error") })
+        );
+
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn provider_error_without_stream_emits_error_then_idle_and_recovers() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "tyde-kiro-provider-error-idle-workspace-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_root)
+            .expect("create fake idle provider error workspace");
+        let program = write_fake_kiro_provider_error_program();
+
+        let (session, mut raw_events) = KiroSession::spawn_admin_with_program_override(
+            &[workspace_root.to_string_lossy().to_string()],
+            None,
+            None,
+            &[],
+            None,
+            Some(program.to_string_lossy().to_string()),
+        )
+        .await
+        .expect("spawn fake idle provider error session");
+        let handle = session.command_handle();
+
+        handle
+            .execute(SessionCommand::SendMessage {
+                message: "idle provider error".to_string(),
+                images: None,
+            })
+            .await
+            .expect("send idle provider error request");
+        let failed = collect_kiro_turn_events(&mut raw_events).await;
+        let error = failed
+            .iter()
+            .position(|event| event.get("kind").and_then(Value::as_str) == Some("Error"))
+            .expect("idle provider error must remain visible");
+        assert_eq!(
+            failed[error..]
+                .iter()
+                .filter_map(|event| event.get("kind").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec!["Error", "TypingStatusChanged"],
+            "idle provider error must emit one error/idle tail: {failed:?}"
+        );
+        assert_eq!(
+            failed[error].get("data").and_then(Value::as_str),
+            Some("idle provider failure")
+        );
+        assert_eq!(
+            failed[error + 1].get("data").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(!failed.iter().any(|event| {
+            matches!(
+                event.get("kind").and_then(Value::as_str),
+                Some("StreamStart")
+                    | Some("StreamDelta")
+                    | Some("StreamReasoningDelta")
+                    | Some("StreamEnd")
+                    | Some("OperationCancelled")
+            )
+        }));
+
+        handle
+            .execute(SessionCommand::SendMessage {
+                message: "recover idle error".to_string(),
+                images: None,
+            })
+            .await
+            .expect("send recovery after idle provider error");
+        let recovered = collect_kiro_turn_events(&mut raw_events).await;
+        let recovered_stream_events = recovered
+            .iter()
+            .filter(|event| stream_event_message_id(event).is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recovered_stream_events
+                .iter()
+                .map(|event| event.get("kind").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec![Some("StreamStart"), Some("StreamDelta"), Some("StreamEnd"),]
+        );
+        assert!(recovered_stream_events.iter().all(|event| {
+            stream_event_message_id(event) == Some("kiro-provider-error-after-idle")
+        }));
+        assert!(
+            !recovered
+                .iter()
+                .any(|event| { event.get("kind").and_then(Value::as_str) == Some("Error") })
+        );
+
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn kiro_stream_identity_is_stable_and_request_scoped() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "tyde-kiro-identity-workspace-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_root).expect("create fake identity workspace");
+        let program = write_fake_kiro_identity_program();
+
+        let (session, mut raw_events) = KiroSession::spawn_admin_with_program_override(
+            &[workspace_root.to_string_lossy().to_string()],
+            None,
+            None,
+            &[],
+            None,
+            Some(program.to_string_lossy().to_string()),
+        )
+        .await
+        .expect("spawn fake Kiro identity session");
+        let handle = session.command_handle();
+
+        handle
+            .execute(SessionCommand::SendMessage {
+                message: "first".to_string(),
+                images: None,
+            })
+            .await
+            .expect("send first fake Kiro request");
+        let first = collect_kiro_turn_events(&mut raw_events).await;
+        let first_stream_events = first
+            .iter()
+            .filter(|event| stream_event_message_id(event).is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            first_stream_events
+                .iter()
+                .map(|event| event.get("kind").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec![
+                Some("StreamStart"),
+                Some("StreamReasoningDelta"),
+                Some("StreamReasoningDelta"),
+                Some("StreamDelta"),
+                Some("StreamDelta"),
+                Some("StreamEnd"),
+            ]
+        );
+        assert!(
+            first_stream_events
+                .iter()
+                .all(|event| { stream_event_message_id(event) == Some("kiro-response-one") })
+        );
+        assert_eq!(
+            first_stream_events
+                .iter()
+                .filter(|event| {
+                    event.get("kind").and_then(Value::as_str) == Some("StreamReasoningDelta")
+                })
+                .filter_map(|event| event.pointer("/data/text").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec!["reason-one ", "reason-two"]
+        );
+        assert_eq!(
+            first_stream_events
+                .last()
+                .and_then(|event| event.pointer("/data/message/content"))
+                .and_then(Value::as_str),
+            Some("hello world")
+        );
+
+        handle
+            .execute(SessionCommand::SendMessage {
+                message: "second".to_string(),
+                images: None,
+            })
+            .await
+            .expect("send second fake Kiro request");
+        let second = collect_kiro_turn_events(&mut raw_events).await;
+        let second_stream_events = second
+            .iter()
+            .filter(|event| stream_event_message_id(event).is_some())
+            .collect::<Vec<_>>();
+        assert!(
+            second_stream_events
+                .iter()
+                .all(|event| { stream_event_message_id(event) == Some("kiro-response-two") })
+        );
+        assert!(
+            !second_stream_events
+                .iter()
+                .any(|event| { stream_event_message_id(event) == Some("kiro-response-one") })
+        );
+        assert_eq!(
+            second_stream_events
+                .last()
+                .and_then(|event| event.pointer("/data/message/content"))
+                .and_then(Value::as_str),
+            Some("second")
+        );
+
+        handle
+            .execute(SessionCommand::SendMessage {
+                message: "missing identity".to_string(),
+                images: None,
+            })
+            .await
+            .expect("send missing-identity fake Kiro request");
+        let missing = collect_kiro_turn_events(&mut raw_events).await;
+        assert!(missing.iter().any(|event| {
+            event.get("kind").and_then(Value::as_str) == Some("Error")
+                && event.get("data").and_then(Value::as_str)
+                    == Some("Stream identity violation: missing message id")
+        }));
+        assert!(!missing.iter().any(|event| {
+            matches!(
+                event.get("kind").and_then(Value::as_str),
+                Some("StreamStart")
+                    | Some("StreamReasoningDelta")
+                    | Some("StreamDelta")
+                    | Some("StreamEnd")
+            )
+        }));
+
+        handle
+            .execute(SessionCommand::SendMessage {
+                message: "reuse identity".to_string(),
+                images: None,
+            })
+            .await
+            .expect("send reused-identity fake Kiro request");
+        let reused = collect_kiro_turn_events(&mut raw_events).await;
+        let reused_identity_errors = reused
+            .iter()
+            .filter(|event| event.get("kind").and_then(Value::as_str) == Some("Error"))
+            .filter_map(|event| event.get("data").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reused_identity_errors,
+            vec!["Stream identity violation: duplicate terminal message id"],
+            "terminal provider ID reuse must emit exactly one typed error: {reused:?}"
+        );
+        assert!(
+            !reused
+                .iter()
+                .any(|event| stream_event_message_id(event).is_some())
+        );
 
         session.shutdown().await;
     }

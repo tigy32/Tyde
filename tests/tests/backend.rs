@@ -219,6 +219,7 @@ agy --model 'Gemini 3.5 Flash (Low)' --print-timeout 30s --dangerously-skip-perm
                 <server::backend::tycode::TycodeBackend as Backend>::spawn(
                     vec![workspace.path().to_string_lossy().to_string()],
                     server::backend::BackendSpawnConfig {
+                        execution_mode: Default::default(),
                         cost_hint: cost_hint_for(BackendKind::Tycode),
                         custom_agent_id: None,
                         startup_mcp_servers: Vec::new(),
@@ -259,6 +260,7 @@ agy --model 'Gemini 3.5 Flash (Low)' --print-timeout 30s --dangerously-skip-perm
                 <server::backend::kiro::KiroBackend as Backend>::spawn(
                     vec![workspace.path().to_string_lossy().to_string()],
                     server::backend::BackendSpawnConfig {
+                        execution_mode: Default::default(),
                         cost_hint: cost_hint_for(BackendKind::Kiro),
                         custom_agent_id: None,
                         startup_mcp_servers: Vec::new(),
@@ -299,6 +301,7 @@ agy --model 'Gemini 3.5 Flash (Low)' --print-timeout 30s --dangerously-skip-perm
                 <server::backend::hermes::HermesBackend as Backend>::spawn(
                     vec![workspace.path().to_string_lossy().to_string()],
                     server::backend::BackendSpawnConfig {
+                        execution_mode: Default::default(),
                         cost_hint: cost_hint_for(BackendKind::Hermes),
                         custom_agent_id: None,
                         startup_mcp_servers: Vec::new(),
@@ -420,11 +423,14 @@ fn write_antigravity_session_record_without_alias(store_dir: &Path, session_id: 
 }
 
 async fn expect_fixture_event(client: &mut client::Connection, context: &str) -> Envelope {
-    match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
-        Ok(Ok(Some(env))) => env,
-        Ok(Ok(None)) => panic!("connection closed before {context}"),
-        Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-        Err(_) => panic!("timed out waiting for {context}"),
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
+            Ok(Ok(Some(env))) if env.kind == FrameKind::BackendCapacity => {}
+            Ok(Ok(Some(env))) => return env,
+            Ok(Ok(None)) => panic!("connection closed before {context}"),
+            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
+            Err(_) => panic!("timed out waiting for {context}"),
+        }
     }
 }
 
@@ -526,6 +532,574 @@ while IFS= read -r _; do :; done
     path
 }
 
+struct CodexIdentityFake {
+    _dir: tempfile::TempDir,
+    binary: PathBuf,
+    late_events_written: PathBuf,
+}
+
+impl CodexIdentityFake {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().expect("create Codex identity fake tempdir");
+        let binary = dir.path().join("codex-identity-app-server.py");
+        std::fs::write(
+            &binary,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+turn_count = 0
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    request_id = request.get("id")
+    method = request.get("method")
+    if method == "initialize":
+        send({"jsonrpc":"2.0","id":request_id,"result":{"userAgent":"fake-codex/identity","codexHome":"/tmp/fake-codex-home","platformFamily":"unix","platformOs":"test"}})
+    elif method == "thread/start":
+        send({"jsonrpc":"2.0","id":request_id,"result":{"thread":{"id":"identity-thread","sessionId":"identity-thread","turns":[]},"model":"fake-codex-model"}})
+    elif method == "turn/start":
+        turn_count += 1
+        if turn_count == 1:
+            send({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"identity-thread","turn":{"id":"identity-turn-one"}}})
+            send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"identity-thread","item":{"id":"parent-one","type":"agentMessage"}}})
+            send({"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"identity-thread","itemId":"parent-one","delta":"First "}})
+            send({"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"identity-thread","itemId":"parent-one","delta":"response"}})
+            send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"identity-thread","item":{"id":"parent-one","type":"agentMessage","text":"First response"}}})
+            send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"identity-thread","item":{"id":"parent-two","type":"agentMessage","text":"Second response"}}})
+            send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"identity-thread","item":{"id":"parent-empty","type":"agentMessage","text":""}}})
+            send({"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"identity-thread","turn":{"id":"identity-turn-one","status":"completed"}}})
+        else:
+            send({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"identity-thread","turn":{"id":"identity-turn-two"}}})
+            send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"identity-thread","item":{"id":"parent-followup","type":"agentMessage","text":"Starting child"}}})
+            send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"identity-thread","item":{"id":"spawn-child","type":"collabAgentToolCall","tool":"spawn","senderThreadId":"identity-thread","receiverThreadId":"identity-child","prompt":"identity child","receiverAgentType":"worker","receiverAgentName":"Identity child"}}})
+            send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"identity-thread","item":{"id":"activity-child","type":"sub_agent_activity","kind":"started","agent_thread_id":"identity-child","agent_path":"/root/identity_child"}}})
+            send({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"identity-child","turn":{"id":"identity-child-turn"}}})
+            send({"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"identity-child","itemId":"child-good","delta":"Child response"}})
+            send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"identity-child","item":{"id":"child-good","type":"agentMessage","text":"Child response"}}})
+            send({"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"identity-child","itemId":"child-active","delta":"Valid before interleave"}})
+            send({"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"identity-child","itemId":"child-foreign","delta":"must never appear"}})
+            send({"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"identity-child","itemId":"child-late-delta","delta":"must stay quarantined"}})
+            send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"identity-child","item":{"id":"child-late-completion","type":"agentMessage","text":"must not resurrect"}}})
+            with open(__file__ + ".late-events-written", "w") as marker:
+                marker.write("done")
+            send({"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"identity-child","turn":{"id":"identity-child-turn","status":"completed"}}})
+            send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"identity-thread","item":{"id":"spawn-child","type":"collabAgentToolCall","tool":"spawn","senderThreadId":"identity-thread","receiverThreadId":"identity-child","status":"completed"}}})
+            send({"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"identity-thread","turn":{"id":"identity-turn-two","status":"completed"}}})
+        send({"jsonrpc":"2.0","id":request_id,"result":{"turn":{"id":"identity-turn"}}})
+    elif method == "turn/interrupt":
+        send({"jsonrpc":"2.0","id":request_id,"result":{}})
+    elif method == "thread/update":
+        send({"jsonrpc":"2.0","id":request_id,"result":{}})
+"#,
+        )
+        .expect("write Codex identity fake");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&binary)
+                .expect("Codex identity fake metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&binary, permissions).expect("chmod Codex identity fake");
+        }
+        let late_events_written =
+            PathBuf::from(format!("{}.late-events-written", binary.to_string_lossy()));
+        Self {
+            _dir: dir,
+            binary,
+            late_events_written,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CodexIdentityObservation {
+    stream_starts: Vec<String>,
+    stream_deltas: Vec<(String, String)>,
+    stream_ends: Vec<(String, String)>,
+    errors: usize,
+    identity_errors: usize,
+    cancellations: usize,
+    unexpected_post_cancel_events: Vec<&'static str>,
+    idle_transitions: usize,
+    cancel_idle_transitions: usize,
+    active_transitions: usize,
+}
+
+fn prohibited_post_cancel_event(event: &ChatEvent) -> Option<&'static str> {
+    match event {
+        ChatEvent::TaskUpdate(_) => Some("TaskUpdate"),
+        ChatEvent::StreamStart(_) => Some("StreamStart"),
+        ChatEvent::StreamDelta(_) => Some("StreamDelta"),
+        ChatEvent::StreamReasoningDelta(_) => Some("StreamReasoningDelta"),
+        ChatEvent::StreamEnd(_) => Some("StreamEnd"),
+        ChatEvent::MessageMetadataUpdated(_) => Some("MessageMetadataUpdated"),
+        ChatEvent::MessageAdded(message)
+            if matches!(
+                message.sender,
+                MessageSender::Error | MessageSender::Assistant { .. }
+            ) =>
+        {
+            Some("MessageAdded")
+        }
+        ChatEvent::OperationCancelled(_) => Some("OperationCancelled"),
+        ChatEvent::TypingStatusChanged(false) => Some("TypingStatusChanged(false)"),
+        ChatEvent::TypingStatusChanged(true) => Some("TypingStatusChanged(true)"),
+        _ => None,
+    }
+}
+
+impl CodexIdentityObservation {
+    fn observe(&mut self, event: ChatEvent) {
+        let expected_first_cancel_idle = self.cancellations > 0
+            && self.cancel_idle_transitions == 0
+            && matches!(event, ChatEvent::TypingStatusChanged(false));
+        if self.cancellations > 0
+            && !expected_first_cancel_idle
+            && let Some(kind) = prohibited_post_cancel_event(&event)
+        {
+            self.unexpected_post_cancel_events.push(kind);
+        }
+        match event {
+            ChatEvent::StreamStart(start) => self.stream_starts.push(
+                start
+                    .message_id
+                    .expect("Codex StreamStart must carry message identity"),
+            ),
+            ChatEvent::StreamDelta(delta) => self.stream_deltas.push((
+                delta
+                    .message_id
+                    .expect("Codex StreamDelta must carry message identity"),
+                delta.text,
+            )),
+            ChatEvent::StreamEnd(end) => self.stream_ends.push((
+                end.message
+                    .message_id
+                    .expect("Codex StreamEnd must carry message identity")
+                    .0,
+                end.message.content,
+            )),
+            ChatEvent::MessageAdded(ChatMessage {
+                sender: MessageSender::Error,
+                content,
+                ..
+            }) => {
+                self.errors += 1;
+                if content.contains("Stream identity violation: foreign active message id") {
+                    self.identity_errors += 1;
+                }
+            }
+            ChatEvent::OperationCancelled(_) => self.cancellations += 1,
+            ChatEvent::TypingStatusChanged(false) => {
+                self.idle_transitions += 1;
+                if self.cancellations > 0 {
+                    self.cancel_idle_transitions += 1;
+                }
+            }
+            ChatEvent::TypingStatusChanged(true) => self.active_transitions += 1,
+            _ => {}
+        }
+    }
+
+    fn observe_bootstrap(&mut self, bootstrap: AgentBootstrapPayload) {
+        for event in bootstrap.events {
+            if let AgentBootstrapEvent::ChatEvent(event) = event {
+                self.observe(event);
+            }
+        }
+    }
+}
+
+async fn connect_and_replay_agent(
+    fixture: &Fixture,
+    agent_id: &protocol::AgentId,
+    context: &str,
+) -> (client::Connection, NewAgentPayload, AgentBootstrapPayload) {
+    let (mut client, bootstrap) = fixture.connect_with_bootstrap().await;
+    let agent = bootstrap
+        .agents
+        .into_iter()
+        .find(|agent| &agent.agent_id == agent_id)
+        .unwrap_or_else(|| panic!("{context} HostBootstrap missing agent {agent_id}"));
+    loop {
+        let env = expect_fixture_event(&mut client, context).await;
+        if env.kind == FrameKind::CommandError {
+            let error: CommandErrorPayload = env.parse_payload().expect("parse CommandError");
+            panic!("command error while waiting for {context}: {error:?}");
+        }
+        if env.kind == FrameKind::AgentBootstrap && env.stream == agent.instance_stream {
+            let replay = env.parse_payload().expect("parse AgentBootstrap");
+            return (client, agent, replay);
+        }
+    }
+}
+
+fn replayed_assistant_messages(bootstrap: &AgentBootstrapPayload) -> Vec<(String, String)> {
+    bootstrap
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message))
+                if matches!(message.sender, MessageSender::Assistant { .. }) =>
+            {
+                Some((
+                    message
+                        .message_id
+                        .as_ref()
+                        .expect("replayed assistant message must retain identity")
+                        .0
+                        .clone(),
+                    message.content.clone(),
+                ))
+            }
+            AgentBootstrapEvent::ChatEvent(ChatEvent::StreamEnd(end)) => Some((
+                end.message
+                    .message_id
+                    .as_ref()
+                    .expect("replayed StreamEnd must retain identity")
+                    .0
+                    .clone(),
+                end.message.content.clone(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn replayed_success_messages(
+    bootstrap: &AgentBootstrapPayload,
+    context: &str,
+) -> Vec<(String, String)> {
+    let mut observation = CodexIdentityObservation::default();
+    observation.observe_bootstrap(bootstrap.clone());
+    assert_eq!(
+        observation.errors, 0,
+        "{context} must not contain an error tail"
+    );
+    assert_eq!(
+        observation.identity_errors, 0,
+        "{context} must not contain an identity error"
+    );
+    assert_eq!(
+        observation.cancellations, 0,
+        "{context} must not contain a cancellation tail"
+    );
+    replayed_assistant_messages(bootstrap)
+}
+
+#[tokio::test]
+async fn fake_codex_provider_items_keep_identity_live_late_and_same_host_reconnect() {
+    init_tracing();
+
+    let fake = CodexIdentityFake::new();
+    let _fake_guard = server::backend::codex::install_test_app_server_binary(fake.binary.clone());
+    let workspace = tempfile::tempdir().expect("create Codex identity workspace");
+    std::fs::write(
+        workspace.path().join("README.txt"),
+        "Codex identity test workspace",
+    )
+    .expect("seed Codex identity workspace");
+    let mut fixture = Fixture::new_with_test_backend(BackendKind::Codex).await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("Codex identity".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec![workspace.path().to_string_lossy().into_owned()],
+                prompt: "emit three provider items".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Codex,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn fake Codex agent");
+
+    let parent = loop {
+        let env = expect_fixture_event(&mut fixture.client, "fake Codex NewAgent").await;
+        if env.kind == FrameKind::CommandError {
+            let error: CommandErrorPayload = env.parse_payload().expect("parse CommandError");
+            panic!("fake Codex spawn failed: {error:?}");
+        }
+        if env.kind == FrameKind::NewAgent {
+            let agent: NewAgentPayload = env.parse_payload().expect("parse NewAgent");
+            if agent.backend_kind == BackendKind::Codex {
+                break agent;
+            }
+        }
+    };
+
+    let mut parent_live = CodexIdentityObservation::default();
+    while parent_live.stream_ends.len() < 3 || parent_live.idle_transitions < 1 {
+        let env =
+            expect_fixture_event(&mut fixture.client, "three live Codex provider items").await;
+        if env.kind == FrameKind::CommandError {
+            let error: CommandErrorPayload = env.parse_payload().expect("parse CommandError");
+            panic!("command error during fake Codex turn: {error:?}");
+        }
+        if env.stream != parent.instance_stream {
+            continue;
+        }
+        match env.kind {
+            FrameKind::AgentBootstrap => parent_live
+                .observe_bootstrap(env.parse_payload().expect("parse parent AgentBootstrap")),
+            FrameKind::ChatEvent => {
+                parent_live.observe(env.parse_payload().expect("parse parent ChatEvent"))
+            }
+            _ => {}
+        }
+    }
+
+    let expected_parent = vec![
+        ("parent-one".to_owned(), "First response".to_owned()),
+        ("parent-two".to_owned(), "Second response".to_owned()),
+        ("parent-empty".to_owned(), String::new()),
+    ];
+    assert_eq!(
+        parent_live.stream_starts,
+        vec!["parent-one", "parent-two", "parent-empty"]
+    );
+    assert_eq!(
+        parent_live.stream_deltas,
+        vec![
+            ("parent-one".to_owned(), "First ".to_owned()),
+            ("parent-one".to_owned(), "response".to_owned()),
+        ]
+    );
+    assert_eq!(parent_live.stream_ends, expected_parent);
+    assert_eq!(parent_live.errors, 0);
+    assert_eq!(parent_live.identity_errors, 0);
+    assert_eq!(parent_live.cancellations, 0);
+    assert_eq!(parent_live.idle_transitions, 1);
+
+    let (late_client, late_agent, late_bootstrap) =
+        connect_and_replay_agent(&fixture, &parent.agent_id, "late Codex attach").await;
+    assert_ne!(late_agent.instance_stream, parent.instance_stream);
+    assert_eq!(
+        replayed_success_messages(&late_bootstrap, "late Codex attach replay"),
+        expected_parent
+    );
+    drop(late_client);
+
+    let (same_host_reconnect_client, same_host_reconnect_agent, same_host_reconnect_bootstrap) =
+        connect_and_replay_agent(
+            &fixture,
+            &parent.agent_id,
+            "fresh Codex connection to same host",
+        )
+        .await;
+    assert_ne!(
+        same_host_reconnect_agent.instance_stream,
+        late_agent.instance_stream
+    );
+    assert_eq!(
+        replayed_success_messages(
+            &same_host_reconnect_bootstrap,
+            "fresh Codex connection to same host replay",
+        ),
+        expected_parent
+    );
+    drop(same_host_reconnect_client);
+
+    fixture
+        .client
+        .send_message(
+            &parent.instance_stream,
+            "exercise child identity quarantine".to_owned(),
+        )
+        .await
+        .expect("send fake Codex follow-up");
+
+    let mut child = None;
+    let mut child_live = CodexIdentityObservation::default();
+    let mut parent_followup = CodexIdentityObservation::default();
+    while child_live.identity_errors < 1
+        || child_live.cancellations < 1
+        || child_live.cancel_idle_transitions < 1
+        || parent_followup.active_transitions < 1
+        || parent_followup.idle_transitions < 1
+        || parent_followup.stream_ends.is_empty()
+    {
+        let env = expect_fixture_event(&mut fixture.client, "fake Codex child identity flow").await;
+        if env.kind == FrameKind::CommandError {
+            let error: CommandErrorPayload = env.parse_payload().expect("parse CommandError");
+            panic!("command error during fake Codex child flow: {error:?}");
+        }
+        if env.kind == FrameKind::NewAgent {
+            let agent: NewAgentPayload = env.parse_payload().expect("parse child NewAgent");
+            if agent.origin == AgentOrigin::BackendNative
+                && agent.parent_agent_id.as_ref() == Some(&parent.agent_id)
+            {
+                child = Some(agent);
+            }
+            continue;
+        }
+        if env.stream == parent.instance_stream && env.kind == FrameKind::ChatEvent {
+            let event: ChatEvent = env
+                .parse_payload()
+                .expect("parse parent follow-up ChatEvent");
+            parent_followup.observe(event);
+            continue;
+        }
+        let Some(child_agent) = child.as_ref() else {
+            continue;
+        };
+        if env.stream != child_agent.instance_stream {
+            continue;
+        }
+        match env.kind {
+            FrameKind::AgentBootstrap => child_live
+                .observe_bootstrap(env.parse_payload().expect("parse child AgentBootstrap")),
+            FrameKind::ChatEvent => {
+                child_live.observe(env.parse_payload().expect("parse child ChatEvent"))
+            }
+            _ => {}
+        }
+    }
+
+    let child = child.expect("fake Codex flow must advertise backend-native child");
+    assert_eq!(parent_followup.stream_starts, vec!["parent-followup"]);
+    assert!(parent_followup.stream_deltas.is_empty());
+    assert_eq!(
+        parent_followup.stream_ends,
+        vec![("parent-followup".to_owned(), "Starting child".to_owned())]
+    );
+    assert_eq!(parent_followup.errors, 0);
+    assert_eq!(parent_followup.identity_errors, 0);
+    assert_eq!(parent_followup.cancellations, 0);
+    assert_eq!(
+        parent_followup.active_transitions, 2,
+        "Codex emits active once for turn/started and once when parent-followup opens"
+    );
+    assert_eq!(parent_followup.idle_transitions, 1);
+    assert_eq!(child_live.stream_starts, vec!["child-good", "child-active"]);
+    assert_eq!(
+        child_live.stream_deltas,
+        vec![
+            ("child-good".to_owned(), "Child response".to_owned()),
+            (
+                "child-active".to_owned(),
+                "Valid before interleave".to_owned(),
+            ),
+        ]
+    );
+    assert!(expected_parent.iter().all(|(id, _)| id != "child-good"));
+    assert_eq!(
+        child_live.stream_ends,
+        vec![("child-good".to_owned(), "Child response".to_owned())]
+    );
+    for forbidden in ["child-foreign", "child-late-delta", "child-late-completion"] {
+        assert!(
+            child_live.stream_starts.iter().all(|id| id != forbidden)
+                && child_live
+                    .stream_deltas
+                    .iter()
+                    .all(|(id, _)| id != forbidden)
+                && child_live.stream_ends.iter().all(|(id, _)| id != forbidden),
+            "late or foreign child item {forbidden} must not resurrect: {child_live:?}"
+        );
+    }
+    assert_eq!(child_live.errors, 1);
+    assert_eq!(child_live.identity_errors, 1);
+    assert_eq!(child_live.cancellations, 1);
+    assert_eq!(child_live.idle_transitions, 1);
+    assert_eq!(child_live.cancel_idle_transitions, 1);
+    assert!(child_live.unexpected_post_cancel_events.is_empty());
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !fake.late_events_written.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fake Codex app-server did not write late-event transport marker");
+
+    loop {
+        match tokio::time::timeout(Duration::from_millis(250), fixture.client.next_event()).await {
+            Err(_) => break,
+            Ok(Ok(Some(env))) if env.kind == FrameKind::BackendCapacity => {}
+            Ok(Ok(Some(env))) if env.kind == FrameKind::CommandError => {
+                let error: CommandErrorPayload = env.parse_payload().expect("parse CommandError");
+                panic!("unexpected command error during post-cancel quiet check: {error:?}");
+            }
+            Ok(Ok(Some(env)))
+                if env.kind == FrameKind::ChatEvent
+                    && (env.stream == parent.instance_stream
+                        || env.stream == child.instance_stream) =>
+            {
+                let event: ChatEvent = env.parse_payload().expect("parse quiet-check ChatEvent");
+                if let Some(kind) = prohibited_post_cancel_event(&event) {
+                    panic!(
+                        "unexpected {kind} after fake Codex cancellation on {}: {event:?}",
+                        env.stream
+                    );
+                }
+                if env.stream == child.instance_stream {
+                    child_live.observe(event);
+                }
+            }
+            Ok(Ok(Some(_))) => {}
+            Ok(Ok(None)) => panic!("connection closed during post-cancel quiet check"),
+            Ok(Err(error)) => panic!("post-cancel quiet check failed: {error:?}"),
+        }
+    }
+    assert_eq!(child_live.errors, 1);
+    assert_eq!(child_live.identity_errors, 1);
+    assert_eq!(child_live.cancellations, 1);
+    assert_eq!(child_live.idle_transitions, 1);
+    assert_eq!(child_live.cancel_idle_transitions, 1);
+    assert!(child_live.unexpected_post_cancel_events.is_empty());
+
+    let (_child_replay_client, replayed_child, child_bootstrap) =
+        connect_and_replay_agent(&fixture, &child.agent_id, "late child replay").await;
+    assert_ne!(replayed_child.instance_stream, child.instance_stream);
+    let replayed_child_messages = replayed_assistant_messages(&child_bootstrap);
+    assert_eq!(
+        replayed_child_messages,
+        vec![
+            ("child-good".to_owned(), "Child response".to_owned()),
+            (
+                "child-active".to_owned(),
+                "Valid before interleave".to_owned(),
+            ),
+        ]
+    );
+    assert!(replayed_child_messages.iter().all(|(id, _)| {
+        !matches!(
+            id.as_str(),
+            "child-foreign" | "child-late-delta" | "child-late-completion"
+        )
+    }));
+    let mut child_replay = CodexIdentityObservation::default();
+    child_replay.observe_bootstrap(child_bootstrap);
+    assert_eq!(child_replay.errors, 1);
+    assert_eq!(child_replay.identity_errors, 1);
+    assert_eq!(child_replay.cancellations, 1);
+    assert_eq!(
+        child_replay.active_transitions, 0,
+        "bootstrap history omits transient active state"
+    );
+    assert_eq!(
+        child_replay.idle_transitions, 0,
+        "bootstrap history omits transient idle state"
+    );
+    assert_eq!(child_replay.cancel_idle_transitions, 0);
+    assert!(child_replay.unexpected_post_cancel_events.is_empty());
+}
+
 #[tokio::test]
 async fn startup_mcp_servers_follow_debug_host_setting_for_new_agents() {
     init_tracing();
@@ -596,6 +1170,7 @@ async fn antigravity_empty_workspace_spawn_is_accepted() {
             | FrameKind::SessionSchemas
             | FrameKind::LaunchProfileCatalogNotify
             | FrameKind::BackendSetup
+            | FrameKind::BackendCapacity
             | FrameKind::TeamPresetCatalogNotify => continue,
             FrameKind::CommandError => {
                 let error = env
@@ -4385,6 +4960,7 @@ async fn real_hermes_openrouter_emits_visible_content() {
     let (backend, mut events) = <server::backend::hermes::HermesBackend as Backend>::spawn(
         vec![workspace.path().to_string_lossy().to_string()],
         server::backend::BackendSpawnConfig {
+            execution_mode: Default::default(),
             cost_hint: cost_hint_for(BackendKind::Hermes),
             custom_agent_id: None,
             startup_mcp_servers: Vec::new(),

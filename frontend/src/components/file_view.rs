@@ -9,12 +9,12 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::components::find_bar::{FindBar, FindState};
 use crate::line_source::FileLines;
-use crate::state::{AppState, CodeIntelKey, TabContent, TabId, TabScrollState};
+use crate::state::{AppState, CodeIntelKey, FileFocus, FileResourceKey, TabId, TabScrollState};
 use crate::syntax_highlight::{LineHighlighter, LineTokens, color_to_css, syntax_for_path};
 
 use protocol::{
     ByteRange, CodeIntelDiagnostic, CodeIntelErrorPayload, CodeIntelSeverity, CodeIntelState,
-    ProjectFileVersion, ProjectPath,
+    ProjectFileVersion,
 };
 
 /// Honest, user-facing label for a file's code-intelligence state. Mirrors the
@@ -127,17 +127,15 @@ fn clear_file_menu_esc_listener() {
 
 /// Reason the go-to-definition / find-references actions are unavailable for a
 /// right-click, or `None` when they can run. Mirrors the F12/Shift+F12
-/// preconditions: an active project, a symbol under the pointer, and code-intel
-/// that isn't unsupported/unavailable/failed for the rendered file version.
+/// preconditions: a symbol under the pointer and code-intel that isn't
+/// unsupported/unavailable/failed for the rendered file version. Resource
+/// routing comes from the view's exact `FileResourceKey`, not active project.
 fn file_context_menu_disabled_reason(
     state: &AppState,
-    key: &Option<CodeIntelKey>,
+    key: &CodeIntelKey,
     version: ProjectFileVersion,
     offset: Option<u32>,
 ) -> Option<String> {
-    let Some(key) = key else {
-        return Some("No active project".to_owned());
-    };
     if offset.is_none() {
         return Some("Right-click on a symbol".to_owned());
     }
@@ -171,7 +169,8 @@ fn file_context_menu_disabled_reason(
 /// actions, matching the F12 keybindings exactly.
 #[component]
 fn FileContextMenu(
-    path: ProjectPath,
+    tab_id: TabId,
+    key: FileResourceKey,
     version: ProjectFileVersion,
     menu: RwSignal<Option<FileMenuState>>,
     x: f64,
@@ -204,22 +203,29 @@ fn FileContextMenu(
     on_cleanup(clear_file_menu_esc_listener);
 
     let def_state = state.clone();
-    let def_path = path.clone();
+    let def_key = key.clone();
     let on_go_to_definition = move |_: web_sys::MouseEvent| {
         menu.set(None);
         if let Some(offset) = offset {
-            crate::actions::navigate_to_definition(&def_state, def_path.clone(), version, offset);
+            crate::actions::navigate_to_definition(
+                &def_state,
+                tab_id,
+                def_key.clone(),
+                version,
+                offset,
+            );
         }
     };
 
     let ref_state = state.clone();
-    let ref_path = path.clone();
+    let ref_key = key.clone();
     let on_show_references = move |_: web_sys::MouseEvent| {
         menu.set(None);
         if let Some(offset) = offset {
             crate::actions::start_find_references(
                 &ref_state,
-                ref_path.clone(),
+                tab_id,
+                ref_key.clone(),
                 version,
                 offset,
                 None,
@@ -291,20 +297,20 @@ fn tab_scroll_state_from_element(el: &web_sys::Element) -> TabScrollState {
 /// Outer `FileView` is intentionally thin: it tracks the loaded file version
 /// (cheap `Memo`) and keys the heavy inner `FileViewLoaded` by that version.
 /// Opening a different file in another tab still does not rebuild this tab, but
-/// a same-path reload at a new `ProjectFileVersion` remounts the body so the DOM,
-/// line table, click/hover versions, and visible-range hints all describe the
-/// same contents.
+/// a same-resource reload at a new `ProjectFileVersion` remounts the body so the
+/// DOM, line table, click/hover versions, and visible-range hints all describe
+/// the same contents.
 #[component]
-pub fn FileView(tab_id: TabId, path: ProjectPath) -> impl IntoView {
+pub fn FileView(tab_id: TabId, key: FileResourceKey) -> impl IntoView {
     let state = expect_context::<AppState>();
-    let file_path = path.clone();
+    let file_key = key.clone();
     let loaded_version: Memo<Option<ProjectFileVersion>> = Memo::new(move |_| {
         state
             .open_files
-            .with(|files| files.get(&file_path).map(|file| file.version))
+            .with(|files| files.get(&file_key).map(|file| file.version))
     });
 
-    let path_for_loaded = path.clone();
+    let key_for_loaded = key.clone();
     view! {
         <div class="file-view">
             <Show
@@ -315,12 +321,12 @@ pub fn FileView(tab_id: TabId, path: ProjectPath) -> impl IntoView {
                     each=move || { loaded_version.get().into_iter().collect::<Vec<_>>() }
                     key=|version| *version
                     children={
-                        let path_for_loaded = path_for_loaded.clone();
+                        let key_for_loaded = key_for_loaded.clone();
                         move |version| {
                             view! {
                                 <FileViewLoaded
                                     tab_id=tab_id
-                                    path=path_for_loaded.clone()
+                                    key=key_for_loaded.clone()
                                     version=version
                                 />
                             }
@@ -335,29 +341,31 @@ pub fn FileView(tab_id: TabId, path: ProjectPath) -> impl IntoView {
 /// Per-tab file body. All heavy setup (line table, find state,
 /// virtualization signals, async syntect task) runs once per rendered file
 /// version. Reads contents untracked from `open_files`; the parent keys this
-/// component by `version`, so a same-path reload remounts with fresh contents.
+/// component by `version`, so a same-resource reload remounts with fresh
+/// contents.
 #[component]
-fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion) -> impl IntoView {
+fn FileViewLoaded(
+    tab_id: TabId,
+    key: FileResourceKey,
+    version: ProjectFileVersion,
+) -> impl IntoView {
     let state = expect_context::<AppState>();
     let initial_scroll_state = state.tab_scroll_state_untracked(tab_id);
 
     let f = state
         .open_files
-        .with_untracked(|files| files.get(&path).cloned())
+        .with_untracked(|files| files.get(&key).cloned())
         .filter(|file| file.version == version)
         .expect("FileViewLoaded mounted with no open_files entry for version");
 
-    let close_path = path.clone();
     // Key for the code-intel status indicator. Stable per tab (the owning
     // host/project don't change for an open file); the status itself is read
     // reactively from the signal in the header.
-    let code_intel_key = state
-        .active_project_ref_untracked()
-        .map(|project| CodeIntelKey {
-            host_id: project.host_id,
-            project_id: project.project_id,
-            path: path.clone(),
-        });
+    let code_intel_key = CodeIntelKey {
+        host_id: key.host_id.clone(),
+        project_id: key.project_id.clone(),
+        path: key.path.clone(),
+    };
     let code_intel_signal = state.code_intel;
     // The version of the contents this view renders. Code-intel status is read
     // at exactly this version, enforcing the version-equals-rendered rule at the
@@ -365,12 +373,19 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
     let code_intel_version = f.version;
     {
         let state_for_focus = state.clone();
-        let focus_path = f.path.clone();
+        let focus_key = key.clone();
         let focus_version = f.version;
         Effect::new(move |_| {
             state_for_focus.code_intel_focus.update(|focus| {
-                if focus.as_ref().is_some_and(|(path, _)| path == &focus_path) {
-                    *focus = Some((focus_path.clone(), focus_version));
+                if focus
+                    .as_ref()
+                    .is_some_and(|focus| focus.tab == tab_id && focus.key == focus_key)
+                {
+                    *focus = Some(FileFocus {
+                        tab: tab_id,
+                        key: focus_key.clone(),
+                        version: focus_version,
+                    });
                 }
             });
         });
@@ -382,17 +397,8 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
         f.contents.unwrap_or_else(|| "(file not found)".to_owned())
     };
 
-    let on_close = move |_| {
-        let state = expect_context::<AppState>();
-        let tab_id = state.center_zone.with_untracked(|cz| {
-            cz.find_tab(&TabContent::File {
-                path: close_path.clone(),
-            })
-        });
-        if let Some(id) = tab_id {
-            state.close_tab(id);
-        }
-    };
+    let state_for_close = state.clone();
+    let on_close = move |_| state_for_close.close_tab(tab_id);
 
     // Hold the entire file content as a single
     // `Arc<str>` plus a per-line byte-offset table.
@@ -576,11 +582,10 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
     // window is first computed, so a deep target line lands in the very first
     // rendered window (no top-then-jump flash). Cleared immediately so it
     // fires once. `pending_line` then drives the measured re-snap below.
-    let goto_path = f.path.clone();
     let initial_goto_line: Option<u32> = state.pending_goto_line.with_untracked(|pending| {
         pending
             .as_ref()
-            .and_then(|(path, line)| (*path == goto_path).then_some(*line))
+            .and_then(|(target, line)| (*target == tab_id).then_some(*line))
     });
     if initial_goto_line.is_some() {
         state.pending_goto_line.set(None);
@@ -591,7 +596,7 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
         state.pending_goto_offset.with_untracked(|pending| {
             pending
                 .as_ref()
-                .and_then(|(path, byte)| (*path == goto_path).then_some(*byte))
+                .and_then(|(target, byte)| (*target == tab_id).then_some(*byte))
                 .map(|byte| lines.line_for_byte(byte) as u32 + 1)
         });
     if initial_goto_offset_line.is_some() {
@@ -679,11 +684,10 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
 
     // Bridge later global goto requests to this file (already-open tab case).
     // The freshly-opened case was handled by the synchronous seed above.
-    let goto_path_for_bridge = f.path.clone();
     let state_for_goto = state.clone();
     Effect::new(move |_| {
-        if let Some((target_path, line)) = state_for_goto.pending_goto_line.get()
-            && target_path == goto_path_for_bridge
+        if let Some((target, line)) = state_for_goto.pending_goto_line.get()
+            && target == tab_id
         {
             pending_line.set(Some(line));
             state_for_goto.pending_goto_line.set(None);
@@ -693,12 +697,11 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
     // Same bridge for byte-offset gotos (go-to-definition into an already-open
     // tab): convert the target byte offset to a 1-based line with this file's
     // `FileLines` and reuse the line-based scroll-snap.
-    let goto_path_for_offset_bridge = f.path.clone();
     let state_for_goto_offset = state.clone();
     let lines_for_goto_offset = lines.clone();
     Effect::new(move |_| {
-        if let Some((target_path, byte)) = state_for_goto_offset.pending_goto_offset.get()
-            && target_path == goto_path_for_offset_bridge
+        if let Some((target, byte)) = state_for_goto_offset.pending_goto_offset.get()
+            && target == tab_id
         {
             let line = lines_for_goto_offset.line_for_byte(byte) as u32 + 1;
             pending_line.set(Some(line));
@@ -771,12 +774,14 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
     // F12 focus.
     let lines_for_click = lines.clone();
     let state_for_click = state.clone();
-    let click_path = f.path.clone();
+    let click_key = key.clone();
     let click_version = f.version;
     let on_content_click = move |ev: web_sys::MouseEvent| {
-        state_for_click
-            .code_intel_focus
-            .set(Some((click_path.clone(), click_version)));
+        state_for_click.code_intel_focus.set(Some(FileFocus {
+            tab: tab_id,
+            key: click_key.clone(),
+            version: click_version,
+        }));
         if !(ev.ctrl_key() || ev.meta_key()) {
             return;
         }
@@ -786,7 +791,8 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
         {
             crate::actions::navigate_to_definition(
                 &state_for_click,
-                click_path.clone(),
+                tab_id,
+                click_key.clone(),
                 click_version,
                 offset,
             );
@@ -800,19 +806,25 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
     let context_menu: RwSignal<Option<FileMenuState>> = RwSignal::new(None);
     let lines_for_ctx = lines.clone();
     let state_for_ctx = state.clone();
-    let ctx_path = f.path.clone();
+    let ctx_resource_key = key.clone();
     let ctx_version = f.version;
-    let ctx_key = code_intel_key.clone();
+    let ctx_code_intel_key = code_intel_key.clone();
     let on_content_contextmenu = move |ev: web_sys::MouseEvent| {
         ev.prevent_default();
-        state_for_ctx
-            .code_intel_focus
-            .set(Some((ctx_path.clone(), ctx_version)));
+        state_for_ctx.code_intel_focus.set(Some(FileFocus {
+            tab: tab_id,
+            key: ctx_resource_key.clone(),
+            version: ctx_version,
+        }));
         let x = ev.client_x() as f64;
         let y = ev.client_y() as f64;
         let offset = byte_offset_at_point(&lines_for_ctx, x, y);
-        let disabled_reason =
-            file_context_menu_disabled_reason(&state_for_ctx, &ctx_key, ctx_version, offset);
+        let disabled_reason = file_context_menu_disabled_reason(
+            &state_for_ctx,
+            &ctx_code_intel_key,
+            ctx_version,
+            offset,
+        );
         context_menu.set(Some(FileMenuState {
             x,
             y,
@@ -825,7 +837,7 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
     // `code_intel_hover`.
     let lines_for_hover = lines.clone();
     let state_for_hover = state.clone();
-    let hover_path = f.path.clone();
+    let hover_key = key.clone();
     let hover_version = f.version;
     let move_hover_timer = hover_timer;
     let move_hovered_offset = hovered_offset;
@@ -841,10 +853,18 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
         );
         let lines = lines_for_hover.clone();
         let state = state_for_hover.clone();
-        let path = hover_path.clone();
+        let key = hover_key.clone();
         let version = hover_version;
         let cb = Closure::<dyn FnMut()>::new(move || {
-            maybe_request_hover(&state, &lines, path.clone(), version, client_x, client_y);
+            maybe_request_hover(
+                &state,
+                &lines,
+                tab_id,
+                key.clone(),
+                version,
+                client_x,
+                client_y,
+            );
         });
         let id = window
             .set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -897,7 +917,7 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
     on_cleanup(move || clear_timeout_timer(visible_timer));
     {
         let state_for_visible = state.clone();
-        let visible_path = f.path.clone();
+        let visible_key = key.clone();
         let visible_version = f.version;
         let lines_for_visible = lines.clone();
         let visible_timer_for_effect = visible_timer;
@@ -921,9 +941,15 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
             // Debounce: cancel a pending send and schedule a fresh one.
             clear_timeout_timer(visible_timer_for_effect);
             let state = state_for_visible.clone();
-            let path = visible_path.clone();
+            let key = visible_key.clone();
             let cb = Closure::<dyn FnMut()>::new(move || {
-                crate::actions::send_visible_range(&state, path.clone(), visible_version, range);
+                crate::actions::send_visible_range(
+                    &state,
+                    tab_id,
+                    key.clone(),
+                    visible_version,
+                    range,
+                );
             });
             let id = window
                 .set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -946,7 +972,6 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
                 return None;
             }
             let offset = hovered_offset.get()?;
-            let key = key.clone()?;
             code_intel_signal.with(|map| map.get(&key)?.navigable_range_at(version, offset))
         })
     };
@@ -961,24 +986,20 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
         let lines = lines.clone();
         let version = code_intel_version;
         Memo::new(move |_| {
-            let mut map = if let Some(key) = key.clone() {
-                code_intel_signal.with(|code_intel| {
-                    let Some(file) = code_intel.get(&key) else {
-                        return HashMap::new();
-                    };
-                    if file.rendered_version != Some(version) {
-                        return HashMap::new();
+            let mut map = code_intel_signal.with(|code_intel| {
+                let Some(file) = code_intel.get(&key) else {
+                    return HashMap::new();
+                };
+                if file.rendered_version != Some(version) {
+                    return HashMap::new();
+                }
+                match file.applied() {
+                    Some(data) if !data.diagnostics.is_empty() => {
+                        build_line_decorations(&lines, &data.diagnostics)
                     }
-                    match file.applied() {
-                        Some(data) if !data.diagnostics.is_empty() => {
-                            build_line_decorations(&lines, &data.diagnostics)
-                        }
-                        _ => HashMap::new(),
-                    }
-                })
-            } else {
-                HashMap::new()
-            };
+                    _ => HashMap::new(),
+                }
+            });
             if let Some(range) = cmd_link_range.get() {
                 add_cmd_link_decoration(&mut map, &lines, range);
             }
@@ -989,7 +1010,7 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
     let lines_for_render = lines.clone();
     let highlighted_for_render = highlighted.clone();
     let find_for_render = find_state.clone();
-    let menu_path = f.path.clone();
+    let menu_key = key.clone();
 
     view! {
                             <div class="file-view-header">
@@ -997,9 +1018,8 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
                                 {
                                     let code_intel_key = code_intel_key.clone();
                                     move || {
-                                        let key = code_intel_key.clone()?;
                                         let label = code_intel_signal.with(|map| {
-                                            let file = map.get(&key)?;
+                                            let file = map.get(&code_intel_key)?;
                                             // Only show status the server resolved
                                             // against the exact text this view is
                                             // rendering (version-equals-rendered).
@@ -1116,7 +1136,8 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
                             {move || {
                                 context_menu.get().map(|m| view! {
                                     <FileContextMenu
-                                        path=menu_path.clone()
+                                        tab_id=tab_id
+                                        key=menu_key.clone()
                                         version=code_intel_version
                                         menu=context_menu
                                         x=m.x
@@ -1762,12 +1783,13 @@ fn clear_timeout_timer(timer: TimeoutClosureSlot) {
 /// a no-op when nothing is focused or selected. Public so `app.rs`'s global
 /// keydown listener can call it.
 pub fn navigate_from_current_selection(state: &AppState) {
-    let Some((path, _)) = state.code_intel_focus.get_untracked() else {
+    let Some(focus) = state.code_intel_focus.get_untracked() else {
         return;
     };
     let Some((version, content)) = state.open_files.with_untracked(|files| {
         files
-            .get(&path)
+            .get(&focus.key)
+            .filter(|file| file.version == focus.version)
             .and_then(|of| of.contents.clone().map(|content| (of.version, content)))
     }) else {
         return;
@@ -1780,7 +1802,7 @@ pub fn navigate_from_current_selection(state: &AppState) {
         return;
     };
     if let Some(offset) = byte_offset_from_range(&lines, &range) {
-        crate::actions::navigate_to_definition(state, path, version, offset);
+        crate::actions::navigate_to_definition(state, focus.tab, focus.key, version, offset);
     }
 }
 
@@ -1791,12 +1813,13 @@ pub fn navigate_from_current_selection(state: &AppState) {
 /// it's a short single token) is captured as the panel's symbol label. Public so
 /// `app.rs`'s global keydown listener can call it.
 pub fn find_references_from_current_selection(state: &AppState) {
-    let Some((path, _)) = state.code_intel_focus.get_untracked() else {
+    let Some(focus) = state.code_intel_focus.get_untracked() else {
         return;
     };
     let Some((version, content)) = state.open_files.with_untracked(|files| {
         files
-            .get(&path)
+            .get(&focus.key)
+            .filter(|file| file.version == focus.version)
             .and_then(|of| of.contents.clone().map(|content| (of.version, content)))
     }) else {
         return;
@@ -1820,7 +1843,7 @@ pub fn find_references_from_current_selection(state: &AppState) {
         }
     };
     if let Some(offset) = byte_offset_from_range(&lines, &range) {
-        crate::actions::start_find_references(state, path, version, offset, symbol);
+        crate::actions::start_find_references(state, focus.tab, focus.key, version, offset, symbol);
     }
 }
 
@@ -1832,7 +1855,8 @@ pub fn find_references_from_current_selection(state: &AppState) {
 fn maybe_request_hover(
     state: &AppState,
     lines: &FileLines,
-    path: ProjectPath,
+    tab: TabId,
+    key: FileResourceKey,
     version: protocol::ProjectFileVersion,
     client_x: f64,
     client_y: f64,
@@ -1846,15 +1870,17 @@ fn maybe_request_hover(
         return;
     }
     // Already showing/awaiting a hover for this exact identifier: leave it.
-    if state
-        .code_intel_hover
-        .with_untracked(|h| h.as_ref().map(|p| p.offset) == Some(target.offset))
-    {
+    if state.code_intel_hover.with_untracked(|hover| {
+        hover.as_ref().is_some_and(|popover| {
+            popover.tab == tab && popover.key == key && popover.offset == target.offset
+        })
+    }) {
         return;
     }
     crate::actions::request_hover(
         state,
-        path,
+        tab,
+        key,
         version,
         target.offset,
         target.anchor_left,
@@ -1948,9 +1974,9 @@ mod conversion_tests {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
-    use crate::state::{AppState, OpenFile};
+    use crate::state::{AppState, FileResourceKey, OpenFile, OpenTarget};
     use leptos::mount::mount_to;
-    use protocol::{ProjectFileVersion, ProjectPath, ProjectRootPath};
+    use protocol::{ProjectFileVersion, ProjectId, ProjectPath, ProjectRootPath};
     use std::cell::RefCell;
     use std::rc::Rc;
     use wasm_bindgen::JsCast;
@@ -1958,6 +1984,14 @@ mod wasm_tests {
     use web_sys::{Element, HtmlElement};
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    fn file_key(path: ProjectPath) -> FileResourceKey {
+        FileResourceKey {
+            host_id: "h".to_owned(),
+            project_id: ProjectId("p".to_owned()),
+            path,
+        }
+    }
 
     /// Inject the production stylesheet once per test session so layout
     /// assertions reflect real styling.
@@ -2063,11 +2097,41 @@ mod wasm_tests {
     }
 
     fn mousemove_code_utf16_col(container: &HtmlElement, utf16_col: u32) {
+        mousemove_code_utf16_col_in(container, ".file-line-code", utf16_col);
+    }
+
+    fn mousemove_code_utf16_col_in(container: &HtmlElement, selector: &str, utf16_col: u32) {
         let code = container
-            .query_selector(".file-line-code")
+            .query_selector(selector)
             .unwrap()
             .expect("code element present");
-        let (x, y) = code_point_for_utf16_col(container, utf16_col);
+        let code_node: &web_sys::Node = code.unchecked_ref();
+        let document = web_sys::window().unwrap().document().unwrap();
+        let mut remaining = utf16_col;
+        let mut point = None;
+        for text_node in super::descendant_text_nodes(code_node) {
+            let text = text_node.text_content().unwrap_or_default();
+            let len = text.encode_utf16().count() as u32;
+            if remaining < len {
+                let range = document.create_range().unwrap();
+                range.set_start(&text_node, remaining).unwrap();
+                range.set_end(&text_node, remaining + 1).unwrap();
+                let rect = range.get_bounding_client_rect();
+                point = Some((
+                    (rect.left() + rect.width() / 2.0) as i32,
+                    (rect.top() + rect.height() / 2.0) as i32,
+                ));
+                break;
+            }
+            remaining -= len;
+        }
+        let (x, y) = point.unwrap_or_else(|| {
+            let rect = code.get_bounding_client_rect();
+            (
+                (rect.left() + 1.0) as i32,
+                (rect.top() + rect.height() / 2.0) as i32,
+            )
+        });
         let init = web_sys::MouseEventInit::new();
         init.set_bubbles(true);
         init.set_client_x(x);
@@ -2075,6 +2139,51 @@ mod wasm_tests {
         let event =
             web_sys::MouseEvent::new_with_mouse_event_init_dict("mousemove", &init).unwrap();
         code.dispatch_event(&event).unwrap();
+    }
+
+    fn recorded_code_intel_routes(kind: &str) -> Vec<(String, String, String)> {
+        let calls = js_sys::eval("window.__test_send_calls || []")
+            .expect("read send calls")
+            .dyn_into::<js_sys::Array>()
+            .expect("send calls array");
+        let mut routes = Vec::new();
+        for entry in calls.iter() {
+            let entry = entry.dyn_into::<js_sys::Array>().expect("send call entry");
+            if entry.get(0).as_string().as_deref() != Some("send_host_line") {
+                continue;
+            }
+            let args: serde_json::Value =
+                serde_json::from_str(&entry.get(1).as_string().expect("send call args"))
+                    .expect("parse send call args");
+            let envelope: serde_json::Value = serde_json::from_str(
+                args.get("line")
+                    .and_then(|value| value.as_str())
+                    .expect("send frame line"),
+            )
+            .expect("parse send frame");
+            if envelope.get("kind").and_then(|value| value.as_str()) != Some(kind) {
+                continue;
+            }
+            routes.push((
+                args.get("hostId")
+                    .and_then(|value| value.as_str())
+                    .expect("frame host")
+                    .to_owned(),
+                envelope
+                    .get("stream")
+                    .and_then(|value| value.as_str())
+                    .expect("frame stream")
+                    .to_owned(),
+                envelope
+                    .get("payload")
+                    .and_then(|payload| payload.get("path"))
+                    .and_then(|path| path.get("relative_path"))
+                    .and_then(|value| value.as_str())
+                    .expect("frame path")
+                    .to_owned(),
+            ));
+        }
+        routes
     }
 
     /// Whether a `code_intel_navigate` frame was put on the wire via the
@@ -2160,9 +2269,10 @@ mod wasm_tests {
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
             let file_path = mount_path.clone();
+            let resource_key = file_key(file_path.clone());
             state.open_files.update(|files| {
                 files.insert(
-                    file_path.clone(),
+                    resource_key.clone(),
                     OpenFile {
                         path: file_path.clone(),
                         version: ProjectFileVersion(1),
@@ -2172,7 +2282,7 @@ mod wasm_tests {
                 );
             });
             provide_context(state);
-            view! { <FileView tab_id=TabId(20_001) path=mount_path.clone() /> }
+            view! { <FileView tab_id=TabId(20_001) key=file_key(mount_path.clone()) /> }
         });
 
         next_tick().await;
@@ -2265,9 +2375,10 @@ mod wasm_tests {
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
             let file_path = mount_path.clone();
+            let resource_key = file_key(file_path.clone());
             state.open_files.update(|files| {
                 files.insert(
-                    file_path.clone(),
+                    resource_key.clone(),
                     OpenFile {
                         path: file_path.clone(),
                         version: ProjectFileVersion(1),
@@ -2278,7 +2389,7 @@ mod wasm_tests {
             });
             *cap.borrow_mut() = Some(state.clone());
             provide_context(state);
-            view! { <FileView tab_id=TabId(20_040) path=mount_path.clone() /> }
+            view! { <FileView tab_id=TabId(20_040) key=file_key(mount_path.clone()) /> }
         });
 
         next_tick().await;
@@ -2289,12 +2400,14 @@ mod wasm_tests {
         assert_eq!(row.text_content().unwrap_or_default(), "old contents");
 
         let state = captured.borrow().clone().unwrap();
-        state
-            .code_intel_focus
-            .set(Some((path.clone(), ProjectFileVersion(1))));
+        state.code_intel_focus.set(Some(FileFocus {
+            tab: TabId(20_040),
+            key: file_key(path.clone()),
+            version: ProjectFileVersion(1),
+        }));
         state.open_files.update(|files| {
             files.insert(
-                path.clone(),
+                file_key(path.clone()),
                 OpenFile {
                     path: path.clone(),
                     version: ProjectFileVersion(2),
@@ -2318,8 +2431,423 @@ mod wasm_tests {
         );
         assert_eq!(
             state.code_intel_focus.get_untracked(),
-            Some((path.clone(), ProjectFileVersion(2))),
+            Some(FileFocus {
+                tab: TabId(20_040),
+                key: file_key(path.clone()),
+                version: ProjectFileVersion(2),
+            }),
             "same-path remount must advance keyboard code-intel focus to the rendered version"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn duplicate_views_share_updates_but_keep_navigation_and_close_targets() {
+        use crate::state::{DuplicateFileResult, PaneId, PendingFileNavigation, TabContent};
+
+        ensure_styles_loaded();
+        install_send_stub();
+
+        let path = ProjectPath {
+            root: ProjectRootPath("test-root".to_owned()),
+            relative_path: "shared.txt".to_owned(),
+        };
+        let key = file_key(path.clone());
+        let initial = (0..1000)
+            .map(|line| format!("original line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let updated = (0..1000)
+            .map(|line| format!("updated line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let container = make_container();
+        let captured = Rc::new(RefCell::new(None));
+        let captured_for_mount = captured.clone();
+        let mount_key = key.clone();
+        let mount_path = path.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.open_files.update(|files| {
+                files.insert(
+                    mount_key.clone(),
+                    OpenFile {
+                        path: mount_path.clone(),
+                        version: ProjectFileVersion(1),
+                        contents: Some(initial.clone()),
+                        is_binary: false,
+                    },
+                );
+            });
+            let primary = state
+                .open_tab_in(
+                    PaneId::Primary,
+                    TabContent::File {
+                        key: mount_key.clone(),
+                    },
+                    "shared.txt".to_owned(),
+                    true,
+                )
+                .expect("primary occurrence");
+            let duplicate = state.duplicate_file_in_result(PaneId::Secondary, primary);
+            let secondary = duplicate.tab_id().expect("secondary occurrence");
+            assert_eq!(
+                duplicate,
+                DuplicateFileResult::Duplicated {
+                    source: primary,
+                    tab: secondary,
+                    target: PaneId::Secondary,
+                },
+                "the fixture must create a new exact secondary occurrence"
+            );
+            *captured_for_mount.borrow_mut() =
+                Some((state.clone(), primary, secondary, mount_key.clone()));
+            provide_context(state);
+            view! {
+                <div id="primary-file" style="height: 260px; min-height: 260px;">
+                    <FileView tab_id=primary key=mount_key.clone() />
+                </div>
+                <div id="secondary-file" style="height: 260px; min-height: 260px;">
+                    <FileView tab_id=secondary key=mount_key />
+                </div>
+            }
+        });
+
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        let (state, primary, secondary, resource_key) =
+            captured.borrow().clone().expect("captured state");
+        wait_ms(VISIBLE_RANGE_DEBOUNCE_MS + 50).await;
+        let visible_routes = recorded_code_intel_routes("code_intel_set_visible_range");
+        assert!(
+            visible_routes.len() >= 2,
+            "both exact file occurrences must emit their own visible-range hint; got {visible_routes:?}"
+        );
+        assert!(visible_routes.iter().all(|route| {
+            route
+                == &(
+                    "h".to_owned(),
+                    "/project/p".to_owned(),
+                    "shared.txt".to_owned(),
+                )
+        }));
+
+        state.open_files.update(|files| {
+            files.insert(
+                resource_key.clone(),
+                OpenFile {
+                    path: path.clone(),
+                    version: ProjectFileVersion(2),
+                    contents: Some(updated),
+                    is_binary: false,
+                },
+            );
+        });
+        for _ in 0..5 {
+            next_tick().await;
+        }
+        for selector in ["#primary-file", "#secondary-file"] {
+            let text = container
+                .query_selector(selector)
+                .unwrap()
+                .expect("file occurrence")
+                .text_content()
+                .unwrap_or_default();
+            assert!(
+                text.contains("updated line 0"),
+                "{selector} did not render the shared authoritative update"
+            );
+            assert!(!text.contains("original line 0"));
+        }
+
+        mousemove_code_utf16_col_in(&container, "#secondary-file .file-line-code", 0);
+        wait_ms(HOVER_DEBOUNCE_MS + 50).await;
+        let secondary_hover = state
+            .code_intel_hover
+            .get_untracked()
+            .expect("secondary hover request");
+        assert_eq!(secondary_hover.tab, secondary);
+        assert_eq!(secondary_hover.key, resource_key);
+
+        mousemove_code_utf16_col_in(&container, "#primary-file .file-line-code", 0);
+        wait_ms(HOVER_DEBOUNCE_MS + 50).await;
+        let primary_hover = state
+            .code_intel_hover
+            .get_untracked()
+            .expect("primary hover request at the same offset");
+        assert_eq!(primary_hover.tab, primary);
+        assert_eq!(primary_hover.key, resource_key);
+        assert_ne!(
+            primary_hover.hover_id, secondary_hover.hover_id,
+            "same-resource panes must not dedupe hover by offset alone"
+        );
+
+        contextmenu_first_line_in(&container, "#secondary-file .file-line-code");
+        next_tick().await;
+        let menu_items = container.query_selector_all(".context-menu-item").unwrap();
+        let show_references: HtmlElement = menu_items.item(1).unwrap().dyn_into().unwrap();
+        show_references.click();
+        next_tick().await;
+        assert_eq!(
+            state.references_state.with_untracked(|references| {
+                references
+                    .source()
+                    .map(|(tab, key, version)| (tab, key.clone(), version))
+            }),
+            Some((secondary, resource_key.clone(), ProjectFileVersion(2))),
+            "references from the secondary occurrence crossed to another view"
+        );
+
+        let secondary_content = container
+            .query_selector("#secondary-file .file-view-content")
+            .unwrap()
+            .expect("secondary file content");
+        secondary_content
+            .dispatch_event(&web_sys::MouseEvent::new("click").unwrap())
+            .unwrap();
+        assert_eq!(
+            state.code_intel_focus.get_untracked(),
+            Some(FileFocus {
+                tab: secondary,
+                key: resource_key.clone(),
+                version: ProjectFileVersion(2),
+            }),
+            "code-intel focus did not retain the clicked occurrence"
+        );
+
+        let primary_scroller = container
+            .query_selector("#primary-file .file-view-content")
+            .unwrap()
+            .expect("primary scroller")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        let secondary_scroller = container
+            .query_selector("#secondary-file .file-view-content")
+            .unwrap()
+            .expect("secondary scroller")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        primary_scroller.set_scroll_top(180);
+        primary_scroller
+            .dispatch_event(&web_sys::Event::new("scroll").unwrap())
+            .unwrap();
+        state.target_file_navigation(secondary, PendingFileNavigation::Line(700));
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert_eq!(
+            primary_scroller.scroll_top(),
+            180,
+            "navigation for the secondary occurrence moved the primary view"
+        );
+        assert!(
+            secondary_scroller.scroll_top() > 5000,
+            "the secondary occurrence did not consume its targeted navigation"
+        );
+        assert_eq!(
+            state
+                .tab_scroll_state_untracked(primary)
+                .map(|scroll| scroll.scroll_top),
+            Some(180)
+        );
+        assert_ne!(
+            state
+                .tab_scroll_state_untracked(primary)
+                .map(|scroll| scroll.scroll_top),
+            state
+                .tab_scroll_state_untracked(secondary)
+                .map(|scroll| scroll.scroll_top)
+        );
+
+        let secondary_close = container
+            .query_selector("#secondary-file .file-view-close")
+            .unwrap()
+            .expect("secondary close button");
+        secondary_close
+            .dispatch_event(&web_sys::MouseEvent::new("click").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert!(
+            state
+                .center_zone
+                .with_untracked(|center| center.tab(primary).is_some())
+        );
+        assert!(
+            state
+                .center_zone
+                .with_untracked(|center| center.tab(secondary).is_none())
+        );
+        assert!(
+            state
+                .open_files
+                .with_untracked(|files| files.contains_key(&resource_key)),
+            "closing one occurrence tore down the shared file"
+        );
+        assert!(state.tab_scroll_state_untracked(primary).is_some());
+        assert!(state.tab_scroll_state_untracked(secondary).is_none());
+    }
+
+    #[wasm_bindgen_test]
+    async fn same_relative_path_in_two_projects_stays_distinct() {
+        use crate::state::{PaneId, TabContent};
+
+        ensure_styles_loaded();
+        install_send_stub();
+
+        let path = ProjectPath {
+            root: ProjectRootPath("same-root-label".to_owned()),
+            relative_path: "src/lib.rs".to_owned(),
+        };
+        let key_a = FileResourceKey {
+            host_id: "host-a".to_owned(),
+            project_id: ProjectId("project-a".to_owned()),
+            path: path.clone(),
+        };
+        let key_b = FileResourceKey {
+            host_id: "host-b".to_owned(),
+            project_id: ProjectId("project-b".to_owned()),
+            path: path.clone(),
+        };
+        let container = make_container();
+        let captured = Rc::new(RefCell::new(None));
+        let captured_for_mount = captured.clone();
+        let mount_a = key_a.clone();
+        let mount_b = key_b.clone();
+        let mount_path = path.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.open_files.update(|files| {
+                files.insert(
+                    mount_a.clone(),
+                    OpenFile {
+                        path: mount_path.clone(),
+                        version: ProjectFileVersion(1),
+                        contents: Some("project alpha".to_owned()),
+                        is_binary: false,
+                    },
+                );
+                files.insert(
+                    mount_b.clone(),
+                    OpenFile {
+                        path: mount_path.clone(),
+                        version: ProjectFileVersion(1),
+                        contents: Some("project bravo".to_owned()),
+                        is_binary: false,
+                    },
+                );
+            });
+            let tab_a = state
+                .open_tab_in(
+                    PaneId::Primary,
+                    TabContent::File {
+                        key: mount_a.clone(),
+                    },
+                    "lib.rs · project-a".to_owned(),
+                    true,
+                )
+                .expect("project-a tab");
+            let tab_b = state
+                .open_tab_in(
+                    PaneId::Secondary,
+                    TabContent::File {
+                        key: mount_b.clone(),
+                    },
+                    "lib.rs · project-b".to_owned(),
+                    true,
+                )
+                .expect("project-b tab");
+            *captured_for_mount.borrow_mut() = Some((state.clone(), tab_a, tab_b));
+            provide_context(state);
+            view! {
+                <div id="project-a-file">
+                    <FileView tab_id=tab_a key=mount_a />
+                </div>
+                <div id="project-b-file">
+                    <FileView tab_id=tab_b key=mount_b />
+                </div>
+            }
+        });
+        next_tick().await;
+        wait_ms(VISIBLE_RANGE_DEBOUNCE_MS + 50).await;
+
+        let text = |selector: &str| {
+            container
+                .query_selector(selector)
+                .unwrap()
+                .expect("project file")
+                .text_content()
+                .unwrap_or_default()
+        };
+        assert!(text("#project-a-file").contains("project alpha"));
+        assert!(text("#project-b-file").contains("project bravo"));
+
+        let (state, tab_a, tab_b) = captured.borrow().clone().expect("captured state");
+        let visible_routes = recorded_code_intel_routes("code_intel_set_visible_range");
+        assert!(
+            visible_routes.contains(&(
+                "host-a".to_owned(),
+                "/project/project-a".to_owned(),
+                "src/lib.rs".to_owned(),
+            )),
+            "project-a visible range was misrouted: {visible_routes:?}"
+        );
+        assert!(
+            visible_routes.contains(&(
+                "host-b".to_owned(),
+                "/project/project-b".to_owned(),
+                "src/lib.rs".to_owned(),
+            )),
+            "project-b visible range was misrouted: {visible_routes:?}"
+        );
+        state.open_files.update(|files| {
+            files.insert(
+                key_a.clone(),
+                OpenFile {
+                    path: path.clone(),
+                    version: ProjectFileVersion(2),
+                    contents: Some("project alpha updated".to_owned()),
+                    is_binary: false,
+                },
+            );
+        });
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert!(text("#project-a-file").contains("project alpha updated"));
+        assert!(text("#project-b-file").contains("project bravo"));
+        assert!(!text("#project-b-file").contains("alpha"));
+
+        mousemove_code_utf16_col_in(&container, "#project-a-file .file-line-code", 0);
+        wait_ms(HOVER_DEBOUNCE_MS + 50).await;
+        let hover_a = state
+            .code_intel_hover
+            .get_untracked()
+            .expect("project-a hover");
+        assert_eq!((hover_a.tab, hover_a.key), (tab_a, key_a.clone()));
+
+        mousemove_code_utf16_col_in(&container, "#project-b-file .file-line-code", 0);
+        wait_ms(HOVER_DEBOUNCE_MS + 50).await;
+        let hover_b = state
+            .code_intel_hover
+            .get_untracked()
+            .expect("project-b hover");
+        assert_eq!((hover_b.tab, hover_b.key), (tab_b, key_b.clone()));
+
+        contextmenu_first_line_in(&container, "#project-b-file .file-line-code");
+        next_tick().await;
+        let menu_items = container.query_selector_all(".context-menu-item").unwrap();
+        let show_references: HtmlElement = menu_items.item(1).unwrap().dyn_into().unwrap();
+        show_references.click();
+        next_tick().await;
+        assert_eq!(
+            state.references_state.with_untracked(|references| {
+                references
+                    .source()
+                    .map(|(tab, key, version)| (tab, key.clone(), version))
+            }),
+            Some((tab_b, key_b, ProjectFileVersion(1))),
+            "same-path references crossed from project-b to project-a"
         );
     }
 
@@ -2345,9 +2873,10 @@ mod wasm_tests {
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
             let file_path = mount_path.clone();
+            let resource_key = file_key(file_path.clone());
             state.open_files.update(|files| {
                 files.insert(
-                    file_path.clone(),
+                    resource_key.clone(),
                     OpenFile {
                         path: file_path.clone(),
                         version: ProjectFileVersion(1),
@@ -2383,7 +2912,7 @@ mod wasm_tests {
                 });
             });
             provide_context(state);
-            view! { <FileView tab_id=TabId(20_041) path=mount_path.clone() /> }
+            view! { <FileView tab_id=TabId(20_041) key=file_key(mount_path.clone()) /> }
         });
 
         next_tick().await;
@@ -2435,7 +2964,7 @@ mod wasm_tests {
             let file_path = mount_path.clone();
             state.open_files.update(|files| {
                 files.insert(
-                    file_path.clone(),
+                    file_key(file_path.clone()),
                     OpenFile {
                         path: file_path.clone(),
                         version: ProjectFileVersion(1),
@@ -2445,7 +2974,7 @@ mod wasm_tests {
                 );
             });
             provide_context(state);
-            view! { <FileView tab_id=TabId(20_002) path=mount_path.clone() /> }
+            view! { <FileView tab_id=TabId(20_002) key=file_key(mount_path.clone()) /> }
         });
         // The fallback highlighter yields once before doing any syntect
         // work (so the parent component can paint plain text first), so
@@ -2513,7 +3042,7 @@ mod wasm_tests {
             let state = AppState::new();
             state.open_files.update(|files| {
                 files.insert(
-                    mount_first_path.clone(),
+                    file_key(mount_first_path.clone()),
                     OpenFile {
                         path: mount_first_path.clone(),
                         version: ProjectFileVersion(1),
@@ -2522,7 +3051,7 @@ mod wasm_tests {
                     },
                 );
                 files.insert(
-                    mount_second_path.clone(),
+                    file_key(mount_second_path.clone()),
                     OpenFile {
                         path: mount_second_path.clone(),
                         version: ProjectFileVersion(1),
@@ -2534,10 +3063,10 @@ mod wasm_tests {
             provide_context(state);
             view! {
                 <div id="file-one">
-                    <FileView tab_id=TabId(20_003) path=mount_first_path.clone() />
+                    <FileView tab_id=TabId(20_003) key=file_key(mount_first_path.clone()) />
                 </div>
                 <div id="file-two">
-                    <FileView tab_id=TabId(20_004) path=mount_second_path.clone() />
+                    <FileView tab_id=TabId(20_004) key=file_key(mount_second_path.clone()) />
                 </div>
             }
         });
@@ -2586,7 +3115,7 @@ mod wasm_tests {
             let file_path = mount_path.clone();
             state.open_files.update(|files| {
                 files.insert(
-                    file_path.clone(),
+                    file_key(file_path.clone()),
                     OpenFile {
                         path: file_path.clone(),
                         version: ProjectFileVersion(1),
@@ -2596,7 +3125,7 @@ mod wasm_tests {
                 );
             });
             provide_context(state);
-            view! { <FileView tab_id=TabId(20_003) path=mount_path.clone() /> }
+            view! { <FileView tab_id=TabId(20_003) key=file_key(mount_path.clone()) /> }
         });
 
         // Virtualization must engage on the very first paint — pre-seeded
@@ -2693,7 +3222,11 @@ mod wasm_tests {
             let file_path = mount_path.clone();
             state.open_files.update(|files| {
                 files.insert(
-                    file_path.clone(),
+                    FileResourceKey {
+                        host_id: mount_host.clone(),
+                        project_id: mount_project.clone(),
+                        path: file_path.clone(),
+                    },
                     OpenFile {
                         path: file_path.clone(),
                         version: ProjectFileVersion(1),
@@ -2702,7 +3235,6 @@ mod wasm_tests {
                     },
                 );
             });
-            // The component derives its code-intel key from the active project.
             state.active_project.set(Some(ActiveProjectRef {
                 host_id: mount_host.clone(),
                 project_id: mount_project.clone(),
@@ -2726,7 +3258,16 @@ mod wasm_tests {
                 });
             });
             provide_context(state);
-            view! { <FileView tab_id=TabId(20_010) path=mount_path.clone() /> }
+            view! {
+                <FileView
+                    tab_id=TabId(20_010)
+                    key=FileResourceKey {
+                        host_id: mount_host.clone(),
+                        project_id: mount_project.clone(),
+                        path: mount_path.clone(),
+                    }
+                />
+            }
         });
 
         next_tick().await;
@@ -2832,7 +3373,7 @@ mod wasm_tests {
             let file_path = mount_path.clone();
             state.open_files.update(|files| {
                 files.insert(
-                    file_path.clone(),
+                    file_key(file_path.clone()),
                     OpenFile {
                         path: file_path.clone(),
                         version: ProjectFileVersion(1),
@@ -2844,9 +3385,9 @@ mod wasm_tests {
             // Request the goto BEFORE mounting the view.
             state
                 .pending_goto_line
-                .set(Some((file_path.clone(), target_line)));
+                .set(Some((TabId(20_004), target_line)));
             provide_context(state);
-            view! { <FileView tab_id=TabId(20_004) path=mount_path.clone() /> }
+            view! { <FileView tab_id=TabId(20_004) key=file_key(mount_path.clone()) /> }
         });
 
         next_tick().await;
@@ -2921,7 +3462,7 @@ mod wasm_tests {
             let file_path = mount_path.clone();
             state.open_files.update(|files| {
                 files.insert(
-                    file_path.clone(),
+                    file_key(file_path.clone()),
                     OpenFile {
                         path: file_path.clone(),
                         version: ProjectFileVersion(1),
@@ -2931,7 +3472,7 @@ mod wasm_tests {
                 );
             });
             provide_context(state);
-            view! { <FileView tab_id=TabId(20_020) path=mount_path.clone() /> }
+            view! { <FileView tab_id=TabId(20_020) key=file_key(mount_path.clone()) /> }
         });
 
         next_tick().await;
@@ -3003,7 +3544,7 @@ mod wasm_tests {
             let file_path = mount_path.clone();
             state.open_files.update(|files| {
                 files.insert(
-                    file_path.clone(),
+                    file_key(file_path.clone()),
                     OpenFile {
                         path: file_path.clone(),
                         version: ProjectFileVersion(1),
@@ -3017,7 +3558,7 @@ mod wasm_tests {
                 project_id: ProjectId("p".to_owned()),
             }));
             provide_context(state);
-            view! { <FileView tab_id=TabId(20_021) path=mount_path.clone() /> }
+            view! { <FileView tab_id=TabId(20_021) key=file_key(mount_path.clone()) /> }
         });
 
         next_tick().await;
@@ -3101,10 +3642,16 @@ mod wasm_tests {
         let cap = captured.clone();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
+            state.pending_goto_line.set(None);
+            state.pending_goto_offset.set(None);
+            state.host_streams.update(|streams| {
+                streams.insert("h".to_owned(), protocol::StreamPath("/host/h".to_owned()));
+            });
             let file_path = mount_path.clone();
+            let resource_key = file_key(file_path.clone());
             state.open_files.update(|files| {
                 files.insert(
-                    file_path.clone(),
+                    resource_key.clone(),
                     OpenFile {
                         path: file_path.clone(),
                         version: ProjectFileVersion(1),
@@ -3147,24 +3694,61 @@ mod wasm_tests {
                 file.set_rendered_version(ProjectFileVersion(1));
                 file.merge_versioned(ProjectFileVersion(1), |d| d.merge_model(model));
             });
+            let tab_id = state
+                .open_tab_at(
+                    OpenTarget::Focused,
+                    crate::state::TabContent::File {
+                        key: resource_key.clone(),
+                    },
+                    "main.rs".to_owned(),
+                    true,
+                )
+                .expect("source file tab");
             *cap.borrow_mut() = Some(state.clone());
             provide_context(state);
-            view! { <FileView tab_id=TabId(20_030) path=mount_path.clone() /> }
+            view! { <FileView tab_id=tab_id key=resource_key /> }
         });
 
         next_tick().await;
         let state = captured.borrow().clone().unwrap();
+        assert!(state.pending_goto_line.get_untracked().is_none());
+        assert!(state.pending_goto_offset.get_untracked().is_none());
+        assert!(
+            state
+                .pending_file_opens
+                .with_untracked(|pending| !pending.contains_key(&file_key(target.clone()))),
+            "the cold-open target must not have a navigation intent before the click"
+        );
 
         cmd_click_first_line(&container);
         for _ in 0..10 {
             next_tick().await;
         }
 
-        // Local jump: the pushed target offset is stashed for the scroll-snap…
+        let target_key = file_key(target.clone());
+        assert!(
+            matches!(
+                state
+                    .pending_file_opens
+                    .with_untracked(|pending| pending.get(&target_key).copied()),
+                Some(crate::state::PendingFileOpen::Open {
+                    navigation: Some(crate::state::PendingFileNavigation::Offset(42)),
+                    ..
+                })
+            ),
+            "a pushed-definition click should preserve its target offset through the cold open"
+        );
         assert_eq!(
-            state.pending_goto_offset.get_untracked(),
-            Some((target.clone(), 42)),
-            "a pushed-definition click should jump locally to the target offset"
+            state.pending_file_opens.with_untracked(|pending| {
+                match pending.get(&target_key).copied() {
+                    Some(crate::state::PendingFileOpen::Open { destination, .. }) => {
+                        Some(destination.pane())
+                    }
+                    _ => None,
+                }
+            }),
+            Some(crate::state::PaneId::Primary),
+            "the cold open must preserve the source TabId's pane as its destination"
         );
         // …and NO on-demand navigate request was sent.
         assert!(
@@ -3210,10 +3794,16 @@ mod wasm_tests {
         let cap = captured.clone();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
+            state.pending_goto_line.set(None);
+            state.pending_goto_offset.set(None);
+            state.host_streams.update(|streams| {
+                streams.insert("h".to_owned(), protocol::StreamPath("/host/h".to_owned()));
+            });
             let file_path = mount_path.clone();
+            let resource_key = file_key(file_path.clone());
             state.open_files.update(|files| {
                 files.insert(
-                    file_path.clone(),
+                    resource_key.clone(),
                     OpenFile {
                         path: file_path.clone(),
                         version: ProjectFileVersion(1),
@@ -3269,24 +3859,61 @@ mod wasm_tests {
                 file.merge_versioned(ProjectFileVersion(1), |d| d.merge_model(chunk));
                 file.merge_versioned(ProjectFileVersion(1), |d| d.merge_model(complete));
             });
+            let tab_id = state
+                .open_tab_at(
+                    OpenTarget::Focused,
+                    crate::state::TabContent::File {
+                        key: resource_key.clone(),
+                    },
+                    "main.rs".to_owned(),
+                    true,
+                )
+                .expect("source file tab");
             *cap.borrow_mut() = Some(state.clone());
             provide_context(state);
-            view! { <FileView tab_id=TabId(20_032) path=mount_path.clone() /> }
+            view! { <FileView tab_id=tab_id key=resource_key /> }
         });
 
         next_tick().await;
         let state = captured.borrow().clone().unwrap();
+        assert!(state.pending_goto_line.get_untracked().is_none());
+        assert!(state.pending_goto_offset.get_untracked().is_none());
+        assert!(
+            state
+                .pending_file_opens
+                .with_untracked(|pending| !pending.contains_key(&file_key(target.clone()))),
+            "the ByteRange cold-open target must have no navigation intent before the click"
+        );
 
         cmd_click_first_line(&container);
         for _ in 0..10 {
             next_tick().await;
         }
 
-        // The ByteRange-delivered target is jumped to locally…
+        let target_key = file_key(target.clone());
+        assert!(
+            matches!(
+                state
+                    .pending_file_opens
+                    .with_untracked(|pending| pending.get(&target_key).copied()),
+                Some(crate::state::PendingFileOpen::Open {
+                    navigation: Some(crate::state::PendingFileNavigation::Offset(42)),
+                    ..
+                })
+            ),
+            "a ByteRange-delivered target preserves navigation through the cold open"
+        );
         assert_eq!(
-            state.pending_goto_offset.get_untracked(),
-            Some((target.clone(), 42)),
-            "a ByteRange-delivered, resolved occurrence navigates locally"
+            state.pending_file_opens.with_untracked(|pending| {
+                match pending.get(&target_key).copied() {
+                    Some(crate::state::PendingFileOpen::Open { destination, .. }) => {
+                        Some(destination.pane())
+                    }
+                    _ => None,
+                }
+            }),
+            Some(crate::state::PaneId::Primary),
+            "the ByteRange cold open must preserve the source TabId's pane as its destination"
         );
         // …with no on-demand navigate request.
         assert!(
@@ -3329,7 +3956,7 @@ mod wasm_tests {
             let file_path = mount_path.clone();
             state.open_files.update(|files| {
                 files.insert(
-                    file_path.clone(),
+                    file_key(file_path.clone()),
                     OpenFile {
                         path: file_path.clone(),
                         version: ProjectFileVersion(1),
@@ -3372,7 +3999,7 @@ mod wasm_tests {
             });
             *cap.borrow_mut() = Some(state.clone());
             provide_context(state);
-            view! { <FileView tab_id=TabId(20_033) path=mount_path.clone() /> }
+            view! { <FileView tab_id=TabId(20_033) key=file_key(mount_path.clone()) /> }
         });
 
         next_tick().await;
@@ -3477,9 +4104,10 @@ mod wasm_tests {
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
             let file_path = mount_path.clone();
+            let resource_key = file_key(file_path.clone());
             state.open_files.update(|files| {
                 files.insert(
-                    file_path.clone(),
+                    resource_key.clone(),
                     OpenFile {
                         path: file_path.clone(),
                         version: ProjectFileVersion(1),
@@ -3521,11 +4149,21 @@ mod wasm_tests {
                 file.merge_versioned(ProjectFileVersion(1), |data| data.merge_model(model));
             });
             state.cmd_held.set(true);
+            let tab_id = state
+                .open_tab_at(
+                    OpenTarget::Focused,
+                    crate::state::TabContent::File {
+                        key: resource_key.clone(),
+                    },
+                    "main.rs".to_owned(),
+                    true,
+                )
+                .expect("hover source tab");
             *cap.borrow_mut() = Some(state.clone());
             provide_context(state);
             view! {
                 <div>
-                    <FileView tab_id=TabId(20_034) path=mount_path.clone() />
+                    <FileView tab_id=tab_id key=resource_key />
                     <HoverPopover />
                 </div>
             }
@@ -3587,9 +4225,10 @@ mod wasm_tests {
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
             let file_path = mount_path.clone();
+            let resource_key = file_key(file_path.clone());
             state.open_files.update(|files| {
                 files.insert(
-                    file_path.clone(),
+                    resource_key.clone(),
                     OpenFile {
                         path: file_path.clone(),
                         version: ProjectFileVersion(1),
@@ -3628,8 +4267,18 @@ mod wasm_tests {
                 file.set_rendered_version(ProjectFileVersion(1));
                 file.merge_versioned(ProjectFileVersion(1), |d| d.merge_model(model));
             });
+            let tab_id = state
+                .open_tab_at(
+                    OpenTarget::Focused,
+                    crate::state::TabContent::File {
+                        key: resource_key.clone(),
+                    },
+                    "main.rs".to_owned(),
+                    true,
+                )
+                .expect("unresolved source tab");
             provide_context(state);
-            view! { <FileView tab_id=TabId(20_031) path=mount_path.clone() /> }
+            view! { <FileView tab_id=tab_id key=resource_key /> }
         });
 
         next_tick().await;
@@ -3656,14 +4305,13 @@ mod wasm_tests {
         use std::cell::RefCell;
         use std::rc::Rc;
 
+        install_send_stub();
+
         let source = ProjectPath {
             root: ProjectRootPath("r".to_owned()),
             relative_path: "main.rs".to_owned(),
         };
-        let target = ProjectPath {
-            root: ProjectRootPath("r".to_owned()),
-            relative_path: "lib.rs".to_owned(),
-        };
+        let target = source.clone();
 
         // Build the navigate context the dispatch guard requires: a recorded
         // request, the active project unchanged, and the source file still open
@@ -3671,22 +4319,14 @@ mod wasm_tests {
         let set_context = {
             let source = source.clone();
             move |state: &AppState, navigate_id: u64| {
+                let key = file_key(source.clone());
                 state.active_project.set(Some(ActiveProjectRef {
                     host_id: "h".to_owned(),
                     project_id: ProjectId("p".to_owned()),
                 }));
-                state
-                    .code_intel_navigate_ctx
-                    .set(Some(CodeIntelNavigateContext {
-                        navigate_id,
-                        host_id: "h".to_owned(),
-                        project_id: ProjectId("p".to_owned()),
-                        path: source.clone(),
-                        version: ProjectFileVersion(1),
-                    }));
                 state.open_files.update(|files| {
                     files.insert(
-                        source.clone(),
+                        key.clone(),
                         OpenFile {
                             path: source.clone(),
                             version: ProjectFileVersion(1),
@@ -3695,6 +4335,22 @@ mod wasm_tests {
                         },
                     );
                 });
+                let tab = state
+                    .open_tab_at(
+                        OpenTarget::Focused,
+                        crate::state::TabContent::File { key: key.clone() },
+                        "main.rs".to_owned(),
+                        true,
+                    )
+                    .expect("source file tab");
+                state
+                    .code_intel_navigate_ctx
+                    .set(Some(CodeIntelNavigateContext {
+                        navigate_id,
+                        tab,
+                        key: key.clone(),
+                        version: ProjectFileVersion(1),
+                    }));
                 state.code_intel.update(|map| {
                     map.entry(CodeIntelKey {
                         host_id: "h".to_owned(),
@@ -3704,6 +4360,7 @@ mod wasm_tests {
                     .or_default()
                     .set_rendered_version(ProjectFileVersion(1));
                 });
+                tab
             }
         };
 
@@ -3712,13 +4369,15 @@ mod wasm_tests {
         let cap = captured.clone();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
+            state.pending_goto_line.set(None);
+            state.pending_goto_offset.set(None);
             *cap.borrow_mut() = Some(state.clone());
             provide_context(state);
             view! { <div></div> }
         });
         next_tick().await;
         let state = captured.borrow().clone().unwrap();
-        set_context(&state, 9);
+        let source_tab = set_context(&state, 9);
 
         let payload = CodeIntelNavigateResultPayload {
             navigate_id: 9,
@@ -3735,7 +4394,7 @@ mod wasm_tests {
         // scroll-snap (the open_project_path read is fired via spawn_local).
         assert_eq!(
             state.pending_goto_offset.get_untracked(),
-            Some((target.clone(), 42)),
+            Some((source_tab, 42)),
             "navigate result should set a pending byte-offset goto to the target"
         );
 
@@ -3760,11 +4419,18 @@ mod wasm_tests {
 
         // A result that arrives after the user switched projects is dropped even
         // when the id matches.
-        set_context(&state, 11);
-        state.active_project.set(Some(ActiveProjectRef {
+        let switched_source_tab = set_context(&state, 11);
+        assert_eq!(state.pending_goto_offset.get_untracked(), None);
+        state.switch_active_project(Some(ActiveProjectRef {
             host_id: "h".to_owned(),
             project_id: ProjectId("other".to_owned()),
         }));
+        assert!(
+            state
+                .center_zone
+                .with_untracked(|center| center.tab(switched_source_tab).is_none()),
+            "the fixture's project switch must actually retire the exact source TabId"
+        );
         let after_switch = CodeIntelNavigateResultPayload {
             navigate_id: 11,
             path: source,
@@ -3802,10 +4468,7 @@ mod wasm_tests {
             root: ProjectRootPath("r".to_owned()),
             relative_path: "main.rs".to_owned(),
         };
-        let local_target = ProjectPath {
-            root: ProjectRootPath("r".to_owned()),
-            relative_path: "lib.rs".to_owned(),
-        };
+        let local_target = source.clone();
         let stale_target = ProjectPath {
             root: ProjectRootPath("r".to_owned()),
             relative_path: "other.rs".to_owned(),
@@ -3827,9 +4490,10 @@ mod wasm_tests {
             host_id: "h".to_owned(),
             project_id: ProjectId("p".to_owned()),
         }));
+        let source_key = file_key(source.clone());
         state.open_files.update(|files| {
             files.insert(
-                source.clone(),
+                source_key.clone(),
                 OpenFile {
                     path: source.clone(),
                     version: ProjectFileVersion(1),
@@ -3838,7 +4502,17 @@ mod wasm_tests {
                 },
             );
         });
-        // Pushed model: occurrence [0,12) resolved to lib.rs.
+        let source_tab = state
+            .open_tab_at(
+                OpenTarget::Focused,
+                crate::state::TabContent::File {
+                    key: source_key.clone(),
+                },
+                "main.rs".to_owned(),
+                true,
+            )
+            .expect("source file tab");
+        // Pushed model: occurrence [0,12) resolved within this source file.
         let model = CodeIntelFileModelPayload {
             path: source.clone(),
             version: ProjectFileVersion(1),
@@ -3876,19 +4550,24 @@ mod wasm_tests {
             .code_intel_navigate_ctx
             .set(Some(CodeIntelNavigateContext {
                 navigate_id: 7,
-                host_id: "h".to_owned(),
-                project_id: ProjectId("p".to_owned()),
-                path: source.clone(),
+                tab: source_tab,
+                key: source_key.clone(),
                 version: ProjectFileVersion(1),
             }));
 
         // A later click resolves LOCALLY from the pushed model.
-        crate::actions::navigate_to_definition(&state, source.clone(), ProjectFileVersion(1), 3);
+        crate::actions::navigate_to_definition(
+            &state,
+            source_tab,
+            source_key,
+            ProjectFileVersion(1),
+            3,
+        );
 
         // The local jump happened and superseded the in-flight navigate context.
         assert_eq!(
             state.pending_goto_offset.get_untracked(),
-            Some((local_target.clone(), 100)),
+            Some((source_tab, 100)),
             "local jump should target the pushed definition"
         );
         assert!(
@@ -3914,7 +4593,7 @@ mod wasm_tests {
         // the stale one.
         assert_eq!(
             state.pending_goto_offset.get_untracked(),
-            Some((local_target, 100)),
+            Some((source_tab, 100)),
             "a late navigate result for a superseded click must not move the cursor"
         );
     }
@@ -3938,14 +4617,25 @@ mod wasm_tests {
         let container = make_container();
         let captured: Rc<RefCell<Option<AppState>>> = Rc::new(RefCell::new(None));
         let cap = captured.clone();
-        let popover_path = path.clone();
+        let popover_key = file_key(path.clone());
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
+            let tab = state
+                .open_tab_at(
+                    OpenTarget::Focused,
+                    crate::state::TabContent::File {
+                        key: popover_key.clone(),
+                    },
+                    "main.rs".to_owned(),
+                    true,
+                )
+                .expect("hover source tab");
             // Seed a popover as if a hover request fired and its result landed.
             state.code_intel_active_hover.set(3);
             state.code_intel_hover.set(Some(HoverPopoverState {
                 hover_id: 3,
-                path: popover_path.clone(),
+                tab,
+                key: popover_key.clone(),
                 version: ProjectFileVersion(1),
                 offset: 0,
                 anchor_left: 120.0,
@@ -3992,8 +4682,12 @@ mod wasm_tests {
     /// Synthesize a right-click over the left edge of the first rendered line's
     /// code (over an identifier, so a byte offset resolves under the caret).
     fn contextmenu_first_line(container: &HtmlElement) {
+        contextmenu_first_line_in(container, ".file-line-code");
+    }
+
+    fn contextmenu_first_line_in(container: &HtmlElement, selector: &str) {
         let code = container
-            .query_selector(".file-line-code")
+            .query_selector(selector)
             .unwrap()
             .expect("code element present");
         let rect = code.get_bounding_client_rect();
@@ -4028,9 +4722,10 @@ mod wasm_tests {
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
             let file_path = mount_path.clone();
+            let resource_key = file_key(file_path.clone());
             state.open_files.update(|files| {
                 files.insert(
-                    file_path.clone(),
+                    resource_key.clone(),
                     OpenFile {
                         path: file_path.clone(),
                         version: ProjectFileVersion(1),
@@ -4043,8 +4738,18 @@ mod wasm_tests {
                 host_id: "h".to_owned(),
                 project_id: ProjectId("p".to_owned()),
             }));
+            let tab_id = state
+                .open_tab_at(
+                    OpenTarget::Focused,
+                    crate::state::TabContent::File {
+                        key: resource_key.clone(),
+                    },
+                    "main.rs".to_owned(),
+                    true,
+                )
+                .expect("context-menu source tab");
             provide_context(state);
-            view! { <FileView tab_id=TabId(20_060) path=mount_path.clone() /> }
+            view! { <FileView tab_id=tab_id key=resource_key /> }
         });
 
         next_tick().await;
@@ -4119,9 +4824,10 @@ mod wasm_tests {
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
             let file_path = mount_path.clone();
+            let resource_key = file_key(file_path.clone());
             state.open_files.update(|files| {
                 files.insert(
-                    file_path.clone(),
+                    resource_key.clone(),
                     OpenFile {
                         path: file_path.clone(),
                         version: ProjectFileVersion(1),
@@ -4134,9 +4840,19 @@ mod wasm_tests {
                 host_id: "h".to_owned(),
                 project_id: ProjectId("p".to_owned()),
             }));
+            let tab_id = state
+                .open_tab_at(
+                    OpenTarget::Focused,
+                    crate::state::TabContent::File {
+                        key: resource_key.clone(),
+                    },
+                    "main.rs".to_owned(),
+                    true,
+                )
+                .expect("references source tab");
             *cap.borrow_mut() = Some(state.clone());
             provide_context(state);
-            view! { <FileView tab_id=TabId(20_062) path=mount_path.clone() /> }
+            view! { <FileView tab_id=tab_id key=resource_key /> }
         });
 
         next_tick().await;
@@ -4200,11 +4916,10 @@ mod wasm_tests {
         );
     }
 
-    /// With no active project the code-intel actions can't run: the menu still
-    /// opens (never a silent no-op) but its items are disabled and it shows a
-    /// clear reason.
+    /// A mounted file carries its owning host/project in `FileResourceKey`, so
+    /// code-intel actions remain available without consulting `active_project`.
     #[wasm_bindgen_test]
-    async fn right_click_without_project_shows_disabled_reason() {
+    async fn right_click_routes_from_file_key_without_active_project() {
         ensure_styles_loaded();
         install_send_stub();
 
@@ -4219,9 +4934,10 @@ mod wasm_tests {
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
             let file_path = mount_path.clone();
+            let resource_key = file_key(file_path.clone());
             state.open_files.update(|files| {
                 files.insert(
-                    file_path.clone(),
+                    resource_key.clone(),
                     OpenFile {
                         path: file_path.clone(),
                         version: ProjectFileVersion(1),
@@ -4230,9 +4946,18 @@ mod wasm_tests {
                     },
                 );
             });
-            // Deliberately no active project.
+            let tab_id = state
+                .open_tab_at(
+                    OpenTarget::Focused,
+                    crate::state::TabContent::File {
+                        key: resource_key.clone(),
+                    },
+                    "main.rs".to_owned(),
+                    true,
+                )
+                .expect("explicit-resource source tab");
             provide_context(state);
-            view! { <FileView tab_id=TabId(20_061) path=mount_path.clone() /> }
+            view! { <FileView tab_id=tab_id key=resource_key /> }
         });
 
         next_tick().await;
@@ -4242,25 +4967,30 @@ mod wasm_tests {
         let menu = container
             .query_selector(".context-menu")
             .unwrap()
-            .expect("context menu should still open when actions are unavailable");
+            .expect("context menu should open from the file's explicit identity");
 
         let items = container.query_selector_all(".context-menu-item").unwrap();
         assert_eq!(items.length(), 2, "expected exactly two action items");
         for i in 0..items.length() {
             let el: Element = items.item(i).unwrap().dyn_into().unwrap();
             assert!(
-                el.has_attribute("disabled"),
-                "action {i} must be disabled with no active project"
+                !el.has_attribute("disabled"),
+                "action {i} incorrectly depended on the active project"
             );
         }
-
-        let hint = menu
-            .query_selector(".context-menu-hint")
-            .unwrap()
-            .expect("a disabled menu must explain why");
         assert!(
-            hint.text_content().unwrap_or_default().contains("project"),
-            "disabled reason should mention the missing active project"
+            menu.query_selector(".context-menu-hint").unwrap().is_none(),
+            "an exact file key must not produce a missing-project hint"
+        );
+
+        let go_to_definition: HtmlElement = items.item(0).unwrap().dyn_into().unwrap();
+        go_to_definition.click();
+        for _ in 0..10 {
+            next_tick().await;
+        }
+        assert!(
+            navigate_frame_was_sent(),
+            "definition navigation should route from FileResourceKey without active_project"
         );
     }
 }

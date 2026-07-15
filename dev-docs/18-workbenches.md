@@ -351,13 +351,14 @@ Creation uses, per parent root:
 git -C <parent_root> rev-parse --show-toplevel
 git -C <parent_root> check-ref-format --branch <branch>
 git -C <parent_root> rev-parse --verify --quiet refs/heads/<branch>   # must fail (branch must not exist)
-git -C <parent_root> worktree add -b <branch> <worktree_path>
+git -C <parent_root> rev-parse --verify <base_ref-or-HEAD>^{commit}
+git -C <parent_root> worktree add -b <branch> <worktree_path> <resolved_sha>
 ```
 
 Removal uses, per worktree root:
 
 ```
-git -C <parent_root> status --porcelain=v1 --untracked-files=all
+git -C <worktree_root> status --porcelain=v1 --untracked-files=all
 git -C <parent_root> worktree remove <worktree_root>
 ```
 
@@ -387,14 +388,16 @@ If any single `git worktree add` fails:
   `git worktree remove --force <path>`. (`--force` is allowed *here* because
   the worktree was created seconds ago by the server itself and is known to be
   empty.)
+- Delete the branch created by each rolled-back add with
+  `git branch -D <branch>`, so an identical retry is not blocked by residue.
 - Do not persist any project record.
 - Surface the original git failure as `CommandErrorCode::Internal`. Include
   any rollback-step failures verbatim in the message — never hide them.
 
 If all `git worktree add` succeed, the server calls
 `ProjectStore::create_workbench`. If the store call fails, run the same
-rollback (`git worktree remove --force` on every created worktree) and surface
-the storage error.
+rollback (`git worktree remove --force` and `git branch -D` for every created
+worktree) and surface the storage error.
 
 ### 5.5 Concurrent create serialization
 
@@ -422,7 +425,7 @@ standalone projects.
 ### 6.1 Branch validation
 
 `GitBranchName` is validated at the protocol boundary. The server runs
-`git check-ref-format --branch <branch>` against the parent's first root. If
+`git check-ref-format --branch <branch>` against every parent root. If
 that command exits non-zero, `WorkbenchCreate` fails with
 `CommandErrorCode::InvalidInput`. This catches `..`, `x y`, leading `-`,
 embedded refspec characters, etc., before any other work.
@@ -442,9 +445,9 @@ Server flow:
 6. Multi-root preflight + rollback flow (§5.4).
 7. Persist `ProjectSource::GitWorkbench` record. Assign per-parent
    `sort_order = max(existing children sort_order) + 1`.
-8. Spawn the project actor for the new workbench so its `/project/<id>` stream
-   is ready before the `Upsert` arrives at any subscriber.
-9. Fan out `ProjectNotify::Upsert { project }`.
+8. Fan out `ProjectNotify::Upsert { project }`.
+9. Spawn the project actor. Failure is logged as a warning because git, store,
+   and the authoritative upsert have already succeeded.
 
 Workbench creation is allowed while parent agents/terminals are running.
 That is the point of the feature.
@@ -503,11 +506,13 @@ on-disk worktree is always cleaned up alongside the record.
 - A persisted session (`SessionRecord.project_id`) references this id.
 - A project-scoped steering record (`Steering { scope: Project(id) }`)
   references this id.
+- A persisted team member binding references this project.
 - Any worktree root is dirty (`git status --porcelain=v1 --untracked-files=all`
   produces output). The error message includes the dirty root paths verbatim.
 - The parent project record is missing — surfaces as `Internal` (this means
   the store is corrupt; see §8).
-- Any worktree path is absent on disk — surfaces as `NotFound`.
+- An absent worktree path is pruned from git bookkeeping and does not block
+  deletion of the authoritative record.
 
 No automatic cleanup of any blocker. The user resolves each explicitly.
 
@@ -671,8 +676,9 @@ that will be a separate explicit command (non-goal §10).
 - No two records share a `worktree_root` or `roots[i]`.
 - `sort_order` values are sufficient for deterministic sort within scope.
 
-If validation fails, loading fails loudly. There is no silent empty-store
-recovery.
+Load validates leniently for legacy survivability: invalid records are
+quarantined with warnings and the repaired store is persisted. Mutation paths
+continue to enforce the strict invariants above.
 
 ### 8.3 Atomic writes
 
@@ -690,10 +696,8 @@ rejection.
 ### 9.2 Workbench worktree directory deleted out-of-band
 
 The project actor for the workbench begins emitting project errors on git and
-file operations — existing failure model. `WorkbenchRemove` returns `NotFound`
-because `git worktree remove` errors when the directory is missing. The
-record is **not** silently deleted. A future explicit "Forget Missing
-Workbench" command (non-goal §10) will repair this.
+file operations — existing failure model. `WorkbenchRemove` prunes stale git
+bookkeeping and deletes the authoritative project record.
 
 ### 9.3 Workbench has uncommitted or untracked changes on remove
 
@@ -716,8 +720,10 @@ check, not just a filesystem check.
 
 ### 9.7 Parent has dirty changes at create time
 
-Allowed. A git worktree starts from `HEAD`, not from working-tree state. The
-server does not copy, stash, or otherwise interpret the parent's dirty state.
+Allowed. The UI path starts from `HEAD`; agent-control MCP may select an
+explicit commit-ish. Both paths resolve a committed base and never use
+working-tree state. The server does not copy, stash, or otherwise interpret
+the parent's dirty content.
 
 ### 9.8 Parent root is not a git top-level
 
@@ -803,7 +809,32 @@ Not part of v1:
   explicit import command.
 - Repairing out-of-band-deleted worktrees (future explicit
   `WorkbenchForgetMissing` repair command).
-- MCP surface for agent-driven workbench create/remove. The server's project
-  manager API should make this easy to add later, but it is not part of this
-  slice.
+- Agent-driven workbench removal.
 - Showing parent/workbench git ahead/behind relationships in the UI.
+
+---
+
+## 11. Agent-control MCP
+
+Authenticated control-surface callers can use `tyde_list_workbenches` and
+`tyde_create_workbench`. Listing is read-only and is limited to the caller's
+canonical standalone project plus that project's workbenches. Creation is
+limited to that same standalone parent and is rejected for read-only callers.
+
+Creation accepts an optional `base_ref`. When omitted, every parent root uses
+its current `HEAD`. Before any worktree is added, the server resolves the base
+to a full commit SHA and records whether every parent root is dirty. Only the
+resolved SHA is passed to `git worktree add`; uncommitted and untracked parent
+changes are disclosed in the result but are never copied. A base must resolve
+in every root of a multi-root project or creation makes no changes.
+
+The result carries the canonical project identity, branch, parent identity,
+and one entry per root containing the parent root, worktree root, resolved base
+commit, and dirty-parent disclosure. `tyde_spawn_agent` should receive the
+returned `project_id`, not copied paths. With a project id, the server derives
+authoritative roots; supplied roots must match them. Without a project id,
+explicit non-empty roots remain required.
+
+The UI creation path continues to use parent `HEAD`; exposing base selection in
+the protocol and UI is deferred. Removal, reassignment, journaling, startup
+reconciliation, and idempotency keys are not part of this MCP v1.

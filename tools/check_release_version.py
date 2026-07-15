@@ -15,17 +15,15 @@ except ModuleNotFoundError:  # pragma: no cover
 JSON_VERSION_PATHS = (
     pathlib.Path("package.json"),
     pathlib.Path("frontend/tauri-shell/tauri.conf.json"),
-    pathlib.Path("mobile/src-tauri/tauri.conf.json"),
 )
 PACKAGE_LOCK_PATH = pathlib.Path("package-lock.json")
 CARGO_PACKAGE_PATHS = (
     pathlib.Path("frontend/tauri-shell/Cargo.toml"),
     pathlib.Path("tyde-server/Cargo.toml"),
-    pathlib.Path("mobile/src-tauri/Cargo.toml"),
 )
 CARGO_LOCK_PATH = pathlib.Path("Cargo.lock")
 CARGO_LOCK_PACKAGE_NAMES = frozenset(
-    {"tauri-shell", "tyde-server", "tyde-mobile-shell"}
+    {"tauri-shell", "tyde-server"}
 )
 
 

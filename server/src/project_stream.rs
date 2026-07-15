@@ -1486,6 +1486,7 @@ async fn emit_project_command_error(
     let payload = CommandErrorPayload {
         stream: stream.path().clone(),
         request_kind,
+        setting_target: None,
         operation: operation.to_owned(),
         code: CommandErrorCode::Internal,
         message,

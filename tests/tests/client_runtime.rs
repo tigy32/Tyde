@@ -3,9 +3,11 @@ use std::time::Duration;
 
 use client::{AgentEndpoint, AgentEvent, HostEndpoint, HostEvent, ProjectEvent};
 use protocol::{
-    AgentBootstrapEvent, BackendConfigPersistenceMode, BackendKind, ChatEvent, ProjectRootPath,
-    ReviewSummaryScope, SendMessagePayload, SpawnAgentParams, SpawnAgentPayload,
+    AgentBootstrapEvent, BackendCapacityState, BackendConfigPersistenceMode, BackendKind,
+    ChatEvent, ProjectRootPath, ReviewSummaryScope, SendMessagePayload, SpawnAgentParams,
+    SpawnAgentPayload,
 };
+use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
@@ -20,6 +22,287 @@ fn init_tracing() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
         .try_init();
+}
+
+fn codex_rate_limits_notification(used_percent: u8) -> serde_json::Value {
+    json!({"rateLimits": {
+        "limitId": "subscription", "limitName": "subscription",
+        "primary": {"usedPercent": used_percent, "windowDurationMins": 300, "resetsAt": 1_700_000_000},
+        "secondary": {"usedPercent": 17, "windowDurationMins": 10_080, "resetsAt": 1_700_100_000},
+        "credits": {"hasCredits": true, "unlimited": false, "balance": "12.50"},
+        "individualLimit": true, "planType": "pro", "rateLimitReachedType": null
+    }})
+}
+
+#[tokio::test]
+async fn passive_capacity_replays_deduplicates_and_stales_over_public_client() {
+    init_tracing();
+    let directory = tempfile::tempdir().expect("create capacity tempdir");
+    let host = server::spawn_host_with_mock_backend(
+        directory.path().join("sessions.json"),
+        directory.path().join("projects.json"),
+        directory.path().join("settings.json"),
+    )
+    .expect("initialize mock host");
+
+    let HostEndpoint {
+        mut events,
+        commands,
+    } = connect_runtime(host.clone()).await;
+    let initial_bootstrap = match next_host_event(&mut events, "bootstrap").await {
+        HostEvent::HostBootstrap(payload) => payload,
+        _ => panic!("expected HostBootstrap"),
+    };
+    let initial = next_host_event(&mut events, "initial capacity replay").await;
+    let HostEvent::BackendCapacity(initial) = initial else {
+        panic!("expected BackendCapacity replay");
+    };
+    assert!(initial.snapshots.iter().any(|snapshot| matches!(
+        (snapshot.backend_kind, &snapshot.state),
+        (BackendKind::Codex, BackendCapacityState::Unavailable { .. })
+    )));
+    assert!(initial.snapshots.iter().any(|snapshot| matches!(
+        (snapshot.backend_kind, &snapshot.state),
+        (
+            BackendKind::Tycode,
+            BackendCapacityState::Unsupported { .. }
+        )
+    )));
+
+    assert!(
+        host.ingest_passive_adapter_notification_for_test(
+            BackendKind::Codex,
+            codex_rate_limits_notification(82),
+        )
+        .await
+    );
+    let updated = next_host_event(&mut events, "known passive capacity").await;
+    let HostEvent::BackendCapacity(updated) = updated else {
+        panic!("expected capacity update");
+    };
+    let codex = updated
+        .snapshots
+        .iter()
+        .find(|snapshot| snapshot.backend_kind == BackendKind::Codex)
+        .expect("Codex snapshot");
+    let BackendCapacityState::Known { report } = &codex.state else {
+        panic!("Codex passive notification must produce a known report");
+    };
+    assert_eq!(
+        report.coverage,
+        protocol::CapacityCoverage::AllVendorBuckets
+    );
+    assert_eq!(report.buckets.len(), 3);
+    assert!(matches!(
+        &report.buckets[0].measure,
+        protocol::CapacityMeasure::UsedPercent {
+            used_percent: 82,
+            remaining_percent: 18,
+            provenance: protocol::ValueProvenance {
+                vendor_reported: true
+            },
+        }
+    ));
+    assert!(initial_bootstrap.agents.is_empty());
+
+    // The adapter ingress is bound to this host's sender. A separate host
+    // starts honestly awaiting its own first passive notification.
+    let isolated_directory = tempfile::tempdir().expect("create isolated capacity tempdir");
+    let isolated_host = server::spawn_host_with_mock_backend(
+        isolated_directory.path().join("sessions.json"),
+        isolated_directory.path().join("projects.json"),
+        isolated_directory.path().join("settings.json"),
+    )
+    .expect("initialize isolated mock host");
+    let HostEndpoint {
+        events: mut isolated_events,
+        ..
+    } = connect_runtime(isolated_host).await;
+    assert!(matches!(
+        next_host_event(&mut isolated_events, "isolated bootstrap").await,
+        HostEvent::HostBootstrap(_)
+    ));
+    assert!(
+        matches!(next_host_event(&mut isolated_events, "isolated capacity replay").await,
+        HostEvent::BackendCapacity(payload) if payload.snapshots.iter().any(|snapshot|
+            matches!((snapshot.backend_kind, &snapshot.state),
+                (BackendKind::Codex, BackendCapacityState::Unavailable {
+                    reason: protocol::CapacityUnavailableReason::AwaitingFirstReport,
+                })) ))
+    );
+
+    // A repeated identical report is an observation, not a duplicate state
+    // change: it refreshes the stale deadline without churn on the public
+    // event stream.
+    host.age_backend_capacity_for_test(BackendKind::Codex, 59 * 60 * 1000)
+        .await;
+
+    // A second agent seeing the same account-wide push does not fan out a
+    // duplicate event or create a second per-agent capacity snapshot.
+    assert!(
+        host.ingest_passive_adapter_notification_for_test(
+            BackendKind::Codex,
+            codex_rate_limits_notification(82),
+        )
+        .await
+    );
+    assert!(
+        timeout(Duration::from_millis(50), events.recv())
+            .await
+            .is_err()
+    );
+    let HostEndpoint {
+        events: mut refreshed_events,
+        ..
+    } = connect_runtime(host.clone()).await;
+    assert!(matches!(
+        next_host_event(&mut refreshed_events, "refreshed bootstrap").await,
+        HostEvent::HostBootstrap(_)
+    ));
+    assert!(
+        matches!(next_host_event(&mut refreshed_events, "refreshed capacity replay").await,
+        HostEvent::BackendCapacity(payload) if payload.snapshots.iter().any(|snapshot|
+            snapshot.backend_kind == BackendKind::Codex
+                && matches!(snapshot.freshness, protocol::CapacityFreshness::Fresh { age_ms } if age_ms < 60_000)))
+    );
+
+    // A later report from another agent connection replaces the account-wide
+    // value; capacity is not keyed by agent or session.
+    assert!(
+        host.ingest_passive_adapter_notification_for_test(
+            BackendKind::Codex,
+            codex_rate_limits_notification(90),
+        )
+        .await
+    );
+    assert!(
+        matches!(next_host_event(&mut events, "last writer capacity").await,
+        HostEvent::BackendCapacity(payload) if payload.snapshots.iter().any(|snapshot|
+            snapshot.backend_kind == BackendKind::Codex && matches!(&snapshot.state,
+                BackendCapacityState::Known { report }
+                    if matches!(&report.buckets[0].measure,
+                        protocol::CapacityMeasure::UsedPercent { used_percent: 90, .. })) ))
+    );
+
+    host.age_backend_capacity_for_test(BackendKind::Codex, 120_000)
+        .await;
+
+    let HostEndpoint {
+        events: mut late_events,
+        ..
+    } = connect_runtime(host.clone()).await;
+    assert!(matches!(
+        next_host_event(&mut late_events, "late bootstrap").await,
+        HostEvent::HostBootstrap(_)
+    ));
+    let late = next_host_event(&mut late_events, "late capacity replay").await;
+    assert!(
+        matches!(late, HostEvent::BackendCapacity(payload) if payload.snapshots.iter().any(|snapshot|
+            snapshot.backend_kind == BackendKind::Codex
+            && matches!(&snapshot.state, BackendCapacityState::Known { report }
+                if matches!(&report.buckets[0].measure,
+                    protocol::CapacityMeasure::UsedPercent { used_percent: 90, .. }))
+            && matches!(snapshot.freshness, protocol::CapacityFreshness::Fresh { age_ms } if (120_000..60 * 60 * 1000).contains(&age_ms))))
+    );
+
+    assert!(
+        host.ingest_passive_adapter_notification_for_test(
+            BackendKind::Claude,
+            json!({"type":"rate_limit_event","rate_limit_info":{
+                "status":"allowed_warning", "rateLimitType":"seven_day_overage_included",
+                "utilization":0.82, "resetsAt":1_700_000_000
+            }}),
+        )
+        .await
+    );
+    assert!(
+        matches!(next_host_event(&mut events, "Claude passive capacity").await,
+        HostEvent::BackendCapacity(payload) if payload.snapshots.iter().any(|snapshot|
+            snapshot.backend_kind == BackendKind::Claude
+                && matches!(&snapshot.state, BackendCapacityState::Known { report }
+                    if report.coverage == protocol::CapacityCoverage::RepresentativeBucketOnly
+                        && report.buckets[0].label == "Fable 5 limit")))
+    );
+
+    host.mark_backend_capacity_stale_for_test(BackendKind::Codex)
+        .await;
+    assert!(
+        matches!(next_host_event(&mut events, "stale capacity").await,
+        HostEvent::BackendCapacity(payload) if payload.snapshots.iter().any(|snapshot|
+            snapshot.backend_kind == BackendKind::Codex && matches!(&snapshot.state, BackendCapacityState::Stale { .. })))
+    );
+
+    // Capacity remains advisory: even a stale Codex report cannot change a
+    // caller-selected backend or invent a launch profile.
+    commands
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("capacity-invariant".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec![workspace_root()],
+                prompt: "capacity must not route this".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("capacity must not affect spawn");
+    let advisory_spawn = next_new_agent_event(&mut events, "advisory spawn").await;
+    assert!(
+        advisory_spawn.info.backend_kind == BackendKind::Claude
+            && advisory_spawn.info.launch_profile_id.is_none()
+    );
+
+    assert!(
+        host.ingest_passive_adapter_notification_for_test(
+            BackendKind::Codex,
+            json!({"rateLimits": {}}),
+        )
+        .await
+    );
+    let malformed_capacity =
+        next_backend_capacity_event(&mut events, "malformed Codex capacity").await;
+    assert!(
+        malformed_capacity.snapshots.iter().any(|snapshot| matches!(
+            (snapshot.backend_kind, &snapshot.state),
+            (
+                BackendKind::Codex,
+                BackendCapacityState::Unavailable {
+                    reason: protocol::CapacityUnavailableReason::MalformedReport,
+                }
+            )
+        )),
+        "unexpected event before malformed Codex capacity: {malformed_capacity:?}"
+    );
+
+    // Capacity is deliberately memory-only: a restarted host replays the
+    // honest awaiting-first-report state rather than a persisted quota value.
+    let restarted = server::spawn_host_with_mock_backend(
+        directory.path().join("sessions.json"),
+        directory.path().join("projects.json"),
+        directory.path().join("settings.json"),
+    )
+    .expect("restart mock host");
+    let HostEndpoint {
+        events: mut restarted_events,
+        ..
+    } = connect_runtime(restarted).await;
+    assert!(matches!(
+        next_host_event(&mut restarted_events, "restart bootstrap").await,
+        HostEvent::HostBootstrap(_)
+    ));
+    assert!(
+        matches!(next_host_event(&mut restarted_events, "restart capacity replay").await,
+        HostEvent::BackendCapacity(payload) if payload.snapshots.iter().any(|snapshot|
+            matches!((snapshot.backend_kind, &snapshot.state),
+                (BackendKind::Codex, BackendCapacityState::Unavailable { .. })) ))
+    );
 }
 
 #[tokio::test]
@@ -115,6 +398,7 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                 | HostEvent::BackendSetup(_)
                 | HostEvent::BackendConfigSchemas(_)
                 | HostEvent::BackendConfigSnapshots(_)
+                | HostEvent::BackendCapacity(_)
                 | HostEvent::AgentClosed(_)
                 | HostEvent::ProjectNotify(_)
                 | HostEvent::NewTerminal(_)
@@ -372,6 +656,40 @@ async fn next_host_event(events: &mut client::HostEvents, context: &str) -> Host
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for host event: {context}"))
         .unwrap_or_else(|| panic!("host event stream closed while waiting for {context}"))
+}
+
+async fn next_backend_capacity_event(
+    events: &mut client::HostEvents,
+    context: &str,
+) -> protocol::BackendCapacityPayload {
+    loop {
+        match next_host_event(events, context).await {
+            HostEvent::BackendCapacity(payload) => return payload,
+            HostEvent::AgentsViewPreferencesNotify(_)
+            | HostEvent::TaskTokenUsage(_)
+            | HostEvent::SessionList(_) => {}
+            event => panic!(
+                "expected BackendCapacity before {context}; got {:?}",
+                std::mem::discriminant(&event)
+            ),
+        }
+    }
+}
+
+async fn next_new_agent_event(
+    events: &mut client::HostEvents,
+    context: &str,
+) -> client::AgentEndpoint {
+    loop {
+        match next_host_event(events, context).await {
+            HostEvent::NewAgent(agent) => return agent,
+            HostEvent::AgentsViewPreferencesNotify(_) | HostEvent::TaskTokenUsage(_) => {}
+            event => panic!(
+                "expected NewAgent before {context}; got {:?}",
+                std::mem::discriminant(&event)
+            ),
+        }
+    }
 }
 
 async fn next_agent_probe(rx: &mut mpsc::Receiver<AgentProbe>, context: &str) -> AgentProbe {

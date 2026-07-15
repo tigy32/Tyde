@@ -9,7 +9,7 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 use crate::actions::spawn_new_chat;
 use crate::components::session_settings::SessionSettingsBar;
 use crate::send::send_frame;
-use crate::state::{AppState, ConnectionStatus};
+use crate::state::{ActiveAgentRef, AppState, ConnectionStatus, PendingTeamMember};
 
 use protocol::{
     AgentOrigin, BackendKind, BackendSetupStatus, CancelQueuedMessagePayload, FrameKind, ImageData,
@@ -24,7 +24,10 @@ struct PendingImage {
 }
 
 #[component]
-fn QueuedMessageRow(id: QueuedMessageId) -> impl IntoView {
+fn QueuedMessageRow(
+    id: QueuedMessageId,
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+) -> impl IntoView {
     let state = expect_context::<AppState>();
 
     let id_for_lookup = id.clone();
@@ -35,7 +38,7 @@ fn QueuedMessageRow(id: QueuedMessageId) -> impl IntoView {
     let state_cancel = state.clone();
 
     let preview = move || {
-        let Some(active) = state_preview.active_agent.get() else {
+        let Some(active) = agent_ref.get() else {
             return String::new();
         };
         let queue = state_preview.agent_message_queue.get();
@@ -54,7 +57,7 @@ fn QueuedMessageRow(id: QueuedMessageId) -> impl IntoView {
     };
 
     let on_send_now = move |_| {
-        let Some(active) = state_send.active_agent.get_untracked() else {
+        let Some(active) = agent_ref.get_untracked() else {
             return;
         };
         let agents = state_send.agents.get_untracked();
@@ -82,7 +85,7 @@ fn QueuedMessageRow(id: QueuedMessageId) -> impl IntoView {
     };
 
     let on_cancel = move |_| {
-        let Some(active) = state_cancel.active_agent.get_untracked() else {
+        let Some(active) = agent_ref.get_untracked() else {
             return;
         };
         let agents = state_cancel.agents.get_untracked();
@@ -130,8 +133,11 @@ fn QueuedMessageRow(id: QueuedMessageId) -> impl IntoView {
     }
 }
 
-fn active_instance_stream(state: &AppState) -> Option<StreamPath> {
-    let active_agent = state.active_agent.get_untracked()?;
+fn target_instance_stream(
+    state: &AppState,
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+) -> Option<StreamPath> {
+    let active_agent = agent_ref.get_untracked()?;
     let agents = state.agents.get_untracked();
     agents
         .iter()
@@ -139,8 +145,11 @@ fn active_instance_stream(state: &AppState) -> Option<StreamPath> {
         .map(|a| a.instance_stream.clone())
 }
 
-fn active_instance_stream_tracked(state: &AppState) -> Option<StreamPath> {
-    let active_agent = state.active_agent.get()?;
+fn target_instance_stream_tracked(
+    state: &AppState,
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+) -> Option<StreamPath> {
+    let active_agent = agent_ref.get()?;
     state.agents.with(|agents| {
         agents
             .iter()
@@ -149,16 +158,19 @@ fn active_instance_stream_tracked(state: &AppState) -> Option<StreamPath> {
     })
 }
 
-fn active_chat_target_ready_tracked(state: &AppState) -> bool {
-    if state.active_agent.get().is_some() {
-        active_instance_stream_tracked(state).is_some()
+fn chat_target_ready_tracked(state: &AppState, agent_ref: Signal<Option<ActiveAgentRef>>) -> bool {
+    if agent_ref.get().is_some() {
+        target_instance_stream_tracked(state, agent_ref).is_some()
     } else {
         true
     }
 }
 
-fn selected_backend_kind(state: &AppState) -> Option<BackendKind> {
-    if let Some(active_agent) = state.active_agent.get_untracked() {
+fn selected_backend_kind(
+    state: &AppState,
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+) -> Option<BackendKind> {
+    if let Some(active_agent) = agent_ref.get_untracked() {
         let agents = state.agents.get_untracked();
         if let Some(agent) = agents
             .iter()
@@ -180,8 +192,11 @@ fn selected_backend_kind(state: &AppState) -> Option<BackendKind> {
     })
 }
 
-fn selected_backend_kind_tracked(state: &AppState) -> Option<BackendKind> {
-    if let Some(active_agent) = state.active_agent.get() {
+fn selected_backend_kind_tracked(
+    state: &AppState,
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+) -> Option<BackendKind> {
+    if let Some(active_agent) = agent_ref.get() {
         let backend = state.agents.with(|agents| {
             agents
                 .iter()
@@ -203,8 +218,11 @@ fn selected_backend_kind_tracked(state: &AppState) -> Option<BackendKind> {
     })
 }
 
-fn active_agent_is_initializing_tracked(state: &AppState) -> bool {
-    let Some(active_agent) = state.active_agent.get() else {
+fn target_agent_is_initializing_tracked(
+    state: &AppState,
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+) -> bool {
+    let Some(active_agent) = agent_ref.get() else {
         return false;
     };
     // `with` reads through the signal without cloning the inner
@@ -222,8 +240,11 @@ fn active_agent_is_initializing_tracked(state: &AppState) -> bool {
     })
 }
 
-fn active_agent_is_backend_native(state: &AppState) -> bool {
-    let Some(active_agent) = state.active_agent.get() else {
+fn target_agent_is_backend_native(
+    state: &AppState,
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+) -> bool {
+    let Some(active_agent) = agent_ref.get() else {
         return false;
     };
     state.agents.with(|agents| {
@@ -235,11 +256,14 @@ fn active_agent_is_backend_native(state: &AppState) -> bool {
     })
 }
 
-/// True when the active agent has reported a backend session id, which is
+/// True when the composer target has reported a backend session id, which is
 /// required to fork via "Fork + send". Tracked so the Fork + send menu
 /// item appears the moment the `AgentStart`/bootstrap event lands.
-fn active_agent_has_session_id_tracked(state: &AppState) -> bool {
-    let Some(active_agent) = state.active_agent.get() else {
+fn target_agent_has_session_id_tracked(
+    state: &AppState,
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+) -> bool {
+    let Some(active_agent) = agent_ref.get() else {
         return false;
     };
     state.agents.with(|agents| {
@@ -315,11 +339,15 @@ impl DraftBackendNotice {
 /// looks usable. We can detect a missing or not-installed backend up front;
 /// "installed but not signed in" only surfaces as a runtime spawn error, so it
 /// is intentionally not covered here.
-fn draft_backend_notice(state: &AppState) -> Option<DraftBackendNotice> {
-    if state.active_agent.get().is_some() {
+fn draft_backend_notice(
+    state: &AppState,
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+    pending_team_member: Signal<Option<PendingTeamMember>>,
+) -> Option<DraftBackendNotice> {
+    if agent_ref.get().is_some() {
         return None;
     }
-    if state.active_pending_team_member_untracked().is_some() {
+    if pending_team_member.get().is_some() {
         return None;
     }
     if !matches!(
@@ -359,7 +387,12 @@ fn restore_submitted_input(
     }
 }
 
-fn submit_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage>>) {
+fn submit_chat_input(
+    state: &AppState,
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+    pending_team_member: Signal<Option<PendingTeamMember>>,
+    pending_images: RwSignal<Vec<PendingImage>>,
+) {
     let draft = state.chat_input.get_untracked();
     let text = draft.trim().to_owned();
     let images = pending_images.get_untracked();
@@ -371,19 +404,19 @@ fn submit_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage
     // A draft with no usable backend: keep the text and let the inline notice
     // above the composer guide the user to setup, instead of clearing the input
     // and silently failing to spawn.
-    if draft_backend_notice(state).is_some() {
+    if draft_backend_notice(state, agent_ref, pending_team_member).is_some() {
         return;
     }
 
-    if state.active_agent.get_untracked().is_none() {
-        // Active tab has no live agent. If it's a draft team-member tab,
+    if agent_ref.get_untracked().is_none() {
+        // The composer owner has no live agent. If it is a draft team-member tab,
         // route through `TeamMemberActivate` so the server spawns the agent
         // under the right `AgentOrigin::TeamMember` (see
         // `dev-docs/19-agent-teams.md` §5 and the backend
         // `activate_team_member` flow). The server's `NewAgent` echo will
         // upgrade this tab's `agent_ref` in dispatch.rs. Otherwise it's an
         // ordinary "New Chat" draft and we fall through to `spawn_new_chat`.
-        if let Some(pending) = state.active_pending_team_member_untracked() {
+        if let Some(pending) = pending_team_member.get_untracked() {
             let Some(stream) = state.host_stream_untracked(&pending.host_id) else {
                 log::error!(
                     "submit_chat_input: host stream missing for {host}",
@@ -434,13 +467,13 @@ fn submit_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage
         return;
     }
 
-    let active_agent = match state.active_agent.get_untracked() {
+    let active_agent = match agent_ref.get_untracked() {
         Some(active_agent) => active_agent,
         None => return,
     };
     let host_id = active_agent.host_id.clone();
 
-    let instance_stream = match active_instance_stream(state) {
+    let instance_stream = match target_instance_stream(state, agent_ref) {
         Some(stream) => stream,
         None => {
             log::error!("submit_chat_input: active agent stream missing");
@@ -476,14 +509,26 @@ fn submit_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage
 
 /// Fork the session and send the draft as a new side question, then clear the
 /// draft optimistically — mirroring `submit_chat_input`'s clear-on-submit.
-/// The Fork + send menu item only shows when there is input and the active agent
+/// The Fork + send menu item only shows when there is input and the target agent
 /// has a session id, so the guard here just protects against an empty draft.
-fn submit_side_question(state: &AppState, pending_images: RwSignal<Vec<PendingImage>>) {
+fn submit_side_question(
+    state: &AppState,
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+    pending_images: RwSignal<Vec<PendingImage>>,
+) {
     let text = state.chat_input.get_untracked();
     let text = text.trim().to_owned();
     let images = pending_images.get_untracked();
     let payload_images = pending_images_to_payload(&images);
     if text.is_empty() && payload_images.is_none() {
+        return;
+    }
+
+    let Some(target) = agent_ref.get_untracked() else {
+        return;
+    };
+    if state.active_agent.get_untracked().as_ref() != Some(&target) {
+        log::error!("submit_side_question: composer owner does not match active_agent");
         return;
     }
 
@@ -493,13 +538,13 @@ fn submit_side_question(state: &AppState, pending_images: RwSignal<Vec<PendingIm
     crate::actions::spawn_side_question(state, text, payload_images);
 }
 
-fn interrupt_active_turn(state: &AppState) {
-    let host_id = match state.active_agent.get_untracked() {
+fn interrupt_target_turn(state: &AppState, agent_ref: Signal<Option<ActiveAgentRef>>) {
+    let host_id = match agent_ref.get_untracked() {
         Some(active_agent) => active_agent.host_id,
         None => return,
     };
 
-    let instance_stream = match active_instance_stream(state) {
+    let instance_stream = match target_instance_stream(state, agent_ref) {
         Some(stream) => stream,
         None => return,
     };
@@ -518,22 +563,26 @@ fn interrupt_active_turn(state: &AppState) {
     });
 }
 
-fn steer_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage>>) {
+fn steer_chat_input(
+    state: &AppState,
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+    pending_images: RwSignal<Vec<PendingImage>>,
+) {
     let draft = state.chat_input.get_untracked();
     let text = draft.trim().to_owned();
     let images = pending_images.get_untracked();
     let payload_images = pending_images_to_payload(&images);
     if text.is_empty() && payload_images.is_none() {
-        interrupt_active_turn(state);
+        interrupt_target_turn(state, agent_ref);
         return;
     }
 
-    let host_id = match state.active_agent.get_untracked() {
+    let host_id = match agent_ref.get_untracked() {
         Some(active_agent) => active_agent.host_id,
         None => return,
     };
 
-    let instance_stream = match active_instance_stream(state) {
+    let instance_stream = match target_instance_stream(state, agent_ref) {
         Some(stream) => stream,
         None => {
             log::error!("steer_chat_input: active agent stream missing");
@@ -721,8 +770,30 @@ async fn read_image_file(file: web_sys::File) -> Result<PendingImage, String> {
 }
 
 #[component]
-pub fn ChatInput() -> impl IntoView {
+pub fn ChatInput(
+    /// Exact live-agent identity of the chat that owns this composer. Draft
+    /// chats supply `None`. The compatibility fallback is single-pane only;
+    /// split callers must always pass the composer owner's signal.
+    #[prop(optional)]
+    agent_ref: Option<Signal<Option<ActiveAgentRef>>>,
+    /// Exact pending team-member identity for a draft composer owner. The
+    /// fallback delegates to the canonical composer-owner state accessor
+    /// rather than reconstructing a target from the focused active tab.
+    #[prop(optional)]
+    pending_team_member: Option<Signal<Option<PendingTeamMember>>>,
+) -> impl IntoView {
     let state = expect_context::<AppState>();
+    let agent_ref = agent_ref.unwrap_or_else(|| {
+        let state = state.clone();
+        Signal::derive(move || state.active_agent.get())
+    });
+    let pending_team_member = pending_team_member.unwrap_or_else(|| {
+        let state = state.clone();
+        Signal::derive(move || {
+            state.center_zone.with(|_| ());
+            state.composer_pending_team_member_untracked()
+        })
+    });
     let pending_images = RwSignal::new(Vec::<PendingImage>::new());
     let attachment_error = RwSignal::new(None::<String>);
     let drag_depth = RwSignal::new(0u32);
@@ -741,10 +812,9 @@ pub fn ChatInput() -> impl IntoView {
         let has_text = ui_state.chat_input.with(|s| !s.trim().is_empty());
         let has_images = ui_images.with(|images| !images.is_empty());
         let has_input = has_text || has_images;
-        let target_ready = active_chat_target_ready_tracked(&ui_state);
-        let is_thinking = active_agent_is_initializing_tracked(&ui_state)
-            || ui_state
-                .active_agent
+        let target_ready = chat_target_ready_tracked(&ui_state, agent_ref);
+        let is_thinking = target_agent_is_initializing_tracked(&ui_state, agent_ref)
+            || agent_ref
                 .get()
                 .map(|agent_ref| {
                     ui_state
@@ -765,10 +835,12 @@ pub fn ChatInput() -> impl IntoView {
     });
 
     let readonly_state = state.clone();
-    let is_readonly = Memo::new(move |_| active_agent_is_backend_native(&readonly_state));
+    let is_readonly =
+        Memo::new(move |_| target_agent_is_backend_native(&readonly_state, agent_ref));
 
     let btw_state = state.clone();
-    let active_has_session = Memo::new(move |_| active_agent_has_session_id_tracked(&btw_state));
+    let active_has_session =
+        Memo::new(move |_| target_agent_has_session_id_tracked(&btw_state, agent_ref));
     // A "Fork + send" needs draft input and a forkable backend session.
     let can_btw = move || ui_mode.get().0 && active_has_session.get();
 
@@ -790,11 +862,10 @@ pub fn ChatInput() -> impl IntoView {
 
     let thinking_state = state.clone();
     let is_thinking = move || {
-        if active_agent_is_initializing_tracked(&thinking_state) {
+        if target_agent_is_initializing_tracked(&thinking_state, agent_ref) {
             return true;
         }
-        thinking_state
-            .active_agent
+        agent_ref
             .get()
             .map(|agent_ref| {
                 // `with` reads through the HashMap signal without cloning it.
@@ -811,7 +882,7 @@ pub fn ChatInput() -> impl IntoView {
         matches!(
             submit_on_enter_state.chat_context_connection_status(),
             ConnectionStatus::Connected
-        ) && active_chat_target_ready_tracked(&submit_on_enter_state)
+        ) && chat_target_ready_tracked(&submit_on_enter_state, agent_ref)
             && (submit_on_enter_state
                 .chat_input
                 .with(|s| !s.trim().is_empty())
@@ -833,7 +904,7 @@ pub fn ChatInput() -> impl IntoView {
             if ev.shift_key() {
                 // Cmd/Ctrl+Shift+Enter → Fork + send, when available.
                 if ui_mode.get_untracked().0 && active_has_session.get_untracked() {
-                    submit_side_question(&on_keydown_state, on_keydown_images);
+                    submit_side_question(&on_keydown_state, agent_ref, on_keydown_images);
                 }
             } else if is_steer.get_untracked() {
                 // Cmd/Ctrl+Enter while thinking with input → steer, mirroring
@@ -842,11 +913,16 @@ pub fn ChatInput() -> impl IntoView {
                 // If steer isn't actionable, no-op — do NOT fall through to
                 // send (the dropdown offers nothing actionable here either).
                 if ui_mode.get_untracked().1 && !is_readonly.get_untracked() {
-                    steer_chat_input(&on_keydown_state, on_keydown_images);
+                    steer_chat_input(&on_keydown_state, agent_ref, on_keydown_images);
                 }
             } else if ui_mode.get_untracked().0 {
                 // Cmd/Ctrl+Enter otherwise → normal send.
-                submit_chat_input(&on_keydown_state, on_keydown_images);
+                submit_chat_input(
+                    &on_keydown_state,
+                    agent_ref,
+                    pending_team_member,
+                    on_keydown_images,
+                );
             }
             return;
         }
@@ -855,7 +931,12 @@ pub fn ChatInput() -> impl IntoView {
         if !ev.shift_key() {
             ev.prevent_default();
             if submit_on_enter_mode() {
-                submit_chat_input(&on_keydown_state, on_keydown_images);
+                submit_chat_input(
+                    &on_keydown_state,
+                    agent_ref,
+                    pending_team_member,
+                    on_keydown_images,
+                );
             }
         }
     };
@@ -870,9 +951,11 @@ pub fn ChatInput() -> impl IntoView {
         let is_steer_now = is_steer.get_untracked();
         let readonly = is_readonly.get_untracked();
         if mode.1 && !is_steer_now && !readonly {
-            primary_interrupt_stored.with_value(interrupt_active_turn);
+            primary_interrupt_stored.with_value(|state| interrupt_target_turn(state, agent_ref));
         } else {
-            primary_submit_stored.with_value(|s| submit_chat_input(s, primary_submit_images));
+            primary_submit_stored.with_value(|state| {
+                submit_chat_input(state, agent_ref, pending_team_member, primary_submit_images)
+            });
         }
     };
 
@@ -880,15 +963,15 @@ pub fn ChatInput() -> impl IntoView {
     let menu_images = pending_images;
     let on_menu_btw = move |_| {
         menu_open.set(false);
-        menu_state.with_value(|s| submit_side_question(s, menu_images));
+        menu_state.with_value(|state| submit_side_question(state, agent_ref, menu_images));
     };
     let on_menu_steer = move |_| {
         menu_open.set(false);
-        menu_state.with_value(|s| steer_chat_input(s, menu_images));
+        menu_state.with_value(|state| steer_chat_input(state, agent_ref, menu_images));
     };
     let on_menu_cancel = move |_| {
         menu_open.set(false);
-        menu_state.with_value(interrupt_active_turn);
+        menu_state.with_value(|state| interrupt_target_turn(state, agent_ref));
     };
 
     let on_split_keydown = move |ev: leptos::ev::KeyboardEvent| {
@@ -981,11 +1064,11 @@ pub fn ChatInput() -> impl IntoView {
             return;
         }
 
-        if !selected_backend_kind(&on_drop_state)
+        if !selected_backend_kind(&on_drop_state, agent_ref)
             .map(BackendKind::supports_image_input)
             .unwrap_or(false)
         {
-            let backend_name = selected_backend_kind(&on_drop_state)
+            let backend_name = selected_backend_kind(&on_drop_state, agent_ref)
                 .map(|backend| format!("{backend:?}"))
                 .unwrap_or_else(|| "selected backend".to_string());
             on_drop_error.set(Some(format!("{backend_name} does not support image input")));
@@ -1054,13 +1137,13 @@ pub fn ChatInput() -> impl IntoView {
 
     let overlay_support_state = state.clone();
     let overlay_is_unsupported = Memo::new(move |_| {
-        !selected_backend_kind_tracked(&overlay_support_state)
+        !selected_backend_kind_tracked(&overlay_support_state, agent_ref)
             .map(BackendKind::supports_image_input)
             .unwrap_or(false)
     });
     let overlay_support_copy_state = state.clone();
     let overlay_drop_copy = Memo::new(move |_| {
-        if selected_backend_kind_tracked(&overlay_support_copy_state)
+        if selected_backend_kind_tracked(&overlay_support_copy_state, agent_ref)
             .map(BackendKind::supports_image_input)
             .unwrap_or(false)
         {
@@ -1072,12 +1155,14 @@ pub fn ChatInput() -> impl IntoView {
 
     // Draft "New Chat" with no usable backend → inline guidance toward setup.
     let notice_compute_state = state.clone();
-    let backend_notice = Memo::new(move |_| draft_backend_notice(&notice_compute_state));
+    let backend_notice = Memo::new(move |_| {
+        draft_backend_notice(&notice_compute_state, agent_ref, pending_team_member)
+    });
     let notice_state = state.clone();
 
     let queue_state = state.clone();
     let queue_ids = Memo::new(move |_| -> Vec<QueuedMessageId> {
-        let Some(active) = queue_state.active_agent.get() else {
+        let Some(active) = agent_ref.get() else {
             return Vec::new();
         };
         queue_state.agent_message_queue.with(|queue| {
@@ -1163,7 +1248,7 @@ pub fn ChatInput() -> impl IntoView {
                         key=|id| id.0.clone()
                         let:id
                     >
-                        <QueuedMessageRow id=id />
+                        <QueuedMessageRow id=id agent_ref=agent_ref />
                     </For>
                 </div>
             </Show>
@@ -1321,7 +1406,7 @@ pub fn ChatInput() -> impl IntoView {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
-    use crate::state::{ActiveAgentRef, AgentInfo, AppState, ConnectionStatus, Tab, TabContent};
+    use crate::state::{ActiveAgentRef, AgentInfo, AppState, ConnectionStatus, TabContent};
     use leptos::mount::mount_to;
     use protocol::{AgentId, AgentOrigin, BackendKind, SessionId, StreamPath};
     use wasm_bindgen::JsCast;
@@ -1416,22 +1501,14 @@ mod wasm_tests {
         if !input.is_empty() {
             state.chat_input.set(input.to_owned());
         }
-        state.center_zone.update(|cz| {
-            let id = crate::state::next_tab_id();
-            cz.tabs.push(Tab {
-                id,
-                content: TabContent::Chat {
-                    agent_ref: Some(ActiveAgentRef {
-                        host_id: HOST.to_owned(),
-                        agent_id: agent_id.clone(),
-                    }),
-                    pending_team_member: None,
-                },
-                label: "Chat".to_owned(),
-                closeable: true,
-            });
-            cz.active_tab_id = Some(id);
-        });
+        state.open_tab(
+            TabContent::chat_with_agent(ActiveAgentRef {
+                host_id: HOST.to_owned(),
+                agent_id,
+            }),
+            "Chat".to_owned(),
+            true,
+        );
     }
 
     fn query(container: &HtmlElement, sel: &str) -> Option<web_sys::Element> {
@@ -1576,6 +1653,66 @@ mod wasm_tests {
             state.chat_input.get_untracked(),
             "hello",
             "keyboard submit must not clear a draft that has no live agent stream"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn explicit_composer_agent_controls_ui_when_another_chat_is_active() {
+        let state = AppState::new();
+        configure(&state, false, false, "send to A");
+        let agent_a = ActiveAgentRef {
+            host_id: HOST.to_owned(),
+            agent_id: AgentId(AGENT.to_owned()),
+        };
+        let agent_b_id = AgentId("agent-2".to_owned());
+        state.agents.update(|agents| {
+            agents.push(AgentInfo {
+                host_id: HOST.to_owned(),
+                agent_id: agent_b_id.clone(),
+                name: "Agent B".to_owned(),
+                origin: AgentOrigin::User,
+                backend_kind: BackendKind::Claude,
+                workspace_roots: Vec::new(),
+                project_id: None,
+                parent_agent_id: None,
+                session_id: None,
+                custom_agent_id: None,
+                workflow: None,
+                created_at_ms: 0,
+                instance_stream: StreamPath("/agent/agent-2/inst".to_owned()),
+                started: true,
+                fatal_error: None,
+                activity_summary: Default::default(),
+            });
+        });
+        state.agent_turn_active.update(|turns| {
+            turns.insert(agent_b_id.clone(), true);
+        });
+        state.open_tab(
+            TabContent::chat_with_agent(ActiveAgentRef {
+                host_id: HOST.to_owned(),
+                agent_id: agent_b_id,
+            }),
+            "Agent B".to_owned(),
+            true,
+        );
+
+        let mount_state = state.clone();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            let owner = Signal::derive(move || Some(agent_a.clone()));
+            view! { <ChatInput agent_ref=owner /> }
+        });
+        next_tick().await;
+
+        assert_eq!(
+            primary(&container)
+                .text_content()
+                .unwrap_or_default()
+                .trim(),
+            "Send",
+            "composer bound to idle agent A must not show Queue just because active agent B is running"
         );
     }
 

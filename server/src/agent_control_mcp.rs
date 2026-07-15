@@ -9,11 +9,11 @@ use protocol::{
     AGENT_CONTROL_DEFAULT_READ_LIMIT, AGENT_CONTROL_DEFAULT_READ_MAX_BYTES,
     AGENT_CONTROL_MAX_READ_LIMIT, AGENT_CONTROL_MAX_READ_MAX_BYTES, AgentControlReadDebugResult,
     AgentControlReadResult, AgentControlStatus, AgentId, AgentInput, AgentOrigin,
-    BackendAccessMode, BackendKind, CustomAgentId, ImageData, LaunchProfileCatalog,
-    LaunchProfileId, ProjectId, SendMessagePayload, SessionSchemaEntry, SessionSettingsValues,
-    SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, Team, TeamMember, TeamMemberBindingPayload,
-    TeamMemberId, WorkflowSaveRequest, WorkflowSaveResponse, WorkflowTargetsResponse,
-    cap_agent_control_events,
+    BackendAccessMode, BackendKind, CustomAgentId, GitBranchName, ImageData, LaunchProfileCatalog,
+    LaunchProfileId, ProjectId, ProjectSource, SendMessagePayload, SessionSchemaEntry,
+    SessionSettingsValues, SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, Team, TeamMember,
+    TeamMemberBindingPayload, TeamMemberId, WorkbenchCreatePayload, WorkflowSaveRequest,
+    WorkflowSaveResponse, WorkflowTargetsResponse, cap_agent_control_events,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
@@ -43,7 +43,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::host::HostHandle;
+use crate::host::{BaseRevision, CreatedWorkbench, HostHandle};
 use crate::team_registry::team_preset_catalog;
 
 pub const AGENT_CONTROL_AGENT_ID_HEADER: &str = "x-tyde-agent-id";
@@ -240,6 +240,7 @@ impl From<CostHintInput> for SpawnCostHint {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SpawnAgentToolInput {
+    #[serde(default)]
     workspace_roots: Vec<String>,
     prompt: String,
     launch_profile_id: Option<String>,
@@ -301,6 +302,55 @@ struct TeamMessageImageInput {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct EmptyToolInput {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CreateWorkbenchToolInput {
+    parent_project_id: String,
+    branch: String,
+    name: Option<String>,
+    base_ref: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateWorkbenchResult {
+    project_id: String,
+    name: String,
+    branch: String,
+    parent_project_id: String,
+    roots: Vec<CreatedWorkbenchRootResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct CreatedWorkbenchRootResult {
+    parent_root: String,
+    worktree_root: String,
+    base_commit: String,
+    parent_root_dirty: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ListWorkbenchesResult {
+    caller_project_id: String,
+    projects: Vec<ProjectOverview>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProjectOverview {
+    project_id: String,
+    name: String,
+    kind: ProjectKindOutput,
+    parent_project_id: Option<String>,
+    branch: Option<String>,
+    workspace_roots: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ProjectKindOutput {
+    Standalone,
+    Workbench,
+}
 
 #[derive(Debug, Serialize)]
 struct SpawnAgentResult {
@@ -547,6 +597,53 @@ impl TydeAgentControlMcpServer {
         match do_spawn_agent(&self.host, input.into(), Some(caller)).await {
             Ok(result) => ok_json(result),
             Err(err) => Ok(err_text(err)),
+        }
+    }
+
+    #[tool(
+        description = "Create a git workbench under the authenticated caller's project. Defaults to each parent root's HEAD; base_ref is resolved in every root before mutation. Uncommitted and untracked parent changes are disclosed but never copied. On an unexpected branch/path conflict, stop and report it rather than retrying with another name."
+    )]
+    async fn tyde_create_workbench(
+        &self,
+        Parameters(input): Parameters<CreateWorkbenchToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = match require_authenticated_caller(self, &parts, "tyde_create_workbench").await
+        {
+            Ok(caller) => caller,
+            Err(error) => return Ok(err_text(error)),
+        };
+        if let Err(error) = reject_mutating_tool_for_read_only_caller(
+            &self.host,
+            Some(&caller),
+            "tyde_create_workbench",
+        )
+        .await
+        {
+            return Ok(err_text(error));
+        }
+        match do_create_workbench(&self.host, &caller, input).await {
+            Ok(result) => ok_json(result),
+            Err(error) => Ok(err_text(error)),
+        }
+    }
+
+    #[tool(
+        description = "List the authenticated caller's canonical project and its git workbenches for safe creation recovery and project_id-based spawning."
+    )]
+    async fn tyde_list_workbenches(
+        &self,
+        Parameters(_input): Parameters<EmptyToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = match require_authenticated_caller(self, &parts, "tyde_list_workbenches").await
+        {
+            Ok(caller) => caller,
+            Err(error) => return Ok(err_text(error)),
+        };
+        match do_list_workbenches(&self.host, &caller).await {
+            Ok(result) => ok_json(result),
+            Err(error) => Ok(err_text(error)),
         }
     }
 
@@ -977,9 +1074,6 @@ async fn do_spawn_agent(
     reject_mutating_tool_for_read_only_caller(host, request_agent_id.as_ref(), "tyde_spawn_agent")
         .await?;
 
-    if input.workspace_roots.is_empty() {
-        return Err("workspace_roots must contain at least one root".to_string());
-    }
     if input.workspace_roots.iter().any(|r| r.trim().is_empty()) {
         return Err("workspace_roots must not contain empty values".to_string());
     }
@@ -1088,6 +1182,144 @@ async fn do_spawn_agent(
         agent_id: agent_id.0,
         name,
         status: agent_status,
+    })
+}
+
+async fn caller_project_scope(
+    host: &HostHandle,
+    caller: &AgentId,
+) -> Result<(ProjectId, Vec<protocol::Project>), String> {
+    let caller_project_id = host
+        .project_id_for_agent(caller)
+        .await
+        .ok_or_else(|| "authenticated caller is not assigned to a project".to_owned())?;
+    let projects = host.list_projects().await?;
+    let caller_project = projects
+        .iter()
+        .find(|project| project.id == caller_project_id)
+        .ok_or_else(|| format!("caller project {caller_project_id} no longer exists"))?;
+    let canonical_project_id = caller_project
+        .parent_project_id()
+        .cloned()
+        .unwrap_or_else(|| caller_project_id.clone());
+    let scoped = projects
+        .into_iter()
+        .filter(|project| {
+            project.id == canonical_project_id
+                || project.parent_project_id() == Some(&canonical_project_id)
+        })
+        .collect();
+    Ok((canonical_project_id, scoped))
+}
+
+async fn do_create_workbench(
+    host: &HostHandle,
+    caller: &AgentId,
+    input: CreateWorkbenchToolInput,
+) -> Result<CreateWorkbenchResult, String> {
+    let parent_project_id = parse_project_id(&input.parent_project_id)?;
+    let (canonical_project_id, _) = caller_project_scope(host, caller).await?;
+    if parent_project_id != canonical_project_id {
+        return Err(format!(
+            "parent_project_id {} is outside caller project scope {}",
+            parent_project_id, canonical_project_id
+        ));
+    }
+    let branch = input.branch.trim();
+    if branch.is_empty() {
+        return Err("branch must not be empty".to_owned());
+    }
+    let name = match input.name {
+        Some(name) if name.trim().is_empty() => {
+            return Err("name must not be empty when supplied".to_owned());
+        }
+        Some(name) => name,
+        None => branch.to_owned(),
+    };
+    let base = input.base_ref.map(BaseRevision);
+    let created = host
+        .create_workbench(
+            WorkbenchCreatePayload {
+                parent_project_id,
+                branch: GitBranchName(branch.to_owned()),
+                name,
+            },
+            base,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    create_workbench_result(created)
+}
+
+fn create_workbench_result(created: CreatedWorkbench) -> Result<CreateWorkbenchResult, String> {
+    let project_id = created.project.id.0;
+    let name = created.project.name;
+    let ProjectSource::GitWorkbench {
+        parent_project_id,
+        branch,
+        ..
+    } = created.project.source
+    else {
+        return Err(format!(
+            "workbench_create returned standalone project {project_id}"
+        ));
+    };
+    Ok(CreateWorkbenchResult {
+        project_id,
+        name,
+        branch: branch.0,
+        parent_project_id: parent_project_id.0,
+        roots: created
+            .roots
+            .into_iter()
+            .map(|root| CreatedWorkbenchRootResult {
+                parent_root: root.root.parent_root.0,
+                worktree_root: root.root.worktree_root.0,
+                base_commit: root.base_commit,
+                parent_root_dirty: root.parent_root_dirty,
+            })
+            .collect(),
+    })
+}
+
+async fn do_list_workbenches(
+    host: &HostHandle,
+    caller: &AgentId,
+) -> Result<ListWorkbenchesResult, String> {
+    let (caller_project_id, projects) = caller_project_scope(host, caller).await?;
+    let projects = projects
+        .into_iter()
+        .map(|project| {
+            let workspace_roots = project
+                .root_paths()
+                .into_iter()
+                .map(|root| root.0)
+                .collect();
+            let (kind, parent_project_id, branch) = match &project.source {
+                ProjectSource::Standalone { .. } => (ProjectKindOutput::Standalone, None, None),
+                ProjectSource::GitWorkbench {
+                    parent_project_id,
+                    branch,
+                    ..
+                } => (
+                    ProjectKindOutput::Workbench,
+                    Some(parent_project_id.0.clone()),
+                    Some(branch.0.clone()),
+                ),
+            };
+            ProjectOverview {
+                project_id: project.id.0,
+                name: project.name,
+                kind,
+                parent_project_id,
+                branch,
+                workspace_roots,
+            }
+        })
+        .collect();
+    Ok(ListWorkbenchesResult {
+        caller_project_id: caller_project_id.0,
+        projects,
     })
 }
 

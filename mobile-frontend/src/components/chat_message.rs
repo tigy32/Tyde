@@ -1,6 +1,6 @@
 use leptos::prelude::*;
 
-use crate::state::ChatMessageEntry;
+use crate::state::{AgentRef, ChatMessageEntry};
 
 /// The per-request token usage shown by default on a mobile chat row, or `None`
 /// when the backend didn't report it (no fake-zero figure). Mirrors the desktop
@@ -32,8 +32,16 @@ fn detail_scopes(message: &protocol::ChatMessage) -> Vec<(&'static str, protocol
 /// (`chat-message-user`, `chat-message-assistant`, etc) so a regression
 /// can assert "the second user message says X" without depending on
 /// CSS class identity.
+///
+/// `owner_agent_ref` is the chat-map key this row belongs to — the agent whose
+/// stream produced it, on the host that owns that stream. It is passed down
+/// explicitly rather than read from `state.active_agent`, because the active
+/// agent is mutable navigation state: it changes the instant the user opens
+/// another chat, while this row still belongs to the stream it came from.
+/// Tool cards need the owning host to resolve child agents (see
+/// [`crate::components::tool_card::ToolCardView`]).
 #[component]
-pub fn ChatMessageView(entry: ChatMessageEntry) -> impl IntoView {
+pub fn ChatMessageView(owner_agent_ref: AgentRef, entry: ChatMessageEntry) -> impl IntoView {
     let (sender_class, sender_test, sender_name): (&'static str, &'static str, String) =
         match &entry.message.sender {
             protocol::MessageSender::User => ("user", "chat-message-user", "You".to_string()),
@@ -105,7 +113,13 @@ pub fn ChatMessageView(entry: ChatMessageEntry) -> impl IntoView {
                 view! {
                     <div class="tool-cards" data-mobile-test="chat-message-tool-cards">
                         {tool_requests.into_iter().map(|t| {
-                            view! { <crate::components::tool_card::ToolCardView entry=t /> }
+                            let owner_agent_ref = owner_agent_ref.clone();
+                            view! {
+                                <crate::components::tool_card::ToolCardView
+                                    owner_agent_ref=owner_agent_ref
+                                    entry=t
+                                />
+                            }
                         }).collect::<Vec<_>>()}
                     </div>
                 }.into_any()
@@ -244,10 +258,17 @@ mod wasm_tests {
         }
     }
 
+    fn owner_ref() -> AgentRef {
+        AgentRef {
+            local_host_id: crate::state::LocalHostId("host-1".to_owned()),
+            agent_id: protocol::AgentId("agent-1".to_owned()),
+        }
+    }
+
     fn mount(entry: ChatMessageEntry) -> HtmlElement {
         let container = make_container();
         mount_to(container.clone(), move || {
-            view! { <ChatMessageView entry=entry.clone() /> }
+            view! { <ChatMessageView owner_agent_ref=owner_ref() entry=entry.clone() /> }
         })
         .forget();
         container

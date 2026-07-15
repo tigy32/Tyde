@@ -8,7 +8,7 @@
 //!
 //! Values are stored as strings (JSON for records, base64 for PSK bytes) so the
 //! object stores never need structured-clone-specific handling. A later phase
-//! (see `docs/plans/mobile-web-pwa.md` → "PSK storage") swaps the PSK store to a
+//! (see `dev-docs/mobile-web-pwa.md` → "PSK storage") swaps the PSK store to a
 //! non-extractable WebCrypto `CryptoKey`; that change is localized to
 //! [`super::store`] and does not touch this generic helper.
 

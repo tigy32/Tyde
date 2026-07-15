@@ -99,7 +99,10 @@ recursively invoking the real check.
 Both nextest profiles report only slow test status, never emit successful test
 output, and defer failure output to nextest's final report. This keeps source
 output concise without weakening diagnostics: `dev.sh` still retains the full
-stage log and replays the complete failing repetition.
+stage log and replays the complete failing repetition. Nextest continues all
+independent native tests within that repetition, retaining every failure reached
+before the authoritative five-minute limit. The failed repetition still blocks
+repetitions 2–3 and every later stage.
 
 Only one check may run in a repository at once; contention fails immediately.
 The wrapper uses pinned sccache 0.16.0 with a bounded local-only 10 GiB cache,

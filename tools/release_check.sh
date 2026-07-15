@@ -133,11 +133,5 @@ python3 tools/check_mobile_web_manifest.py \
     --protocol-source protocol/src/types.rs \
     "v$VERSION"
 
-cat <<'NOTE'
-==> Native mobile drift note
-Native mobile is a bundled installed app and is not server-pinned by the web
-loader/release manifest. Rebuild and reinstall native mobile apps after protocol
-changes; this guard cannot update already-installed native apps.
-NOTE
 
 log "Release check passed."

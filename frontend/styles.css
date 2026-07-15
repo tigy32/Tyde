@@ -1133,6 +1133,207 @@ details summary:focus:not(:focus-visible) {
     position: relative;
 }
 
+/* ===== Split View ===== */
+.center-panes {
+    flex: 1;
+    display: flex;
+    flex-direction: row;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+}
+
+.editor-pane {
+    flex: 1 1 0;
+    display: flex;
+    flex-direction: column;
+    /* One of the three independent guards on the pane minimum: this one
+       protects ordinary flex layout and window resize. The width observer
+       controls split availability and narrow mode; SplitRatio clamps the
+       ratio itself. */
+    min-width: 320px;
+    min-height: 0;
+    overflow: hidden;
+    position: relative;
+}
+
+/* Narrow mode shows a single pane, so the two-pane minimum no longer applies. */
+.center-panes-narrow .editor-pane {
+    min-width: 0;
+    flex: 1 1 100%;
+}
+
+.editor-pane.pane-hidden {
+    display: none;
+}
+
+/* The focused pane differs by weight as well as color, so focus is not
+   conveyed by hue alone. */
+.editor-pane.pane-split.pane-focused > .tab-bar {
+    border-bottom-color: var(--accent-primary);
+    box-shadow: inset 0 2px 0 0 var(--accent-primary);
+}
+
+.editor-pane.pane-split.pane-focused .tab.active {
+    font-weight: 600;
+}
+
+.editor-pane.pane-split:not(.pane-focused) > .tab-bar {
+    background: var(--surface-2);
+}
+
+.pane-divider {
+    flex: 0 0 5px;
+    width: 5px;
+    cursor: col-resize;
+    background: var(--border-primary);
+    border: none;
+    padding: 0;
+    touch-action: none;
+    position: relative;
+    /* Above the panes. `.editor-pane` is positioned, so without this the pane
+       content paints over the divider's transparent grab band below and the
+       overhang is unclickable — the pointer lands on the file view instead of
+       the divider. */
+    z-index: 2;
+}
+
+/* The divider stays 5px of ink, but is grabbable well beyond it: the hit area
+   is widened with a transparent overlay rather than by drawing a heavier line.
+   Panes are >=320px, so the overhang can never reach a neighbouring target. */
+.pane-divider::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    /* 10px each side + the 5px line = a 25px grab band, past the 24px minimum,
+       while the drawn divider stays 5px. Panes are >=320px, so the overhang can
+       never reach a neighbouring target. */
+    left: -10px;
+    right: -10px;
+    cursor: col-resize;
+}
+
+.pane-divider:hover,
+.pane-divider.pane-divider-active,
+.pane-divider:focus-visible {
+    background: var(--accent-primary);
+    outline: none;
+}
+
+/* Move-only cross-pane drop target. */
+.pane-drop-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 5;
+    pointer-events: none;
+    background: color-mix(in srgb, var(--accent-primary) 18%, transparent);
+    border: 2px dashed var(--accent-primary);
+}
+
+.center-narrow-notice {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    padding: var(--space-2) var(--space-3);
+    background: var(--surface-2);
+    border-bottom: 1px solid var(--border-primary);
+    font-size: 0.923rem;
+    color: var(--text-secondary);
+}
+
+.center-narrow-actions {
+    display: flex;
+    gap: var(--space-2);
+    flex: 0 0 auto;
+}
+
+/* Both strip controls carry a >=24x24 target (WCAG 2.5.8). A 44x44 control
+   cannot fit a 36px tab strip without redesigning the strip, so the full-size
+   (>=44px) targets for these same actions are the menu items below, which every
+   one of them can also be reached through. */
+.split-right-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 28px;
+    height: 28px;
+    padding: 0 4px;
+    color: var(--text-secondary);
+}
+
+.split-right-btn:hover:not(.disabled) {
+    color: var(--text-bright);
+    background: var(--surface-3);
+}
+
+/* Never hidden — a control that cannot run still says why it cannot. */
+.split-right-btn.disabled,
+.split-right-btn[aria-disabled="true"] {
+    opacity: 0.45;
+    cursor: default;
+}
+
+.pane-actions {
+    position: relative;
+    display: flex;
+    align-items: center;
+}
+
+.pane-actions-trigger {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 28px;
+    height: 28px;
+    color: var(--text-secondary);
+    border-radius: 3px;
+}
+
+.pane-actions-trigger:hover {
+    color: var(--text-primary);
+    background: var(--surface-3);
+}
+
+.pane-actions-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+}
+
+.pane-actions-menu {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    z-index: 1001;
+}
+
+/* The >=44px target for every command these menus carry. */
+.center-menu .context-menu-item {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 2px;
+    min-height: 44px;
+    padding: 8px 12px;
+}
+
+/* Screen-reader-only live region: announcements without visible chrome. */
+.visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+}
+
+
+
 /* ===== Tab Bar ===== */
 .tab-bar {
     display: flex;
@@ -1152,6 +1353,16 @@ details summary:focus:not(:focus-visible) {
 
 .tab-bar-hidden {
     display: none;
+}
+
+/* Owns the tablist role: the tab buttons are its only meaningful descendants,
+   while the pane/tool actions sit outside it in the bar. */
+.tab-strip {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    align-items: stretch;
+    gap: 1px;
 }
 
 .tab-strip-scroll {
@@ -2822,6 +3033,10 @@ kbd {
     color: var(--error);
 }
 
+.tool-card-malformed {
+    border-color: color-mix(in srgb, var(--error) 45%, var(--border-primary));
+}
+
 .tool-chevron {
     color: var(--text-tertiary);
     font-size: 0.692rem;
@@ -3817,33 +4032,39 @@ kbd {
     letter-spacing: 0.04em;
 }
 
-/* ===== Markdown Rendering ===== */
-.chat-card-body p {
+/* ===== Markdown Rendering =====
+   Scoped to both the chat card body and `.tool-md`, the container that tool
+   cards render agent-authored Markdown into (e.g. the message a
+   `tyde_send_agent_message` call delivered). Tool cards are siblings of
+   `.chat-card-body`, not children, so they need the scope explicitly — and
+   sharing one rule set is what makes tool-card Markdown read identically to
+   chat Markdown instead of drifting into a second look. */
+:is(.chat-card-body, .tool-md) p {
     margin: 0 0 0.5em 0;
     white-space: pre-wrap;
 }
 
-.chat-card-body p:last-child {
+:is(.chat-card-body, .tool-md) p:last-child {
     margin-bottom: 0;
 }
 
-.chat-card-body :is(h1, h2, h3, h4, h5, h6) {
+:is(.chat-card-body, .tool-md) :is(h1, h2, h3, h4, h5, h6) {
     font-weight: 600;
     color: var(--text-bright);
     margin: 0.8em 0 0.3em 0;
 }
 
-.chat-card-body :is(h1, h2, h3, h4, h5, h6):first-child {
+:is(.chat-card-body, .tool-md) :is(h1, h2, h3, h4, h5, h6):first-child {
     margin-top: 0;
 }
 
-.chat-card-body h1 { font-size: 1.4em; }
-.chat-card-body h2 { font-size: 1.2em; }
-.chat-card-body h3 { font-size: 1.1em; }
-.chat-card-body :is(h4, h5, h6) { font-size: 1em; }
+:is(.chat-card-body, .tool-md) h1 { font-size: 1.4em; }
+:is(.chat-card-body, .tool-md) h2 { font-size: 1.2em; }
+:is(.chat-card-body, .tool-md) h3 { font-size: 1.1em; }
+:is(.chat-card-body, .tool-md) :is(h4, h5, h6) { font-size: 1em; }
 
 /* Inline code (outside of <pre>) */
-.chat-card-body code {
+:is(.chat-card-body, .tool-md) code {
     font-family: var(--font-mono);
     font-size: 0.9em;
     padding: 1px 5px;
@@ -3857,7 +4078,7 @@ kbd {
     color: var(--text-bright);
 }
 
-.chat-card-body .md-code-block {
+:is(.chat-card-body, .tool-md) .md-code-block {
     margin: 0.5em 0;
     border-radius: 6px;
     overflow: hidden;
@@ -3898,7 +4119,7 @@ kbd {
     background: var(--surface-hover);
 }
 
-.chat-card-body .md-code-block pre {
+:is(.chat-card-body, .tool-md) .md-code-block pre {
     margin: 0;
     padding: var(--space-2) var(--space-3);
     overflow-x: auto;
@@ -3908,7 +4129,7 @@ kbd {
 
 /* Reset inline-code styling inside code blocks; syntect emits inline styles
    on each token, but we still want a consistent base font/line-height. */
-.chat-card-body pre code {
+:is(.chat-card-body, .tool-md) pre code {
     font-family: var(--font-mono);
     font-size: 0.923rem;
     line-height: 1.5;
@@ -3918,64 +4139,64 @@ kbd {
     border-radius: 0;
 }
 
-.chat-card-body :is(ul, ol) {
+:is(.chat-card-body, .tool-md) :is(ul, ol) {
     margin: 0.3em 0;
     padding-left: 1.5em;
 }
 
-.chat-card-body :is(ul, ol) li {
+:is(.chat-card-body, .tool-md) :is(ul, ol) li {
     margin: 0.15em 0;
 }
 
-.chat-card-body blockquote {
+:is(.chat-card-body, .tool-md) blockquote {
     border-left: 3px solid var(--border-secondary);
     padding-left: var(--space-3);
     margin: 0.5em 0;
     color: var(--text-secondary);
 }
 
-.chat-card-body a {
+:is(.chat-card-body, .tool-md) a {
     color: var(--accent-primary);
     text-decoration: none;
 }
 
-.chat-card-body a:hover {
+:is(.chat-card-body, .tool-md) a:hover {
     text-decoration: underline;
 }
 
-.chat-card-body hr {
+:is(.chat-card-body, .tool-md) hr {
     border: none;
     border-top: 1px solid var(--border-primary);
     margin: 0.8em 0;
 }
 
 /* Task list items produced by GFM ENABLE_TASKLISTS */
-.chat-card-body :is(ul, ol).contains-task-list {
+:is(.chat-card-body, .tool-md) :is(ul, ol).contains-task-list {
     list-style: none;
     padding-left: 0.5em;
 }
 
-.chat-card-body li.task-list-item {
+:is(.chat-card-body, .tool-md) li.task-list-item {
     list-style: none;
 }
 
-.chat-card-body li.task-list-item input[type="checkbox"] {
+:is(.chat-card-body, .tool-md) li.task-list-item input[type="checkbox"] {
     margin-right: 0.4em;
 }
 
 /* GFM tables */
-.chat-card-body table {
+:is(.chat-card-body, .tool-md) table {
     border-collapse: collapse;
     margin: 0.5em 0;
 }
 
-.chat-card-body :is(th, td) {
+:is(.chat-card-body, .tool-md) :is(th, td) {
     border: 1px solid var(--border-primary);
     padding: 4px 8px;
     text-align: left;
 }
 
-.chat-card-body th {
+:is(.chat-card-body, .tool-md) th {
     background: var(--surface-2);
     font-weight: 600;
 }
@@ -5437,15 +5658,43 @@ kbd {
     margin-left: auto;
 }
 
+/* `display: none` removed this control from the accessibility tree entirely, so a
+   screen reader in *browse* mode — which walks the rendered document, not the
+   focus order — never found "Open to the Side" at all. (The `:focus` rule below
+   could never match either: a `display: none` element cannot be focused.)
+
+   It is now visually hidden rather than structurally absent: clipped to a 1px
+   box so it costs no space and no ink in the sighted UI, while remaining in the
+   document, in the a11y tree, and focusable. Hover or keyboard focus restores it
+   to a normal control. */
 .agent-card-action {
-    display: none;
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    opacity: 0;
 }
 
 .agent-card:hover .agent-card-action,
 .agent-card:focus-within .agent-card-action,
-.agent-card-action:focus {
+.agent-card-action:focus,
+.agent-card-action:focus-visible {
+    position: static;
+    width: auto;
+    height: auto;
+    min-width: 24px;
+    min-height: 24px;
+    margin: 0;
+    overflow: visible;
+    clip-path: none;
+    opacity: 1;
     display: inline-flex;
     align-items: center;
+    justify-content: center;
 }
 
 .agent-card-status {
@@ -5918,6 +6167,138 @@ kbd {
 
 .fe-item:hover {
     background: var(--surface-hover);
+}
+
+/* File row: the name opens in the focused pane, the trailing action opens to
+   the side. The action is always in the tab order — it is revealed on hover or
+   focus, never hidden from the keyboard. */
+.fe-row {
+    display: flex;
+    align-items: center;
+    position: relative;
+}
+
+.fe-row:hover {
+    background: var(--surface-hover);
+}
+
+.fe-row .fe-item {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+/* The inline action is a pointer convenience. Its hit target is 44px wide and
+   spans the full row height — a 44x44 box is not reachable inside a 26px tree
+   row without making every row 44px tall, so the full-size (>=44px) target for
+   this action is the row context menu's item below. */
+.fe-open-side {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    align-self: stretch;
+    width: 44px;
+    min-height: 26px;
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--text-secondary);
+    border-radius: 3px;
+    cursor: pointer;
+    /* Quiet until the row is engaged — revealed on hover, on keyboard focus
+       anywhere in the row, and on its own focus. Hover-only would hide the
+       affordance from every keyboard and touch user.
+
+       `pointer-events: none` while invisible is the load-bearing half: an
+       `opacity: 0` element still swallows clicks, so a reuse of this class in a
+       row that does not match the reveal selectors below (the git panel's
+       `.gp-file-row` was exactly that) left an *invisible but clickable* target
+       sitting in the row. It is now unclickable precisely when it is unseeable. */
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.1s;
+}
+
+.fe-open-side-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+}
+
+/* Every row that hosts this control lists itself here. The explorer, search and
+   references rows use `.fe-row`; the git panel's file rows are `.gp-file-row`
+   (whose `.gp-file-actions` group reveals itself the same way). A disabled
+   control is always shown: it carries the reason, and a reason nobody can see is
+   the failure this exists to prevent. */
+.fe-row:hover .fe-open-side,
+.fe-row:focus-within .fe-open-side,
+.gp-file-row:hover .fe-open-side,
+.gp-file-row:focus-within .fe-open-side,
+.fe-open-side:focus-visible,
+.fe-open-side.disabled,
+.fe-open-side[aria-disabled="true"] {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+.fe-open-side:focus-visible {
+    outline: 2px solid var(--accent-primary);
+    outline-offset: -2px;
+}
+
+/* A refusal the user can see, not only hear. */
+.fe-refusal {
+    flex: 1 0 100%;
+    margin: 2px 0 4px 28px;
+    padding: 4px 8px;
+    border-left: 2px solid var(--accent-primary);
+    background: var(--surface-2);
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+    white-space: normal;
+}
+
+.fe-row {
+    flex-wrap: wrap;
+}
+
+/* Row context menu: the full-size target for the same actions. */
+.fe-menu-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+}
+
+.fe-menu {
+    min-width: 220px;
+}
+
+.fe-menu-item {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 2px;
+    min-height: 44px;
+    padding: 8px 12px;
+}
+
+.fe-open-side:hover {
+    color: var(--text-bright);
+    background: var(--surface-3);
+}
+
+.fe-open-side.disabled,
+.fe-open-side[aria-disabled="true"] {
+    color: var(--text-secondary);
+    cursor: default;
+}
+
+.fe-open-side.disabled:hover,
+.fe-open-side[aria-disabled="true"]:hover {
+    background: none;
+    color: var(--text-secondary);
 }
 
 .fe-item:active {
@@ -7132,6 +7513,37 @@ kbd {
     background: var(--surface-hover);
 }
 
+.cp-result-item.disabled {
+    cursor: default;
+    opacity: 0.75;
+}
+
+.cp-result-item.disabled:hover {
+    background: transparent;
+}
+
+.cp-row-hints {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    margin-left: auto;
+    flex: 0 0 auto;
+    color: var(--text-secondary);
+    font-size: 0.72rem;
+    white-space: nowrap;
+}
+
+.cp-hint-label {
+    color: var(--text-secondary);
+}
+
+.cp-cmd-reason {
+    flex: 1 1 auto;
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+    white-space: normal;
+}
+
 .cp-result-item.selected {
     background: var(--surface-2);
 }
@@ -8118,6 +8530,245 @@ kbd {
     font-size: 0.9rem;
 }
 
+/* --- Managed-projection disclosures (Tycode) ---
+   Server-owned typed state rendered above the native settings groups. The
+   hierarchy runs loudest to quietest: the one-time notice (new, actionable), the
+   unsupported-provider status, the softer advisories, then the persistent
+   ownership line. Severity is never carried by colour alone — each row also has
+   its own title text and ARIA role from the component. Nothing here uses
+   `content: attr(...)`, so no attribute value can be echoed into rendered text. */
+
+.settings-native-disclosures {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+}
+
+/* Quietest, and permanent: the copy/shared-file split is a standing fact, not an
+   event. `overflow-wrap` matters — these lines carry absolute paths that would
+   otherwise push the settings page sideways on a narrow window. */
+.settings-native-ownership {
+    margin: 0;
+    color: var(--text-tertiary);
+    font-size: 0.82rem;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+}
+
+/* The one-time notice. Accent-tinted so it reads as informational and new,
+   distinct from the advisories below it, which sit on the neutral surface. */
+.settings-native-notice {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-3);
+    background: var(--accent-subtle);
+    border: 1px solid var(--border-primary);
+    border-left: 3px solid var(--accent-primary);
+    border-radius: 6px;
+}
+
+.settings-native-notice-title {
+    margin: 0;
+    color: var(--text-primary);
+    font-size: 0.9rem;
+    font-weight: 600;
+}
+
+.settings-native-notice-text {
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+}
+
+/* Matches the `.settings-btn` idiom rather than borrowing the class, so the
+   notice keeps its own compact scale. The global `:focus-visible` ring applies;
+   the border shift below is an additional cue, never a replacement for it. */
+.settings-native-notice-dismiss {
+    align-self: flex-start;
+    height: 28px;
+    padding: 0 var(--space-3);
+    font-family: inherit;
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: var(--text-primary);
+    background: var(--surface-3);
+    border: 1px solid var(--border-primary);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.settings-native-notice-dismiss:hover,
+.settings-native-notice-dismiss:focus-visible {
+    background: var(--surface-2);
+    border-color: var(--border-secondary);
+}
+
+/* One card per typed advisory. The left bar carries the severity; the title
+   colour reinforces it. A `Ready` snapshot stays editable while these are up, so
+   nothing here dims or overlays the controls below. */
+.settings-native-advisory {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    padding: var(--space-2) var(--space-3);
+    background: var(--surface-2);
+    border: 1px solid var(--border-primary);
+    border-left: 3px solid var(--border-secondary);
+    border-radius: 6px;
+}
+
+.settings-native-advisory-title {
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    font-weight: 600;
+}
+
+.settings-native-advisory-text {
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+}
+
+/* `role="status"`: the active provider cannot be modelled in Tyde's copy. The
+   settings remain Ready and editable so the user can choose a supported one;
+   this is the visually strongest advisory, but its live region stays polite. */
+.settings-native-advisory-unsupported {
+    border-left-color: var(--error);
+}
+
+.settings-native-advisory-unsupported .settings-native-advisory-title {
+    color: var(--error);
+}
+
+/* `role="status"`: actionable but not broken — configure a provider. */
+.settings-native-advisory-no-provider {
+    border-left-color: var(--warning);
+}
+
+.settings-native-advisory-no-provider .settings-native-advisory-title {
+    color: var(--warning);
+}
+
+/* `role="status"`: a passed-through backend diagnostic. Neutral by design — it
+   inherits the base bar and title colour. */
+.settings-native-advisory-backend {
+    border-left-color: var(--border-secondary);
+}
+
+/* Managed-projection recovery. This is the only state that blocks the backend
+   outright, so it sits first and reads loudest — but it is still `role="status"`,
+   not an alert: the server publishes it on every refresh while the projection
+   stays wedged, and an assertive region would re-announce the whole card each
+   time. The button it carries only *opens* a confirmation; the destructive
+   confirm lives in `.settings-confirm-modal`, styled with the existing danger
+   button. */
+.settings-native-reset {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-3);
+    background: var(--surface-2);
+    border: 1px solid var(--border-primary);
+    border-left: 3px solid var(--error);
+    border-radius: 6px;
+}
+
+.settings-native-reset-title {
+    margin: 0;
+    color: var(--error);
+    font-size: 0.9rem;
+    font-weight: 600;
+}
+
+.settings-native-reset-text {
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+}
+
+/* The server's refusal of a reset, rendered on the card the reset was offered
+ * from. Sits directly above the action so the answer and the control that
+ * produced it read as one thing — a refusal reported only in the far-corner host
+ * status line makes a destructive button look like it did nothing. */
+.settings-native-reset-refusal {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    padding: var(--space-2);
+    background: var(--surface-2);
+    border: 1px solid var(--error);
+    border-left-width: 3px;
+    border-radius: 6px;
+}
+
+.settings-native-reset-refusal-title {
+    margin: 0;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--error);
+}
+
+.settings-native-reset-refusal-text {
+    margin: 0;
+    font-size: 0.85rem;
+    line-height: 1.5;
+    color: var(--text-secondary);
+    /* Server reasons carry projection ids and absolute paths. */
+    overflow-wrap: anywhere;
+}
+
+.settings-native-reset-action {
+    align-self: flex-start;
+    height: 28px;
+    padding: 0 var(--space-3);
+    font-family: inherit;
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: var(--text-primary);
+    background: var(--surface-3);
+    border: 1px solid var(--border-primary);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.settings-native-reset-action:hover,
+.settings-native-reset-action:focus-visible {
+    color: var(--error);
+    background: var(--surface-2);
+    border-color: var(--error);
+}
+
+@media (max-width: 800px) {
+    .settings-native-reset,
+    .settings-native-notice,
+    .settings-native-advisory {
+        padding: var(--space-2);
+    }
+
+    /* A full-width target is easier to hit on a narrow/touch viewport. */
+    .settings-native-reset-action,
+    .settings-native-notice-dismiss {
+        align-self: stretch;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .settings-native-reset-action,
+    .settings-native-notice-dismiss {
+        transition: none;
+    }
+}
+
 .settings-panel-header {
     display: flex;
     align-items: center;
@@ -8187,6 +8838,40 @@ kbd {
     margin: 0;
     color: var(--text-secondary);
     line-height: 1.5;
+}
+
+/* `SettingsConfirmDialog` only ever gates irreversible actions — deleting a
+ * launch profile, a custom agent, an MCP server, or a steering entry, and
+ * resetting Tyde's managed projection — so it carries a danger accent that the
+ * other modals sharing `.settings-confirm-modal` (the team draft editor, and
+ * friends) do not. Scoped to this modifier for exactly that reason. */
+.settings-confirm-danger {
+    border-color: var(--error);
+}
+
+.settings-confirm-danger .settings-confirm-title {
+    color: var(--error);
+}
+
+/* The destructive choice is the loud one; Cancel stays the quiet default and is
+ * where focus lands, so the hierarchy reads the same by sight and by keyboard. */
+.settings-confirm-danger .settings-btn-danger {
+    border-color: var(--error);
+    font-weight: 600;
+}
+
+.settings-confirm-danger .settings-btn-danger:hover:not(:disabled) {
+    background: var(--error);
+    color: var(--surface-1);
+}
+
+/* The dialog moves focus to Cancel as it opens. That ring is the only signal a
+ * sighted keyboard user gets that focus has entered the modal, so it must not be
+ * suppressed by the global `button:focus:not(:focus-visible)` reset. */
+.settings-confirm-modal:focus-visible,
+.settings-confirm-modal .settings-btn:focus-visible {
+    outline: 2px solid var(--accent-primary);
+    outline-offset: 2px;
 }
 
 .settings-backend-header {
@@ -9272,6 +9957,58 @@ kbd {
 .context-menu-item:hover {
     background: var(--surface-hover);
     color: var(--text-bright);
+}
+
+/* A command that can't run stays visible and says why, rather than vanishing. */
+.context-menu-item.disabled,
+.context-menu-item[aria-disabled="true"] {
+    color: var(--text-secondary);
+    cursor: default;
+}
+
+.context-menu-item.disabled:hover,
+.context-menu-item[aria-disabled="true"]:hover {
+    background: transparent;
+    color: var(--text-secondary);
+}
+
+.context-menu-item .context-menu-reason {
+    display: block;
+    margin-top: 2px;
+    font-size: 0.72rem;
+    line-height: 1.3;
+    color: var(--text-secondary);
+    white-space: normal;
+    max-width: 260px;
+}
+
+.context-menu-separator {
+    height: 1px;
+    margin: 3px 6px;
+    background: var(--border-primary);
+}
+
+.context-menu-shortcut {
+    margin-left: auto;
+    padding-left: var(--space-3);
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+}
+
+/* The tab a refused drag is pointing at: the occurrence already open in the
+   pane the user is hovering. */
+.tab.tab-drag-conflict {
+    outline: 2px dashed var(--accent-primary);
+    outline-offset: -2px;
+}
+
+/* A refusal shown on the still-open palette surface. */
+.cp-notice {
+    padding: var(--space-2) var(--space-3);
+    border-bottom: 1px solid var(--border-primary);
+    background: var(--surface-2);
+    color: var(--text-primary);
+    font-size: 0.8rem;
 }
 
 /* Context-menu item that pairs a label with a keyboard-shortcut hint on the
@@ -11067,6 +11804,133 @@ pre.tool-error-pre {
     background: var(--accent-subtle);
 }
 
+/* ── Tyde orchestration: tyde_send_agent_message ─────────────────────────
+   The message is content, not debug output, so it renders as real Markdown in
+   `--text-primary` rather than as an escaped-JSON <pre> in `--text-secondary`.
+   Long messages are clamped by max-height on the *rendered* container (never by
+   truncating the Markdown source, which would break mid-fence and mid-table)
+   and expanded with a real <button>. */
+.tool-send-message {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    align-items: flex-start;
+    min-width: 0;
+    margin-top: var(--space-1);
+}
+
+.tool-send-message-header {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    width: 100%;
+    min-width: 0;
+}
+
+.tool-send-message-label {
+    flex-shrink: 0;
+    font-size: 0.769rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--text-tertiary, var(--text-secondary));
+}
+
+.tool-send-message-recipient {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 0.846rem;
+    color: var(--text-primary);
+}
+
+.tool-send-message-body {
+    position: relative;
+    width: 100%;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    font-size: 0.923rem;
+    color: var(--text-primary);
+}
+
+.tool-send-message-body.clamped {
+    max-height: 18rem;
+    overflow: hidden;
+}
+
+/* Soft bottom fade so the clamp reads as a cut rather than as a message that
+   happens to end mid-sentence. Decorative only — the `Show more` button is the
+   actual affordance. */
+.tool-send-message-body.clamped::after {
+    content: "";
+    position: absolute;
+    inset-inline: 0;
+    bottom: 0;
+    height: 3rem;
+    pointer-events: none;
+    background: linear-gradient(to bottom, transparent, var(--surface-1));
+}
+
+.tool-send-message-raw {
+    width: 100%;
+    min-width: 0;
+    margin-top: var(--space-1);
+}
+
+/* ── Tyde orchestration: tyde_await_agents completion ────────────────────
+   The live rows above (server progress) are the sole agent roster. This is only
+   the wait's verdict — counts, plus any agent that came back failed — so it must
+   stay a single quiet line and never re-list the agents. No raw JSON in any
+   output mode. */
+.tool-await-result {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    margin-top: var(--space-1);
+}
+
+.tool-await-verdict {
+    font-size: 0.769rem;
+    color: var(--text-tertiary, var(--text-secondary));
+}
+
+.tool-await-verdict-failed {
+    font-size: 0.769rem;
+    color: var(--error);
+}
+
+/* Protocol drift: a typed request whose completion arrived as an untyped shape,
+   or an untyped request whose completion arrived typed (a malformed canonical
+   payload). Surfaced loudly rather than silently swallowed. */
+.tool-typed-mismatch {
+    margin-top: var(--space-1);
+    font-size: 0.846rem;
+    color: var(--error);
+}
+
+/* A sanitized copy of the request that failed to normalize. Behind a closed
+   disclosure so a failure stays inspectable without restoring normal JSON noise. */
+.tool-malformed-payload {
+    margin-top: var(--space-1);
+    min-width: 0;
+}
+
+@media (max-width: 720px) {
+    /* Keep the recipient legible instead of squeezing it: the action wraps to
+       its own full-width row with a comfortable tap target. */
+    .tool-send-message-header {
+        flex-wrap: wrap;
+    }
+
+    .tool-send-message-header .tool-live-link {
+        margin-left: 0;
+        width: 100%;
+        min-height: 44px;
+    }
+}
+
 .workflow-run-panel {
     display: flex;
     flex-direction: column;
@@ -11687,4 +12551,333 @@ pre.tool-error-pre {
     display: flex;
     justify-content: flex-end;
     gap: var(--space-2);
+}
+
+/* ── Subscription capacity ───────────────────────────────────────────────────
+   Advisory quota reported by a backend. Severity is never carried by colour
+   alone — every state also has a word — and the bar is decorative: its
+   aria-label carries the same sentence the text does. Bars are drawn only for
+   an authoritative vendor-reported percentage, never for credits, a
+   magnitude-less bucket, or a state with no report (an empty bar reads as
+   "0% used"). Buckets are never merged into a single figure. */
+
+.settings-capacity .capacity-cards {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    margin-top: var(--space-2);
+}
+
+.capacity-card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-3);
+    background: var(--surface-1);
+    border: 1px solid var(--border-primary);
+    border-left: 3px solid var(--border-secondary);
+    border-radius: 6px;
+}
+
+.capacity-card[data-capacity-state="known"] {
+    border-left-color: var(--success);
+}
+
+.capacity-card[data-capacity-state="stale"] {
+    border-left-color: var(--warning);
+}
+
+.capacity-card[data-capacity-state="auth-error"],
+.capacity-card[data-capacity-state="rate-limited"] {
+    border-left-color: var(--error);
+}
+
+.capacity-card-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-2);
+    flex-wrap: wrap;
+}
+
+.capacity-backend {
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.capacity-state {
+    font-size: 0.78rem;
+    color: var(--text-secondary);
+}
+
+.capacity-state[data-capacity-state="stale"] {
+    color: var(--warning);
+}
+
+.capacity-state[data-capacity-state="auth-error"],
+.capacity-state[data-capacity-state="rate-limited"] {
+    color: var(--error);
+}
+
+.capacity-card-meta,
+.capacity-bucket-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-1) var(--space-3);
+    font-size: 0.72rem;
+    color: var(--text-tertiary);
+}
+
+.capacity-explanation {
+    margin: 0;
+    font-size: 0.78rem;
+    line-height: 1.45;
+    color: var(--text-secondary);
+}
+
+/* The coverage caveat is text, always present — never a hover-only tooltip.
+   Without it, a one-bucket report and a complete one look identical. */
+.capacity-coverage {
+    margin: 0;
+    padding: var(--space-2);
+    font-size: 0.75rem;
+    line-height: 1.45;
+    color: var(--text-secondary);
+    background: var(--surface-hover);
+    border-radius: 4px;
+}
+
+.capacity-buckets {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+}
+
+.capacity-bucket {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    padding-top: var(--space-2);
+    border-top: 1px solid var(--border-primary);
+}
+
+.capacity-bucket-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-2);
+}
+
+.capacity-bucket-label {
+    font-size: 0.82rem;
+    color: var(--text-primary);
+}
+
+.capacity-bucket-status {
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+}
+
+.capacity-bucket-status[data-capacity-status="warning"] {
+    color: var(--warning);
+}
+
+.capacity-bucket-status[data-capacity-status="rejected"] {
+    color: var(--error);
+}
+
+.capacity-measure {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex-wrap: wrap;
+}
+
+.capacity-bar {
+    flex: 1 1 140px;
+    min-width: 100px;
+    height: 6px;
+    background: var(--surface-hover);
+    border-radius: 3px;
+    overflow: hidden;
+}
+
+.capacity-bar-fill {
+    height: 100%;
+    background: var(--accent-primary);
+    border-radius: 3px;
+}
+
+.capacity-figures {
+    display: flex;
+    gap: var(--space-3);
+    font-size: 0.75rem;
+    font-variant-numeric: tabular-nums;
+}
+
+/* Each figure carries its own provenance directly beneath it. The used
+   percentage is the vendor's; the remaining percentage is Tyde's complement.
+   One caption spanning both would tar the vendor's number as derived. */
+.capacity-figure {
+    display: flex;
+    flex-direction: column;
+    line-height: 1.3;
+}
+
+.capacity-used {
+    color: var(--text-primary);
+}
+
+.capacity-remaining {
+    color: var(--text-tertiary);
+}
+
+.capacity-provenance {
+    font-size: 0.66rem;
+    color: var(--text-tertiary);
+}
+
+.capacity-provenance-vendor {
+    color: var(--text-secondary);
+}
+
+.capacity-no-magnitude,
+.capacity-credits {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+}
+
+.capacity-empty {
+    margin-top: var(--space-2);
+}
+
+/* ── Compact capacity row (token-usage popup) ────────────────────────────────
+   A sibling region of the task-token breakdown, never a line inside it: task
+   tokens measure this task, capacity measures the account, and the two are not
+   summable. */
+
+.capacity-compact {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    margin-top: var(--space-2);
+    padding-top: var(--space-2);
+    border-top: 1px solid var(--border-primary);
+}
+
+.capacity-compact-title {
+    color: var(--text-secondary);
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.capacity-compact-bucket {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex-wrap: wrap;
+}
+
+.capacity-compact-label {
+    color: var(--text-primary);
+}
+
+/* The vendor's own bucket type. The server's label rule is lossy — Claude's
+   seven_day and seven_day_overage_included both label as "weekly limit" — so
+   this is what keeps two different limits distinguishable. */
+.capacity-compact-vendor,
+.capacity-meta-vendor {
+    font-family: var(--font-mono);
+    font-size: 0.66rem;
+    color: var(--text-tertiary);
+}
+
+.capacity-compact-bucket .capacity-bar {
+    flex: 1 1 80px;
+    min-width: 60px;
+}
+
+.capacity-compact-textual-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    flex-wrap: wrap;
+}
+
+.capacity-compact-figures {
+    font-variant-numeric: tabular-nums;
+    color: var(--text-primary);
+}
+
+.capacity-compact-reset,
+.capacity-compact-freshness,
+.capacity-compact-explanation {
+    color: var(--text-tertiary);
+    font-size: 0.68rem;
+}
+
+.capacity-compact-more {
+    color: var(--accent-link);
+    font-size: 0.68rem;
+}
+
+.capacity-compact-state {
+    color: var(--text-secondary);
+}
+
+.capacity-compact[data-capacity-state="stale"] .capacity-compact-state,
+.capacity-compact-coverage {
+    color: var(--warning);
+    font-size: 0.68rem;
+}
+
+.capacity-compact[data-capacity-state="auth-error"] .capacity-compact-state,
+.capacity-compact[data-capacity-state="rate-limited"] .capacity-compact-state {
+    color: var(--error);
+}
+
+.capacity-compact-textual .capacity-bucket {
+    border-top: none;
+    padding-top: 0;
+}
+
+/* Narrow viewports (and the mobile web shell) stack the bucket rows rather
+   than clipping them. */
+@media (max-width: 640px) {
+    .capacity-compact-bucket,
+    .capacity-measure {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: var(--space-1);
+    }
+
+    .capacity-bar,
+    .capacity-compact-bucket .capacity-bar {
+        width: 100%;
+        flex: 0 0 auto;
+    }
+}
+
+/* ===== Reduced motion =====
+   Placed last on purpose: these selectors have the same specificity as the rules
+   they override, so source order is what decides. An earlier block (as the first
+   attempt at this was) is silently beaten by the `.context-menu { animation }`
+   further down the file.
+
+   Only rules that actually animate appear here — a selector listed for an
+   element with nothing to animate is dead weight that reads as coverage. */
+@media (prefers-reduced-motion: reduce) {
+    /* `menu-in`. `.context-menu` covers the tab menu, the pane-actions menu and
+       the explorer's file menu, all of which carry that class. */
+    .context-menu,
+    .chat-send-menu {
+        animation: none;
+    }
+
+    /* Opacity reveals: the side-open control and the git panel's action group. */
+    .fe-open-side,
+    .gp-file-actions {
+        transition: none;
+    }
 }

@@ -37,6 +37,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::SessionSchemas
                 | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
+                | FrameKind::BackendCapacity
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
@@ -109,6 +110,7 @@ async fn drain_initial_project_state_pushes(client: &mut client::Connection, con
                             | FrameKind::SessionSchemas
                             | FrameKind::LaunchProfileCatalogNotify
                             | FrameKind::BackendSetup
+                            | FrameKind::BackendCapacity
                             | FrameKind::QueuedMessages
                             | FrameKind::SessionSettings
                             | FrameKind::TeamPresetCatalogNotify

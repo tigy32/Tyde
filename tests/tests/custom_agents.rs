@@ -77,6 +77,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::SessionSchemas
                 | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
+                | FrameKind::BackendCapacity
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
@@ -232,6 +233,7 @@ async fn expect_session_list(
                 | FrameKind::SessionSchemas
                 | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
+                | FrameKind::BackendCapacity
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
@@ -293,6 +295,7 @@ async fn wait_for_session_list(
                 | FrameKind::SessionSchemas
                 | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
+                | FrameKind::BackendCapacity
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
@@ -361,6 +364,18 @@ fn sample_mcp_server(id: &str, name: &str) -> McpServerConfig {
             command: "echo".to_string(),
             args: vec!["hello".to_string()],
             env: HashMap::new(),
+        },
+    }
+}
+
+fn sample_http_mcp_server(id: &str, name: &str, url: &str) -> McpServerConfig {
+    McpServerConfig {
+        id: McpServerId(id.to_string()),
+        name: name.to_string(),
+        transport: McpTransportConfig::Http {
+            url: url.to_string(),
+            headers: HashMap::new(),
+            bearer_token_env_var: None,
         },
     }
 }
@@ -1015,6 +1030,54 @@ async fn default_agent_resolves_all_current_skills_and_mcp_servers() {
     assert!(text.contains("[startup_mcp_servers: tyde-agent-control(http), tyde-agent-await(http), docs-server(stdio)]"));
     assert!(text.contains("lint=Run cargo test -q before reporting completion."));
     assert!(text.contains("qa=Check the visible UI state before reporting completion."));
+}
+
+#[tokio::test]
+async fn generated_name_isolates_configured_http_mcp_from_setup() {
+    let mut fixture = Fixture::new().await;
+    let mcp_server = sample_http_mcp_server(
+        "method-not-allowed",
+        "method-not-allowed",
+        "https://example.com/mcp",
+    );
+
+    fixture
+        .client
+        .mcp_server_upsert(McpServerUpsertPayload {
+            mcp_server: mcp_server.clone(),
+        })
+        .await
+        .expect("mcp_server_upsert failed");
+    let _ = expect_next_event(&mut fixture.client, "McpServerNotify upsert").await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: None,
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/generated-name-mcp-isolation".to_string()],
+                prompt: "inspect endpoint isolation".to_string(),
+                images: None,
+                backend_kind: BackendKind::Codex,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn_agent failed");
+
+    let env = expect_next_event(&mut fixture.client, "NewAgent").await;
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse NewAgentPayload");
+    assert_eq!(new_agent.name, "Inspect Endpoint Isolation");
+
+    let _ = expect_next_event(&mut fixture.client, "AgentStart").await;
+    let text = expect_turn_text(&mut fixture.client, "default turn").await;
+    assert!(text.contains("method-not-allowed(http)"));
 }
 
 #[tokio::test]

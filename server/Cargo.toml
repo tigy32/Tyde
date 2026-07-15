@@ -5,6 +5,7 @@ edition.workspace = true
 [features]
 default = []
 full-backends = []
+test-support = []
 
 [dependencies]
 anyhow = "1"

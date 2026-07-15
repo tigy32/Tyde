@@ -21,7 +21,10 @@ use crate::state::{
     ToolOutputMode, TransientEvent,
 };
 
-use protocol::{BackendKind, FetchSessionHistoryPayload, FrameKind};
+use protocol::{
+    BackendKind, FetchSessionHistoryPayload, FrameKind, ProjectDiffScope, ReviewCreatePayload,
+    ReviewDiffSelection, StreamPath,
+};
 
 /// Default per-row height assumed for rows we haven't measured yet.
 /// Affects initial scrollbar size and pre-measurement window math; once
@@ -120,14 +123,30 @@ pub fn ChatView(
     /// agent_ref upgrades from `None` to the spawned agent (see
     /// `dispatch.rs` agent-creation handling).
     agent_ref: Signal<Option<ActiveAgentRef>>,
-    /// True only when this tab is the active one in the center-zone.
-    /// Used to gate the `ChatInput` so hidden chat tabs don't mount
-    /// duplicate inputs that all subscribe to the global
-    /// `state.chat_input` — every keystroke would wake each hidden
-    /// instance, doubling-or-worse the per-keystroke main-thread cost.
-    is_active: Signal<bool>,
+    /// True only when this chat owns the singleton composer. In a single pane
+    /// this is the active chat; in a split it is derived from
+    /// `CenterZoneState::composer_owner()` and may remain true while a file in
+    /// the other pane has focus.
+    #[prop(optional)]
+    owns_composer: Option<Signal<bool>>,
+    /// Compatibility input for the pre-split center zone. Remove once every
+    /// caller supplies `owns_composer` from the layout foundation.
+    #[prop(optional)]
+    is_active: Option<Signal<bool>>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
+    let owns_composer = owns_composer
+        .or(is_active)
+        .unwrap_or_else(|| Signal::derive(|| false));
+    let pending_state = state.clone();
+    let composer_pending_team_member = Signal::derive(move || {
+        pending_state.center_zone.with(|_| ());
+        pending_state.composer_pending_team_member_untracked()
+    });
+    let reply_state = state.clone();
+    let reply_in_this_pane = move |_| {
+        reply_state.activate_tab(tab_id);
+    };
     let initial_scroll_state = state.tab_scroll_state_untracked(tab_id);
 
     let has_agent = move || agent_ref.get().is_some();
@@ -827,8 +846,10 @@ pub fn ChatView(
                         };
                         view! { <span class=badge_class>{label}</span> }
                     })}
-                    <ToolOutputModeToggle />
-                    <ReviewChangesButton />
+                    <Show when=move || owns_composer.get()>
+                        <ToolOutputModeToggle />
+                    </Show>
+                    <ReviewChangesButton agent_ref=agent_ref />
                 </div>
                 {move || {
                     view! {
@@ -1000,10 +1021,21 @@ pub fn ChatView(
                 </div>
             </Show>
             <Show
-                when=move || is_active.get()
-                fallback=|| ()
+                when=move || owns_composer.get()
+                fallback=move || view! {
+                    <button
+                        class="chat-reply-in-pane"
+                        type="button"
+                        on:click=reply_in_this_pane.clone()
+                    >
+                        "Reply in this pane"
+                    </button>
+                }
             >
-                <ChatInput />
+                <ChatInput
+                    agent_ref=agent_ref
+                    pending_team_member=composer_pending_team_member
+                />
             </Show>
             </div>
           </div>
@@ -1186,26 +1218,139 @@ fn ToolOutputModeToggle() -> impl IntoView {
     }
 }
 
+fn agent_project_id(
+    state: &AppState,
+    agent_ref: &ActiveAgentRef,
+    tracked: bool,
+) -> Option<protocol::ProjectId> {
+    let find = |agents: &[AgentInfo]| {
+        agents
+            .iter()
+            .find(|agent| {
+                agent.host_id == agent_ref.host_id && agent.agent_id == agent_ref.agent_id
+            })
+            .and_then(|agent| agent.project_id.clone())
+    };
+    if tracked {
+        state.agents.with(|agents| find(agents))
+    } else {
+        state.agents.with_untracked(|agents| find(agents))
+    }
+}
+
+fn agent_has_reviewable_changes(state: &AppState, agent_ref: &ActiveAgentRef) -> bool {
+    let Some(project_id) = agent_project_id(state, agent_ref, true) else {
+        return false;
+    };
+    state.git_status.with(|map| {
+        map.get(&project_id).is_some_and(|roots| {
+            roots.iter().any(|root| {
+                root.files
+                    .iter()
+                    .any(|file| file.unstaged.is_some() || file.untracked)
+            })
+        })
+    })
+}
+
+fn agent_review_create_pending(state: &AppState, agent_ref: &ActiveAgentRef) -> bool {
+    let Some(project_id) = agent_project_id(state, agent_ref, true) else {
+        return false;
+    };
+    state
+        .review_create_pending
+        .with(|map| map.contains_key(&(agent_ref.host_id.clone(), project_id)))
+}
+
+fn create_review_for_agent(state: &AppState, agent_ref: ActiveAgentRef) {
+    let Some(project_id) = agent_project_id(state, &agent_ref, false) else {
+        log::warn!(
+            "create_review_for_agent: agent {} has no project — skipping",
+            agent_ref.agent_id
+        );
+        return;
+    };
+
+    if !crate::components::review_view::open_changed_diff_for_project(
+        state,
+        &agent_ref.host_id,
+        &project_id,
+    ) {
+        return;
+    }
+
+    let has_draft = state.review_summaries.with_untracked(|map| {
+        map.get(&project_id)
+            .and_then(|summaries| crate::components::review_view::pick_workspace_draft(summaries))
+            .is_some()
+    });
+    if has_draft {
+        return;
+    }
+
+    let key = (agent_ref.host_id.clone(), project_id.clone());
+    let mut claimed = false;
+    state.review_create_pending.update(|map| {
+        let entry = map.entry(key.clone()).or_insert(0);
+        if *entry == 0 {
+            *entry = 1;
+            claimed = true;
+        }
+    });
+    if !claimed {
+        return;
+    }
+
+    let host_id = agent_ref.host_id;
+    let stream = StreamPath(format!("/project/{}", project_id.0));
+    let payload = ReviewCreatePayload {
+        selection: ReviewDiffSelection::Workspace {
+            scope: ProjectDiffScope::Unstaged,
+        },
+    };
+    let failure_state = state.clone();
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(error) = send_frame(&host_id, stream, FrameKind::ReviewCreate, &payload).await {
+            log::error!("failed to send ReviewCreate: {error}");
+            failure_state.review_create_pending.update(|map| {
+                if let Some(count) = map.get_mut(&key) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        map.remove(&key);
+                    }
+                }
+            });
+        }
+    });
+}
+
 /// "Review changes" header button. A navigation shortcut: visible whenever
-/// the active agent owns a project that has uncommitted changes, it opens
+/// the rendered agent owns a project that has uncommitted changes, it opens
 /// (or focuses) the project's changed-file diff tab — the canonical
 /// always-on inline review surface. Reviews are always-on and root-scoped
 /// server-side, so this does not start a lifecycle; it only jumps to the
 /// surface (with a legacy get-or-create fallback if no draft summary has
 /// arrived yet). Disabled only while that fallback create is in flight.
 #[component]
-fn ReviewChangesButton() -> impl IntoView {
+fn ReviewChangesButton(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView {
     let state = expect_context::<AppState>();
     let visibility_state = state.clone();
     let visible = move || {
-        crate::components::review_view::active_agent_has_reviewable_changes(&visibility_state)
+        agent_ref
+            .get()
+            .is_some_and(|target| agent_has_reviewable_changes(&visibility_state, &target))
     };
     let pending_state = state.clone();
-    let pending =
-        move || crate::components::review_view::active_agent_review_create_pending(&pending_state);
+    let pending = move || {
+        agent_ref
+            .get()
+            .is_some_and(|target| agent_review_create_pending(&pending_state, &target))
+    };
     let click_state = state.clone();
     let on_click = move |_| {
-        crate::components::review_view::create_review_for_active_agent(&click_state);
+        if let Some(target) = agent_ref.get_untracked() {
+            create_review_for_agent(&click_state, target);
+        }
     };
     view! {
         <Show when=visible.clone()>
@@ -1240,9 +1385,12 @@ fn ReviewChangesButton() -> impl IntoView {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
-    use crate::state::{ActiveAgentRef, AppState, ChatMessageEntry};
+    use crate::state::{ActiveAgentRef, AgentInfo, AppState, ChatMessageEntry, TabContent};
     use leptos::mount::mount_to;
-    use protocol::{AgentId, ChatMessage, MessageSender};
+    use protocol::{
+        AgentId, AgentOrigin, BackendKind, ChatMessage, MessageSender, ProjectGitChangeKind,
+        ProjectGitFileStatus, ProjectId, ProjectRootGitStatus, ProjectRootPath, StreamPath,
+    };
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
     use web_sys::{Element, HtmlElement};
@@ -1827,6 +1975,181 @@ mod wasm_tests {
                 .unwrap()
                 .is_none(),
             "draft team-member chat should not mount the old team roster sidebar"
+        );
+    }
+
+    fn make_target_agent(host_id: &str, agent_id: &str, project_id: Option<&str>) -> AgentInfo {
+        AgentInfo {
+            host_id: host_id.to_owned(),
+            agent_id: AgentId(agent_id.to_owned()),
+            name: agent_id.to_owned(),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Claude,
+            workspace_roots: Vec::new(),
+            project_id: project_id.map(|id| ProjectId(id.to_owned())),
+            parent_agent_id: None,
+            session_id: None,
+            custom_agent_id: None,
+            workflow: None,
+            created_at_ms: 0,
+            instance_stream: StreamPath(format!("/agent/{agent_id}")),
+            started: true,
+            fatal_error: None,
+            activity_summary: Default::default(),
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn split_chats_mount_one_composer_and_one_global_tool_toggle() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.agents.set(vec![
+                make_target_agent("host-a", "agent-a", None),
+                make_target_agent("host-b", "agent-b", None),
+            ]);
+            provide_context(state);
+            let agent_a = Signal::derive(|| {
+                Some(ActiveAgentRef {
+                    host_id: "host-a".to_owned(),
+                    agent_id: AgentId("agent-a".to_owned()),
+                })
+            });
+            let agent_b = Signal::derive(|| {
+                Some(ActiveAgentRef {
+                    host_id: "host-b".to_owned(),
+                    agent_id: AgentId("agent-b".to_owned()),
+                })
+            });
+            let owns = Signal::derive(|| true);
+            let does_not_own = Signal::derive(|| false);
+            view! {
+                <div>
+                    <ChatView tab_id=TabId(30_001) agent_ref=agent_a owns_composer=owns />
+                    <ChatView
+                        tab_id=TabId(30_002)
+                        agent_ref=agent_b
+                        owns_composer=does_not_own
+                    />
+                </div>
+            }
+        });
+        next_tick().await;
+
+        assert_eq!(
+            container
+                .query_selector_all(".chat-input-area")
+                .unwrap()
+                .length(),
+            1,
+            "two rendered chats must mount exactly one composer"
+        );
+        assert_eq!(
+            container
+                .query_selector_all(".tool-output-mode-toggle")
+                .unwrap()
+                .length(),
+            1,
+            "the client-global tool-output preference must render once"
+        );
+        assert_eq!(
+            container
+                .query_selector_all(".chat-reply-in-pane")
+                .unwrap()
+                .length(),
+            1,
+            "the non-owning rendered chat must offer one keyboard-accessible reply action"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn review_button_targets_rendered_agent_not_global_active_agent() {
+        let _ = js_sys::eval(
+            r#"
+                window.__TAURI__ = window.__TAURI__ || {};
+                window.__TAURI__.core = window.__TAURI__.core || {};
+                window.__TAURI__.core.invoke = function() { return Promise.resolve(); };
+            "#,
+        );
+        let container = make_container();
+        let state_handle: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let state_for_mount = state_handle.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.agents.set(vec![
+                make_target_agent("host-a", "agent-a", Some("project-a")),
+                make_target_agent("host-b", "agent-b", Some("project-b")),
+            ]);
+            state.open_tab(
+                TabContent::chat_with_agent(ActiveAgentRef {
+                    host_id: "host-b".to_owned(),
+                    agent_id: AgentId("agent-b".to_owned()),
+                }),
+                "Agent B".to_owned(),
+                true,
+            );
+            state.git_status.update(|map| {
+                map.insert(
+                    ProjectId("project-a".to_owned()),
+                    vec![ProjectRootGitStatus {
+                        root: ProjectRootPath("/repo-a".to_owned()),
+                        branch: Some("main".to_owned()),
+                        ahead: 0,
+                        behind: 0,
+                        clean: false,
+                        files: vec![ProjectGitFileStatus {
+                            relative_path: "src/lib.rs".to_owned(),
+                            staged: None,
+                            unstaged: Some(ProjectGitChangeKind::Modified),
+                            untracked: false,
+                        }],
+                    }],
+                );
+            });
+            *state_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            let rendered_agent = Signal::derive(|| {
+                Some(ActiveAgentRef {
+                    host_id: "host-a".to_owned(),
+                    agent_id: AgentId("agent-a".to_owned()),
+                })
+            });
+            let owns = Signal::derive(|| false);
+            view! {
+                <ChatView
+                    tab_id=TabId(30_003)
+                    agent_ref=rendered_agent
+                    owns_composer=owns
+                />
+            }
+        });
+        next_tick().await;
+
+        let button: HtmlElement = container
+            .query_selector(".chat-review-btn")
+            .unwrap()
+            .expect("rendered agent A has reviewable changes")
+            .dyn_into()
+            .unwrap();
+        button.click();
+        next_tick().await;
+
+        let state = state_handle.borrow().as_ref().cloned().unwrap();
+        let target = state.center_zone.with_untracked(|center| {
+            center.active_tab().and_then(|tab| match &tab.content {
+                TabContent::Diff {
+                    host_id,
+                    project_id,
+                    ..
+                } => Some((host_id.clone(), project_id.clone())),
+                _ => None,
+            })
+        });
+        assert_eq!(
+            target,
+            Some(("host-a".to_owned(), ProjectId("project-a".to_owned()))),
+            "Review changes must open the rendered agent's project even while agent B is globally active"
         );
     }
 }

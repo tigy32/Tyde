@@ -13,9 +13,12 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::components::agents_panel::{
-    DerivedAgentState, backend_class, backend_label, derive_agent_state, relative_time,
-    status_class, status_icon, status_label,
+    DerivedAgentState, SIDE_OPEN_REASON_STYLE, SIDE_OPEN_TARGET_STYLE, activate_agent_side_open,
+    agent_side_open_block, backend_class, backend_label, derive_agent_state, relative_time,
+    side_open_announcement, side_open_label, side_open_title, status_class, status_icon,
+    status_label,
 };
+use crate::components::center_zone::workspace_width;
 use crate::state::{ActiveAgentRef, AgentInfo, AgentMonitorKey, AppState, ProjectInfo, TabContent};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2283,11 +2286,70 @@ fn AgentMonitorRowView(
             .is_some_and(|index| index + 1 < visible_keys.get().len())
     };
 
+    // Open to the Side, identical in semantics to the Agents panel: state
+    // eligibility composed with the UI-owned width gate, both rechecked on
+    // activation, and chats are never duplicated.
+    let side_width = workspace_width();
+    let side_block_state = state.clone();
+    let side_block_agent = agent.clone();
+    let side_block = Memo::new(move |_| {
+        agent_side_open_block(&side_block_state, side_width.get(), &side_block_agent)
+    });
+    let side_disabled = move || side_block.get().is_some();
+    // No ':' — this id is used as a CSS id selector by `aria-describedby`
+    // consumers and in tests.
+    let side_reason_id = format!(
+        "monitor-open-side-reason-{}-{}",
+        key.host_id, key.agent_id.0
+    );
+    let side_label = side_open_label(&name);
+
+    // A refusal the user cannot perceive is the same as a dead control: every
+    // refusal is rendered as visible text on the row *and* announced politely.
+    let side_refusal: RwSignal<Option<&'static str>> = RwSignal::new(None);
+
+    let side_state = state.clone();
+    let side_agent = agent.clone();
+    let side_name = name.clone();
+    let open_to_side = move || {
+        // Rechecks the width gate and then the state API, so neither a window
+        // that shrank nor a layout that changed since the last render can be
+        // acted on.
+        match activate_agent_side_open(&side_state, side_width.get_untracked(), &side_agent) {
+            Ok(result) => {
+                side_refusal.set(result.disabled_reason());
+                announcement.set(side_open_announcement(&side_name, result));
+            }
+            Err(reason) => {
+                side_refusal.set(Some(reason));
+                announcement.set(reason.to_owned());
+            }
+        }
+    };
+
+    let on_side_click = {
+        let open_to_side = open_to_side.clone();
+        move |ev: web_sys::MouseEvent| {
+            // The row itself would otherwise open the chat in the focused pane.
+            ev.stop_propagation();
+            open_to_side();
+        }
+    };
+
     let state_for_keydown = state.clone();
     let key_for_keydown = key.clone();
     let name_for_keydown = name.clone();
     let agent_for_keydown = agent.clone();
+    let kd_side = open_to_side.clone();
     let on_keydown = move |ev: web_sys::KeyboardEvent| {
+        if ev.key() == "Enter" && (ev.ctrl_key() || ev.meta_key()) {
+            // Element-scoped chord (dev-docs/32 §12): the chat composer owns
+            // Cmd/Ctrl+Enter, so this must not reach a global handler.
+            ev.prevent_default();
+            ev.stop_propagation();
+            kd_side();
+            return;
+        }
         if reorderable && ev.alt_key() {
             match ev.key().as_str() {
                 "ArrowUp" => {
@@ -2618,6 +2680,34 @@ fn AgentMonitorRowView(
             </div>
 
             <div class="agent-monitor-actions">
+                <button
+                    type="button"
+                    class="agent-monitor-open-side"
+                    style=SIDE_OPEN_TARGET_STYLE
+                    data-test="agent-open-side"
+                    aria-label=side_label
+                    aria-disabled=move || side_disabled().then_some("true")
+                    aria-describedby={
+                        let side_reason_id = side_reason_id.clone();
+                        move || side_disabled().then(|| side_reason_id.clone())
+                    }
+                    title=move || side_open_title(side_block.get())
+                    on:click=on_side_click
+                    on:keydown=stop_keydown
+                >
+                    <span aria-hidden="true">"\u{29C9}"</span>
+                </button>
+                {
+                    let side_reason_id = side_reason_id.clone();
+                    move || side_block.get().map(|block| view! {
+                        <span id=side_reason_id.clone() style=SIDE_OPEN_REASON_STYLE>
+                            {block.reason()}
+                        </span>
+                    })
+                }
+                {move || side_refusal.get().map(|reason| view! {
+                    <span class="agent-monitor-side-refusal" role="status">{reason}</span>
+                })}
                 <button
                     type="button"
                     class=move || {
@@ -2963,14 +3053,20 @@ mod tests {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
-    use crate::state::AppState;
+    use crate::components::agents_panel::{agent_side_open_eligibility, side_open_chord_hint};
+    use crate::components::center_zone::CenterWorkspaceWidth;
+    use crate::components::command_palette::split_creation_availability;
+    use crate::state::{
+        ActiveProjectRef, AgentOpenToSideResult, AppState, FileResourceKey, OpenTarget, PaneId,
+        TabId,
+    };
     use leptos::mount::mount_to;
     use protocol::{
         AgentId, AgentManualTagAssignment, AgentManualTagDescriptor, AgentPinsSnapshot,
         AgentSortMode, AgentStatusFilter, AgentSystemTagAssignment, AgentSystemTagDescriptor,
         AgentSystemTagId, AgentsSmartViewsSnapshot, AgentsViewPreferences,
-        AgentsViewPreferencesSnapshot, BuiltInSmartViewId, SmartView, SmartViewId, StreamPath,
-        UserSmartViewId,
+        AgentsViewPreferencesSnapshot, BuiltInSmartViewId, ProjectPath, ProjectRootPath, SmartView,
+        SmartViewId, StreamPath, UserSmartViewId,
     };
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
@@ -4182,6 +4278,575 @@ mod wasm_tests {
                 .unwrap()
                 .is_none(),
             "filtered-out pin must not create a Pinned section"
+        );
+    }
+
+    // ── Open Agent to the Side (dev-docs/32 §9, §12) ─────────────────────
+    //
+    // The Agent Monitor offers the same one-operation side-open as the Agents
+    // panel, through the same authoritative `AppState::open_agent_chat_to_side`.
+
+    fn agent_in(name: &str, project: Option<&str>) -> AgentInfo {
+        AgentInfo {
+            project_id: project.map(|id| ProjectId(id.to_owned())),
+            ..agent(name, 100, false)
+        }
+    }
+
+    /// Prime a mountable monitor whose single agent lives in `agent_project`,
+    /// with `alpha` active and tabs enabled.
+    fn side_open_state(agent_project: Option<&str>) -> (AppState, AgentInfo) {
+        let agent = agent_in("alpha-agent", agent_project);
+        let state = primed_state(vec![agent.clone()], AgentsViewPreferences::default());
+        state.tabs_enabled.set(true);
+        state.active_project.set(Some(ActiveProjectRef {
+            host_id: HOST.to_owned(),
+            project_id: ProjectId("alpha".to_owned()),
+        }));
+        (state, agent)
+    }
+
+    fn mount_monitor(container: &HtmlElement, state: AppState) -> impl Sized {
+        // The center-workspace width is a *thread-local global* (center_zone.rs)
+        // and survives across tests on the shared wasm test thread, so every
+        // mount must state its own precondition or it inherits the previous
+        // test's measurement. A leaked narrow width makes the width gate refuse
+        // and every side-open here would quietly do nothing. This declares the
+        // workspace unmeasured, which the gate treats as wide enough.
+        CenterWorkspaceWidth::forget_measurement();
+        mount_to(container.clone(), move || {
+            provide_context(state.clone());
+            view! { <AgentMonitorView /> }
+        })
+    }
+
+    /// Mount with an explicit measured center-workspace width, the way the real
+    /// center zone's `ResizeObserver` reports it. The width is a thread-local
+    /// global, not context, so this sets it directly rather than providing it.
+    fn mount_monitor_at_width(
+        container: &HtmlElement,
+        state: AppState,
+        width: Option<f64>,
+    ) -> impl Sized {
+        workspace_width().set(width);
+        mount_to(container.clone(), move || {
+            provide_context(state.clone());
+            view! { <AgentMonitorView /> }
+        })
+    }
+
+    fn text_of(container: &HtmlElement, selector: &str) -> String {
+        container
+            .query_selector(selector)
+            .unwrap()
+            .unwrap_or_else(|| panic!("expected {selector:?} to be rendered"))
+            .text_content()
+            .unwrap_or_default()
+    }
+
+    /// The shortcut hint the action should advertise, from the same bound chord
+    /// the handler matches — never a hardcoded "Ctrl+Enter".
+    fn expected_side_title() -> String {
+        format!("Open to the side ({})", side_open_chord_hint())
+    }
+
+    fn side_button(container: &HtmlElement) -> HtmlElement {
+        container
+            .query_selector("[data-test='agent-open-side']")
+            .unwrap()
+            .expect("monitor row exposes an Open to the Side action")
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+    }
+
+    fn chat_occurrences(state: &AppState, agent: &AgentInfo) -> Vec<(PaneId, TabId)> {
+        let content = TabContent::chat_with_agent(ActiveAgentRef {
+            host_id: agent.host_id.clone(),
+            agent_id: agent.agent_id.clone(),
+        });
+        state
+            .center_zone
+            .with_untracked(|center_zone| center_zone.occurrences(&content))
+    }
+
+    /// An agent with no tab yet opens exactly once, in the other pane.
+    #[wasm_bindgen_test]
+    async fn monitor_open_to_side_opens_the_chat_in_the_other_pane() {
+        let (state, agent) = side_open_state(Some("alpha"));
+        let container = make_container();
+        let _h = mount_monitor(&container, state.clone());
+        next_tick().await;
+
+        assert_eq!(
+            agent_side_open_eligibility(&state, &agent),
+            None,
+            "the authoritative query reports this agent as eligible"
+        );
+        let button = side_button(&container);
+        assert_eq!(
+            button.get_attribute("aria-disabled"),
+            None,
+            "an eligible action is not aria-disabled"
+        );
+        assert_eq!(
+            button.get_attribute("title"),
+            Some(expected_side_title()),
+            "an eligible action advertises its shortcut, derived from the bound \
+             chord so it is platform-correct rather than a hardcoded Ctrl+Enter"
+        );
+
+        button.click();
+        next_tick().await;
+
+        let occurrences = chat_occurrences(&state, &agent);
+        assert_eq!(occurrences.len(), 1, "chats are never duplicated");
+        assert_eq!(occurrences[0].0, PaneId::Secondary);
+        assert!(state.center_zone.get_untracked().is_split());
+        assert!(
+            container
+                .text_content()
+                .unwrap_or_default()
+                .contains("Opened alpha-agent in the other pane"),
+            "the monitor announces the outcome"
+        );
+    }
+
+    /// An existing focused-pane occurrence moves, keeping its `TabId`.
+    #[wasm_bindgen_test]
+    async fn monitor_open_to_side_moves_an_existing_chat_and_keeps_its_tab_id() {
+        let (state, agent) = side_open_state(Some("alpha"));
+        state.open_tab(
+            TabContent::chat_with_agent(ActiveAgentRef {
+                host_id: agent.host_id.clone(),
+                agent_id: agent.agent_id.clone(),
+            }),
+            agent.name.clone(),
+            true,
+        );
+        let before = chat_occurrences(&state, &agent);
+        assert_eq!(before[0].0, PaneId::Primary);
+        let original = before[0].1;
+
+        let container = make_container();
+        let _h = mount_monitor(&container, state.clone());
+        next_tick().await;
+
+        assert_eq!(
+            agent_side_open_eligibility(&state, &agent),
+            None,
+            "a chat beside other tabs in the focused pane is eligible to move"
+        );
+
+        side_button(&container).click();
+        next_tick().await;
+
+        let after = chat_occurrences(&state, &agent);
+        assert_eq!(after.len(), 1, "moving must not create a second chat tab");
+        assert_eq!(
+            after[0],
+            (PaneId::Secondary, original),
+            "the same tab moved to the other pane"
+        );
+    }
+
+    /// A cross-project agent keeps a visible, `aria-disabled` action that
+    /// explains itself and changes nothing.
+    #[wasm_bindgen_test]
+    async fn monitor_open_to_side_is_disabled_cross_project_and_mutates_nothing() {
+        // Active project is `alpha`; this agent belongs to `beta`.
+        let (state, agent) = side_open_state(Some("beta"));
+        let container = make_container();
+        let _h = mount_monitor(&container, state.clone());
+        next_tick().await;
+
+        // Same authoritative source as the Agents panel — the monitor renders
+        // what the state layer says, and derives no policy of its own.
+        let eligibility = agent_side_open_eligibility(&state, &agent);
+        assert_eq!(
+            eligibility,
+            Some(AgentOpenToSideResult::CrossProject),
+            "the authoritative eligibility query refuses a cross-project agent"
+        );
+        let reason = eligibility
+            .expect("refused")
+            .disabled_reason()
+            .expect("a refusal carries a reason");
+        assert_eq!(
+            reason, "This agent is in another project — open that project first.",
+            "the reason text is the state layer's, and this pins it"
+        );
+
+        let button = side_button(&container);
+        assert_eq!(
+            button.get_attribute("aria-disabled").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            button.get_attribute("aria-label").as_deref(),
+            Some("Open alpha-agent to the side"),
+            "the action names its agent for screen readers"
+        );
+
+        let described_by = button
+            .get_attribute("aria-describedby")
+            .expect("a disabled action describes why");
+        let description = container
+            .query_selector(&format!("#{described_by}"))
+            .unwrap()
+            .expect("description element")
+            .text_content()
+            .unwrap_or_default();
+        assert_eq!(description, reason);
+        assert_eq!(button.get_attribute("title").as_deref(), Some(reason));
+
+        button.click();
+        next_tick().await;
+
+        assert!(
+            chat_occurrences(&state, &agent).is_empty(),
+            "a refused side-open opens nothing"
+        );
+        assert!(
+            !state.center_zone.get_untracked().is_split(),
+            "a refused side-open creates no split"
+        );
+        assert_eq!(
+            state
+                .active_project
+                .get_untracked()
+                .expect("active project")
+                .project_id,
+            ProjectId("alpha".to_owned()),
+            "the side action never switches project"
+        );
+    }
+
+    /// The chord is scoped to the row and must not reach a global handler,
+    /// which is what keeps the composer's Cmd/Ctrl+Enter send/steer intact.
+    #[wasm_bindgen_test]
+    async fn monitor_ctrl_enter_opens_to_the_side_without_escaping_the_row() {
+        let (state, agent) = side_open_state(Some("alpha"));
+        let container = make_container();
+        let _h = mount_monitor(&container, state.clone());
+        next_tick().await;
+
+        js_sys::eval(
+            r#"
+            (function() {
+                window.__monitor_escaped = 0;
+                window.__monitor_listener = function(ev) {
+                    if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) {
+                        window.__monitor_escaped += 1;
+                    }
+                };
+                window.addEventListener('keydown', window.__monitor_listener);
+            })();
+            "#,
+        )
+        .expect("install listener");
+
+        let row = container
+            .query_selector(".agent-monitor-row")
+            .unwrap()
+            .expect("monitor row")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        let event: web_sys::Event = js_sys::eval(
+            "new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true, \
+             cancelable: true })",
+        )
+        .expect("event")
+        .dyn_into()
+        .expect("KeyboardEvent is an Event");
+        row.dispatch_event(&event).expect("dispatch");
+        next_tick().await;
+
+        let escaped = js_sys::eval(
+            "(function() { window.removeEventListener('keydown', window.__monitor_listener); \
+             return window.__monitor_escaped; })();",
+        )
+        .expect("read counter")
+        .as_f64()
+        .expect("number");
+        assert_eq!(
+            escaped, 0.0,
+            "the contextual chord must not bubble into the composer/global handler"
+        );
+
+        let occurrences = chat_occurrences(&state, &agent);
+        assert_eq!(occurrences.len(), 1);
+        assert_eq!(
+            occurrences[0].0,
+            PaneId::Secondary,
+            "the chord opens to the side, not in the focused pane"
+        );
+    }
+
+    /// The ordinary row click is unchanged: focused pane, no split.
+    #[wasm_bindgen_test]
+    async fn monitor_ordinary_row_click_still_opens_in_the_focused_pane() {
+        let (state, agent) = side_open_state(Some("alpha"));
+        let container = make_container();
+        let _h = mount_monitor(&container, state.clone());
+        next_tick().await;
+
+        let row = container
+            .query_selector(".agent-monitor-row")
+            .unwrap()
+            .expect("monitor row")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        row.click();
+        next_tick().await;
+
+        let occurrences = chat_occurrences(&state, &agent);
+        assert_eq!(occurrences.len(), 1);
+        assert_eq!(occurrences[0].0, PaneId::Primary);
+        assert!(!state.center_zone.get_untracked().is_split());
+    }
+
+    /// Too narrow to create a second pane: visible, aria-disabled, shared reason,
+    /// no tab and no split, with the refusal both visible and announced.
+    #[wasm_bindgen_test]
+    async fn monitor_open_to_side_is_disabled_in_a_narrow_workspace_with_no_split() {
+        let (state, agent) = side_open_state(Some("alpha"));
+        let container = make_container();
+        let _h = mount_monitor_at_width(&container, state.clone(), Some(500.0));
+        next_tick().await;
+
+        assert_eq!(
+            agent_side_open_eligibility(&state, &agent),
+            None,
+            "state eligibility does not refuse here; the width gate does"
+        );
+        let reason = split_creation_availability(&state, Some(500.0))
+            .reason()
+            .expect("a 500px workspace cannot create a split");
+        assert_eq!(
+            reason, "Not enough width to split — widen the window or hide a side panel.",
+            "the same shared sentence the Agents panel and explorer use"
+        );
+
+        let button = side_button(&container);
+        assert_eq!(
+            button.get_attribute("aria-disabled").as_deref(),
+            Some("true"),
+            "a too-narrow workspace leaves the action visible and aria-disabled"
+        );
+        assert_eq!(button.get_attribute("title").as_deref(), Some(reason));
+        let described_by = button
+            .get_attribute("aria-describedby")
+            .expect("a disabled action describes why");
+        assert_eq!(text_of(&container, &format!("#{described_by}")), reason);
+
+        button.click();
+        next_tick().await;
+
+        assert!(
+            chat_occurrences(&state, &agent).is_empty(),
+            "a width-refused side-open must create no tab"
+        );
+        assert!(
+            !state.center_zone.get_untracked().is_split(),
+            "a width-refused side-open must create no split"
+        );
+        assert_eq!(
+            text_of(&container, ".agent-monitor-side-refusal"),
+            reason,
+            "the refusal is visible on the row, not just in the a11y tree"
+        );
+        assert_eq!(
+            text_of(&container, ".agent-monitor-live"),
+            reason,
+            "the refusal is also announced politely"
+        );
+    }
+
+    /// An existing split stays actionable at the same narrow width.
+    #[wasm_bindgen_test]
+    async fn monitor_narrow_workspace_stays_actionable_once_a_split_exists() {
+        let (state, agent) = side_open_state(Some("alpha"));
+        state.open_tab_at(
+            OpenTarget::Beside,
+            TabContent::File {
+                key: FileResourceKey {
+                    host_id: HOST.to_owned(),
+                    project_id: ProjectId("alpha".to_owned()),
+                    path: ProjectPath {
+                        root: ProjectRootPath("/tmp/alpha".to_owned()),
+                        relative_path: "notes.rs".to_owned(),
+                    },
+                },
+            },
+            "notes.rs".to_owned(),
+            true,
+        );
+        state.focus_pane(PaneId::Primary);
+        assert!(state.center_zone.get_untracked().is_split());
+
+        let container = make_container();
+        let _h = mount_monitor_at_width(&container, state.clone(), Some(500.0));
+        next_tick().await;
+
+        let button = side_button(&container);
+        assert_eq!(
+            button.get_attribute("aria-disabled"),
+            None,
+            "narrow mode must not disable the action when a split already exists"
+        );
+
+        button.click();
+        next_tick().await;
+
+        let occurrences = chat_occurrences(&state, &agent);
+        assert_eq!(occurrences.len(), 1, "chats are never duplicated");
+        assert_eq!(
+            occurrences[0].0,
+            PaneId::Secondary,
+            "the chat opens into the existing other pane"
+        );
+    }
+
+    /// REGRESSION: a state refusal and a width refusal coexisting must produce
+    /// one reason across the tooltip, the aria description, the visible notice,
+    /// and the announcement. Rendering and activation share one composition.
+    #[wasm_bindgen_test]
+    async fn monitor_cross_project_in_a_narrow_workspace_names_one_reason_everywhere() {
+        // Active project is `alpha`; this agent belongs to `beta`.
+        let (state, agent) = side_open_state(Some("beta"));
+        let container = make_container();
+        let _h = mount_monitor_at_width(&container, state.clone(), Some(500.0));
+        next_tick().await;
+
+        let state_reason = agent_side_open_eligibility(&state, &agent)
+            .expect("the state layer refuses a cross-project agent")
+            .disabled_reason()
+            .expect("a refusal carries a reason");
+        let width_reason = split_creation_availability(&state, Some(500.0))
+            .reason()
+            .expect("a 500px workspace also cannot create a split");
+        assert_ne!(
+            state_reason, width_reason,
+            "the two refusals must be distinguishable for this test to mean anything"
+        );
+
+        let button = side_button(&container);
+        assert_eq!(
+            button.get_attribute("aria-disabled").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            button.get_attribute("title").as_deref(),
+            Some(state_reason),
+            "state precedence, identical to the Agents panel"
+        );
+        let described_by = button
+            .get_attribute("aria-describedby")
+            .expect("a disabled action describes why");
+        assert_eq!(
+            text_of(&container, &format!("#{described_by}")),
+            state_reason
+        );
+
+        button.click();
+        next_tick().await;
+
+        assert_eq!(
+            text_of(&container, ".agent-monitor-side-refusal"),
+            state_reason,
+            "the visible notice must name the same refusal the control rendered"
+        );
+        assert_eq!(
+            text_of(&container, ".agent-monitor-live"),
+            state_reason,
+            "the announcement must name the same refusal the control rendered"
+        );
+        assert!(
+            chat_occurrences(&state, &agent).is_empty(),
+            "a doubly-refused side-open opens nothing"
+        );
+        assert!(
+            !state.center_zone.get_untracked().is_split(),
+            "a doubly-refused side-open creates no split"
+        );
+        assert_eq!(
+            state
+                .active_project
+                .get_untracked()
+                .expect("active project")
+                .project_id,
+            ProjectId("alpha".to_owned()),
+            "and switches no project"
+        );
+    }
+
+    /// Tabs disabled *and* a workspace too narrow to split.
+    #[wasm_bindgen_test]
+    async fn monitor_tabs_disabled_in_a_narrow_workspace_names_one_reason_everywhere() {
+        let (state, agent) = side_open_state(Some("alpha"));
+        state.tabs_enabled.set(false);
+        let container = make_container();
+        let _h = mount_monitor_at_width(&container, state.clone(), Some(500.0));
+        next_tick().await;
+
+        let state_reason = agent_side_open_eligibility(&state, &agent)
+            .expect("the state layer refuses when tabs are disabled")
+            .disabled_reason()
+            .expect("a refusal carries a reason");
+        assert_eq!(state_reason, "Enable tabs to use split view.");
+        let width_reason = split_creation_availability(&state, Some(500.0))
+            .reason()
+            .expect("a 500px workspace also cannot create a split");
+        assert_ne!(state_reason, width_reason);
+
+        let button = side_button(&container);
+        assert_eq!(
+            button.get_attribute("aria-disabled").as_deref(),
+            Some("true")
+        );
+        assert_eq!(button.get_attribute("title").as_deref(), Some(state_reason));
+        let described_by = button
+            .get_attribute("aria-describedby")
+            .expect("a disabled action describes why");
+        assert_eq!(
+            text_of(&container, &format!("#{described_by}")),
+            state_reason
+        );
+
+        button.click();
+        next_tick().await;
+
+        assert_eq!(
+            text_of(&container, ".agent-monitor-side-refusal"),
+            state_reason,
+            "visible notice matches what the control rendered"
+        );
+        assert_eq!(
+            text_of(&container, ".agent-monitor-live"),
+            state_reason,
+            "announcement matches what the control rendered"
+        );
+        assert!(
+            chat_occurrences(&state, &agent).is_empty(),
+            "a doubly-refused side-open opens nothing"
+        );
+        assert!(!state.center_zone.get_untracked().is_split());
+    }
+
+    /// The action is a real pointer target, sized in this component's markup.
+    #[wasm_bindgen_test]
+    async fn monitor_side_open_action_is_at_least_a_44px_target() {
+        let (state, _agent) = side_open_state(Some("alpha"));
+        let container = make_container();
+        let _h = mount_monitor(&container, state);
+        next_tick().await;
+
+        let rect = side_button(&container).get_bounding_client_rect();
+        assert!(
+            rect.width() >= 44.0 && rect.height() >= 44.0,
+            "Open to the Side must be at least a 44x44px target; got {}x{}",
+            rect.width(),
+            rect.height()
         );
     }
 }

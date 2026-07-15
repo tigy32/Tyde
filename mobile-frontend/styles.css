@@ -1286,20 +1286,24 @@ input, textarea, select {
     margin-top: var(--space-1);
 }
 
-.message-content {
+/* Markdown scope: chat messages, and `.tool-md` — the container tool cards
+   render agent-authored Markdown into (e.g. the message a
+   `tyde_send_agent_message` call delivered). Sharing one rule set is what keeps
+   tool-card Markdown reading identically to chat Markdown. */
+:is(.message-content, .tool-md) {
     word-break: break-word;
     overflow-wrap: break-word;
 }
 
-.message-content p {
+:is(.message-content, .tool-md) p {
     margin-bottom: var(--space-2);
 }
 
-.message-content p:last-child {
+:is(.message-content, .tool-md) p:last-child {
     margin-bottom: 0;
 }
 
-.message-content pre {
+:is(.message-content, .tool-md) pre {
     background: var(--bg-surface-3);
     padding: var(--space-3);
     border-radius: var(--radius-sm);
@@ -1310,7 +1314,7 @@ input, textarea, select {
     margin: var(--space-2) 0;
 }
 
-.message-content code {
+:is(.message-content, .tool-md) code {
     font-family: var(--font-mono);
     font-size: 13px;
     background: var(--bg-surface-3);
@@ -1318,37 +1322,37 @@ input, textarea, select {
     border-radius: 3px;
 }
 
-.message-content pre code {
+:is(.message-content, .tool-md) pre code {
     background: none;
     padding: 0;
 }
 
-.message-content ul, .message-content ol {
+:is(.message-content, .tool-md) :is(ul, ol) {
     padding-left: var(--space-5);
     margin: var(--space-2) 0;
 }
 
-.message-content blockquote {
+:is(.message-content, .tool-md) blockquote {
     border-left: 3px solid var(--border-strong);
     padding-left: var(--space-3);
     color: var(--text-secondary);
     margin: var(--space-2) 0;
 }
 
-.message-content table {
+:is(.message-content, .tool-md) table {
     border-collapse: collapse;
     width: 100%;
     margin: var(--space-2) 0;
     font-size: 13px;
 }
 
-.message-content th, .message-content td {
+:is(.message-content, .tool-md) :is(th, td) {
     border: 1px solid var(--border-default);
     padding: var(--space-1) var(--space-2);
     text-align: left;
 }
 
-.message-content th {
+:is(.message-content, .tool-md) th {
     background: var(--bg-surface-2);
     font-weight: 600;
 }
@@ -1480,6 +1484,114 @@ input, textarea, select {
     border-radius: var(--radius-sm);
     white-space: pre-wrap;
     word-break: break-all;
+}
+
+/* ── Tyde orchestration ─────────────────────────────────────────────── */
+
+.send-agent-message-body,
+.await-agents-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    margin-top: var(--space-2);
+    min-width: 0;
+}
+
+.send-agent-message-to {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    min-width: 0;
+}
+
+.send-agent-message-label {
+    flex-shrink: 0;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--text-tertiary);
+}
+
+.send-agent-message-recipient {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 13px;
+    color: var(--text-primary);
+}
+
+/* The message is content, not debug output: full-size text, not the 11px
+   monospace of the generic `.tool-output` dump.
+
+   Height is bounded and the overflow **scrolls** rather than being clipped.
+   Desktop clamps with `overflow: hidden` plus a measured Show-more toggle; on
+   the small screen this reaches the same goal — the card cannot swallow the
+   viewport — while keeping every word reachable without measurement, and
+   without ever leaving a focusable child (a link, a code-copy button) clipped
+   out of sight: a scroll container brings focused children into view. */
+.send-agent-message-text {
+    min-width: 0;
+    max-height: 60vh;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    font-size: 14px;
+    color: var(--text-primary);
+}
+
+/* Summary mode: the message sits behind a closed disclosure, so a user who set
+   Summary to quiet the conversation actually gets quiet. */
+.send-agent-message-disclosure > summary {
+    font-size: 12px;
+    color: var(--text-tertiary);
+    cursor: pointer;
+    padding: var(--space-1) 0;
+}
+
+.await-agents-group-title {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--text-tertiary);
+}
+
+.await-agents-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-2);
+    min-width: 0;
+    padding: var(--space-1) 0;
+}
+
+.await-agents-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 13px;
+    color: var(--text-primary);
+}
+
+.await-agents-status {
+    flex-shrink: 0;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.tool-typed-mismatch {
+    font-size: 13px;
+    color: var(--accent-error);
+}
+
+/* A sanitized copy of the request that failed to normalize, behind a closed
+   disclosure so failure diagnostics do not expose credentials or restore normal
+   JSON noise. */
+.tool-malformed-payload {
+    margin-top: var(--space-1);
+    min-width: 0;
 }
 
 /* ── ExitPlanMode ───────────────────────────────────────────────────── */
@@ -3549,4 +3661,499 @@ input, textarea, select {
     display: flex;
     flex-direction: column;
     gap: 0.5rem;
+}
+
+/* ── Subscription capacity ───────────────────────────────────────────────────
+   Mobile parity with desktop: same states, same coverage caveat, same absolute
+   timestamps. Stacked rather than a wide row so nothing clips at phone width.
+   Bars are drawn only for an authoritative vendor-reported percentage — never
+   for credits, a magnitude-less bucket, or a state with no report, because an
+   empty bar reads as "0% used". Buckets are never merged into one figure. */
+
+/* Mobile has no `.settings-description` rule of its own — the existing sections
+   are all label/value rows. Capacity needs prose to explain its states. */
+.settings-description {
+    margin: 0 0 var(--space-3);
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--text-secondary);
+}
+
+.capacity-cards {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+}
+
+.capacity-card,
+.capacity-compact {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-3);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+}
+
+.capacity-card {
+    border-left: 3px solid var(--border-strong);
+}
+
+.capacity-card[data-capacity-state="known"] {
+    border-left-color: var(--accent-success);
+}
+
+.capacity-card[data-capacity-state="stale"] {
+    border-left-color: var(--accent-warning);
+}
+
+.capacity-card[data-capacity-state="auth-error"],
+.capacity-card[data-capacity-state="rate-limited"] {
+    border-left-color: var(--accent-error);
+}
+
+.capacity-card-head,
+.capacity-bucket-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-2);
+    flex-wrap: wrap;
+}
+
+.capacity-backend {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.capacity-state {
+    font-size: 13px;
+    color: var(--text-secondary);
+}
+
+.capacity-state[data-capacity-state="stale"] {
+    color: var(--accent-warning);
+}
+
+.capacity-state[data-capacity-state="auth-error"],
+.capacity-state[data-capacity-state="rate-limited"] {
+    color: var(--accent-error);
+}
+
+.capacity-card-meta,
+.capacity-bucket-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: 12px;
+    color: var(--text-tertiary);
+}
+
+.capacity-meta-vendor {
+    font-family: var(--font-mono);
+}
+
+.capacity-explanation {
+    margin: 0;
+    font-size: 13px;
+    line-height: 1.45;
+    color: var(--text-secondary);
+}
+
+/* Text, always present — never a hover-only tooltip. A caveat that only exists
+   on desktop is a dropped error state. */
+.capacity-coverage {
+    margin: 0;
+    padding: var(--space-2);
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--text-secondary);
+    background: var(--bg-hover);
+    border-radius: var(--radius-sm);
+}
+
+.capacity-buckets {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+}
+
+.capacity-bucket {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    padding-top: var(--space-2);
+    border-top: 1px solid var(--border-default);
+}
+
+.capacity-bucket-label {
+    font-size: 14px;
+    color: var(--text-primary);
+}
+
+.capacity-bucket-status {
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.capacity-bucket-status[data-capacity-status="warning"] {
+    color: var(--accent-warning);
+}
+
+.capacity-bucket-status[data-capacity-status="rejected"] {
+    color: var(--accent-error);
+}
+
+/* Stacked: label above bar above figures. Never a wide row that clips. */
+.capacity-measure,
+.capacity-compact-bucket {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-1);
+}
+
+.capacity-bar {
+    width: 100%;
+    height: 6px;
+    background: var(--bg-hover);
+    border-radius: var(--radius-full);
+    overflow: hidden;
+}
+
+.capacity-bar-fill {
+    height: 100%;
+    background: var(--accent-primary);
+    border-radius: var(--radius-full);
+}
+
+.capacity-figures,
+.capacity-compact-figures {
+    display: flex;
+    gap: var(--space-4);
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+}
+
+/* Each figure carries its own provenance beneath it: the used percentage is the
+   vendor's, the remaining percentage is Tyde's complement. A caption spanning
+   both would tar the vendor's number as derived. */
+.capacity-figure {
+    display: flex;
+    flex-direction: column;
+    line-height: 1.35;
+}
+
+.capacity-used {
+    color: var(--text-primary);
+}
+
+.capacity-remaining {
+    color: var(--text-tertiary);
+}
+
+.capacity-provenance {
+    font-size: 11px;
+    color: var(--text-tertiary);
+}
+
+.capacity-provenance-vendor {
+    color: var(--text-secondary);
+}
+
+.capacity-no-magnitude,
+.capacity-credits {
+    font-size: 13px;
+    color: var(--text-secondary);
+}
+
+/* The vendor's own bucket type. The server's label rule is lossy — seven_day and
+   seven_day_overage_included both label as "weekly limit" — so this is what
+   keeps two different limits distinguishable. */
+.capacity-compact-vendor {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-tertiary);
+}
+
+/* The compact row is labelled "Subscription" so it can never be read as this
+   task's token usage — a different measurement of a different thing. */
+.capacity-compact-title {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-secondary);
+}
+
+.capacity-compact-label {
+    font-size: 14px;
+    color: var(--text-primary);
+}
+
+.capacity-compact-state {
+    font-size: 14px;
+    color: var(--text-secondary);
+}
+
+.capacity-compact-more {
+    font-size: 12px;
+    color: var(--accent-primary);
+}
+
+.capacity-compact-coverage {
+    font-size: 12px;
+    color: var(--accent-warning);
+}
+
+.capacity-compact-freshness {
+    font-size: 12px;
+    color: var(--text-tertiary);
+}
+
+/* ── Pending submission recovery ────────────────────────────────────── */
+
+/*
+ * The surface that holds a user's message when the transport could not account
+ * for it. It appears in two places: host-scoped (a direct child of the app
+ * shell, above the navigated content) and agent-scoped (inside a chat, directly
+ * above the composer).
+ *
+ * The app shell is a fixed-height flex column (`.mobile-app`, 100dvh), so this
+ * surface MUST be `flex-shrink: 0` — otherwise it gets crushed to nothing — and
+ * it MUST cap its own height, or a handful of failed messages squeeze the
+ * content (or the composer) off the screen entirely. `100dvh` shrinks when the
+ * software keyboard opens, so the cap is what keeps the composer reachable with
+ * the keyboard up.
+ */
+.pending-submissions {
+    flex-shrink: 0;
+    max-height: 45vh;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: var(--space-3);
+    background: var(--bg-surface);
+    border-bottom: 1px solid var(--border-strong);
+}
+
+.pending-submissions-title {
+    margin: 0 0 var(--space-2);
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--accent-warning);
+    /* A long heading must wrap, never widen the page. */
+    overflow-wrap: anywhere;
+}
+
+.pending-submissions-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+/*
+ * Inside a chat the list sits between the scrolling transcript and the composer.
+ * It gets its own cap and scroller so that no number of failed messages can push
+ * the composer below the fold — the composer is how the user gets out of the
+ * situation, so it is the one thing that must never be displaced.
+ */
+.chat-view .pending-submissions-list {
+    flex-shrink: 0;
+    max-height: 40vh;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: var(--space-2) var(--space-3);
+    border-top: 1px solid var(--border-strong);
+    background: var(--bg-surface);
+}
+
+.pending-submission {
+    /* `min-width: 0` lets the flex child actually shrink, which is what allows
+     * the text below to wrap instead of forcing a horizontal scrollbar. */
+    min-width: 0;
+    padding: var(--space-3);
+    background: var(--bg-surface-2);
+    border: 1px solid var(--border-strong);
+    border-left: 3px solid var(--accent-warning);
+    border-radius: var(--radius-md);
+}
+
+.pending-submission-state {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-bright);
+    overflow-wrap: anywhere;
+}
+
+.pending-submission-detail {
+    margin-top: var(--space-1);
+    font-size: 12px;
+    line-height: 1.4;
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
+}
+
+/*
+ * The user's own words. This is the guaranteed escape hatch — it stays
+ * selectable, and a long paste or an unbroken token must wrap rather than
+ * scroll the page sideways.
+ */
+.pending-submission-text {
+    margin: var(--space-2) 0 0;
+    padding: var(--space-2);
+    max-height: 8em;
+    overflow-y: auto;
+    font-size: 13px;
+    line-height: 1.45;
+    color: var(--text-primary);
+    background: var(--bg-base);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    overflow-wrap: anywhere;
+    word-break: break-word;
+}
+
+/*
+ * Four controls on a narrow phone: they wrap rather than overflow. Every one of
+ * them is at least 44x44 (also enforced inline, so the tap targets survive even
+ * if this stylesheet does not load).
+ */
+.pending-submission-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    margin-top: var(--space-3);
+}
+
+.pending-submission-action {
+    flex: 0 1 auto;
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0 var(--space-3);
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+    background: var(--bg-surface-3);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+}
+
+.pending-submission-action:disabled {
+    opacity: 0.45;
+    cursor: default;
+}
+
+.pending-submission-discard {
+    color: var(--accent-error);
+    border-color: var(--accent-error);
+}
+
+/*
+ * Resend is never the default action: it can start a second agent and bill for
+ * it. It is styled as a plain control, deliberately no more prominent than
+ * Discard, and it sits last.
+ */
+.pending-submission-resend {
+    margin-left: auto;
+}
+
+.pending-submission-warning {
+    margin: var(--space-2) 0 0;
+    font-size: 12px;
+    line-height: 1.4;
+    color: var(--accent-warning);
+    overflow-wrap: anywhere;
+}
+
+.pending-submission-hint {
+    margin: var(--space-2) 0 0;
+    font-size: 12px;
+    line-height: 1.4;
+    color: var(--text-tertiary);
+    overflow-wrap: anywhere;
+}
+
+/* Short viewports (a small phone with the keyboard open): give the surface less
+ * of the screen so the composer and the transcript stay usable. */
+@media (max-height: 600px) {
+    .pending-submissions {
+        max-height: 35vh;
+    }
+
+    .chat-view .pending-submissions-list {
+        max-height: 30vh;
+    }
+}
+
+/* ── Chat load failure (terminal state for a chat that cannot load) ──── */
+
+.chat-load-failed {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-4);
+    padding: var(--space-5) var(--space-4);
+    text-align: center;
+}
+
+.chat-load-failed-message {
+    margin: 0;
+    max-width: 34ch;
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
+}
+
+.chat-load-failed-reconnect {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0 var(--space-5);
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 600;
+    color: #fff;
+    background: var(--accent-primary);
+    border: 1px solid var(--accent-primary);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+}
+
+.chat-load-failed-reconnect:disabled {
+    opacity: 0.6;
+    cursor: default;
+}
+
+/*
+ * The banner's container sets `pointer-events: none` so the floating pill never
+ * eats taps meant for the workspace beneath it. Anything interactive inside it
+ * has to opt back in, or it silently cannot be clicked.
+ */
+.connection-banner-reconnect {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0 var(--space-3);
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+    color: #fff;
+    background: var(--accent-primary);
+    border: 1px solid var(--accent-primary);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    pointer-events: auto;
+}
+
+.connection-banner-reconnect:disabled {
+    opacity: 0.6;
+    cursor: default;
 }

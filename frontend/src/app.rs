@@ -6,7 +6,8 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::bridge;
-use crate::components::command_palette::CommandPalette;
+use crate::components::center_zone::{CenterWorkspaceWidth, workspace_width};
+use crate::components::command_palette::{CommandPalette, execute_command, global_command_for};
 use crate::components::feedback_modal::FeedbackModal;
 use crate::components::header::Header;
 use crate::components::help_tour::HelpTour;
@@ -19,7 +20,7 @@ use crate::components::workflows_panel::WorkflowRunModal;
 use crate::devtools;
 use crate::dispatch::dispatch_envelope;
 use crate::send::send_frame;
-use crate::state::{AppState, ConnectionStatus, TabId};
+use crate::state::{AppState, CENTER_SPLIT_RATIO_STORAGE_KEY, ConnectionStatus, SplitRatio, TabId};
 
 use protocol::{
     Envelope, FrameKind, HelloPayload, PROTOCOL_VERSION, ProjectPath, ProjectRootPath, StreamPath,
@@ -107,7 +108,10 @@ fn app_listener_token_is_current(token: u64) -> bool {
     app_listeners_active() && APP_LISTENER_TOKEN.with(|current| current.get() == token)
 }
 
-fn clear_app_listeners() {
+/// `pub(crate)` so a test that installed the global listeners can take them down
+/// again. They live in thread-locals shared by the whole wasm test binary, so a
+/// leaked listener would fire against a stale `AppState` in later tests.
+pub(crate) fn clear_app_listeners() {
     set_app_listeners_active(false);
     HOST_LISTENER_HANDLES.with(|handles| {
         for handle in handles.borrow_mut().drain(..) {
@@ -155,7 +159,42 @@ fn keyboard_event_is_cmd_modifier(ev: &web_sys::KeyboardEvent) -> bool {
     ev.ctrl_key() || ev.meta_key() || matches!(ev.key().as_str(), "Control" | "Meta")
 }
 
-fn install_keydown_listener(state: AppState) {
+fn local_storage() -> Option<web_sys::Storage> {
+    web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+}
+
+/// The split ratio is the only piece of center-zone layout that survives a
+/// reload (dev-docs/32 §6). Topology, focus, tabs, and resource placement are
+/// deliberately not persisted, so a cold start cannot resurrect a phantom pane
+/// or a stale resource. A stored value is clamped on the way in, so a
+/// hand-edited or stale entry can never produce an unusable pane.
+fn restore_center_split_ratio(state: &AppState) {
+    let Some(storage) = local_storage() else {
+        return;
+    };
+    let Ok(Some(raw)) = storage.get_item(CENTER_SPLIT_RATIO_STORAGE_KEY) else {
+        return;
+    };
+    match raw.parse::<f64>() {
+        Ok(value) => state.center_split_ratio.set(SplitRatio::new(value)),
+        Err(error) => {
+            log::warn!("ignoring unparseable stored center split ratio {raw:?}: {error}");
+        }
+    }
+}
+
+fn persist_center_split_ratio(ratio: SplitRatio) {
+    if let Some(storage) = local_storage() {
+        let _ = storage.set_item(CENTER_SPLIT_RATIO_STORAGE_KEY, &ratio.get().to_string());
+    }
+}
+
+/// `pub(crate)` so component tests can install the *real* global handler rather
+/// than a stand-in. The Escape interaction between this listener and a modal's own
+/// keydown handler is a genuine integration, and a dialog-only fixture cannot see
+/// it — which is exactly how the "Escape closes the whole Settings overlay" defect
+/// survived a green test suite.
+pub(crate) fn install_keydown_listener(state: AppState, workspace_width: CenterWorkspaceWidth) {
     KEYDOWN_LISTENER_HANDLE.with(|slot| {
         if let Some(existing) = slot.borrow_mut().take() {
             existing.remove();
@@ -170,6 +209,25 @@ fn install_keydown_listener(state: AppState) {
         if keyboard_event_is_cmd_modifier(&ev) {
             state.cmd_held.set(true);
         }
+        // Mid-composition keystrokes belong to the IME, not to us. Every
+        // binding below is a Ctrl/Cmd chord, so none of them competes with
+        // ordinary text entry in an input, textarea, or the chat composer —
+        // and Command/Ctrl+Enter is deliberately *not* bound here: it stays
+        // element-scoped (palette/explorer/search rows open to the side, the
+        // composer sends or steers) per dev-docs/32 §12.
+        if ev.is_composing() {
+            return;
+        }
+        // The global chords are *generated* from the command table's `Global`
+        // bindings — this handler cannot claim a chord the table did not
+        // declare global, which is what keeps `Command/Ctrl+Enter` (the
+        // composer's send/steer) out of the window scope by construction rather
+        // than by discipline.
+        if let Some(command) = global_command_for(&ev) {
+            ev.prevent_default();
+            execute_command(&state, command, workspace_width.get_untracked());
+            return;
+        }
         match ev.key().as_str() {
             key if ctrl_or_meta && ev.shift_key() && key.eq_ignore_ascii_case("f") => {
                 ev.prevent_default();
@@ -179,17 +237,9 @@ fn install_keydown_listener(state: AppState) {
                 ev.prevent_default();
                 state.command_palette_open.update(|v| *v = !*v);
             }
-            "," if ctrl_or_meta => {
-                ev.prevent_default();
-                state.settings_open.update(|v| *v = !*v);
-            }
             "f" if ctrl_or_meta => {
                 ev.prevent_default();
                 state.find_bar_open.update(|v| *v = !*v);
-            }
-            "n" if ctrl_or_meta => {
-                ev.prevent_default();
-                crate::actions::begin_new_chat(&state, None);
             }
             "F12" if ev.shift_key() => {
                 // Find-references from the caret in the focused file view.
@@ -202,6 +252,21 @@ fn install_keydown_listener(state: AppState) {
                 crate::components::file_view::navigate_from_current_selection(&state);
             }
             "Escape" => {
+                // Escape is the one binding here that nested handlers also claim,
+                // and it dismisses one layer at a time. A component that has
+                // already called `prevent_default()` has said it handled this
+                // Escape — dismissing *its* layer — so the global must not go on
+                // to dismiss another one underneath. Without this, Escape inside a
+                // modal in Settings closed the modal and the whole Settings
+                // overlay in a single keypress.
+                //
+                // Every layer this arm owns still closes on Escape: the command
+                // palette and find bar each close themselves and are unaffected,
+                // and nothing inside Settings claims Escape except a modal that is
+                // dismissing itself.
+                if ev.default_prevented() {
+                    return;
+                }
                 if state.command_palette_open.get_untracked() {
                     state.command_palette_open.set(false);
                 } else if state.settings_open.get_untracked() {
@@ -639,6 +704,18 @@ pub fn App() -> impl IntoView {
     let state = AppState::new();
     restore_appearance(&state);
     provide_context(state.clone());
+    // One measurement of the center workspace, shared by the center zone (which
+    // measures it), the command palette, and the global shortcuts (which gate
+    // split availability on it). The handle carries no signal of its own — it
+    // resolves the one thread-local measurement — so parking it in the keydown
+    // listener below cannot outlive anybody's reactive owner.
+    let center_width = workspace_width();
+    restore_center_split_ratio(&state);
+
+    let ratio_state = state.clone();
+    Effect::new(move |_| {
+        persist_center_split_ratio(ratio_state.center_split_ratio.get());
+    });
 
     let listener_token = begin_app_listener_lifecycle();
     set_app_listeners_active(true);
@@ -703,9 +780,13 @@ pub fn App() -> impl IntoView {
     // mutation (rename, replace_active payload upgrade, etc.). Without
     // this gate, every tab-strip rename would re-touch `tab_lru` and
     // cascade-rerender every TabMount that subscribes to it.
+    //
+    // Both panes' active tabs are pinned by `AppState::mounted_tab_ids`, so a
+    // tab switch in one pane can never unmount the other pane's content — the
+    // LRU only decides which *inactive* tabs stay warm.
     let state_for_lru_memo = state.clone();
     let active_tab_memo: Memo<Option<TabId>> =
-        Memo::new(move |_| state_for_lru_memo.center_zone.with(|cz| cz.active_tab_id));
+        Memo::new(move |_| state_for_lru_memo.center_zone.with(|cz| cz.active_tab_id()));
     let state_for_lru = state.clone();
     Effect::new(move |_| {
         if let Some(active) = active_tab_memo.get() {
@@ -718,7 +799,7 @@ pub fn App() -> impl IntoView {
     let state_for_cmd_clear = state.clone();
     let state_for_clicks = state.clone();
     Effect::new(move |_| {
-        install_keydown_listener(state_for_keys.clone());
+        install_keydown_listener(state_for_keys.clone(), center_width);
     });
     Effect::new(move |_| {
         install_keyup_listener(state_for_keyup.clone());

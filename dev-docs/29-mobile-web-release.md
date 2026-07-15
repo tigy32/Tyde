@@ -107,10 +107,16 @@ tools/release_check.sh [v<release>]
 
 It validates build/version/protocol/mobile-web coherence by generating a
 temporary manifest entry for the checked version instead of requiring
-`web/loader/manifest.json` to already contain the release. It also prints the
-native-mobile drift reminder: installed native apps are bundled and must be
-rebuilt/reinstalled after protocol changes. This guard does not replace the
-AGENTS release steps for a clean tree, `main`, tag checks, approval, or pushes.
+`web/loader/manifest.json` to already contain the release. This guard does not
+replace the AGENTS release steps for a clean tree, `main`, tag checks, approval,
+or pushes.
+
+The native iOS shell is end-of-life. External distribution is unconfirmed, so
+if an installed native build exists, migrate to the PWA with Add to Home Screen
+and re-scan the host QR. Pairing state cannot migrate from the native Keychain
+and app-container stores to the PWA's IndexedDB store, so re-pairing is
+required. Any App Store, TestFlight, or native signing retirement remains an
+owner follow-up; desktop Tauri signing and notarization stay supported.
 
 Use these focused checks for release-infra changes:
 

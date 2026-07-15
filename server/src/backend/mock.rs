@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocol::{
-    AgentInput, BackendAccessMode, BackendKind, ChatEvent, ChatMessage, ChatMessageId,
+    AgentId, AgentInput, BackendAccessMode, BackendKind, ChatEvent, ChatMessage, ChatMessageId,
     MessageMetadataUpdateData, MessageSender, MessageTokenUsage, ModelInfo, OperationCancelledData,
     OrchestrationAgentOrigin, OrchestrationAgentType, OrchestrationEvent, OrchestrationId,
     OrchestrationPayload, SessionId, StreamEndData, StreamStartData, StreamTextDeltaData,
@@ -17,6 +17,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
+use super::agent_control_progress::{await_progress_data_for_tool, tyde_tool_result};
 use super::empty_session_settings_schema;
 use super::{
     Backend, BackendSession, BackendSpawnConfig, BackendStartupError, EventStream,
@@ -28,6 +29,7 @@ const MOCK_MODEL: &str = "mock";
 const FORCE_SPAWN_FAILURE_SENTINEL: &str = "__mock_fail_spawn__";
 const EMPTY_AGENT_CONTROL_OUTPUT_SENTINEL: &str = "__mock_empty_agent_control_output__";
 const SPAWN_NATIVE_CHILD_SENTINEL: &str = "__mock_spawn_native_child__";
+pub(crate) const SPAWN_LIVE_NATIVE_CHILD_SENTINEL: &str = "__mock_spawn_live_native_child__";
 /// Like `__mock_spawn_native_child__` but drops the emitter handle immediately
 /// after the turn completes, which closes the child's backend event stream.
 /// Used to regression-test that the relay agent actor parks instead of exiting
@@ -56,6 +58,8 @@ const MOCK_EXIT_PLAN_MODE_SENTINEL: &str = "__mock_exit_plan_mode__";
 const MOCK_EXIT_PLAN_MODE_STREAM_END_FIRST_SENTINEL: &str =
     "__mock_exit_plan_mode_stream_end_first__";
 const MOCK_AGENT_CONTROL_AWAIT_SENTINEL: &str = "__mock_agent_control_await__";
+pub(crate) const MOCK_AGENT_CONTROL_SEND_MESSAGE_SENTINEL: &str =
+    "__mock_agent_control_send_message__";
 const MOCK_HISTORY_SENTINEL: &str = "__mock_history__";
 const MOCK_CLOSE_RESUME_BEFORE_BARRIER_SENTINEL: &str = "__mock_close_resume_before_barrier__";
 const MOCK_LATE_USAGE_SENTINEL: &str = "__mock_late_usage__";
@@ -495,7 +499,19 @@ fn start_mock_command_loop(
                 if !emit_held_turn(&events_tx, &session_id_for_task, &initial_message).await {
                     return;
                 }
+                maybe_spawn_live_native_child(
+                    &initial_message,
+                    &mut subagent_emitter_rx,
+                    &mut active_subagents,
+                )
+                .await;
                 holding_until_interrupt = true;
+            } else if let Some((agent_id, message)) =
+                parse_mock_agent_control_send_message(&initial_message)
+            {
+                if !emit_mock_agent_control_send_message(&events_tx, agent_id, message) {
+                    return;
+                }
             } else if let Some(agent_ids) = parse_mock_agent_control_await(&initial_message) {
                 if !emit_mock_agent_control_await(
                     &events_tx,
@@ -584,7 +600,14 @@ fn start_mock_command_loop(
                         continue;
                     }
                     record_prompt(&session_id_for_task, &payload.message);
-                    if let Some(agent_ids) = parse_mock_agent_control_await(&payload.message) {
+                    if let Some((agent_id, message)) =
+                        parse_mock_agent_control_send_message(&payload.message)
+                    {
+                        if !emit_mock_agent_control_send_message(&events_tx, agent_id, message) {
+                            return;
+                        }
+                    } else if let Some(agent_ids) = parse_mock_agent_control_await(&payload.message)
+                    {
                         if !emit_mock_agent_control_await(
                             &events_tx,
                             agent_control_await_mcp.as_ref(),
@@ -658,6 +681,37 @@ fn start_mock_command_loop(
                 }
                 MockCommand::Interrupt => {
                     if holding_until_interrupt {
+                        for child in &active_subagents {
+                            let _ = child.event_tx.send(ChatEvent::StreamEnd(StreamEndData {
+                                message: ChatMessage {
+                                    message_id: Some(ChatMessageId(format!(
+                                        "mock-live-{}",
+                                        child.agent_id.0
+                                    ))),
+                                    timestamp: now_ms(),
+                                    sender: MessageSender::Assistant {
+                                        agent: "mock-live-native-child".to_owned(),
+                                    },
+                                    content: "mock live native child working".to_owned(),
+                                    reasoning: None,
+                                    tool_calls: Vec::new(),
+                                    model_info: Some(ModelInfo {
+                                        model: MOCK_MODEL.to_owned(),
+                                    }),
+                                    token_usage: None,
+                                    context_breakdown: None,
+                                    images: None,
+                                },
+                            }));
+                            let _ = child.event_tx.send(ChatEvent::OperationCancelled(
+                                OperationCancelledData {
+                                    message:
+                                        "Parent agent turn ended before the sub-agent completed"
+                                            .to_owned(),
+                                },
+                            ));
+                            let _ = child.event_tx.send(ChatEvent::TypingStatusChanged(false));
+                        }
                         let _ =
                             events_tx.send(ChatEvent::OperationCancelled(OperationCancelledData {
                                 message: "mock backend interrupted held turn".to_owned(),
@@ -673,6 +727,50 @@ fn start_mock_command_loop(
 
         drop(active_subagents);
     });
+}
+
+async fn maybe_spawn_live_native_child(
+    prompt: &str,
+    subagent_emitter_rx: &mut watch::Receiver<Option<Arc<dyn SubAgentEmitter>>>,
+    active_subagents: &mut Vec<SubAgentHandle>,
+) {
+    if !prompt.contains(SPAWN_LIVE_NATIVE_CHILD_SENTINEL) {
+        return;
+    }
+    sleep(Duration::from_millis(50)).await;
+    let emitter = wait_for_subagent_emitter(subagent_emitter_rx).await;
+    let handle = match emitter
+        .on_subagent_spawned(
+            format!("mock-live-tool-use-{}", Uuid::new_v4()),
+            "mock-live-native-child".to_owned(),
+            "live native child task".to_owned(),
+            "mock".to_owned(),
+            Some(SessionId(Uuid::new_v4().to_string())),
+        )
+        .await
+    {
+        Ok(handle) => handle,
+        Err(error) => {
+            tracing::error!(%error, "mock live native child relay registration failed");
+            return;
+        }
+    };
+    let message_id = Some(format!("mock-live-{}", handle.agent_id.0));
+    let _ = handle.event_tx.send(ChatEvent::TypingStatusChanged(true));
+    let _ = handle
+        .event_tx
+        .send(ChatEvent::StreamStart(StreamStartData {
+            message_id: message_id.clone(),
+            agent: "mock-live-native-child".to_owned(),
+            model: Some(MOCK_MODEL.to_owned()),
+        }));
+    let _ = handle
+        .event_tx
+        .send(ChatEvent::StreamDelta(StreamTextDeltaData {
+            message_id,
+            text: "mock live native child working".to_owned(),
+        }));
+    active_subagents.push(handle);
 }
 
 async fn emit_held_turn(
@@ -813,25 +911,12 @@ async fn emit_turn(
     }
 
     if user_message.contains(EMPTY_AGENT_CONTROL_OUTPUT_SENTINEL) {
+        let empty_output_message_id = ChatMessageId(Uuid::new_v4().to_string());
         if events_tx
-            .send(ChatEvent::MessageAdded(ChatMessage {
-                message_id: Some(protocol::ChatMessageId(Uuid::new_v4().to_string())),
-                timestamp: now_ms(),
-                sender: MessageSender::Assistant {
-                    agent: "mock".to_owned(),
-                },
-                content: String::new(),
-                reasoning: Some(protocol::ReasoningData {
-                    text: "hidden reasoning".to_owned(),
-                    tokens: None,
-                    signature: None,
-                    blob: None,
-                }),
-                tool_calls: Vec::new(),
-                model_info: None,
-                token_usage: None,
-                context_breakdown: None,
-                images: None,
+            .send(ChatEvent::StreamStart(StreamStartData {
+                message_id: Some(empty_output_message_id.0.clone()),
+                agent: "mock".to_owned(),
+                model: None,
             }))
             .is_err()
         {
@@ -840,13 +925,18 @@ async fn emit_turn(
         if events_tx
             .send(ChatEvent::StreamEnd(StreamEndData {
                 message: ChatMessage {
-                    message_id: Some(protocol::ChatMessageId(Uuid::new_v4().to_string())),
+                    message_id: Some(empty_output_message_id),
                     timestamp: now_ms(),
                     sender: MessageSender::Assistant {
                         agent: "mock".to_owned(),
                     },
                     content: String::new(),
-                    reasoning: None,
+                    reasoning: Some(protocol::ReasoningData {
+                        text: "hidden reasoning".to_owned(),
+                        tokens: None,
+                        signature: None,
+                        blob: None,
+                    }),
                     tool_calls: Vec::new(),
                     model_info: None,
                     token_usage: None,
@@ -864,6 +954,18 @@ async fn emit_turn(
     }
 
     if user_message.trim() == MOCK_COMPACT_SENTINEL {
+        let compact_message_id = ChatMessageId(Uuid::new_v4().to_string());
+        if events_tx
+            .send(ChatEvent::StreamStart(StreamStartData {
+                message_id: Some(compact_message_id.0.clone()),
+                agent: "mock".to_owned(),
+                model: Some(MOCK_MODEL.to_owned()),
+            }))
+            .is_err()
+        {
+            return false;
+        }
+
         if events_tx
             .send(ChatEvent::MessageAdded(ChatMessage {
                 message_id: None,
@@ -885,7 +987,7 @@ async fn emit_turn(
         if events_tx
             .send(ChatEvent::StreamEnd(StreamEndData {
                 message: ChatMessage {
-                    message_id: None,
+                    message_id: Some(compact_message_id),
                     timestamp: now_ms(),
                     sender: MessageSender::Assistant {
                         agent: "mock".to_owned(),
@@ -1016,6 +1118,83 @@ fn parse_mock_agent_control_await(message: &str) -> Option<Vec<String>> {
     (!agent_ids.is_empty()).then_some(agent_ids)
 }
 
+fn parse_mock_agent_control_send_message(message: &str) -> Option<(AgentId, String)> {
+    let (_, after_sentinel) = message.split_once(MOCK_AGENT_CONTROL_SEND_MESSAGE_SENTINEL)?;
+    let after_sentinel = after_sentinel.trim_start();
+    let (agent_id, message) = after_sentinel.split_once(char::is_whitespace)?;
+    let message = message.trim_start();
+    (!agent_id.is_empty() && !message.is_empty())
+        .then(|| (AgentId(agent_id.to_owned()), message.to_owned()))
+}
+
+fn emit_mock_agent_control_send_message(
+    events_tx: &mpsc::UnboundedSender<ChatEvent>,
+    agent_id: AgentId,
+    message: String,
+) -> bool {
+    let message_id = Some(Uuid::new_v4().to_string());
+    let tool_call_id = format!("mock-agent-control-send-message-{}", Uuid::new_v4());
+    let tool_name = "tyde_send_agent_message";
+    let response_text = "mock agent-control message delivered".to_owned();
+
+    events_tx.send(ChatEvent::TypingStatusChanged(true)).is_ok()
+        && events_tx
+            .send(ChatEvent::StreamStart(StreamStartData {
+                message_id: message_id.clone(),
+                agent: "mock".to_owned(),
+                model: Some(MOCK_MODEL.to_owned()),
+            }))
+            .is_ok()
+        && events_tx
+            .send(ChatEvent::ToolRequest(ToolRequest {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.to_owned(),
+                tool_type: ToolRequestType::TydeSendAgentMessage { agent_id, message },
+            }))
+            .is_ok()
+        && events_tx
+            .send(ChatEvent::ToolExecutionCompleted(
+                ToolExecutionCompletedData {
+                    tool_call_id,
+                    tool_name: tool_name.to_owned(),
+                    tool_result: ToolExecutionResult::TydeSendAgentMessage,
+                    success: true,
+                    error: None,
+                    normalization_failure: None,
+                },
+            ))
+            .is_ok()
+        && events_tx
+            .send(ChatEvent::StreamDelta(StreamTextDeltaData {
+                message_id: message_id.clone(),
+                text: response_text.clone(),
+            }))
+            .is_ok()
+        && events_tx
+            .send(ChatEvent::StreamEnd(StreamEndData {
+                message: ChatMessage {
+                    message_id: message_id.map(ChatMessageId),
+                    timestamp: now_ms(),
+                    sender: MessageSender::Assistant {
+                        agent: "mock".to_owned(),
+                    },
+                    content: response_text,
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    model_info: Some(ModelInfo {
+                        model: MOCK_MODEL.to_owned(),
+                    }),
+                    token_usage: None,
+                    context_breakdown: None,
+                    images: None,
+                },
+            }))
+            .is_ok()
+        && events_tx
+            .send(ChatEvent::TypingStatusChanged(false))
+            .is_ok()
+}
+
 async fn emit_mock_agent_control_await(
     events_tx: &mpsc::UnboundedSender<ChatEvent>,
     agent_control_await_mcp: Option<&MockAgentControlAwaitMcp>,
@@ -1024,6 +1203,8 @@ async fn emit_mock_agent_control_await(
     let message_id = Some(Uuid::new_v4().to_string());
     let tool_call_id = format!("mock-agent-control-await-{}", Uuid::new_v4());
     let tool_name = "tyde_await_agents";
+    let typed_agent_ids = agent_ids.iter().cloned().map(AgentId).collect::<Vec<_>>();
+    let arguments = json!({ "agent_ids": agent_ids.clone() });
 
     if events_tx
         .send(ChatEvent::TypingStatusChanged(true))
@@ -1045,13 +1226,16 @@ async fn emit_mock_agent_control_await(
         .send(ChatEvent::ToolRequest(ToolRequest {
             tool_call_id: tool_call_id.clone(),
             tool_name: tool_name.to_owned(),
-            tool_type: ToolRequestType::Other {
-                args: json!({
-                    "agent_ids": agent_ids.clone(),
-                }),
+            tool_type: ToolRequestType::TydeAwaitAgents {
+                agent_ids: typed_agent_ids,
             },
         }))
         .is_err()
+    {
+        return false;
+    }
+    if let Some(progress) = await_progress_data_for_tool(&tool_call_id, tool_name, &arguments)
+        && events_tx.send(ChatEvent::ToolProgress(progress)).is_err()
     {
         return false;
     }
@@ -1060,15 +1244,27 @@ async fn emit_mock_agent_control_await(
         Some(config) => call_agent_control_await_mcp(config, &agent_ids).await,
         None => Err("mock backend has no tyde-agent-await MCP server".to_owned()),
     };
-    let (success, tool_result, error, response_text) = match result {
-        Ok(body) => (
-            true,
-            ToolExecutionResult::Other {
-                result: body.clone(),
-            },
-            None,
-            format!("mock agent-control await completed: {body}"),
-        ),
+    let (success, tool_result, error, response_text, normalization_failure) = match result {
+        Ok(body) => match tyde_tool_result(tool_name, &body) {
+            Ok(Some(tool_result)) => (
+                true,
+                tool_result,
+                None,
+                format!("mock agent-control await completed: {body}"),
+                None,
+            ),
+            Ok(None) => unreachable!("canonical await tool must normalize"),
+            Err(error) => (
+                false,
+                ToolExecutionResult::Error {
+                    short_message: "tyde_await_agents result normalization failed".to_owned(),
+                    detailed_message: error.to_string(),
+                },
+                Some(error.to_string()),
+                format!("mock agent-control await normalization failed: {error}"),
+                Some(error.normalization_failure),
+            ),
+        },
         Err(error) => (
             false,
             ToolExecutionResult::Error {
@@ -1077,6 +1273,7 @@ async fn emit_mock_agent_control_await(
             },
             Some(error.clone()),
             format!("mock agent-control await failed: {error}"),
+            None,
         ),
     };
 
@@ -1088,6 +1285,7 @@ async fn emit_mock_agent_control_await(
                 tool_result,
                 success,
                 error,
+                normalization_failure,
             },
         ))
         .is_err()
@@ -1410,6 +1608,7 @@ async fn emit_exit_plan_mode_completion(
                 },
                 success: true,
                 error: None,
+                normalization_failure: None,
             },
         ))
         .is_err()
@@ -1482,6 +1681,7 @@ fn emit_mock_tool_failure_without_idle(events_tx: &mpsc::UnboundedSender<ChatEve
                 "Claude history did not contain a tool_result before the conversation advanced; treating the tool as interrupted."
                     .to_owned(),
             ),
+            normalization_failure: None,
         },
     ));
 }
@@ -1512,7 +1712,7 @@ async fn maybe_spawn_native_child(
     };
     let tool_use_id = format!("mock-tool-use-{}", Uuid::new_v4());
 
-    let handle = emitter
+    let handle = match emitter
         .on_subagent_spawned(
             tool_use_id,
             "mock-native-child".to_owned(),
@@ -1520,7 +1720,14 @@ async fn maybe_spawn_native_child(
             "mock".to_owned(),
             Some(SessionId(Uuid::new_v4().to_string())),
         )
-        .await;
+        .await
+    {
+        Ok(handle) => handle,
+        Err(error) => {
+            tracing::error!(%error, "mock native child relay registration failed");
+            return;
+        }
+    };
 
     emit_native_child_turn(&handle.event_tx, child_prompt);
     if drop_handle {
@@ -1680,5 +1887,60 @@ mod tests {
             .get(&backend.session_id.0)
             .expect("mock session record");
         assert_eq!(record.access_mode, BackendAccessMode::ReadOnly);
+    }
+
+    #[tokio::test]
+    async fn empty_agent_control_output_uses_one_stream_identity() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        assert!(
+            emit_turn(
+                &events_tx,
+                &SessionId("mock-empty-output-session".to_owned()),
+                EMPTY_AGENT_CONTROL_OUTPUT_SENTINEL,
+                false,
+            )
+            .await
+        );
+
+        let events = std::iter::from_fn(|| events_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(events.len(), 4);
+        assert!(matches!(&events[0], ChatEvent::TypingStatusChanged(true)));
+        let start_id = match &events[1] {
+            ChatEvent::StreamStart(start) => start
+                .message_id
+                .as_ref()
+                .filter(|message_id| !message_id.is_empty())
+                .expect("empty-output StreamStart identity"),
+            event => panic!("expected StreamStart, got {event:?}"),
+        };
+        let completed = match &events[2] {
+            ChatEvent::StreamEnd(end) => &end.message,
+            event => panic!("expected StreamEnd, got {event:?}"),
+        };
+        assert_eq!(
+            completed
+                .message_id
+                .as_ref()
+                .expect("empty-output StreamEnd identity")
+                .0
+                .as_str(),
+            start_id.as_str()
+        );
+        assert!(completed.content.is_empty());
+        assert_eq!(
+            completed
+                .reasoning
+                .as_ref()
+                .map(|reasoning| reasoning.text.as_str()),
+            Some("hidden reasoning")
+        );
+        assert!(matches!(&events[3], ChatEvent::TypingStatusChanged(false)));
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            ChatEvent::MessageAdded(ChatMessage {
+                sender: MessageSender::Error,
+                ..
+            })
+        )));
     }
 }

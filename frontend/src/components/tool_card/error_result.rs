@@ -10,7 +10,11 @@ use protocol::ToolExecutionResult;
 
 use crate::state::ToolOutputMode;
 
-pub(crate) fn render(result: &ToolExecutionResult, mode: ToolOutputMode) -> AnyView {
+pub(crate) fn render(
+    result: &ToolExecutionResult,
+    malformed_payload: Option<&serde_json::Value>,
+    mode: ToolOutputMode,
+) -> AnyView {
     let ToolExecutionResult::Error {
         short_message,
         detailed_message,
@@ -26,24 +30,30 @@ pub(crate) fn render(result: &ToolExecutionResult, mode: ToolOutputMode) -> AnyV
     if mode == ToolOutputMode::Summary {
         let oneliner = single_line(&short);
         return view! {
-            <div class="tool-result-error">
-                <span class="tool-error-icon">"\u{2715}"</span>
-                <span class="tool-error-short">{format!("Error: {oneliner}")}</span>
+            <div>
+                {malformed_payload.map(super::other::render_drift)}
+                <div class="tool-result-error">
+                    <span class="tool-error-icon">"\u{2715}"</span>
+                    <span class="tool-error-short">{format!("Error: {oneliner}")}</span>
+                </div>
             </div>
         }
         .into_any();
     }
 
     view! {
-        <div class="tool-result-error">
-            <span class="tool-error-icon">"\u{2715}"</span>
-            <pre class="tool-result-stderr tool-error-pre">{short}</pre>
-            <Show when=move || has_detail>
-                <details class="tool-error-details">
-                    <summary>"Details"</summary>
-                    <pre class="tool-error-detail">{detail.clone()}</pre>
-                </details>
-            </Show>
+        <div>
+            {malformed_payload.map(super::other::render_drift)}
+            <div class="tool-result-error">
+                <span class="tool-error-icon">"\u{2715}"</span>
+                <pre class="tool-result-stderr tool-error-pre">{short}</pre>
+                <Show when=move || has_detail>
+                    <details class="tool-error-details">
+                        <summary>"Details"</summary>
+                        <pre class="tool-error-detail">{detail.clone()}</pre>
+                    </details>
+                </Show>
+            </div>
         </div>
     }
     .into_any()
@@ -80,7 +90,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn summary_shows_one_liner() {
         let r = err("boom over\nmultiple\nlines", "");
-        let container = mount(move || render(&r, ToolOutputMode::Summary));
+        let container = mount(move || render(&r, None, ToolOutputMode::Summary));
         next_tick().await;
         let body = text(&container);
         // Newlines collapsed into a single visible line.
@@ -91,7 +101,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn compact_shows_pre_and_collapsed_details() {
         let r = err("boom", "stack trace here");
-        let container = mount(move || render(&r, ToolOutputMode::Compact));
+        let container = mount(move || render(&r, None, ToolOutputMode::Compact));
         next_tick().await;
         assert_eq!(count(&container, "pre.tool-error-pre"), 1);
         // <details> is present but collapsed by default; its summary should be
@@ -102,7 +112,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn compact_no_details_when_detailed_message_empty() {
         let r = err("boom", "");
-        let container = mount(move || render(&r, ToolOutputMode::Compact));
+        let container = mount(move || render(&r, None, ToolOutputMode::Compact));
         next_tick().await;
         assert_eq!(count(&container, ".tool-error-details"), 0);
     }

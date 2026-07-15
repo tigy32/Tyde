@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use client::ClientConfig;
@@ -22,6 +22,7 @@ use uuid::Uuid;
 const DEBUG_REPO_ROOT_ENV: &str = "TYDE_DEBUG_REPO_ROOT";
 const MOBILE_PAIRINGS_STORE_PATH_ENV: &str = "TYDE_MOBILE_PAIRINGS_STORE_PATH";
 const START_TIMEOUT: Duration = Duration::from_secs(105);
+const STARTUP_LOG_TAIL_BYTES: usize = 32 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct DebugServerConfig {
@@ -71,6 +72,8 @@ struct DevInstanceRecord {
     frontend_url: String,
     config_path: PathBuf,
     store_dir: PathBuf,
+    startup_output: Arc<StdMutex<Vec<u8>>>,
+    startup_capture_tasks: Vec<tokio::task::JoinHandle<()>>,
     child: AsyncGroupChild,
     started_at_ms: u64,
 }
@@ -354,20 +357,35 @@ async fn start_instance(
     })?;
 
     let config_path = write_dev_config(&project_dir, frontend_port, &instance_id)?;
-    let mut command = tauri_dev_command(&project_dir, &config_path)?;
+    let mut command = tauri_dev_command(&config_path)?;
     command
         .current_dir(&project_dir)
         .env("TYDE_DEV_INSTANCE", "1")
         .env("TYDE_DEV_HOST_BIND_ADDR", host_addr.to_string())
         .env("TYDE_DEV_UI_DEBUG_BIND_ADDR", ui_debug_addr.to_string())
         .env(MOBILE_PAIRINGS_STORE_PATH_ENV, &mobile_pairings_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let child = command
+    let mut child = command
         .group_spawn()
         .map_err(|err| format!("failed to spawn Tyde dev instance: {err}"))?;
+    let startup_output = Arc::new(StdMutex::new(Vec::new()));
+    let stdout = child
+        .inner()
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to capture Tyde dev instance stdout".to_string())?;
+    let stderr = child
+        .inner()
+        .stderr
+        .take()
+        .ok_or_else(|| "failed to capture Tyde dev instance stderr".to_string())?;
+    let startup_capture_tasks = vec![
+        tokio::spawn(capture_startup_output(stdout, Arc::clone(&startup_output))),
+        tokio::spawn(capture_startup_output(stderr, Arc::clone(&startup_output))),
+    ];
 
     let mut record = DevInstanceRecord {
         instance_id: instance_id.clone(),
@@ -378,6 +396,8 @@ async fn start_instance(
         frontend_url: frontend_url.clone(),
         config_path,
         store_dir,
+        startup_output,
+        startup_capture_tasks,
         child,
         started_at_ms: now_ms(),
     };
@@ -478,24 +498,41 @@ async fn wait_for_instance_ready(record: &mut DevInstanceRecord) -> Result<(), S
     loop {
         match record.child.try_wait() {
             Ok(Some(exit_status)) => {
-                return Err(format!(
-                    "dev instance {} exited before ready: {exit_status}",
-                    record.instance_id
+                for mut task in record.startup_capture_tasks.drain(..) {
+                    if timeout(Duration::from_millis(250), &mut task)
+                        .await
+                        .is_err()
+                    {
+                        task.abort();
+                    }
+                }
+                return Err(with_startup_diagnostics(
+                    format!(
+                        "dev instance {} exited before ready: {exit_status}",
+                        record.instance_id
+                    ),
+                    &record.startup_output,
                 ));
             }
             Ok(None) => {}
             Err(err) => {
-                return Err(format!(
-                    "failed to read dev instance {} process status: {err}",
-                    record.instance_id
+                return Err(with_startup_diagnostics(
+                    format!(
+                        "failed to read dev instance {} process status: {err}",
+                        record.instance_id
+                    ),
+                    &record.startup_output,
                 ));
             }
         }
 
         if started.elapsed() > START_TIMEOUT {
-            return Err(format!(
-                "timed out waiting for dev instance {} to become ready",
-                record.instance_id
+            return Err(with_startup_diagnostics(
+                format!(
+                    "timed out waiting for dev instance {} to become ready",
+                    record.instance_id
+                ),
+                &record.startup_output,
             ));
         }
 
@@ -645,19 +682,99 @@ fn write_dev_config(
     Ok(output_path)
 }
 
-fn tauri_dev_command(repo_root: &Path, config_path: &Path) -> Result<Command, String> {
-    let local_cli = repo_root.join("node_modules/.bin/tauri");
-    let mut command = if local_cli.is_file() {
-        let mut command = Command::new(local_cli);
-        command.arg("dev");
-        command
-    } else {
-        let mut command = Command::new("npx");
-        command.arg("tauri").arg("dev");
-        command
+fn tauri_dev_command(config_path: &Path) -> Result<Command, String> {
+    let cargo_tauri = resolve_cargo_tauri().ok_or_else(|| {
+        "cargo-tauri was not found in PATH or the Cargo bin directory; install the Tauri CLI and ensure cargo-tauri is available before starting a Tyde dev instance (the launcher does not use npx or install packages)".to_string()
+    })?;
+    Ok(tauri_dev_command_with_cli(config_path, &cargo_tauri))
+}
+
+fn tauri_dev_command_with_cli(config_path: &Path, cargo_tauri: &Path) -> Command {
+    let mut command = Command::new(cargo_tauri);
+    command.arg("dev");
+    command.arg("--config").arg(config_path).arg("--no-watch");
+    command
+}
+
+fn resolve_cargo_tauri() -> Option<PathBuf> {
+    let mut dirs = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if let Some(cargo_home) = std::env::var_os("CARGO_HOME") {
+        dirs.push(PathBuf::from(cargo_home).join("bin"));
+    } else if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join(".cargo/bin"));
+    }
+    find_cargo_tauri_in_dirs(dirs)
+}
+
+fn find_cargo_tauri_in_dirs(dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    dirs.into_iter()
+        .map(|dir| dir.join(format!("cargo-tauri{}", std::env::consts::EXE_SUFFIX)))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
     };
-    command.arg("--config").arg(config_path);
-    Ok(command)
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+async fn capture_startup_output(
+    mut reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    output: Arc<StdMutex<Vec<u8>>>,
+) {
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) => return,
+            Ok(count) => append_startup_output(&output, &chunk[..count]),
+            Err(_) => return,
+        }
+    }
+}
+
+fn append_startup_output(output: &StdMutex<Vec<u8>>, bytes: &[u8]) {
+    let mut output = output.lock().expect("startup output mutex poisoned");
+    if bytes.len() >= STARTUP_LOG_TAIL_BYTES {
+        output.clear();
+        output.extend_from_slice(&bytes[bytes.len() - STARTUP_LOG_TAIL_BYTES..]);
+        return;
+    }
+    let overflow = output
+        .len()
+        .saturating_add(bytes.len())
+        .saturating_sub(STARTUP_LOG_TAIL_BYTES);
+    if overflow > 0 {
+        output.drain(..overflow);
+    }
+    output.extend_from_slice(bytes);
+}
+
+fn with_startup_diagnostics(message: String, output: &StdMutex<Vec<u8>>) -> String {
+    let output = output.lock().expect("startup output mutex poisoned");
+    let diagnostics = if output.is_empty() {
+        "startup output was empty".to_string()
+    } else {
+        format!(
+            "startup output (last {} bytes):\n{}",
+            output.len(),
+            String::from_utf8_lossy(output.as_slice()).trim_end()
+        )
+    };
+    format!("{message}\n{diagnostics}")
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -900,5 +1017,64 @@ mod tests {
             ))
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn tauri_dev_command_uses_resolved_cargo_tauri_without_install_fallback() {
+        let config_path = Path::new("/repo/frontend/tauri-shell/tauri.conf.json");
+        let command =
+            tauri_dev_command_with_cli(config_path, Path::new("/toolchain/bin/cargo-tauri"));
+        let rendered = format!("{command:?}");
+
+        assert!(rendered.contains("/toolchain/bin/cargo-tauri"));
+        assert!(rendered.contains("dev"));
+        assert!(rendered.contains("--config"));
+        assert!(rendered.contains("--no-watch"));
+        assert!(!rendered.contains("npx"));
+        assert!(!rendered.contains("node_modules"));
+    }
+
+    #[test]
+    fn cargo_tauri_resolution_uses_explicit_search_order() {
+        let first = tempfile::tempdir().expect("first temp dir");
+        let second = tempfile::tempdir().expect("second temp dir");
+        let expected = second
+            .path()
+            .join(format!("cargo-tauri{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&expected, b"test executable").expect("write candidate");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = expected
+                .metadata()
+                .expect("candidate metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&expected, permissions).expect("make candidate executable");
+        }
+
+        let resolved = find_cargo_tauri_in_dirs(vec![
+            first.path().to_path_buf(),
+            second.path().to_path_buf(),
+        ]);
+
+        assert_eq!(resolved, Some(expected));
+    }
+
+    #[test]
+    fn startup_diagnostics_include_bounded_output_tail() {
+        let marker = b"actionable cargo-tauri failure\n";
+        let output = StdMutex::new(Vec::new());
+        append_startup_output(&output, &vec![b'x'; STARTUP_LOG_TAIL_BYTES + 17]);
+        append_startup_output(&output, marker);
+
+        let message = with_startup_diagnostics("exited before ready".to_string(), &output);
+
+        assert!(message.contains("exited before ready"));
+        assert!(message.contains("actionable cargo-tauri failure"));
+        assert_eq!(
+            output.lock().expect("startup output").len(),
+            STARTUP_LOG_TAIL_BYTES
+        );
     }
 }

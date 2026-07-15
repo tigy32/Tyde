@@ -1,6 +1,10 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use command_group::AsyncCommandGroup;
 use protocol::{
@@ -14,22 +18,57 @@ use tokio::process::Command;
 use crate::browse_stream::host_platform;
 use crate::process_env;
 
-pub(crate) const TYCODE_VERSION: &str = "0.9.2-pre.1";
-pub(crate) const TYCODE_SETTINGS_SCHEMA_MIN_VERSION: &str = "0.10.0";
+pub(crate) const TYCODE_VERSION: &str = "0.10.0";
+// Keep the stable grouped-settings adoption floor synchronized in its invariant test.
 const TYCODE_RELEASE_BASE_URL: &str = "https://github.com/tigy32/Tycode/releases/download";
 const TYCODE_SUBPROCESS_SHA256_AARCH64_APPLE_DARWIN: &str =
-    "78e068456cd6dbdd1c0e2e4c27da4f409e7874c2c3e8d770d01c15d49341452b";
+    "3a3b4ea1bb74bcf7b9078ba21de954468c944613e0573b6ed03abb81670ca96e";
 const TYCODE_SUBPROCESS_SHA256_X86_64_APPLE_DARWIN: &str =
-    "46e2e7803c7e3ab91094ece81af3e894122af56971e1933f37b4d826582738a8";
+    "c1bbfc5b2a64d309d3d1c13a7b9057a5946a8c6e2cb66cc15019b97053eb6c1e";
 const TYCODE_SUBPROCESS_SHA256_AARCH64_UNKNOWN_LINUX_MUSL: &str =
-    "6e72b738dc5dbf3ec158dc8e8e8cfad2f30a0a7f615fdf64b41a3f2dc0207db2";
+    "1844c3d98d126dbdf49e661d94930de6feb7c53a3f0806b7b0b797e34ad3481d";
 const TYCODE_SUBPROCESS_SHA256_X86_64_UNKNOWN_LINUX_MUSL: &str =
-    "05e440903a6d44fc7d6fd74be2f748aff12f443506959725c6179379ec393dab";
+    "abfcd6865151ba48d33d582b1fa706460d41b5807d4c194778c757102ff1d6c7";
 const CLAUDE_CLI_CANDIDATES: &[&str] = &["claude"];
 const CODEX_CLI_CANDIDATES: &[&str] = &["codex"];
 const ANTIGRAVITY_CLI_CANDIDATES: &[&str] = &["agy"];
 const KIRO_CLI_CANDIDATES: &[&str] = &["kiro-cli", "kiro-cli-chat"];
 const HERMES_PYTHON_MODULE: &str = "tui_gateway.entry";
+
+pub(crate) struct PreparedBackendSetupCommand {
+    program: String,
+    arguments: Vec<String>,
+    display_command: String,
+    staged_script: PathBuf,
+}
+
+impl PreparedBackendSetupCommand {
+    pub(crate) fn program(&self) -> &str {
+        &self.program
+    }
+
+    pub(crate) fn arguments(&self) -> &[String] {
+        &self.arguments
+    }
+
+    pub(crate) fn display_command(&self) -> &str {
+        &self.display_command
+    }
+}
+
+impl Drop for PreparedBackendSetupCommand {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_file(&self.staged_script)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %self.staged_script.display(),
+                %error,
+                "failed to remove staged backend setup script"
+            );
+        }
+    }
+}
 
 pub(crate) async fn collect_backend_setup() -> BackendSetupPayload {
     let platform = host_platform();
@@ -89,61 +128,129 @@ pub(crate) fn stub_backend_setup() -> BackendSetupPayload {
     BackendSetupPayload { backends }
 }
 
-pub(crate) async fn runnable_command(
+pub(crate) async fn prepare_runnable_command(
     backend_kind: BackendKind,
     action: BackendSetupAction,
-) -> Option<String> {
+) -> Result<Option<PreparedBackendSetupCommand>, String> {
+    let platform = host_platform();
     let payload = collect_backend_setup().await;
     let info = payload
         .backends
         .into_iter()
-        .find(|info| info.backend_kind == backend_kind)?;
+        .find(|info| info.backend_kind == backend_kind);
+    let Some(info) = info else {
+        return Ok(None);
+    };
 
     let command = match action {
         BackendSetupAction::Install => info.install_command,
         BackendSetupAction::SignIn => info.sign_in_command,
     };
+    let Some(command) = command.filter(|command| command.runnable) else {
+        return Ok(None);
+    };
+    stage_backend_setup_command(&command.command, platform).map(Some)
+}
 
-    command
-        .as_ref()
-        .filter(|cmd| cmd.runnable)
-        .map(|cmd| cmd.command.clone())
+fn stage_backend_setup_command(
+    command: &str,
+    platform: HostPlatform,
+) -> Result<PreparedBackendSetupCommand, String> {
+    let suffix = if platform == HostPlatform::Windows {
+        ".ps1"
+    } else {
+        ".sh"
+    };
+    let mut staged = tempfile::Builder::new()
+        .prefix("tyde-backend-setup-")
+        .suffix(suffix)
+        .tempfile()
+        .map_err(|error| format!("failed to create private backend setup script: {error}"))?;
+
+    #[cfg(unix)]
+    staged
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("failed to secure backend setup script: {error}"))?;
+
+    let path = staged.path().to_path_buf();
+    let path_text = path.to_string_lossy();
+    let (program, arguments, display_command, script) = if platform == HostPlatform::Windows {
+        let display_path = format!("\"{}\"", path_text.replace('"', "`\""));
+        let display_command =
+            format!("powershell.exe -NoProfile -ExecutionPolicy Bypass -File {display_path}");
+        let display_literal = display_command.replace('\'', "''");
+        (
+            "powershell.exe".to_owned(),
+            vec![
+                "-NoProfile".to_owned(),
+                "-ExecutionPolicy".to_owned(),
+                "Bypass".to_owned(),
+                "-File".to_owned(),
+                path_text.into_owned(),
+            ],
+            display_command,
+            format!("Write-Output '$ {display_literal}'\n{command}\n"),
+        )
+    } else {
+        let display_command = format!("/bin/sh {}", shell_quote(&path_text));
+        let display_literal = shell_quote(&format!("$ {display_command}"));
+        (
+            "/bin/sh".to_owned(),
+            vec![path_text.into_owned()],
+            display_command,
+            format!("printf '%s\\n' {display_literal}\n{command}\n"),
+        )
+    };
+
+    staged
+        .write_all(script.as_bytes())
+        .map_err(|error| format!("failed to write backend setup script: {error}"))?;
+    staged
+        .as_file()
+        .sync_all()
+        .map_err(|error| format!("failed to sync backend setup script: {error}"))?;
+    let (file, staged_script) = staged
+        .keep()
+        .map_err(|error| format!("failed to retain backend setup script: {error}"))?;
+    drop(file);
+
+    Ok(PreparedBackendSetupCommand {
+        program,
+        arguments,
+        display_command,
+        staged_script,
+    })
 }
 
 pub(crate) fn tycode_versioned_binary_path() -> Result<PathBuf, String> {
-    Ok(home_dir()?
-        .join(".tyde")
+    Ok(tycode_versioned_binary_path_for_home(&home_dir()?))
+}
+
+fn tycode_versioned_binary_path_for_home(home: &Path) -> PathBuf {
+    home.join(".tyde")
         .join("tycode")
         .join(TYCODE_VERSION)
-        .join("tycode-subprocess"))
+        .join("tycode-subprocess")
 }
 
 pub(crate) fn resolve_tycode_binary_path() -> Option<String> {
-    if let Ok(path) = tycode_versioned_binary_path()
-        && path.is_file()
-    {
-        return Some(path.to_string_lossy().to_string());
-    }
-
-    process_env::resolve_login_shell_command_path("tycode-subprocess")
-        .map(|path| path.to_string_lossy().to_string())
+    let home = home_dir().ok()?;
+    resolve_tycode_binary_path_for_home(&home)
 }
 
-pub(crate) fn tycode_probe_candidates() -> Vec<String> {
-    tycode_probe_candidates_from_resolved_path(resolve_tycode_binary_path().as_deref())
-}
-
-fn tycode_probe_candidates_from_resolved_path(resolved_binary_path: Option<&str>) -> Vec<String> {
-    resolved_binary_path
-        .map(Path::new)
-        .into_iter()
-        .map(|path| path.to_string_lossy().to_string())
-        .collect()
+fn resolve_tycode_binary_path_for_home(home: &Path) -> Option<String> {
+    let path = tycode_versioned_binary_path_for_home(home);
+    let metadata = std::fs::symlink_metadata(&path).ok()?;
+    metadata
+        .file_type()
+        .is_file()
+        .then(|| path.to_string_lossy().to_string())
 }
 
 async fn probe_backend(kind: BackendKind, platform: HostPlatform) -> BackendSetupInfo {
     let probe = match kind {
-        BackendKind::Tycode => probe_tycode_candidates(&tycode_probe_candidates()).await,
+        BackendKind::Tycode => probe_installed_tycode().await,
         BackendKind::Kiro => probe_candidates(&command_candidates(KIRO_CLI_CANDIDATES)).await,
         BackendKind::Claude => probe_candidates(&command_candidates(CLAUDE_CLI_CANDIDATES)).await,
         BackendKind::Codex => probe_candidates(&command_candidates(CODEX_CLI_CANDIDATES)).await,
@@ -173,21 +280,6 @@ fn backend_setup_info_from_probe(
         diagnostic: probe.diagnostic,
         sign_in_command,
     }
-}
-
-pub(crate) fn tycode_settings_schema_supported_by_pinned_release() -> bool {
-    false
-}
-
-pub(crate) fn tycode_settings_schema_release_blocker_message() -> Option<String> {
-    (!tycode_settings_schema_supported_by_pinned_release()).then(|| {
-        format!(
-            "Tyde currently pins tycode-subprocess {TYCODE_VERSION}, but Tycode's grouped \
-             GetSettingsSchema settings protocol was added after that release. Tycode native \
-             settings are unavailable until Tyde pins a Tycode release containing that protocol \
-             (expected {TYCODE_SETTINGS_SCHEMA_MIN_VERSION} or newer)."
-        )
-    })
 }
 
 fn backend_setup_status_for_probe(
@@ -251,19 +343,20 @@ impl ProbeResult {
     }
 }
 
-async fn probe_tycode_candidates(candidates: &[String]) -> ProbeResult {
-    for candidate in candidates {
-        match validate_tycode_command(candidate).await {
-            TycodeCommandValidation::Compatible { version } => {
-                return ProbeResult::installed(Some(version));
-            }
-            TycodeCommandValidation::Incompatible { diagnostic } => {
-                return ProbeResult::unavailable(diagnostic);
-            }
-            TycodeCommandValidation::Unavailable => continue,
+async fn probe_installed_tycode() -> ProbeResult {
+    probe_resolved_tycode(resolve_tycode_binary_path()).await
+}
+
+async fn probe_resolved_tycode(command: Option<String>) -> ProbeResult {
+    let Some(command) = command else {
+        return ProbeResult::not_installed();
+    };
+    match validate_tycode_command(&command).await {
+        TycodeCommandValidation::Compatible { version } => ProbeResult::installed(Some(version)),
+        TycodeCommandValidation::Incompatible { diagnostic } => {
+            ProbeResult::unavailable(diagnostic)
         }
     }
-    ProbeResult::not_installed()
 }
 
 async fn probe_candidates(candidates: &[String]) -> ProbeResult {
@@ -277,94 +370,203 @@ async fn probe_candidates(candidates: &[String]) -> ProbeResult {
 }
 
 async fn probe_command(command: &str) -> Option<Option<String>> {
-    let output = run_version_command(command).await?;
-    let Some((stdout, stderr)) = output else {
-        return Some(None);
-    };
-    let version = stdout
+    let child_path = process_env::resolved_child_process_path().map(std::ffi::OsStr::to_os_string);
+    let output = run_version_command_with_child_path(command, child_path)
+        .await
+        .ok()?;
+    let version = output
+        .stdout
         .lines()
-        .chain(stderr.lines())
+        .chain(output.stderr.lines())
         .map(str::trim)
         .find(|line| !line.is_empty())
         .map(|line| line.to_string());
     Some(version)
 }
 
-async fn run_version_command(command: &str) -> Option<Option<(String, String)>> {
+struct VersionCommandOutput {
+    stdout: String,
+    stderr: String,
+}
+
+enum VersionCommandFailure {
+    Start(String),
+    TimedOut,
+    NonZero {
+        status: String,
+        stdout: String,
+        stderr: String,
+    },
+}
+
+async fn wait_for_version_command_group(
+    child: &mut command_group::AsyncGroupChild,
+    started: Instant,
+    command: &str,
+) -> std::io::Result<std::process::ExitStatus> {
+    trace_version_probe_stage(started, command, "try_wait_poll_started");
+    // command-group's Unix group wait is not cancellation-safe, so keep the
+    // whole process group authoritative through cancellable polling.
+    loop {
+        if let Some(status) = child.try_wait()? {
+            trace_version_probe_stage(started, command, "try_wait_poll_completed");
+            return Ok(status);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn run_version_command(command: &str) -> Result<VersionCommandOutput, VersionCommandFailure> {
+    // The pinned Tycode command is already an explicit path. Resolving a login
+    // shell PATH here would synchronously run outside the probe timeout.
+    run_version_command_with_child_path(command, None).await
+}
+
+fn trace_version_probe_stage(started: Instant, command: &str, stage: &str) {
+    let elapsed_ms = started.elapsed().as_millis();
+    tracing::debug!(command, stage, elapsed_ms = %elapsed_ms, "version probe stage");
+    #[cfg(test)]
+    eprintln!("version_probe command={command:?} stage={stage} elapsed_ms={elapsed_ms}");
+}
+
+async fn run_version_command_with_child_path(
+    command: &str,
+    child_path: Option<std::ffi::OsString>,
+) -> Result<VersionCommandOutput, VersionCommandFailure> {
+    let started = Instant::now();
+    trace_version_probe_stage(started, command, "function_started");
     let mut command = Command::new(command);
     command
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(path) = process_env::resolved_child_process_path() {
+    if let Some(path) = child_path {
         command.env("PATH", path);
     }
-    let mut child = command.group_spawn().ok()?;
-    let mut stdout_pipe = child.inner().stdout.take()?;
-    let mut stderr_pipe = child.inner().stderr.take()?;
+    let command_name = command
+        .as_std()
+        .get_program()
+        .to_string_lossy()
+        .into_owned();
+    trace_version_probe_stage(started, &command_name, "group_spawn_started");
+    let mut child = command
+        .group_spawn()
+        .map_err(|error| VersionCommandFailure::Start(format!("failed to spawn: {error}")))?;
+    trace_version_probe_stage(started, &command_name, "group_spawn_completed");
+    let mut stdout_pipe = child.inner().stdout.take().ok_or_else(|| {
+        VersionCommandFailure::Start("failed to capture standard output".to_owned())
+    })?;
+    let mut stderr_pipe = child.inner().stderr.take().ok_or_else(|| {
+        VersionCommandFailure::Start("failed to capture standard error".to_owned())
+    })?;
 
     let mut stdout_bytes = Vec::new();
     let mut stderr_bytes = Vec::new();
     let probe = tokio::time::timeout(Duration::from_secs(2), async {
         tokio::join!(
-            child.wait(),
-            stdout_pipe.read_to_end(&mut stdout_bytes),
-            stderr_pipe.read_to_end(&mut stderr_bytes),
+            wait_for_version_command_group(&mut child, started, &command_name),
+            async {
+                trace_version_probe_stage(started, &command_name, "stdout_read_started");
+                let result = stdout_pipe.read_to_end(&mut stdout_bytes).await;
+                trace_version_probe_stage(started, &command_name, "stdout_read_completed");
+                result
+            },
+            async {
+                trace_version_probe_stage(started, &command_name, "stderr_read_started");
+                let result = stderr_pipe.read_to_end(&mut stderr_bytes).await;
+                trace_version_probe_stage(started, &command_name, "stderr_read_completed");
+                result
+            },
         )
     })
     .await;
+    trace_version_probe_stage(started, &command_name, "probe_join_completed");
     let status = match probe {
         Ok((Ok(status), Ok(_), Ok(_))) => status,
-        Ok(_) => return Some(None),
+        Ok((status, stdout, stderr)) => {
+            trace_version_probe_stage(started, &command_name, "function_returning_read_error");
+            return Err(VersionCommandFailure::Start(format!(
+                "failed while waiting or reading output: status={status:?}, stdout={stdout:?}, stderr={stderr:?}"
+            )));
+        }
         Err(_) => {
-            let _ = child.kill().await;
-            return Some(None);
+            trace_version_probe_stage(started, &command_name, "probe_timeout_fired");
+            drop(stdout_pipe);
+            drop(stderr_pipe);
+            trace_version_probe_stage(started, &command_name, "pipe_readers_dropped");
+            let kill_result = child.start_kill();
+            trace_version_probe_stage(started, &command_name, "start_kill_returned");
+            if let Err(error) = kill_result {
+                tracing::warn!(%error, "failed to kill timed-out version command group");
+            }
+            trace_version_probe_stage(started, &command_name, "background_reap_spawning");
+            let reap_command = command_name.clone();
+            tokio::spawn(async move {
+                trace_version_probe_stage(started, &reap_command, "background_reap_started");
+                if let Err(error) = child.wait().await {
+                    tracing::warn!(%error, "failed to reap timed-out version command group");
+                }
+                trace_version_probe_stage(started, &reap_command, "background_reap_completed");
+            });
+            trace_version_probe_stage(started, &command_name, "background_reap_spawned");
+            trace_version_probe_stage(started, &command_name, "function_returning_timeout");
+            return Err(VersionCommandFailure::TimedOut);
         }
     };
 
     let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
     let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
-    let _ = status;
-    Some(Some((stdout, stderr)))
+    if !status.success() {
+        trace_version_probe_stage(started, &command_name, "function_returning_nonzero");
+        return Err(VersionCommandFailure::NonZero {
+            status: status.to_string(),
+            stdout,
+            stderr,
+        });
+    }
+    trace_version_probe_stage(started, &command_name, "function_returning_success");
+    Ok(VersionCommandOutput { stdout, stderr })
 }
 
 enum TycodeCommandValidation {
     Compatible { version: String },
     Incompatible { diagnostic: BackendSetupDiagnostic },
-    Unavailable,
 }
 
 pub(crate) async fn ensure_tycode_command_compatible(command: &str) -> Result<String, String> {
+    let expected_path = tycode_versioned_binary_path()?;
+    if Path::new(command) != expected_path {
+        return Err(format!(
+            "Tyde only runs the installed checksum-pinned Tycode artifact at {}; refusing {command}",
+            expected_path.display()
+        ));
+    }
     match validate_tycode_command(command).await {
         TycodeCommandValidation::Compatible { version: _ } => Ok(command.to_string()),
         TycodeCommandValidation::Incompatible { diagnostic } => Err(diagnostic.message),
-        TycodeCommandValidation::Unavailable => Err(format!(
-            "Failed to run tycode-subprocess --version for {command}"
-        )),
     }
 }
 
 async fn validate_tycode_command(command: &str) -> TycodeCommandValidation {
-    let Some(output) = run_version_command(command).await else {
-        return TycodeCommandValidation::Unavailable;
+    let output = match run_version_command(command).await {
+        Ok(output) => output,
+        Err(failure) => {
+            return TycodeCommandValidation::Incompatible {
+                diagnostic: tycode_version_command_failure(command, failure),
+            };
+        }
     };
-    let Some((stdout, stderr)) = output else {
+    let expected = format!("tycode-subprocess {TYCODE_VERSION}");
+    if exact_tycode_version_output(&output, &expected) {
+        return TycodeCommandValidation::Compatible { version: expected };
+    }
+    let Some(version_line) = parse_tycode_version_output(&output.stdout, &output.stderr) else {
         return TycodeCommandValidation::Incompatible {
             diagnostic: BackendSetupDiagnostic {
                 code: BackendSetupDiagnosticCode::CommandFailed,
                 message: format!(
-                    "Tycode command {command} did not complete a --version probe; Tyde requires tycode-subprocess {TYCODE_VERSION}"
-                ),
-            },
-        };
-    };
-    let Some(version_line) = parse_tycode_version_output(&stdout, &stderr) else {
-        return TycodeCommandValidation::Incompatible {
-            diagnostic: BackendSetupDiagnostic {
-                code: BackendSetupDiagnosticCode::CommandFailed,
-                message: format!(
-                    "Tycode command {command} did not report a parseable --version; Tyde requires tycode-subprocess {TYCODE_VERSION}"
+                    "Tycode command {command} did not report the exact expected --version output {expected:?}"
                 ),
             },
         };
@@ -379,18 +581,55 @@ async fn validate_tycode_command(command: &str) -> TycodeCommandValidation {
             },
         };
     };
-    if version == TYCODE_VERSION {
-        return TycodeCommandValidation::Compatible {
-            version: version_line,
-        };
-    }
     TycodeCommandValidation::Incompatible {
         diagnostic: BackendSetupDiagnostic {
             code: BackendSetupDiagnosticCode::CommandFailed,
             message: format!(
-                "Tycode command {command} reported version {version}, but Tyde requires tycode-subprocess {TYCODE_VERSION}; install the pinned Tycode release artifact"
+                "Tycode command {command} reported {version_line:?} (version {version}), but Tyde requires exact --version output {expected:?} from the pinned installed artifact"
             ),
         },
+    }
+}
+
+fn exact_tycode_version_output(output: &VersionCommandOutput, expected: &str) -> bool {
+    output.stderr.is_empty()
+        && (output.stdout == expected
+            || output.stdout == format!("{expected}\n")
+            || output.stdout == format!("{expected}\r\n"))
+}
+
+fn tycode_version_command_failure(
+    command: &str,
+    failure: VersionCommandFailure,
+) -> BackendSetupDiagnostic {
+    let expected = format!("tycode-subprocess {TYCODE_VERSION}");
+    let message = match failure {
+        VersionCommandFailure::Start(error) => {
+            format!("Tycode command {command} could not run its required --version probe: {error}")
+        }
+        VersionCommandFailure::TimedOut => {
+            format!("Tycode command {command} timed out during its required --version probe")
+        }
+        VersionCommandFailure::NonZero {
+            status,
+            stdout,
+            stderr,
+        } => {
+            let output = VersionCommandOutput { stdout, stderr };
+            if exact_tycode_version_output(&output, &expected) {
+                format!(
+                    "Tycode command {command} reported exact expected --version output {expected:?} but exited unsuccessfully with {status}"
+                )
+            } else {
+                format!(
+                    "Tycode command {command} exited unsuccessfully with {status} during --version; Tyde requires exact output {expected:?}"
+                )
+            }
+        }
+    };
+    BackendSetupDiagnostic {
+        code: BackendSetupDiagnosticCode::CommandFailed,
+        message,
     }
 }
 
@@ -715,7 +954,7 @@ fn tycode_install_command(platform: HostPlatform) -> Option<BackendSetupCommand>
             ),
             command: tycode_unix_install_command(),
             display_command: Some(format!(
-                "sh -lc 'download Tycode v{TYCODE_VERSION} into ~/.tyde/tycode/{TYCODE_VERSION}'"
+                "/bin/sh <private Tyde v{TYCODE_VERSION} setup script>"
             )),
             runnable: true,
         }),
@@ -725,7 +964,7 @@ fn tycode_install_command(platform: HostPlatform) -> Option<BackendSetupCommand>
 
 fn tycode_unix_install_command() -> String {
     format!(
-        r#"set -euo pipefail
+        r#"set -eu
 
 VERSION="{version}"
 BASE_URL="{release_base}/v{version}"
@@ -846,6 +1085,125 @@ fn _tycode_release_asset_url(asset_name: &str) -> String {
 mod tests {
     use super::*;
 
+    const TYCODE_GROUPED_SETTINGS_ADOPTION_FLOOR: &str = "0.10.0";
+
+    fn parse_semver(value: &str) -> Result<([u64; 3], Option<Vec<&str>>), String> {
+        let (version, build) = value
+            .split_once('+')
+            .map_or((value, None), |(version, build)| (version, Some(build)));
+        if let Some(build) = build {
+            validate_semver_identifiers(build, false)?;
+        }
+        let (core, prerelease) = version
+            .split_once('-')
+            .map_or((version, None), |(core, prerelease)| {
+                (core, Some(prerelease))
+            });
+        let mut parts = core.split('.');
+        let core = [
+            parse_semver_core_part(parts.next(), "major")?,
+            parse_semver_core_part(parts.next(), "minor")?,
+            parse_semver_core_part(parts.next(), "patch")?,
+        ];
+        if parts.next().is_some() {
+            return Err(format!("semantic version has too many core parts: {value}"));
+        }
+        let prerelease = match prerelease {
+            Some(prerelease) => {
+                validate_semver_identifiers(prerelease, true)?;
+                Some(prerelease.split('.').collect::<Vec<_>>())
+            }
+            None => None,
+        };
+        Ok((core, prerelease))
+    }
+
+    fn parse_semver_core_part(part: Option<&str>, name: &str) -> Result<u64, String> {
+        let part = part.ok_or_else(|| format!("semantic version is missing {name}"))?;
+        if part.len() > 1 && part.starts_with('0') {
+            return Err(format!("semantic version {name} has a leading zero"));
+        }
+        part.parse::<u64>()
+            .map_err(|err| format!("invalid semantic version {name} {part:?}: {err}"))
+    }
+
+    fn validate_semver_identifiers(
+        value: &str,
+        reject_numeric_leading_zero: bool,
+    ) -> Result<(), String> {
+        if value.is_empty() {
+            return Err("semantic version identifier list is empty".to_string());
+        }
+        for identifier in value.split('.') {
+            if identifier.is_empty()
+                || !identifier
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+            {
+                return Err(format!(
+                    "invalid semantic version identifier {identifier:?}"
+                ));
+            }
+            if reject_numeric_leading_zero
+                && identifier.len() > 1
+                && identifier.starts_with('0')
+                && identifier.chars().all(|ch| ch.is_ascii_digit())
+            {
+                return Err(format!(
+                    "numeric semantic version identifier has a leading zero: {identifier}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn compare_semver(left: &str, right: &str) -> Result<std::cmp::Ordering, String> {
+        let (left_core, left_prerelease) = parse_semver(left)?;
+        let (right_core, right_prerelease) = parse_semver(right)?;
+        let core_order = left_core.cmp(&right_core);
+        if core_order != std::cmp::Ordering::Equal {
+            return Ok(core_order);
+        }
+        match (left_prerelease, right_prerelease) {
+            (None, None) => Ok(std::cmp::Ordering::Equal),
+            (None, Some(_)) => Ok(std::cmp::Ordering::Greater),
+            (Some(_), None) => Ok(std::cmp::Ordering::Less),
+            (Some(left), Some(right)) => Ok(compare_semver_prerelease(&left, &right)),
+        }
+    }
+
+    fn compare_semver_prerelease(left: &[&str], right: &[&str]) -> std::cmp::Ordering {
+        for (left, right) in left.iter().zip(right) {
+            let left_numeric = left.chars().all(|ch| ch.is_ascii_digit());
+            let right_numeric = right.chars().all(|ch| ch.is_ascii_digit());
+            let order = match (left_numeric, right_numeric) {
+                (true, true) => left.len().cmp(&right.len()).then_with(|| left.cmp(right)),
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                (false, false) => left.cmp(right),
+            };
+            if order != std::cmp::Ordering::Equal {
+                return order;
+            }
+        }
+        left.len().cmp(&right.len())
+    }
+
+    #[test]
+    fn pinned_tycode_meets_grouped_settings_adoption_floor() {
+        let pinned_order = compare_semver(TYCODE_VERSION, TYCODE_GROUPED_SETTINGS_ADOPTION_FLOOR)
+            .expect("Tycode adoption versions must be valid semantic versions");
+        assert!(matches!(
+            pinned_order,
+            std::cmp::Ordering::Equal | std::cmp::Ordering::Greater
+        ));
+        assert_eq!(
+            compare_semver("0.10.0-pre.1", TYCODE_GROUPED_SETTINGS_ADOPTION_FLOOR)
+                .expect("0.10.0-pre.1 is a valid semantic version"),
+            std::cmp::Ordering::Less
+        );
+    }
+
     struct EnvGuard {
         key: &'static str,
         old_value: Option<String>,
@@ -896,6 +1254,14 @@ mod tests {
         }
     }
 
+    fn write_installed_tycode(home: &Path, body: &str) -> PathBuf {
+        let path = tycode_versioned_binary_path_for_home(home);
+        std::fs::create_dir_all(path.parent().expect("Tycode install directory"))
+            .expect("create Tycode install directory");
+        write_executable(&path, body);
+        path
+    }
+
     fn write_fake_hermes_cli_install(dir: &Path) -> String {
         let project = dir.join("hermes-agent");
         std::fs::create_dir_all(&project).expect("create fake Hermes project");
@@ -938,13 +1304,31 @@ mod tests {
     }
 
     #[test]
-    fn tycode_version_parser_accepts_prerelease_pin() {
+    fn tycode_version_parser_accepts_pinned_version() {
         let line = format!("tycode-subprocess {TYCODE_VERSION}");
         let parsed = parse_tycode_version_output(&line, "");
         assert_eq!(parsed.as_deref(), Some(line.as_str()));
         assert_eq!(
             parsed.as_deref().and_then(parse_tycode_reported_version),
             Some(TYCODE_VERSION)
+        );
+        assert_eq!(
+            parse_tycode_version_output("tycode-subprocess 0.9.2-pre.1", "")
+                .as_deref()
+                .and_then(parse_tycode_reported_version),
+            Some("0.9.2-pre.1")
+        );
+    }
+
+    #[test]
+    fn tycode_version_parser_accepts_v0_10_prerelease_format() {
+        let line = "tycode-subprocess 0.10.0-pre.1";
+        let parsed = parse_tycode_version_output(line, "");
+
+        assert_eq!(parsed.as_deref(), Some(line));
+        assert_eq!(
+            parsed.as_deref().and_then(parse_tycode_reported_version),
+            Some("0.10.0-pre.1")
         );
     }
 
@@ -964,13 +1348,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn missing_installed_tycode_artifact_preserves_install_flow() {
+        let home = tempfile::tempdir().expect("create tempdir");
+
+        let resolved = resolve_tycode_binary_path_for_home(home.path());
+        assert_eq!(resolved, None);
+        let probe = probe_resolved_tycode(resolved).await;
+        let info = backend_setup_info_from_probe(BackendKind::Tycode, HostPlatform::Linux, probe);
+
+        assert_eq!(info.status, BackendSetupStatus::NotInstalled);
+        assert!(info.install_command.is_some());
+        assert!(info.diagnostic.is_none());
+    }
+
     #[test]
-    fn tycode_probe_candidates_use_only_resolved_absolute_paths() {
-        assert_eq!(
-            tycode_probe_candidates_from_resolved_path(Some("/tmp/tycode-subprocess")),
-            vec!["/tmp/tycode-subprocess".to_string()]
+    fn path_tycode_imposter_is_ignored() {
+        let home = tempfile::tempdir().expect("create tempdir");
+        let path_dir = tempfile::tempdir().expect("create PATH tempdir");
+        let imposter = path_dir.path().join("tycode-subprocess");
+        write_executable(
+            &imposter,
+            &format!("#!/bin/sh\nprintf 'tycode-subprocess {TYCODE_VERSION}\\n'\n"),
         );
-        assert!(tycode_probe_candidates_from_resolved_path(None).is_empty());
+
+        assert!(imposter.is_file());
+        assert_eq!(resolve_tycode_binary_path_for_home(home.path()), None);
     }
 
     #[test]
@@ -992,17 +1395,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tycode_probe_accepts_pinned_version() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let command = dir.path().join("tycode-subprocess");
-        write_executable(
-            &command,
+    async fn exact_installed_tycode_artifact_is_accepted() {
+        let home = tempfile::tempdir().expect("create tempdir");
+        let command = write_installed_tycode(
+            home.path(),
             &format!(
                 "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'tycode-subprocess {TYCODE_VERSION}\\n'; exit 0; fi\nexit 1\n"
             ),
         );
+        let resolved = resolve_tycode_binary_path_for_home(home.path());
+        let command = command.to_string_lossy().into_owned();
 
-        let result = probe_tycode_candidates(&[command.to_string_lossy().to_string()]).await;
+        assert_eq!(resolved.as_deref(), Some(command.as_str()));
+        let result = probe_resolved_tycode(resolved).await;
 
         assert_eq!(result.status, BackendSetupStatus::Installed);
         let expected_version = format!("tycode-subprocess {TYCODE_VERSION}");
@@ -1019,16 +1424,46 @@ mod tests {
             "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'tycode-subprocess 0.7.7\\n'; exit 0; fi\nexit 1\n",
         );
 
-        let result = probe_tycode_candidates(&[command.to_string_lossy().to_string()]).await;
+        let result = probe_resolved_tycode(Some(command.to_string_lossy().to_string())).await;
 
         assert_eq!(result.status, BackendSetupStatus::Unavailable);
         assert_eq!(result.version, None);
         let diagnostic = result.diagnostic.expect("diagnostic");
         assert_eq!(diagnostic.code, BackendSetupDiagnosticCode::CommandFailed);
         assert!(
-            diagnostic.message.contains("reported version 0.7.7")
+            diagnostic.message.contains("version 0.7.7")
                 && diagnostic.message.contains(TYCODE_VERSION),
             "diagnostic should name reported and required versions: {}",
+            diagnostic.message
+        );
+    }
+
+    #[tokio::test]
+    async fn nonzero_exact_tycode_version_output_is_rejected() {
+        let home = tempfile::tempdir().expect("create tempdir");
+        let command = write_installed_tycode(
+            home.path(),
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'tycode-subprocess {TYCODE_VERSION}\\n'; exit 9; fi\nexit 1\n"
+            ),
+        );
+        let resolved = resolve_tycode_binary_path_for_home(home.path());
+        let command = command.to_string_lossy().into_owned();
+
+        assert_eq!(resolved.as_deref(), Some(command.as_str()));
+        let result = probe_resolved_tycode(resolved).await;
+
+        assert_eq!(result.status, BackendSetupStatus::Unavailable);
+        assert_eq!(result.version, None);
+        let diagnostic = result.diagnostic.expect("diagnostic");
+        assert_eq!(diagnostic.code, BackendSetupDiagnosticCode::CommandFailed);
+        assert!(
+            diagnostic
+                .message
+                .contains("reported exact expected --version output")
+                && diagnostic.message.contains("exited unsuccessfully")
+                && diagnostic.message.contains("9"),
+            "diagnostic should preserve exact output and failed status: {}",
             diagnostic.message
         );
     }
@@ -1050,7 +1485,7 @@ mod tests {
         .await
         .expect("version probe must bound pipe draining held open by descendants");
 
-        assert!(result.is_some_and(|output| output.is_none()));
+        assert!(matches!(result, Err(VersionCommandFailure::TimedOut)));
     }
 
     #[test]
@@ -1359,6 +1794,50 @@ mod tests {
                 .await
                 .is_err(),
             "timed-out Hermes import probes must not be treated as installed"
+        );
+    }
+
+    #[test]
+    fn tycode_install_script_uses_portable_private_shell_state() {
+        let command = tycode_install_command(HostPlatform::Linux).expect("Tycode install command");
+
+        assert!(command.command.starts_with("set -eu\n"));
+        assert!(!command.command.contains("pipefail"));
+        assert_eq!(
+            command.display_command.as_deref(),
+            Some("/bin/sh <private Tyde v0.10.0 setup script>")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_setup_command_is_private_truthful_and_bounded() {
+        let prepared = stage_backend_setup_command("printf 'ready\\n'", HostPlatform::Linux)
+            .expect("stage backend setup command");
+        let path = prepared.staged_script.clone();
+        let metadata = std::fs::metadata(&path).expect("stat staged setup script");
+        let script = std::fs::read_to_string(&path).expect("read staged setup script");
+
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(prepared.program(), "/bin/sh");
+        assert_eq!(prepared.arguments(), &[path.to_string_lossy().into_owned()]);
+        assert_eq!(
+            prepared.display_command(),
+            format!("/bin/sh {}", shell_quote(&path.to_string_lossy()))
+        );
+        assert!(
+            script.starts_with(&format!(
+                "printf '%s\\n' {}\n",
+                shell_quote(&format!("$ {}", prepared.display_command()))
+            )),
+            "staged script must visibly report the exact command that launched it"
+        );
+        assert!(script.ends_with("printf 'ready\\n'\n"));
+
+        drop(prepared);
+        assert!(
+            !path.exists(),
+            "dropping the prepared command must clean up"
         );
     }
 }

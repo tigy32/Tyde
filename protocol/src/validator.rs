@@ -1,6 +1,7 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
+use crate::types::StreamIdentityViolation;
 use crate::types::{
     AgentBootstrapEvent, AgentBootstrapPayload, AgentCompactNotifyPayload, AgentCompactPayload,
     BrowseBootstrapPayload, CloseAgentPayload, NewTerminalPayload, ProjectBootstrapPayload,
@@ -8,35 +9,36 @@ use crate::types::{
 };
 use crate::{
     AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentClosedPayload, AgentOrigin,
-    AgentStartPayload, AgentsViewPreferencesNotifyPayload, BackendConfigSchemasPayload,
-    BackendConfigSnapshotsPayload, BackendKind, BackendSetupPayload, CancelWorkflowPayload,
-    ChatEvent, ChatMessage, ChatMessageId, ClientErrorPayload, CodeIntelDiagnosticsPayload,
-    CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelHoverResultPayload,
-    CodeIntelNavigateResultPayload, CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
-    CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
-    CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
-    DeleteSessionPayload, Envelope, FetchSessionHistoryPayload, FrameKind, HostBootstrapPayload,
-    HostBrowseClosePayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
-    HostBrowseListPayload, HostBrowseOpenedPayload, HostBrowseStartPayload, HostSettingsPayload,
-    LaunchProfileCatalogPayload, ListSessionsPayload, LoadAgentPayload, McpServerDeletePayload,
-    McpServerNotifyPayload, McpServerUpsertPayload, MobileAccessStatePayload,
-    MobileDeviceRenamePayload, MobileDeviceRevokePayload, MobilePairingCancelPayload,
-    MobilePairingOfferPayload, MobilePairingStartPayload, NewAgentPayload, ProjectAddRootPayload,
-    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
-    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
-    ProjectGitStatusPayload, ProjectNotifyPayload, ProjectRenamePayload, ProjectReorderPayload,
-    ProjectSearchCompletePayload, ProjectSearchResultsPayload, ReviewEventPayload,
-    RunBackendSetupPayload, SessionHistoryPayload, SessionListPayload, SessionSchemasPayload,
-    SetAgentGroupsPayload, SetAgentPinsPayload, SetAgentTagsPayload, SetAgentsSmartViewsPayload,
-    SetAgentsViewPreferencesPayload, SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload,
-    SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload,
-    StreamPath, TaskTokenUsagePayload, TeamCreatePayload, TeamDeletePayload,
-    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
-    TeamDraftDiscardPayload, TeamDraftNotifyPayload, TeamDraftShufflePayload,
-    TeamDraftUpdatePayload, TeamMemberActivatePayload, TeamMemberBindingNotifyPayload,
-    TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberNotifyPayload,
-    TeamMemberShufflePayload, TeamMemberShuffleSuggestionNotifyPayload, TeamMemberUpdatePayload,
-    TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
+    AgentStartPayload, AgentsViewPreferencesNotifyPayload, BackendCapacityPayload,
+    BackendConfigSchemasPayload, BackendConfigSnapshotsPayload, BackendKind, BackendSetupPayload,
+    CancelWorkflowPayload, ChatEvent, ChatMessage, ChatMessageId, ClientErrorPayload,
+    CodeIntelDiagnosticsPayload, CodeIntelErrorPayload, CodeIntelFileModelPayload,
+    CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload, CodeIntelOverviewPayload,
+    CodeIntelReferencesCompletePayload, CodeIntelReferencesResultsPayload, CodeIntelStatusPayload,
+    CommandErrorPayload, CustomAgentDeletePayload, CustomAgentNotifyPayload,
+    CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FetchSessionHistoryPayload,
+    FrameKind, HostBootstrapPayload, HostBrowseClosePayload, HostBrowseEntriesPayload,
+    HostBrowseErrorPayload, HostBrowseListPayload, HostBrowseOpenedPayload, HostBrowseStartPayload,
+    HostSettingsPayload, LaunchProfileCatalogPayload, ListSessionsPayload, LoadAgentPayload,
+    McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
+    MobileAccessStatePayload, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
+    MobilePairingCancelPayload, MobilePairingOfferPayload, MobilePairingStartPayload,
+    NewAgentPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
+    ProjectDeleteRootPayload, ProjectEventPayload, ProjectFileContentsPayload,
+    ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectNotifyPayload,
+    ProjectRenamePayload, ProjectReorderPayload, ProjectSearchCompletePayload,
+    ProjectSearchResultsPayload, ReviewEventPayload, RunBackendSetupPayload, SessionHistoryPayload,
+    SessionListPayload, SessionSchemasPayload, SetAgentGroupsPayload, SetAgentPinsPayload,
+    SetAgentTagsPayload, SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload,
+    SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentPayload,
+    SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload, StreamPath,
+    TaskTokenUsagePayload, TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload,
+    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload,
+    TeamDraftNotifyPayload, TeamDraftShufflePayload, TeamDraftUpdatePayload,
+    TeamMemberActivatePayload, TeamMemberBindingNotifyPayload, TeamMemberCreatePayload,
+    TeamMemberDeletePayload, TeamMemberNotifyPayload, TeamMemberShufflePayload,
+    TeamMemberShuffleSuggestionNotifyPayload, TeamMemberUpdatePayload, TeamNotifyPayload,
+    TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
     TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
     ToolExecutionCompletedData, ToolRequest, TriggerWorkflowPayload, WelcomePayload,
     WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowNotifyPayload, WorkflowRefreshPayload,
@@ -118,6 +120,21 @@ impl ProtocolValidator {
         }
 
         Ok(())
+    }
+
+    /// Applies the backend-native `ConversationCleared` boundary for an agent
+    /// stream. That wire notification is not a client protocol frame, so the
+    /// owning backend bridge must call this explicit typed reset point.
+    pub fn conversation_cleared(&mut self, stream: &StreamPath) {
+        let Some(state) = self.agent_streams.get_mut(stream) else {
+            return;
+        };
+        state.active_stream = None;
+        state.assistant_turn_open = false;
+        state.known_message_ids.clear();
+        state.terminal_stream_message_ids.clear();
+        state.pending_tool_calls.clear();
+        state.cancelled_tool_calls.clear();
     }
 
     fn validate_host_envelope(&mut self, envelope: &Envelope) -> Result<(), ProtocolViolation> {
@@ -298,6 +315,9 @@ impl ProtocolValidator {
                     envelope,
                     "BackendConfigSnapshots",
                 )
+            }
+            FrameKind::BackendCapacity => {
+                parse_host_payload::<BackendCapacityPayload>(self, envelope, "BackendCapacity")
             }
             FrameKind::SessionSchemas => {
                 parse_host_payload::<SessionSchemasPayload>(self, envelope, "SessionSchemas")
@@ -842,6 +862,7 @@ impl ProtocolValidator {
                 active_stream: None,
                 assistant_turn_open: false,
                 known_message_ids: HashMap::new(),
+                terminal_stream_message_ids: HashSet::new(),
                 pending_tool_calls: HashMap::new(),
                 cancelled_tool_calls: HashMap::new(),
             },
@@ -1383,10 +1404,11 @@ fn validate_chat_event(
         }
         ChatEvent::StreamStart(data) => {
             if state.active_stream.is_some() {
-                return Err(build_violation(
+                return Err(build_stream_identity_violation(
                     recent_frames,
                     envelope,
-                    Some(state.backend_kind),
+                    state.backend_kind,
+                    StreamIdentityViolation::ForeignActiveMessageId,
                     "received StreamStart while previous assistant stream is still open".to_owned(),
                 ));
             }
@@ -1399,14 +1421,30 @@ fn validate_chat_event(
                         .to_owned(),
                 ));
             }
+            let message_id = required_stream_message_id(
+                recent_frames,
+                envelope,
+                state.backend_kind,
+                data.required_message_id(),
+                "StreamStart",
+            )?;
+            if state.known_message_ids.contains_key(&message_id)
+                || state.terminal_stream_message_ids.contains(&message_id)
+            {
+                return Err(build_stream_identity_violation(
+                    recent_frames,
+                    envelope,
+                    state.backend_kind,
+                    StreamIdentityViolation::DuplicateTerminalMessageId,
+                    "received StreamStart with a previously terminal message_id".to_owned(),
+                ));
+            }
             state.assistant_turn_open = true;
-            state.active_stream = Some(ActiveStreamState {
-                message_id: data.message_id.clone(),
-            });
+            state.active_stream = Some(ActiveStreamState { message_id });
             Ok(())
         }
         ChatEvent::StreamDelta(delta) | ChatEvent::StreamReasoningDelta(delta) => {
-            let Some(active) = state.active_stream.as_mut() else {
+            let Some(active) = state.active_stream.as_ref() else {
                 return Err(build_violation(
                     recent_frames,
                     envelope,
@@ -1414,13 +1452,45 @@ fn validate_chat_event(
                     format!("received {} before StreamStart", chat_event_label(event)),
                 ));
             };
-            if let Some(actual) = &delta.message_id {
-                active.message_id = Some(actual.clone());
+            let actual = required_stream_message_id(
+                recent_frames,
+                envelope,
+                state.backend_kind,
+                delta.required_message_id(),
+                chat_event_label(event),
+            )?;
+            if actual != active.message_id {
+                return Err(build_stream_identity_violation(
+                    recent_frames,
+                    envelope,
+                    state.backend_kind,
+                    StreamIdentityViolation::ForeignActiveMessageId,
+                    format!(
+                        "received {} for a foreign active message_id",
+                        chat_event_label(event)
+                    ),
+                ));
             }
             Ok(())
         }
         ChatEvent::StreamEnd(data) => {
-            let Some(active_stream) = state.active_stream.take() else {
+            let actual = required_chat_message_id(
+                recent_frames,
+                envelope,
+                state.backend_kind,
+                data.required_message_id(),
+                "StreamEnd",
+            )?;
+            let Some(active_stream) = state.active_stream.as_ref() else {
+                if state.terminal_stream_message_ids.contains(&actual) {
+                    return Err(build_stream_identity_violation(
+                        recent_frames,
+                        envelope,
+                        state.backend_kind,
+                        StreamIdentityViolation::ConflictingDuplicateCompletion,
+                        "received a duplicate StreamEnd for a terminal message_id".to_owned(),
+                    ));
+                }
                 return Err(build_violation(
                     recent_frames,
                     envelope,
@@ -1428,21 +1498,19 @@ fn validate_chat_event(
                     "received StreamEnd before StreamStart".to_owned(),
                 ));
             };
-            if let (Some(expected), Some(actual)) = (
-                active_stream.message_id.as_deref(),
-                data.message.message_id.as_ref().map(|id| id.0.as_str()),
-            ) && expected != actual
-            {
-                return Err(build_violation(
+            if actual != active_stream.message_id {
+                return Err(build_stream_identity_violation(
                     recent_frames,
                     envelope,
-                    Some(state.backend_kind),
-                    format!(
-                        "received StreamEnd message_id {actual} but active stream message_id is {expected}"
-                    ),
+                    state.backend_kind,
+                    StreamIdentityViolation::MismatchedEndMessageId,
+                    "received StreamEnd with a message_id different from the active stream"
+                        .to_owned(),
                 ));
             }
             register_message_id(recent_frames, envelope, state, &data.message)?;
+            state.active_stream.take();
+            state.terminal_stream_message_ids.insert(actual);
             Ok(())
         }
         ChatEvent::ToolRequest(request) => {
@@ -1466,6 +1534,9 @@ fn validate_chat_event(
             Ok(())
         }
         ChatEvent::OperationCancelled(_) => {
+            if let Some(active) = state.active_stream.take() {
+                state.terminal_stream_message_ids.insert(active.message_id);
+            }
             state
                 .cancelled_tool_calls
                 .extend(state.pending_tool_calls.drain());
@@ -1492,21 +1563,68 @@ fn register_message_id(
         crate::MessageSender::Assistant { .. } => KnownMessageKind::Assistant,
         _ => KnownMessageKind::Other,
     };
-    if let Some(existing) = state.known_message_ids.get(message_id)
-        && *existing != kind
-    {
-        return Err(build_violation(
+    if let Some(existing) = state.known_message_ids.get(message_id) {
+        let violation = build_violation(
             recent_frames,
             envelope,
             Some(state.backend_kind),
             format!(
-                "received message_id {} for {:?} message after it was used for {:?}",
-                message_id, kind, existing
+                "received duplicate message_id for {:?} message after it was used for {:?}",
+                kind, existing
             ),
-        ));
+        );
+        return Err(violation);
     }
     state.known_message_ids.insert(message_id.clone(), kind);
     Ok(())
+}
+
+fn required_stream_message_id(
+    recent_frames: &[ObservedFrame],
+    envelope: &Envelope,
+    backend_kind: BackendKind,
+    message_id: Result<ChatMessageId, StreamIdentityViolation>,
+    event_label: &str,
+) -> Result<ChatMessageId, ProtocolViolation> {
+    message_id.map_err(|kind| {
+        build_stream_identity_violation(
+            recent_frames,
+            envelope,
+            backend_kind,
+            kind,
+            format!("received {event_label} without a message_id"),
+        )
+    })
+}
+
+fn required_chat_message_id(
+    recent_frames: &[ObservedFrame],
+    envelope: &Envelope,
+    backend_kind: BackendKind,
+    message_id: Result<ChatMessageId, StreamIdentityViolation>,
+    event_label: &str,
+) -> Result<ChatMessageId, ProtocolViolation> {
+    message_id.map_err(|kind| {
+        build_stream_identity_violation(
+            recent_frames,
+            envelope,
+            backend_kind,
+            kind,
+            format!("received {event_label} without a message_id"),
+        )
+    })
+}
+
+fn build_stream_identity_violation(
+    recent_frames: &[ObservedFrame],
+    envelope: &Envelope,
+    backend_kind: BackendKind,
+    kind: StreamIdentityViolation,
+    message: String,
+) -> ProtocolViolation {
+    let mut violation = build_violation(recent_frames, envelope, Some(backend_kind), message);
+    violation.stream_identity_violation = Some(kind);
+    violation
 }
 
 fn validate_tool_request(
@@ -1594,6 +1712,7 @@ fn build_violation(
         frame_kind: envelope.kind,
         backend_kind,
         message,
+        stream_identity_violation: None,
         recent_frames: recent_frames.to_vec(),
     }
 }
@@ -1605,6 +1724,7 @@ pub struct ProtocolViolation {
     pub frame_kind: FrameKind,
     pub backend_kind: Option<BackendKind>,
     pub message: String,
+    pub stream_identity_violation: Option<StreamIdentityViolation>,
     pub recent_frames: Vec<ObservedFrame>,
 }
 
@@ -1662,13 +1782,14 @@ struct AgentStreamState {
     active_stream: Option<ActiveStreamState>,
     assistant_turn_open: bool,
     known_message_ids: HashMap<ChatMessageId, KnownMessageKind>,
+    terminal_stream_message_ids: HashSet<ChatMessageId>,
     pending_tool_calls: HashMap<String, String>,
     cancelled_tool_calls: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
 struct ActiveStreamState {
-    message_id: Option<String>,
+    message_id: ChatMessageId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2091,6 +2212,7 @@ mod tests {
             tool_result: crate::ToolExecutionResult::Other { result: json!({}) },
             success: true,
             error: None,
+            normalization_failure: None,
         })
     }
 
@@ -2490,7 +2612,7 @@ mod tests {
             .validate_envelope(&chat_envelope(
                 3,
                 &ChatEvent::StreamEnd(StreamEndData {
-                    message: assistant_message("hi"),
+                    message: assistant_message_with_id("msg-1", "hi"),
                 }),
             ))
             .unwrap();
@@ -2500,6 +2622,107 @@ mod tests {
         validator
             .validate_envelope(&chat_envelope(5, &tool_completed("call-1")))
             .unwrap();
+    }
+
+    #[test]
+    fn conversation_cleared_releases_known_and_terminal_stream_message_ids() {
+        let mut validator = ProtocolValidator::new();
+
+        validator.validate_envelope(&new_agent_envelope()).unwrap();
+        validator
+            .validate_envelope(&agent_bootstrap_start_envelope())
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(
+                1,
+                &ChatEvent::StreamStart(StreamStartData {
+                    message_id: Some("msg-1".to_owned()),
+                    agent: "assistant".to_owned(),
+                    model: None,
+                }),
+            ))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(
+                2,
+                &ChatEvent::StreamEnd(StreamEndData {
+                    message: assistant_message_with_id("msg-1", "first"),
+                }),
+            ))
+            .unwrap();
+
+        validator.conversation_cleared(&agent_stream());
+
+        validator
+            .validate_envelope(&chat_envelope(
+                3,
+                &ChatEvent::StreamStart(StreamStartData {
+                    message_id: Some("msg-1".to_owned()),
+                    agent: "assistant".to_owned(),
+                    model: None,
+                }),
+            ))
+            .expect("ConversationCleared must release prior known and terminal ids");
+    }
+
+    #[test]
+    fn operation_cancelled_discards_an_open_stream_for_the_next_stream_start() {
+        let mut validator = ProtocolValidator::new();
+
+        validator.validate_envelope(&new_agent_envelope()).unwrap();
+        validator
+            .validate_envelope(&agent_bootstrap_start_envelope())
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(
+                1,
+                &ChatEvent::StreamStart(StreamStartData {
+                    message_id: Some("discarded".to_owned()),
+                    agent: "assistant".to_owned(),
+                    model: None,
+                }),
+            ))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(
+                2,
+                &ChatEvent::OperationCancelled(crate::OperationCancelledData {
+                    message: "Stream identity violation".to_owned(),
+                }),
+            ))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(
+                3,
+                &ChatEvent::StreamStart(StreamStartData {
+                    message_id: Some("next".to_owned()),
+                    agent: "assistant".to_owned(),
+                    model: None,
+                }),
+            ))
+            .expect("a discarded stream must not block the next stream start");
+        validator
+            .validate_envelope(&chat_envelope(
+                4,
+                &ChatEvent::StreamEnd(StreamEndData {
+                    message: assistant_message_with_id("next", "next response"),
+                }),
+            ))
+            .unwrap();
+        let duplicate = validator
+            .validate_envelope(&chat_envelope(
+                5,
+                &ChatEvent::StreamStart(StreamStartData {
+                    message_id: Some("discarded".to_owned()),
+                    agent: "assistant".to_owned(),
+                    model: None,
+                }),
+            ))
+            .expect_err("discarded ids remain terminal until ConversationCleared");
+        assert_eq!(
+            duplicate.stream_identity_violation,
+            Some(StreamIdentityViolation::DuplicateTerminalMessageId)
+        );
     }
 
     #[test]
@@ -2538,6 +2761,31 @@ mod tests {
         validator
             .validate_envelope(&chat_envelope(2, &metadata_updated("msg-1")))
             .unwrap();
+    }
+
+    #[test]
+    fn rejects_duplicate_same_sender_message_id() {
+        let mut validator = ProtocolValidator::new();
+
+        validator.validate_envelope(&new_agent_envelope()).unwrap();
+        validator
+            .validate_envelope(&agent_bootstrap_start_envelope())
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(
+                1,
+                &assistant_message_added_with_id("msg-1", "first"),
+            ))
+            .unwrap();
+        let violation = validator
+            .validate_envelope(&chat_envelope(
+                2,
+                &assistant_message_added_with_id("msg-1", "duplicate"),
+            ))
+            .expect_err("same-sender messages must not reuse an id");
+
+        assert_eq!(violation.stream_identity_violation, None);
+        assert!(!violation.message.contains("msg-1"));
     }
 
     #[test]
@@ -2603,7 +2851,188 @@ mod tests {
             ))
             .expect_err("StreamEnd should preserve the active stream message id");
 
-        assert!(violation.to_string().contains("active stream message_id"));
+        assert!(
+            violation
+                .to_string()
+                .contains("message_id different from the active stream")
+        );
+        assert_eq!(
+            violation.stream_identity_violation,
+            Some(StreamIdentityViolation::MismatchedEndMessageId)
+        );
+
+        validator
+            .validate_envelope(&chat_envelope(
+                3,
+                &ChatEvent::StreamEnd(StreamEndData {
+                    message: assistant_message_with_id("msg-1", "hi"),
+                }),
+            ))
+            .expect("a rejected foreign end must not replace the active stream id");
+    }
+
+    #[test]
+    fn rejects_missing_and_foreign_stream_delta_ids_without_rebinding() {
+        let mut validator = ProtocolValidator::new();
+
+        validator.validate_envelope(&new_agent_envelope()).unwrap();
+        validator
+            .validate_envelope(&agent_bootstrap_start_envelope())
+            .unwrap();
+        let missing = validator
+            .validate_envelope(&chat_envelope(
+                1,
+                &ChatEvent::StreamStart(StreamStartData {
+                    message_id: None,
+                    agent: "assistant".to_owned(),
+                    model: None,
+                }),
+            ))
+            .expect_err("runtime stream starts require a message id");
+        assert_eq!(
+            missing.stream_identity_violation,
+            Some(StreamIdentityViolation::MissingMessageId)
+        );
+
+        validator
+            .validate_envelope(&chat_envelope(
+                2,
+                &ChatEvent::StreamStart(StreamStartData {
+                    message_id: Some("msg-1".to_owned()),
+                    agent: "assistant".to_owned(),
+                    model: None,
+                }),
+            ))
+            .unwrap();
+        let foreign = validator
+            .validate_envelope(&chat_envelope(
+                3,
+                &ChatEvent::StreamDelta(StreamTextDeltaData {
+                    message_id: Some("msg-2".to_owned()),
+                    text: "foreign".to_owned(),
+                }),
+            ))
+            .expect_err("a delta must not rebind the active stream id");
+        assert_eq!(
+            foreign.stream_identity_violation,
+            Some(StreamIdentityViolation::ForeignActiveMessageId)
+        );
+
+        validator
+            .validate_envelope(&chat_envelope(
+                4,
+                &ChatEvent::StreamDelta(StreamTextDeltaData {
+                    message_id: Some("msg-1".to_owned()),
+                    text: "accepted".to_owned(),
+                }),
+            ))
+            .expect("a foreign delta must leave the original stream active");
+        validator
+            .validate_envelope(&chat_envelope(
+                5,
+                &ChatEvent::StreamEnd(StreamEndData {
+                    message: assistant_message_with_id("msg-1", "accepted"),
+                }),
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn rejects_second_stream_start_without_closing_or_rebinding_the_first() {
+        let mut validator = ProtocolValidator::new();
+
+        validator.validate_envelope(&new_agent_envelope()).unwrap();
+        validator
+            .validate_envelope(&agent_bootstrap_start_envelope())
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(
+                1,
+                &ChatEvent::StreamStart(StreamStartData {
+                    message_id: Some("msg-1".to_owned()),
+                    agent: "assistant".to_owned(),
+                    model: None,
+                }),
+            ))
+            .unwrap();
+        let violation = validator
+            .validate_envelope(&chat_envelope(
+                2,
+                &ChatEvent::StreamStart(StreamStartData {
+                    message_id: Some("msg-2".to_owned()),
+                    agent: "assistant".to_owned(),
+                    model: None,
+                }),
+            ))
+            .expect_err("a second stream start must be rejected");
+        assert_eq!(
+            violation.stream_identity_violation,
+            Some(StreamIdentityViolation::ForeignActiveMessageId)
+        );
+        validator
+            .validate_envelope(&chat_envelope(
+                3,
+                &ChatEvent::StreamEnd(StreamEndData {
+                    message: assistant_message_with_id("msg-1", "first"),
+                }),
+            ))
+            .expect("rejected second start must leave the first stream active");
+    }
+
+    #[test]
+    fn rejects_reused_terminal_stream_message_id() {
+        let mut validator = ProtocolValidator::new();
+
+        validator.validate_envelope(&new_agent_envelope()).unwrap();
+        validator
+            .validate_envelope(&agent_bootstrap_start_envelope())
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(
+                1,
+                &ChatEvent::StreamStart(StreamStartData {
+                    message_id: Some("msg-1".to_owned()),
+                    agent: "assistant".to_owned(),
+                    model: None,
+                }),
+            ))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(
+                2,
+                &ChatEvent::StreamEnd(StreamEndData {
+                    message: assistant_message_with_id("msg-1", "complete"),
+                }),
+            ))
+            .unwrap();
+
+        let violation = validator
+            .validate_envelope(&chat_envelope(
+                3,
+                &ChatEvent::StreamStart(StreamStartData {
+                    message_id: Some("msg-1".to_owned()),
+                    agent: "assistant".to_owned(),
+                    model: None,
+                }),
+            ))
+            .expect_err("terminal stream ids are immutable");
+        assert_eq!(
+            violation.stream_identity_violation,
+            Some(StreamIdentityViolation::DuplicateTerminalMessageId)
+        );
+
+        let duplicate_end = validator
+            .validate_envelope(&chat_envelope(
+                4,
+                &ChatEvent::StreamEnd(StreamEndData {
+                    message: assistant_message_with_id("msg-1", "complete"),
+                }),
+            ))
+            .expect_err("a terminal stream must not complete twice");
+        assert_eq!(
+            duplicate_end.stream_identity_violation,
+            Some(StreamIdentityViolation::ConflictingDuplicateCompletion)
+        );
     }
 
     #[test]
@@ -2631,7 +3060,7 @@ mod tests {
             .validate_envelope(&chat_envelope(
                 3,
                 &ChatEvent::StreamEnd(StreamEndData {
-                    message: assistant_message("hi"),
+                    message: assistant_message_with_id("msg-1", "hi"),
                 }),
             ))
             .unwrap();
@@ -2733,7 +3162,7 @@ mod tests {
             .validate_envelope(&chat_envelope(
                 2,
                 &ChatEvent::StreamEnd(StreamEndData {
-                    message: assistant_message("hi"),
+                    message: assistant_message_with_id("msg-1", "hi"),
                 }),
             ))
             .unwrap();
@@ -2780,7 +3209,7 @@ mod tests {
             .validate_envelope(&chat_envelope(
                 2,
                 &ChatEvent::StreamEnd(StreamEndData {
-                    message: assistant_message("hi"),
+                    message: assistant_message_with_id("msg-1", "hi"),
                 }),
             ))
             .unwrap();
@@ -2829,7 +3258,7 @@ mod tests {
             .validate_envelope(&chat_envelope(
                 2,
                 &ChatEvent::StreamEnd(StreamEndData {
-                    message: assistant_message("hi"),
+                    message: assistant_message_with_id("msg-1", "hi"),
                 }),
             ))
             .unwrap();

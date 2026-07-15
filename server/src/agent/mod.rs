@@ -5,17 +5,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use protocol::types::StreamIdentityViolation;
 use protocol::{
     AgentActivityStats, AgentActivityStatsPayload, AgentActivitySummary, AgentBootstrapEvent,
     AgentBootstrapPayload, AgentControlLatestOutput, AgentControlOutput, AgentErrorCode,
     AgentErrorPayload, AgentId, AgentInput, AgentOrigin, AgentRenamedPayload, AgentStartPayload,
     BackendAccessMode, BackendKind, ChatEvent, ChatMessage, ChatMessageId, Envelope, FrameKind,
-    MessageMetadataUpdateData, MessageOrigin, MessageSender, MessageTokenUsage, ModelRequestId,
-    ModelRequestTokenUsage, QueuedMessageEntry, QueuedMessageId, QueuedMessagesPayload,
-    ReviewErrorContext, SendMessagePayload, SessionId, SessionSettingsPayload,
-    SessionSettingsValues, SpawnCostHint, StreamEndData, StreamStartData, StreamTextDeltaData,
-    TaskTokenUsageAmount, TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage,
-    TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult,
+    MessageMetadataUpdateData, MessageOrigin, MessageSender, MessageTokenUsage, ModelInfo,
+    ModelRequestId, ModelRequestTokenUsage, QueuedMessageEntry, QueuedMessageId,
+    QueuedMessagesPayload, ReasoningData, ReviewErrorContext, SendMessagePayload, SessionId,
+    SessionSettingsPayload, SessionSettingsValues, SpawnCostHint, StreamEndData, StreamStartData,
+    StreamTextDeltaData, TaskTokenUsageAmount, TaskTokenUsageScope,
+    TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
+    ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -29,11 +31,12 @@ use crate::backend::kiro::KiroBackend;
 use crate::backend::mock::MockBackend;
 use crate::backend::tycode::TycodeBackend;
 use crate::backend::{
-    Backend, BackendEvent, BackendSession, BackendSpawnConfig, BackendStartupError, EventStream,
-    StartupMcpServer, apply_session_settings_update, resolve_backend_session_settings,
-    validate_runtime_session_settings_update, validate_session_settings_values,
+    Backend, BackendEvent, BackendExecutionMode, BackendSession, BackendSpawnConfig,
+    BackendStartupError, EventStream, apply_session_settings_update,
+    resolve_backend_session_settings, validate_runtime_session_settings_update,
+    validate_session_settings_values,
 };
-use crate::host::HostSubAgentEmitter;
+use crate::host::{HostCapacityTx, HostSubAgentEmitter};
 use crate::review::ReviewRegistryHandle;
 use crate::store::session::SessionStore;
 use crate::stream::Stream;
@@ -58,6 +61,23 @@ type BackendSpawnResult = Result<(BackendHandle, EventStream, SessionId), String
 type BackendForkResult = Result<(BackendHandle, EventStream, SessionId), BackendStartupError>;
 type BackendResumeResult = Result<(BackendHandle, EventStream), String>;
 type BackendFuture<T> = Pin<Box<dyn std::future::Future<Output = T> + Send>>;
+
+#[derive(Clone)]
+struct HostSubAgentEmitterContext {
+    host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
+    capacity_tx: HostCapacityTx,
+}
+
+impl HostSubAgentEmitterContext {
+    fn emitter(self, agent_id: AgentId, workspace_roots: Vec<String>) -> HostSubAgentEmitter {
+        HostSubAgentEmitter::new(
+            self.host_sub_agent_spawn_tx,
+            self.capacity_tx,
+            agent_id,
+            workspace_roots,
+        )
+    }
+}
 
 impl From<BackendStartupError> for AgentStartupFailure {
     fn from(error: BackendStartupError) -> Self {
@@ -111,9 +131,34 @@ struct AgentNameChangeContext<'a> {
 pub(crate) struct AgentActorRuntimeContext {
     pub(crate) session_store: Arc<Mutex<SessionStore>>,
     pub(crate) host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
+    pub(crate) capacity_tx: HostCapacityTx,
     pub(crate) review_registry: ReviewRegistryHandle,
     pub(crate) status_handle: registry::AgentStatusHandle,
     pub(crate) antigravity_conversations_dir: PathBuf,
+}
+
+pub(crate) struct AgentActorRuntimeResources {
+    pub(crate) session_store: Arc<Mutex<SessionStore>>,
+    pub(crate) host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
+    pub(crate) capacity_tx: HostCapacityTx,
+    pub(crate) review_registry: ReviewRegistryHandle,
+    pub(crate) antigravity_conversations_dir: PathBuf,
+}
+
+impl AgentActorRuntimeResources {
+    pub(crate) fn with_status(
+        self,
+        status_handle: registry::AgentStatusHandle,
+    ) -> AgentActorRuntimeContext {
+        AgentActorRuntimeContext {
+            session_store: self.session_store,
+            host_sub_agent_spawn_tx: self.host_sub_agent_spawn_tx,
+            capacity_tx: self.capacity_tx,
+            review_registry: self.review_registry,
+            status_handle,
+            antigravity_conversations_dir: self.antigravity_conversations_dir,
+        }
+    }
 }
 
 enum AgentCommand {
@@ -213,6 +258,8 @@ struct ActiveCompaction {
 struct AgentReplayState {
     active_stream: Option<ReplayActiveStream>,
     completed_stream: Option<ReplayCompletedStream>,
+    terminal_stream_message_ids: HashSet<ChatMessageId>,
+    recorded_message_senders: HashMap<ChatMessageId, MessageSender>,
     typing: bool,
     /// Position in the event_log of the single retained `ToolProgress`
     /// envelope per tool_call_id. Progress snapshots are coalesced
@@ -225,6 +272,13 @@ struct AgentReplayState {
 impl AgentReplayState {
     fn clear_active_stream(&mut self) {
         self.active_stream = None;
+        self.completed_stream = None;
+    }
+
+    fn discard_active_stream(&mut self) {
+        if let Some(stream) = self.active_stream.take() {
+            self.terminal_stream_message_ids.insert(stream.message_id);
+        }
         self.completed_stream = None;
     }
 
@@ -241,17 +295,17 @@ impl AgentReplayState {
             return events;
         };
 
-        let current_message_id = active.current_message_id.clone();
+        let current_message_id = active.message_id.0.clone();
         events.push(ChatEvent::StreamStart(active.start.clone()));
         if !active.reasoning.is_empty() {
             events.push(ChatEvent::StreamReasoningDelta(StreamTextDeltaData {
-                message_id: current_message_id.clone(),
+                message_id: Some(current_message_id.clone()),
                 text: active.reasoning.clone(),
             }));
         }
         if !active.text.is_empty() {
             events.push(ChatEvent::StreamDelta(StreamTextDeltaData {
-                message_id: current_message_id,
+                message_id: Some(current_message_id),
                 text: active.text.clone(),
             }));
         }
@@ -263,17 +317,17 @@ impl AgentReplayState {
         let Some(completed) = &self.completed_stream else {
             return;
         };
-        let current_message_id = completed.stream.current_message_id.clone();
+        let current_message_id = completed.stream.message_id.0.clone();
         events.push(ChatEvent::StreamStart(completed.stream.start.clone()));
         if !completed.stream.reasoning.is_empty() {
             events.push(ChatEvent::StreamReasoningDelta(StreamTextDeltaData {
-                message_id: current_message_id.clone(),
+                message_id: Some(current_message_id.clone()),
                 text: completed.stream.reasoning.clone(),
             }));
         }
         if !completed.stream.text.is_empty() {
             events.push(ChatEvent::StreamDelta(StreamTextDeltaData {
-                message_id: current_message_id,
+                message_id: Some(current_message_id),
                 text: completed.stream.text.clone(),
             }));
         }
@@ -301,18 +355,7 @@ impl AgentReplayState {
                 .filter_map(chat_event_tool_call_id)
                 .map(ToOwned::to_owned),
         );
-        let mut message = completed.end.message.clone();
-        if message.message_id.is_none()
-            && let Some(message_id) = completed.stream.current_message_id.clone().or(completed
-                .stream
-                .start
-                .message_id
-                .clone())
-        {
-            message.message_id = Some(ChatMessageId(message_id));
-        }
-        let message =
-            message_has_renderable_content(&message, !tool_call_ids.is_empty()).then_some(message);
+        let message = Some(completed.end.message.clone());
         Some(CompletedStreamHistoryFilter {
             message,
             tool_call_ids,
@@ -391,7 +434,7 @@ impl CompletedStreamHistoryFilter {
 }
 
 struct ReplayActiveStream {
-    current_message_id: Option<String>,
+    message_id: ChatMessageId,
     start: StreamStartData,
     text: String,
     reasoning: String,
@@ -689,14 +732,21 @@ impl AgentActivityStatsTracker {
                 .retain(|_, usage| matches!(usage, TaskTokenUsageScope::Known { .. }));
         } else {
             self.refresh_token_usage();
-            token_usage.cumulative = match synthesized_cumulative_unavailable_reason(
-                self.token_usage_by_source.values(),
+            if !matches!(
+                token_usage.cumulative,
+                TokenUsageScope::Unavailable {
+                    reason: TokenUsageUnavailableReason::ProviderScopeAmbiguous
+                }
             ) {
-                Some(reason) => TokenUsageScope::Unavailable { reason },
-                None => TokenUsageScope::Known {
-                    usage: Box::new(self.stats.token_usage.clone()),
-                },
-            };
+                token_usage.cumulative = match synthesized_cumulative_unavailable_reason(
+                    self.token_usage_by_source.values(),
+                ) {
+                    Some(reason) => TokenUsageScope::Unavailable { reason },
+                    None => TokenUsageScope::Known {
+                        usage: Box::new(self.stats.token_usage.clone()),
+                    },
+                };
+            }
         }
         self.stats.source_through_seq = Some(source_seq);
         token_usage
@@ -1032,10 +1082,9 @@ enum ActorLifecycle {
 
 pub(crate) struct GenerateAgentNameRequest {
     pub backend_kind: BackendKind,
-    pub workspace_roots: Vec<String>,
     pub prompt: String,
-    pub startup_mcp_servers: Vec<StartupMcpServer>,
     pub use_mock_backend: bool,
+    pub capacity_tx: HostCapacityTx,
 }
 
 pub(crate) struct GenerateAgentActivitySummaryRequest {
@@ -1047,6 +1096,7 @@ pub(crate) struct GenerateAgentActivitySummaryRequest {
     pub source_from_seq: Option<u64>,
     pub source_through_seq: Option<u64>,
     pub use_mock_backend: bool,
+    pub capacity_tx: HostCapacityTx,
 }
 
 pub(crate) async fn generate_agent_name(
@@ -1063,19 +1113,10 @@ pub(crate) async fn generate_agent_name(
 
     let name_prompt = build_name_generation_prompt(prompt);
     let logged_name_prompt = name_prompt.clone();
-    let startup_mcp_server_names = request
-        .startup_mcp_servers
-        .iter()
-        .map(|server| server.name.clone())
-        .collect::<Vec<_>>();
-    let spawn_config = BackendSpawnConfig {
-        cost_hint: Some(SpawnCostHint::Low),
-        custom_agent_id: None,
-        startup_mcp_servers: request.startup_mcp_servers,
-        session_settings: None,
-        backend_config: Default::default(),
-        resolved_spawn_config: Default::default(),
-    };
+    let spawn_config = agent_name_generation_spawn_config();
+    let isolated_workspace = tempfile::tempdir()
+        .map_err(|err| format!("failed to create isolated agent naming workspace: {err}"))?;
+    let workspace_roots = vec![isolated_workspace.path().to_string_lossy().into_owned()];
     let initial_input = SendMessagePayload {
         message: name_prompt,
         images: None,
@@ -1087,10 +1128,13 @@ pub(crate) async fn generate_agent_name(
     let (_backend, mut events, _session_id) = match spawn_backend(
         &name_agent_id,
         request.backend_kind,
-        request.workspace_roots,
+        workspace_roots,
         spawn_config,
         initial_input,
-        host_sub_agent_spawn_tx,
+        HostSubAgentEmitterContext {
+            host_sub_agent_spawn_tx,
+            capacity_tx: request.capacity_tx.clone(),
+        },
         None,
     )
     .await
@@ -1111,12 +1155,27 @@ pub(crate) async fn generate_agent_name(
             cost_hint = ?SpawnCostHint::Low,
             prompt = %prompt,
             name_prompt = %logged_name_prompt,
-            startup_mcp_servers = ?startup_mcp_server_names,
             error = %err,
             "agent name generator failed"
         );
     }
     result
+}
+
+pub(crate) fn agent_name_generation_spawn_config() -> BackendSpawnConfig {
+    BackendSpawnConfig {
+        execution_mode: BackendExecutionMode::InferenceOnly,
+        cost_hint: Some(SpawnCostHint::Low),
+        custom_agent_id: None,
+        startup_mcp_servers: Vec::new(),
+        session_settings: None,
+        backend_config: Default::default(),
+        resolved_spawn_config: customization::ResolvedSpawnConfig {
+            tool_policy: ToolPolicy::AllowList { tools: Vec::new() },
+            access_mode: BackendAccessMode::ReadOnly,
+            ..Default::default()
+        },
+    }
 }
 
 async fn collect_agent_name_events(events: &mut EventStream) -> Result<String, String> {
@@ -1175,6 +1234,7 @@ pub(crate) async fn generate_agent_activity_summary(
         ..Default::default()
     };
     let spawn_config = BackendSpawnConfig {
+        execution_mode: BackendExecutionMode::Agent,
         cost_hint: Some(SpawnCostHint::Low),
         custom_agent_id: None,
         startup_mcp_servers: Vec::new(),
@@ -1199,7 +1259,10 @@ pub(crate) async fn generate_agent_activity_summary(
         workspace_roots,
         spawn_config,
         initial_input,
-        host_sub_agent_spawn_tx,
+        HostSubAgentEmitterContext {
+            host_sub_agent_spawn_tx,
+            capacity_tx: request.capacity_tx.clone(),
+        },
         None,
     )
     .await
@@ -1434,7 +1497,7 @@ async fn spawn_backend(
     workspace_roots: Vec<String>,
     config: BackendSpawnConfig,
     initial_input: SendMessagePayload,
-    host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
+    sub_agent_context: HostSubAgentEmitterContext,
     antigravity_conversations_dir: Option<PathBuf>,
 ) -> BackendSpawnResult {
     match backend_kind {
@@ -1449,11 +1512,8 @@ async fn spawn_backend(
             Ok((Box::new(b), events, session_id))
         }
         BackendKind::Claude => {
-            let emitter = Arc::new(HostSubAgentEmitter::new(
-                host_sub_agent_spawn_tx,
-                agent_id.clone(),
-                workspace_roots.clone(),
-            ));
+            let emitter =
+                Arc::new(sub_agent_context.emitter(agent_id.clone(), workspace_roots.clone()));
             let (b, events) = ClaudeBackend::spawn_with_subagent_emitter(
                 workspace_roots,
                 config,
@@ -1465,15 +1525,16 @@ async fn spawn_backend(
             Ok((Box::new(b), events, session_id))
         }
         BackendKind::Codex => {
-            let (b, events) =
-                CodexBackend::spawn(workspace_roots.clone(), config, initial_input).await?;
-            let session_id = Backend::session_id(&b);
-            b.set_subagent_emitter(Arc::new(HostSubAgentEmitter::new(
-                host_sub_agent_spawn_tx,
-                agent_id.clone(),
+            let emitter =
+                Arc::new(sub_agent_context.emitter(agent_id.clone(), workspace_roots.clone()));
+            let (b, events) = CodexBackend::spawn_with_subagent_emitter(
                 workspace_roots,
-            )))
-            .await;
+                config,
+                initial_input,
+                emitter,
+            )
+            .await?;
+            let session_id = Backend::session_id(&b);
             Ok((Box::new(b), events, session_id))
         }
         BackendKind::Antigravity => {
@@ -1505,7 +1566,7 @@ async fn resume_backend(
     workspace_roots: Vec<String>,
     config: BackendSpawnConfig,
     session_id: SessionId,
-    host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
+    sub_agent_context: HostSubAgentEmitterContext,
     antigravity_conversations_dir: Option<PathBuf>,
 ) -> BackendResumeResult {
     let (backend, events): (BackendHandle, EventStream) = match backend_kind {
@@ -1520,23 +1581,20 @@ async fn resume_backend(
         BackendKind::Claude => {
             let (b, events) =
                 ClaudeBackend::resume(workspace_roots.clone(), config, session_id.clone()).await?;
-            b.set_subagent_emitter(Arc::new(HostSubAgentEmitter::new(
-                host_sub_agent_spawn_tx,
-                agent_id.clone(),
-                workspace_roots,
-            )))
+            b.set_subagent_emitter(Arc::new(
+                sub_agent_context.emitter(agent_id.clone(), workspace_roots),
+            ))
             .await;
             (Box::new(b), events)
         }
         BackendKind::Codex => {
             let (b, events) =
                 CodexBackend::resume(workspace_roots.clone(), config, session_id.clone()).await?;
-            b.set_subagent_emitter(Arc::new(HostSubAgentEmitter::new(
-                host_sub_agent_spawn_tx,
-                agent_id.clone(),
-                workspace_roots,
-            )))
-            .await;
+            b.set_subagent_emitter(Arc::new(
+                sub_agent_context.emitter(agent_id.clone(), workspace_roots),
+            ))
+            .await
+            .map_err(|err| format!("Failed to install Codex sub-agent emitter: {err}"))?;
             (Box::new(b), events)
         }
         BackendKind::Antigravity => {
@@ -1568,7 +1626,7 @@ async fn fork_backend(
     config: BackendSpawnConfig,
     from_session_id: SessionId,
     initial_input: SendMessagePayload,
-    host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
+    sub_agent_context: HostSubAgentEmitterContext,
 ) -> BackendForkResult {
     match backend_kind {
         BackendKind::Tycode => {
@@ -1592,11 +1650,9 @@ async fn fork_backend(
                 initial_input,
             )
             .await?;
-            b.set_subagent_emitter(Arc::new(HostSubAgentEmitter::new(
-                host_sub_agent_spawn_tx,
-                agent_id.clone(),
-                workspace_roots,
-            )))
+            b.set_subagent_emitter(Arc::new(
+                sub_agent_context.emitter(agent_id.clone(), workspace_roots),
+            ))
             .await;
             let session_id = Backend::session_id(&b);
             Ok((Box::new(b), events, session_id))
@@ -1610,12 +1666,15 @@ async fn fork_backend(
             )
             .await?;
             let session_id = Backend::session_id(&b);
-            b.set_subagent_emitter(Arc::new(HostSubAgentEmitter::new(
-                host_sub_agent_spawn_tx,
-                agent_id.clone(),
-                workspace_roots,
-            )))
-            .await;
+            b.set_subagent_emitter(Arc::new(
+                sub_agent_context.emitter(agent_id.clone(), workspace_roots),
+            ))
+            .await
+            .map_err(|err| {
+                BackendStartupError::backend_failed(format!(
+                    "Failed to install Codex sub-agent emitter: {err}"
+                ))
+            })?;
             Ok((Box::new(b), events, session_id))
         }
         BackendKind::Antigravity => {
@@ -1640,17 +1699,15 @@ fn spawn_mock(
     workspace_roots: Vec<String>,
     config: BackendSpawnConfig,
     initial_input: SendMessagePayload,
-    host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
+    sub_agent_context: HostSubAgentEmitterContext,
 ) -> BackendFuture<BackendSpawnResult> {
     Box::pin(async move {
         let (b, events) =
             MockBackend::spawn(workspace_roots.clone(), config, initial_input).await?;
         let sid = Backend::session_id(&b);
-        b.set_subagent_emitter(Arc::new(HostSubAgentEmitter::new(
-            host_sub_agent_spawn_tx,
-            agent_id,
-            workspace_roots,
-        )))
+        b.set_subagent_emitter(Arc::new(
+            sub_agent_context.emitter(agent_id, workspace_roots),
+        ))
         .await;
         Ok((Box::new(b) as BackendHandle, events, sid))
     })
@@ -1660,7 +1717,7 @@ fn resume_mock(
     agent_id: AgentId,
     workspace_roots: Vec<String>,
     session_id: SessionId,
-    host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
+    sub_agent_context: HostSubAgentEmitterContext,
 ) -> BackendFuture<BackendResumeResult> {
     Box::pin(async move {
         let (b, events) = MockBackend::resume(
@@ -1669,11 +1726,9 @@ fn resume_mock(
             session_id.clone(),
         )
         .await?;
-        b.set_subagent_emitter(Arc::new(HostSubAgentEmitter::new(
-            host_sub_agent_spawn_tx,
-            agent_id,
-            workspace_roots,
-        )))
+        b.set_subagent_emitter(Arc::new(
+            sub_agent_context.emitter(agent_id, workspace_roots),
+        ))
         .await;
         Ok((Box::new(b) as BackendHandle, events))
     })
@@ -1685,7 +1740,7 @@ fn fork_mock(
     config: BackendSpawnConfig,
     from_session_id: SessionId,
     initial_input: SendMessagePayload,
-    host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
+    sub_agent_context: HostSubAgentEmitterContext,
 ) -> BackendFuture<BackendForkResult> {
     Box::pin(async move {
         let (b, events) = MockBackend::fork(
@@ -1696,11 +1751,9 @@ fn fork_mock(
         )
         .await?;
         let sid = Backend::session_id(&b);
-        b.set_subagent_emitter(Arc::new(HostSubAgentEmitter::new(
-            host_sub_agent_spawn_tx,
-            agent_id,
-            workspace_roots,
-        )))
+        b.set_subagent_emitter(Arc::new(
+            sub_agent_context.emitter(agent_id, workspace_roots),
+        ))
         .await;
         Ok((Box::new(b) as BackendHandle, events, sid))
     })
@@ -1715,10 +1768,15 @@ pub(crate) fn spawn_agent_actor(
     let AgentActorRuntimeContext {
         session_store,
         host_sub_agent_spawn_tx,
+        capacity_tx,
         review_registry,
         status_handle,
         antigravity_conversations_dir,
     } = runtime;
+    let sub_agent_context = HostSubAgentEmitterContext {
+        host_sub_agent_spawn_tx,
+        capacity_tx,
+    };
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentCommand>();
     let accepting_input = Arc::new(AtomicBool::new(false));
     let accepting_input_task = Arc::clone(&accepting_input);
@@ -1748,6 +1806,7 @@ pub(crate) fn spawn_agent_actor(
         } = request;
         let mut current_start = start.clone();
         let spawn_config = BackendSpawnConfig {
+            execution_mode: BackendExecutionMode::Agent,
             cost_hint,
             custom_agent_id: current_start.custom_agent_id.clone(),
             startup_mcp_servers,
@@ -1771,6 +1830,7 @@ pub(crate) fn spawn_agent_actor(
         let mut current_session_settings = resolve_backend_session_settings(
             backend_kind,
             &BackendSpawnConfig {
+                execution_mode: BackendExecutionMode::Agent,
                 cost_hint: initial_cost_hint,
                 custom_agent_id: current_start.custom_agent_id.clone(),
                 startup_mcp_servers: Vec::new(),
@@ -1787,105 +1847,220 @@ pub(crate) fn spawn_agent_actor(
         let starts_with_initial_turn = resume_session_id.is_none();
         let is_resume = resume_session_id.is_some();
 
-        let startup_result: Result<
-            (
-                BackendHandle,
-                EventStream,
-                SessionId,
-                Option<SendMessagePayload>,
-            ),
-            AgentStartupFailure,
-        > = if let Some(err) = startup_failure {
-            Err(err)
-        } else {
-            match resume_session_id {
-                Some(session_id) => {
-                    let resumed = if use_mock_backend {
-                        resume_mock(
-                            agent_id.clone(),
-                            workspace_roots.clone(),
-                            session_id.clone(),
-                            host_sub_agent_spawn_tx.clone(),
-                        )
-                        .await
-                    } else {
-                        resume_backend(
-                            &agent_id,
-                            backend_kind,
-                            workspace_roots.clone(),
-                            spawn_config.clone(),
-                            session_id.clone(),
-                            host_sub_agent_spawn_tx.clone(),
-                            Some(antigravity_conversations_dir.clone()),
-                        )
-                        .await
-                    };
-                    resumed
-                        .map(|(backend, events)| (backend, events, session_id, initial_input))
-                        .map_err(AgentStartupFailure::backend_failed)
-                }
-                None => {
-                    if let Some(from_session_id) = fork_from_session_id {
-                        let first_input = initial_input.expect("fork spawn requires initial_input");
-                        let forked = if use_mock_backend {
-                            fork_mock(
+        let mut startup_future = Box::pin(async {
+            #[cfg(test)]
+            wait_for_agent_startup_test_gate(&agent_id).await;
+            let startup_result: Result<
+                (
+                    BackendHandle,
+                    EventStream,
+                    SessionId,
+                    Option<SendMessagePayload>,
+                ),
+                AgentStartupFailure,
+            > = if let Some(err) = startup_failure {
+                Err(err)
+            } else {
+                match resume_session_id {
+                    Some(session_id) => {
+                        let resumed = if use_mock_backend {
+                            resume_mock(
                                 agent_id.clone(),
                                 workspace_roots.clone(),
-                                spawn_config,
-                                from_session_id,
-                                first_input,
-                                host_sub_agent_spawn_tx.clone(),
+                                session_id.clone(),
+                                sub_agent_context.clone(),
                             )
                             .await
                         } else {
-                            fork_backend(
+                            resume_backend(
                                 &agent_id,
                                 backend_kind,
                                 workspace_roots.clone(),
-                                spawn_config,
-                                from_session_id,
-                                first_input,
-                                host_sub_agent_spawn_tx.clone(),
+                                spawn_config.clone(),
+                                session_id.clone(),
+                                sub_agent_context.clone(),
+                                Some(antigravity_conversations_dir.clone()),
                             )
                             .await
                         };
-                        forked
-                            .map(|(backend, events, session_id)| {
-                                (backend, events, session_id, None)
-                            })
-                            .map_err(AgentStartupFailure::from)
-                    } else {
-                        let first_input = initial_input.expect("new spawn requires initial_input");
-                        let spawned = if use_mock_backend {
-                            spawn_mock(
-                                agent_id.clone(),
-                                workspace_roots.clone(),
-                                spawn_config,
-                                first_input,
-                                host_sub_agent_spawn_tx.clone(),
-                            )
-                            .await
-                        } else {
-                            spawn_backend(
-                                &agent_id,
-                                backend_kind,
-                                workspace_roots.clone(),
-                                spawn_config,
-                                first_input,
-                                host_sub_agent_spawn_tx.clone(),
-                                Some(antigravity_conversations_dir),
-                            )
-                            .await
-                        };
-                        spawned
-                            .map(|(backend, events, session_id)| {
-                                (backend, events, session_id, None)
-                            })
+                        resumed
+                            .map(|(backend, events)| (backend, events, session_id, initial_input))
                             .map_err(AgentStartupFailure::backend_failed)
+                    }
+                    None => {
+                        if let Some(from_session_id) = fork_from_session_id {
+                            let first_input =
+                                initial_input.expect("fork spawn requires initial_input");
+                            let forked = if use_mock_backend {
+                                fork_mock(
+                                    agent_id.clone(),
+                                    workspace_roots.clone(),
+                                    spawn_config,
+                                    from_session_id,
+                                    first_input,
+                                    sub_agent_context.clone(),
+                                )
+                                .await
+                            } else {
+                                fork_backend(
+                                    &agent_id,
+                                    backend_kind,
+                                    workspace_roots.clone(),
+                                    spawn_config,
+                                    from_session_id,
+                                    first_input,
+                                    sub_agent_context.clone(),
+                                )
+                                .await
+                            };
+                            forked
+                                .map(|(backend, events, session_id)| {
+                                    (backend, events, session_id, None)
+                                })
+                                .map_err(AgentStartupFailure::from)
+                        } else {
+                            let first_input =
+                                initial_input.expect("new spawn requires initial_input");
+                            let spawned = if use_mock_backend {
+                                spawn_mock(
+                                    agent_id.clone(),
+                                    workspace_roots.clone(),
+                                    spawn_config,
+                                    first_input,
+                                    sub_agent_context.clone(),
+                                )
+                                .await
+                            } else {
+                                spawn_backend(
+                                    &agent_id,
+                                    backend_kind,
+                                    workspace_roots.clone(),
+                                    spawn_config,
+                                    first_input,
+                                    sub_agent_context,
+                                    Some(antigravity_conversations_dir),
+                                )
+                                .await
+                            };
+                            spawned
+                                .map(|(backend, events, session_id)| {
+                                    (backend, events, session_id, None)
+                                })
+                                .map_err(AgentStartupFailure::backend_failed)
+                        }
+                    }
+                }
+            };
+            startup_result
+        });
+        let startup_cancellation_supported = backend_startup_drop_cancels_workers(backend_kind);
+        let mut pending_startup_attaches: Vec<(Stream, oneshot::Sender<bool>)> = Vec::new();
+        #[cfg(test)]
+        wait_for_agent_startup_selection_test_gate(&agent_id).await;
+        let startup_result = loop {
+            match next_agent_startup_event(
+                startup_future.as_mut(),
+                &mut rx,
+                startup_cancellation_supported,
+            )
+            .await
+            {
+                AgentStartupEvent::Completed(result) => break result,
+                AgentStartupEvent::Command(command) => {
+                    let Some(command) = command else {
+                        return;
+                    };
+                    match command {
+                        AgentCommand::Interrupt { reply } => {
+                            accepting_input_task.store(false, Ordering::SeqCst);
+                            status_handle
+                                .update(|status| {
+                                    status.terminated = true;
+                                    status.is_thinking = false;
+                                    status.turn_completed = true;
+                                    status.pending_user_response = None;
+                                    status.activity_counter =
+                                        status.activity_counter.saturating_add(1);
+                                })
+                                .await;
+                            for (_, attach_reply) in std::mem::take(&mut pending_startup_attaches) {
+                                let _ = attach_reply.send(true);
+                            }
+                            let _ = reply.send(InterruptOutcome::Interrupted);
+                            let _ = startup_tx.send(Err("agent startup interrupted".to_owned()));
+                            return;
+                        }
+                        AgentCommand::Close { reply } => {
+                            accepting_input_task.store(false, Ordering::SeqCst);
+                            status_handle
+                                .update(|status| {
+                                    status.terminated = true;
+                                    status.is_thinking = false;
+                                    status.turn_completed = true;
+                                    status.pending_user_response = None;
+                                    status.activity_counter =
+                                        status.activity_counter.saturating_add(1);
+                                })
+                                .await;
+                            for (_, attach_reply) in std::mem::take(&mut pending_startup_attaches) {
+                                let _ = attach_reply.send(true);
+                            }
+                            let _ = reply.send(());
+                            let _ = startup_tx.send(Err("agent startup closed".to_owned()));
+                            return;
+                        }
+                        AgentCommand::Attach { stream, reply } => {
+                            tracing::debug!(
+                                agent_id = %current_start.agent_id,
+                                stream = %stream.path(),
+                                "deferring agent stream attachment until startup bootstrap is available"
+                            );
+                            pending_startup_attaches.push((stream, reply));
+                        }
+                        AgentCommand::ReadOutput { reply, .. } => {
+                            let _ = reply.send(Vec::new());
+                        }
+                        AgentCommand::ReadLatestOutput { reply } => {
+                            let _ = reply.send(Ok(latest_output.output().clone()));
+                        }
+                        AgentCommand::FetchSessionHistory {
+                            before_seq,
+                            limit,
+                            reply,
+                        } => {
+                            let _ = reply
+                                .send(session_history_window(&event_log, before_seq, limit, None));
+                        }
+                        AgentCommand::ReadActivityHistory { reply, .. } => {
+                            let _ = reply.send(AgentActivityHistorySnapshot {
+                                rendered: String::new(),
+                                from_seq: None,
+                                through_seq: None,
+                                event_count: 0,
+                                active_stream_included: false,
+                            });
+                        }
+                        AgentCommand::ReadUsageSnapshot { reply } => {
+                            let _ = reply.send(agent_usage_snapshot_from_tracker(
+                                &current_start,
+                                &activity_stats,
+                            ));
+                        }
+                        AgentCommand::SetName { reply, .. } => {
+                            let _ = reply.send(false);
+                        }
+                        AgentCommand::Compact { reply, .. } => {
+                            let _ = reply.send(Err("agent backend is starting".to_owned()));
+                        }
+                        AgentCommand::ReleaseCompaction { reply } => {
+                            let _ = reply.send(());
+                        }
+                        AgentCommand::SendInput(_) | AgentCommand::ResumeReplayBarrier { .. } => {}
                     }
                 }
             }
         };
+        drop(startup_future);
 
         let (backend, mut events, actor_session_id, initial_follow_up) = match startup_result {
             Ok(result) => result,
@@ -1926,6 +2101,13 @@ pub(crate) fn spawn_agent_actor(
                     &payload,
                 )
                 .await;
+                flush_pending_agent_attaches(
+                    &event_log,
+                    Some(&replay_state),
+                    &mut latest_output,
+                    &mut subscribers,
+                    &mut pending_startup_attaches,
+                );
                 park_terminal_agent(
                     &session_store,
                     current_session_id.as_ref(),
@@ -1957,6 +2139,7 @@ pub(crate) fn spawn_agent_actor(
         let mut resume_replay_barrier_task = None;
         if is_resume && let Some(barrier_rx) = events.take_resume_replay_complete() {
             resume_replay_gate_pending = true;
+            pending_resume_attaches.append(&mut pending_startup_attaches);
             resume_replay_barrier_task = Some(spawn_resume_replay_barrier_task(
                 actor_tx.clone(),
                 barrier_rx,
@@ -2037,6 +2220,15 @@ pub(crate) fn spawn_agent_actor(
             &queue,
         )
         .await;
+        if !resume_replay_gate_pending {
+            flush_pending_agent_attaches(
+                &event_log,
+                Some(&replay_state),
+                &mut latest_output,
+                &mut subscribers,
+                &mut pending_startup_attaches,
+            );
+        }
 
         let mut initial_follow_up = initial_follow_up.filter(|input| {
             !input.message.trim().is_empty()
@@ -2108,7 +2300,7 @@ pub(crate) fn spawn_agent_actor(
                                 &payload,
                             )
                             .await;
-                            flush_pending_resume_attaches(
+                            flush_pending_agent_attaches(
                                 &event_log,
                                 None,
                                 &mut latest_output,
@@ -2196,6 +2388,20 @@ pub(crate) fn spawn_agent_actor(
                             continue;
                         }
                     };
+                    if let Err(violation) =
+                        validate_chat_event_stream_identity(&replay_state, &event)
+                    {
+                        let error = stream_identity_violation_event(violation);
+                        append_chat_event(
+                            &canonical_stream,
+                            &mut event_log,
+                            &mut subscribers,
+                            &mut replay_state,
+                            &error,
+                        )
+                        .await;
+                        continue;
+                    }
                     if resume_replay_gate_pending {
                         ingest_gated_replay_event(
                             &mut event,
@@ -2294,6 +2500,7 @@ pub(crate) fn spawn_agent_actor(
                         }
                         ChatEvent::TypingStatusChanged(typing) => {
                             let typing = *typing;
+                            let mut completed_by_idle = false;
                             if typing {
                                 in_turn = true;
                                 idle_transition_armed = true;
@@ -2301,6 +2508,7 @@ pub(crate) fn spawn_agent_actor(
                                 idle_transition_armed = false;
                             } else if in_turn && idle_transition_armed {
                                 real_idle_transition = true;
+                                completed_by_idle = true;
                                 in_turn = false;
                                 idle_transition_armed = false;
                             } else if in_turn {
@@ -2311,6 +2519,9 @@ pub(crate) fn spawn_agent_actor(
                             }
                             status_handle.update(|s| {
                                 s.is_thinking = typing;
+                                if completed_by_idle {
+                                    s.turn_completed = true;
+                                }
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
                         }
@@ -2321,6 +2532,7 @@ pub(crate) fn spawn_agent_actor(
                             }
                             status_handle.update(|s| {
                                 s.pending_user_response = None;
+                                s.is_thinking = false;
                                 s.turn_completed = true;
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
@@ -2418,6 +2630,7 @@ pub(crate) fn spawn_agent_actor(
                     )
                     .await;
                     if synthesize_idle_after_error {
+                        replay_state.discard_active_stream();
                         append_chat_event(
                             &canonical_stream,
                             &mut event_log,
@@ -2631,7 +2844,7 @@ pub(crate) fn spawn_agent_actor(
                             match result {
                                 Ok(()) => {
                                     accepting_input_task.store(true, Ordering::SeqCst);
-                                    flush_pending_resume_attaches(
+                                    flush_pending_agent_attaches(
                                         &event_log,
                                         Some(&replay_state),
                                         &mut latest_output,
@@ -2692,7 +2905,7 @@ pub(crate) fn spawn_agent_actor(
                                         &payload,
                                     )
                                     .await;
-                                    flush_pending_resume_attaches(
+                                    flush_pending_agent_attaches(
                                         &event_log,
                                         None,
                                         &mut latest_output,
@@ -3488,6 +3701,79 @@ pub(crate) fn spawn_agent_actor(
     )
 }
 
+enum AgentStartupEvent<T> {
+    Completed(T),
+    Command(Option<AgentCommand>),
+}
+
+fn backend_startup_drop_cancels_workers(backend_kind: BackendKind) -> bool {
+    // Enabling the command race is safe only when every startup path for the
+    // backend explicitly cancels or reaps work after its returned future drops.
+    matches!(
+        backend_kind,
+        BackendKind::Claude | BackendKind::Codex | BackendKind::Tycode
+    )
+}
+
+#[cfg(test)]
+struct AgentStartupTestGate {
+    agent_id: AgentId,
+    entered: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+static AGENT_STARTUP_TEST_GATE: std::sync::Mutex<Option<AgentStartupTestGate>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static AGENT_STARTUP_SELECTION_TEST_GATE: std::sync::Mutex<Option<AgentStartupTestGate>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+async fn wait_for_agent_startup_test_gate(agent_id: &AgentId) {
+    wait_for_matching_agent_startup_test_gate(&AGENT_STARTUP_TEST_GATE, agent_id).await;
+}
+
+#[cfg(test)]
+async fn wait_for_agent_startup_selection_test_gate(agent_id: &AgentId) {
+    wait_for_matching_agent_startup_test_gate(&AGENT_STARTUP_SELECTION_TEST_GATE, agent_id).await;
+}
+
+#[cfg(test)]
+async fn wait_for_matching_agent_startup_test_gate(
+    slot: &std::sync::Mutex<Option<AgentStartupTestGate>>,
+    agent_id: &AgentId,
+) {
+    let gate = {
+        let mut gate = slot.lock().expect("agent startup test gate mutex poisoned");
+        if gate.as_ref().is_some_and(|gate| &gate.agent_id == agent_id) {
+            gate.take()
+        } else {
+            None
+        }
+    };
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(());
+        let _ = gate.release.await;
+    }
+}
+
+async fn next_agent_startup_event<F>(
+    startup: Pin<&mut F>,
+    rx: &mut mpsc::UnboundedReceiver<AgentCommand>,
+    cancellation_supported: bool,
+) -> AgentStartupEvent<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::select! {
+        biased;
+        command = rx.recv(), if cancellation_supported => AgentStartupEvent::Command(command),
+        result = startup => AgentStartupEvent::Completed(result),
+    }
+}
+
 pub(crate) fn spawn_relay_agent_actor(
     agent_id: AgentId,
     start: AgentStartPayload,
@@ -3587,6 +3873,21 @@ pub(crate) fn spawn_relay_agent_actor(
                         return;
                     };
 
+                    if let Err(violation) =
+                        validate_chat_event_stream_identity(&replay_state, &event)
+                    {
+                        let error = stream_identity_violation_event(violation);
+                        append_chat_event(
+                            &canonical_stream,
+                            &mut event_log,
+                            &mut subscribers,
+                            &mut replay_state,
+                            &error,
+                        )
+                        .await;
+                        continue;
+                    }
+
                     match &event {
                         ChatEvent::MessageAdded(message) => {
                             if matches!(message.sender, MessageSender::Error) {
@@ -3631,6 +3932,7 @@ pub(crate) fn spawn_relay_agent_actor(
                             pending_tool_response_ids.clear();
                             status_handle.update(|s| {
                                 s.pending_user_response = None;
+                                s.is_thinking = false;
                                 s.turn_completed = true;
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
@@ -4416,6 +4718,8 @@ fn interrupted_tool_completion(completion: &ToolExecutionCompletedData) -> bool 
         | ToolExecutionResult::ReadFiles { .. }
         | ToolExecutionResult::SearchTypes { .. }
         | ToolExecutionResult::GetTypeDocs { .. }
+        | ToolExecutionResult::TydeSendAgentMessage
+        | ToolExecutionResult::TydeAwaitAgents { .. }
         | ToolExecutionResult::Other { .. } => false,
     }
 }
@@ -4439,7 +4743,15 @@ async fn append_chat_event(
     replay_state: &mut AgentReplayState,
     event: &ChatEvent,
 ) {
-    record_chat_event_for_replay(canonical_stream, event_log, replay_state, event);
+    if let Err(violation) = validate_chat_event_stream_identity(replay_state, event) {
+        let error = stream_identity_violation_event(violation);
+        record_chat_event_for_replay(canonical_stream, event_log, replay_state, &error)
+            .expect("identity violation error is a non-stream event");
+        broadcast_live_event(subscribers, FrameKind::ChatEvent, &error).await;
+        return;
+    }
+    record_chat_event_for_replay(canonical_stream, event_log, replay_state, event)
+        .expect("preflighted replay event remains valid");
     broadcast_live_event(subscribers, FrameKind::ChatEvent, event).await;
 }
 
@@ -4501,7 +4813,7 @@ fn abort_resume_replay_barrier_task(task: &mut Option<tokio::task::JoinHandle<()
     }
 }
 
-fn flush_pending_resume_attaches(
+fn flush_pending_agent_attaches(
     event_log: &[Envelope],
     replay_state: Option<&AgentReplayState>,
     latest_output: &mut AgentControlLatestOutput,
@@ -4509,7 +4821,7 @@ fn flush_pending_resume_attaches(
     pending_attaches: &mut Vec<(Stream, oneshot::Sender<bool>)>,
 ) {
     let output = current_latest_output(latest_output, event_log)
-        .expect("typed resume replay log must project latest output");
+        .expect("typed agent replay log must project latest output");
     for (stream, reply) in std::mem::take(pending_attaches) {
         let attached = attach_subscriber_with_latest_output(
             event_log,
@@ -4594,6 +4906,12 @@ async fn ingest_gated_replay_event(
     active_stream_text: &mut String,
     activity_event_seq: &mut u64,
 ) {
+    if let Err(violation) = validate_chat_event_stream_identity(replay_state, event) {
+        let error = stream_identity_violation_event(violation);
+        record_chat_event_for_replay(canonical_stream, event_log, replay_state, &error)
+            .expect("identity violation error is a non-stream event");
+        return;
+    }
     match &*event {
         ChatEvent::StreamStart(_) => active_stream_text.clear(),
         ChatEvent::StreamDelta(delta) => active_stream_text.push_str(&delta.text),
@@ -4614,7 +4932,8 @@ async fn ingest_gated_replay_event(
     if matches!(&*event, ChatEvent::StreamEnd(_)) {
         active_stream_text.clear();
     }
-    record_chat_event_for_replay(canonical_stream, event_log, replay_state, &*event);
+    record_chat_event_for_replay(canonical_stream, event_log, replay_state, &*event)
+        .expect("preflighted replay event remains valid");
 }
 
 fn record_chat_event_for_replay(
@@ -4622,12 +4941,14 @@ fn record_chat_event_for_replay(
     event_log: &mut Vec<Envelope>,
     replay_state: &mut AgentReplayState,
     event: &ChatEvent,
-) {
+) -> Result<(), StreamIdentityViolation> {
+    validate_chat_event_stream_identity(replay_state, event)?;
     match event {
         ChatEvent::StreamStart(start) => {
+            let message_id = required_replay_stream_message_id(start.required_message_id())?;
             replay_state.completed_stream = None;
             replay_state.active_stream = Some(ReplayActiveStream {
-                current_message_id: start.message_id.clone(),
+                message_id,
                 start: start.clone(),
                 text: String::new(),
                 reasoning: String::new(),
@@ -4635,63 +4956,53 @@ fn record_chat_event_for_replay(
             });
         }
         ChatEvent::StreamDelta(delta) => {
-            if let Some(active) = replay_state.active_stream.as_mut() {
-                if let Some(message_id) = &delta.message_id {
-                    active.current_message_id = Some(message_id.clone());
-                }
-                active.text.push_str(&delta.text);
-            } else {
-                tracing::error!(
-                    "received StreamDelta without active stream while recording replay"
-                );
-                push_chat_event_to_replay_log(canonical_stream, event_log, event);
+            let message_id = required_replay_stream_message_id(delta.required_message_id())?;
+            let Some(active) = replay_state.active_stream.as_mut() else {
+                return Err(StreamIdentityViolation::ForeignActiveMessageId);
+            };
+            if message_id != active.message_id {
+                return Err(StreamIdentityViolation::ForeignActiveMessageId);
             }
+            active.text.push_str(&delta.text);
         }
         ChatEvent::StreamReasoningDelta(delta) => {
-            if let Some(active) = replay_state.active_stream.as_mut() {
-                if let Some(message_id) = &delta.message_id {
-                    active.current_message_id = Some(message_id.clone());
-                }
-                active.reasoning.push_str(&delta.text);
-            } else {
-                tracing::error!(
-                    "received StreamReasoningDelta without active stream while recording replay"
-                );
-                push_chat_event_to_replay_log(canonical_stream, event_log, event);
+            let message_id = required_replay_stream_message_id(delta.required_message_id())?;
+            let Some(active) = replay_state.active_stream.as_mut() else {
+                return Err(StreamIdentityViolation::ForeignActiveMessageId);
+            };
+            if message_id != active.message_id {
+                return Err(StreamIdentityViolation::ForeignActiveMessageId);
             }
+            active.reasoning.push_str(&delta.text);
         }
         ChatEvent::StreamEnd(data) => {
-            let active_stream = replay_state.active_stream.take();
-            let mut message = data.message.clone();
-            let tool_events = active_stream
-                .map(|stream| {
-                    if message.message_id.is_none()
-                        && let Some(message_id) = stream
-                            .current_message_id
-                            .clone()
-                            .or(stream.start.message_id.clone())
-                    {
-                        message.message_id = Some(ChatMessageId(message_id));
-                    }
-                    let tool_events = stream.tool_events.clone();
-                    let end = StreamEndData {
-                        message: message.clone(),
-                    };
-                    replay_state.completed_stream = Some(ReplayCompletedStream {
-                        stream,
-                        end,
-                        post_end_events: Vec::new(),
-                    });
-                    tool_events
-                })
-                .unwrap_or_default();
-            if message_has_renderable_content(&message, !tool_events.is_empty()) {
-                push_chat_event_to_replay_log(
-                    canonical_stream,
-                    event_log,
-                    &ChatEvent::MessageAdded(message),
-                );
-            }
+            let message_id = required_replay_chat_message_id(data.required_message_id())?;
+            let stream = replay_state
+                .active_stream
+                .take()
+                .expect("active stream was checked above");
+            replay_state.terminal_stream_message_ids.insert(message_id);
+            let message = data.message.clone();
+            replay_state.recorded_message_senders.insert(
+                message
+                    .message_id
+                    .clone()
+                    .expect("validated StreamEnd message id"),
+                message.sender.clone(),
+            );
+            let tool_events = stream.tool_events.clone();
+            replay_state.completed_stream = Some(ReplayCompletedStream {
+                stream,
+                end: StreamEndData {
+                    message: message.clone(),
+                },
+                post_end_events: Vec::new(),
+            });
+            push_chat_event_to_replay_log(
+                canonical_stream,
+                event_log,
+                &ChatEvent::MessageAdded(message),
+            );
             for tool_event in tool_events {
                 if let ChatEvent::ToolProgress(data) = &tool_event {
                     coalesce_progress_into_replay_log(
@@ -4747,7 +5058,26 @@ fn record_chat_event_for_replay(
             }
         }
         ChatEvent::OperationCancelled(_) => {
-            replay_state.clear_active_stream();
+            if let Some(stream) = replay_state.active_stream.take() {
+                replay_state
+                    .terminal_stream_message_ids
+                    .insert(stream.message_id.clone());
+                let message = cancelled_stream_message(&stream);
+                if message_has_renderable_content(&message, !stream.tool_events.is_empty()) {
+                    replay_state
+                        .recorded_message_senders
+                        .insert(stream.message_id.clone(), message.sender.clone());
+                    push_chat_event_to_replay_log(
+                        canonical_stream,
+                        event_log,
+                        &ChatEvent::MessageAdded(message),
+                    );
+                }
+                for tool_event in stream.tool_events {
+                    push_chat_event_to_replay_log(canonical_stream, event_log, &tool_event);
+                }
+            }
+            replay_state.completed_stream = None;
             push_chat_event_to_replay_log(canonical_stream, event_log, event);
         }
         ChatEvent::TypingStatusChanged(typing) => {
@@ -4757,12 +5087,154 @@ fn record_chat_event_for_replay(
             }
             push_chat_event_to_replay_log(canonical_stream, event_log, event);
         }
-        ChatEvent::MessageAdded(_)
-        | ChatEvent::TaskUpdate(_)
-        | ChatEvent::RetryAttempt(_)
-        | ChatEvent::Orchestration(_) => {
+        ChatEvent::MessageAdded(message) => {
+            if let Some(message_id) = &message.message_id {
+                replay_state
+                    .recorded_message_senders
+                    .insert(message_id.clone(), message.sender.clone());
+            }
             push_chat_event_to_replay_log(canonical_stream, event_log, event);
         }
+        ChatEvent::TaskUpdate(_) | ChatEvent::RetryAttempt(_) | ChatEvent::Orchestration(_) => {
+            push_chat_event_to_replay_log(canonical_stream, event_log, event);
+        }
+    }
+    Ok(())
+}
+
+fn validate_chat_event_stream_identity(
+    replay_state: &AgentReplayState,
+    event: &ChatEvent,
+) -> Result<(), StreamIdentityViolation> {
+    match event {
+        ChatEvent::StreamStart(start) => {
+            let message_id = required_replay_stream_message_id(start.required_message_id())?;
+            if replay_state.active_stream.is_some() {
+                return Err(StreamIdentityViolation::ForeignActiveMessageId);
+            }
+            if replay_state
+                .terminal_stream_message_ids
+                .contains(&message_id)
+            {
+                return Err(StreamIdentityViolation::DuplicateTerminalMessageId);
+            }
+            if replay_state
+                .recorded_message_senders
+                .contains_key(&message_id)
+            {
+                return Err(StreamIdentityViolation::DuplicateTerminalMessageId);
+            }
+        }
+        ChatEvent::StreamDelta(delta) | ChatEvent::StreamReasoningDelta(delta) => {
+            let message_id = required_replay_stream_message_id(delta.required_message_id())?;
+            let Some(active) = replay_state.active_stream.as_ref() else {
+                return Err(StreamIdentityViolation::ForeignActiveMessageId);
+            };
+            if message_id != active.message_id {
+                return Err(StreamIdentityViolation::ForeignActiveMessageId);
+            }
+        }
+        ChatEvent::StreamEnd(data) => {
+            let message_id = required_replay_chat_message_id(data.required_message_id())?;
+            let Some(active) = replay_state.active_stream.as_ref() else {
+                return Err(
+                    if replay_state
+                        .terminal_stream_message_ids
+                        .contains(&message_id)
+                    {
+                        StreamIdentityViolation::ConflictingDuplicateCompletion
+                    } else {
+                        StreamIdentityViolation::ForeignActiveMessageId
+                    },
+                );
+            };
+            if message_id != active.message_id {
+                return Err(StreamIdentityViolation::MismatchedEndMessageId);
+            }
+            if replay_state
+                .recorded_message_senders
+                .contains_key(&message_id)
+            {
+                return Err(StreamIdentityViolation::DuplicateTerminalMessageId);
+            }
+        }
+        ChatEvent::MessageAdded(message) => {
+            if let Some(message_id) = &message.message_id
+                && replay_state
+                    .recorded_message_senders
+                    .contains_key(message_id)
+            {
+                return Err(StreamIdentityViolation::DuplicateTerminalMessageId);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn required_replay_stream_message_id(
+    message_id: Result<ChatMessageId, StreamIdentityViolation>,
+) -> Result<ChatMessageId, StreamIdentityViolation> {
+    message_id
+}
+
+fn required_replay_chat_message_id(
+    message_id: Result<ChatMessageId, StreamIdentityViolation>,
+) -> Result<ChatMessageId, StreamIdentityViolation> {
+    message_id
+}
+
+fn stream_identity_violation_event(violation: StreamIdentityViolation) -> ChatEvent {
+    let content = match violation {
+        StreamIdentityViolation::MissingMessageId => {
+            "Stream identity violation: missing message id"
+        }
+        StreamIdentityViolation::ForeignActiveMessageId => {
+            "Stream identity violation: foreign active message id"
+        }
+        StreamIdentityViolation::MismatchedEndMessageId => {
+            "Stream identity violation: mismatched end message id"
+        }
+        StreamIdentityViolation::DuplicateTerminalMessageId => {
+            "Stream identity violation: duplicate terminal message id"
+        }
+        StreamIdentityViolation::ConflictingDuplicateCompletion => {
+            "Stream identity violation: conflicting duplicate completion"
+        }
+    };
+    ChatEvent::MessageAdded(ChatMessage {
+        message_id: None,
+        timestamp: now_ms(),
+        sender: MessageSender::Error,
+        content: content.to_owned(),
+        reasoning: None,
+        tool_calls: Vec::new(),
+        model_info: None,
+        token_usage: None,
+        context_breakdown: None,
+        images: None,
+    })
+}
+
+fn cancelled_stream_message(stream: &ReplayActiveStream) -> ChatMessage {
+    ChatMessage {
+        message_id: Some(stream.message_id.clone()),
+        timestamp: now_ms(),
+        sender: MessageSender::Assistant {
+            agent: stream.start.agent.clone(),
+        },
+        content: stream.text.clone(),
+        reasoning: (!stream.reasoning.is_empty()).then(|| ReasoningData {
+            text: stream.reasoning.clone(),
+            tokens: None,
+            signature: None,
+            blob: None,
+        }),
+        tool_calls: Vec::new(),
+        model_info: stream.start.model.clone().map(|model| ModelInfo { model }),
+        token_usage: None,
+        context_breakdown: None,
+        images: None,
     }
 }
 
@@ -4997,6 +5469,18 @@ fn agent_usage_snapshot_from_tracker(
         usage,
         model,
     }
+}
+
+#[cfg(test)]
+pub(crate) fn task_usage_scope_from_chat_events_for_test(
+    backend_kind: BackendKind,
+    events: impl IntoIterator<Item = ChatEvent>,
+) -> TaskTokenUsageScope {
+    let mut tracker = AgentActivityStatsTracker::for_backend(backend_kind);
+    for (source_seq, mut event) in events.into_iter().enumerate() {
+        tracker.observe_chat_event(&mut event, source_seq as u64, "");
+    }
+    tracker.usage_snapshot().0
 }
 
 fn agent_usage_snapshot_from_log(
@@ -5304,6 +5788,7 @@ fn attach_subscriber_with_latest_output(
     subscribers: &mut Vec<Stream>,
     stream: Stream,
 ) -> bool {
+    let stream_path = stream.path().clone();
     let mut events = agent_bootstrap_events_from_log(event_log);
     let history_entries = filtered_session_history_entries_from_log(event_log, replay_state);
     let history_tail = initial_history_tail_entries(&history_entries);
@@ -5330,6 +5815,7 @@ fn attach_subscriber_with_latest_output(
         );
     }
 
+    let bootstrap_event_count = events.len();
     let payload = serde_json::to_value(AgentBootstrapPayload {
         events,
         latest_output: latest_output.clone(),
@@ -5343,6 +5829,11 @@ fn attach_subscriber_with_latest_output(
     }
 
     subscribers.push(stream);
+    tracing::debug!(
+        stream = %stream_path,
+        bootstrap_event_count,
+        "activated agent subscriber after AgentBootstrap"
+    );
     true
 }
 
@@ -5573,7 +6064,7 @@ async fn apply_runtime_session_updates(
     }
 }
 
-fn build_name_generation_prompt(prompt: &str) -> String {
+pub(crate) fn build_name_generation_prompt(prompt: &str) -> String {
     format!(
         "Return only a short 2-4 word work name for this request. No quotes, no markdown, no explanation. Request: {prompt}"
     )
@@ -5755,27 +6246,516 @@ mod tests {
         AgentControlLatestOutput, AgentControlOutput, AgentId, AgentInput, AgentStartPayload,
         ChatEvent, ChatMessage, ChatMessageId, FrameKind, MessageMetadataUpdateData, MessageSender,
         MessageTokenUsage, ModelInfo, ModelRequestId, ModelRequestTokenUsage, ModelTurnId,
-        ReasoningData, SessionId, StreamEndData, StreamPath, StreamStartData, StreamTextDeltaData,
-        TaskList, TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage,
-        TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData,
-        ToolExecutionResult, ToolRequest, ToolRequestType,
+        ReasoningData, ServerGeneratedChatMessageIdOrigin, ServerGeneratedChatMessageIdentity,
+        SessionId, StreamEndData, StreamPath, StreamStartData, StreamTextDeltaData, TaskList,
+        TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope,
+        TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult, ToolRequest,
+        ToolRequestType,
     };
     use tokio::sync::{Mutex, mpsc, watch};
     use tokio::time::timeout;
 
     use super::{
-        AgentActivityStatsTracker, AgentCommand, AgentHandle, AgentReplayState,
-        GenerateAgentActivitySummaryRequest, InterruptOutcome, activity_history_snapshot,
+        AGENT_STARTUP_SELECTION_TEST_GATE, AGENT_STARTUP_TEST_GATE, AgentActivityStatsTracker,
+        AgentActorRuntimeContext, AgentCommand, AgentHandle, AgentReplayState, AgentStartupFailure,
+        AgentStartupTestGate, GenerateAgentActivitySummaryRequest, InterruptOutcome,
+        ResolvedSpawnRequest, activity_history_snapshot, agent_name_generation_spawn_config,
         agent_usage_snapshot_from_log, append_chat_event, append_event, attach_subscriber,
         attach_subscriber_with_latest_output, collect_agent_activity_summary_events,
-        collect_agent_name_events, current_latest_output, generate_mock_name, known_turn_usage,
-        output_events_since, replay_envelope, sanitize_generated_agent_name,
-        session_history_window, spawn_relay_agent_actor, upsert_activity_stats_snapshot,
+        collect_agent_name_events, current_latest_output, generate_mock_name,
+        ingest_gated_replay_event, known_turn_usage, output_events_since, replay_envelope,
+        resolve_backend_session_settings, sanitize_generated_agent_name, session_history_window,
+        spawn_agent_actor, spawn_relay_agent_actor, upsert_activity_stats_snapshot,
     };
+    use crate::agent::customization::ResolvedSpawnConfig;
     use crate::agent::registry::AgentStatusHandle;
-    use crate::backend::EventStream;
+    use crate::backend::{BackendExecutionMode, BackendSpawnConfig, EventStream};
+    use crate::review::ReviewRegistry;
+    use crate::store::project::ProjectStore;
+    use crate::store::review::ReviewStore;
     use crate::store::session::SessionStore;
     use crate::stream::Stream;
+
+    static AGENT_STARTUP_ACTOR_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+    fn startup_actor_fixture(
+        agent_id: &str,
+        startup_failure: Option<AgentStartupFailure>,
+    ) -> (
+        tempfile::TempDir,
+        AgentStartPayload,
+        ResolvedSpawnRequest,
+        AgentActorRuntimeContext,
+        AgentStatusHandle,
+    ) {
+        let dir = tempfile::tempdir().expect("agent startup tempdir");
+        let session_store = Arc::new(Mutex::new(
+            SessionStore::load(dir.path().join("sessions.json"))
+                .expect("load startup session store"),
+        ));
+        let project_store = Arc::new(Mutex::new(
+            ProjectStore::load(dir.path().join("projects.json"))
+                .expect("load startup project store"),
+        ));
+        let review_store =
+            ReviewStore::load(dir.path().join("reviews.json")).expect("load review store");
+        let (review_delivery_tx, _review_delivery_rx) = mpsc::channel(1);
+        let (review_ai_spawn_tx, _review_ai_spawn_rx) = mpsc::channel(1);
+        let (review_project_update_tx, _review_project_update_rx) = mpsc::unbounded_channel();
+        let review_registry = ReviewRegistry::spawn(
+            review_store,
+            project_store,
+            review_delivery_tx,
+            review_ai_spawn_tx,
+            review_project_update_tx,
+        )
+        .expect("spawn review registry");
+        let (host_sub_agent_spawn_tx, _host_sub_agent_spawn_rx) = mpsc::unbounded_channel();
+        let (capacity_tx, _capacity_rx) = mpsc::unbounded_channel();
+        let (status_handle, _status_rx) = AgentStatusHandle::new();
+        let start = AgentStartPayload {
+            backend_kind: protocol::BackendKind::Claude,
+            ..test_agent_start(agent_id)
+        };
+        let request = ResolvedSpawnRequest {
+            name: start.name.clone(),
+            origin: start.origin,
+            custom_agent_id: None,
+            team_id: None,
+            team_member_id: None,
+            workflow: None,
+            parent_agent_id: None,
+            parent_session_id: None,
+            project_id: None,
+            backend_kind: protocol::BackendKind::Claude,
+            launch_profile_id: None,
+            workspace_roots: start.workspace_roots.clone(),
+            initial_input: Some(protocol::SendMessagePayload {
+                message: "startup attachment ordering".to_owned(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            }),
+            cost_hint: None,
+            session_settings: None,
+            session_settings_schema: None,
+            backend_config: Default::default(),
+            startup_mcp_servers: Vec::new(),
+            resolved_spawn_config: ResolvedSpawnConfig::default(),
+            resume_session_id: None,
+            fork_from_session_id: None,
+            startup_warning: None,
+            startup_failure,
+            initial_alias: None,
+            use_mock_backend: true,
+        };
+        let runtime = AgentActorRuntimeContext {
+            session_store,
+            host_sub_agent_spawn_tx,
+            capacity_tx,
+            review_registry,
+            status_handle: status_handle.clone(),
+            antigravity_conversations_dir: dir.path().join("antigravity"),
+        };
+        (dir, start, request, runtime, status_handle)
+    }
+
+    fn install_agent_startup_gate(
+        agent_id: AgentId,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *AGENT_STARTUP_TEST_GATE
+            .lock()
+            .expect("agent startup test gate mutex poisoned") = Some(AgentStartupTestGate {
+            agent_id,
+            entered: entered_tx,
+            release: release_rx,
+        });
+        (entered_rx, release_tx)
+    }
+
+    #[tokio::test]
+    async fn actor_interrupt_close_and_simultaneous_ready_preempt_startup_without_publication() {
+        let _startup_test_guard = AGENT_STARTUP_ACTOR_TEST_LOCK.lock().await;
+        for (close, simultaneous_ready) in [(false, false), (true, false), (false, true)] {
+            let dir = tempfile::tempdir().expect("agent startup tempdir");
+            let session_store = Arc::new(Mutex::new(
+                SessionStore::load(dir.path().join("sessions.json"))
+                    .expect("load startup session store"),
+            ));
+            let project_store = Arc::new(Mutex::new(
+                ProjectStore::load(dir.path().join("projects.json"))
+                    .expect("load startup project store"),
+            ));
+            let review_store =
+                ReviewStore::load(dir.path().join("reviews.json")).expect("load review store");
+            let (review_delivery_tx, _review_delivery_rx) = mpsc::channel(1);
+            let (review_ai_spawn_tx, _review_ai_spawn_rx) = mpsc::channel(1);
+            let (review_project_update_tx, _review_project_update_rx) = mpsc::unbounded_channel();
+            let review_registry = ReviewRegistry::spawn(
+                review_store,
+                project_store,
+                review_delivery_tx,
+                review_ai_spawn_tx,
+                review_project_update_tx,
+            )
+            .expect("spawn review registry");
+            let (host_sub_agent_spawn_tx, _host_sub_agent_spawn_rx) = mpsc::unbounded_channel();
+            let (capacity_tx, _capacity_rx) = mpsc::unbounded_channel();
+            let (status_handle, _status_rx) = AgentStatusHandle::new();
+            let start = AgentStartPayload {
+                backend_kind: protocol::BackendKind::Claude,
+                ..test_agent_start(if simultaneous_ready {
+                    "startup-simultaneous-interrupt-agent"
+                } else if close {
+                    "startup-close-agent"
+                } else {
+                    "startup-interrupt-agent"
+                })
+            };
+            let request = ResolvedSpawnRequest {
+                name: start.name.clone(),
+                origin: start.origin,
+                custom_agent_id: None,
+                team_id: None,
+                team_member_id: None,
+                workflow: None,
+                parent_agent_id: None,
+                parent_session_id: None,
+                project_id: None,
+                backend_kind: protocol::BackendKind::Claude,
+                launch_profile_id: None,
+                workspace_roots: start.workspace_roots.clone(),
+                initial_input: Some(protocol::SendMessagePayload {
+                    message: "must never publish".to_owned(),
+                    images: None,
+                    origin: None,
+                    tool_response: None,
+                }),
+                cost_hint: None,
+                session_settings: None,
+                session_settings_schema: None,
+                backend_config: Default::default(),
+                startup_mcp_servers: Vec::new(),
+                resolved_spawn_config: ResolvedSpawnConfig::default(),
+                resume_session_id: None,
+                fork_from_session_id: None,
+                startup_warning: None,
+                startup_failure: None,
+                initial_alias: None,
+                use_mock_backend: true,
+            };
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let mut release_tx = Some(release_tx);
+            let gate = AgentStartupTestGate {
+                agent_id: start.agent_id.clone(),
+                entered: entered_tx,
+                release: release_rx,
+            };
+            let gate_slot = if simultaneous_ready {
+                &AGENT_STARTUP_SELECTION_TEST_GATE
+            } else {
+                &AGENT_STARTUP_TEST_GATE
+            };
+            *gate_slot
+                .lock()
+                .expect("agent startup test gate mutex poisoned") = Some(gate);
+            let (handle, startup) = spawn_agent_actor(
+                start.agent_id.clone(),
+                start,
+                request,
+                AgentActorRuntimeContext {
+                    session_store: Arc::clone(&session_store),
+                    host_sub_agent_spawn_tx,
+                    capacity_tx,
+                    review_registry,
+                    status_handle: status_handle.clone(),
+                    antigravity_conversations_dir: dir.path().join("antigravity"),
+                },
+            );
+            timeout(Duration::from_secs(1), entered_rx)
+                .await
+                .expect("actor must enter delayed backend startup")
+                .expect("actor must signal delayed backend startup");
+            let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+            let (attach_reply, attach_response) = tokio::sync::oneshot::channel();
+            handle
+                .tx
+                .send(AgentCommand::Attach {
+                    stream: replay_stream(output_tx),
+                    reply: attach_reply,
+                })
+                .expect("queue startup attach before cancellation");
+            if simultaneous_ready {
+                let (interrupt_reply, interrupt_response) = tokio::sync::oneshot::channel();
+                handle
+                    .tx
+                    .send(AgentCommand::Interrupt {
+                        reply: interrupt_reply,
+                    })
+                    .expect("queue simultaneous startup interrupt");
+                release_tx
+                    .take()
+                    .expect("simultaneous startup release sender")
+                    .send(())
+                    .expect("release simultaneous startup selection");
+                assert!(
+                    timeout(Duration::from_secs(1), attach_response)
+                        .await
+                        .expect("simultaneous startup attach must be bounded")
+                        .expect("simultaneous startup attach reply")
+                );
+                assert_eq!(
+                    timeout(Duration::from_secs(1), interrupt_response)
+                        .await
+                        .expect("simultaneous startup interrupt must be bounded")
+                        .expect("simultaneous startup interrupt reply"),
+                    InterruptOutcome::Interrupted
+                );
+            } else if close {
+                assert!(
+                    timeout(Duration::from_secs(1), handle.close())
+                        .await
+                        .expect("close during startup must be bounded")
+                );
+                assert!(
+                    timeout(Duration::from_secs(1), attach_response)
+                        .await
+                        .expect("startup attach before close must be bounded")
+                        .expect("startup attach before close reply")
+                );
+            } else {
+                assert_eq!(
+                    timeout(Duration::from_secs(1), handle.interrupt())
+                        .await
+                        .expect("interrupt during startup must be bounded"),
+                    InterruptOutcome::Interrupted
+                );
+                assert!(
+                    timeout(Duration::from_secs(1), attach_response)
+                        .await
+                        .expect("startup attach before interrupt must be bounded")
+                        .expect("startup attach before interrupt reply")
+                );
+            }
+            if !simultaneous_ready {
+                assert!(
+                    release_tx
+                        .take()
+                        .expect("delayed startup release sender")
+                        .send(())
+                        .is_err(),
+                    "startup future must be dropped"
+                );
+            }
+            let startup_error = timeout(Duration::from_secs(1), startup)
+                .await
+                .expect("startup cancellation response must be bounded")
+                .expect("actor must send its typed startup cancellation result")
+                .expect_err("startup must report cancellation");
+            assert_eq!(
+                startup_error,
+                if close {
+                    "agent startup closed"
+                } else {
+                    "agent startup interrupted"
+                }
+            );
+            let status = status_handle.snapshot().await;
+            assert!(status.terminated);
+            assert!(!status.is_thinking);
+            assert!(status.turn_completed);
+            assert_eq!(status.status(), protocol::AgentControlStatus::Idle);
+            assert!(
+                timeout(Duration::from_secs(1), output_rx.recv())
+                    .await
+                    .expect("startup subscriber must close")
+                    .is_none(),
+                "startup cancellation must not publish AgentStart or replay events"
+            );
+            assert!(
+                session_store
+                    .lock()
+                    .await
+                    .list()
+                    .expect("list startup sessions")
+                    .is_empty(),
+                "startup cancellation must not persist a session"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_startup_attachments_receive_complete_bootstrap_before_live_events() {
+        let _startup_test_guard = AGENT_STARTUP_ACTOR_TEST_LOCK.lock().await;
+        let (_dir, start, request, runtime, _status_handle) =
+            startup_actor_fixture("startup-attach-success", None);
+        let expected_settings = resolve_backend_session_settings(
+            protocol::BackendKind::Claude,
+            &BackendSpawnConfig {
+                execution_mode: BackendExecutionMode::Agent,
+                resolved_spawn_config: ResolvedSpawnConfig::default(),
+                ..BackendSpawnConfig::default()
+            },
+        );
+        let (entered_rx, release_tx) = install_agent_startup_gate(start.agent_id.clone());
+        let (handle, startup_rx) =
+            spawn_agent_actor(start.agent_id.clone(), start, request, runtime);
+        entered_rx
+            .await
+            .expect("actor must enter delayed backend startup");
+
+        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+        let (attach_reply, attach_rx) = tokio::sync::oneshot::channel();
+        handle
+            .tx
+            .send(AgentCommand::Attach {
+                stream: replay_stream(output_tx),
+                reply: attach_reply,
+            })
+            .expect("queue pending startup attachment");
+        let (dead_output_tx, dead_output_rx) = mpsc::unbounded_channel();
+        drop(dead_output_rx);
+        let (dead_attach_reply, dead_attach_rx) = tokio::sync::oneshot::channel();
+        handle
+            .tx
+            .send(AgentCommand::Attach {
+                stream: replay_stream(dead_output_tx),
+                reply: dead_attach_reply,
+            })
+            .expect("queue dead pending startup attachment");
+
+        release_tx
+            .send(())
+            .expect("release delayed backend startup");
+        startup_rx
+            .await
+            .expect("actor must report startup result")
+            .expect("mock backend startup must succeed");
+        assert!(attach_rx.await.expect("pending attachment reply"));
+        assert!(!dead_attach_rx.await.expect("dead pending attachment reply"));
+
+        let first = output_rx
+            .recv()
+            .await
+            .expect("pending attachment must receive bootstrap");
+        assert_eq!(first.kind, FrameKind::AgentBootstrap);
+        let bootstrap: AgentBootstrapPayload = first
+            .parse_payload()
+            .expect("startup AgentBootstrap payload");
+        assert_eq!(bootstrap.events.len(), 4);
+        let expected_start = handle.snapshot();
+        let AgentBootstrapEvent::AgentStart(bootstrap_start) = &bootstrap.events[0] else {
+            panic!("startup bootstrap must begin with AgentStart");
+        };
+        assert_eq!(
+            serde_json::to_value(bootstrap_start).expect("serialize bootstrap AgentStart"),
+            serde_json::to_value(&expected_start).expect("serialize expected AgentStart")
+        );
+        assert!(matches!(
+            &bootstrap.events[1],
+            AgentBootstrapEvent::AgentActivityStats(payload)
+                if payload.agent_id == expected_start.agent_id
+                    && payload.stats == AgentActivityStats::default()
+        ));
+        assert!(matches!(
+            &bootstrap.events[2],
+            AgentBootstrapEvent::SessionSettings(payload) if payload.values == expected_settings
+        ));
+        assert!(matches!(
+            &bootstrap.events[3],
+            AgentBootstrapEvent::QueuedMessages(payload) if payload.messages.is_empty()
+        ));
+
+        assert!(handle.close().await);
+        while let Some(envelope) = output_rx.recv().await {
+            assert_ne!(
+                envelope.kind,
+                FrameKind::AgentStart,
+                "startup AgentStart must remain inside AgentBootstrap"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_startup_attachment_failure_receives_terminal_bootstrap() {
+        let _startup_test_guard = AGENT_STARTUP_ACTOR_TEST_LOCK.lock().await;
+        let failure_message = "fixture startup failure";
+        let (_dir, start, request, runtime, _status_handle) = startup_actor_fixture(
+            "startup-attach-failure",
+            Some(AgentStartupFailure::backend_failed(failure_message)),
+        );
+        let (entered_rx, release_tx) = install_agent_startup_gate(start.agent_id.clone());
+        let (handle, startup_rx) =
+            spawn_agent_actor(start.agent_id.clone(), start.clone(), request, runtime);
+        entered_rx
+            .await
+            .expect("actor must enter delayed failing startup");
+
+        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+        let (attach_reply, attach_rx) = tokio::sync::oneshot::channel();
+        handle
+            .tx
+            .send(AgentCommand::Attach {
+                stream: replay_stream(output_tx),
+                reply: attach_reply,
+            })
+            .expect("queue pending failing-startup attachment");
+        release_tx
+            .send(())
+            .expect("release delayed failing startup");
+
+        let startup_error = startup_rx
+            .await
+            .expect("actor must report startup failure")
+            .expect_err("fixture startup must fail");
+        assert_eq!(startup_error, failure_message);
+        assert!(attach_rx.await.expect("failing startup attachment reply"));
+        let first = output_rx
+            .recv()
+            .await
+            .expect("failing startup attachment must receive terminal bootstrap");
+        assert_eq!(first.kind, FrameKind::AgentBootstrap);
+        let bootstrap: AgentBootstrapPayload = first
+            .parse_payload()
+            .expect("terminal startup AgentBootstrap payload");
+        let AgentBootstrapEvent::AgentStart(bootstrap_start) = &bootstrap.events[0] else {
+            panic!("terminal bootstrap must begin with AgentStart");
+        };
+        assert_eq!(
+            serde_json::to_value(bootstrap_start).expect("serialize terminal AgentStart"),
+            serde_json::to_value(&start).expect("serialize expected terminal AgentStart")
+        );
+        assert!(bootstrap.events.iter().any(|event| matches!(
+            event,
+            AgentBootstrapEvent::AgentActivityStats(payload)
+                if payload.agent_id == start.agent_id
+                    && payload.stats == AgentActivityStats::default()
+        )));
+        assert!(bootstrap.events.iter().any(|event| matches!(
+            event,
+            AgentBootstrapEvent::QueuedMessages(payload) if payload.messages.is_empty()
+        )));
+        assert!(bootstrap.events.iter().any(|event| matches!(
+            event,
+            AgentBootstrapEvent::AgentError(payload)
+                if payload.fatal && payload.message.contains(failure_message)
+        )));
+
+        assert!(handle.close().await);
+        while let Some(envelope) = output_rx.recv().await {
+            assert_ne!(
+                envelope.kind,
+                FrameKind::AgentStart,
+                "failed startup AgentStart must remain inside terminal AgentBootstrap"
+            );
+        }
+    }
 
     fn spawn_failed_agent_actor(
         start: AgentStartPayload,
@@ -5909,6 +6889,12 @@ mod tests {
         }
     }
 
+    fn assistant_message_with_id(message_id: &str, content: &str) -> ChatMessage {
+        let mut message = assistant_message(content);
+        message.message_id = Some(ChatMessageId(message_id.to_owned()));
+        message
+    }
+
     fn metadata_update(message_id: &str, total_tokens: u64) -> ChatEvent {
         ChatEvent::MessageMetadataUpdated(MessageMetadataUpdateData {
             message_id: ChatMessageId(message_id.to_owned()),
@@ -5945,6 +6931,7 @@ mod tests {
             },
             success: true,
             error: None,
+            normalization_failure: None,
         })
     }
 
@@ -6022,6 +7009,7 @@ mod tests {
             source_from_seq: Some(1),
             source_through_seq: Some(2),
             use_mock_backend: false,
+            capacity_tx: tokio::sync::mpsc::unbounded_channel().0,
         }
     }
 
@@ -6458,6 +7446,32 @@ mod tests {
         assert!(usage.turn.known_usage().is_none());
         assert!(usage.cumulative.known_usage().is_none());
         assert_eq!(stats.snapshot().token_usage, TokenUsage::default());
+    }
+
+    #[test]
+    fn activity_stats_preserves_explicit_ambiguous_cumulative_scope() {
+        let mut stats = AgentActivityStatsTracker::default();
+        let mut message = assistant_message("current turn");
+        message.message_id = Some(ChatMessageId("message-ambiguous-cumulative".to_owned()));
+        let mut token_usage =
+            MessageTokenUsage::request_and_turn_known(token_usage(7), token_usage(11));
+        token_usage.cumulative = TokenUsageScope::Unavailable {
+            reason: TokenUsageUnavailableReason::ProviderScopeAmbiguous,
+        };
+        message.token_usage = Some(token_usage);
+        let mut event = ChatEvent::MessageAdded(message);
+
+        assert!(stats.observe_chat_event(&mut event, 0, ""));
+        let ChatEvent::MessageAdded(message) = event else {
+            panic!("expected MessageAdded")
+        };
+        assert!(matches!(
+            message.token_usage.expect("message usage").cumulative,
+            TokenUsageScope::Unavailable {
+                reason: TokenUsageUnavailableReason::ProviderScopeAmbiguous
+            }
+        ));
+        assert_eq!(stats.snapshot().token_usage.total_tokens, 11);
     }
 
     #[test]
@@ -6940,6 +7954,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn generated_name_setup_selects_backend_inference_mode() {
+        let config = agent_name_generation_spawn_config();
+
+        assert!(config.startup_mcp_servers.is_empty());
+        assert_eq!(config.execution_mode, BackendExecutionMode::InferenceOnly);
+        assert!(config.session_settings.is_none());
+        assert!(config.backend_config.0.is_empty());
+        assert_eq!(
+            config.resolved_spawn_config.access_mode,
+            protocol::BackendAccessMode::ReadOnly
+        );
+        assert_eq!(
+            config.resolved_spawn_config.tool_policy,
+            protocol::ToolPolicy::AllowList { tools: Vec::new() }
+        );
+    }
+
     fn generated_name_stream_end(content: &str, reasoning: Option<&str>) -> ChatEvent {
         ChatEvent::StreamEnd(StreamEndData {
             message: ChatMessage {
@@ -7345,7 +8377,7 @@ mod tests {
             &mut subscribers,
             &mut replay_state,
             &ChatEvent::StreamEnd(StreamEndData {
-                message: assistant_message("metadata arrives later"),
+                message: assistant_message_with_id("message-1", "metadata arrives later"),
             }),
         )
         .await;
@@ -7548,7 +8580,7 @@ mod tests {
             &mut subscribers,
             &mut replay_state,
             &ChatEvent::StreamStart(StreamStartData {
-                message_id: Some("turn-1".to_owned()),
+                message_id: Some("message-1".to_owned()),
                 agent: "mock".to_owned(),
                 model: Some("mock-model".to_owned()),
             }),
@@ -7573,7 +8605,7 @@ mod tests {
             &mut subscribers,
             &mut replay_state,
             &ChatEvent::StreamEnd(StreamEndData {
-                message: assistant_message("hello world"),
+                message: assistant_message_with_id("message-1", "hello world"),
             }),
         )
         .await;
@@ -7739,7 +8771,7 @@ mod tests {
             &mut subscribers,
             &mut replay_state,
             &ChatEvent::StreamStart(StreamStartData {
-                message_id: Some("turn-1".to_owned()),
+                message_id: Some("message-1".to_owned()),
                 agent: "mock".to_owned(),
                 model: Some("mock-model".to_owned()),
             }),
@@ -7762,7 +8794,7 @@ mod tests {
             &mut subscribers,
             &mut replay_state,
             &ChatEvent::StreamEnd(StreamEndData {
-                message: assistant_message("hello world"),
+                message: assistant_message_with_id("message-1", "hello world"),
             }),
         )
         .await;
@@ -7855,7 +8887,7 @@ mod tests {
             &mut subscribers,
             &mut replay_state,
             &ChatEvent::StreamStart(StreamStartData {
-                message_id: Some("turn-1".to_owned()),
+                message_id: Some("message-1".to_owned()),
                 agent: "mock".to_owned(),
                 model: Some("mock-model".to_owned()),
             }),
@@ -7911,7 +8943,533 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_active_reasoning_uses_latest_message_id_before_live_end() {
+    async fn replay_preserves_server_generated_identity_without_rederiving_it() {
+        let canonical_stream = "/agent/replay-agent";
+        let mut event_log = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+        let mut subscribers = Vec::new();
+        let identity = ServerGeneratedChatMessageIdentity {
+            origin: ServerGeneratedChatMessageIdOrigin::LegacyReplay,
+            stream_epoch: 9,
+            item_ordinal: 1,
+        };
+        let message_id = identity.message_id();
+
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamStart(StreamStartData {
+                message_id: Some(message_id.0.clone()),
+                agent: "mock".to_owned(),
+                model: None,
+            }),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamEnd(StreamEndData {
+                message: assistant_message_with_id(&message_id.0, "legacy response"),
+            }),
+        )
+        .await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        attach_subscriber(
+            &event_log,
+            Some(&replay_state),
+            &mut subscribers,
+            replay_stream(tx),
+        );
+
+        let bootstrap = recv_agent_bootstrap_events(&mut rx, "generated identity bootstrap").await;
+        let replayed = bootstrap.into_iter().find_map(|event| match event {
+            AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message)) => message.message_id,
+            _ => None,
+        });
+        assert_eq!(replayed, Some(identity.message_id()));
+    }
+
+    #[tokio::test]
+    async fn replay_rejects_foreign_delta_without_rebinding_or_raw_id_leakage() {
+        let canonical_stream = "/agent/replay-agent";
+        let mut event_log = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+        let mut subscribers = Vec::new();
+
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &stream_start("message-1"),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamDelta(StreamTextDeltaData {
+                message_id: Some("foreign-provider-item-secret".to_owned()),
+                text: "foreign".to_owned(),
+            }),
+        )
+        .await;
+
+        let active = replay_state
+            .active_stream
+            .as_ref()
+            .expect("foreign delta must not clear the active stream");
+        assert_eq!(active.message_id, ChatMessageId("message-1".to_owned()));
+        assert!(active.text.is_empty());
+        let logged = event_log
+            .iter()
+            .map(|envelope| envelope.payload.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(logged.contains("foreign active message id"));
+        assert!(!logged.contains("foreign-provider-item-secret"));
+
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamEnd(StreamEndData {
+                message: assistant_message_with_id("foreign-end-secret", "foreign end"),
+            }),
+        )
+        .await;
+        assert_eq!(
+            replay_state
+                .active_stream
+                .as_ref()
+                .expect("foreign end must not close the active stream")
+                .message_id,
+            ChatMessageId("message-1".to_owned())
+        );
+        let logged = event_log
+            .iter()
+            .map(|envelope| envelope.payload.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(logged.contains("mismatched end message id"));
+        assert!(!logged.contains("foreign-end-secret"));
+
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamDelta(StreamTextDeltaData {
+                message_id: Some("message-1".to_owned()),
+                text: "accepted".to_owned(),
+            }),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamEnd(StreamEndData {
+                message: assistant_message_with_id("message-1", "accepted"),
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            replay_state
+                .completed_stream
+                .as_ref()
+                .expect("matching end completes the original stream")
+                .end
+                .message
+                .message_id,
+            Some(ChatMessageId("message-1".to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn gated_foreign_delta_is_rejected_before_stats_or_active_text_mutate() {
+        let canonical_stream = "/agent/replay-agent";
+        let mut event_log = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+        let mut subscribers = Vec::new();
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &stream_start("message-1"),
+        )
+        .await;
+
+        let mut event = ChatEvent::StreamDelta(StreamTextDeltaData {
+            message_id: Some("foreign-id".to_owned()),
+            text: "must not reach derived state".to_owned(),
+        });
+        let mut stats = AgentActivityStatsTracker::default();
+        let mut active_stream_text = "accepted text".to_owned();
+        let mut activity_event_seq = 7;
+        ingest_gated_replay_event(
+            &mut event,
+            canonical_stream,
+            &AgentId("replay-agent".to_owned()),
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &mut stats,
+            &mut active_stream_text,
+            &mut activity_event_seq,
+        )
+        .await;
+
+        assert_eq!(active_stream_text, "accepted text");
+        assert_eq!(activity_event_seq, 7);
+        assert!(event_log.iter().all(|envelope| {
+            !envelope
+                .payload
+                .to_string()
+                .contains("must not reach derived state")
+        }));
+        assert!(event_log.iter().any(|envelope| {
+            envelope
+                .payload
+                .to_string()
+                .contains("foreign active message id")
+        }));
+    }
+
+    #[tokio::test]
+    async fn replay_rejects_duplicate_terminal_stream_identity() {
+        let canonical_stream = "/agent/replay-agent";
+        let mut event_log = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+        let mut subscribers = Vec::new();
+
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &stream_start("message-1"),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamEnd(StreamEndData {
+                message: assistant_message_with_id("message-1", "complete"),
+            }),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &stream_start("message-1"),
+        )
+        .await;
+
+        assert!(replay_state.active_stream.is_none());
+        assert!(
+            replay_state
+                .terminal_stream_message_ids
+                .contains(&ChatMessageId("message-1".to_owned()))
+        );
+        let last = event_log.last().expect("violation is recorded");
+        let event = last
+            .parse_payload::<ChatEvent>()
+            .expect("typed violation event");
+        assert!(matches!(
+            event,
+            ChatEvent::MessageAdded(ChatMessage {
+                sender: MessageSender::Error,
+                content,
+                ..
+            }) if content == "Stream identity violation: duplicate terminal message id"
+        ));
+    }
+
+    #[tokio::test]
+    async fn replay_rejects_duplicate_same_sender_message_identity() {
+        let canonical_stream = "/agent/replay-agent";
+        let mut event_log = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+        let mut subscribers = Vec::new();
+        let first = ChatEvent::MessageAdded(assistant_message_with_id("message-1", "first"));
+        let second = ChatEvent::MessageAdded(assistant_message_with_id("message-1", "second"));
+
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &first,
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &second,
+        )
+        .await;
+
+        assert_eq!(
+            event_log
+                .iter()
+                .filter(|envelope| matches!(
+                    envelope.parse_payload::<ChatEvent>(),
+                    Ok(ChatEvent::MessageAdded(message))
+                        if message.message_id == Some(ChatMessageId("message-1".to_owned()))
+                ))
+                .count(),
+            1
+        );
+        assert!(event_log.iter().any(|envelope| {
+            envelope
+                .payload
+                .to_string()
+                .contains("duplicate terminal message id")
+        }));
+    }
+
+    #[tokio::test]
+    async fn empty_stream_completion_remains_durable_after_idle() {
+        let canonical_stream = "/agent/replay-agent";
+        let mut event_log = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+        let mut subscribers = Vec::new();
+
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::TypingStatusChanged(true),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &stream_start("completion-only-1"),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamEnd(StreamEndData {
+                message: assistant_message_with_id("completion-only-1", ""),
+            }),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::TypingStatusChanged(false),
+        )
+        .await;
+
+        assert!(event_log.iter().any(|envelope| {
+            matches!(
+                envelope.parse_payload::<ChatEvent>(),
+                Ok(ChatEvent::MessageAdded(message))
+                    if message.message_id == Some(ChatMessageId("completion-only-1".to_owned()))
+                        && message.content.is_empty()
+            )
+        }));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        attach_subscriber(
+            &event_log,
+            Some(&replay_state),
+            &mut subscribers,
+            replay_stream(tx),
+        );
+        let events = recv_agent_bootstrap_events(&mut rx, "late bootstrap").await;
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message))
+                    if message.message_id == Some(ChatMessageId("completion-only-1".to_owned()))
+                        && message.content.is_empty()
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn cancelled_reasoning_stream_remains_durable_with_its_stream_identity() {
+        let canonical_stream = "/agent/replay-agent";
+        let mut event_log = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+        let mut subscribers = Vec::new();
+
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &stream_start("reasoning-only-1"),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamReasoningDelta(StreamTextDeltaData {
+                message_id: Some("reasoning-only-1".to_owned()),
+                text: "thinking".to_owned(),
+            }),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::OperationCancelled(protocol::OperationCancelledData {
+                message: "cancelled".to_owned(),
+            }),
+        )
+        .await;
+
+        assert!(event_log.iter().any(|envelope| {
+            matches!(
+                envelope.parse_payload::<ChatEvent>(),
+                Ok(ChatEvent::MessageAdded(message))
+                    if message.message_id == Some(ChatMessageId("reasoning-only-1".to_owned()))
+                        && message.reasoning.as_ref().map(|reasoning| reasoning.text.as_str())
+                            == Some("thinking")
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn live_and_replay_stream_frames_preserve_exact_message_identity() {
+        let canonical_stream = "/agent/replay-agent";
+        let mut event_log = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+        let mut subscribers = Vec::new();
+        let (live_tx, mut live_rx) = mpsc::unbounded_channel();
+        attach_subscriber(
+            &event_log,
+            Some(&replay_state),
+            &mut subscribers,
+            replay_stream(live_tx),
+        );
+        let _ = recv_agent_bootstrap_events(&mut live_rx, "initial bootstrap").await;
+
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::TypingStatusChanged(true),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &stream_start("message-1"),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamReasoningDelta(StreamTextDeltaData {
+                message_id: Some("message-1".to_owned()),
+                text: "thinking".to_owned(),
+            }),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamDelta(StreamTextDeltaData {
+                message_id: Some("message-1".to_owned()),
+                text: "answer".to_owned(),
+            }),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamEnd(StreamEndData {
+                message: assistant_message_with_id("message-1", "answer"),
+            }),
+        )
+        .await;
+
+        let mut live = Vec::new();
+        for _ in 0..5 {
+            let envelope = timeout(Duration::from_secs(1), live_rx.recv())
+                .await
+                .expect("timed out waiting for live stream frame")
+                .expect("live subscriber closed");
+            live.push(
+                envelope
+                    .parse_payload::<ChatEvent>()
+                    .expect("typed live chat event"),
+            );
+        }
+        let (replay_tx, mut replay_rx) = mpsc::unbounded_channel();
+        attach_subscriber(
+            &event_log,
+            Some(&replay_state),
+            &mut subscribers,
+            replay_stream(replay_tx),
+        );
+        let replay = recv_agent_bootstrap_events(&mut replay_rx, "late bootstrap")
+            .await
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentBootstrapEvent::ChatEvent(event) => Some(event),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        let live_stream = live
+            .into_iter()
+            .filter(|event| !matches!(event, ChatEvent::TypingStatusChanged(_)))
+            .collect::<Vec<_>>();
+        let replay_stream = replay
+            .into_iter()
+            .filter(|event| !matches!(event, ChatEvent::TypingStatusChanged(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            serde_json::to_value(live_stream).expect("serialize live stream frames"),
+            serde_json::to_value(replay_stream).expect("serialize replay stream frames")
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_active_reasoning_preserves_stream_message_id_before_live_end() {
         let canonical_stream = "/agent/replay-agent";
         let mut event_log = Vec::new();
         let mut replay_state = AgentReplayState::default();
@@ -7931,7 +9489,7 @@ mod tests {
             &mut subscribers,
             &mut replay_state,
             &ChatEvent::StreamStart(StreamStartData {
-                message_id: Some("turn-1".to_owned()),
+                message_id: Some("reasoning-item-1".to_owned()),
                 agent: "mock".to_owned(),
                 model: Some("mock-model".to_owned()),
             }),
@@ -8066,7 +9624,7 @@ mod tests {
             &mut subscribers,
             &mut replay_state,
             &ChatEvent::StreamStart(StreamStartData {
-                message_id: Some("turn-1".to_owned()),
+                message_id: Some("message-1".to_owned()),
                 agent: "mock".to_owned(),
                 model: Some("mock-model".to_owned()),
             }),
@@ -8089,7 +9647,7 @@ mod tests {
             &mut subscribers,
             &mut replay_state,
             &ChatEvent::StreamEnd(StreamEndData {
-                message: assistant_message("hello"),
+                message: assistant_message_with_id("message-1", "hello"),
             }),
         )
         .await;
@@ -8163,6 +9721,7 @@ mod tests {
                 },
                 success: true,
                 error: None,
+                normalization_failure: None,
             }),
         )
         .await;
@@ -8172,7 +9731,7 @@ mod tests {
             &mut subscribers,
             &mut replay_state,
             &ChatEvent::StreamEnd(StreamEndData {
-                message: assistant_message(""),
+                message: assistant_message_with_id("message-1", ""),
             }),
         )
         .await;

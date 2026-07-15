@@ -25,12 +25,13 @@ pub fn ChatMessageView(
     // already dedup via `PartialEq` on the projected tuple, so this
     // is purely savings on the per-evaluation alloc cost.
     let entry_for_meta = entry.clone();
-    let card_meta: Memo<(String, String, bool, bool)> = Memo::new(move |_| {
+    let card_meta: Memo<(String, String, bool, bool, bool)> = Memo::new(move |_| {
         entry_for_meta.with(|e| match &e.message.sender {
             MessageSender::User => (
                 "chat-card chat-card-user".to_owned(),
                 "You".to_owned(),
                 true,
+                false,
                 false,
             ),
             MessageSender::Assistant { agent } => (
@@ -38,10 +39,12 @@ pub fn ChatMessageView(
                 agent.clone(),
                 false,
                 true,
+                false,
             ),
             MessageSender::System => (
                 "chat-card chat-card-system".to_owned(),
                 "System".to_owned(),
+                false,
                 false,
                 false,
             ),
@@ -50,12 +53,14 @@ pub fn ChatMessageView(
                 "Warning".to_owned(),
                 false,
                 false,
+                false,
             ),
             MessageSender::Error => (
                 "chat-card chat-card-error".to_owned(),
                 "Error".to_owned(),
                 false,
                 false,
+                true,
             ),
         })
     });
@@ -139,9 +144,13 @@ pub fn ChatMessageView(
     let entry_for_reasoning_slot = StoredValue::new_local(entry_for_reasoning.clone());
 
     view! {
-        <div class=move || card_meta.with(|(c, _, _, _)| c.clone())>
+        <div
+            class=move || card_meta.with(|(c, _, _, _, _)| c.clone())
+            role=move || card_meta.with(|(_, _, _, _, is_error)| is_error.then_some("alert"))
+            aria-label=move || card_meta.with(|(_, _, _, _, is_error)| is_error.then_some("Error message"))
+        >
             <div class="chat-card-header">
-                <span class="chat-card-sender">{move || card_meta.with(|(_, s, _, _)| s.clone())}</span>
+                <span class="chat-card-sender">{move || card_meta.with(|(_, s, _, _, _)| s.clone())}</span>
                 {move || model_memo.get().map(|m| view! {
                     <span class="chat-card-model">{m}</span>
                 })}
@@ -234,7 +243,7 @@ pub fn ChatMessageView(
 
             // Footer (assistant only)
             {move || {
-                let is_assistant = card_meta.with(|(_, _, _, ia)| *ia);
+                let is_assistant = card_meta.with(|(_, _, _, ia, _)| *ia);
                 if !is_assistant {
                     return None;
                 }

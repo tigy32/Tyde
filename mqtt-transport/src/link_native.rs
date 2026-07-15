@@ -10,6 +10,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(test)]
+use std::time::Instant;
 
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -49,6 +51,25 @@ pub(crate) struct NativeMqttLink {
     publish_tokens_by_pkid: HashMap<u16, PublishToken>,
     #[cfg(test)]
     accepted_publish_count: Option<Arc<AtomicUsize>>,
+    #[cfg(test)]
+    diagnostic: Option<TestConnectionDiagnostic>,
+}
+
+#[cfg(test)]
+pub(crate) struct TestConnectionDiagnosticContext {
+    pub(crate) label: String,
+    pub(crate) phase: &'static str,
+    pub(crate) started_at: Instant,
+    pub(crate) role: String,
+    pub(crate) inbound_topic: String,
+    pub(crate) outbound_topic: String,
+    pub(crate) client_identity: String,
+}
+
+#[cfg(test)]
+struct TestConnectionDiagnostic {
+    context: TestConnectionDiagnosticContext,
+    connack_observed: bool,
 }
 
 impl NativeMqttLink {
@@ -66,6 +87,8 @@ impl NativeMqttLink {
             publish_tokens_by_pkid: HashMap::new(),
             #[cfg(test)]
             accepted_publish_count: None,
+            #[cfg(test)]
+            diagnostic: None,
         })
     }
 
@@ -75,6 +98,17 @@ impl NativeMqttLink {
         accepted_publish_count: Option<Arc<AtomicUsize>>,
     ) {
         self.accepted_publish_count = accepted_publish_count;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_connection_diagnostic(
+        &mut self,
+        context: TestConnectionDiagnosticContext,
+    ) {
+        self.diagnostic = Some(TestConnectionDiagnostic {
+            context,
+            connack_observed: false,
+        });
     }
 
     fn allocate_publish_token(&mut self) -> Result<PublishToken, MqttTransportError> {
@@ -89,6 +123,27 @@ impl NativeMqttLink {
 
     fn translate_event(&mut self, event: Event) -> Result<LinkEvent, MqttTransportError> {
         match event {
+            #[cfg(test)]
+            Event::Incoming(Packet::ConnAck(connack)) => {
+                if let Some(diagnostic) = self.diagnostic.as_mut()
+                    && !diagnostic.connack_observed
+                {
+                    diagnostic.connack_observed = true;
+                    eprintln!(
+                        "mqtt transport test connack label={} phase={} elapsed_ms={} role={} client_identity={} inbound_topic={} outbound_topic={} connack={connack:?}",
+                        diagnostic.context.label,
+                        diagnostic.context.phase,
+                        diagnostic.context.started_at.elapsed().as_millis(),
+                        diagnostic.context.role,
+                        diagnostic.context.client_identity,
+                        diagnostic.context.inbound_topic,
+                        diagnostic.context.outbound_topic,
+                    );
+                }
+                Ok(LinkEvent::Other)
+            }
+            #[cfg(not(test))]
+            Event::Incoming(Packet::ConnAck(_)) => Ok(LinkEvent::Other),
             Event::Incoming(Packet::Publish(publish)) => Ok(LinkEvent::Publish(IncomingPublish {
                 topic: publish.topic.to_vec(),
                 payload: publish.payload.to_vec(),
@@ -176,13 +231,27 @@ impl MqttLink for NativeMqttLink {
     }
 
     async fn poll(&mut self) -> Result<LinkEvent, MqttTransportError> {
-        let event =
-            self.eventloop
-                .poll()
-                .await
-                .map_err(|source| MqttTransportError::BrokerConnect {
+        let event = match self.eventloop.poll().await {
+            Ok(event) => event,
+            Err(source) => {
+                #[cfg(test)]
+                if let Some(diagnostic) = self.diagnostic.as_ref() {
+                    eprintln!(
+                        "mqtt transport test poll failed label={} phase={} elapsed_ms={} role={} client_identity={} inbound_topic={} outbound_topic={} rumqttc_error={source:?}",
+                        diagnostic.context.label,
+                        diagnostic.context.phase,
+                        diagnostic.context.started_at.elapsed().as_millis(),
+                        diagnostic.context.role,
+                        diagnostic.context.client_identity,
+                        diagnostic.context.inbound_topic,
+                        diagnostic.context.outbound_topic,
+                    );
+                }
+                return Err(MqttTransportError::BrokerConnect {
                     source: Box::new(source),
-                })?;
+                });
+            }
+        };
         self.translate_event(event)
     }
 

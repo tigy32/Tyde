@@ -122,8 +122,16 @@ fn ScannerScreen() -> impl IntoView {
                 >"Cancel"</button>
             </div>
             <div class="view-body">
-                <p class="pairing-instruction" data-mobile-test="pairing-scanner-instruction">
-                    "Point your phone at the QR code shown in Tyde on your computer (Settings → Hosts)."
+                // The QR lives under Settings → Mobile, not Settings → Hosts.
+                // `aria-label` carries the same path in words: the arrow is a
+                // visual breadcrumb, and screen readers announce it
+                // inconsistently or not at all.
+                <p
+                    class="pairing-instruction"
+                    data-mobile-test="pairing-scanner-instruction"
+                    aria-label="Point your phone at the QR code shown in Tyde on your computer, under Settings, in the Mobile tab."
+                >
+                    "Point your phone at the QR code shown in Tyde on your computer (Settings → Mobile)."
                 </p>
                 <div class="pairing-scanner-frame" data-mobile-test="pairing-scanner-frame">
                     <div class="pairing-scanner-reticle" aria-hidden="true"></div>
@@ -206,8 +214,16 @@ fn ManualPasteScreen() -> impl IntoView {
                     prop:value=move || pasted.get()
                     on:input=move |ev| pasted.set(event_target_value(&ev))
                 />
+                // Announced: this appears *in response to* the user tapping Continue,
+                // and a screen-reader user who is told nothing simply taps again.
                 {move || error.get().map(|msg| view! {
-                    <p class="pairing-error">{msg}</p>
+                    <p
+                        class="pairing-error"
+                        role="alert"
+                        data-mobile-test="pairing-paste-error"
+                    >
+                        {msg}
+                    </p>
                 })}
                 <button
                     type="button"
@@ -547,7 +563,15 @@ fn ServiceAuthCard(
         MobileServiceAuthState::AuthFailed { message } => view! {
             <div class="pairing-card" data-mobile-test="pairing-auth-failed">
                 <h2 class="pairing-card-title">"Sign in with Tyggs"</h2>
-                <p class="pairing-card-body">{message}</p>
+                // The heading is the *action*; the failure itself is in the body, so
+                // that is what has to be announced.
+                <p
+                    class="pairing-card-body"
+                    role="alert"
+                    data-mobile-test="pairing-auth-failed-message"
+                >
+                    {message}
+                </p>
                 {auth_provider_buttons(
                     "pairing-auth-sign-in",
                     busy,
@@ -560,7 +584,13 @@ fn ServiceAuthCard(
         MobileServiceAuthState::ServiceUnavailable { message, retryable } => view! {
             <div class="pairing-card" data-mobile-test="pairing-service-unavailable">
                 <h2 class="pairing-card-title">"Service unavailable"</h2>
-                <p class="pairing-card-body">{message}</p>
+                <p
+                    class="pairing-card-body"
+                    role="alert"
+                    data-mobile-test="pairing-service-unavailable-message"
+                >
+                    {message}
+                </p>
                 {retryable.then(|| view! {
                     <Button
                         label="Try again"
@@ -667,7 +697,15 @@ fn RepairRequiredScreen(message: String) -> impl IntoView {
                 <h1 class="view-title">"Re-pair required"</h1>
             </div>
             <div class="view-body">
-                <div class="pairing-card" data-mobile-test="pairing-repair-required">
+                // Terminal, and unrecoverable without acting on what this says — so
+                // it is announced on arrival rather than left for the user to go
+                // looking for. The card wraps only the message, so nothing else is
+                // dragged into the announcement.
+                <div
+                    class="pairing-card"
+                    role="alert"
+                    data-mobile-test="pairing-repair-required"
+                >
                     <p class="pairing-card-body">{message}</p>
                 </div>
                 <Button
@@ -705,7 +743,13 @@ fn FailedScreen(message: String) -> impl IntoView {
                 <h1 class="view-title">"Pairing failed"</h1>
             </div>
             <div class="view-body">
-                <p class="pairing-error">{message}</p>
+                <p
+                    class="pairing-error"
+                    role="alert"
+                    data-mobile-test="pairing-failed-message"
+                >
+                    {message}
+                </p>
                 <Button
                     label="Try again"
                     variant=ButtonVariant::Primary
@@ -759,16 +803,7 @@ mod wasm_tests {
         }
     }
 
-    fn force_web_backend() {
-        let window = web_sys::window().expect("window");
-        let _ = js_sys::Reflect::delete_property(
-            &window,
-            &wasm_bindgen::JsValue::from_str("__TAURI__"),
-        );
-    }
-
     fn set_service_config(json: &str) {
-        force_web_backend();
         let window = web_sys::window().expect("window");
         let key = wasm_bindgen::JsValue::from_str("__TYDE_MOBILE_SERVICE__");
         if json.is_empty() {
@@ -777,6 +812,246 @@ mod wasm_tests {
         }
         let value = js_sys::JSON::parse(json).expect("parse service config");
         js_sys::Reflect::set(&window, &key, &value).expect("install service config");
+    }
+
+    /// The scanner is the one screen a user stares at while hunting for the QR,
+    /// and it told them to look under Settings → Hosts — which has no pairing
+    /// controls at all. Following it led to a dead end with nothing on screen to
+    /// correct the mistake.
+    ///
+    /// This string had **no test at all**, which is how it shipped wrong.
+    ///
+    /// Evidence for "Mobile": `MobileTab` renders the pairing QR and the "Start
+    /// pairing" button (`frontend/src/components/settings_panel.rs:4574`);
+    /// `HostsTab` renders neither.
+    #[wasm_bindgen_test]
+    async fn scanner_instruction_points_at_the_settings_tab_that_has_the_qr() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            provide_context(state);
+            view! { <PairingFlow screen=PairingScreen::Scanner /> }
+        });
+        next_tick().await;
+
+        let instruction = container
+            .query_selector("[data-mobile-test='pairing-scanner-instruction']")
+            .unwrap()
+            .expect("the scanner must tell the user where to find the QR");
+        let text = instruction.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Settings → Mobile"),
+            "the scanner must name the Settings tab that actually shows the QR, got: {text}"
+        );
+        assert!(
+            !text.contains("Hosts"),
+            "Hosts has no QR, so sending the user there is a dead end: {text}"
+        );
+
+        // The arrow is decoration. A screen-reader user must still be told which
+        // tab to open, in words.
+        let spoken = instruction.get_attribute("aria-label").expect(
+            "the instruction must have a spoken form, since '→' is announced inconsistently",
+        );
+        assert!(
+            spoken.contains("Settings") && spoken.contains("Mobile"),
+            "the spoken form must name both Settings and the Mobile tab, got: {spoken}"
+        );
+        assert!(
+            !spoken.contains('→'),
+            "the spoken form must not rely on a glyph screen readers mangle, got: {spoken}"
+        );
+    }
+
+    /// Read the announced role of a rendered element.
+    fn role_of(container: &HtmlElement, test_id: &str) -> Option<String> {
+        container
+            .query_selector(&format!("[data-mobile-test='{test_id}']"))
+            .unwrap()
+            .and_then(|el| el.get_attribute("role"))
+    }
+
+    /// **A terminal pairing failure that announces nothing leaves a screen-reader user
+    /// stranded on it.**
+    ///
+    /// "Re-pair required" is the hard stop: the pairing has failed closed and the user
+    /// cannot proceed without acting on what the message says. It carried no `role` and
+    /// no `aria-live`, so arriving there said nothing at all — the message had to be
+    /// hunted for by manual traversal.
+    #[wasm_bindgen_test]
+    async fn repair_required_announces_the_terminal_failure() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            provide_context(state);
+            view! {
+                <PairingFlow screen=PairingScreen::RepairRequired {
+                    message: "This pairing code used the old public broker.".to_owned(),
+                } />
+            }
+        });
+        next_tick().await;
+
+        assert_eq!(
+            role_of(&container, "pairing-repair-required").as_deref(),
+            Some("alert"),
+            "a terminal, unrecoverable-without-action state must announce itself"
+        );
+        let announced = container
+            .query_selector("[data-mobile-test='pairing-repair-required']")
+            .unwrap()
+            .unwrap()
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            announced.contains("old public broker"),
+            "the announcement must carry the reason, not just a bare alert: {announced}"
+        );
+    }
+
+    /// `PairingScreen::Failed` — the product state is literally named for the failure,
+    /// so the screen has no excuse for staying silent.
+    #[wasm_bindgen_test]
+    async fn pairing_failed_announces_the_failure() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            provide_context(state);
+            view! {
+                <PairingFlow screen=PairingScreen::Failed {
+                    message: "Could not reach the host.".to_owned(),
+                } />
+            }
+        });
+        next_tick().await;
+
+        assert_eq!(
+            role_of(&container, "pairing-failed-message").as_deref(),
+            Some("alert"),
+            "a failed pairing must announce why"
+        );
+    }
+
+    /// The paste validation error appears *because the user just tapped Continue*.
+    /// Unannounced, a screen-reader user simply taps it again.
+    #[wasm_bindgen_test]
+    async fn paste_validation_error_announces_itself() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            provide_context(state);
+            view! { <PairingFlow screen=PairingScreen::ManualPaste /> }
+        });
+        next_tick().await;
+
+        assert!(
+            role_of(&container, "pairing-paste-error").is_none(),
+            "nothing has failed yet — an alert here would be inventing one"
+        );
+
+        // Tap Continue with an empty box: the product itself calls this an error.
+        let continue_button: HtmlElement = container
+            .query_selector("button.ui-button-primary")
+            .unwrap()
+            .expect("Continue must render")
+            .dyn_into()
+            .unwrap();
+        continue_button.click();
+        next_tick().await;
+
+        assert_eq!(
+            role_of(&container, "pairing-paste-error").as_deref(),
+            Some("alert"),
+            "the validation failure must be announced when it appears"
+        );
+    }
+
+    /// `AuthFailed` and `ServiceUnavailable` both name a failure in the product state.
+    #[wasm_bindgen_test]
+    async fn service_auth_failures_announce_themselves() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            view! {
+                <ServiceAuthCard
+                    auth=MobileServiceAuthState::AuthFailed {
+                        message: "Sign-in did not complete.".to_owned(),
+                    }
+                    busy=false
+                    on_retry=Callback::new(|_: ()| {})
+                    on_sign_in=Callback::new(|_: AuthProvider| {})
+                />
+            }
+        });
+        next_tick().await;
+        assert_eq!(
+            role_of(&container, "pairing-auth-failed-message").as_deref(),
+            Some("alert"),
+            "a failed sign-in must announce why"
+        );
+
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            view! {
+                <ServiceAuthCard
+                    auth=MobileServiceAuthState::ServiceUnavailable {
+                        message: "Tyggs is unreachable right now.".to_owned(),
+                        retryable: true,
+                    }
+                    busy=false
+                    on_retry=Callback::new(|_: ()| {})
+                    on_sign_in=Callback::new(|_: AuthProvider| {})
+                />
+            }
+        });
+        next_tick().await;
+        assert_eq!(
+            role_of(&container, "pairing-service-unavailable-message").as_deref(),
+            Some("alert"),
+            "an unavailable service must announce why"
+        );
+    }
+
+    /// **A paywall is not a failure, and must not be announced as one.**
+    ///
+    /// `PassRequired` is an entitlement the user does not yet have — nothing has gone
+    /// wrong, and nothing is broken. Wrapping it in `role="alert"` would interrupt with
+    /// an assertive announcement of a fault that does not exist, which is exactly the
+    /// invented-failure the alert pass must not produce. It stays a plain card, and this
+    /// pins that decision so it is not "fixed" later by pattern-matching on the others.
+    #[wasm_bindgen_test]
+    async fn a_paywall_is_not_announced_as_a_failure() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            view! {
+                <ServiceAuthCard
+                    auth=MobileServiceAuthState::PassRequired {
+                        message: "A Tyggs Pass is required.".to_owned(),
+                        paywall_url: "https://tyggs.com/go".to_owned(),
+                    }
+                    busy=false
+                    on_retry=Callback::new(|_: ()| {})
+                    on_sign_in=Callback::new(|_: AuthProvider| {})
+                />
+            }
+        });
+        next_tick().await;
+
+        let paywall = container
+            .query_selector("[data-mobile-test='pairing-paywall']")
+            .unwrap()
+            .expect("the paywall must render");
+        assert!(
+            paywall.query_selector("[role='alert']").unwrap().is_none(),
+            "needing a pass is not a fault — announcing it as one invents a failure"
+        );
+        // …and it still does its job.
+        assert!(
+            container
+                .query_selector("[data-mobile-test='pairing-paywall-link']")
+                .unwrap()
+                .is_some(),
+            "the paywall must still offer the way forward"
+        );
     }
 
     #[wasm_bindgen_test]

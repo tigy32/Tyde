@@ -74,6 +74,11 @@ fn ActiveHostShell() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
     view! {
         <components::ConnectionBanner />
+        // Host-scoped, so a new-chat submission the transport lost stays
+        // recoverable wherever the user navigates — it has no agent to live
+        // under, and the client will not guess one. Above the content (and so
+        // above the composer) it stays reachable with the keyboard open.
+        <components::PendingSubmissions />
         <div class="mobile-content">
             {move || {
                 let viewing_chat = state.viewing_chat.get();
@@ -293,6 +298,28 @@ fn install_event_listeners(state: AppState) {
             bridge::listen_mobile_shell_error(move |error| {
                 log::error!("mobile shell error: {:?} {}", error.code, error.message);
                 state_shell_error.mobile_shell_error.set(Some(error));
+            })
+            .await,
+        );
+
+        let state_submission = state.clone();
+        register_listener(
+            &state,
+            "submission-transport-outcome",
+            bridge::listen_submission_transport_outcome(move |event| {
+                log::info!(
+                    "submission_transport_outcome host={} connection_instance_id={} \
+                     local_submission_id={} outcome={:?}",
+                    event.local_host_id,
+                    event.connection_instance_id,
+                    event.local_submission_id.0,
+                    event.outcome
+                );
+                state_submission.apply_submission_outcome(
+                    event.local_submission_id,
+                    event.connection_instance_id,
+                    event.outcome,
+                );
             })
             .await,
         );
@@ -574,12 +601,12 @@ fn apply_connection_status(
             // underlying MQTT connection we already set up.  If so there is
             // no need to allocate a new host stream or send Hello — doing so
             // would reset protocol seq state and trigger a full rebootstrap
-            // for no reason (e.g. the WASM frontend reattached while the
-            // native connection stayed alive).
+            // for no reason (e.g. the frontend listener was reattached while
+            // the web connection stayed alive).
             let same_connection = match connection_instance_id {
                 Some(id) => {
-                    // Native side is providing an instance id: use it as the
-                    // authoritative check.
+                    // The connection manager provides an instance id: use it
+                    // as the authoritative check.
                     state
                         .active_connection_instance_ids
                         .get_untracked()
@@ -775,8 +802,23 @@ fn apply_disconnect(state: &AppState, host: &LocalHostId, _reason: Option<String
     state
         .agents
         .update(|agents| agents.retain(|a| a.local_host_id != *host));
+    // Both halves of the load latch must go. `agent_load_requests` alone is not
+    // enough: `agent_loaded` is only ever written by an `AgentBootstrap`, and
+    // the next connection mints a *new* agent instance stream, so a surviving
+    // `agent_loaded` entry marks a chat as bootstrapped against a stream that no
+    // longer exists. `ChatView` would then render an empty transcript as
+    // "loaded and genuinely empty" instead of re-requesting the bootstrap.
     state.agent_load_requests.update(|m| {
         m.retain(|k| k.local_host_id != *host);
+    });
+    state.agent_loaded.update(|m| {
+        m.retain(|k| k.local_host_id != *host);
+    });
+    // Clearing the load error alongside the latch is what makes a reconnect the
+    // recovery action: the next connection's auto-load re-sends `LoadAgent` on
+    // the fresh instance stream instead of re-rendering a stale failure.
+    state.agent_load_errors.update(|m| {
+        m.retain(|k, _| k.local_host_id != *host);
     });
     state
         .sessions
@@ -825,15 +867,19 @@ fn apply_disconnect(state: &AppState, host: &LocalHostId, _reason: Option<String
     {
         state.active_project.set(None);
     }
-    if state
-        .active_agent
-        .get_untracked()
-        .as_ref()
-        .is_some_and(|active| active.local_host_id == *host)
-    {
-        state.active_agent.set(None);
-        state.viewing_chat.set(false);
-    }
+    // `active_agent` and `viewing_chat` deliberately survive a disconnect.
+    //
+    // They are *navigation* state — where the user is standing — not server state,
+    // and every byte of server state above has just been dropped, so nothing stale
+    // is being kept authoritative. Clearing them silently teleported the user out
+    // of the chat they were reading, which had two costs: the terminal
+    // "connection dropped → Reconnect" state inside the chat became unreachable
+    // (`ChatView` had already unmounted by the time anyone could render it), and a
+    // transient blip threw them back to the tab list for no reason.
+    //
+    // Staying put means `ChatView` renders the disconnected terminal state, and a
+    // reconnect re-bootstraps the host, re-loads this agent on its fresh instance
+    // stream, and puts the user back in their conversation.
 }
 
 fn make_host_stream() -> protocol::StreamPath {
@@ -876,23 +922,6 @@ mod wasm_tests {
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
     }
 
-    fn install_tauri_invoke_stub() {
-        js_sys::eval(
-            r#"
-            (function() {
-                window.__TAURI__ = window.__TAURI__ || {};
-                window.__TAURI__.core = window.__TAURI__.core || {};
-                window.__TAURI__.core.invoke = function() {
-                    return Promise.resolve();
-                };
-                window.__TAURI__.event = window.__TAURI__.event || {};
-                window.__TAURI__.event.listen = function() { return Promise.resolve(null); };
-            })();
-        "#,
-        )
-        .expect("install tauri stub");
-    }
-
     fn empty_host_settings() -> protocol::HostSettings {
         protocol::HostSettings {
             enabled_backends: Vec::new(),
@@ -923,6 +952,205 @@ mod wasm_tests {
             auto_connect: false,
             last_connected_at_ms: None,
         }
+    }
+
+    /// **The real disconnect lifecycle must leave the user somewhere they can act.**
+    ///
+    /// `apply_disconnect` used to clear `active_agent` and `viewing_chat`, which
+    /// unmounted `ChatView` outright. Every terminal recovery state inside the
+    /// chat was therefore unreachable in the one lifecycle that actually happens:
+    /// the chat-level test could set a `Disconnected` status directly and see the
+    /// recovery, but a genuine `HostDisconnected` event teleported the user away
+    /// before anything could render it.
+    ///
+    /// So this drives the *real* handler into a *real* mounted `ChatView`.
+    ///
+    /// Server state must still be dropped — nothing stale may be presented as
+    /// authoritative — while the navigation pointer survives, so the user stays
+    /// in the conversation and is offered the reconnect that fixes it.
+    #[wasm_bindgen_test]
+    async fn a_real_disconnect_leaves_an_actionable_recovery_in_the_open_chat() {
+        let container = make_container();
+        let host = LocalHostId("host-disconnect".to_owned());
+        let host_for_mount = host.clone();
+        let handle: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let handle_for_mount = handle.clone();
+        let mount = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let agent_ref = crate::state::AgentRef {
+                local_host_id: host_for_mount.clone(),
+                agent_id: protocol::AgentId("agent-1".to_owned()),
+            };
+            state.active_local_host_id.set(Some(host_for_mount.clone()));
+            state.connection_statuses.update(|m| {
+                m.insert(host_for_mount.clone(), ConnectionStatus::Connected);
+            });
+            state.host_streams.update(|m| {
+                m.insert(
+                    host_for_mount.clone(),
+                    protocol::StreamPath("/host/h1".to_owned()),
+                );
+            });
+            state.agents.set(vec![crate::state::AgentInfo {
+                local_host_id: host_for_mount.clone(),
+                agent_id: protocol::AgentId("agent-1".to_owned()),
+                name: "Coder".to_owned(),
+                origin: protocol::AgentOrigin::User,
+                backend_kind: protocol::BackendKind::Claude,
+                workspace_roots: Vec::new(),
+                project_id: None,
+                parent_agent_id: None,
+                session_id: None,
+                custom_agent_id: None,
+                created_at_ms: 0,
+                instance_stream: protocol::StreamPath("/agent/a1/inst".to_owned()),
+                started: true,
+                fatal_error: None,
+            }]);
+            state.active_agent.set(Some(crate::state::ActiveAgentRef {
+                local_host_id: host_for_mount.clone(),
+                agent_id: protocol::AgentId("agent-1".to_owned()),
+            }));
+            state.viewing_chat.set(true);
+            // The chat is mid-load: the latch is set and no snapshot has landed.
+            // This is exactly the state the user reported as an endless spinner.
+            state.agent_load_requests.update(|m| {
+                m.insert(agent_ref);
+            });
+            *handle_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! { <crate::components::ChatView /> }
+        });
+        std::mem::forget(mount);
+        next_tick().await;
+        let state = handle.borrow().as_ref().unwrap().clone();
+
+        // A message the user discarded *before* the drop. Its tombstone is the only
+        // thing stopping the tool card that sent it from going back to claiming it
+        // is on its way to the agent — so a disconnect must not take it.
+        let discarded = crate::state::SubmissionOriginId(999);
+        state.hold_submission(crate::state::PendingSubmission {
+            local_submission_id: crate::bridge::LocalSubmissionId(99),
+            origin: discarded,
+            local_host_id: host.clone(),
+            connection_instance_id: 7,
+            target: crate::state::SubmissionTarget::NewChat,
+            text: "thrown away".to_owned(),
+            images: Vec::new(),
+            tool_response: None,
+            state: crate::state::PendingSubmissionState::NotSent,
+        });
+        state.withdraw_submission(
+            crate::bridge::LocalSubmissionId(99),
+            crate::state::SubmissionWithdrawal::Discarded,
+        );
+
+        // A message that was in flight when the link died — it must survive, because
+        // its record is the only holder of the user's text.
+        state.hold_submission(crate::state::PendingSubmission {
+            local_submission_id: crate::bridge::LocalSubmissionId(1),
+            origin: state.mint_submission_origin(),
+            local_host_id: host.clone(),
+            connection_instance_id: 7,
+            target: crate::state::SubmissionTarget::NewChat,
+            text: "do not lose me".to_owned(),
+            images: Vec::new(),
+            tool_response: None,
+            state: crate::state::PendingSubmissionState::QueuedLocally,
+        });
+
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-loading-spinner']")
+                .unwrap()
+                .is_some(),
+            "precondition: the chat is showing a loading spinner"
+        );
+
+        // The real thing.
+        apply_disconnect(&state, &host, Some("link dropped".to_owned()));
+        next_tick().await;
+        next_tick().await;
+
+        // The user is still standing in their conversation.
+        assert!(
+            state.viewing_chat.get_untracked(),
+            "a dropped connection must not teleport the user out of the chat they \
+             were reading"
+        );
+        assert!(
+            state.active_agent.get_untracked().is_some(),
+            "the navigation pointer is not server state and must survive the drop"
+        );
+
+        // Stale server state is *not* kept around pretending to be authoritative.
+        assert!(
+            state.agents.get_untracked().is_empty(),
+            "the agent snapshot is server state and must be dropped"
+        );
+        assert!(
+            state.agent_loaded.get_untracked().is_empty(),
+            "a bootstrap from a dead stream must not still count as loaded"
+        );
+        assert!(
+            state.agent_load_requests.get_untracked().is_empty(),
+            "the load latch must clear so the next connection re-loads the agent"
+        );
+
+        // And the spinner is gone, replaced by something the user can act on.
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-loading-spinner']")
+                .unwrap()
+                .is_none(),
+            "a bootstrap that can never arrive must not still render as loading"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-empty']")
+                .unwrap()
+                .is_none(),
+            "the conversation is not empty — we simply no longer know what is in it. \
+             Calling it empty is a lie the user would act on"
+        );
+        let failed = container
+            .query_selector("[data-mobile-test='chat-load-failed']")
+            .unwrap()
+            .expect("the real disconnect lifecycle must render the terminal recovery");
+        assert_eq!(
+            failed.get_attribute("role").as_deref(),
+            Some("alert"),
+            "a screen reader told 'Loading conversation' must be told how it ended"
+        );
+        let reconnect = container
+            .query_selector("[data-mobile-test='chat-load-failed-reconnect']")
+            .unwrap()
+            .expect("the terminal state must offer the action that fixes it");
+        assert!(
+            !reconnect.has_attribute("disabled"),
+            "the reconnect must be reachable"
+        );
+
+        // The in-flight message is still recoverable.
+        assert_eq!(
+            state.pending_submissions.get_untracked().len(),
+            1,
+            "a disconnect must never destroy a held submission — that record is the \
+             only copy of the user's text"
+        );
+        // And the truth about the one the user threw away survives too. A disconnect
+        // is not teardown: only forgetting the host is, and until then a tool card
+        // that discarded its reply must keep saying so rather than reverting to
+        // "queued locally".
+        assert_eq!(
+            state.submission_lifecycle(discarded),
+            crate::state::SubmissionLifecycle::Withdrawn(
+                crate::state::SubmissionWithdrawal::Discarded
+            ),
+            "a dropped connection must not resurrect the 'queued locally' lie about a \
+             message the user discarded"
+        );
     }
 
     #[wasm_bindgen_test]
@@ -959,7 +1187,7 @@ mod wasm_tests {
     /// host_stream present uses the legacy heuristic: same stream, no re-Hello.
     #[wasm_bindgen_test]
     fn connected_status_replay_does_not_replace_host_stream() {
-        install_tauri_invoke_stub();
+        let _send_guard = bridge::test_clean_sends();
         let state = AppState::new();
         let host = LocalHostId("host-connected-replay".to_owned());
 
@@ -991,7 +1219,7 @@ mod wasm_tests {
     /// `install_event_listeners`; the test documents its inherent behavior.
     #[wasm_bindgen_test]
     fn frontend_reattach_forces_connected_status_to_refresh_host_stream() {
-        install_tauri_invoke_stub();
+        let _send_guard = bridge::test_clean_sends();
         let state = AppState::new();
         let host = LocalHostId("host-frontend-reattach".to_owned());
 
@@ -1031,7 +1259,7 @@ mod wasm_tests {
     /// only to be rejected again — the "spinning forever" bug).
     #[wasm_bindgen_test]
     fn update_required_status_is_sticky_over_transport_reconnect() {
-        install_tauri_invoke_stub();
+        let _send_guard = bridge::test_clean_sends();
         let state = AppState::new();
         let host = LocalHostId("host-update-required".to_owned());
         let update_required = ConnectionStatus::UpdateRequired {
@@ -1135,7 +1363,7 @@ mod wasm_tests {
     /// broken end-to-end, not just on a synthetic status insert.
     #[wasm_bindgen_test]
     fn connected_then_incompatible_reject_clears_runtime_and_is_sticky() {
-        install_tauri_invoke_stub();
+        let _send_guard = bridge::test_clean_sends();
         let state = AppState::new();
         let host = LocalHostId("host-connected-reject".to_owned());
 
@@ -1236,7 +1464,7 @@ mod wasm_tests {
     /// exact MQTT connection.
     #[wasm_bindgen_test]
     fn same_instance_id_connected_replay_preserves_stream() {
-        install_tauri_invoke_stub();
+        let _send_guard = bridge::test_clean_sends();
         let state = AppState::new();
         let host = LocalHostId("host-same-instance".to_owned());
 
@@ -1287,7 +1515,7 @@ mod wasm_tests {
     /// stream and data must survive.
     #[wasm_bindgen_test]
     fn frontend_attach_alone_does_not_clear_state() {
-        install_tauri_invoke_stub();
+        let _send_guard = bridge::test_clean_sends();
         let state = AppState::new();
         let host = LocalHostId("host-attach-no-clear".to_owned());
 
@@ -1343,7 +1571,7 @@ mod wasm_tests {
     /// state — that arrives and replaces atomically via host_bootstrap.
     #[wasm_bindgen_test]
     fn new_instance_id_sends_new_hello_without_pre_clearing_state() {
-        install_tauri_invoke_stub();
+        let _send_guard = bridge::test_clean_sends();
         let state = AppState::new();
         let host = LocalHostId("host-new-instance".to_owned());
 
@@ -1406,7 +1634,7 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     fn same_instance_replay_before_new_bootstrap_stays_bootstrapping() {
-        install_tauri_invoke_stub();
+        let _send_guard = bridge::test_clean_sends();
         let state = AppState::new();
         let host = LocalHostId("host-replay-before-bootstrap".to_owned());
         let old_stream = protocol::StreamPath("/host/old-bootstrap".to_owned());
@@ -1469,7 +1697,7 @@ mod wasm_tests {
     /// visible so the UI shows stale projections during reconnect.
     #[wasm_bindgen_test]
     fn connecting_after_connected_preserves_stale_state() {
-        install_tauri_invoke_stub();
+        let _send_guard = bridge::test_clean_sends();
         let state = AppState::new();
         let host = LocalHostId("host-connecting-stale".to_owned());
 
@@ -1535,8 +1763,7 @@ mod wasm_tests {
     /// reactive state exactly as they did before.
     #[wasm_bindgen_test]
     fn terminal_disconnected_and_failed_clear_state() {
-        install_tauri_invoke_stub();
-
+        let _send_guard = bridge::test_clean_sends();
         // ── Disconnected ─────────────────────────────────────────────
         {
             let state = AppState::new();
@@ -1652,7 +1879,7 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     fn stale_host_lines_from_previous_connection_are_ignored() {
-        install_tauri_invoke_stub();
+        let _send_guard = bridge::test_clean_sends();
         let state = AppState::new();
         let host = LocalHostId("host-stale-line".to_owned());
 

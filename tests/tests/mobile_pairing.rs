@@ -7,13 +7,14 @@ use mqtt_transport::{
     host_to_client_topic,
 };
 use protocol::{
-    BackendKind, BrokerUrl, ChatEvent, CommandErrorCode, CommandErrorPayload, Envelope, FrameKind,
-    HostBootstrapPayload, HostSettingValue, ListSessionsPayload, LoadAgentPayload,
-    MobileAccessErrorCode, MobileAccessStatePayload, MobileBrokerStatus, MobileDeviceState,
-    MobilePairingOfferPayload, MobilePairingStartPayload, MobilePairingState, NewAgentPayload,
-    ProjectCreatePayload, ProjectRootPath, SendMessagePayload, SessionId, SessionListPageStatus,
-    SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath, TerminalCreatePayload,
-    TerminalLaunchTarget, write_envelope,
+    AgentBootstrapEvent, AgentBootstrapPayload, BackendKind, BrokerUrl, ChatEvent,
+    CommandErrorCode, CommandErrorPayload, Envelope, FrameKind, HostBootstrapPayload,
+    HostSettingValue, ListSessionsPayload, LoadAgentPayload, MobileAccessErrorCode,
+    MobileAccessStatePayload, MobileBrokerStatus, MobileDeviceState, MobilePairingOfferPayload,
+    MobilePairingStartPayload, MobilePairingState, NewAgentPayload, ProjectCreatePayload,
+    ProjectRootPath, SendMessagePayload, SessionId, SessionListPageStatus, SetSettingPayload,
+    SpawnAgentParams, SpawnAgentPayload, StreamPath, TerminalCreatePayload, TerminalLaunchTarget,
+    write_envelope,
 };
 use server::backend::BackendSession;
 use server::store::session::SessionStore;
@@ -271,6 +272,176 @@ async fn load_mobile_agent(client: &mut client::Connection, agent: &NewAgentPayl
     let _ = wait_for_kind(client, FrameKind::AgentBootstrap, "mobile AgentBootstrap").await;
 }
 
+async fn wait_for_agent_bootstrap_on_stream(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    context: &str,
+) -> AgentBootstrapPayload {
+    loop {
+        let env = next_event(client, context).await;
+        if env.kind == FrameKind::CommandError {
+            let payload: CommandErrorPayload = env.parse_payload().expect("parse command error");
+            panic!("command error while waiting for {context}: {payload:?}");
+        }
+        if env.kind != FrameKind::AgentBootstrap {
+            continue;
+        }
+        assert_eq!(
+            &env.stream, stream,
+            "AgentBootstrap arrived on the wrong instance stream"
+        );
+        return env.parse_payload().expect("parse AgentBootstrap");
+    }
+}
+
+fn assert_initial_mock_response(bootstrap: &AgentBootstrapPayload, prompt: &str, context: &str) {
+    let expected = format!("mock backend response to: {prompt}");
+    let responses = bootstrap
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message)) => {
+                Some(message.content.as_str())
+            }
+            AgentBootstrapEvent::ChatEvent(ChatEvent::StreamEnd(end)) => {
+                Some(end.message.content.as_str())
+            }
+            _ => None,
+        })
+        .filter(|content| content.contains(expected.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        responses.len(),
+        1,
+        "{context} should contain exactly one authoritative initial mock response: {:?}",
+        bootstrap.events
+    );
+}
+
+#[tokio::test]
+async fn mqtt_mobile_new_chat_spawns_and_loads_agent() {
+    let broker = support::start_plain_mqtt_broker().expect("start local MQTT broker");
+    let harness = Harness::new().await;
+    let mut desktop = harness.connect_desktop().await;
+    expect_initial_replay(&mut desktop).await;
+
+    set_mobile_broker_url(&mut desktop, Some(broker.broker_url.clone())).await;
+    set_mobile_enabled(&mut desktop, true).await;
+    let _ = wait_for_mobile_state(
+        &mut desktop,
+        |state| matches!(state.broker_status, MobileBrokerStatus::Online { .. }),
+        "MobileBrokerStatus::Online",
+    )
+    .await;
+    send_mobile_pairing_start(&mut desktop).await;
+
+    let offer_env = wait_for_kind(
+        &mut desktop,
+        FrameKind::MobilePairingOffer,
+        "MobilePairingOffer",
+    )
+    .await;
+    let offer: MobilePairingOfferPayload = offer_env.parse_payload().expect("parse offer");
+    let qr = MobilePairingQrPayload::from_any(&offer.qr_uri.0).expect("parse QR");
+    let mut mobile = connect_mobile_client(&qr).await;
+    let bootstrap_env = expect_next_kind(
+        &mut mobile,
+        FrameKind::HostBootstrap,
+        "empty mobile HostBootstrap",
+    )
+    .await;
+    let bootstrap: HostBootstrapPayload = bootstrap_env
+        .parse_payload()
+        .expect("parse empty mobile HostBootstrap");
+    assert!(bootstrap.agents.is_empty());
+
+    let prompt = "initial prompt from mobile new chat";
+    let mobile_host_stream = host_stream(&mobile);
+    send_host_payload(
+        &mut mobile,
+        FrameKind::SpawnAgent,
+        &SpawnAgentPayload {
+            name: Some("mobile new chat agent".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: Vec::new(),
+                prompt: prompt.to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        },
+    )
+    .await;
+
+    let mobile_new_env = wait_for_kind(&mut mobile, FrameKind::NewAgent, "mobile NewAgent").await;
+    assert_eq!(mobile_new_env.stream, mobile_host_stream);
+    let mobile_agent: NewAgentPayload = mobile_new_env.parse_payload().expect("parse NewAgent");
+
+    let desktop_new_env =
+        wait_for_kind(&mut desktop, FrameKind::NewAgent, "desktop NewAgent").await;
+    let desktop_agent: NewAgentPayload = desktop_new_env
+        .parse_payload()
+        .expect("parse desktop NewAgent");
+    assert_eq!(desktop_agent.agent_id, mobile_agent.agent_id);
+    assert_ne!(desktop_agent.instance_stream, mobile_agent.instance_stream);
+    let desktop_end = wait_for_chat_stream_end(&mut desktop, "desktop initial StreamEnd").await;
+    let ChatEvent::StreamEnd(desktop_end) = desktop_end else {
+        panic!("expected desktop StreamEnd");
+    };
+    assert!(
+        desktop_end
+            .message
+            .content
+            .contains(&format!("mock backend response to: {prompt}")),
+        "unexpected desktop response: {}",
+        desktop_end.message.content
+    );
+
+    send_stream_payload(
+        &mut mobile,
+        mobile_agent.instance_stream.clone(),
+        FrameKind::LoadAgent,
+        &LoadAgentPayload {},
+    )
+    .await;
+    let first_bootstrap = wait_for_agent_bootstrap_on_stream(
+        &mut mobile,
+        &mobile_agent.instance_stream,
+        "mobile-created AgentBootstrap",
+    )
+    .await;
+    assert_initial_mock_response(&first_bootstrap, prompt, "first mobile load");
+
+    let mut reconnected = connect_mobile_client(&qr).await;
+    let reconnected_agent =
+        expect_mobile_replay(&mut reconnected, 0, "reconnected mobile replay").await;
+    assert_eq!(reconnected_agent.agent_id, mobile_agent.agent_id);
+    assert_ne!(
+        reconnected_agent.instance_stream,
+        mobile_agent.instance_stream
+    );
+    send_stream_payload(
+        &mut reconnected,
+        reconnected_agent.instance_stream.clone(),
+        FrameKind::LoadAgent,
+        &LoadAgentPayload {},
+    )
+    .await;
+    let replayed_bootstrap = wait_for_agent_bootstrap_on_stream(
+        &mut reconnected,
+        &reconnected_agent.instance_stream,
+        "reconnected mobile AgentBootstrap",
+    )
+    .await;
+    assert_initial_mock_response(&replayed_bootstrap, prompt, "reconnected mobile load");
+}
+
 #[tokio::test]
 async fn mqtt_mobile_duplicate_load_agent_reports_command_error() {
     let broker = support::start_plain_mqtt_broker().expect("start local MQTT broker");
@@ -330,16 +501,50 @@ async fn mqtt_mobile_duplicate_load_agent_reports_command_error() {
     )
     .await;
 
-    let error = wait_for_command_error(&mut mobile, "duplicate mobile LoadAgent").await;
+    let error = loop {
+        let env = next_event(&mut mobile, "duplicate mobile LoadAgent").await;
+        if env.kind == FrameKind::AgentBootstrap && env.stream == replayed_agent.instance_stream {
+            panic!("rejected duplicate LoadAgent produced a false AgentBootstrap success");
+        }
+        if env.kind == FrameKind::CommandError {
+            break env
+                .parse_payload::<CommandErrorPayload>()
+                .expect("parse duplicate LoadAgent CommandError");
+        }
+    };
     assert_eq!(error.stream, replayed_agent.instance_stream);
     assert_eq!(error.request_kind, FrameKind::LoadAgent);
     assert_eq!(error.operation, "load_agent");
     assert_eq!(error.code, CommandErrorCode::Conflict);
+    assert!(!error.fatal);
     assert!(
         error.message.contains("already attached"),
         "unexpected duplicate LoadAgent message: {}",
         error.message
     );
+
+    send_host_payload(
+        &mut mobile,
+        FrameKind::ListSessions,
+        &ListSessionsPayload::default(),
+    )
+    .await;
+    loop {
+        let env = next_event(&mut mobile, "SessionList after rejected LoadAgent").await;
+        if env.kind == FrameKind::AgentBootstrap && env.stream == replayed_agent.instance_stream {
+            panic!("rejected duplicate LoadAgent later produced a false AgentBootstrap success");
+        }
+        if env.kind == FrameKind::CommandError {
+            let payload: CommandErrorPayload = env.parse_payload().expect("parse command error");
+            panic!("command error while checking rejected LoadAgent: {payload:?}");
+        }
+        if env.kind == FrameKind::SessionList {
+            let sessions: protocol::SessionListPayload =
+                env.parse_payload().expect("parse SessionList");
+            assert_eq!(sessions.sessions.len(), 1);
+            break;
+        }
+    }
 }
 
 #[tokio::test]

@@ -6,7 +6,7 @@ edition.workspace = true
 client = { path = "../client" }
 protocol = { path = "../protocol" }
 mqtt-transport = { path = "../mqtt-transport", features = ["test-support"] }
-server = { path = "../server" }
+server = { path = "../server", features = ["test-support"] }
 tyde-dev-driver = { path = "../dev-driver" }
 futures-util = "0.3"
 paste = "1"

@@ -13,7 +13,6 @@ members = [
     "tyde-server",
     "mqtt-transport",
     "mobile-shell-types",
-    "mobile/src-tauri",
     "mobile-frontend",
 ]
 

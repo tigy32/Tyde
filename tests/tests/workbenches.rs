@@ -7,15 +7,20 @@ use std::time::Duration;
 
 use fixture::Fixture;
 use protocol::{
-    BackendKind, CommandErrorCode, CommandErrorPayload, CustomAgent, CustomAgentId,
-    CustomAgentUpsertPayload, Envelope, FrameKind, GitBranchName, HostSettingValue,
-    NewAgentPayload, NewTerminalPayload, Project, ProjectAddRootPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectDeleteRootPayload, ProjectNotifyPayload, ProjectRootPath,
-    ProjectSource, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, Steering, SteeringId,
-    SteeringScope, SteeringUpsertPayload, TeamCreatePayload, TeamMemberCreateSpec,
-    TerminalCreatePayload, TerminalLaunchTarget, ToolPolicy, WorkbenchCreatePayload,
-    WorkbenchRemovePayload,
+    AgentId, AgentStartPayload, BackendAccessMode, BackendKind, CommandErrorCode,
+    CommandErrorPayload, CustomAgent, CustomAgentId, CustomAgentUpsertPayload, Envelope, FrameKind,
+    GitBranchName, HostSettingValue, NewAgentPayload, NewTerminalPayload, Project,
+    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
+    ProjectNotifyPayload, ProjectRootPath, ProjectSource, SetSettingPayload, SpawnAgentParams,
+    SpawnAgentPayload, Steering, SteeringId, SteeringScope, SteeringUpsertPayload,
+    TeamCreatePayload, TeamMemberCreateSpec, TerminalCreatePayload, TerminalLaunchTarget,
+    ToolPolicy, WorkbenchCreatePayload, WorkbenchRemovePayload,
 };
+use rmcp::ServiceExt;
+use rmcp::model::{CallToolRequestParams, RawContent};
+use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use serde_json::{Value, json};
 
 async fn expect_next_event(client: &mut client::Connection, context: &str) -> Envelope {
     loop {
@@ -31,6 +36,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::SessionSchemas
                 | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
+                | FrameKind::BackendCapacity
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
                 | FrameKind::SessionList
@@ -76,6 +82,18 @@ async fn expect_kind(client: &mut client::Connection, kind: FrameKind, context: 
         };
         if env.kind == kind {
             return env;
+        }
+        if env.kind == FrameKind::AgentBootstrap && kind == FrameKind::AgentStart {
+            let bootstrap: protocol::AgentBootstrapPayload =
+                env.parse_payload().expect("AgentBootstrap payload");
+            if let Some(protocol::AgentBootstrapEvent::AgentStart(start)) = bootstrap
+                .events
+                .into_iter()
+                .find(|event| matches!(event, protocol::AgentBootstrapEvent::AgentStart(_)))
+            {
+                return Envelope::from_payload(env.stream, FrameKind::AgentStart, env.seq, &start)
+                    .expect("serialize AgentStart");
+            }
         }
     }
 }
@@ -166,6 +184,121 @@ fn git(root: &Path, args: &[&str]) {
     );
 }
 
+fn git_stdout(root: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(output.status.success(), "git {args:?} failed");
+    String::from_utf8(output.stdout)
+        .expect("git output UTF-8")
+        .trim()
+        .to_owned()
+}
+
+async fn call_agent_control(
+    fixture: &Fixture,
+    caller: &AgentId,
+    name: &str,
+    arguments: Value,
+) -> (bool, String) {
+    call_agent_control_optional(fixture, Some(caller), name, arguments).await
+}
+
+async fn call_agent_control_optional(
+    fixture: &Fixture,
+    caller: Option<&AgentId>,
+    name: &str,
+    arguments: Value,
+) -> (bool, String) {
+    let url = fixture.agent_control_http_url().await;
+    let bearer = match caller {
+        Some(caller) => {
+            let caller_auth = fixture.agent_control_caller(caller).await;
+            Some(
+                caller_auth
+                    .authorization
+                    .strip_prefix("Bearer ")
+                    .expect("bearer credential")
+                    .to_owned(),
+            )
+        }
+        None => None,
+    };
+    call_agent_control_request(url, bearer, name.to_owned(), arguments).await
+}
+
+async fn call_agent_control_request(
+    url: String,
+    bearer: Option<String>,
+    name: String,
+    arguments: Value,
+) -> (bool, String) {
+    let config = StreamableHttpClientTransportConfig::with_uri(url);
+    let config = match bearer.as_deref() {
+        Some(bearer) => config.auth_header(bearer),
+        None => config,
+    };
+    let transport = StreamableHttpClientTransport::from_config(config);
+    let service = ().serve(transport).await.expect("connect agent-control MCP");
+    let result = service
+        .call_tool(CallToolRequestParams {
+            meta: None,
+            name: name.clone().into(),
+            arguments: Some(arguments.as_object().expect("object arguments").clone()),
+            task: None,
+        })
+        .await
+        .expect("call agent-control tool");
+    let RawContent::Text(text) = &result.content.first().expect("tool content").raw else {
+        panic!("expected text tool result")
+    };
+    let response = (result.is_error.unwrap_or(false), text.text.clone());
+    service.cancel().await.expect("cancel MCP client");
+    response
+}
+
+async fn assert_no_new_agent(client: &mut client::Connection, context: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
+            return;
+        };
+        match tokio::time::timeout(remaining, client.next_event()).await {
+            Ok(Ok(Some(env))) if env.kind == FrameKind::NewAgent => {
+                panic!("unexpected NewAgent while {context}")
+            }
+            Ok(Ok(Some(_))) => {}
+            Ok(Ok(None)) => panic!("connection closed while {context}"),
+            Ok(Err(error)) => panic!("event error while {context}: {error:?}"),
+            Err(_) => return,
+        }
+    }
+}
+
+async fn assert_no_project_upsert(client: &mut client::Connection, context: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
+            return;
+        };
+        match tokio::time::timeout(remaining, client.next_event()).await {
+            Ok(Ok(Some(env))) if env.kind == FrameKind::ProjectNotify => {
+                let notify: ProjectNotifyPayload = env.parse_payload().expect("ProjectNotify");
+                if matches!(notify, ProjectNotifyPayload::Upsert { .. }) {
+                    panic!("unexpected project upsert while {context}");
+                }
+            }
+            Ok(Ok(Some(_))) => {}
+            Ok(Ok(None)) => panic!("connection closed while {context}"),
+            Ok(Err(error)) => panic!("event error while {context}: {error:?}"),
+            Err(_) => return,
+        }
+    }
+}
+
 fn init_git_repo(name: &str) -> tempfile::TempDir {
     let repo = tempfile::tempdir().expect("create temp repo");
     git(repo.path(), &["init"]);
@@ -227,6 +360,42 @@ fn expected_worktree_path(parent_root: &Path, encoded_branch: &str) -> PathBuf {
         .and_then(|name| name.to_str())
         .expect("temp repo basename should be UTF-8");
     parent_root.with_file_name(format!("{}--{}", basename, encoded_branch))
+}
+
+async fn spawn_project_caller(
+    client: &mut client::Connection,
+    project: &Project,
+    name: &str,
+    access_mode: BackendAccessMode,
+) -> NewAgentPayload {
+    client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some(name.to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: Some(project.id.clone()),
+            params: SpawnAgentParams::New {
+                workspace_roots: project_roots(project),
+                prompt: "workbench caller".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Codex,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode,
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn project caller");
+    loop {
+        let payload: NewAgentPayload = expect_kind(client, FrameKind::NewAgent, name)
+            .await
+            .parse_payload()
+            .expect("NewAgent");
+        if payload.name == name {
+            return payload;
+        }
+    }
 }
 
 #[tokio::test]
@@ -911,4 +1080,540 @@ async fn workbench_remove_rejects_live_agent_live_terminal_session_and_steering_
     let error = expect_command_error(&mut fixture.client, "steering blocker").await;
     assert_eq!(error.code, CommandErrorCode::Conflict);
     assert!(error.message.contains("steering"));
+}
+
+#[tokio::test]
+async fn agent_control_creates_lists_and_spawns_workbenches() {
+    let repo = init_git_repo("agent-control-workbench");
+    let mut fixture = Fixture::new().await;
+    let parent = create_project(&mut fixture.client, vec![repo.path()]).await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("workbench-orchestrator".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: Some(parent.id.clone()),
+            params: SpawnAgentParams::New {
+                workspace_roots: project_roots(&parent),
+                prompt: "orchestrate workbenches".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Codex,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: BackendAccessMode::Unrestricted,
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn orchestrator");
+    let orchestrator = loop {
+        let env = expect_kind(&mut fixture.client, FrameKind::NewAgent, "orchestrator").await;
+        let agent: NewAgentPayload = env.parse_payload().expect("NewAgent");
+        if agent.name == "workbench-orchestrator" {
+            break agent;
+        }
+    };
+
+    let (is_error, body) = call_agent_control(
+        &fixture,
+        &orchestrator.agent_id,
+        "tyde_list_workbenches",
+        json!({}),
+    )
+    .await;
+    assert!(!is_error, "list failed: {body}");
+    let listed: Value = serde_json::from_str(&body).expect("list JSON");
+    assert_eq!(listed["caller_project_id"], parent.id.0);
+    assert_eq!(listed["projects"].as_array().expect("projects").len(), 1);
+
+    let first_commit = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+    fs::write(repo.path().join("second.txt"), "second commit").expect("second content");
+    git(repo.path(), &["add", "second.txt"]);
+    git(repo.path(), &["commit", "-m", "second"]);
+    let base_head = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+    fs::write(repo.path().join("dirty.txt"), "not copied").expect("dirty parent");
+    let (is_error, body) = call_agent_control(
+        &fixture,
+        &orchestrator.agent_id,
+        "tyde_create_workbench",
+        json!({
+            "parent_project_id": parent.id.0, "branch": "feature/mcp-default"
+        }),
+    )
+    .await;
+    assert!(!is_error, "create failed: {body}");
+    let created: Value = serde_json::from_str(&body).expect("create JSON");
+    let workbench_id = created["project_id"]
+        .as_str()
+        .expect("project id")
+        .to_owned();
+    let root = &created["roots"][0];
+    assert_eq!(root["base_commit"], base_head);
+    assert_eq!(root["parent_root_dirty"], true);
+    let worktree_root = root["worktree_root"]
+        .as_str()
+        .expect("worktree root")
+        .to_owned();
+    assert!(!Path::new(&worktree_root).join("dirty.txt").exists());
+    let ProjectNotifyPayload::Upsert { project: workbench } =
+        expect_project_notify(&mut fixture.client, "MCP workbench upsert").await
+    else {
+        panic!("expected workbench upsert")
+    };
+    let ProjectSource::GitWorkbench {
+        parent_project_id,
+        branch,
+        roots,
+    } = &workbench.source
+    else {
+        panic!("expected GitWorkbench source")
+    };
+    assert_eq!(parent_project_id, &parent.id);
+    assert_eq!(branch.0, "feature/mcp-default");
+    assert_eq!(roots[0].parent_root.0, repo.path().display().to_string());
+    assert_eq!(roots[0].worktree_root.0, worktree_root);
+
+    let (is_error, body) = call_agent_control(
+        &fixture,
+        &orchestrator.agent_id,
+        "tyde_spawn_agent",
+        json!({
+            "project_id": workbench_id, "prompt": "work in isolation", "backend_kind": "codex"
+        }),
+    )
+    .await;
+    assert!(!is_error, "derived-root spawn failed: {body}");
+    let spawned: NewAgentPayload = expect_kind(
+        &mut fixture.client,
+        FrameKind::NewAgent,
+        "derived-root NewAgent",
+    )
+    .await
+    .parse_payload()
+    .expect("NewAgent payload");
+    assert_eq!(spawned.project_id.as_ref(), Some(&workbench.id));
+    assert_eq!(
+        spawned.parent_agent_id.as_ref(),
+        Some(&orchestrator.agent_id)
+    );
+    assert_eq!(spawned.workspace_roots, vec![worktree_root.clone()]);
+    let started: AgentStartPayload = expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentStart,
+        "derived-root AgentStart",
+    )
+    .await
+    .parse_payload()
+    .expect("AgentStart payload");
+    assert_eq!(started.project_id.as_ref(), Some(&workbench.id));
+    assert_eq!(
+        started.parent_agent_id.as_ref(),
+        Some(&orchestrator.agent_id)
+    );
+    assert_eq!(started.workspace_roots, vec![worktree_root.clone()]);
+
+    let (is_error, body) = call_agent_control(
+        &fixture,
+        &orchestrator.agent_id,
+        "tyde_spawn_agent",
+        json!({
+            "project_id": workbench_id, "workspace_roots": [repo.path()],
+            "prompt": "escape", "backend_kind": "codex"
+        }),
+    )
+    .await;
+    assert!(is_error, "mismatched roots unexpectedly spawned: {body}");
+    assert!(body.contains("authoritative roots"));
+    assert_no_new_agent(&mut fixture.client, "rejecting mismatched roots").await;
+    let (is_error, body) = call_agent_control(
+        &fixture,
+        &orchestrator.agent_id,
+        "tyde_spawn_agent",
+        json!({"prompt": "inherit parent project", "backend_kind": "codex"}),
+    )
+    .await;
+    assert!(!is_error, "parent-project inheritance failed: {body}");
+    let inherited_spawn: NewAgentPayload = expect_kind(
+        &mut fixture.client,
+        FrameKind::NewAgent,
+        "inherited-project NewAgent",
+    )
+    .await
+    .parse_payload()
+    .expect("inherited-project payload");
+    assert_eq!(inherited_spawn.project_id.as_ref(), Some(&parent.id));
+    assert_eq!(
+        inherited_spawn.parent_agent_id.as_ref(),
+        Some(&orchestrator.agent_id)
+    );
+    assert_eq!(inherited_spawn.workspace_roots, project_roots(&parent));
+    let _ = expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentStart,
+        "inherited-project AgentStart",
+    )
+    .await;
+
+    let projectless_parent_root = tempfile::tempdir().expect("projectless parent root");
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("projectless-parent".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec![projectless_parent_root.path().display().to_string()],
+                prompt: "projectless parent".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Codex,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: BackendAccessMode::Unrestricted,
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn projectless parent");
+    let projectless_parent: NewAgentPayload = expect_kind(
+        &mut fixture.client,
+        FrameKind::NewAgent,
+        "projectless parent NewAgent",
+    )
+    .await
+    .parse_payload()
+    .expect("projectless parent payload");
+    let _ = expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentStart,
+        "projectless parent AgentStart",
+    )
+    .await;
+    let (is_error, body) = call_agent_control(
+        &fixture,
+        &projectless_parent.agent_id,
+        "tyde_spawn_agent",
+        json!({"prompt": "missing roots", "backend_kind": "codex"}),
+    )
+    .await;
+    assert!(
+        is_error,
+        "projectless rootless spawn unexpectedly succeeded: {body}"
+    );
+    assert_no_new_agent(&mut fixture.client, "rejecting projectless rootless spawn").await;
+
+    let explicit_root = tempfile::tempdir().expect("explicit projectless root");
+    let explicit_root_path = explicit_root.path().display().to_string();
+    let (is_error, body) = call_agent_control(
+        &fixture,
+        &projectless_parent.agent_id,
+        "tyde_spawn_agent",
+        json!({
+            "workspace_roots": [explicit_root_path],
+            "prompt": "valid projectless explicit root",
+            "backend_kind": "codex"
+        }),
+    )
+    .await;
+    assert!(!is_error, "projectless explicit-root spawn failed: {body}");
+    let explicit_spawn: NewAgentPayload = expect_kind(
+        &mut fixture.client,
+        FrameKind::NewAgent,
+        "projectless explicit-root NewAgent",
+    )
+    .await
+    .parse_payload()
+    .expect("projectless explicit-root payload");
+    assert_eq!(explicit_spawn.project_id, None);
+    assert_eq!(
+        explicit_spawn.parent_agent_id.as_ref(),
+        Some(&projectless_parent.agent_id)
+    );
+    assert_eq!(explicit_spawn.workspace_roots, vec![explicit_root_path]);
+    let _ = expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentStart,
+        "projectless explicit-root AgentStart",
+    )
+    .await;
+
+    for arguments in [
+        json!({"parent_project_id": parent.id.0, "branch": "feature/invalid", "base_ref": "--help"}),
+        json!({"parent_project_id": parent.id.0, "branch": "feature/blank-name", "name": "   "}),
+    ] {
+        let (is_error, body) = call_agent_control(
+            &fixture,
+            &orchestrator.agent_id,
+            "tyde_create_workbench",
+            arguments,
+        )
+        .await;
+        assert!(is_error, "invalid create unexpectedly succeeded: {body}");
+    }
+    let (is_error, body) = call_agent_control(&fixture, &orchestrator.agent_id,
+        "tyde_create_workbench", json!({
+            "parent_project_id": parent.id.0, "branch": "feature/historical", "base_ref": first_commit
+        })).await;
+    assert!(!is_error, "historical create failed: {body}");
+    let historical: Value = serde_json::from_str(&body).expect("historical JSON");
+    assert_eq!(historical["roots"][0]["base_commit"], first_commit);
+    let historical_root = historical["roots"][0]["worktree_root"]
+        .as_str()
+        .expect("root");
+    assert_eq!(
+        git_stdout(Path::new(historical_root), &["rev-parse", "HEAD"]),
+        first_commit
+    );
+    assert!(!Path::new(historical_root).join("second.txt").exists());
+    let _ = expect_project_notify(&mut fixture.client, "historical upsert").await;
+
+    let (is_error, body) = call_agent_control(
+        &fixture,
+        &orchestrator.agent_id,
+        "tyde_list_workbenches",
+        json!({}),
+    )
+    .await;
+    assert!(!is_error, "recovery list failed: {body}");
+    let recovery: Value = serde_json::from_str(&body).expect("recovery list JSON");
+    assert_eq!(recovery["projects"].as_array().expect("projects").len(), 3);
+    let (is_error, body) = call_agent_control(
+        &fixture,
+        &orchestrator.agent_id,
+        "tyde_create_workbench",
+        json!({
+            "parent_project_id": parent.id.0, "branch": "feature/mcp-default"
+        }),
+    )
+    .await;
+    assert!(is_error, "duplicate create unexpectedly succeeded: {body}");
+    let (is_error, body) = call_agent_control(
+        &fixture,
+        &orchestrator.agent_id,
+        "tyde_list_workbenches",
+        json!({}),
+    )
+    .await;
+    assert!(!is_error, "post-conflict list failed: {body}");
+    let post_conflict: Value = serde_json::from_str(&body).expect("post-conflict JSON");
+    assert_eq!(
+        post_conflict["projects"]
+            .as_array()
+            .expect("projects")
+            .iter()
+            .filter(|project| project["branch"] == "feature/mcp-default")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn agent_control_workbenches_enforce_auth_access_and_scope() {
+    let repo = init_git_repo("scope-parent");
+    let other_repo = init_git_repo("scope-other");
+    let mut fixture = Fixture::new().await;
+    let parent = create_project(&mut fixture.client, vec![repo.path()]).await;
+    let other = create_project(&mut fixture.client, vec![other_repo.path()]).await;
+
+    for (tool, arguments) in [
+        ("tyde_list_workbenches", json!({})),
+        (
+            "tyde_create_workbench",
+            json!({
+                "parent_project_id": parent.id.0, "branch": "feature/no-auth"
+            }),
+        ),
+    ] {
+        let (is_error, body) = call_agent_control_optional(&fixture, None, tool, arguments).await;
+        assert!(is_error, "unauthenticated {tool} succeeded: {body}");
+    }
+    assert!(!expected_worktree_path(repo.path(), "feature%2Fno-auth").exists());
+
+    let read_only = spawn_project_caller(
+        &mut fixture.client,
+        &parent,
+        "read-only-workbench-caller",
+        BackendAccessMode::ReadOnly,
+    )
+    .await;
+    let (is_error, body) = call_agent_control(
+        &fixture,
+        &read_only.agent_id,
+        "tyde_list_workbenches",
+        json!({}),
+    )
+    .await;
+    assert!(!is_error, "read-only list failed: {body}");
+    let (is_error, body) = call_agent_control(
+        &fixture,
+        &read_only.agent_id,
+        "tyde_create_workbench",
+        json!({"parent_project_id": parent.id.0, "branch": "feature/read-only"}),
+    )
+    .await;
+    assert!(is_error, "read-only create succeeded: {body}");
+    assert!(body.contains("ReadOnly"));
+    assert!(!expected_worktree_path(repo.path(), "feature%2Fread-only").exists());
+
+    let caller = spawn_project_caller(
+        &mut fixture.client,
+        &parent,
+        "scoped-workbench-caller",
+        BackendAccessMode::Unrestricted,
+    )
+    .await;
+    let (is_error, body) = call_agent_control(
+        &fixture,
+        &caller.agent_id,
+        "tyde_create_workbench",
+        json!({"parent_project_id": other.id.0, "branch": "feature/out-of-scope"}),
+    )
+    .await;
+    assert!(is_error, "out-of-scope create succeeded: {body}");
+    assert!(body.contains("outside caller project scope"));
+    assert!(!expected_worktree_path(other_repo.path(), "feature%2Fout-of-scope").exists());
+}
+
+#[tokio::test]
+async fn agent_control_multi_root_preflight_and_removed_spawn_are_atomic() {
+    let first = init_git_repo("multi-first");
+    let second = init_git_repo("multi-second");
+    git(first.path(), &["branch", "first-only-base"]);
+    let mut fixture = Fixture::new().await;
+    let parent = create_project(&mut fixture.client, vec![first.path(), second.path()]).await;
+    let caller = spawn_project_caller(
+        &mut fixture.client,
+        &parent,
+        "multi-root-caller",
+        BackendAccessMode::Unrestricted,
+    )
+    .await;
+    let (is_error, body) = call_agent_control(
+        &fixture,
+        &caller.agent_id,
+        "tyde_create_workbench",
+        json!({
+            "parent_project_id": parent.id.0,
+            "branch": "feature/multi-fail",
+            "base_ref": "first-only-base"
+        }),
+    )
+    .await;
+    assert!(
+        is_error,
+        "multi-root preflight unexpectedly succeeded: {body}"
+    );
+    assert!(body.contains(&second.path().display().to_string()));
+    for root in [first.path(), second.path()] {
+        assert!(!expected_worktree_path(root, "feature%2Fmulti-fail").exists());
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/heads/feature/multi-fail",
+            ])
+            .status()
+            .expect("git show-ref");
+        assert!(!output.success());
+    }
+    assert_no_project_upsert(&mut fixture.client, "rejecting multi-root preflight").await;
+
+    let removable = create_workbench(&mut fixture.client, &parent, "feature/removed").await;
+    fixture
+        .client
+        .workbench_remove(WorkbenchRemovePayload {
+            id: removable.id.clone(),
+        })
+        .await
+        .expect("remove workbench");
+    let ProjectNotifyPayload::Delete { project } =
+        expect_project_notify(&mut fixture.client, "removed workbench delete").await
+    else {
+        panic!("expected workbench delete")
+    };
+    assert_eq!(project.id, removable.id);
+    let (is_error, body) = call_agent_control(
+        &fixture,
+        &caller.agent_id,
+        "tyde_spawn_agent",
+        json!({
+            "project_id": removable.id.0,
+            "prompt": "must not register",
+            "backend_kind": "codex"
+        }),
+    )
+    .await;
+    assert!(is_error, "spawn into removed workbench succeeded: {body}");
+    assert!(body.contains("missing project"));
+    assert_no_new_agent(&mut fixture.client, "rejecting removed-workbench spawn").await;
+}
+
+#[tokio::test]
+async fn concurrent_workbench_remove_and_mcp_spawn_have_one_winner() {
+    let repo = init_git_repo("remove-spawn-race");
+    let mut fixture = Fixture::new().await;
+    let parent = create_project(&mut fixture.client, vec![repo.path()]).await;
+    let caller = spawn_project_caller(
+        &mut fixture.client,
+        &parent,
+        "remove-spawn-race-caller",
+        BackendAccessMode::Unrestricted,
+    )
+    .await;
+    let workbench = create_workbench(&mut fixture.client, &parent, "feature/remove-spawn").await;
+    let hook = fixture.install_workbench_remove_test_hook();
+    let (mut remove_client, _) = fixture.connect_with_bootstrap().await;
+    remove_client
+        .workbench_remove(WorkbenchRemovePayload {
+            id: workbench.id.clone(),
+        })
+        .await
+        .expect("send concurrent remove");
+    hook.wait_until_reached().await;
+
+    let caller_auth = fixture.agent_control_caller(&caller.agent_id).await;
+    let bearer = caller_auth
+        .authorization
+        .strip_prefix("Bearer ")
+        .expect("bearer credential")
+        .to_owned();
+    let url = fixture.agent_control_http_url().await;
+    let project_id = workbench.id.0.clone();
+    let spawn_task = tokio::spawn(async move {
+        call_agent_control_request(
+            url,
+            Some(bearer),
+            "tyde_spawn_agent".to_owned(),
+            json!({
+                "project_id": project_id,
+                "prompt": "race removal",
+                "backend_kind": "codex"
+            }),
+        )
+        .await
+    });
+    hook.wait_until_spawn_waiting().await;
+    hook.resume();
+
+    let (is_error, body) = spawn_task.await.expect("spawn task join");
+    assert!(is_error, "remove and spawn both succeeded: {body}");
+    assert!(
+        body.contains("missing project") || body.contains("being removed"),
+        "spawn returned a success-shaped failure: {body}"
+    );
+    let ProjectNotifyPayload::Delete { project } =
+        expect_project_notify(&mut fixture.client, "concurrent remove winner").await
+    else {
+        panic!("removal did not emit Delete after winning the shared lock")
+    };
+    assert_eq!(project.id, workbench.id);
+    assert_no_new_agent(
+        &mut fixture.client,
+        "verifying losing concurrent spawn did not register",
+    )
+    .await;
 }

@@ -5,9 +5,13 @@ use leptos::prelude::*;
 
 use protocol::ProjectPath;
 
-use crate::actions::{open_file, start_project_search};
+use crate::actions::{open_project_path_at_navigation, start_project_search};
+use crate::components::center_zone::{announce, workspace_width};
+use crate::components::command_palette::{
+    ContextActionId, context_binding, open_to_side_availability,
+};
 use crate::components::find_bar::render_text_with_highlights;
-use crate::state::AppState;
+use crate::state::{AppState, OpenTarget, PendingFileNavigation};
 
 /// Project-wide ("global") search panel, shown as the third tab of the left
 /// dock. Mirrors the in-file `FindBar` controls (case / whole-word / regex)
@@ -138,6 +142,7 @@ pub fn SearchPanel() -> impl IntoView {
 
     // Per-file collapse state (keyed by the rendered path string).
     let collapsed: RwSignal<HashSet<String>> = RwSignal::new(HashSet::new());
+    let side_notice: RwSignal<Option<&'static str>> = RwSignal::new(None);
 
     let results_view = {
         let state = state.clone();
@@ -145,7 +150,7 @@ pub fn SearchPanel() -> impl IntoView {
             let files = state.search_state.with(|s| s.results.clone());
             files
                 .into_iter()
-                .map(|file| file_group(state.clone(), collapsed, file))
+                .map(|file| file_group(state.clone(), collapsed, side_notice, file))
                 .collect_view()
         }
     };
@@ -200,6 +205,15 @@ pub fn SearchPanel() -> impl IntoView {
                     "Results truncated — refine your search."
                 </div>
             </Show>
+            <Show when=move || side_notice.get().is_some()>
+                <div
+                    class="cp-notice"
+                    role="status"
+                    data-testid="search-side-open-notice"
+                >
+                    {move || side_notice.get().unwrap_or_default()}
+                </div>
+            </Show>
             <div class="search-results">
                 {results_view}
             </div>
@@ -228,8 +242,10 @@ fn path_key(path: &ProjectPath) -> String {
 fn file_group(
     state: AppState,
     collapsed: RwSignal<HashSet<String>>,
+    side_notice: RwSignal<Option<&'static str>>,
     file: protocol::ProjectSearchFileResult,
 ) -> impl IntoView {
+    let width = workspace_width();
     let key = path_key(&file.path);
     let display_name = file.path.relative_path.clone();
     let match_count = file.matches.len();
@@ -269,21 +285,101 @@ fn file_group(
                 .collect();
             let highlighted = render_text_with_highlights(&m.line_text, &ranges);
             let line_number = m.line_number;
+            let availability = {
+                let state = state.clone();
+                Memo::new(move |_| open_to_side_availability(&state, width.get()))
+            };
+            let open_to_side = {
+                let state = state.clone();
+                let path = file_path.clone();
+                move || {
+                    if let Some(reason) = availability.get_untracked().reason() {
+                        side_notice.set(Some(reason));
+                        announce(reason);
+                        return;
+                    }
+                    side_notice.set(None);
+                    let _ = open_project_path_at_navigation(
+                        &state,
+                        path.clone(),
+                        OpenTarget::Beside,
+                        PendingFileNavigation::Line(line_number),
+                    );
+                }
+            };
             let on_click = {
                 let state = state.clone();
                 let path = file_path.clone();
                 move |_| {
-                    state
-                        .pending_goto_line
-                        .set(Some((path.clone(), line_number)));
-                    open_file(&state, path.clone());
+                    side_notice.set(None);
+                    let _ = open_project_path_at_navigation(
+                        &state,
+                        path.clone(),
+                        OpenTarget::Focused,
+                        PendingFileNavigation::Line(line_number),
+                    );
                 }
             };
+            let on_keydown = {
+                let open_to_side = open_to_side.clone();
+                move |ev: web_sys::KeyboardEvent| {
+                    if ev.key() == "Enter" && (ev.meta_key() || ev.ctrl_key()) {
+                        ev.prevent_default();
+                        ev.stop_propagation();
+                        open_to_side();
+                    }
+                }
+            };
+            let on_side_click = {
+                let open_to_side = open_to_side.clone();
+                move |ev: web_sys::MouseEvent| {
+                    ev.stop_propagation();
+                    open_to_side();
+                }
+            };
+            let side_hint = context_binding(ContextActionId::OpenToSide).chord().hint();
+            let row_side_hint = side_hint.clone();
+            let row_title = move || match availability.get().reason() {
+                Some(reason) => {
+                    format!("Open; {row_side_hint} Open to the Side unavailable: {reason}")
+                }
+                None => format!("Open ({row_side_hint} opens to the side)"),
+            };
+            let side_title = move || match availability.get().reason() {
+                Some(reason) => reason.to_owned(),
+                None => format!("Open to the side ({side_hint})"),
+            };
+            let side_label = format!(
+                "Open {} at line {} to the side",
+                file_path.relative_path.as_str(),
+                line_number
+            );
             view! {
-                <button class="search-match-row" on:click=on_click>
-                    <span class="search-match-line">{line_number.to_string()}</span>
-                    <span class="search-match-text">{highlighted}</span>
-                </button>
+                <div class="fe-row">
+                    <button
+                        class="search-match-row fe-item"
+                        title=row_title
+                        aria-keyshortcuts="Enter Control+Enter Meta+Enter"
+                        on:click=on_click
+                        on:keydown=on_keydown
+                    >
+                        <span class="search-match-line">{line_number.to_string()}</span>
+                        <span class="search-match-text">{highlighted}</span>
+                    </button>
+                    <button
+                        class="fe-open-side search-result-open-side"
+                        class:disabled=move || !availability.get().is_enabled()
+                        aria-label=side_label
+                        aria-keyshortcuts="Control+Enter Meta+Enter"
+                        aria-disabled=move || {
+                            (!availability.get().is_enabled()).then_some("true")
+                        }
+                        title=side_title
+                        on:click=on_side_click
+                    >
+                        <span class="fe-open-side-icon" aria-hidden="true">"\u{29c9}"</span>
+                    </button>
+                </div>
             }
         })
         .collect_view();
@@ -311,9 +407,12 @@ fn file_group(
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
-    use crate::state::AppState;
+    use crate::state::{ActiveProjectRef, AppState, FileResourceKey, OpenFile, PaneId, TabContent};
     use leptos::mount::mount_to;
-    use protocol::{ProjectPath, ProjectRootPath, ProjectSearchFileResult, ProjectSearchMatch};
+    use protocol::{
+        ProjectFileVersion, ProjectId, ProjectPath, ProjectRootPath, ProjectSearchFileResult,
+        ProjectSearchMatch,
+    };
     use std::cell::RefCell;
     use std::rc::Rc;
     use wasm_bindgen::JsCast;
@@ -387,12 +486,47 @@ mod wasm_tests {
         container.query_selector_all(selector).unwrap().length() as usize
     }
 
+    fn file_key(project: &str, path: ProjectPath) -> FileResourceKey {
+        FileResourceKey {
+            host_id: "host".to_owned(),
+            project_id: ProjectId(project.to_owned()),
+            path,
+        }
+    }
+
+    fn seed_loaded_file(state: &AppState, key: &FileResourceKey) {
+        state.open_files.update(|files| {
+            files.insert(
+                key.clone(),
+                OpenFile {
+                    path: key.path.clone(),
+                    version: ProjectFileVersion(1),
+                    contents: Some("the needle".to_owned()),
+                    is_binary: false,
+                },
+            );
+        });
+    }
+
+    fn dispatch_side_enter(target: &HtmlElement) {
+        let init = web_sys::KeyboardEventInit::new();
+        init.set_bubbles(true);
+        init.set_key("Enter");
+        init.set_ctrl_key(true);
+        let event =
+            web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &init).unwrap();
+        target.dispatch_event(&event).unwrap();
+    }
+
     fn mount_panel(setup: impl Fn(&AppState) + 'static) -> (HtmlElement, AppState) {
+        workspace_width().set(None);
         let container = make_container();
         let captured: Rc<RefCell<Option<AppState>>> = Rc::new(RefCell::new(None));
         let captured_for_mount = captured.clone();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
+            state.pending_goto_line.set(None);
+            state.pending_goto_offset.set(None);
             setup(&state);
             *captured_for_mount.borrow_mut() = Some(state.clone());
             provide_context(state.clone());
@@ -558,9 +692,44 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn clicking_match_row_sets_pending_goto_line() {
+    async fn clicking_match_row_targets_focused_exact_project_occurrence() {
         ensure_styles_loaded();
-        let (container, state) = mount_panel(|state| {
+        let path = ProjectPath {
+            root: ProjectRootPath("test-root".to_owned()),
+            relative_path: "src/a.rs".to_owned(),
+        };
+        let current_key = file_key("current", path.clone());
+        let other_key = file_key("other", path.clone());
+        let current_for_setup = current_key.clone();
+        let other_for_setup = other_key.clone();
+        let (container, state) = mount_panel(move |state| {
+            state.active_project.set(Some(ActiveProjectRef {
+                host_id: "host".to_owned(),
+                project_id: ProjectId("current".to_owned()),
+            }));
+            seed_loaded_file(state, &current_for_setup);
+            seed_loaded_file(state, &other_for_setup);
+            let current_tab = state
+                .open_tab_in(
+                    PaneId::Primary,
+                    TabContent::File {
+                        key: current_for_setup.clone(),
+                    },
+                    "a.rs · current".to_owned(),
+                    true,
+                )
+                .expect("current-project occurrence");
+            state
+                .open_tab_in(
+                    PaneId::Secondary,
+                    TabContent::File {
+                        key: other_for_setup.clone(),
+                    },
+                    "a.rs · other".to_owned(),
+                    true,
+                )
+                .expect("other-project occurrence");
+            state.activate_tab(current_tab);
             state.search_state.update(|s| {
                 s.query = "needle".to_owned();
                 s.results = vec![file_result(
@@ -591,17 +760,204 @@ mod wasm_tests {
 
         next_tick().await;
 
-        let pending = state.pending_goto_line.get_untracked();
+        let current_tab = state
+            .resolve_file_occurrence(&current_key, PaneId::Primary)
+            .expect("current project occurrence")
+            .1;
+        let other_tab = state
+            .resolve_file_occurrence(&other_key, PaneId::Primary)
+            .expect("other project occurrence")
+            .1;
         assert_eq!(
-            pending,
-            Some((
-                ProjectPath {
-                    root: ProjectRootPath("test-root".to_owned()),
-                    relative_path: "src/a.rs".to_owned(),
-                },
-                42,
-            )),
-            "clicking a result should request a goto to that file + line"
+            state.pending_goto_line.get_untracked(),
+            Some((current_tab, 42)),
+            "ordinary search navigation must target the focused exact-project occurrence"
+        );
+        assert_ne!(current_tab, other_tab);
+    }
+
+    #[wasm_bindgen_test]
+    async fn side_enter_is_row_scoped_and_targets_only_the_duplicate() {
+        ensure_styles_loaded();
+        workspace_width().set(Some(1.0));
+        let path = ProjectPath {
+            root: ProjectRootPath("test-root".to_owned()),
+            relative_path: "src/a.rs".to_owned(),
+        };
+        let key = file_key("current", path);
+        let key_for_setup = key.clone();
+        let (container, state) = mount_panel(move |state| {
+            state.active_project.set(Some(ActiveProjectRef {
+                host_id: "host".to_owned(),
+                project_id: ProjectId("current".to_owned()),
+            }));
+            seed_loaded_file(state, &key_for_setup);
+            state
+                .open_tab_in(
+                    PaneId::Primary,
+                    TabContent::File {
+                        key: key_for_setup.clone(),
+                    },
+                    "a.rs".to_owned(),
+                    true,
+                )
+                .expect("primary occurrence");
+            state.search_state.update(|search| {
+                search.query = "needle".to_owned();
+                search.results = vec![file_result(
+                    "src/a.rs",
+                    &[(42, "the needle", (4, 10))],
+                    false,
+                )];
+                search.total_files = 1;
+                search.total_matches = 1;
+            });
+        });
+        assert_eq!(
+            workspace_width().get_untracked(),
+            None,
+            "a result-panel mount must discard a stale prior workspace measurement"
+        );
+        next_tick().await;
+
+        let document = web_sys::window().unwrap().document().unwrap();
+        let init = web_sys::KeyboardEventInit::new();
+        init.set_bubbles(true);
+        init.set_key("Enter");
+        init.set_ctrl_key(true);
+        document
+            .dispatch_event(
+                &web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &init)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            state.center_zone.with_untracked(|center| {
+                center
+                    .occurrences(&TabContent::File { key: key.clone() })
+                    .len()
+            }),
+            1,
+            "a global Open to the Side chord must not open a search result"
+        );
+        assert!(state.pending_goto_line.get_untracked().is_none());
+
+        let row = container
+            .query_selector(".search-match-row")
+            .unwrap()
+            .expect("match row")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        assert_eq!(
+            row.get_attribute("aria-keyshortcuts").as_deref(),
+            Some("Enter Control+Enter Meta+Enter")
+        );
+        let side_hint = crate::components::command_palette::context_binding(
+            crate::components::command_palette::ContextActionId::OpenToSide,
+        )
+        .chord()
+        .hint();
+        assert_eq!(
+            row.get_attribute("title").as_deref(),
+            Some(format!("Open ({side_hint} opens to the side)").as_str()),
+            "the row title must show the exact platform chord that opens to the side"
+        );
+        let side_action = container
+            .query_selector(".search-result-open-side")
+            .unwrap()
+            .expect("visible side-open action")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        assert_eq!(
+            side_action.get_attribute("aria-label").as_deref(),
+            Some("Open src/a.rs at line 42 to the side")
+        );
+        assert_eq!(
+            side_action.get_attribute("aria-keyshortcuts").as_deref(),
+            Some("Control+Enter Meta+Enter")
+        );
+        state.tabs_enabled.set(false);
+        next_tick().await;
+        assert_eq!(
+            side_action.get_attribute("aria-disabled").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            side_action.get_attribute("title").as_deref(),
+            Some("Enable tabs to use split view.")
+        );
+        let disabled_row_title = row.get_attribute("title").unwrap_or_default();
+        assert_eq!(
+            disabled_row_title,
+            format!(
+                "Open; {side_hint} Open to the Side unavailable: Enable tabs to use split view."
+            ),
+            "the disabled row title must preserve the exact platform chord and refusal"
+        );
+        dispatch_side_enter(&row);
+        next_tick().await;
+        assert_eq!(
+            state.center_zone.with_untracked(|center| {
+                center
+                    .occurrences(&TabContent::File { key: key.clone() })
+                    .len()
+            }),
+            1,
+            "the shared unavailable policy must refuse without a focused-pane consolation open"
+        );
+        assert!(state.pending_goto_line.get_untracked().is_none());
+        let notice = container
+            .query_selector("[data-testid=\"search-side-open-notice\"]")
+            .unwrap()
+            .expect("visible side-open refusal notice");
+        assert_eq!(notice.get_attribute("role").as_deref(), Some("status"));
+        assert_eq!(
+            notice.text_content().unwrap_or_default().trim(),
+            "Enable tabs to use split view."
+        );
+
+        state.tabs_enabled.set(true);
+        next_tick().await;
+        dispatch_side_enter(&row);
+        next_tick().await;
+
+        let occurrences = state
+            .center_zone
+            .with_untracked(|center| center.occurrences(&TabContent::File { key: key.clone() }));
+        assert_eq!(
+            occurrences.len(),
+            2,
+            "side open should duplicate a loaded file"
+        );
+        let secondary = occurrences
+            .iter()
+            .find_map(|(pane, tab)| (*pane == PaneId::Secondary).then_some(*tab))
+            .expect("secondary duplicate");
+        assert_eq!(
+            state.pending_goto_line.get_untracked(),
+            Some((secondary, 42))
+        );
+        let primary = occurrences
+            .iter()
+            .find_map(|(pane, tab)| (*pane == PaneId::Primary).then_some(*tab))
+            .expect("primary occurrence");
+        assert_ne!(primary, secondary);
+        assert!(
+            container
+                .query_selector("[data-testid=\"search-side-open-notice\"]")
+                .unwrap()
+                .is_none(),
+            "a successful retry clears the visible refusal"
+        );
+
+        assert!(state.reveal_tab(primary));
+        state.pending_goto_line.set(None);
+        side_action.click();
+        next_tick().await;
+        assert_eq!(
+            state.pending_goto_line.get_untracked(),
+            Some((secondary, 42)),
+            "the visible affordance must target the exact side occurrence"
         );
     }
 }

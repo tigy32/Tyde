@@ -72,14 +72,21 @@ async fn next_kind(
 }
 
 async fn expect_no_event(client: &mut client::Connection, duration: Duration, context: &str) {
-    match tokio::time::timeout(duration, client.next_event()).await {
-        Err(_) => {}
-        Ok(Ok(None)) => {}
-        Ok(Ok(Some(env))) => panic!(
-            "unexpected event before {context}: kind={} stream={}",
-            env.kind, env.stream
-        ),
-        Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
+    let deadline = tokio::time::Instant::now() + duration;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return;
+        }
+        match tokio::time::timeout(deadline - now, client.next_event()).await {
+            Err(_) | Ok(Ok(None)) => return,
+            Ok(Ok(Some(env))) if env.kind == FrameKind::BackendCapacity => {}
+            Ok(Ok(Some(env))) => panic!(
+                "unexpected event before {context}: kind={} stream={}",
+                env.kind, env.stream
+            ),
+            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
+        }
     }
 }
 
@@ -1196,6 +1203,24 @@ async fn changed_session_schemas_still_emit_live_after_host_bootstrap() {
         bootstrap.session_schemas[0].backend_kind(),
         BackendKind::Claude
     );
+    let protocol::SessionSchemaEntry::Ready { schema } = &bootstrap.session_schemas[0] else {
+        panic!("Claude session schema should be ready");
+    };
+    let effort_field = schema
+        .fields
+        .iter()
+        .find(|field| field.key == "effort")
+        .expect("Claude effort field");
+    let protocol::SessionSettingFieldType::Select { options, .. } = &effort_field.field_type else {
+        panic!("Claude effort should be a select field");
+    };
+    assert_eq!(
+        options
+            .iter()
+            .map(|option| option.value.as_str())
+            .collect::<Vec<_>>(),
+        vec!["low", "medium", "high", "xhigh", "max"]
+    );
 
     client
         .set_setting(SetSettingPayload {
@@ -1221,6 +1246,136 @@ async fn changed_session_schemas_still_emit_live_after_host_bootstrap() {
             .map(protocol::SessionSchemaEntry::backend_kind)
             .collect::<Vec<_>>(),
         vec![BackendKind::Claude, BackendKind::Codex]
+    );
+}
+
+#[tokio::test]
+async fn claude_xhigh_tier_round_trips_and_invalid_effort_preserves_state() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sessions_path = dir.path().join("sessions.json");
+    let projects_path = dir.path().join("projects.json");
+    let settings_path = dir.path().join("settings.json");
+    write_enabled_backends_settings(&settings_path, &[BackendKind::Claude]);
+
+    let mut xhigh = SessionSettingsValues::default();
+    xhigh.0.insert(
+        "effort".to_owned(),
+        SessionSettingValue::String("xhigh".to_owned()),
+    );
+    let expected_config = protocol::BackendTierConfig {
+        low: SessionSettingsValues::default(),
+        high: xhigh.clone(),
+    };
+
+    {
+        let host = server::spawn_host_with_mock_backend(
+            sessions_path.clone(),
+            projects_path.clone(),
+            settings_path.clone(),
+        )
+        .expect("spawn host");
+        let mut client = connect_raw(host).await;
+        let _ = next_env(&mut client, "initial host bootstrap").await;
+
+        client
+            .set_setting(SetSettingPayload {
+                setting: HostSettingValue::BackendTiers {
+                    backend: BackendKind::Claude,
+                    config: expected_config.clone(),
+                },
+            })
+            .await
+            .expect("save Claude xhigh tier");
+        let saved = next_kind(
+            &mut client,
+            FrameKind::HostSettings,
+            "Claude xhigh HostSettings",
+        )
+        .await
+        .parse_payload::<protocol::HostSettingsPayload>()
+        .expect("parse Claude xhigh HostSettings");
+        assert_eq!(
+            saved
+                .settings
+                .backend_tier_configs
+                .get(&BackendKind::Claude),
+            Some(&expected_config)
+        );
+        assert_eq!(
+            saved.settings.backend_tier_configs[&BackendKind::Claude]
+                .high
+                .0
+                .get("effort"),
+            Some(&SessionSettingValue::String("xhigh".to_owned()))
+        );
+
+        let mut ultra = SessionSettingsValues::default();
+        ultra.0.insert(
+            "effort".to_owned(),
+            SessionSettingValue::String("ultra".to_owned()),
+        );
+        client
+            .set_setting(SetSettingPayload {
+                setting: HostSettingValue::BackendTiers {
+                    backend: BackendKind::Claude,
+                    config: protocol::BackendTierConfig {
+                        low: SessionSettingsValues::default(),
+                        high: ultra,
+                    },
+                },
+            })
+            .await
+            .expect("send invalid Claude tier");
+        let error = next_kind(
+            &mut client,
+            FrameKind::CommandError,
+            "invalid Claude effort CommandError",
+        )
+        .await
+        .parse_payload::<CommandErrorPayload>()
+        .expect("parse invalid Claude effort CommandError");
+        assert_eq!(error.code, CommandErrorCode::InvalidInput);
+        assert!(error.message.contains("effort"));
+        assert!(error.message.contains("ultra"));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, client.next_event()).await {
+                Err(_) | Ok(Ok(None)) => break,
+                Ok(Ok(Some(event))) => assert_ne!(
+                    event.kind,
+                    FrameKind::HostSettings,
+                    "rejected Claude effort must not emit substituted or unset settings"
+                ),
+                Ok(Err(error)) => panic!("client failed after rejected Claude effort: {error:?}"),
+            }
+        }
+    }
+
+    let host = server::spawn_host_with_mock_backend(sessions_path, projects_path, settings_path)
+        .expect("reload host");
+    let mut client = connect_raw(host).await;
+    let bootstrap = next_env(&mut client, "reloaded host bootstrap")
+        .await
+        .parse_payload::<HostBootstrapPayload>()
+        .expect("parse reloaded HostBootstrap");
+    assert_eq!(
+        bootstrap
+            .settings
+            .backend_tier_configs
+            .get(&BackendKind::Claude),
+        Some(&expected_config)
+    );
+    assert_eq!(
+        bootstrap.settings.backend_tier_configs[&BackendKind::Claude]
+            .high
+            .0
+            .get("effort"),
+        Some(&SessionSettingValue::String("xhigh".to_owned()))
     );
 }
 

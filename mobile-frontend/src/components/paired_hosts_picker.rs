@@ -425,16 +425,7 @@ mod wasm_tests {
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
     }
 
-    fn force_web_backend() {
-        let window = web_sys::window().expect("window");
-        let _ = js_sys::Reflect::delete_property(
-            &window,
-            &wasm_bindgen::JsValue::from_str("__TAURI__"),
-        );
-    }
-
     fn set_service_config(json: &str) {
-        force_web_backend();
         let window = web_sys::window().expect("window");
         let key = wasm_bindgen::JsValue::from_str("__TYDE_MOBILE_SERVICE__");
         if json.is_empty() {
@@ -553,7 +544,6 @@ mod wasm_tests {
     /// "Sign in with Tyggs" action — not a no-op Connect (findings #3/#7).
     #[wasm_bindgen_test]
     async fn service_auth_required_host_offers_sign_in_not_connect() {
-        force_web_backend();
         let container = make_container();
         let host = LocalHostId("h-auth".to_owned());
         let host_for_mount = host.clone();

@@ -30,6 +30,8 @@ pub use backend::{acp, antigravity, claude, codex, kiro, subprocess};
 pub use acceptor::{HandshakeError, accept, listen_uds};
 pub use agent_control_mcp::AgentControlMcpCaller;
 pub use connection::{run_connection, run_mobile_connection};
+#[cfg(feature = "test-support")]
+pub use host::InstalledWorkbenchRemoveHook;
 pub use host::{
     HostHandle, HostRuntimeConfig, spawn_host, spawn_host_with_mock_backend,
     spawn_host_with_mock_backend_and_runtime_config, spawn_host_with_session_store,

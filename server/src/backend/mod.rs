@@ -120,6 +120,13 @@ pub struct StartupMcpServer {
     pub transport: StartupMcpTransport,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackendExecutionMode {
+    #[default]
+    Agent,
+    InferenceOnly,
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentIdentity {
     pub id: String,
@@ -141,6 +148,7 @@ pub struct BackendSession {
 
 #[derive(Debug, Clone, Default)]
 pub struct BackendSpawnConfig {
+    pub execution_mode: BackendExecutionMode,
     pub cost_hint: Option<SpawnCostHint>,
     pub custom_agent_id: Option<CustomAgentId>,
     pub startup_mcp_servers: Vec<StartupMcpServer>,

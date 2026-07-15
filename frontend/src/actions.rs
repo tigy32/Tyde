@@ -3,8 +3,9 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::send::send_frame;
 use crate::state::{
-    ActiveAgentRef, ActiveProjectRef, AppState, DockVisibility, LeftTab, PendingWorkbenchCreate,
-    TabContent, sort_project_infos,
+    ActiveAgentRef, ActiveProjectRef, AppState, DockVisibility, FileResourceKey, LeftTab,
+    OpenTarget, PaneId, PendingFileNavigation, PendingFileOpen, PendingOpenDestination,
+    PendingWorkbenchCreate, TabContent, TabId, sort_project_infos,
 };
 
 use protocol::{
@@ -415,19 +416,120 @@ pub fn spawn_side_question(state: &AppState, prompt: String, images: Option<Vec<
     });
 }
 
-pub fn open_file(state: &AppState, path: ProjectPath) {
-    open_project_path(state, path);
+pub fn open_project_path(state: &AppState, path: ProjectPath) {
+    open_project_path_at(state, path, OpenTarget::Focused);
 }
 
-pub fn open_project_path(state: &AppState, path: ProjectPath) {
+pub fn open_project_path_at(state: &AppState, path: ProjectPath, target: OpenTarget) {
+    let destination = state
+        .center_zone
+        .with_untracked(|center_zone| center_zone.resolve(target));
+    let _ = open_project_path_in_mode(
+        state,
+        path,
+        destination,
+        None,
+        matches!(target, OpenTarget::Beside),
+    );
+}
+
+pub fn open_project_path_at_navigation(
+    state: &AppState,
+    path: ProjectPath,
+    target: OpenTarget,
+    navigation: PendingFileNavigation,
+) -> Option<TabId> {
+    let destination = state
+        .center_zone
+        .with_untracked(|center_zone| center_zone.resolve(target));
+    open_project_path_in_mode(
+        state,
+        path,
+        destination,
+        Some(navigation),
+        matches!(target, OpenTarget::Beside),
+    )
+}
+
+pub fn open_project_path_in(
+    state: &AppState,
+    path: ProjectPath,
+    destination: PaneId,
+    navigation: Option<PendingFileNavigation>,
+) -> Option<TabId> {
+    open_project_path_in_mode(state, path, destination, navigation, false)
+}
+
+fn open_project_path_in_mode(
+    state: &AppState,
+    path: ProjectPath,
+    destination: PaneId,
+    navigation: Option<PendingFileNavigation>,
+    duplicate_loaded: bool,
+) -> Option<TabId> {
     let Some(active_project) = state.active_project_ref_untracked() else {
         log::error!("open_project_path: no active project");
-        return;
+        return None;
     };
+
+    let key = FileResourceKey {
+        host_id: active_project.host_id.clone(),
+        project_id: active_project.project_id.clone(),
+        path: path.clone(),
+    };
+    if let Some(tab) = state.file_occurrence_in(destination, &key) {
+        state.activate_tab(tab);
+        if let Some(navigation) = navigation {
+            state.target_file_navigation(tab, navigation);
+        }
+        return Some(tab);
+    }
+
+    if !duplicate_loaded && let Some((_, tab)) = state.resolve_file_occurrence(&key, destination) {
+        state.activate_tab(tab);
+        if let Some(navigation) = navigation {
+            state.target_file_navigation(tab, navigation);
+        }
+        return Some(tab);
+    }
+
+    let loaded = state
+        .open_files
+        .with_untracked(|files| files.contains_key(&key));
+    if loaded {
+        if duplicate_loaded
+            && let Some((_, source)) = state.resolve_file_occurrence(&key, destination.other())
+        {
+            if let Some(tab) = state.duplicate_file_in_result(destination, source).tab_id() {
+                if let Some(navigation) = navigation {
+                    state.target_file_navigation(tab, navigation);
+                }
+                return Some(tab);
+            }
+            return None;
+        }
+        let label = file_label(state, &path);
+        let tab = state.open_tab_in(destination, TabContent::File { key }, label, true);
+        if let Some(tab) = tab
+            && let Some(navigation) = navigation
+        {
+            state.target_file_navigation(tab, navigation);
+        }
+        return tab;
+    }
+
     let Some(_host_stream) = state.host_stream_untracked(&active_project.host_id) else {
         log::error!("open_project_path: host stream missing");
-        return;
+        return None;
     };
+
+    state.record_pending_file_open(
+        key,
+        PendingFileOpen::Open {
+            destination: PendingOpenDestination::new(destination),
+            navigation,
+        },
+    );
 
     let perf_key = format!("file:{}", path.relative_path);
     crate::perf::mark_start(&perf_key);
@@ -438,12 +540,28 @@ pub fn open_project_path(state: &AppState, path: ProjectPath) {
         active_project.project_id.0.clone(),
         path,
     );
+    None
+}
+
+fn file_label(state: &AppState, path: &ProjectPath) -> String {
+    let base = path
+        .relative_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(&path.relative_path);
+    if state
+        .active_project_info_untracked()
+        .is_some_and(|project| project.project.root_paths().len() > 1)
+    {
+        format!("{base} · {}", crate::state::root_display_name(&path.root))
+    } else {
+        base.to_string()
+    }
 }
 
 /// Re-read an already-open file in the background after the server reports its
-/// version advanced (`ProjectEventPayload::FilesChanged`). Marks the path in
-/// `pending_file_refreshes` so the `ProjectFileContents` handler updates it in
-/// place — without `open_tab` stealing focus — then issues the same
+/// version advanced (`ProjectEventPayload::FilesChanged`). Records an
+/// in-place refresh unless a user open already owns the route, then issues the same
 /// read + subscribe an open does. Re-reading (rather than just bumping the
 /// tracked version) is required for correctness: code-intel results are
 /// computed against byte offsets, so the client must hold the *new* text before
@@ -455,9 +573,12 @@ pub fn refresh_open_file(
     project_id: ProjectId,
     path: ProjectPath,
 ) {
-    state.pending_file_refreshes.update(|pending| {
-        pending.insert(path.clone());
-    });
+    let key = FileResourceKey {
+        host_id: host_id.clone(),
+        project_id: project_id.clone(),
+        path: path.clone(),
+    };
+    state.record_pending_file_open(key, PendingFileOpen::RefreshInPlace);
     send_read_and_subscribe(host_id, project_id.0, path);
 }
 
@@ -514,14 +635,15 @@ fn next_code_intel_id(state: &AppState) -> u64 {
 /// `code_intel_navigate` miss-fill (M2).
 pub fn navigate_to_definition(
     state: &AppState,
-    path: ProjectPath,
+    tab: TabId,
+    key: FileResourceKey,
     version: ProjectFileVersion,
     offset: u32,
 ) {
-    if try_local_definition_jump(state, &path, version, offset) {
+    if try_local_definition_jump(state, tab, &key, version, offset) {
         return;
     }
-    request_navigate(state, path, version, offset);
+    request_navigate(state, tab, key, version, offset);
 }
 
 /// Attempt a local go-to-definition against the pushed model. Returns `true`
@@ -530,17 +652,15 @@ pub fn navigate_to_definition(
 /// leaving navigation to the on-demand fallback.
 fn try_local_definition_jump(
     state: &AppState,
-    path: &ProjectPath,
+    source_tab: TabId,
+    source: &FileResourceKey,
     version: ProjectFileVersion,
     offset: u32,
 ) -> bool {
-    let Some(active) = state.active_project_ref_untracked() else {
-        return false;
-    };
     let key = crate::state::CodeIntelKey {
-        host_id: active.host_id,
-        project_id: active.project_id,
-        path: path.clone(),
+        host_id: source.host_id.clone(),
+        project_id: source.project_id.clone(),
+        path: source.path.clone(),
     };
     let target = state.code_intel.with_untracked(|map| {
         let file = map.get(&key)?;
@@ -563,10 +683,26 @@ fn try_local_definition_jump(
             // Clearing the context makes `apply_code_intel_navigate_result` drop
             // any such result on arrival.
             state.code_intel_navigate_ctx.set(None);
-            state
-                .pending_goto_offset
-                .set(Some((location.path.clone(), location.range.start)));
-            open_project_path(state, location.path);
+            let destination = state
+                .center_zone
+                .with_untracked(|center_zone| center_zone.locate_tab(source_tab));
+            let Some(destination) = destination else {
+                return false;
+            };
+            if location.path == source.path {
+                state.activate_tab(source_tab);
+                state.target_file_navigation(
+                    source_tab,
+                    PendingFileNavigation::Offset(location.range.start),
+                );
+            } else {
+                open_project_path_in(
+                    state,
+                    location.path,
+                    destination,
+                    Some(PendingFileNavigation::Offset(location.range.start)),
+                );
+            }
             true
         }
         None => false,
@@ -576,23 +712,25 @@ fn try_local_definition_jump(
 /// Send a `code_intel_set_visible_range` hint so the server prioritizes
 /// resolving the on-screen occurrences first (M3). Pure prioritization — it
 /// never changes which identifiers are clickable. Debounced at the call site so
-/// scrolling doesn't flood the stream.
+/// scrolling doesn't flood the stream. The caller supplies the exact mounted
+/// occurrence; stale timers from an unmounted or changed file are ignored.
 pub fn send_visible_range(
     state: &AppState,
-    path: ProjectPath,
+    tab: TabId,
+    key: FileResourceKey,
     version: ProjectFileVersion,
     range: ByteRange,
 ) {
-    let Some(active) = state.active_project_ref_untracked() else {
+    if !state.file_occurrence_is_current(tab, &key, version) {
         return;
-    };
+    }
     let payload = CodeIntelSetVisibleRangePayload {
-        path,
+        path: key.path,
         version,
         range,
     };
-    let project_stream = StreamPath(format!("/project/{}", active.project_id.0));
-    let host_id = active.host_id;
+    let project_stream = StreamPath(format!("/project/{}", key.project_id.0));
+    let host_id = key.host_id;
     spawn_local(async move {
         if let Err(error) = send_frame(
             &host_id,
@@ -614,14 +752,11 @@ pub fn send_visible_range(
 /// `code_intel_navigate_result` arrives (see `dispatch.rs`).
 pub fn request_navigate(
     state: &AppState,
-    path: ProjectPath,
+    tab: TabId,
+    key: FileResourceKey,
     version: ProjectFileVersion,
     offset: u32,
 ) {
-    let Some(active_project) = state.active_project_ref_untracked() else {
-        log::error!("request_navigate: no active project");
-        return;
-    };
     let navigate_id = next_code_intel_id(state);
     // Record the full context so the result is only acted on while it still
     // applies (same host/project, source file still open at this version).
@@ -629,19 +764,18 @@ pub fn request_navigate(
         .code_intel_navigate_ctx
         .set(Some(crate::state::CodeIntelNavigateContext {
             navigate_id,
-            host_id: active_project.host_id.clone(),
-            project_id: active_project.project_id.clone(),
-            path: path.clone(),
+            tab,
+            key: key.clone(),
             version,
         }));
     let payload = CodeIntelNavigatePayload {
         navigate_id,
-        path,
+        path: key.path,
         version,
         offset,
     };
-    let project_stream = StreamPath(format!("/project/{}", active_project.project_id.0));
-    let host_id = active_project.host_id;
+    let project_stream = StreamPath(format!("/project/{}", key.project_id.0));
+    let host_id = key.host_id;
     spawn_local(async move {
         if let Err(error) = send_frame(
             &host_id,
@@ -656,28 +790,31 @@ pub fn request_navigate(
     });
 }
 
-/// On-demand hover: request type/doc markdown at `offset` bytes into `path`.
+/// On-demand hover: request type/doc markdown at `offset` bytes into an exact
+/// mounted file occurrence.
 /// Mints a fresh `hover_id`, records it active (superseding older hovers), and
 /// seeds the popover with the captured anchor rect and `None` contents — the
 /// popover renders nothing until the correlated result fills the markdown in.
 #[allow(clippy::too_many_arguments)]
 pub fn request_hover(
     state: &AppState,
-    path: ProjectPath,
+    tab: TabId,
+    key: FileResourceKey,
     version: ProjectFileVersion,
     offset: u32,
     anchor_left: f64,
     anchor_top: f64,
     anchor_bottom: f64,
 ) {
-    let Some(active_project) = state.active_project_ref_untracked() else {
+    if !state.file_occurrence_is_current(tab, &key, version) {
         return;
-    };
+    }
     let hover_id = next_code_intel_id(state);
     state.code_intel_active_hover.set(hover_id);
     state.code_intel_hover.set(Some(crate::state::HoverPopover {
         hover_id,
-        path: path.clone(),
+        tab,
+        key: key.clone(),
         version,
         offset,
         anchor_left,
@@ -687,12 +824,12 @@ pub fn request_hover(
     }));
     let payload = CodeIntelHoverPayload {
         hover_id,
-        path,
+        path: key.path,
         version,
         offset,
     };
-    let project_stream = StreamPath(format!("/project/{}", active_project.project_id.0));
-    let host_id = active_project.host_id;
+    let project_stream = StreamPath(format!("/project/{}", key.project_id.0));
+    let host_id = key.host_id;
     spawn_local(async move {
         if let Err(error) = send_frame(
             &host_id,
@@ -725,27 +862,27 @@ pub fn dismiss_hover(state: &AppState) {
 /// `references_id` (which supersedes any prior query — late frames for an older
 /// id are dropped by `dispatch`), resets the panel to an in-flight empty state,
 /// switches the left dock to the References tab, and streams the request to the
-/// active project. Results arrive incrementally on
+/// initiating file resource. Results arrive incrementally on
 /// `code_intel_references_results` frames and finish with a
 /// `code_intel_references_complete`.
 pub fn start_find_references(
     state: &AppState,
-    path: ProjectPath,
+    tab: TabId,
+    key: FileResourceKey,
     version: ProjectFileVersion,
     offset: u32,
     symbol: Option<String>,
 ) {
-    let Some(active_project) = state.active_project_ref_untracked() else {
-        log::error!("start_find_references: no active project");
+    if !state.file_occurrence_is_current(tab, &key, version) {
+        log::error!("start_find_references: initiating file occurrence is stale");
         return;
-    };
+    }
     let references_id = next_code_intel_id(state);
     state
         .references_state
         .set(crate::state::ProjectReferencesUiState {
-            host_id: Some(active_project.host_id.clone()),
-            project_id: Some(active_project.project_id.clone()),
-            source_path: Some(path.clone()),
+            source_tab: Some(tab),
+            source_key: Some(key.clone()),
             source_version: Some(version),
             active_references_id: references_id,
             in_flight: true,
@@ -756,13 +893,13 @@ pub fn start_find_references(
 
     let payload = CodeIntelFindReferencesPayload {
         references_id,
-        path,
+        path: key.path,
         version,
         offset,
         include_declaration: true,
     };
-    let project_stream = StreamPath(format!("/project/{}", active_project.project_id.0));
-    let host_id = active_project.host_id;
+    let project_stream = StreamPath(format!("/project/{}", key.project_id.0));
+    let host_id = key.host_id;
     spawn_local(async move {
         if let Err(error) = send_frame(
             &host_id,
@@ -791,10 +928,10 @@ pub fn cancel_find_references(state: &AppState) {
     if references_id == 0 {
         return;
     }
-    let Some((host_id, project_id)) = state
-        .references_state
-        .with_untracked(|s| Some((s.host_id.clone()?, s.project_id.clone()?)))
-    else {
+    let Some((host_id, project_id)) = state.references_state.with_untracked(|s| {
+        let (_, key, _) = s.source()?;
+        Some((key.host_id.clone(), key.project_id.clone()))
+    }) else {
         return;
     };
     state.references_state.update(|s| s.in_flight = false);
@@ -1253,6 +1390,71 @@ pub fn send_set_session_settings(state: &AppState, values: SessionSettingsValues
             log::error!("failed to send SetSessionSettings: {error}");
         }
     });
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod native_tests {
+    use super::*;
+    use crate::state::OpenFile;
+
+    #[test]
+    fn side_open_with_navigation_targets_the_duplicate_occurrence() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let project_id = ProjectId("project".to_owned());
+            let path = ProjectPath {
+                root: ProjectRootPath("/repo".to_owned()),
+                relative_path: "src/main.rs".to_owned(),
+            };
+            let key = FileResourceKey {
+                host_id: "host".to_owned(),
+                project_id: project_id.clone(),
+                path: path.clone(),
+            };
+            state.active_project.set(Some(ActiveProjectRef {
+                host_id: key.host_id.clone(),
+                project_id,
+            }));
+            state.open_files.update(|files| {
+                files.insert(
+                    key.clone(),
+                    OpenFile {
+                        path: path.clone(),
+                        version: ProjectFileVersion(1),
+                        contents: Some("fn main() {}".to_owned()),
+                        is_binary: false,
+                    },
+                );
+            });
+            let primary = state
+                .open_tab_in(
+                    PaneId::Primary,
+                    TabContent::File { key: key.clone() },
+                    "main.rs".to_owned(),
+                    true,
+                )
+                .expect("primary occurrence");
+
+            let secondary = open_project_path_at_navigation(
+                &state,
+                path,
+                OpenTarget::Beside,
+                PendingFileNavigation::Line(27),
+            )
+            .expect("loaded side open is synchronous");
+
+            assert_ne!(primary, secondary);
+            assert_eq!(
+                state.file_occurrence_in(PaneId::Secondary, &key),
+                Some(secondary)
+            );
+            assert_eq!(
+                state.pending_goto_line.get_untracked(),
+                Some((secondary, 27))
+            );
+        });
+    }
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]

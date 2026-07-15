@@ -1,14 +1,14 @@
 //! Browser (PWA) persistence for paired hosts and PSKs.
 //!
-//! Ports `mobile/src-tauri/src/paired_hosts.rs` (host records) and
-//! `psk_store.rs` (secret storage) to IndexedDB. The Keychain / app-data-file
-//! backends do not exist in a browser, so both live in IndexedDB via
-//! [`super::idb`].
+//! The removed native host-record and secret-store implementations remain in
+//! Git history as provenance for this IndexedDB port. The Keychain /
+//! app-data-file backends do not exist in a browser, so both stores live in
+//! IndexedDB via [`super::idb`].
 //!
 //! ## PSK storage seam (later-phase hardening)
 //!
 //! For this phase the PSK is stored as raw 32 bytes (base64) in IndexedDB —
-//! the documented fallback in `docs/plans/mobile-web-pwa.md` → "PSK storage".
+//! the documented fallback in `dev-docs/mobile-web-pwa.md` → "PSK storage".
 //! The eventual hardening stores the long-term PSK as a **non-extractable
 //! WebCrypto HKDF `CryptoKey`** so the root secret never exists as readable
 //! bytes at rest. To keep that swap localized, all PSK access goes through the

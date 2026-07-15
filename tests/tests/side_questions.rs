@@ -203,6 +203,86 @@ async fn expect_new_agent(client: &mut client::Connection, context: &str) -> New
     }
 }
 
+async fn expect_new_agent_with_diagnostics(
+    client: &mut client::Connection,
+    host: &server::HostHandle,
+    context: &str,
+) -> NewAgentPayload {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let pending_key = client as *mut client::Connection as usize;
+    let mut observed = Vec::new();
+    let mut deferred = HashMap::<StreamPath, VecDeque<Envelope>>::new();
+    loop {
+        let env = if let Some(env) = pop_pending_agent_event(pending_key) {
+            env
+        } else {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                let registered_agent_ids = host.agent_ids().await;
+                panic!(
+                    "timed out waiting for {context}; observed post-spawn frames: {observed:#?}; deferred frames: {deferred:#?}; registered agent ids at timeout: {registered_agent_ids:#?}"
+                );
+            };
+            match tokio::time::timeout(remaining, client.next_event()).await {
+                Ok(Ok(Some(env))) => env,
+                Ok(Ok(None)) => panic!(
+                    "connection closed before {context}; observed post-spawn frames: {observed:#?}; deferred frames: {deferred:#?}"
+                ),
+                Ok(Err(error)) => panic!(
+                    "next_event failed before {context}: {error:?}; observed post-spawn frames: {observed:#?}; deferred frames: {deferred:#?}"
+                ),
+                Err(_) => {
+                    let registered_agent_ids = host.agent_ids().await;
+                    panic!(
+                        "timed out waiting for {context}; observed post-spawn frames: {observed:#?}; deferred frames: {deferred:#?}; registered agent ids at timeout: {registered_agent_ids:#?}"
+                    );
+                }
+            }
+        };
+        let command_error = (env.kind == FrameKind::CommandError).then(|| {
+            env.parse_payload::<CommandErrorPayload>()
+                .map(|error| format!("{error:?}"))
+                .unwrap_or_else(|error| format!("unparseable CommandError: {error}"))
+        });
+        observed.push(format!(
+            "kind={:?} stream={} seq={} command_error={:?} payload={}",
+            env.kind, env.stream, env.seq, command_error, env.payload
+        ));
+        eprintln!(
+            "diagnostic stale-parent post-spawn frame: {}",
+            observed.last().expect("just pushed diagnostic frame")
+        );
+        if env.kind == FrameKind::NewAgent {
+            for (stream, mut events) in deferred {
+                push_pending_agent_events(pending_key, &stream, &mut events);
+            }
+            return env.parse_payload().expect("parse NewAgentPayload");
+        }
+        if env.kind == FrameKind::AgentBootstrap {
+            let stream = env.stream.clone();
+            let bootstrap: AgentBootstrapPayload = env.parse_payload().expect("AgentBootstrap");
+            let bootstrap_event_count = bootstrap.events.len();
+            for (index, event) in bootstrap.events.into_iter().enumerate() {
+                if let Some(event) = agent_bootstrap_event_envelope(&stream, index as u64, event) {
+                    observed.push(format!(
+                        "bootstrap kind={:?} stream={} seq={} payload={}",
+                        event.kind, event.stream, event.seq, event.payload
+                    ));
+                    deferred.entry(stream.clone()).or_default().push_back(event);
+                }
+            }
+            eprintln!(
+                "diagnostic stale-parent AgentBootstrap unpacked: stream={} events={bootstrap_event_count}",
+                stream
+            );
+        } else {
+            deferred
+                .entry(env.stream.clone())
+                .or_default()
+                .push_back(env);
+        }
+    }
+}
+
 async fn expect_agent_start(
     client: &mut client::Connection,
     stream: &StreamPath,
@@ -615,7 +695,7 @@ async fn stale_parent_fork_fails_without_touching_source_session() {
 
     let host = server::spawn_host_with_store_paths(session_path, project_path, settings_path)
         .expect("spawn real-backend host");
-    let (mut client, _bootstrap) = connect_host(host).await;
+    let (mut client, _bootstrap) = connect_host(host.clone()).await;
 
     client
         .spawn_agent(SpawnAgentPayload {
@@ -633,7 +713,8 @@ async fn stale_parent_fork_fails_without_touching_source_session() {
         .await
         .expect("send stale-parent fork spawn");
 
-    let child = expect_new_agent(&mut client, "stale-parent child NewAgent").await;
+    let child =
+        expect_new_agent_with_diagnostics(&mut client, &host, "stale-parent child NewAgent").await;
     assert_eq!(child.origin, AgentOrigin::SideQuestion);
     assert_eq!(child.backend_kind, BackendKind::Codex);
     assert_eq!(

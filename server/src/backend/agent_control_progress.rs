@@ -2,11 +2,24 @@ use std::collections::HashSet;
 
 use protocol::{
     AgentControlAgentRef, AgentControlProgress, AgentControlProgressKind, AgentId,
-    ToolProgressData, ToolProgressUpdate,
+    ToolExecutionNormalizationFailure, ToolExecutionResult, ToolProgressData, ToolProgressUpdate,
+    ToolRequestType, TydeAgentWaitStatus,
 };
+use serde::Deserialize;
 use serde_json::Value;
 
 const MAX_PARSE_DEPTH: usize = 8;
+const ARGUMENT_WRAPPER_KEYS: &[&str] = &[
+    "arguments",
+    "args",
+    "input",
+    "input_data",
+    "inputData",
+    "tool_input",
+    "toolInput",
+    "parameters",
+    "params",
+];
 
 pub(crate) fn is_tyde_agent_control_spawn_tool_name(tool_name: &str) -> bool {
     is_tyde_agent_control_tool_name(tool_name, "tydespawnagent")
@@ -15,6 +28,189 @@ pub(crate) fn is_tyde_agent_control_spawn_tool_name(tool_name: &str) -> bool {
 pub(crate) fn is_tyde_agent_control_await_tool_name(tool_name: &str) -> bool {
     is_tyde_agent_control_tool_name(tool_name, "tydeawaitagents")
         || normalize_tool_name(tool_name).ends_with("tydeagentawaittydeawaitagents")
+}
+
+fn is_tyde_agent_control_send_message_tool_name(tool_name: &str) -> bool {
+    is_tyde_agent_control_tool_name(tool_name, "tydesendagentmessage")
+}
+
+#[derive(Debug)]
+pub(crate) struct ToolNormalizeError {
+    pub(crate) tool: String,
+    pub(crate) normalization_failure: ToolExecutionNormalizationFailure,
+    pub(crate) detail: String,
+}
+
+impl std::fmt::Display for ToolNormalizeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "canonical tool '{}' violated its typed contract: {}",
+            self.tool, self.detail
+        )
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SendAgentMessageResult {
+    ok: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AwaitAgentsResult {
+    ready: Vec<TydeAgentWaitStatus>,
+    still_thinking: Vec<TydeAgentWaitStatus>,
+}
+
+pub(crate) fn tyde_tool_request_type(
+    tool_name: &str,
+    arguments: &Value,
+) -> Result<Option<ToolRequestType>, ToolNormalizeError> {
+    let typed = if is_tyde_agent_control_send_message_tool_name(tool_name) {
+        let (agent_id, message) = find_send_message_arguments(arguments, 0).ok_or_else(|| {
+            normalize_error(
+                tool_name,
+                ToolExecutionNormalizationFailure::CanonicalRequest,
+                "expected non-empty agent_id/agentId and message in canonical arguments",
+            )
+        })?;
+        ToolRequestType::TydeSendAgentMessage { agent_id, message }
+    } else if is_tyde_agent_control_await_tool_name(tool_name) {
+        let agent_ids = parse_await_agent_refs(arguments)
+            .into_iter()
+            .map(|agent| agent.agent_id)
+            .collect::<Vec<_>>();
+        if agent_ids.is_empty() {
+            return Err(normalize_error(
+                tool_name,
+                ToolExecutionNormalizationFailure::CanonicalRequest,
+                "agent_ids must contain at least one non-empty id",
+            ));
+        }
+        ToolRequestType::TydeAwaitAgents { agent_ids }
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(typed))
+}
+
+fn find_send_message_arguments(value: &Value, depth: usize) -> Option<(AgentId, String)> {
+    if depth > MAX_PARSE_DEPTH {
+        return None;
+    }
+    match value {
+        Value::Object(map) => {
+            let agent_id = ["agent_id", "agentId"]
+                .into_iter()
+                .find_map(|key| map.get(key).and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let message = map.get("message").and_then(Value::as_str);
+            if let (Some(agent_id), Some(message)) = (agent_id, message)
+                && !message.trim().is_empty()
+            {
+                return Some((AgentId(agent_id.to_owned()), message.to_owned()));
+            }
+            ARGUMENT_WRAPPER_KEYS.iter().find_map(|key| {
+                map.get(*key)
+                    .and_then(|nested| find_send_message_arguments(nested, depth + 1))
+            })
+        }
+        Value::String(text) => parse_embedded_json(text)
+            .and_then(|parsed| find_send_message_arguments(&parsed, depth + 1)),
+        _ => None,
+    }
+}
+
+pub(crate) fn tyde_tool_result(
+    tool_name: &str,
+    result: &Value,
+) -> Result<Option<ToolExecutionResult>, ToolNormalizeError> {
+    let canonical = canonical_result_value(result);
+    let typed = if is_tyde_agent_control_send_message_tool_name(tool_name) {
+        let parsed: SendAgentMessageResult = parse_canonical(
+            tool_name,
+            &canonical,
+            ToolExecutionNormalizationFailure::CanonicalResult,
+        )?;
+        if !parsed.ok {
+            return Err(normalize_error(
+                tool_name,
+                ToolExecutionNormalizationFailure::CanonicalResult,
+                "successful result did not acknowledge delivery",
+            ));
+        }
+        ToolExecutionResult::TydeSendAgentMessage
+    } else if is_tyde_agent_control_await_tool_name(tool_name) {
+        let parsed: AwaitAgentsResult = parse_canonical(
+            tool_name,
+            &canonical,
+            ToolExecutionNormalizationFailure::CanonicalResult,
+        )?;
+        ToolExecutionResult::TydeAwaitAgents {
+            ready: parsed.ready,
+            still_thinking: parsed.still_thinking,
+        }
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(typed))
+}
+
+fn parse_canonical<T: for<'de> Deserialize<'de>>(
+    tool_name: &str,
+    value: &Value,
+    normalization_failure: ToolExecutionNormalizationFailure,
+) -> Result<T, ToolNormalizeError> {
+    serde_json::from_value(value.clone()).map_err(|_| {
+        normalize_error(
+            tool_name,
+            normalization_failure,
+            "result does not match the canonical schema",
+        )
+    })
+}
+
+fn normalize_error(
+    tool_name: &str,
+    normalization_failure: ToolExecutionNormalizationFailure,
+    detail: impl Into<String>,
+) -> ToolNormalizeError {
+    ToolNormalizeError {
+        tool: tool_name.to_string(),
+        normalization_failure,
+        detail: detail.into(),
+    }
+}
+
+fn canonical_result_value(value: &Value) -> Value {
+    if value.get("kind").and_then(Value::as_str) == Some("Other") {
+        return value
+            .get("result")
+            .map(canonical_result_value)
+            .unwrap_or_else(|| value.clone());
+    }
+    if let Some(text) = value.as_str()
+        && let Some(parsed) = parse_embedded_json(text)
+    {
+        return canonical_result_value(&parsed);
+    }
+    if let Some(text) = value.pointer("/content/0/text").and_then(Value::as_str)
+        && let Some(parsed) = parse_embedded_json(text)
+    {
+        return canonical_result_value(&parsed);
+    }
+    for key in ["result", "structuredContent", "structured_content"] {
+        if let Some(candidate) = value.get(key) {
+            let normalized = canonical_result_value(candidate);
+            if normalized.is_object() {
+                return normalized;
+            }
+        }
+    }
+    value.clone()
 }
 
 pub(crate) fn await_progress_data_for_tool(
@@ -107,18 +303,8 @@ fn collect_await_agent_refs(
                     collect_agent_ref_values(candidate, depth + 1, refs, seen);
                 }
             }
-            for key in [
-                "arguments",
-                "args",
-                "input",
-                "input_data",
-                "inputData",
-                "tool_input",
-                "toolInput",
-                "parameters",
-                "params",
-            ] {
-                if let Some(candidate) = map.get(key) {
+            for key in ARGUMENT_WRAPPER_KEYS {
+                if let Some(candidate) = map.get(*key) {
                     collect_await_agent_refs(candidate, depth + 1, refs, seen);
                 }
             }
@@ -412,6 +598,191 @@ mod tests {
                 &json!({ "agent_id": "agent-a" })
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn normalizes_canonical_tyde_requests_and_results() {
+        for tool_name in [
+            "tyde_send_agent_message",
+            "mcp__tyde-agent-control__tyde_send_agent_message",
+        ] {
+            assert_eq!(
+                tyde_tool_request_type(
+                    tool_name,
+                    &json!({ "agent_id": "agent-a", "message": "# Follow up" })
+                )
+                .expect("send request")
+                .expect("canonical request"),
+                ToolRequestType::TydeSendAgentMessage {
+                    agent_id: AgentId("agent-a".to_owned()),
+                    message: "# Follow up".to_owned(),
+                }
+            );
+            assert_eq!(
+                tyde_tool_result(
+                    tool_name,
+                    &json!({ "kind": "Other", "result": { "ok": true } })
+                )
+                .expect("send result")
+                .expect("canonical result"),
+                ToolExecutionResult::TydeSendAgentMessage
+            );
+        }
+
+        for tool_name in [
+            "tyde_await_agents",
+            "mcp__tyde-agent-control__tyde_await_agents",
+            "mcp__tyde-agent-await__tyde_await_agents",
+        ] {
+            assert_eq!(
+                tyde_tool_request_type(
+                    tool_name,
+                    &json!({ "arguments": { "agent_ids": ["agent-a", "agent-b"] } })
+                )
+                .expect("await request")
+                .expect("canonical request"),
+                ToolRequestType::TydeAwaitAgents {
+                    agent_ids: vec![AgentId("agent-a".to_owned()), AgentId("agent-b".to_owned())],
+                }
+            );
+            assert!(matches!(
+                tyde_tool_result(
+                    tool_name,
+                    &json!({
+                        "kind": "Other",
+                        "result": {
+                            "ready": [{ "agent_id": "agent-a", "status": "idle" }],
+                            "still_thinking": [{ "agent_id": "agent-b", "status": "thinking" }]
+                        }
+                    })
+                )
+                .expect("await result")
+                .expect("canonical result"),
+                ToolExecutionResult::TydeAwaitAgents { ready, still_thinking }
+                    if ready[0].agent_id == AgentId("agent-a".to_owned())
+                        && still_thinking[0].agent_id == AgentId("agent-b".to_owned())
+            ));
+        }
+    }
+
+    #[test]
+    fn request_normalizer_and_progress_accept_observed_argument_wrappers() {
+        let exact_message = "  # Keep exact bytes\n\n- item  ";
+        for wrapper in ARGUMENT_WRAPPER_KEYS {
+            let await_arguments = json!({
+                (*wrapper): { "agentIds": ["agent-a", "agent-b"] }
+            });
+            let typed = tyde_tool_request_type("tyde_await_agents", &await_arguments)
+                .expect("observed await wrapper must not error")
+                .expect("canonical await request");
+            assert_eq!(
+                typed,
+                ToolRequestType::TydeAwaitAgents {
+                    agent_ids: vec![AgentId("agent-a".to_owned()), AgentId("agent-b".to_owned())],
+                },
+                "await wrapper {wrapper}"
+            );
+            let progress =
+                await_progress_data_for_tool("call-await", "tyde_await_agents", &await_arguments)
+                    .expect("observed await wrapper must produce progress");
+            let ToolProgressUpdate::AgentControl(progress) = progress.update else {
+                panic!("expected agent-control progress for {wrapper}");
+            };
+            assert_eq!(
+                progress
+                    .agents
+                    .into_iter()
+                    .map(|agent| agent.agent_id)
+                    .collect::<Vec<_>>(),
+                vec![AgentId("agent-a".to_owned()), AgentId("agent-b".to_owned())],
+                "await progress wrapper {wrapper}"
+            );
+
+            let send_arguments = json!({
+                (*wrapper): { "agentId": "agent-a", "message": exact_message }
+            });
+            assert_eq!(
+                tyde_tool_request_type("tyde_send_agent_message", &send_arguments)
+                    .expect("observed send wrapper must not error")
+                    .expect("canonical send request"),
+                ToolRequestType::TydeSendAgentMessage {
+                    agent_id: AgentId("agent-a".to_owned()),
+                    message: exact_message.to_owned(),
+                },
+                "send wrapper {wrapper}"
+            );
+        }
+
+        let embedded_await = json!({
+            "arguments": "{\"agentIds\":[\"agent-c\",\"agent-d\"]}"
+        });
+        assert_eq!(
+            tyde_tool_request_type("tyde_await_agents", &embedded_await)
+                .expect("embedded await JSON must not error")
+                .expect("canonical await request"),
+            ToolRequestType::TydeAwaitAgents {
+                agent_ids: vec![AgentId("agent-c".to_owned()), AgentId("agent-d".to_owned())],
+            }
+        );
+        for singular in [
+            json!({ "agent_id": "agent-e" }),
+            json!({ "agentId": { "id": "agent-e", "name": "E" } }),
+        ] {
+            assert_eq!(
+                tyde_tool_request_type("tyde_await_agents", &singular)
+                    .expect("observed singular await shape must not error")
+                    .expect("canonical await request"),
+                ToolRequestType::TydeAwaitAgents {
+                    agent_ids: vec![AgentId("agent-e".to_owned())],
+                }
+            );
+        }
+
+        let embedded_send = json!({
+            "parameters": {
+                "input": {
+                    "args": format!(
+                        "{{\"agentId\":\"agent-c\",\"message\":{}}}",
+                        serde_json::to_string(exact_message).expect("serialize message")
+                    )
+                }
+            }
+        });
+        assert_eq!(
+            tyde_tool_request_type("tyde_send_agent_message", &embedded_send)
+                .expect("embedded send JSON must not error")
+                .expect("canonical send request"),
+            ToolRequestType::TydeSendAgentMessage {
+                agent_id: AgentId("agent-c".to_owned()),
+                message: exact_message.to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_canonical_tyde_payloads_are_errors() {
+        let request =
+            tyde_tool_request_type("tyde_send_agent_message", &json!({ "agent_id": "agent-a" }));
+        assert_eq!(
+            request
+                .expect_err("malformed canonical request")
+                .normalization_failure,
+            ToolExecutionNormalizationFailure::CanonicalRequest
+        );
+        let result = tyde_tool_result(
+            "mcp__tyde-agent-await__tyde_await_agents",
+            &json!({ "ready": [] }),
+        );
+        assert_eq!(
+            result
+                .expect_err("malformed canonical result")
+                .normalization_failure,
+            ToolExecutionNormalizationFailure::CanonicalResult
+        );
+        assert_eq!(
+            tyde_tool_request_type("unrelated", &json!({})).expect("unrelated request"),
+            None
         );
     }
 }

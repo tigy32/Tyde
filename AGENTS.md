@@ -75,6 +75,9 @@ fix the root cause. Do not fall back to serial `cargo test`, increase the
 timeout, split the canonical suite, reduce coverage, or skip, weaken, or delete
 tests to get under the limit. Install the runner with
 `cargo install cargo-nextest --locked` if `cargo nextest` is unavailable.
+Within a failed native repetition, nextest runs all independent tests so the
+retained diagnostics include every failure reached before that authoritative
+limit. The failed repetition still blocks repetitions 2–3 and all later stages.
 
 For clippy: **fix the underlying issue**. Do not paper over violations with
 `_`-prefixed unused names, `#[allow(...)]` attributes, or other suppressions
@@ -157,7 +160,7 @@ After approval:
    it exists unless the user gives explicit further instructions.
 5. Run the canonical local release guard: `tools/release_check.sh vX.Y.Z`.
    This includes the required `./dev.sh check` validation plus mobile-web
-   release-coherence checks and the native mobile drift reminder. It does not
+   release-coherence checks. It does not
    replace the clean tree, `main`, tag, approval, or push checks in this
    section. Stop if any check fails.
 6. Re-run the release-version check immediately before tagging:
@@ -186,22 +189,47 @@ in. When pre-commit checks surface that kind of collateral:
 Mention the collateral fix in the commit body so it's discoverable, but
 don't split it into a separate commit just for purity.
 
-## Frontend UI tests are inviolate
+## Frontend UI tests are load-bearing
 
 Component-level wasm tests live inline in their component file under
 `#[cfg(all(test, target_arch = "wasm32"))] mod wasm_tests` and are exercised by
 `./dev.sh check`. They mount real Leptos components into a real DOM in headless
-Chrome.
+Chrome. Their whole point is to be something an agent cannot silently route
+around.
 
-If a UI test fails after a code change, you may **not** weaken or delete
-the assertion to make the test pass. Either:
+**Never weaken, delete, or rewrite a test to make it pass.** A red test is a
+claim that something is wrong; deleting the claim does not make it false. Green
+is not the goal — correct is. This applies to every test in the repository, not
+just the wasm ones.
 
-1. Fix the code so the original assertion holds again, or
-2. If the assertion is genuinely wrong (testing the wrong thing), explain
-   why to the user and ask before changing it.
+When a test fails, work from evidence:
 
-The whole point of these tests is to be a thing the AI can't silently
-route around.
+1. **Start from the assumption that the test is right and the code is wrong.**
+   This is the common case. Fix the code so the original assertion holds.
+2. **Only when the evidence says the assertion itself is wrong may you change
+   it.** An assertion is wrong when it does not actually test the behavior it
+   exists to guard — for example it pins an implementation detail, or it rejects
+   input the product handles correctly.
+
+You do **not** need to ask permission first. You do need to show your work. A
+correction must, in the change itself:
+
+- **State the evidence.** Name the real rendered output, value, or event, and
+  show why the assertion rejects behavior that is in fact correct. "The test is
+  wrong" is not evidence, and neither is "it started failing".
+- **Preserve the behavioral contract the assertion was reaching for.** Work out
+  what it was protecting and keep protecting it. A correction narrows or sharpens
+  an assertion; it never quietly drops the guarantee.
+- **Prefer strengthening to loosening.** A corrected assertion should usually be
+  *more* specific than the one it replaces. If the only way to describe your
+  change is "assert less", stop — you are almost certainly fixing the wrong end.
+- **Change only the incorrect assertion.** Leave the rest of the test, and the
+  rest of the suite, alone.
+- **Never change production behavior merely to satisfy a test.** If the code is
+  right, the code stays.
+
+If you cannot produce that evidence, the assertion is not wrong and you are
+stuck. Say so and stop, rather than editing the test until it goes green.
 
 ## Debugging discipline
 

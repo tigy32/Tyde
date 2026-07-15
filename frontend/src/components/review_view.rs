@@ -17,8 +17,6 @@
 //! * Late-subscribe replay: `ReviewEvent::Snapshot` is the source of truth
 //!   on subscribe and replaces any prior partial entry.
 
-use std::collections::BTreeMap;
-
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
@@ -30,8 +28,8 @@ pub(crate) use crate::components::review_layer::ComposerState;
 use crate::send::send_frame;
 
 use crate::state::{
-    ActiveAgentRef, AgentInfo, AppState, DiffKey, DiffViewState, ReviewActionGate,
-    ReviewActionTarget, TabContent, root_display_name,
+    ActiveAgentRef, AgentInfo, AppState, DiffKey, DiffViewState, ReviewActionTarget, TabContent,
+    root_display_name,
 };
 
 use protocol::{
@@ -1259,75 +1257,10 @@ pub(crate) fn pick_workspace_draft(summaries: &[ReviewSummary]) -> Option<&Revie
         .max_by_key(|s| s.updated_at_ms)
 }
 
-/// The single active workspace Draft review id for `project_id`, if any.
-/// One review spans all of the project's roots, so this is keyed by project
-/// alone (no root).
-fn workspace_draft_for_project(
-    state: &AppState,
-    project_id: &protocol::ProjectId,
-) -> Option<protocol::ReviewId> {
-    state.review_summaries.with_untracked(|map| {
-        map.get(project_id)
-            .and_then(|summaries| pick_workspace_draft(summaries).map(|s| s.id.clone()))
-    })
-}
-
-/// Send a workspace-scoped `ReviewCreate` with create-pending gating, with
-/// no tab navigation — callers decide which surface to show. There is at
-/// most one active Draft per project: callers must check
-/// [`workspace_draft_for_project`] first.
-///
-/// The selection is `Workspace { Unstaged }` to match the active-review
-/// model: there is exactly one active review per project spanning all of its
-/// roots, and the server normalizes every active review to
-/// `Workspace { scope: Unstaged }`.
-///
-/// The create-pending gate is keyed by `(host, project)`: a project has one
-/// active review, and the `CommandError` clear path in dispatch recovers
-/// `(host, project)` from the `/project/{id}` stream. The gate is a transient
-/// debounce, not lifecycle state.
-fn send_review_create(state: &AppState, host_id: &str, project_id: &protocol::ProjectId) {
-    let mut claimed = false;
-    let key = (host_id.to_owned(), project_id.clone());
-    state.review_create_pending.update(|map| {
-        let entry = map.entry(key.clone()).or_insert(0);
-        if *entry == 0 {
-            *entry = 1;
-            claimed = true;
-        }
-    });
-    if !claimed {
-        return;
-    }
-
-    let stream = StreamPath(format!("/project/{}", project_id.0));
-    let payload = protocol::ReviewCreatePayload {
-        selection: protocol::ReviewDiffSelection::Workspace {
-            scope: ProjectDiffScope::Unstaged,
-        },
-    };
-    let state_for_failure = state.clone();
-    let host = host_id.to_owned();
-    spawn_local(async move {
-        if let Err(e) = send_frame(&host, stream, FrameKind::ReviewCreate, &payload).await {
-            log::error!("failed to send ReviewCreate: {e}");
-            state_for_failure.review_create_pending.update(|map| {
-                if let Some(count) = map.get_mut(&key) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        map.remove(&key);
-                    }
-                }
-            });
-        }
-    });
-}
-
 /// First root with an unstaged change (modified-but-unstaged or untracked)
 /// for `project_id`, or `None` when nothing is reviewable. Reviews track
 /// `Unstaged`, so a staged-only root is skipped — it would open an empty
-/// review surface. Shared by the diff-surface opener and the legacy
-/// `ReviewCreate` fallback so both agree on which root a review covers.
+/// review surface.
 fn review_root_for_project(
     state: &AppState,
     project_id: &protocol::ProjectId,
@@ -2232,107 +2165,6 @@ fn subscribe_backoff_ms(failures: u32) -> i32 {
     delay as i32
 }
 
-/// Public entry — used by the agent chat header's "Review changes" button.
-///
-/// Reviews are always-on and workspace-scoped server-side, so this is
-/// primarily navigation: it opens/focuses the project's normal changed-file
-/// diff tab (the canonical inline review surface). The active workspace
-/// review's decorations resolve on that diff tab from the bootstrap/summary
-/// stream. If no Draft summary has arrived yet, it also fires a legacy
-/// get-or-create `ReviewCreate` as a fallback so the surface is never blank
-/// against an older server. We never open a standalone `TabContent::Review`
-/// workbench — that surface has been retired.
-pub fn create_review_for_active_agent(state: &AppState) {
-    let Some(active_agent) = state.active_agent.get_untracked() else {
-        return;
-    };
-    let host_id = active_agent.host_id.clone();
-    let agent_id = active_agent.agent_id.clone();
-
-    let project_id = state.agents.with_untracked(|agents| {
-        agents
-            .iter()
-            .find(|a| a.host_id == host_id && a.agent_id == agent_id)
-            .and_then(|a| a.project_id.clone())
-    });
-    let Some(project_id) = project_id else {
-        log::warn!("create_review_for_active_agent: agent has no project — skipping");
-        return;
-    };
-
-    // Always land the user on the changed-file diff surface.
-    open_changed_diff_for_project(state, &host_id, &project_id);
-
-    // Create only when the project has reviewable changes and no active
-    // workspace Draft yet. One review spans all roots, so the check and the
-    // create are both project-scoped.
-    if review_root_for_project(state, &project_id).is_some()
-        && workspace_draft_for_project(state, &project_id).is_none()
-    {
-        send_review_create(state, &host_id, &project_id);
-    }
-}
-
-/// Returns true when the active agent's project has changes an always-on
-/// review would cover — any modified-but-unstaged or untracked file in any
-/// root (driving the visibility of the "Review changes" header button).
-///
-/// Staged-only roots are excluded: reviews track `Unstaged`, and
-/// [`review_root_for_project`] (which the click handler uses to pick a root)
-/// would skip them, so showing the button there would do nothing.
-pub fn active_agent_has_reviewable_changes(state: &AppState) -> bool {
-    let Some(active_agent) = state.active_agent.get() else {
-        return false;
-    };
-    let project_id = state.agents.with(|agents| {
-        agents
-            .iter()
-            .find(|a| a.host_id == active_agent.host_id && a.agent_id == active_agent.agent_id)
-            .and_then(|a| a.project_id.clone())
-    });
-    let Some(project_id) = project_id else {
-        return false;
-    };
-    state.git_status.with(|map| {
-        map.get(&project_id)
-            .is_some_and(|roots| roots.iter().any(root_has_reviewable_changes))
-    })
-}
-
-/// Whether a `ReviewCreate` is currently in flight for the active agent's
-/// project — used to disable the "Review changes" button until the
-/// server's `ReviewListChanged` echoes back.
-pub fn active_agent_review_create_pending(state: &AppState) -> bool {
-    let Some(active_agent) = state.active_agent.get() else {
-        return false;
-    };
-    let project_id = state.agents.with(|agents| {
-        agents
-            .iter()
-            .find(|a| a.host_id == active_agent.host_id && a.agent_id == active_agent.agent_id)
-            .and_then(|a| a.project_id.clone())
-    });
-    let Some(project_id) = project_id else {
-        return false;
-    };
-    state
-        .review_create_pending
-        .with(|map| map.contains_key(&(active_agent.host_id, project_id)))
-}
-
-// ── BTreeMap import is referenced by tests below ───────────────────────
-#[allow(dead_code)]
-fn _btree_marker() -> BTreeMap<u32, u32> {
-    BTreeMap::new()
-}
-
-// `ReviewActionGate` is referenced via `state.review_action_pending`; touch
-// the import so removal of the field fails compilation cleanly.
-#[allow(dead_code)]
-fn _gate_marker() -> ReviewActionGate {
-    ReviewActionGate::default()
-}
-
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
@@ -3051,6 +2883,25 @@ mod wasm_tests {
                 untracked,
             }],
         }
+    }
+
+    fn active_agent_has_reviewable_changes(state: &AppState) -> bool {
+        let Some(active_agent) = state.active_agent.get() else {
+            return false;
+        };
+        let project_id = state.agents.with(|agents| {
+            agents
+                .iter()
+                .find(|a| a.host_id == active_agent.host_id && a.agent_id == active_agent.agent_id)
+                .and_then(|a| a.project_id.clone())
+        });
+        let Some(project_id) = project_id else {
+            return false;
+        };
+        state.git_status.with(|map| {
+            map.get(&project_id)
+                .is_some_and(|roots| roots.iter().any(root_has_reviewable_changes))
+        })
     }
 
     /// Fix 2: the chat "Review changes" button (gated on
@@ -3790,7 +3641,4 @@ mod wasm_tests {
         }
         None
     }
-
-    #[allow(dead_code)]
-    fn _silence_unused(_: &Element) {}
 }

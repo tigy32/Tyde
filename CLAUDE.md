@@ -57,16 +57,46 @@ Avoid asserting on:
 
 **The hard rule for AI agents (Claude included):**
 
-When a UI test fails after a code change, you may **not** weaken or delete
-the assertion to make the test pass without explicit human approval. Either:
+These tests are load-bearing. **Never weaken, delete, or rewrite one to make
+it pass.** A red test is a claim that something is wrong; deleting the claim
+does not make it false. Green is not the goal — correct is.
 
-1. Fix the code so the original assertion holds again, or
-2. If the assertion turns out to be wrong (testing the wrong thing, not the
-   user-visible behavior), explain why to the user and ask before changing
-   it.
+When a UI test fails, work from evidence:
+
+1. **Start from the assumption that the test is right and the code is
+   wrong.** That is the common case. Fix the code so the original assertion
+   holds.
+2. **Only when the evidence says the assertion itself is wrong may you
+   change it** — for example it pins internal structure rather than
+   user-visible behavior, or it rejects output the component renders
+   correctly.
+
+You do **not** need to ask permission first, but you must show your work. A
+correction must:
+
+- **Name the concrete evidence** — the actual rendered text, geometry, or
+  value, and why the assertion rejects behavior that is in fact correct.
+  "It started failing" is not evidence.
+- **Preserve the behavioral contract the assertion was reaching for.** A
+  correction narrows or sharpens an assertion; it never quietly drops the
+  guarantee.
+- **Prefer strengthening to loosening.** A corrected assertion should
+  usually be *more* specific than the one it replaces. If the only way to
+  describe your change is "assert less", stop.
+- **Document the rationale in the change itself**, so a reviewer reading the
+  diff sees the evidence and the preserved contract.
+- **Change only the incorrect assertion**, and never adjust production
+  behavior merely to satisfy a test.
+
+If you cannot produce that evidence, the assertion is not wrong — say so and
+stop, rather than editing the test until it goes green.
 
 The whole point of these tests is to be a thing the AI can't silently route
-around. Routing around them defeats their purpose.
+around. Correcting one on the evidence is not routing around it; editing it
+until it passes is.
+
+`AGENTS.md` ("Frontend UI tests are load-bearing") is the canonical statement
+of this policy and applies to every test in the repository.
 
 The first such test lives at `frontend/src/components/file_view.rs` →
 `mod wasm_tests`. It catches the class of bug where the file view

@@ -3,6 +3,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::bridge;
+use crate::components::backend_capacity::SubscriptionCapacitySection;
 use crate::components::host_browser::HostBrowser;
 use crate::components::ui::{Button, ButtonSize, ButtonVariant, ConfirmModal, EmptyState};
 use crate::state::{AppState, PairedHostSummary, ToolOutputMode};
@@ -197,6 +198,8 @@ pub fn SettingsView() -> impl IntoView {
                         }.into_any()
                     }}
                 </div>
+
+                <SubscriptionCapacitySection />
 
                 <div class="settings-section" data-mobile-test="settings-custom-agents">
                     <h2 class="settings-section-title">"Custom Agents"</h2>

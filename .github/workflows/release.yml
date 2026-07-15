@@ -65,9 +65,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The workspace compiles the Tauri GUI crates (tauri-shell,
-      # tyde-mobile-shell), so the native test build needs the same system libs
-      # the release build installs.
+      # The workspace compiles the Tauri GUI crate (tauri-shell), so the native
+      # test build needs the same system libs the release build installs.
       - name: Install Linux dependencies
         run: |
           sudo apt-get update

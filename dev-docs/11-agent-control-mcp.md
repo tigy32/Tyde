@@ -369,6 +369,167 @@ Parent agents that need child results should use the explicit MCP flow:
 The server still owns all agent state and all output events; it just no longer
 converts child output into hidden parent input.
 
+---
+
+## Tool Call Presentation
+
+How these tool calls *render* is part of the contract, not a frontend detail.
+Left untyped, every orchestration call arrives as `ToolRequestType::Other { args }`
+and is dispatched to the generic renderer, which prints the MCP execution envelope
+as raw JSON — call args and result — in every card. For the two tools whose payload
+is human-meaningful, that was actively worse than showing nothing: a
+`tyde_send_agent_message` card printed the sent message **twice**, escaped and
+monospaced, and a `tyde_await_agents` card dumped JSON underneath a purpose-built
+live card that was strictly more informative.
+
+The fix is typed protocol variants, not a suppression flag in the UI. Because
+`ToolRequestType` is matched exhaustively in the frontend, a typed variant simply
+never reaches the generic renderer — the duplication is gone by construction, and
+the compiler refuses to build until a renderer exists.
+
+### Typed request / completion contract
+
+`protocol/src/types.rs` owns these. They are the single source of truth; no
+frontend parses tool arguments.
+
+| Tool | `ToolRequestType` | `ToolExecutionResult` |
+| --- | --- | --- |
+| `tyde_send_agent_message` | `TydeSendAgentMessage { agent_id, message }` | `TydeSendAgentMessage` (unit) |
+| `tyde_await_agents` | `TydeAwaitAgents { agent_ids }` | `TydeAwaitAgents { ready, still_thinking }` of `TydeAgentWaitStatus { agent_id, status }` |
+
+The send completion is a **unit variant** on purpose: the MCP tool returns
+`{"ok": true}` and nothing else, so there is no result body to render — the card's
+header status carries the whole outcome. The await completion mirrors
+`AwaitAgentsResult` exactly, which is status-only (see `tyde_await_agents` above).
+
+Everything else — `tyde_spawn_agent`, `tyde_team_message_member`, `tyde_read_agent`,
+`tyde_read_agent_debug`, `tyde_list_agents`, `tyde_list_launch_options`, and the
+workflow tools — stays `Other`. For those, the structured result **is** the payload
+the caller wants; there is no competing semantic card, and typing them would be a
+broad change to generic tool rendering with no evidence behind it.
+
+### Normalizer invariant: never a silent `Other`
+
+The backend maps tool name + arguments into these typed variants (handling the bare,
+`mcp__tyde-agent-control__…`, and `mcp__tyde-agent-await__…` spellings). If it sees a
+canonical Tyde tool name and **cannot** parse its arguments, it must not quietly emit
+`ToolRequestType::Other`. That is an invariant violation: it must log with the tool
+name, `tool_call_id`, and the parse detail, and surface a visible error. The raw
+payload may still be shown *because the failure is loud* — that is inspection, not a
+fallback.
+
+This state is near-unreachable by construction: the MCP inputs are
+`#[serde(deny_unknown_fields)]` with required fields, ids are validated, and empty
+messages are rejected before execution. A parse failure here means protocol drift,
+which is exactly what should scream.
+
+### Disclosure rule
+
+`ToolOutputMode` is an existing, typed, user-driven control, so it carries this —
+no new affordance, no new mental model.
+
+| Mode | `tyde_send_agent_message` | `tyde_await_agents` |
+| --- | --- | --- |
+| Summary | Semantic only. Zero raw JSON. | Semantic only. Zero raw JSON. |
+| Compact | Semantic only. Zero raw JSON. | Semantic only. Zero raw JSON. |
+| Full | Semantic + a **closed** `Typed request` disclosure | Semantic only. **No raw, even in Full.** |
+
+The `Full` disclosure is labeled **`Typed request`**, not "raw tool data", because
+that is what it holds: the canonical typed request the server produced and the card
+rendered. It is not the MCP envelope, and it must not claim to be — in the one case
+where you would genuinely want the envelope (a normalization failure) the request has
+already fallen back to `Other` and the generic renderer shows the real raw anyway.
+
+Both surfaces honor these modes. Mobile is not exempt: a user who selects `Summary` to
+quiet the conversation gets quiet on the phone too (see **Long content** below).
+
+Await omits raw even in `Full` because the typed request and completion are
+lossless with respect to the tool's semantics — the only residue in the raw
+envelope is tycode transport metadata (`id`, `server`, `pluginId`, `durationMs`,
+`appContext`), which belongs in logs, not in the conversation. Stated as a conscious
+trade: `durationMs` leaves the UI for this tool.
+
+**Errors are never hidden.** A `ToolExecutionResult::Error` short-circuits to the
+error renderer before any of this, in every mode.
+
+### The spawn prompt must stay visible
+
+`SpawnAgentToolInput` carries `prompt` — the full task brief — and today it is
+visible **only** in the raw args block. Any rule of the form "orchestration cards
+suppress raw" therefore **deletes the spawn prompt from the default view**.
+
+The rule above is keyed on **typed variant identity**, never on "is this an
+agent-control card". That distinction is load-bearing: spawn stays `Other`, keeps
+dispatching to the generic renderer, and keeps showing its prompt exactly as before
+— zero diff on that path. A wasm test (`spawn_card_keeps_prompt_visible`) locks it.
+
+If spawn is typed later, it needs its own semantic renderer that shows the prompt
+as Markdown *before* it stops routing to the generic one. Do not "simplify" the rule
+into a blanket suppression; that would silently delete real content.
+
+### Rendering
+
+- **Desktop** — `frontend/src/components/tool_card/tyde_send_agent_message.rs` and
+  `tyde_await_agents.rs`, dispatched from `render_body`'s exhaustive match.
+- **Mobile** — `mobile-frontend/src/components/tool_card.rs`. Mobile dispatches with
+  `if let`, not an exhaustive `match`, so a typed variant with no mobile arm falls
+  through **silently** to a Rust `Debug` dump. The compiler will not catch that. Any
+  new typed orchestration variant must land its mobile arm in the same change.
+- **Agent identity** — cards name a child agent by its live name from server-owned
+  agent state, falling back to the raw id. Never an invented label; a bare uuid is
+  unreadable, but a wrong name is worse.
+
+### Markdown is an injection sink
+
+The sent message is fed into `inner_html` on **both** surfaces, and it is not
+necessarily authored by the agent you are talking to — agents routinely relay text they
+did not write (a fetched page, a file's contents, another agent's output). Both
+renderers therefore carry the same hardening contract, and any new consumer must use
+one of them rather than rolling its own:
+
+- raw block/inline HTML is downgraded to escaped text (so `<img src=x onerror=…>` and
+  `<svg onload=…>` render as visible text, not as live markup with live handlers);
+- link/image URLs are scheme-filtered to `http` / `https` / `mailto` / relative
+  (so `javascript:` and `data:` cannot survive).
+
+`frontend/src/markdown.rs` and `mobile-frontend/src/markdown.rs` share that contract.
+They deliberately differ in *presentation* only — desktop adds syntect highlighting and
+code-copy chrome; mobile keeps plain fences. Safety is shared; styling is not.
+
+### The await card has exactly one agent roster
+
+The live rows (from `AgentControlProgress`) name every watched agent with live status.
+The completion renderer must **not** list them again: a second roster is the same
+duplication the raw JSON was, just prettier. It contributes only what the live rows
+cannot — they always render *now* — namely the wait's verdict at the moment it
+returned: a single concise line of counts (`Wait returned · 2 ready · 1 still
+thinking`), plus any agent that came back **failed**, named explicitly, since counts
+alone would bury a failure and the live row beside it may since have changed.
+
+Statuses in that verdict are the tool's own, rendered **verbatim** — never re-derived
+from current agent state, which would silently rewrite history.
+
+Mobile has no `ToolProgress` wiring, so on mobile the typed request/completion *is* the
+roster. That is not a duplicate — it is the sole presentation there.
+
+### Long content
+
+A sent message can be thousands of characters, and it must never swallow the view.
+
+- **Desktop** clamps the *rendered* container by `max-height` (never the Markdown
+  source — truncating source breaks mid-fence and mid-table) with a `Show more` toggle.
+  The overflow is measured from the DOM and **re-measured on resize** via a
+  `ResizeObserver`: measured only at mount, a card narrowed afterwards (a dragged
+  splitter, the 720px reflow) would clip content with no toggle to reveal it. Because
+  `overflow: hidden` clips visually but leaves children in the tab order, focus inside
+  the clipped region **expands** the card, so nothing is ever focused while invisible.
+- **Mobile** bounds the body's height and makes it **scrollable** instead. Stated
+  plainly as a deliberate divergence: the behavior differs, the guarantee does not —
+  full content, always reachable, never dominating. A scroll container needs no
+  measurement, no `ResizeObserver`, and can never leave a focusable child clipped out of
+  sight. In `Summary`, mobile puts the message behind a **closed** disclosure so the
+  mode does what it says.
+
 ## Implementation
 
 ### Server Structure
@@ -474,3 +635,29 @@ Agent control MCP follows the same pattern as debug MCP:
 
 That keeps the workflow power while staying aligned with the rewrite
 philosophy and the proven debug MCP pattern.
+
+---
+
+## Workbench Tools
+
+The control endpoint also exposes `tyde_list_workbenches` and
+`tyde_create_workbench`. Both require an authenticated, active caller. Listing
+is permitted for read-only callers; creation is mutating and is rejected for
+`BackendAccessMode::ReadOnly`.
+
+These tools are deliberately least-privilege scoped. The caller must be
+assigned to a project. The server resolves that assignment to its canonical
+standalone parent, and listing returns only that parent and its workbenches.
+Creation requires that exact parent id; an unrelated project id is rejected.
+The explicit id is retained as a confirmation guard rather than inferred from
+ambient paths.
+
+Creation accepts a branch, an optional non-blank display name, and optional
+`base_ref`. The server resolves the base in every parent root before mutation,
+passes only full commit SHAs to git, and reports each parent root, worktree
+root, base SHA, and dirty-parent flag. Dirty parent content is never copied.
+
+Agents enter a workbench by calling `tyde_spawn_agent` with its `project_id`.
+The server derives authoritative roots from that project. Supplied roots must
+match; missing/removing projects, mismatches, and a request with neither a
+project nor roots fail before agent registration.

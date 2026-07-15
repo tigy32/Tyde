@@ -5,10 +5,10 @@ use protocol::types::{AgentClosedPayload, CloseAgentPayload};
 use protocol::{
     AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentBootstrapPayload,
     AgentErrorPayload, AgentRenamedPayload, AgentStartPayload, AgentsViewPreferencesNotifyPayload,
-    BackendConfigSchemasPayload, BackendConfigSnapshotsPayload, BackendSetupPayload,
-    CancelWorkflowPayload, ChatEvent, CodeIntelDiagnosticsPayload, CodeIntelErrorPayload,
-    CodeIntelFileModelPayload, CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload,
-    CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
+    BackendCapacityPayload, BackendConfigSchemasPayload, BackendConfigSnapshotsPayload,
+    BackendSetupPayload, CancelWorkflowPayload, ChatEvent, CodeIntelDiagnosticsPayload,
+    CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelHoverResultPayload,
+    CodeIntelNavigateResultPayload, CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
     CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
     CustomAgentNotifyPayload, Envelope, FetchSessionHistoryPayload, FrameError, FrameKind,
     HostBootstrapPayload, HostSettingsPayload, InterruptPayload, LaunchProfileCatalogPayload,
@@ -136,6 +136,7 @@ pub enum HostEvent {
     BackendSetup(BackendSetupPayload),
     BackendConfigSchemas(BackendConfigSchemasPayload),
     BackendConfigSnapshots(BackendConfigSnapshotsPayload),
+    BackendCapacity(BackendCapacityPayload),
     LaunchProfileCatalogNotify(LaunchProfileCatalogPayload),
     SessionSchemas(SessionSchemasPayload),
     SessionList(SessionListPayload),
@@ -904,6 +905,14 @@ async fn handle_host_envelope(
             let _ = host_tx
                 .send(HostEvent::BackendConfigSnapshots(payload))
                 .await;
+            true
+        }
+        FrameKind::BackendCapacity => {
+            let payload: BackendCapacityPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::BackendCapacity(payload)).await;
             true
         }
         FrameKind::MobileAccessState => {

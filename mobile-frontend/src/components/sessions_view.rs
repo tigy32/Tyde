@@ -357,6 +357,8 @@ async fn resume_session(
         &payload,
     )
     .await
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 async fn delete_session(
@@ -376,7 +378,9 @@ async fn delete_session(
             session_id: session_id.clone(),
         },
     )
-    .await?;
+    .await
+    .map(|_| ())
+    .map_err(|error| error.to_string())?;
 
     Ok(())
 }

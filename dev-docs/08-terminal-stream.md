@@ -652,4 +652,83 @@ and events, not inferred in the frontend.
 
 ---
 
+## 13. Trusted Backend Setup Terminals
+
+Backend setup uses the terminal stream for observable PTY output and lifecycle,
+but it does not expand the public terminal protocol into an arbitrary process
+launcher.
+
+The public `TerminalCreatePayload` and `TerminalLaunchTarget` still create only
+the normal server-selected terminal shell. On Unix that shell remains a login
+shell. Clients cannot send an executable or argument vector in a terminal-create
+event.
+
+For a typed backend setup action, the server instead prepares a fixed trusted
+command and uses a crate-private launch mode:
+
+- the server writes its generated setup command to a unique private temporary
+  script and syncs it before launch;
+- Unix scripts use mode `0600` and run as the exact argv
+  `/bin/sh <staged-script>`, without `-l`, pasted input, login-shell startup
+  files, or prompt hooks;
+- Unix setup scripts use portable `/bin/sh` state such as `set -eu`, not
+  non-portable `pipefail` behavior;
+- Windows uses a private staged `.ps1` with the fixed
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File <staged-script>`
+  argv;
+- the staged script prints the same invocation the server reports, so the PTY
+  remains truthful and inspectable;
+- the trusted child still owns the PTY, so an intended sign-in command may
+  prompt normally even though its launching shell is noninteractive;
+- the staged file is removed if launch fails or after the terminal exits.
+
+Both normal-shell and trusted launches set `TERM=xterm-256color` and the
+server-resolved child `PATH`. Once launched, trusted setup uses the same typed
+terminal bootstrap, output, resize, close, error, and exit events as every other
+terminal. If stream publication fails, the server closes and unregisters the
+PTY rather than leaving an unobservable setup process running.
+
+Every setup exit, including a non-zero or signalled exit, starts one serialized
+server refresh sequence after staged-file cleanup:
+
+1. recompute and fan out backend setup status;
+2. refresh and force-emit session settings/schema snapshots;
+3. refresh and force-emit backend configuration/native-settings snapshots.
+
+The fixed order prevents an Installed setup badge from coexisting with a stale
+native-settings state until a toggle or restart. This refresh is server-owned;
+the frontend does not infer success from terminal text or provide a local
+refresh workaround.
+
+### Tycode installed identity
+
+The child `PATH` supplied to a trusted setup PTY is only its process
+environment. It is not a Tycode runtime-resolution fallback. Tyde runs Tycode
+only from the checksum-pinned installed path:
+
+```text
+~/.tyde/tycode/0.10.0/tycode-subprocess
+```
+
+The installer verifies the platform release checksum before publishing that
+file. Runtime compatibility additionally requires the installed file to be a
+regular file, `--version` to exit successfully with empty stderr, and stdout to
+contain exactly `tycode-subprocess 0.10.0` apart from its conventional final
+line ending. Exact text followed by a non-zero exit is a failure, not a valid
+installation. Tyde does not search the login-shell `PATH`, accept an out-of-tree
+binary, or downgrade to an older version.
+
+A missing installed artifact remains `NotInstalled` where Tyde has a supported
+installer. A present artifact that cannot prove the exact successful identity
+is `Unavailable` with the server diagnostic. Setup and repair remain typed
+backend actions; this does not add executable selection to terminal protocol.
+
+### Corrective validation status
+
+The trusted-terminal and installed-identity implementation described here is
+awaiting the repository's canonical `./dev.sh check`. Earlier validation does
+not cover the corrective installed-only/non-zero-exit behavior.
+
+---
+
 Protocol v4 note: terminal streams start with `terminal_bootstrap` seq 0, which wraps the previous terminal start data. Terminal output begins only after that bootstrap has been queued.

@@ -1,5 +1,7 @@
 use anyhow::Error as AnyhowError;
-use protocol::{CommandErrorCode, CommandErrorPayload, FrameKind, StreamPath};
+use protocol::{
+    CommandErrorCode, CommandErrorPayload, FrameKind, HostSettingErrorTarget, StreamPath,
+};
 
 pub type AppResult<T> = Result<T, AppError>;
 
@@ -88,6 +90,8 @@ impl AppError {
         CommandErrorPayload {
             stream: request_stream,
             request_kind,
+            setting_target: (request_kind == FrameKind::SetSetting)
+                .then_some(HostSettingErrorTarget::Malformed),
             operation: self.operation.to_owned(),
             code: self.code(),
             message: self.message.clone(),

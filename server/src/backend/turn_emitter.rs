@@ -13,10 +13,10 @@
 //! `OperationCancelled` → `TypingStatusChanged(false)` in that order.
 //!
 //! Invariants:
-//!   - `stream_start` opens a stream. If a previous stream is still
-//!     open, the emitter closes it first. If a delta or StreamEnd arrives
-//!     without an open stream, the emitter synthesizes a StreamStart
-//!     first so the frontend never sees unpaired stream events.
+//!   - `stream_start_with_id` opens a stream. Deltas and ends must carry that
+//!     exact typed message id; foreign or missing ids are reported instead of
+//!     closing, synthesizing, or rebinding a stream. The string-only methods
+//!     are a temporary adapter compatibility seam, not the canonical API.
 //!   - `tool_request` records the id; `tool_completed` clears it. Any
 //!     still-pending id at cancel time is completed as a cancellation
 //!     inside `operation_cancelled`.
@@ -29,13 +29,17 @@
 //! `ConversationCleared`, `ModelRequestTokenUsage`, backend `Error`) also
 //! have typed methods so no backend needs to reach past the emitter.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use protocol::{ModelRequestTokenUsage, TaskList, TokenUsageUnavailableReason};
+use protocol::types::StreamIdentityViolation;
+use protocol::{
+    ChatMessageId, ModelRequestTokenUsage, ServerGeneratedChatMessageIdentity, TaskList,
+    TokenUsageUnavailableReason, ToolExecutionNormalizationFailure,
+};
 
 /// Sender half of the wire channel. Kept private to this module; every
 /// emission must go through the typed methods below.
@@ -49,9 +53,12 @@ struct TurnEmitterState {
     default_model: Option<String>,
     stream_open: bool,
     assistant_turn_open: bool,
-    current_stream_message_id: Option<String>,
+    current_stream_message_id: Option<ChatMessageId>,
+    terminal_stream_message_ids: HashSet<ChatMessageId>,
+    identity_violation_reported: bool,
     emitted_tool_requests: IndexMap<String, String>,
     completed_tool_requests: HashSet<String>,
+    normalization_failures: HashMap<String, ToolExecutionNormalizationFailure>,
 }
 
 // =============================================================================
@@ -136,44 +143,128 @@ impl TurnEmitter {
                 stream_open: false,
                 assistant_turn_open: false,
                 current_stream_message_id: None,
+                terminal_stream_message_ids: HashSet::new(),
+                identity_violation_reported: false,
                 emitted_tool_requests: IndexMap::new(),
                 completed_tool_requests: HashSet::new(),
+                normalization_failures: HashMap::new(),
             }),
         }
     }
 
     // ---------- Chat stream pairing (protocol-ordered) ----------
 
-    pub fn stream_start(&self, message_id: &str, agent: AgentName<'_>, model: Option<&str>) {
+    /// Transitional backend-adapter compatibility entry point. New code must
+    /// use `stream_start_with_id`.
+    pub(crate) fn stream_start(&self, message_id: &str, agent: AgentName<'_>, model: Option<&str>) {
+        self.lock().stream_start_legacy(message_id, agent, model);
+    }
+
+    pub fn stream_start_with_id(
+        &self,
+        message_id: ChatMessageId,
+        agent: AgentName<'_>,
+        model: Option<&str>,
+    ) {
         self.lock().stream_start(message_id, agent, model);
     }
 
-    pub fn stream_delta(&self, message_id: &str, text: &str) {
+    /// Opens a stream under a persisted server-generated identity contract.
+    /// Callers retain the contract through replay and use its `ChatMessageId`
+    /// for all following typed stream operations.
+    pub fn stream_start_with_generated_identity(
+        &self,
+        identity: &ServerGeneratedChatMessageIdentity,
+        agent: AgentName<'_>,
+        model: Option<&str>,
+    ) {
+        self.stream_start_with_id(identity.message_id(), agent, model);
+    }
+
+    /// Transitional backend-adapter compatibility entry point. New code must
+    /// use `stream_delta_with_id`.
+    pub(crate) fn stream_delta(&self, message_id: &str, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.lock().stream_delta_legacy(message_id, text);
+    }
+
+    pub fn stream_delta_with_id(&self, message_id: ChatMessageId, text: &str) {
         if text.is_empty() {
             return;
         }
         self.lock().stream_delta(message_id, text);
     }
 
-    pub fn stream_reasoning_delta(&self, message_id: &str, text: &str) {
+    /// Transitional backend-adapter compatibility entry point. New code must
+    /// use `stream_reasoning_delta_with_id`.
+    pub(crate) fn stream_reasoning_delta(&self, message_id: &str, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.lock().stream_reasoning_delta_legacy(message_id, text);
+    }
+
+    pub fn stream_reasoning_delta_with_id(&self, message_id: ChatMessageId, text: &str) {
         if text.is_empty() {
             return;
         }
         self.lock().stream_reasoning_delta(message_id, text);
     }
 
-    pub fn stream_end(&self, payload: StreamEndPayload<'_>) {
-        self.lock().stream_end(payload);
+    /// Transitional backend-adapter compatibility entry point. New code must
+    /// carry its intended `ChatMessageId` through `stream_end_with_id`.
+    pub(crate) fn stream_end(&self, payload: StreamEndPayload<'_>) {
+        self.lock().stream_end_legacy(payload);
+    }
+
+    pub fn stream_end_with_id(&self, message_id: ChatMessageId, payload: StreamEndPayload<'_>) {
+        self.lock().stream_end(message_id, payload);
+    }
+
+    /// Discards an invalid open stream without fabricating a terminal
+    /// assistant message. The emitted error/cancellation/idle tail is
+    /// intentionally distinct from `operation_cancelled`, which closes a
+    /// valid stream with `StreamEnd` first.
+    pub fn discard_open_stream_with_identity_violation(&self, violation: StreamIdentityViolation) {
+        self.lock()
+            .discard_open_stream_with_identity_violation(violation);
     }
 
     // ---------- Tool pairing (protocol-ordered) ----------
 
     pub fn tool_request(&self, tool_call_id: &str, tool_name: &str, tool_type: Value) {
-        self.lock().tool_request(tool_call_id, tool_name, tool_type);
+        self.lock()
+            .tool_request(tool_call_id, tool_name, tool_type, None);
+    }
+
+    pub fn tool_request_with_normalization_failure(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        tool_type: Value,
+        normalization_failure: ToolExecutionNormalizationFailure,
+    ) {
+        self.lock().tool_request(
+            tool_call_id,
+            tool_name,
+            tool_type,
+            Some(normalization_failure),
+        );
     }
 
     pub fn tool_completed(&self, data: ToolCompletedPayload<'_>) {
-        self.lock().tool_completed(data);
+        self.lock().tool_completed(data, None);
+    }
+
+    pub fn tool_completed_with_normalization_failure(
+        &self,
+        data: ToolCompletedPayload<'_>,
+        normalization_failure: ToolExecutionNormalizationFailure,
+    ) {
+        self.lock()
+            .tool_completed(data, Some(normalization_failure));
     }
 
     /// Live progress snapshot for a tool call. Deliberately stateless:
@@ -364,6 +455,8 @@ impl TurnEmitter {
     pub fn conversation_cleared(&self) {
         let mut state = self.lock();
         state.reset_turn_state();
+        state.terminal_stream_message_ids.clear();
+        state.identity_violation_reported = false;
         state.send(json!({ "kind": "ConversationCleared" }));
     }
 
@@ -436,16 +529,37 @@ impl TurnEmitterState {
         let _ = self.tx.send(event);
     }
 
-    fn stream_start(&mut self, message_id: &str, agent: AgentName<'_>, model: Option<&str>) {
+    fn stream_start_legacy(&mut self, message_id: &str, agent: AgentName<'_>, model: Option<&str>) {
+        let message_id = match required_message_id(message_id) {
+            Some(message_id) => message_id,
+            None => {
+                self.stream_identity_violation(StreamIdentityViolation::MissingMessageId);
+                return;
+            }
+        };
+        self.stream_start(message_id, agent, model);
+    }
+
+    fn stream_start(
+        &mut self,
+        message_id: ChatMessageId,
+        agent: AgentName<'_>,
+        model: Option<&str>,
+    ) {
+        if self.terminal_stream_message_ids.contains(&message_id) {
+            self.stream_identity_violation(StreamIdentityViolation::DuplicateTerminalMessageId);
+            return;
+        }
         if self.stream_open {
-            self.stream_end(StreamEndPayload::default());
+            self.stream_identity_violation(StreamIdentityViolation::ForeignActiveMessageId);
+            return;
         }
         self.complete_pending_tools_as_cancelled("Tool execution was cancelled before new stream");
 
-        let message_id = normalized_id(message_id, "assistant");
+        self.identity_violation_reported = false;
         self.stream_open = true;
         self.assistant_turn_open = true;
-        self.current_stream_message_id = Some(message_id.to_string());
+        self.current_stream_message_id = Some(message_id.clone());
         self.default_agent = agent.0.to_string();
         self.default_model = model.map(str::to_owned);
         let model_value = model
@@ -454,44 +568,69 @@ impl TurnEmitterState {
         self.send(json!({
             "kind": "StreamStart",
             "data": {
-                "message_id": message_id,
+                "message_id": message_id.0,
                 "agent": agent.0,
                 "model": model_value,
             },
         }));
     }
 
-    fn stream_delta(&mut self, message_id: &str, text: &str) {
-        self.ensure_stream_open(message_id);
-        let message_id = normalized_id(message_id, "assistant");
-        self.current_stream_message_id = Some(message_id.to_string());
+    fn stream_delta_legacy(&mut self, message_id: &str, text: &str) {
+        let Some(message_id) = required_message_id(message_id) else {
+            self.stream_identity_violation(StreamIdentityViolation::MissingMessageId);
+            return;
+        };
+        self.stream_delta(message_id, text);
+    }
+
+    fn stream_delta(&mut self, message_id: ChatMessageId, text: &str) {
+        let Some(message_id) = self.active_stream_message_id(message_id) else {
+            return;
+        };
         self.send(json!({
             "kind": "StreamDelta",
-            "data": { "message_id": message_id, "text": text },
+            "data": { "message_id": message_id.0, "text": text },
         }));
     }
 
-    fn stream_reasoning_delta(&mut self, message_id: &str, text: &str) {
-        self.ensure_stream_open(message_id);
-        let message_id = normalized_id(message_id, "assistant");
-        self.current_stream_message_id = Some(message_id.to_string());
+    fn stream_reasoning_delta_legacy(&mut self, message_id: &str, text: &str) {
+        let Some(message_id) = required_message_id(message_id) else {
+            self.stream_identity_violation(StreamIdentityViolation::MissingMessageId);
+            return;
+        };
+        self.stream_reasoning_delta(message_id, text);
+    }
+
+    fn stream_reasoning_delta(&mut self, message_id: ChatMessageId, text: &str) {
+        let Some(message_id) = self.active_stream_message_id(message_id) else {
+            return;
+        };
         self.send(json!({
             "kind": "StreamReasoningDelta",
-            "data": { "message_id": message_id, "text": text },
+            "data": { "message_id": message_id.0, "text": text },
         }));
     }
 
-    fn stream_end(&mut self, payload: StreamEndPayload<'_>) {
-        if !self.stream_open {
-            self.open_synthetic_stream("assistant");
+    fn stream_end_legacy(&mut self, payload: StreamEndPayload<'_>) {
+        let Some(message_id) = self.current_stream_message_id.clone() else {
+            self.stream_identity_violation(StreamIdentityViolation::MissingMessageId);
+            return;
+        };
+        self.stream_end(message_id, payload);
+    }
+
+    fn stream_end(&mut self, message_id: ChatMessageId, payload: StreamEndPayload<'_>) {
+        if !self.stream_open || self.current_stream_message_id.as_ref() != Some(&message_id) {
+            self.stream_identity_violation(StreamIdentityViolation::MismatchedEndMessageId);
+            return;
         }
-        let message_id = self.current_stream_message_id.clone();
         self.stream_open = false;
         self.current_stream_message_id = None;
+        self.terminal_stream_message_ids.insert(message_id.clone());
         self.send(build_stream_end_value(
             &payload,
             &self.default_agent,
-            message_id.as_deref(),
+            &message_id.0,
         ));
     }
 
@@ -500,6 +639,7 @@ impl TurnEmitterState {
             "Tool execution was cancelled before assistant message",
         );
         self.assistant_turn_open = true;
+        self.identity_violation_reported = false;
         self.send(build_assistant_message_value(&payload));
     }
 
@@ -533,7 +673,13 @@ impl TurnEmitterState {
         }));
     }
 
-    fn tool_request(&mut self, tool_call_id: &str, tool_name: &str, tool_type: Value) {
+    fn tool_request(
+        &mut self,
+        tool_call_id: &str,
+        tool_name: &str,
+        tool_type: Value,
+        normalization_failure: Option<ToolExecutionNormalizationFailure>,
+    ) {
         if !self.assistant_turn_open {
             self.ensure_assistant_turn_open(tool_call_id);
         }
@@ -552,6 +698,15 @@ impl TurnEmitterState {
             );
         }
         self.completed_tool_requests.remove(tool_call_id);
+        match normalization_failure {
+            Some(failure) => {
+                self.normalization_failures
+                    .insert(tool_call_id.to_string(), failure);
+            }
+            None => {
+                self.normalization_failures.remove(tool_call_id);
+            }
+        }
         self.emitted_tool_requests
             .insert(tool_call_id.to_string(), tool_name.to_string());
         self.send(json!({
@@ -564,7 +719,11 @@ impl TurnEmitterState {
         }));
     }
 
-    fn tool_completed(&mut self, data: ToolCompletedPayload<'_>) {
+    fn tool_completed(
+        &mut self,
+        data: ToolCompletedPayload<'_>,
+        normalization_failure: Option<ToolExecutionNormalizationFailure>,
+    ) {
         match self.pending_tool_name(data.tool_call_id).cloned() {
             Some(expected_name) if expected_name != data.tool_name => {
                 self.send_tool_completed(
@@ -584,6 +743,7 @@ impl TurnEmitterState {
                             "reason": "tool completion arrived without a matching request",
                         },
                     }),
+                    None,
                 );
             }
             Some(_) => {}
@@ -598,15 +758,21 @@ impl TurnEmitterState {
                             "reason": "tool completion arrived without a pending request",
                         },
                     }),
+                    None,
                 );
             }
         }
-        self.send_tool_completed(
+        let normalization_failure = merge_normalization_failures(
+            self.normalization_failures.remove(data.tool_call_id),
+            normalization_failure,
+        );
+        self.send_tool_completed_with_normalization_failure(
             data.tool_call_id,
             data.tool_name,
             data.tool_result,
             data.success,
             data.error,
+            normalization_failure,
         );
     }
 
@@ -618,26 +784,51 @@ impl TurnEmitterState {
         success: bool,
         error: Option<&str>,
     ) {
+        let normalization_failure = self.normalization_failures.remove(tool_call_id);
+        self.send_tool_completed_with_normalization_failure(
+            tool_call_id,
+            tool_name,
+            tool_result,
+            success,
+            error,
+            normalization_failure,
+        );
+    }
+
+    fn send_tool_completed_with_normalization_failure(
+        &mut self,
+        tool_call_id: &str,
+        tool_name: &str,
+        tool_result: Value,
+        success: bool,
+        error: Option<&str>,
+        normalization_failure: Option<ToolExecutionNormalizationFailure>,
+    ) {
         self.completed_tool_requests
             .insert(tool_call_id.to_string());
         let error_value = error
             .map(|s| Value::String(s.to_owned()))
             .unwrap_or(Value::Null);
+        let mut data = json!({
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "tool_result": tool_result,
+            "success": success,
+            "error": error_value,
+        });
+        if let Some(normalization_failure) = normalization_failure {
+            data["normalization_failure"] = serde_json::to_value(normalization_failure)
+                .expect("serialize normalization failure");
+        }
         self.send(json!({
             "kind": "ToolExecutionCompleted",
-            "data": {
-                "tool_call_id": tool_call_id,
-                "tool_name": tool_name,
-                "tool_result": tool_result,
-                "success": success,
-                "error": error_value,
-            },
+            "data": data,
         }));
     }
 
     fn abort(&mut self, cancellation_message: &str) {
-        if self.stream_open {
-            self.stream_end(StreamEndPayload::default());
+        if let Some(message_id) = self.current_stream_message_id.clone() {
+            self.stream_end(message_id, StreamEndPayload::default());
         }
 
         self.complete_pending_tools_as_cancelled("Tool execution was cancelled by user");
@@ -653,10 +844,12 @@ impl TurnEmitterState {
         self.reset_turn_state();
     }
 
-    fn ensure_stream_open(&mut self, message_id: &str) {
-        if !self.stream_open {
-            self.open_synthetic_stream(message_id);
+    fn active_stream_message_id(&mut self, message_id: ChatMessageId) -> Option<ChatMessageId> {
+        if !self.stream_open || self.current_stream_message_id.as_ref() != Some(&message_id) {
+            self.stream_identity_violation(StreamIdentityViolation::ForeignActiveMessageId);
+            return None;
         }
+        Some(message_id)
     }
 
     fn ensure_assistant_turn_open(&mut self, message_id: &str) {
@@ -668,7 +861,45 @@ impl TurnEmitterState {
     fn open_synthetic_stream(&mut self, message_id: &str) {
         let agent = self.default_agent.clone();
         let model = self.default_model.clone();
-        self.stream_start(message_id, AgentName(&agent), model.as_deref());
+        self.stream_start_legacy(message_id, AgentName(&agent), model.as_deref());
+    }
+
+    fn stream_identity_violation(&mut self, violation: StreamIdentityViolation) {
+        if self.identity_violation_reported {
+            return;
+        }
+        if self.stream_open {
+            self.discard_open_stream_with_identity_violation(violation);
+            return;
+        }
+        self.identity_violation_reported = true;
+        self.send(json!({
+            "kind": "Error",
+            "data": stream_identity_violation_message(violation),
+        }));
+    }
+
+    fn discard_open_stream_with_identity_violation(&mut self, violation: StreamIdentityViolation) {
+        if self.identity_violation_reported {
+            return;
+        }
+        self.identity_violation_reported = true;
+        if let Some(message_id) = self.current_stream_message_id.take() {
+            self.terminal_stream_message_ids.insert(message_id);
+        }
+        self.reset_turn_state();
+        self.send(json!({
+            "kind": "Error",
+            "data": stream_identity_violation_message(violation),
+        }));
+        self.send(json!({
+            "kind": "OperationCancelled",
+            "data": { "message": "Stream identity violation" },
+        }));
+        self.send(json!({
+            "kind": "TypingStatusChanged",
+            "data": false,
+        }));
     }
 
     fn complete_pending_tools_as_cancelled(&mut self, detailed_message: &str) {
@@ -706,13 +937,25 @@ impl TurnEmitterState {
         self.current_stream_message_id = None;
         self.emitted_tool_requests.clear();
         self.completed_tool_requests.clear();
+        self.normalization_failures.clear();
+    }
+}
+
+fn merge_normalization_failures(
+    existing: Option<ToolExecutionNormalizationFailure>,
+    incoming: Option<ToolExecutionNormalizationFailure>,
+) -> Option<ToolExecutionNormalizationFailure> {
+    match (existing, incoming) {
+        (None, None) => None,
+        (Some(failure), None) | (None, Some(failure)) => Some(failure),
+        (Some(existing), Some(incoming)) => Some(existing.combined_with(incoming)),
     }
 }
 
 fn build_stream_end_value(
     payload: &StreamEndPayload<'_>,
     default_agent: &str,
-    message_id: Option<&str>,
+    message_id: &str,
 ) -> Value {
     let agent_name = payload.agent.map(|a| a.0).unwrap_or(default_agent);
     let model_info = payload
@@ -754,8 +997,28 @@ fn build_stream_end_value(
     })
 }
 
-fn normalized_id<'a>(id: &'a str, fallback: &'a str) -> &'a str {
-    if id.trim().is_empty() { fallback } else { id }
+fn required_message_id(message_id: &str) -> Option<ChatMessageId> {
+    (!message_id.trim().is_empty()).then(|| ChatMessageId(message_id.to_owned()))
+}
+
+fn stream_identity_violation_message(violation: StreamIdentityViolation) -> &'static str {
+    match violation {
+        StreamIdentityViolation::MissingMessageId => {
+            "Stream identity violation: missing message id"
+        }
+        StreamIdentityViolation::ForeignActiveMessageId => {
+            "Stream identity violation: foreign active message id"
+        }
+        StreamIdentityViolation::MismatchedEndMessageId => {
+            "Stream identity violation: mismatched end message id"
+        }
+        StreamIdentityViolation::DuplicateTerminalMessageId => {
+            "Stream identity violation: duplicate terminal message id"
+        }
+        StreamIdentityViolation::ConflictingDuplicateCompletion => {
+            "Stream identity violation: conflicting duplicate completion"
+        }
+    }
 }
 
 fn cancelled_tool_result(detailed_message: &str) -> Value {
@@ -806,19 +1069,22 @@ fn build_message_token_usage_value(
             })
             .unwrap_or(Value::Null);
     }
+    let unavailable_reason =
+        unavailable_reason.unwrap_or(TokenUsageUnavailableReason::BackendDidNotReport);
     json!({
-        "request": token_usage_scope_value(request_usage),
-        "turn": token_usage_scope_value(turn_usage),
-        "cumulative": token_usage_scope_value(cumulative_usage),
+        "request": token_usage_scope_value(request_usage, unavailable_reason),
+        "turn": token_usage_scope_value(turn_usage, unavailable_reason),
+        "cumulative": token_usage_scope_value(cumulative_usage, unavailable_reason),
     })
 }
 
-fn token_usage_scope_value(usage: Option<Value>) -> Value {
+fn token_usage_scope_value(
+    usage: Option<Value>,
+    unavailable_reason: TokenUsageUnavailableReason,
+) -> Value {
     match usage {
         Some(usage) => json!({ "kind": "known", "usage": usage }),
-        None => {
-            token_usage_unavailable_scope_value(TokenUsageUnavailableReason::BackendDidNotReport)
-        }
+        None => token_usage_unavailable_scope_value(unavailable_reason),
     }
 }
 
@@ -851,8 +1117,8 @@ mod tests {
         AgentBootstrapEvent, AgentBootstrapPayload, AgentId, AgentOrigin, AgentStartPayload,
         BackendKind, BackendSetupPayload, ChatEvent, Envelope, FrameKind, HostBootstrapPayload,
         HostSettings, MobileAccessStatePayload, MobileBrokerStatus, MobilePairingState,
-        NewAgentPayload, PROTOCOL_VERSION, ProtocolValidator, StreamPath, TeamPresetCatalog,
-        Version, WelcomePayload,
+        NewAgentPayload, PROTOCOL_VERSION, ProtocolValidator, ServerGeneratedChatMessageIdOrigin,
+        StreamPath, TeamPresetCatalog, Version, WelcomePayload,
     };
 
     fn recv_events(rx: &mut mpsc::UnboundedReceiver<Value>) -> Vec<Value> {
@@ -873,6 +1139,74 @@ mod tests {
             .filter_map(|event| event.get("kind").and_then(Value::as_str))
             .map(str::to_owned)
             .collect()
+    }
+
+    #[test]
+    fn normalization_failures_are_carried_on_the_paired_completion() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new(tx);
+        emitter.tool_request_with_normalization_failure(
+            "tool-normalization",
+            "tyde_send_agent_message",
+            json!({ "kind": "Other", "args": { "agent_id": "agent-a" } }),
+            ToolExecutionNormalizationFailure::CanonicalRequest,
+        );
+        emitter.tool_completed_with_normalization_failure(
+            ToolCompletedPayload {
+                tool_call_id: "tool-normalization",
+                tool_name: "tyde_send_agent_message",
+                tool_result: json!({ "kind": "Other", "result": { "ok": true } }),
+                success: false,
+                error: Some("canonical result was invalid"),
+            },
+            ToolExecutionNormalizationFailure::CanonicalResult,
+        );
+
+        let completion = recv_events(&mut rx)
+            .into_iter()
+            .find(|event| {
+                event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
+            })
+            .expect("normalization completion");
+        let event: ChatEvent =
+            serde_json::from_value(completion).expect("completion remains a typed ChatEvent");
+        let ChatEvent::ToolExecutionCompleted(completion) = event else {
+            panic!("expected tool completion");
+        };
+        assert_eq!(
+            completion.normalization_failure,
+            Some(ToolExecutionNormalizationFailure::CanonicalRequestAndResult)
+        );
+    }
+
+    #[test]
+    fn unrelated_tool_errors_omit_normalization_failure() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new(tx);
+        emitter.tool_request(
+            "tool-unrelated-error",
+            "run_command",
+            json!({ "kind": "Other", "args": { "command": "false" } }),
+        );
+        emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id: "tool-unrelated-error",
+            tool_name: "run_command",
+            tool_result: json!({ "kind": "Error", "result": {} }),
+            success: false,
+            error: Some("exit status 1"),
+        });
+
+        let completion = recv_events(&mut rx)
+            .into_iter()
+            .find(|event| {
+                event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
+            })
+            .expect("unrelated completion");
+        assert!(
+            completion
+                .get("data")
+                .is_some_and(|data| { data.get("normalization_failure").is_none() })
+        );
     }
 
     fn assert_protocol_valid(events: &[Value]) {
@@ -1113,21 +1447,24 @@ mod tests {
     }
 
     #[test]
-    fn stream_end_without_open_stream_synthesizes_stream_start() {
+    fn stream_end_without_open_stream_reports_identity_violation() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let emitter = TurnEmitter::new(tx);
         emitter.stream_end(StreamEndPayload::default());
         drop(emitter);
         let events = recv_events(&mut rx);
-        assert_protocol_valid(&events);
-        assert_eq!(event_kinds(&events), vec!["StreamStart", "StreamEnd"]);
+        assert_eq!(event_kinds(&events), vec!["Error"]);
+        assert_eq!(
+            events[0].get("data").and_then(Value::as_str),
+            Some("Stream identity violation: missing message id")
+        );
     }
 
     #[test]
     fn stream_end_carries_active_stream_message_id() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let emitter = TurnEmitter::new_for_agent(tx, AgentName("codex"));
-        emitter.stream_start("turn-1", AgentName("codex"), Some("gpt-5-codex"));
+        emitter.stream_start("message-1", AgentName("codex"), Some("gpt-5-codex"));
         emitter.stream_delta("message-1", "hello");
         emitter.stream_end(StreamEndPayload {
             content: "hello".to_string(),
@@ -1205,6 +1542,7 @@ mod tests {
     fn stream_end_emits_explicit_unavailable_token_usage_when_requested() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let emitter = TurnEmitter::new(tx);
+        emitter.stream_start("message-1", AgentName("assistant"), None);
         emitter.stream_end(StreamEndPayload {
             content: "done".to_string(),
             token_usage_unavailable_reason: Some(TokenUsageUnavailableReason::BackendDidNotReport),
@@ -1233,6 +1571,52 @@ mod tests {
                 .pointer("/data/message/token_usage/cumulative/reason")
                 .and_then(Value::as_str),
             Some("backend_did_not_report")
+        );
+    }
+
+    #[test]
+    fn mixed_token_usage_preserves_known_turn_and_provider_scope_reason() {
+        let token_usage = build_message_token_usage_value(
+            None,
+            Some(json!({ "total_tokens": 12 })),
+            None,
+            Some(TokenUsageUnavailableReason::ProviderScopeAmbiguous),
+        );
+
+        assert_eq!(
+            token_usage.pointer("/turn/kind"),
+            Some(&Value::String("known".to_owned()))
+        );
+        assert_eq!(
+            token_usage.pointer("/turn/usage/total_tokens"),
+            Some(&Value::from(12))
+        );
+        assert_eq!(
+            token_usage.pointer("/request/reason"),
+            Some(&Value::String("provider_scope_ambiguous".to_owned()))
+        );
+        assert_eq!(
+            token_usage.pointer("/cumulative/reason"),
+            Some(&Value::String("provider_scope_ambiguous".to_owned()))
+        );
+    }
+
+    #[test]
+    fn mixed_token_usage_defaults_absent_scopes_to_backend_not_reported() {
+        let token_usage =
+            build_message_token_usage_value(None, Some(json!({ "total_tokens": 12 })), None, None);
+
+        assert_eq!(
+            token_usage.pointer("/turn/kind"),
+            Some(&Value::String("known".to_owned()))
+        );
+        assert_eq!(
+            token_usage.pointer("/request/reason"),
+            Some(&Value::String("backend_did_not_report".to_owned()))
+        );
+        assert_eq!(
+            token_usage.pointer("/cumulative/reason"),
+            Some(&Value::String("backend_did_not_report".to_owned()))
         );
     }
 
@@ -1295,6 +1679,7 @@ mod tests {
     fn stream_delta_is_suppressed_when_text_empty() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let emitter = TurnEmitter::new(tx);
+        emitter.stream_start("msg-1", AgentName("assistant"), None);
         emitter.stream_delta("msg-1", "");
         emitter.stream_delta("msg-1", "hi");
         drop(emitter);
@@ -1304,38 +1689,183 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_delta_without_open_stream_synthesizes_stream_start() {
+    fn reasoning_delta_without_open_stream_reports_identity_violation() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let emitter = TurnEmitter::new_for_agent(tx, AgentName("codex"));
         emitter.stream_reasoning_delta("reason-1", "thinking");
         drop(emitter);
         let events = recv_events(&mut rx);
-        assert_protocol_valid(&events);
+        assert_eq!(event_kinds(&events), vec!["Error"]);
         assert_eq!(
-            event_kinds(&events),
-            vec!["StreamStart", "StreamReasoningDelta"]
-        );
-        assert_eq!(
-            events[0]
-                .get("data")
-                .and_then(|data| data.get("agent"))
-                .and_then(Value::as_str),
-            Some("codex")
+            events[0].get("data").and_then(Value::as_str),
+            Some("Stream identity violation: foreign active message id")
         );
     }
 
     #[test]
-    fn second_stream_start_closes_previous_stream_first() {
+    fn foreign_delta_discards_the_open_stream_without_a_fabricated_completion() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new_for_agent(tx, AgentName("codex"));
+        emitter.stream_start("message-1", AgentName("codex"), None);
+        emitter.stream_delta("message-2", "foreign");
+        drop(emitter);
+
+        let events = recv_events(&mut rx);
+        assert_eq!(
+            event_kinds(&events),
+            vec![
+                "StreamStart",
+                "Error",
+                "OperationCancelled",
+                "TypingStatusChanged",
+            ]
+        );
+        assert!(event_kinds(&events).iter().all(|kind| kind != "StreamEnd"));
+        assert_eq!(
+            events[1].get("data").and_then(Value::as_str),
+            Some("Stream identity violation: foreign active message id")
+        );
+    }
+
+    #[test]
+    fn terminal_stream_message_id_cannot_be_reused() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new(tx);
+        emitter.stream_start("message-1", AgentName("assistant"), None);
+        emitter.stream_end(StreamEndPayload::default());
+        emitter.stream_start("message-1", AgentName("assistant"), None);
+        drop(emitter);
+
+        let events = recv_events(&mut rx);
+        assert_eq!(
+            event_kinds(&events),
+            vec!["StreamStart", "StreamEnd", "Error"]
+        );
+        assert_eq!(
+            events[2].get("data").and_then(Value::as_str),
+            Some("Stream identity violation: duplicate terminal message id")
+        );
+    }
+
+    #[test]
+    fn typed_stream_end_rejects_a_foreign_id_and_reports_once_per_turn() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new(tx);
+        emitter.stream_start_with_id(
+            ChatMessageId("message-1".to_owned()),
+            AgentName("assistant"),
+            None,
+        );
+        emitter.stream_end_with_id(
+            ChatMessageId("message-2".to_owned()),
+            StreamEndPayload::default(),
+        );
+        emitter.stream_end_with_id(
+            ChatMessageId("message-1".to_owned()),
+            StreamEndPayload::default(),
+        );
+        drop(emitter);
+
+        let events = recv_events(&mut rx);
+        assert_eq!(
+            event_kinds(&events),
+            vec![
+                "StreamStart",
+                "Error",
+                "OperationCancelled",
+                "TypingStatusChanged",
+            ]
+        );
+        assert!(event_kinds(&events).iter().all(|kind| kind != "StreamEnd"));
+        assert_eq!(
+            event_kinds(&events)
+                .iter()
+                .filter(|kind| kind.as_str() == "Error")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn typed_discard_cancels_without_stream_end_and_allows_the_next_stream() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new(tx);
+        emitter.stream_start_with_id(
+            ChatMessageId("discarded-message".to_owned()),
+            AgentName("assistant"),
+            None,
+        );
+        emitter.discard_open_stream_with_identity_violation(
+            StreamIdentityViolation::ForeignActiveMessageId,
+        );
+        emitter.stream_start_with_id(
+            ChatMessageId("next-message".to_owned()),
+            AgentName("assistant"),
+            None,
+        );
+        drop(emitter);
+
+        let events = recv_events(&mut rx);
+        assert_eq!(
+            event_kinds(&events),
+            vec![
+                "StreamStart",
+                "Error",
+                "OperationCancelled",
+                "TypingStatusChanged",
+                "StreamStart",
+            ]
+        );
+        assert!(event_kinds(&events).iter().all(|kind| kind != "StreamEnd"));
+    }
+
+    #[test]
+    fn generated_identity_contract_is_carried_through_typed_stream_end() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new(tx);
+        let identity = ServerGeneratedChatMessageIdentity {
+            origin: ServerGeneratedChatMessageIdOrigin::IdlessReasoning,
+            stream_epoch: 4,
+            item_ordinal: 2,
+        };
+        let message_id = identity.message_id();
+
+        emitter.stream_start_with_generated_identity(&identity, AgentName("assistant"), None);
+        emitter.stream_reasoning_delta_with_id(message_id.clone(), "thinking");
+        emitter.stream_end_with_id(message_id, StreamEndPayload::default());
+        drop(emitter);
+
+        let events = recv_events(&mut rx);
+        assert_eq!(
+            events[0]
+                .pointer("/data/message_id")
+                .and_then(Value::as_str),
+            Some("server-generated:idless_reasoning:4:2")
+        );
+        assert_eq!(
+            events[2]
+                .pointer("/data/message/message_id")
+                .and_then(Value::as_str),
+            Some("server-generated:idless_reasoning:4:2")
+        );
+    }
+
+    #[test]
+    fn second_stream_start_is_rejected_without_rebinding_the_active_stream() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let emitter = TurnEmitter::new_for_agent(tx, AgentName("codex"));
         emitter.stream_start("msg-1", AgentName("codex"), Some("model-a"));
         emitter.stream_start("msg-2", AgentName("codex"), Some("model-a"));
         drop(emitter);
         let events = recv_events(&mut rx);
-        assert_protocol_valid(&events);
         assert_eq!(
             event_kinds(&events),
-            vec!["StreamStart", "StreamEnd", "StreamStart"]
+            vec![
+                "StreamStart",
+                "Error",
+                "OperationCancelled",
+                "TypingStatusChanged",
+            ]
         );
     }
 

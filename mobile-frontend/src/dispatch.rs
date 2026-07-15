@@ -8,22 +8,23 @@ use protocol::types::{AgentCompactNotifyPayload, AgentCompactStatus};
 use protocol::{
     AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentBootstrapEvent,
     AgentBootstrapPayload, AgentClosedPayload, AgentErrorPayload, AgentId, AgentOrigin,
-    AgentRenamedPayload, AgentStartPayload, BackendConfigSchemasPayload, BackendSetupPayload,
-    BrowseBootstrapListing, BrowseBootstrapPayload, ChatEvent, ClientErrorCode,
-    CodeIntelOverviewPayload, CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FrameKind,
-    HostBootstrapPayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
+    AgentRenamedPayload, AgentStartPayload, BackendCapacityPayload, BackendConfigSchemasPayload,
+    BackendSetupPayload, BrowseBootstrapListing, BrowseBootstrapPayload, ChatEvent,
+    ClientErrorCode, CodeIntelOverviewPayload, CommandErrorPayload, CustomAgentNotifyPayload,
+    Envelope, FrameKind, HostBootstrapPayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
     HostBrowseOpenedPayload, HostSettingsPayload, LaunchProfileCatalogPayload, ListSessionsPayload,
     McpServerNotifyPayload, NewAgentPayload, ProjectBootstrapPayload, ProjectEventPayload,
     ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
-    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProtocolValidator,
-    QueuedMessagesPayload, RejectCode, RejectPayload, ReviewBootstrapPayload, ReviewEventPayload,
-    ReviewId, SeqMismatch, SessionHistoryPayload, SessionListPayload, SessionSchemasPayload,
-    SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload, StreamPath,
-    TaskTokenUsagePayload, TeamCompactNotifyPayload, TeamCompactStatus, TeamDraftNotifyPayload,
+    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, QueuedMessagesPayload, RejectCode,
+    RejectPayload, ReviewBootstrapPayload, ReviewEventPayload, ReviewId, SeqMismatch,
+    SessionHistoryPayload, SessionListPayload, SessionSchemasPayload, SessionSettingsPayload,
+    SkillNotifyPayload, SteeringNotifyPayload, StreamPath, TaskTokenUsagePayload,
+    TeamCompactNotifyPayload, TeamCompactStatus, TeamDraftNotifyPayload,
     TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
     TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
 };
 
+use crate::bridge;
 use crate::state::MobileShellError;
 use crate::state::{
     ActiveAgentRef, AgentInfo, AgentRef, AppState, ChatMessageEntry, ConnectionStatus,
@@ -69,42 +70,12 @@ impl FrontendSeqValidator {
     }
 }
 
-/// Per-`LocalHostId` `ProtocolValidator` map. Phase C HIGH 2: a single global
-/// validator keyed by `StreamPath` collides when two hosts use the same
-/// `/agent/...` path, and a host's reconnect replaying the same stream is
-/// rejected as a duplicate. Scope by `(LocalHostId, StreamPath)` instead.
-struct PerHostProtocolValidators {
-    by_host: HashMap<LocalHostId, ProtocolValidator>,
-}
-
-impl PerHostProtocolValidators {
-    fn new() -> Self {
-        Self {
-            by_host: HashMap::new(),
-        }
-    }
-
-    fn validate(&mut self, host: &LocalHostId, envelope: &Envelope) -> Result<(), String> {
-        let validator = self.by_host.entry(host.clone()).or_default();
-        validator
-            .validate_envelope(envelope)
-            .map_err(|e| format!("{e}"))
-    }
-
-    fn reset_host(&mut self, host: &LocalHostId) {
-        self.by_host.remove(host);
-    }
-}
-
 thread_local! {
     static INBOUND_SEQ: RefCell<FrontendSeqValidator> = RefCell::new(FrontendSeqValidator::new());
-    static INBOUND_PROTOCOL: RefCell<PerHostProtocolValidators> =
-        RefCell::new(PerHostProtocolValidators::new());
 }
 
 pub fn reset_inbound_seq_for_host(host: &LocalHostId) {
     INBOUND_SEQ.with(|validator| validator.borrow_mut().reset_host(host));
-    INBOUND_PROTOCOL.with(|validator| validator.borrow_mut().reset_host(host));
 }
 
 /// Test helper: prime the inbound validators for `host` so subsequent
@@ -112,10 +83,8 @@ pub fn reset_inbound_seq_for_host(host: &LocalHostId) {
 /// `Welcome` (seq 0) + `HostBootstrap` (seq 1) pair on the
 /// `/host/<host>` stream.
 ///
-/// After priming, the `ProtocolValidator` considers the host stream to
-/// have observed a bootstrap, but the `FrontendSeqValidator` has been
-/// rewound so tests can dispatch their first envelope at seq `0`
-/// without a seq-mismatch error.
+/// After priming, the `FrontendSeqValidator` is rewound so tests can
+/// dispatch their first envelope at seq `0` without a seq-mismatch error.
 #[allow(dead_code)]
 pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
     use protocol::{
@@ -195,8 +164,7 @@ pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
             .expect("synthetic HostBootstrap");
     dispatch_envelope(state, host, bootstrap_env);
 
-    // Rewind only the FrontendSeqValidator. The ProtocolValidator keeps
-    // the saw_welcome/saw_bootstrap state from the synthetic frames.
+    // Let the test's next envelope start a fresh sequence.
     INBOUND_SEQ.with(|validator| validator.borrow_mut().reset_host(host));
 }
 
@@ -214,21 +182,13 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
         if envelope.kind == FrameKind::SessionList {
             clear_session_list_loading(state, host);
         }
-        report_protocol_error(state, host, message);
+        report_protocol_error(
+            state,
+            host,
+            bridge::ConnectionInvalidation::SequenceViolation { message },
+        );
         return;
     }
-    if let Err(error) =
-        INBOUND_PROTOCOL.with(|validator| validator.borrow_mut().validate(host, &envelope))
-    {
-        let message = format!("protocol violation on host {host}: {error}");
-        log::error!("{message}");
-        if envelope.kind == FrameKind::SessionList {
-            clear_session_list_loading(state, host);
-        }
-        report_protocol_error(state, host, message);
-        return;
-    }
-
     match envelope.kind {
         FrameKind::Welcome => {
             state.command_errors_by_host.update(|map| {
@@ -252,7 +212,11 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                     host, envelope.stream, envelope.seq, error
                 );
                 log::error!("{message}");
-                report_protocol_error(state, host, message);
+                report_protocol_error(
+                    state,
+                    host,
+                    bridge::ConnectionInvalidation::ProtocolViolation { message },
+                );
             }
         },
         FrameKind::AgentBootstrap => match envelope.parse_payload::<AgentBootstrapPayload>() {
@@ -380,6 +344,27 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                 });
             }
         }
+        FrameKind::BackendCapacity => match envelope.parse_payload::<BackendCapacityPayload>() {
+            Ok(payload) => {
+                // Full replacement for this host — the server owns the canonical
+                // per-(host, backend) snapshot and re-emits it on every change,
+                // so mobile holds no history and merges nothing.
+                state.backend_capacity_by_host.update(|by_host| {
+                    let host_capacity = by_host.entry(host.clone()).or_default();
+                    host_capacity.clear();
+                    for snapshot in payload.snapshots {
+                        host_capacity.insert(snapshot.backend_kind, snapshot);
+                    }
+                });
+            }
+            Err(error) => log::error!(
+                "failed to parse BackendCapacity host={} stream={} seq={}: {}",
+                host,
+                envelope.stream,
+                envelope.seq,
+                error
+            ),
+        },
         FrameKind::BackendConfigSchemas => {
             if let Err(error) = envelope.parse_payload::<BackendConfigSchemasPayload>() {
                 log::error!(
@@ -608,14 +593,19 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
             }
             Err(error) => {
                 let message = format!(
-                    "failed to parse SessionList host={} stream={} seq={}: {}",
+                    "failed to parse SessionList payload host={} stream={} seq={}: {}",
                     host, envelope.stream, envelope.seq, error
                 );
                 log::error!("{message}");
                 state.command_errors_by_host.update(|map| {
-                    map.insert(host.clone(), message);
+                    map.insert(host.clone(), message.clone());
                 });
                 clear_session_list_loading(state, host);
+                report_protocol_error(
+                    state,
+                    host,
+                    bridge::ConnectionInvalidation::ProtocolViolation { message },
+                );
             }
         },
         FrameKind::ProjectNotify => {
@@ -990,16 +980,36 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
     }
 }
 
-fn report_protocol_error(state: &AppState, host: &LocalHostId, message: String) {
+/// Surface a sequence/protocol violation **and terminate the connection**.
+///
+/// Dropping the offending frame and returning is what wedged the stream: the
+/// frontend's expected sequence number is not advanced, so every later frame on
+/// that stream mismatches too, and the stream is dead forever while the UI keeps
+/// waiting. The server's own validator terminates the connection on a violation;
+/// this makes the client agree. A terminated connection reconnects on the
+/// existing backoff and rebootstraps from authoritative state, which is
+/// recoverable — a silently wedged stream is not.
+fn report_protocol_error(
+    state: &AppState,
+    host: &LocalHostId,
+    invalidation: bridge::ConnectionInvalidation,
+) {
+    let message = invalidation.to_string();
     state.connection_statuses.update(|map| {
         map.insert(host.clone(), ConnectionStatus::Error(message.clone()));
     });
-    // Report the seq/protocol violation back to the host so the server logs
-    // it. The frame that triggered this already parsed cleanly, so there is no
-    // raw offending line to forward — the structured message carries the
-    // detail. Sent on the host stream via the shared outbound seq counter, so
-    // it cannot itself re-enter inbound validation and loop.
+    // Report the violation back to the host so the server logs it, before the
+    // connection goes away. The frame that triggered this already parsed
+    // cleanly, so there is no raw offending line to forward — the structured
+    // message carries the detail. Sent on the host stream via the shared
+    // outbound seq counter, so it cannot itself re-enter inbound validation and
+    // loop. Best-effort: the invalidation below may tear the connection down
+    // before it is written, and the server validates independently anyway.
     emit_client_protocol_error(state, host, message.clone());
+    if let Err(error) = bridge::invalidate_host_connection(host, invalidation) {
+        // Already gone — the outcome we wanted. Nothing to escalate.
+        log::warn!("connection already unavailable while invalidating host={host}: {error}");
+    }
     state.mobile_shell_error.set(Some(MobileShellError {
         code: MobileAccessErrorCode::BrokerProtocol,
         message,
@@ -1335,12 +1345,14 @@ fn clear_session_history_loading_on_error(
     });
 }
 
-/// Handle a `CommandError` whose `request_kind` is `LoadAgent`. The mobile
-/// chat shows a spinner while `agent_load_requests` holds the stream and
-/// `agent_loaded` does not and the transcript has no content; a failed load
-/// would otherwise spin forever. Push a visible error row into the transcript:
-/// that makes `no_content` false in `ChatView`, so the spinner is replaced by
-/// the error rather than hanging.
+/// Handle a `CommandError` whose `request_kind` is `LoadAgent`. The mobile chat
+/// shows a spinner while the load is latched and no snapshot has arrived; a
+/// failed load would otherwise spin forever, because `agent_loaded` is only ever
+/// written by a *successful* `AgentBootstrap`.
+///
+/// This records a typed load error, which is the spinner's terminal state, and
+/// pushes a visible error row into the transcript so the failure is legible in
+/// the conversation itself.
 ///
 /// Deliberately keep the `agent_load_requests` latch set (and leave
 /// `agent_loaded` unset, since no snapshot arrived). `ChatView`'s auto-load
@@ -1349,30 +1361,36 @@ fn clear_session_history_loading_on_error(
 /// changes, so clearing the latch here would let the next run re-send:
 /// `LoadAgent` -> conflict -> another error row, with the latch cleared each
 /// time. The retained latch is the thing that stops the retry whenever the
-/// effect runs.
+/// effect runs. Recovery is a deliberate reconnect, which clears both the latch
+/// and the error and re-loads on a fresh instance stream.
 fn surface_load_agent_error(state: &AppState, host: &LocalHostId, payload: &CommandErrorPayload) {
+    let message = format!("Failed to load conversation: {}", payload.message);
     let Some(agent_ref) = resolve_agent_ref(state, host, &payload.stream) else {
         log::warn!(
             "load_agent error on unknown stream host={} stream={}",
             host,
             payload.stream
         );
-        // The agent isn't known locally, so there's no transcript to attach to.
-        // Fall back to a host-level error so the failure is still visible.
+        // The stream maps to no agent we know, so the error cannot be attributed
+        // to one — and guessing which chat it belongs to is exactly the
+        // inference this client does not do. Surface it at the host level so it
+        // is still visible. The spinner is not stranded by this: `ChatView` will
+        // not spin for an agent that is absent from `state.agents`, which is the
+        // only way this branch is reachable for an agent the user has open.
         state.command_errors_by_host.update(|map| {
-            map.insert(
-                host.clone(),
-                format!("Failed to load conversation: {}", payload.message),
-            );
+            map.insert(host.clone(), message);
         });
         return;
     };
+    state.agent_load_errors.update(|map| {
+        map.insert(agent_ref.clone(), message.clone());
+    });
     let entry = ChatMessageEntry {
         message: protocol::ChatMessage {
             message_id: None,
             timestamp: js_sys::Date::now() as u64,
             sender: protocol::MessageSender::Error,
-            content: format!("Failed to load conversation: {}", payload.message),
+            content: message,
             reasoning: None,
             tool_calls: Vec::new(),
             model_info: None,
@@ -1470,11 +1488,13 @@ pub fn apply_chat_event(state: &AppState, agent_ref: &AgentRef, event: ChatEvent
             });
         }
         ChatEvent::MessageAdded(message) => {
-            let entry = ChatMessageEntry {
-                message,
-                tool_requests: Vec::new(),
-            };
-            state.push_chat_message_entry(&agent_ref, entry);
+            state.push_chat_message_entry(
+                &agent_ref,
+                ChatMessageEntry {
+                    message,
+                    tool_requests: Vec::new(),
+                },
+            );
         }
         ChatEvent::MessageMetadataUpdated(data) => {
             log::trace!(
@@ -1489,45 +1509,35 @@ pub fn apply_chat_event(state: &AppState, agent_ref: &AgentRef, event: ChatEvent
             state.transient_events.update(|events| {
                 events.remove(&agent_ref);
             });
-            let streaming = StreamingState {
-                agent_name: data.agent,
-                model: data.model,
-                text: leptos::prelude::ArcRwSignal::new(String::new()),
-                reasoning: leptos::prelude::ArcRwSignal::new(String::new()),
-                tool_requests: leptos::prelude::ArcRwSignal::new(Vec::new()),
-            };
             state.streaming_text.update(|map| {
-                map.insert(agent_ref.clone(), streaming);
+                map.insert(
+                    agent_ref.clone(),
+                    StreamingState {
+                        agent_name: data.agent,
+                        model: data.model,
+                        text: leptos::prelude::ArcRwSignal::new(String::new()),
+                        reasoning: leptos::prelude::ArcRwSignal::new(String::new()),
+                        tool_requests: leptos::prelude::ArcRwSignal::new(Vec::new()),
+                    },
+                );
             });
         }
         ChatEvent::StreamDelta(data) => {
-            let streaming = state
+            if let Some(streaming) = state
                 .streaming_text
-                .with_untracked(|map| map.get(&agent_ref).cloned());
-            if let Some(streaming) = streaming {
+                .with_untracked(|map| map.get(&agent_ref).cloned())
+            {
                 streaming.text.update(|text| text.push_str(&data.text));
-            } else {
-                log::error!(
-                    "StreamDelta without StreamStart host={} agent_id={}",
-                    agent_ref.local_host_id,
-                    agent_ref.agent_id,
-                );
             }
         }
         ChatEvent::StreamReasoningDelta(data) => {
-            let streaming = state
+            if let Some(streaming) = state
                 .streaming_text
-                .with_untracked(|map| map.get(&agent_ref).cloned());
-            if let Some(streaming) = streaming {
+                .with_untracked(|map| map.get(&agent_ref).cloned())
+            {
                 streaming
                     .reasoning
                     .update(|reasoning| reasoning.push_str(&data.text));
-            } else {
-                log::error!(
-                    "StreamReasoningDelta without StreamStart host={} agent_id={}",
-                    agent_ref.local_host_id,
-                    agent_ref.agent_id,
-                );
             }
         }
         ChatEvent::StreamEnd(data) => {
@@ -1536,32 +1546,18 @@ pub fn apply_chat_event(state: &AppState, agent_ref: &AgentRef, event: ChatEvent
                 .with_untracked(|map| map.get(&agent_ref).cloned());
             let tool_requests = streaming
                 .as_ref()
-                .map(|s| s.tool_requests.get_untracked())
+                .map(|streaming| streaming.tool_requests.get_untracked())
                 .unwrap_or_default();
             state.streaming_text.update(|map| {
                 map.remove(&agent_ref);
             });
-            let has_renderable_content = !data.message.content.trim().is_empty()
-                || data
-                    .message
-                    .reasoning
-                    .as_ref()
-                    .is_some_and(|r| !r.text.trim().is_empty())
-                || !data.message.tool_calls.is_empty()
-                || data
-                    .message
-                    .images
-                    .as_ref()
-                    .is_some_and(|images| !images.is_empty())
-                || !tool_requests.is_empty();
-            if !has_renderable_content {
-                return;
-            }
-            let entry = ChatMessageEntry {
-                message: data.message,
-                tool_requests,
-            };
-            state.push_chat_message_entry(&agent_ref, entry);
+            state.push_chat_message_entry(
+                &agent_ref,
+                ChatMessageEntry {
+                    message: present_completed_message(data.message, !tool_requests.is_empty()),
+                    tool_requests,
+                },
+            );
         }
         ChatEvent::ToolRequest(request) => {
             let tool_entry = ToolRequestEntry {
@@ -1585,7 +1581,6 @@ pub fn apply_chat_event(state: &AppState, agent_ref: &AgentRef, event: ChatEvent
                 }
             });
         }
-        // Live tool progress is not rendered on mobile (v1).
         ChatEvent::ToolProgress(_) => {}
         ChatEvent::ToolExecutionCompleted(data) => {
             let call_id = data.tool_call_id.clone();
@@ -1669,26 +1664,15 @@ pub fn apply_chat_event(state: &AppState, agent_ref: &AgentRef, event: ChatEvent
 fn apply_session_history(
     state: &AppState,
     host: &LocalHostId,
-    stream: &StreamPath,
+    _stream: &StreamPath,
     payload: SessionHistoryPayload,
 ) {
-    let Some(agent_ref) = resolve_agent_ref(state, host, stream) else {
-        log::warn!("session_history on unknown stream host={host} stream={stream}");
-        return;
+    let agent_ref = AgentRef {
+        local_host_id: host.clone(),
+        agent_id: payload.agent_id.clone(),
     };
-    if payload.agent_id != agent_ref.agent_id {
-        log::error!(
-            "session_history agent mismatch host={} stream={} payload_agent_id={} stream_agent_id={}",
-            host,
-            stream,
-            payload.agent_id,
-            agent_ref.agent_id
-        );
-        return;
-    }
-
     let mut replay = MobileHistoryReplay::default();
-    for event in payload.events.into_iter().rev() {
+    for event in payload.events {
         replay.apply(event, host, &agent_ref);
     }
 
@@ -1763,12 +1747,10 @@ impl MobileHistoryReplay {
                 }
             }
             ChatEvent::StreamEnd(data) => {
-                if history_message_has_renderable_content(&data.message) {
-                    self.push_entry(ChatMessageEntry {
-                        message: data.message,
-                        tool_requests: Vec::new(),
-                    });
-                }
+                self.push_entry(ChatMessageEntry {
+                    message: present_completed_message(data.message, false),
+                    tool_requests: Vec::new(),
+                });
             }
             ChatEvent::ToolRequest(request) => {
                 let tool_name = request.tool_name.clone();
@@ -1821,7 +1803,7 @@ impl MobileHistoryReplay {
     fn push_entry(&mut self, entry: ChatMessageEntry) {
         let index = self.rows.len();
         if let Some(message_id) = entry.message.message_id.clone() {
-            self.message_index.insert(message_id, index);
+            self.message_index.entry(message_id).or_insert(index);
         }
         for tool in &entry.tool_requests {
             self.tool_index
@@ -1842,6 +1824,18 @@ fn history_message_has_renderable_content(message: &protocol::ChatMessage) -> bo
             .images
             .as_ref()
             .is_some_and(|images| !images.is_empty())
+}
+
+const EMPTY_RESPONSE_PLACEHOLDER: &str = "_Empty response._";
+
+fn present_completed_message(
+    mut message: protocol::ChatMessage,
+    has_attached_tools: bool,
+) -> protocol::ChatMessage {
+    if !history_message_has_renderable_content(&message) && !has_attached_tools {
+        message.content = EMPTY_RESPONSE_PLACEHOLDER.to_owned();
+    }
+    message
 }
 
 fn rebuild_chat_message_index(state: &AppState, agent_ref: &AgentRef) {
@@ -2049,7 +2043,11 @@ fn apply_host_bootstrap(
                 host, stream, current
             );
             log::error!("{message}");
-            report_protocol_error(state, host, message);
+            report_protocol_error(
+                state,
+                host,
+                bridge::ConnectionInvalidation::ProtocolViolation { message },
+            );
             return;
         }
     } else {
@@ -2263,6 +2261,10 @@ fn apply_agent_bootstrap(
     });
     state.agent_loaded.update(|m| {
         m.insert(agent_ref.clone());
+    });
+    // An authoritative snapshot retires any earlier load failure for this agent.
+    state.agent_load_errors.update(|m| {
+        m.remove(&agent_ref);
     });
     // Replace prior per-agent chat/stream/queue/task state so the bootstrap
     // snapshot is authoritative.
@@ -2529,7 +2531,7 @@ mod tests {
 
             let message =
                 |content: String, sender: protocol::MessageSender| protocol::ChatMessage {
-                    message_id: None,
+                    message_id: Some(protocol::ChatMessageId("midturn-message".to_owned())),
                     timestamp: 0,
                     sender,
                     content,
@@ -2614,6 +2616,66 @@ mod tests {
                     .with_untracked(|map| map.get(&agent_ref).map(Vec::len)),
                 Some(1),
                 "live StreamEnd should append while prior history remains unloaded"
+            );
+        });
+    }
+
+    #[test]
+    fn session_history_uses_payload_owner_and_server_order() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host = LocalHostId("history-host".to_owned());
+            let payload_agent = AgentId("payload-agent".to_owned());
+            let agent_ref = AgentRef {
+                local_host_id: host.clone(),
+                agent_id: payload_agent.clone(),
+            };
+            let message = |id: &str, content: &str| protocol::ChatMessage {
+                message_id: Some(protocol::ChatMessageId(id.to_owned())),
+                timestamp: 0,
+                sender: protocol::MessageSender::Assistant {
+                    agent: "History Agent".to_owned(),
+                },
+                content: content.to_owned(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            };
+
+            apply_session_history(
+                &state,
+                &host,
+                &StreamPath("/agent/different-stream-owner/inst".to_owned()),
+                SessionHistoryPayload {
+                    agent_id: payload_agent,
+                    events: vec![
+                        ChatEvent::MessageAdded(message("first", "first delivered")),
+                        ChatEvent::MessageAdded(message("second", "second delivered")),
+                    ],
+                    has_more_before: false,
+                    oldest_seq: None,
+                },
+            );
+
+            let rows = state
+                .chat_messages
+                .with_untracked(|map| map.get(&agent_ref).cloned())
+                .expect("payload-owned history rows");
+            assert_eq!(
+                rows.iter()
+                    .map(|entry| entry.message.content.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["first delivered", "second delivered"]
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter_map(|entry| entry.message.message_id.as_ref().map(|id| id.0.as_str()))
+                    .collect::<Vec<_>>(),
+                vec!["first", "second"]
             );
         });
     }
@@ -2746,6 +2808,7 @@ mod wasm_tests {
                 &protocol::CommandErrorPayload {
                     stream: StreamPath("/host/mobile-session-list-error".to_owned()),
                     request_kind: FrameKind::ListSessions,
+                    setting_target: None,
                     operation: "list_sessions".to_owned(),
                     code: protocol::CommandErrorCode::InvalidInput,
                     message: "stale session list cursor generation 1".to_owned(),
@@ -3587,6 +3650,7 @@ mod wasm_tests {
                 &CommandErrorPayload {
                     stream: instance_stream.clone(),
                     request_kind: FrameKind::LoadAgent,
+                    setting_target: None,
                     operation: "load_agent".to_owned(),
                     code: protocol::CommandErrorCode::Conflict,
                     message: "agent already attached".to_owned(),
@@ -3642,6 +3706,7 @@ mod wasm_tests {
                 &CommandErrorPayload {
                     stream: instance_stream.clone(),
                     request_kind: FrameKind::LoadAgent,
+                    setting_target: None,
                     operation: "load_agent".to_owned(),
                     code: protocol::CommandErrorCode::Conflict,
                     message: "agent already attached".to_owned(),
@@ -3696,6 +3761,7 @@ mod wasm_tests {
                 &CommandErrorPayload {
                     stream: instance_stream.clone(),
                     request_kind: FrameKind::FetchSessionHistory,
+                    setting_target: None,
                     operation: "fetch_session_history".to_owned(),
                     code: protocol::CommandErrorCode::Internal,
                     message: "history read failed".to_owned(),
@@ -3971,6 +4037,220 @@ mod wasm_tests {
                 .and_then(|t| t.request.known_usage())
                 .is_some_and(|u| u.total_tokens == 10),
             "token_usage request scope patched in place"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn ordered_stream_events_render_without_client_identity_ownership() {
+        let state = AppState::new();
+        let agent_ref = AgentRef {
+            local_host_id: LocalHostId("mobile-server-ordered-stream".to_owned()),
+            agent_id: AgentId("agent".to_owned()),
+        };
+        apply_chat_event(
+            &state,
+            &agent_ref,
+            ChatEvent::StreamStart(protocol::StreamStartData {
+                message_id: Some("start-id".to_owned()),
+                agent: "codex".to_owned(),
+                model: None,
+            }),
+        );
+        apply_chat_event(
+            &state,
+            &agent_ref,
+            ChatEvent::StreamDelta(protocol::StreamTextDeltaData {
+                message_id: Some("delta-id".to_owned()),
+                text: "server text".to_owned(),
+            }),
+        );
+        apply_chat_event(
+            &state,
+            &agent_ref,
+            ChatEvent::StreamReasoningDelta(protocol::StreamTextDeltaData {
+                message_id: None,
+                text: "server reasoning".to_owned(),
+            }),
+        );
+
+        let preview = state
+            .streaming_text
+            .with_untracked(|map| map.get(&agent_ref).cloned())
+            .expect("server Start owns the live preview");
+        assert_eq!(preview.text.get_untracked(), "server text");
+        assert_eq!(preview.reasoning.get_untracked(), "server reasoning");
+
+        apply_chat_event(
+            &state,
+            &agent_ref,
+            ChatEvent::StreamEnd(protocol::StreamEndData {
+                message: protocol::ChatMessage {
+                    message_id: Some(protocol::ChatMessageId("end-id".to_owned())),
+                    timestamp: 1,
+                    sender: protocol::MessageSender::Assistant {
+                        agent: "codex".to_owned(),
+                    },
+                    content: "server completion".to_owned(),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    model_info: None,
+                    token_usage: None,
+                    context_breakdown: None,
+                    images: None,
+                },
+            }),
+        );
+
+        let rows = state
+            .chat_messages
+            .with_untracked(|map| map.get(&agent_ref).cloned())
+            .expect("authoritative completion row");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message.content, "server completion");
+        assert_eq!(
+            rows[0].message.message_id,
+            Some(protocol::ChatMessageId("end-id".to_owned()))
+        );
+        assert!(matches!(
+            rows[0].message.sender,
+            protocol::MessageSender::Assistant { .. }
+        ));
+        assert!(
+            state
+                .streaming_text
+                .with_untracked(|map| !map.contains_key(&agent_ref))
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn empty_completion_and_repeated_server_rows_match_history() {
+        let state = AppState::new();
+        let agent_ref = AgentRef {
+            local_host_id: LocalHostId("mobile-empty-completion".to_owned()),
+            agent_id: AgentId("agent".to_owned()),
+        };
+        let assistant_message = |id: &str, content: &str| protocol::ChatMessage {
+            message_id: Some(protocol::ChatMessageId(id.to_owned())),
+            timestamp: 1,
+            sender: protocol::MessageSender::Assistant {
+                agent: "codex".to_owned(),
+            },
+            content: content.to_owned(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            model_info: None,
+            token_usage: None,
+            context_breakdown: None,
+            images: None,
+        };
+
+        apply_chat_event(
+            &state,
+            &agent_ref,
+            ChatEvent::StreamStart(protocol::StreamStartData {
+                message_id: Some("empty-item".to_owned()),
+                agent: "codex".to_owned(),
+                model: None,
+            }),
+        );
+        apply_chat_event(
+            &state,
+            &agent_ref,
+            ChatEvent::StreamEnd(protocol::StreamEndData {
+                message: assistant_message("empty-item", ""),
+            }),
+        );
+
+        let live_empty = state
+            .chat_messages
+            .with_untracked(|rows| rows.get(&agent_ref).cloned())
+            .expect("empty completion row");
+        assert_eq!(live_empty.len(), 1);
+        assert_eq!(
+            live_empty[0].message.message_id,
+            Some(protocol::ChatMessageId("empty-item".to_owned()))
+        );
+        assert_eq!(live_empty[0].message.content, EMPTY_RESPONSE_PLACEHOLDER);
+        assert!(!live_empty[0].message.content.trim().is_empty());
+
+        let mut replay = MobileHistoryReplay::default();
+        replay.apply(
+            ChatEvent::StreamEnd(protocol::StreamEndData {
+                message: assistant_message("empty-history", ""),
+            }),
+            &agent_ref.local_host_id,
+            &agent_ref,
+        );
+        assert_eq!(replay.rows.len(), 1);
+        assert_eq!(replay.rows[0].message.content, EMPTY_RESPONSE_PLACEHOLDER);
+
+        let original = assistant_message("message-added", "original");
+        let repeated = assistant_message("message-added", "server second row");
+        apply_chat_event(
+            &state,
+            &agent_ref,
+            ChatEvent::MessageAdded(original.clone()),
+        );
+        apply_chat_event(
+            &state,
+            &agent_ref,
+            ChatEvent::MessageAdded(repeated.clone()),
+        );
+        let live_rows = state
+            .chat_messages
+            .with_untracked(|rows| rows.get(&agent_ref).cloned())
+            .expect("live rows");
+        assert_eq!(
+            live_rows
+                .iter()
+                .filter(|entry| {
+                    entry.message.message_id
+                        == Some(protocol::ChatMessageId("message-added".to_owned()))
+                })
+                .count(),
+            2,
+            "server rows render in order even when they carry the same metadata key"
+        );
+        assert_eq!(
+            live_rows
+                .iter()
+                .filter(|entry| {
+                    entry.message.message_id
+                        == Some(protocol::ChatMessageId("message-added".to_owned()))
+                })
+                .map(|entry| entry.message.content.clone())
+                .collect::<Vec<_>>(),
+            vec!["original".to_owned(), "server second row".to_owned()]
+        );
+
+        let mut replay = MobileHistoryReplay::default();
+        replay.apply(
+            ChatEvent::MessageAdded(original),
+            &agent_ref.local_host_id,
+            &agent_ref,
+        );
+        replay.apply(
+            ChatEvent::MessageAdded(repeated),
+            &agent_ref.local_host_id,
+            &agent_ref,
+        );
+        assert_eq!(replay.rows.len(), 2);
+        assert_eq!(
+            replay
+                .rows
+                .iter()
+                .filter(|entry| {
+                    entry.message.message_id
+                        == Some(protocol::ChatMessageId("message-added".to_owned()))
+                })
+                .count(),
+            2
+        );
+        assert!(
+            !replay
+                .rows
+                .iter()
+                .any(|entry| matches!(entry.message.sender, protocol::MessageSender::Error))
         );
     }
 }

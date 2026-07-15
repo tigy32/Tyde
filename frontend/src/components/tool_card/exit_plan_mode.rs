@@ -22,7 +22,7 @@ use protocol::{
 use wasm_bindgen_futures::spawn_local;
 
 use crate::send::send_frame;
-use crate::state::{AppState, ToolOutputMode};
+use crate::state::{ActiveAgentRef, AppState, ToolOutputMode};
 
 /// The reactive status signals an `ExitPlanModeCard` shares with its async send
 /// task. Bundled into one `Copy` value so the decision/result of a submit can be
@@ -35,6 +35,7 @@ struct DecisionStatus {
 }
 
 pub(crate) fn render(
+    agent_ref: Signal<Option<ActiveAgentRef>>,
     tool_call_id: &str,
     req: &ToolRequestType,
     result: Option<&ToolExecutionResult>,
@@ -46,6 +47,7 @@ pub(crate) fn render(
 
     view! {
         <ExitPlanModeCard
+            agent_ref=agent_ref
             tool_call_id=tool_call_id.to_owned()
             plan=plan.clone()
             plan_path=plan_path.clone()
@@ -57,6 +59,7 @@ pub(crate) fn render(
 
 #[component]
 fn ExitPlanModeCard(
+    agent_ref: Signal<Option<ActiveAgentRef>>,
     tool_call_id: String,
     plan: Option<String>,
     plan_path: Option<String>,
@@ -89,7 +92,14 @@ fn ExitPlanModeCard(
                 ExitPlanModeDecision::Reject if !trimmed.is_empty() => Some(trimmed),
                 _ => None,
             };
-            let (host_id, stream) = match decision_target(&state) {
+            let Some(agent_ref) = agent_ref.get_untracked() else {
+                log::error!("exit_plan_mode: rendered chat has no agent target");
+                send_error.set(Some(
+                    "No active agent is available. Reopen the chat and try again.".to_owned(),
+                ));
+                return;
+            };
+            let (host_id, stream) = match decision_target(&state, &agent_ref) {
                 Ok(target) => target,
                 Err(message) => {
                     send_error.set(Some(message.to_owned()));
@@ -191,20 +201,25 @@ fn ExitPlanModeCard(
     }
 }
 
-fn decision_target(state: &AppState) -> Result<(String, StreamPath), &'static str> {
-    let Some(active) = state.active_agent.get_untracked() else {
-        log::error!("exit_plan_mode: no active agent to respond to");
-        return Err("No active agent is available. Reopen the chat and try again.");
-    };
+fn decision_target(
+    state: &AppState,
+    agent_ref: &ActiveAgentRef,
+) -> Result<(String, StreamPath), &'static str> {
     let stream = state.agents.get_untracked().iter().find_map(|a| {
-        (a.host_id == active.host_id && a.agent_id == active.agent_id)
+        (a.host_id == agent_ref.host_id && a.agent_id == agent_ref.agent_id)
             .then(|| a.instance_stream.clone())
     });
     let Some(stream) = stream else {
-        log::error!("exit_plan_mode: active agent has no instance stream");
-        return Err("The active agent stream is not available yet. Try again after reconnecting.");
+        log::error!(
+            "exit_plan_mode: rendered agent {} on host {} has no instance stream",
+            agent_ref.agent_id,
+            agent_ref.host_id
+        );
+        return Err(
+            "The rendered agent stream is not available yet. Try again after reconnecting.",
+        );
     };
-    Ok((active.host_id, stream))
+    Ok((agent_ref.host_id.clone(), stream))
 }
 
 fn send_decision(
@@ -246,7 +261,7 @@ fn send_decision(
 mod wasm_tests {
     use super::*;
     use crate::components::tool_card::{ToolCardView, test_utils::*};
-    use crate::state::{ActiveAgentRef, AgentInfo, AppState, TabContent, ToolRequestEntry};
+    use crate::state::{AgentInfo, AppState, TabContent, ToolRequestEntry};
     use leptos::mount::mount_to;
     use protocol::{
         AgentId, AgentOrigin, BackendKind, StreamPath, ToolExecutionCompletedData, ToolRequest,
@@ -264,6 +279,10 @@ mod wasm_tests {
                 agent_id: AgentId("agent-1".to_owned()),
             })
         })
+    }
+
+    fn no_agent_ref() -> Signal<Option<ActiveAgentRef>> {
+        Signal::derive(|| None)
     }
 
     fn exit_plan_req() -> ToolRequestType {
@@ -288,6 +307,7 @@ mod wasm_tests {
                 },
                 success,
                 error: (!success).then(|| "rejected".to_owned()),
+                normalization_failure: None,
             }),
         }
     }
@@ -333,6 +353,60 @@ mod wasm_tests {
         state.open_tab(
             TabContent::chat_with_agent(ActiveAgentRef { host_id, agent_id }),
             "Claude".to_owned(),
+            true,
+        );
+    }
+
+    fn rendered_agent_a() -> ActiveAgentRef {
+        ActiveAgentRef {
+            host_id: "host-a".to_owned(),
+            agent_id: AgentId("agent-a".to_owned()),
+        }
+    }
+
+    fn rendered_agent_a_signal() -> Signal<Option<ActiveAgentRef>> {
+        Signal::derive(|| Some(rendered_agent_a()))
+    }
+
+    fn agent_info(agent_ref: ActiveAgentRef, stream: &str) -> AgentInfo {
+        AgentInfo {
+            host_id: agent_ref.host_id,
+            agent_id: agent_ref.agent_id,
+            name: "Agent".to_owned(),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Claude,
+            workspace_roots: Vec::new(),
+            project_id: None,
+            parent_agent_id: None,
+            session_id: None,
+            custom_agent_id: None,
+            workflow: None,
+            created_at_ms: 0,
+            instance_stream: StreamPath(stream.to_owned()),
+            started: true,
+            fatal_error: None,
+            activity_summary: Default::default(),
+        }
+    }
+
+    fn configure_agent_a_while_b_owns_composer(state: &AppState) {
+        let agent_a = rendered_agent_a();
+        let agent_b = ActiveAgentRef {
+            host_id: "host-b".to_owned(),
+            agent_id: AgentId("agent-b".to_owned()),
+        };
+        state.agents.set(vec![
+            agent_info(agent_a.clone(), "/agent/a/stream"),
+            agent_info(agent_b.clone(), "/agent/b/stream"),
+        ]);
+        state.open_tab(
+            TabContent::chat_with_agent(agent_a),
+            "Agent A".to_owned(),
+            true,
+        );
+        state.open_tab(
+            TabContent::chat_with_agent(agent_b),
+            "Agent B".to_owned(),
             true,
         );
     }
@@ -389,6 +463,35 @@ mod wasm_tests {
             .dyn_into::<js_sys::Array>()
             .expect("call entry");
         entry.get(1).as_string().unwrap_or_default()
+    }
+
+    fn last_send_route(calls: &js_sys::Array) -> (String, String) {
+        assert_eq!(calls.length(), 1, "one control activation must send once");
+        let entry = calls
+            .get(0)
+            .dyn_into::<js_sys::Array>()
+            .expect("call entry");
+        assert_eq!(entry.get(0).as_string().as_deref(), Some("send_host_line"));
+        let args: serde_json::Value =
+            serde_json::from_str(&entry.get(1).as_string().expect("serialized invoke args"))
+                .expect("invoke args JSON");
+        let host_id = args
+            .get("hostId")
+            .and_then(|value| value.as_str())
+            .expect("hostId")
+            .to_owned();
+        let envelope: serde_json::Value = serde_json::from_str(
+            args.get("line")
+                .and_then(|value| value.as_str())
+                .expect("serialized envelope"),
+        )
+        .expect("envelope JSON");
+        let stream = envelope
+            .get("stream")
+            .and_then(|value| value.as_str())
+            .expect("stream")
+            .to_owned();
+        (host_id, stream)
     }
 
     fn install_error_capture() -> js_sys::Array {
@@ -580,7 +683,15 @@ mod wasm_tests {
     async fn renders_plan_text_and_path_without_pre() {
         let container = mount_with_state(
             |_| {},
-            || render("toolu_plan", &exit_plan_req(), None, ToolOutputMode::Full),
+            || {
+                render(
+                    test_agent_ref(),
+                    "toolu_plan",
+                    &exit_plan_req(),
+                    None,
+                    ToolOutputMode::Full,
+                )
+            },
         );
         next_tick().await;
 
@@ -602,7 +713,15 @@ mod wasm_tests {
     async fn pending_shows_approve_and_reject() {
         let container = mount_with_state(
             |_| {},
-            || render("toolu_plan", &exit_plan_req(), None, ToolOutputMode::Full),
+            || {
+                render(
+                    test_agent_ref(),
+                    "toolu_plan",
+                    &exit_plan_req(),
+                    None,
+                    ToolOutputMode::Full,
+                )
+            },
         );
         next_tick().await;
 
@@ -641,7 +760,13 @@ mod wasm_tests {
     async fn approve_sends_decision_one_click() {
         let calls = install_send_capture_stub();
         let container = mount_with_state(configure_active_agent, || {
-            render("toolu_plan", &exit_plan_req(), None, ToolOutputMode::Full)
+            render(
+                test_agent_ref(),
+                "toolu_plan",
+                &exit_plan_req(),
+                None,
+                ToolOutputMode::Full,
+            )
         });
         next_tick().await;
 
@@ -669,7 +794,13 @@ mod wasm_tests {
     async fn reject_includes_feedback() {
         let calls = install_send_capture_stub();
         let container = mount_with_state(configure_active_agent, || {
-            render("toolu_plan", &exit_plan_req(), None, ToolOutputMode::Full)
+            render(
+                test_agent_ref(),
+                "toolu_plan",
+                &exit_plan_req(),
+                None,
+                ToolOutputMode::Full,
+            )
         });
         next_tick().await;
 
@@ -697,7 +828,15 @@ mod wasm_tests {
     async fn decision_without_active_agent_shows_retryable_error() {
         let container = mount_with_state(
             |_| {},
-            || render("toolu_plan", &exit_plan_req(), None, ToolOutputMode::Full),
+            || {
+                render(
+                    no_agent_ref(),
+                    "toolu_plan",
+                    &exit_plan_req(),
+                    None,
+                    ToolOutputMode::Full,
+                )
+            },
         );
         next_tick().await;
 
@@ -713,6 +852,56 @@ mod wasm_tests {
         assert!(
             !approve_button(&container).unwrap().disabled(),
             "decision should remain retryable after a failure"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn decision_routes_to_rendered_agent_while_other_agent_owns_composer() {
+        let calls = install_send_capture_stub();
+        let state = AppState::new();
+        configure_agent_a_while_b_owns_composer(&state);
+        let composer_before = state
+            .center_zone
+            .with_untracked(|center| center.composer_owner());
+        let active_before = state.active_agent.get_untracked();
+        assert_eq!(
+            active_before
+                .as_ref()
+                .map(|agent| agent.agent_id.0.as_str()),
+            Some("agent-b"),
+            "agent B must own the composer before activating agent A's control"
+        );
+
+        let container = make_container();
+        let mount_state = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! {
+                <ToolCardView agent_ref=rendered_agent_a_signal() entry=pending_entry() />
+            }
+        });
+        handle.forget();
+        next_tick().await;
+
+        approve_button(&container).unwrap().click();
+        next_tick().await;
+
+        assert_eq!(
+            last_send_route(&calls),
+            ("host-a".to_owned(), "/agent/a/stream".to_owned()),
+            "ExitPlanMode must route through rendered agent A"
+        );
+        assert_eq!(
+            state
+                .center_zone
+                .with_untracked(|center| center.composer_owner()),
+            composer_before,
+            "approving agent A's plan must not focus its chat or move composer ownership"
+        );
+        assert_eq!(
+            state.active_agent.get_untracked(),
+            active_before,
+            "agent B must remain composer owner after agent A's plan decision"
         );
     }
 }

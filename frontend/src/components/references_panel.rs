@@ -4,9 +4,13 @@ use leptos::prelude::*;
 
 use protocol::{CodeIntelReferencesFileResult, ProjectPath};
 
-use crate::actions::{clear_references, open_file, open_project_path};
+use crate::actions::{clear_references, open_project_path_at_navigation};
+use crate::components::center_zone::{announce, workspace_width};
+use crate::components::command_palette::{
+    ContextActionId, context_binding, open_to_side_availability,
+};
 use crate::components::find_bar::render_text_with_highlights;
-use crate::state::{AppState, ProjectReferencesMode};
+use crate::state::{AppState, OpenTarget, PendingFileNavigation, ProjectReferencesMode};
 
 /// Find-references results panel (M5), shown as the fourth tab of the left dock
 /// and auto-activated by Shift+F12. Mirrors [`SearchPanel`](super::search_panel)'s
@@ -86,6 +90,7 @@ pub fn ReferencesPanel() -> impl IntoView {
 
     // Per-file collapse state (keyed by the rendered path string).
     let collapsed: RwSignal<HashSet<String>> = RwSignal::new(HashSet::new());
+    let side_notice: RwSignal<Option<&'static str>> = RwSignal::new(None);
 
     let results_view = {
         let state = state.clone();
@@ -104,7 +109,9 @@ pub fn ReferencesPanel() -> impl IntoView {
             });
             files
                 .into_iter()
-                .map(|(file, row_start)| file_group(state.clone(), collapsed, file, row_start))
+                .map(|(file, row_start)| {
+                    file_group(state.clone(), collapsed, side_notice, file, row_start)
+                })
                 .collect_view()
         }
     };
@@ -127,6 +134,15 @@ pub fn ReferencesPanel() -> impl IntoView {
                     "Results truncated — some references are not shown."
                 </div>
             </Show>
+            <Show when=move || side_notice.get().is_some()>
+                <div
+                    class="cp-notice"
+                    role="status"
+                    data-testid="references-side-open-notice"
+                >
+                    {move || side_notice.get().unwrap_or_default()}
+                </div>
+            </Show>
             <div class="search-results">
                 {results_view}
             </div>
@@ -147,9 +163,11 @@ fn path_key(path: &ProjectPath) -> String {
 fn file_group(
     state: AppState,
     collapsed: RwSignal<HashSet<String>>,
+    side_notice: RwSignal<Option<&'static str>>,
     file: CodeIntelReferencesFileResult,
     row_start: usize,
 ) -> impl IntoView {
+    let width = workspace_width();
     let key = path_key(&file.path);
     let display_name = file.path.relative_path.clone();
     let ref_count: usize = file.lines.iter().map(|line| line.ranges.len()).sum();
@@ -191,31 +209,105 @@ fn file_group(
             let highlighted = render_text_with_highlights(&line.line_text, &ranges);
             let line_number = line.line_number;
             let row_index = row_start + line_index;
-            let on_click = {
+            let availability = {
+                let state = state.clone();
+                Memo::new(move |_| open_to_side_availability(&state, width.get()))
+            };
+            let open_target = {
                 let state = state.clone();
                 let path = file_path.clone();
-                move |_| {
-                    if let Some(target) = state
+                move |open_target| {
+                    let (path, navigation) = if let Some(target) = state
                         .references_state
                         .with_untracked(|s| s.row_targets.get(row_index).cloned())
                     {
-                        state
-                            .pending_goto_offset
-                            .set(Some((target.path.clone(), target.range.start)));
-                        open_project_path(&state, target.path);
+                        (
+                            target.path,
+                            PendingFileNavigation::Offset(target.range.start),
+                        )
                     } else {
-                        state
-                            .pending_goto_line
-                            .set(Some((path.clone(), line_number)));
-                        open_file(&state, path.clone());
-                    }
+                        (path.clone(), PendingFileNavigation::Line(line_number))
+                    };
+                    let _ = open_project_path_at_navigation(&state, path, open_target, navigation);
                 }
             };
+            let on_click = {
+                let open_target = open_target.clone();
+                move |_| {
+                    side_notice.set(None);
+                    open_target(OpenTarget::Focused);
+                }
+            };
+            let open_to_side = {
+                let open_target = open_target.clone();
+                move || {
+                    if let Some(reason) = availability.get_untracked().reason() {
+                        side_notice.set(Some(reason));
+                        announce(reason);
+                        return;
+                    }
+                    side_notice.set(None);
+                    open_target(OpenTarget::Beside);
+                }
+            };
+            let on_side_click = {
+                let open_to_side = open_to_side.clone();
+                move |ev: web_sys::MouseEvent| {
+                    ev.stop_propagation();
+                    open_to_side();
+                }
+            };
+            let open_to_side_for_key = open_to_side.clone();
+            let on_keydown = move |ev: web_sys::KeyboardEvent| {
+                if ev.key() == "Enter" && (ev.meta_key() || ev.ctrl_key()) {
+                    ev.prevent_default();
+                    ev.stop_propagation();
+                    open_to_side_for_key();
+                }
+            };
+            let side_hint = context_binding(ContextActionId::OpenToSide).chord().hint();
+            let row_side_hint = side_hint.clone();
+            let row_title = move || match availability.get().reason() {
+                Some(reason) => {
+                    format!("Open; {row_side_hint} Open to the Side unavailable: {reason}")
+                }
+                None => format!("Open ({row_side_hint} opens to the side)"),
+            };
+            let side_title = move || match availability.get().reason() {
+                Some(reason) => reason.to_owned(),
+                None => format!("Open to the side ({side_hint})"),
+            };
+            let side_label = format!(
+                "Open {} at line {} to the side",
+                file_path.relative_path.as_str(),
+                line_number
+            );
             view! {
-                <button class="search-match-row" on:click=on_click>
-                    <span class="search-match-line">{line_number.to_string()}</span>
-                    <span class="search-match-text">{highlighted}</span>
-                </button>
+                <div class="fe-row">
+                    <button
+                        class="search-match-row fe-item"
+                        title=row_title
+                        aria-keyshortcuts="Enter Control+Enter Meta+Enter"
+                        on:click=on_click
+                        on:keydown=on_keydown
+                    >
+                        <span class="search-match-line">{line_number.to_string()}</span>
+                        <span class="search-match-text">{highlighted}</span>
+                    </button>
+                    <button
+                        class="fe-open-side search-result-open-side"
+                        class:disabled=move || !availability.get().is_enabled()
+                        aria-label=side_label
+                        aria-keyshortcuts="Control+Enter Meta+Enter"
+                        aria-disabled=move || {
+                            (!availability.get().is_enabled()).then_some("true")
+                        }
+                        title=side_title
+                        on:click=on_side_click
+                    >
+                        <span class="fe-open-side-icon" aria-hidden="true">"\u{29c9}"</span>
+                    </button>
+                </div>
             }
         })
         .collect_view();
@@ -243,11 +335,14 @@ fn file_group(
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
-    use crate::state::{AppState, ProjectReferencesUiState};
+    use crate::state::{
+        ActiveProjectRef, AppState, FileResourceKey, OpenFile, PaneId, ProjectReferencesUiState,
+        TabContent,
+    };
     use leptos::mount::mount_to;
     use protocol::{
-        ByteRange, CodeIntelReferenceLine, CodeIntelReferencesFileResult, ProjectPath,
-        ProjectRootPath,
+        ByteRange, CodeIntelReferenceLine, CodeIntelReferencesFileResult, ProjectFileVersion,
+        ProjectId, ProjectPath, ProjectRootPath,
     };
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -325,12 +420,47 @@ mod wasm_tests {
         container.query_selector_all(selector).unwrap().length() as usize
     }
 
+    fn file_key(project: &str, path: ProjectPath) -> FileResourceKey {
+        FileResourceKey {
+            host_id: "host".to_owned(),
+            project_id: ProjectId(project.to_owned()),
+            path,
+        }
+    }
+
+    fn seed_loaded_file(state: &AppState, key: &FileResourceKey, contents: &str) {
+        state.open_files.update(|files| {
+            files.insert(
+                key.clone(),
+                OpenFile {
+                    path: key.path.clone(),
+                    version: ProjectFileVersion(1),
+                    contents: Some(contents.to_owned()),
+                    is_binary: false,
+                },
+            );
+        });
+    }
+
+    fn dispatch_side_enter(target: &HtmlElement) {
+        let init = web_sys::KeyboardEventInit::new();
+        init.set_bubbles(true);
+        init.set_key("Enter");
+        init.set_meta_key(true);
+        let event =
+            web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &init).unwrap();
+        target.dispatch_event(&event).unwrap();
+    }
+
     fn mount_panel(setup: impl Fn(&AppState) + 'static) -> (HtmlElement, AppState) {
+        workspace_width().set(None);
         let container = make_container();
         let captured: Rc<RefCell<Option<AppState>>> = Rc::new(RefCell::new(None));
         let captured_for_mount = captured.clone();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
+            state.pending_goto_line.set(None);
+            state.pending_goto_offset.set(None);
             setup(&state);
             *captured_for_mount.borrow_mut() = Some(state.clone());
             provide_context(state.clone());
@@ -404,10 +534,48 @@ mod wasm_tests {
     /// Clicking a reference row requests a goto to that file + line (the same
     /// navigation the search panel uses), so the click drives the editor.
     #[wasm_bindgen_test]
-    async fn clicking_reference_sets_pending_goto_line() {
+    async fn clicking_reference_targets_focused_exact_project_occurrence() {
         ensure_styles_loaded();
-        let (container, state) = mount_panel(|state| {
+        let path = ProjectPath {
+            root: ProjectRootPath("test-root".to_owned()),
+            relative_path: "src/a.rs".to_owned(),
+        };
+        let current_key = file_key("current", path.clone());
+        let other_key = file_key("other", path);
+        let current_for_setup = current_key.clone();
+        let other_for_setup = other_key.clone();
+        let (container, state) = mount_panel(move |state| {
+            state.active_project.set(Some(ActiveProjectRef {
+                host_id: "host".to_owned(),
+                project_id: ProjectId("current".to_owned()),
+            }));
+            seed_loaded_file(state, &current_for_setup, "foo();");
+            seed_loaded_file(state, &other_for_setup, "other foo();");
+            let current_tab = state
+                .open_tab_in(
+                    PaneId::Primary,
+                    TabContent::File {
+                        key: current_for_setup.clone(),
+                    },
+                    "a.rs · current".to_owned(),
+                    true,
+                )
+                .expect("current-project occurrence");
+            state
+                .open_tab_in(
+                    PaneId::Secondary,
+                    TabContent::File {
+                        key: other_for_setup.clone(),
+                    },
+                    "a.rs · other".to_owned(),
+                    true,
+                )
+                .expect("other-project occurrence");
+            state.activate_tab(current_tab);
             state.references_state.set(ProjectReferencesUiState {
+                source_tab: Some(current_tab),
+                source_key: Some(current_for_setup.clone()),
+                source_version: Some(ProjectFileVersion(1)),
                 active_references_id: 1,
                 in_flight: false,
                 symbol: None,
@@ -439,16 +607,209 @@ mod wasm_tests {
 
         next_tick().await;
 
+        let current_tab = state
+            .resolve_file_occurrence(&current_key, PaneId::Primary)
+            .expect("current occurrence")
+            .1;
+        let other_tab = state
+            .resolve_file_occurrence(&other_key, PaneId::Primary)
+            .expect("other occurrence")
+            .1;
         assert_eq!(
             state.pending_goto_line.get_untracked(),
-            Some((
-                ProjectPath {
-                    root: ProjectRootPath("test-root".to_owned()),
-                    relative_path: "src/a.rs".to_owned(),
-                },
-                42,
-            )),
-            "clicking a reference should request a goto to that file + line"
+            Some((current_tab, 42)),
+            "reference navigation must not cross into the same-path other-project occurrence"
+        );
+        assert_ne!(current_tab, other_tab);
+        assert_eq!(
+            state.references_state.with_untracked(|references| {
+                references
+                    .source()
+                    .map(|(tab, key, version)| (tab, key.clone(), version))
+            }),
+            Some((current_tab, current_key, ProjectFileVersion(1)))
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn side_enter_is_row_scoped_and_targets_only_the_duplicate() {
+        ensure_styles_loaded();
+        workspace_width().set(Some(1.0));
+        let path = ProjectPath {
+            root: ProjectRootPath("test-root".to_owned()),
+            relative_path: "src/a.rs".to_owned(),
+        };
+        let key = file_key("current", path);
+        let key_for_setup = key.clone();
+        let (container, state) = mount_panel(move |state| {
+            state.active_project.set(Some(ActiveProjectRef {
+                host_id: "host".to_owned(),
+                project_id: ProjectId("current".to_owned()),
+            }));
+            seed_loaded_file(state, &key_for_setup, "foo();");
+            let source_tab = state
+                .open_tab_in(
+                    PaneId::Primary,
+                    TabContent::File {
+                        key: key_for_setup.clone(),
+                    },
+                    "a.rs".to_owned(),
+                    true,
+                )
+                .expect("primary occurrence");
+            state.references_state.set(ProjectReferencesUiState {
+                source_tab: Some(source_tab),
+                source_key: Some(key_for_setup.clone()),
+                source_version: Some(ProjectFileVersion(1)),
+                active_references_id: 1,
+                results: vec![file_result("src/a.rs", &[(42, "foo();", (0, 3))], false)],
+                total_files: 1,
+                total_references: 1,
+                ..Default::default()
+            });
+        });
+        assert_eq!(
+            workspace_width().get_untracked(),
+            None,
+            "a references-panel mount must discard a stale prior workspace measurement"
+        );
+        next_tick().await;
+
+        let init = web_sys::KeyboardEventInit::new();
+        init.set_bubbles(true);
+        init.set_key("Enter");
+        init.set_meta_key(true);
+        web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .dispatch_event(
+                &web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &init)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            state.center_zone.with_untracked(|center| {
+                center
+                    .occurrences(&TabContent::File { key: key.clone() })
+                    .len()
+            }),
+            1,
+            "a global Open to the Side chord must not open a reference result"
+        );
+
+        let row = container
+            .query_selector(".search-match-row")
+            .unwrap()
+            .expect("reference row")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        assert_eq!(
+            row.get_attribute("aria-keyshortcuts").as_deref(),
+            Some("Enter Control+Enter Meta+Enter")
+        );
+        let side_hint = crate::components::command_palette::context_binding(
+            crate::components::command_palette::ContextActionId::OpenToSide,
+        )
+        .chord()
+        .hint();
+        assert_eq!(
+            row.get_attribute("title").as_deref(),
+            Some(format!("Open ({side_hint} opens to the side)").as_str()),
+            "the row title must show the exact platform chord that opens to the side"
+        );
+        let side_action = container
+            .query_selector(".search-result-open-side")
+            .unwrap()
+            .expect("visible side-open action")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        assert_eq!(
+            side_action.get_attribute("aria-label").as_deref(),
+            Some("Open src/a.rs at line 42 to the side")
+        );
+        assert_eq!(
+            side_action.get_attribute("aria-keyshortcuts").as_deref(),
+            Some("Control+Enter Meta+Enter")
+        );
+        state.tabs_enabled.set(false);
+        next_tick().await;
+        assert_eq!(
+            side_action.get_attribute("aria-disabled").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            side_action.get_attribute("title").as_deref(),
+            Some("Enable tabs to use split view.")
+        );
+        let disabled_row_title = row.get_attribute("title").unwrap_or_default();
+        assert_eq!(
+            disabled_row_title,
+            format!(
+                "Open; {side_hint} Open to the Side unavailable: Enable tabs to use split view."
+            ),
+            "the disabled row title must preserve the exact platform chord and refusal"
+        );
+        dispatch_side_enter(&row);
+        next_tick().await;
+        assert_eq!(
+            state.center_zone.with_untracked(|center| {
+                center
+                    .occurrences(&TabContent::File { key: key.clone() })
+                    .len()
+            }),
+            1,
+            "the shared unavailable policy must refuse without a focused-pane consolation open"
+        );
+        assert!(state.pending_goto_line.get_untracked().is_none());
+        let notice = container
+            .query_selector("[data-testid=\"references-side-open-notice\"]")
+            .unwrap()
+            .expect("visible side-open refusal notice");
+        assert_eq!(notice.get_attribute("role").as_deref(), Some("status"));
+        assert_eq!(
+            notice.text_content().unwrap_or_default().trim(),
+            "Enable tabs to use split view."
+        );
+
+        state.tabs_enabled.set(true);
+        next_tick().await;
+        dispatch_side_enter(&row);
+        next_tick().await;
+
+        let occurrences = state
+            .center_zone
+            .with_untracked(|center| center.occurrences(&TabContent::File { key: key.clone() }));
+        assert_eq!(occurrences.len(), 2);
+        let secondary = occurrences
+            .iter()
+            .find_map(|(pane, tab)| (*pane == PaneId::Secondary).then_some(*tab))
+            .expect("secondary duplicate");
+        let primary = occurrences
+            .iter()
+            .find_map(|(pane, tab)| (*pane == PaneId::Primary).then_some(*tab))
+            .expect("primary occurrence");
+        assert_ne!(primary, secondary);
+        assert_eq!(
+            state.pending_goto_line.get_untracked(),
+            Some((secondary, 42))
+        );
+        assert!(
+            container
+                .query_selector("[data-testid=\"references-side-open-notice\"]")
+                .unwrap()
+                .is_none(),
+            "a successful retry clears the visible refusal"
+        );
+
+        assert!(state.reveal_tab(primary));
+        state.pending_goto_line.set(None);
+        side_action.click();
+        next_tick().await;
+        assert_eq!(
+            state.pending_goto_line.get_untracked(),
+            Some((secondary, 42)),
+            "the visible affordance must target the exact side occurrence"
         );
     }
 
@@ -457,13 +818,8 @@ mod wasm_tests {
     /// row jumps to the second target's byte offset.
     #[wasm_bindgen_test]
     async fn navigate_result_with_two_targets_populates_chooser_and_clicks_second() {
-        use crate::state::{
-            ActiveProjectRef, CodeIntelKey, CodeIntelNavigateContext, OpenFile,
-            ProjectReferencesMode,
-        };
-        use protocol::{
-            CodeIntelLocation, CodeIntelNavigateResultPayload, ProjectFileVersion, ProjectId,
-        };
+        use crate::state::{CodeIntelKey, CodeIntelNavigateContext, ProjectReferencesMode};
+        use protocol::{CodeIntelLocation, CodeIntelNavigateResultPayload};
 
         ensure_styles_loaded();
         let root = ProjectRootPath("test-root".to_owned());
@@ -479,6 +835,24 @@ mod wasm_tests {
             root,
             relative_path: "src/second.rs".to_owned(),
         };
+        let source_key = FileResourceKey {
+            host_id: "chooser-host".to_owned(),
+            project_id: ProjectId("chooser-project".to_owned()),
+            path: source.clone(),
+        };
+        let first_key = FileResourceKey {
+            host_id: "chooser-host".to_owned(),
+            project_id: ProjectId("chooser-project".to_owned()),
+            path: first.clone(),
+        };
+        let second_key = FileResourceKey {
+            host_id: "chooser-host".to_owned(),
+            project_id: ProjectId("chooser-project".to_owned()),
+            path: second.clone(),
+        };
+        let source_for_setup = source_key.clone();
+        let first_key_for_setup = first_key.clone();
+        let second_key_for_setup = second_key.clone();
         let first_for_setup = first.clone();
         let second_for_setup = second.clone();
         let (container, state) = mount_panel(move |state| {
@@ -486,44 +860,27 @@ mod wasm_tests {
                 host_id: "chooser-host".to_owned(),
                 project_id: ProjectId("chooser-project".to_owned()),
             }));
+            seed_loaded_file(state, &source_for_setup, "fn main() { thing(); }");
+            seed_loaded_file(state, &first_key_for_setup, "pub fn first() {}\n");
+            seed_loaded_file(state, &second_key_for_setup, "pub fn second() {}\n");
+            let source_tab = state
+                .open_tab_in(
+                    PaneId::Primary,
+                    TabContent::File {
+                        key: source_for_setup.clone(),
+                    },
+                    "main.rs".to_owned(),
+                    true,
+                )
+                .expect("definition source tab");
             state
                 .code_intel_navigate_ctx
                 .set(Some(CodeIntelNavigateContext {
                     navigate_id: 77,
-                    host_id: "chooser-host".to_owned(),
-                    project_id: ProjectId("chooser-project".to_owned()),
-                    path: source.clone(),
+                    tab: source_tab,
+                    key: source_for_setup.clone(),
                     version: ProjectFileVersion(1),
                 }));
-            state.open_files.update(|files| {
-                files.insert(
-                    source.clone(),
-                    OpenFile {
-                        path: source.clone(),
-                        version: ProjectFileVersion(1),
-                        contents: Some("fn main() { thing(); }".to_owned()),
-                        is_binary: false,
-                    },
-                );
-                files.insert(
-                    first_for_setup.clone(),
-                    OpenFile {
-                        path: first_for_setup.clone(),
-                        version: ProjectFileVersion(1),
-                        contents: Some("pub fn first() {}\n".to_owned()),
-                        is_binary: false,
-                    },
-                );
-                files.insert(
-                    second_for_setup.clone(),
-                    OpenFile {
-                        path: second_for_setup.clone(),
-                        version: ProjectFileVersion(1),
-                        contents: Some("pub fn second() {}\n".to_owned()),
-                        is_binary: false,
-                    },
-                );
-            });
             state.code_intel.update(|map| {
                 map.entry(CodeIntelKey {
                     host_id: "chooser-host".to_owned(),
@@ -559,6 +916,13 @@ mod wasm_tests {
             assert_eq!(s.mode, ProjectReferencesMode::DefinitionTargets);
             assert_eq!(s.results.len(), 2, "both targets appear in the chooser");
             assert_eq!(s.row_targets.len(), 2, "each chooser row has a target");
+            assert_eq!(
+                s.source()
+                    .map(|(tab, key, version)| (tab, key.clone(), version)),
+                state
+                    .resolve_file_occurrence(&source_key, PaneId::Primary)
+                    .map(|(_, tab)| (tab, source_key.clone(), ProjectFileVersion(1)))
+            );
         });
         assert_eq!(
             query_count(&container, ".search-match-row"),
@@ -579,10 +943,13 @@ mod wasm_tests {
 
         next_tick().await;
 
+        let second_tab = state
+            .resolve_file_occurrence(&second_key, PaneId::Primary)
+            .expect("second target occurrence")
+            .1;
         assert_eq!(
             state.pending_goto_offset.get_untracked(),
-            Some((second.clone(), 7)),
-            "clicking the second definition target should navigate to that target"
+            Some((second_tab, 7))
         );
         assert!(
             state.pending_goto_line.get_untracked().is_none(),

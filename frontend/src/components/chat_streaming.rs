@@ -30,7 +30,7 @@ pub fn ChatStreamingView(
     let model = streaming.model;
 
     let throttled_text = throttled_string_signal(text.clone(), clone_text, None);
-    let reasoning_open = RwSignal::new(false);
+    let reasoning_open = RwSignal::new(true);
     let throttled_reasoning = throttled_string_signal(
         reasoning.clone(),
         capped_reasoning_text,
@@ -57,6 +57,7 @@ pub fn ChatStreamingView(
                     Some(view! {
                         <details
                             class="chat-card-reasoning"
+                            open=true
                             on:toggle=move |ev: leptos::ev::Event| {
                                 if let Some(target) = ev.target()
                                     && let Ok(el) = target.dyn_into::<web_sys::HtmlDetailsElement>()
@@ -184,4 +185,92 @@ fn capped_reasoning_text(text: &str) -> String {
     capped.push_str("...\n");
     capped.push_str(tail);
     capped
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use crate::state::ActiveAgentRef;
+    use leptos::mount::mount_to;
+    use protocol::AgentId;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    async fn next_tick() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 50)
+                .unwrap();
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn live_reasoning_is_immediately_visible_in_an_open_disclosure() {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document.create_element("div").unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        let container = container.dyn_into::<web_sys::HtmlElement>().unwrap();
+        let reasoning = ArcRwSignal::new(String::new());
+        let streaming = StreamingState {
+            agent_name: "codex".to_owned(),
+            model: Some("gpt-test".to_owned()),
+            text: ArcRwSignal::new(String::new()),
+            reasoning: reasoning.clone(),
+            tool_requests: ArcRwSignal::new(Vec::new()),
+        };
+        let _handle = mount_to(container.clone(), move || {
+            view! {
+                <ChatStreamingView
+                    agent_ref=Signal::derive(|| Some(ActiveAgentRef {
+                        host_id: "host".to_owned(),
+                        agent_id: AgentId("agent".to_owned()),
+                    }))
+                    streaming=streaming.clone()
+                />
+            }
+        });
+
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".chat-card-reasoning")
+                .unwrap()
+                .is_none(),
+            "an empty stream has no reasoning disclosure"
+        );
+
+        reasoning.set("inspect the first item".to_owned());
+        next_tick().await;
+        let details = container
+            .query_selector(".chat-card-reasoning")
+            .unwrap()
+            .expect("live reasoning disclosure")
+            .dyn_into::<web_sys::HtmlDetailsElement>()
+            .unwrap();
+        assert!(details.open(), "live reasoning must start expanded");
+        let content = container
+            .query_selector(".reasoning-content")
+            .unwrap()
+            .expect("visible live reasoning content");
+        assert!(
+            content
+                .text_content()
+                .unwrap()
+                .contains("inspect the first item")
+        );
+
+        reasoning.set("inspect the eventual assistant item".to_owned());
+        next_tick().await;
+        assert!(
+            content
+                .text_content()
+                .unwrap()
+                .contains("inspect the eventual assistant item"),
+            "same preview updates without replacing its disclosure"
+        );
+    }
 }

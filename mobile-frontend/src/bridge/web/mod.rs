@@ -1,9 +1,8 @@
 //! Browser (PWA) bridge backend.
 //!
-//! Direct-to-wasm equivalents of the Tauri `mobile-shell` commands/events:
-//! transport + connection manager ([`connection`]), IndexedDB persistence
-//! ([`store`]), QR scanning ([`qr`]), and an in-process event hub ([`events`]).
-//! Selected at runtime by [`super`] when `window.__TAURI__` is absent.
+//! Direct-to-wasm host I/O: transport + connection manager ([`connection`]),
+//! IndexedDB persistence ([`store`]), QR scanning ([`qr`]), and an in-process
+//! event hub ([`events`]).
 
 mod connection;
 mod events;
@@ -23,7 +22,10 @@ use protocol::PROTOCOL_VERSION;
 
 use crate::state::PairingOffer;
 
-use super::UnlistenHandle;
+use super::{
+    Accepted, ConnectionInvalidation, InvalidationRejected, SendRejected,
+    SubmissionTransportOutcomeEvent, UnlistenHandle,
+};
 use store::{IndexedDbHostStore, IndexedDbPskStore, PskStore, WebPairedHostRecord};
 
 pub use qr::{ensure_camera_permission, scan_qr};
@@ -31,6 +33,12 @@ pub use service::{
     AuthProvider, RedeemOutcome, authenticate as authenticate_managed,
     complete_boot_auth_callback as complete_boot_managed_auth_callback,
     probe_auth as probe_managed_auth,
+};
+
+#[cfg(all(test, target_arch = "wasm32"))]
+pub use connection::{
+    TestSendGuard, test_capture_sends, test_clean_sends, test_defer_sends, test_reject_sends,
+    test_resolve_next_send, test_send_attempts, test_sent_lines,
 };
 
 // ── Paired-host queries ───────────────────────────────────────────────────
@@ -116,7 +124,7 @@ pub async fn redeem_managed_and_connect(qr_uri: &str) -> Result<(), RedeemOutcom
 
 /// User-facing copy for a legacy public-broker QR that fails closed. Kept in one
 /// place so the scan-time and stored-record repair surfaces stay consistent.
-const LEGACY_QR_REPAIR_MESSAGE: &str = "This is an older Tyde pairing code that used the shared public broker, which is no longer supported. Open Tyde on your computer (Settings → Hosts), turn on mobile access again, and scan the new QR code to re-pair.";
+const LEGACY_QR_REPAIR_MESSAGE: &str = "This is an older Tyde pairing code that used the shared public broker, which is no longer supported. Open Tyde on your computer, open the Mobile tab in Settings (Settings → Mobile), turn on mobile access again, and scan the new QR code to re-pair.";
 
 pub async fn start_pairing(qr_uri: &str) -> Result<(), String> {
     let payload = parse_and_validate(qr_uri)?;
@@ -258,10 +266,20 @@ pub async fn set_paired_host_auto_connect(
     Ok(())
 }
 
-pub async fn send_host_line(local_host_id: &LocalHostId, line: &str) -> Result<(), String> {
+pub async fn send_host_line(
+    local_host_id: &LocalHostId,
+    line: &str,
+) -> Result<Accepted, SendRejected> {
     connection::manager()
         .send_line(local_host_id.clone(), line.to_owned())
         .await
+}
+
+pub fn invalidate_host_connection(
+    local_host_id: &LocalHostId,
+    reason: ConnectionInvalidation,
+) -> Result<(), InvalidationRejected> {
+    connection::manager().invalidate(local_host_id, reason)
 }
 
 /// No-op: the browser path never assigns delivery ids, so there is nothing to
@@ -344,7 +362,15 @@ pub async fn listen_mobile_shell_error(
     )))
 }
 
-// ── Helpers (ported from mobile/src-tauri/src/lib.rs) ──────────────────────
+pub async fn listen_submission_transport_outcome(
+    callback: impl Fn(SubmissionTransportOutcomeEvent) + 'static,
+) -> Result<UnlistenHandle, String> {
+    Ok(UnlistenHandle::from_cleanup(
+        connection::on_submission_transport_outcome(callback),
+    ))
+}
+
+// ── Pairing helpers ────────────────────────────────────────────────────────
 
 async fn emit_paired_hosts_changed() {
     match IndexedDbHostStore.list_summaries().await {
@@ -753,6 +779,18 @@ mod wasm_tests {
         match classify_pairing_offer(&uri).await.expect("classify legacy") {
             PairingOffer::RepairRequired { message } => {
                 assert!(!message.is_empty(), "repair message must be actionable");
+                assert!(
+                    message.contains("Settings → Mobile"),
+                    "repair must point at the tab that contains pairing: {message}"
+                );
+                assert!(
+                    message.contains("Mobile tab in Settings"),
+                    "spoken wording must not depend on the arrow glyph: {message}"
+                );
+                assert!(
+                    !message.contains("Settings → Hosts"),
+                    "the Hosts tab is a dead-end recovery path: {message}"
+                );
             }
             other => panic!("expected repair required, got {other:?}"),
         }

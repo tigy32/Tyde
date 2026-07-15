@@ -418,33 +418,13 @@ mod wasm_tests {
         }
     }
 
-    /// Capture `send_host_line` invokes so a test can inspect the wire.
-    fn record_bridge() {
-        let _ = js_sys::eval(
-            "(function(){ \
-               window.__sent_lines = []; \
-               window.__TAURI__ = window.__TAURI__ || {}; \
-               window.__TAURI__.core = window.__TAURI__.core || {}; \
-               window.__TAURI__.core.invoke = function(cmd, args){ \
-                 try { \
-                   if (cmd === 'send_host_line' && args) { \
-                     var line = (args.line !== undefined) ? args.line \
-                       : (args.get ? args.get('line') : undefined); \
-                     if (line !== undefined) { window.__sent_lines.push(line); } \
-                   } \
-                 } catch (e) {} \
-                 return Promise.resolve(); }; \
-               window.__TAURI__.event = window.__TAURI__.event || {}; \
-               window.__TAURI__.event.listen = function(){ return Promise.resolve(function(){}); }; \
-             })();",
-        );
+    /// Capture sends through the production web connection manager seam.
+    fn record_bridge() -> crate::bridge::TestSendGuard {
+        crate::bridge::test_capture_sends()
     }
 
     fn sent_lines_joined() -> String {
-        js_sys::eval("(window.__sent_lines||[]).join('\\n')")
-            .ok()
-            .and_then(|v| v.as_string())
-            .unwrap_or_default()
+        crate::bridge::test_sent_lines().join("\n")
     }
 
     /// Tapping a project row selects it and notifies the host with a
@@ -452,7 +432,7 @@ mod wasm_tests {
     /// nothing is sent.
     #[wasm_bindgen_test]
     async fn selecting_project_sends_project_accessed() {
-        record_bridge();
+        let _send_guard = record_bridge();
         let host = LocalHostId("host-1".to_owned());
         let host_clone = host.clone();
         let container = make_container();

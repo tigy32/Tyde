@@ -5,25 +5,30 @@ use wasm_bindgen_futures::spawn_local;
 use crate::app::{connect_one_host, refresh_configured_hosts};
 use crate::bridge::{self, HostTransportConfig as BridgeHostTransportConfig};
 use crate::send::send_frame;
-use crate::state::{AppState, DiffViewMode, NativeSettingsSaveState, ToolOutputMode};
+use crate::state::{
+    AppState, DiffViewMode, ManagedProjectionResetState, NativeSettingsSaveState, ToolOutputMode,
+};
 
 use protocol::{
     BackendConfigField, BackendConfigFieldType, BackendConfigPersistenceMode,
-    BackendConfigSnapshotStatus, BackendConfigValues, BackendKind, BackendNativeSettingsGroup,
-    BackendNativeSettingsGroupKind, BackendNativeSettingsSnapshot, BackendSetupAction,
-    BackendSetupInfo, BackendSetupStatus, BackgroundAgentFeature, BrokerUrl, CodeIntelProviderId,
-    CustomAgent, CustomAgentId, DiffContextMode, FrameKind, HostExecutablePath,
-    HostLaunchProfileConfig, HostSettingValue, LaunchProfileId, McpServerConfig, McpServerId,
-    McpTransportConfig, MobileAccessStatePayload, MobileBrokerStatus, MobileDeviceState,
-    MobilePairingOfferId, MobilePairingOfferPayload, MobilePairingState, ProjectId,
-    RunBackendSetupPayload, SessionSchemaEntry, SessionSettingField, SessionSettingFieldType,
-    SessionSettingValue, SessionSettingsSchema, SessionSettingsValues, SetSettingPayload, Skill,
-    SkillId, Steering, SteeringId, SteeringScope, ToolPolicy,
+    BackendConfigSnapshotStatus, BackendConfigValues, BackendKind, BackendNativeSettingsAdvisory,
+    BackendNativeSettingsGroup, BackendNativeSettingsGroupKind, BackendNativeSettingsProvenance,
+    BackendNativeSettingsSnapshot, BackendSetupAction, BackendSetupInfo, BackendSetupStatus,
+    BackgroundAgentFeature, BrokerUrl, CodeIntelProviderId, CommandErrorCode, CustomAgent,
+    CustomAgentId, DiffContextMode, FrameKind, HostExecutablePath, HostLaunchProfileConfig,
+    HostSettingValue, LaunchProfileId, McpServerConfig, McpServerId, McpTransportConfig,
+    MobileAccessStatePayload, MobileBrokerStatus, MobileDeviceState, MobilePairingOfferId,
+    MobilePairingOfferPayload, MobilePairingState, ProjectId, RunBackendSetupPayload,
+    SessionSchemaEntry, SessionSettingField, SessionSettingFieldType, SessionSettingValue,
+    SessionSettingsSchema, SessionSettingsValues, SetSettingPayload, Skill, SkillId, Steering,
+    SteeringId, SteeringScope, ToolPolicy, TycodeManagedProjectionRecoveryState,
+    TycodeProjectionId, TycodeProjectionSource, TycodeProjectionStateHash,
 };
 
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 
+use crate::components::backend_capacity::SubscriptionCapacitySection;
 use crate::components::session_settings::{
     SessionSettingsControls, clear_invalid_dependent_select_values,
 };
@@ -2052,6 +2057,7 @@ fn BackendsTab(active_page: RwSignal<SettingsPage>) -> impl IntoView {
             </div>
         </div>
 
+        <SubscriptionCapacitySection />
         <ComplexityTiersSection />
         <LaunchProfilesSection />
     }
@@ -2674,6 +2680,84 @@ fn update_tier_setting(
     );
 }
 
+/// Everything an armed managed-projection reset must carry, captured from the
+/// recovery card the user was actually shown.
+///
+/// The tokens are the pair the server requires to match its current state; a stale
+/// pair is a typed `Conflict` and removes nothing.
+///
+/// `host_id` is captured here, at arming time, and is **not** re-derived when the
+/// user confirms. The card belongs to one host, and the confirmation quotes that
+/// host's tokens — so resolving "the selected host" again at confirm time would
+/// aim a destructive command at whatever machine happened to be selected by then.
+/// A reset is the one action in settings that deletes data; it does not get to
+/// change its mind about its target between the warning and the click.
+#[derive(Clone, Debug, PartialEq)]
+struct PendingProjectionReset {
+    host_id: String,
+    projection_id: TycodeProjectionId,
+    state_hash: TycodeProjectionStateHash,
+}
+
+/// Is an armed reset still describing something that exists?
+///
+/// It stops being live the moment the user moves to another host, or the server
+/// republishes the projection with different tokens. In either case what the user
+/// consented to is gone, so the confirmation must not be actionable: consent to a
+/// warning about host A's wedged projection is not consent to touch host B's, and
+/// consent to reset projection `proj-A` is not consent to reset whatever replaced
+/// it.
+fn reset_arming_is_live(
+    state: &AppState,
+    kind: BackendKind,
+    armed: &PendingProjectionReset,
+) -> bool {
+    if state.selected_host_id.get().as_deref() != Some(armed.host_id.as_str()) {
+        return false;
+    }
+    let snapshots = state.backend_native_settings.get();
+    let Some(snapshot) = snapshots
+        .get(&armed.host_id)
+        .and_then(|by_kind| by_kind.get(&kind))
+    else {
+        return false;
+    };
+    let Some(TycodeManagedProjectionRecoveryState::ManagedProjectionResetRequired {
+        expected_projection_id,
+        expected_state_hash,
+        ..
+    }) = snapshot.managed_projection_recovery.as_ref()
+    else {
+        return false;
+    };
+    *expected_projection_id == armed.projection_id && *expected_state_hash == armed.state_hash
+}
+
+/// `SetSetting` addressed to one named host.
+///
+/// `send_host_setting` resolves whatever host is selected at the moment it runs,
+/// which is right for a control the user is looking at and wrong for a destructive
+/// command that was authorised some time ago against a specific host.
+fn send_host_setting_to(state: &AppState, host_id: &str, setting: HostSettingValue) {
+    let Some((host_id, host_stream)) = host_stream_with_id(state, host_id) else {
+        log::error!("send_host_setting_to: no stream for host {host_id}");
+        return;
+    };
+
+    spawn_local(async move {
+        if let Err(error) = send_frame(
+            &host_id,
+            host_stream,
+            FrameKind::SetSetting,
+            &SetSettingPayload { setting },
+        )
+        .await
+        {
+            log::error!("failed to send SetSetting: {error}");
+        }
+    });
+}
+
 /// One backend's settings page, reached from the Backends sidebar group. The
 /// page content is driven entirely by the server-owned schema, snapshot, and
 /// host-settings state for the selected host; fields are generated from the
@@ -2684,6 +2768,7 @@ fn BackendSettingsPage(kind: BackendKind) -> impl IntoView {
     let state = expect_context::<AppState>();
     let state_for_body = state.clone();
     let state_for_status = state.clone();
+    let state_for_reset = state.clone();
     // The selected native-settings group (by id) lives at the page level, not
     // inside the body closure, so it survives the body's reactive rerenders
     // (a save marking `native_settings_save_state` Pending, or a fresh snapshot
@@ -2692,6 +2777,26 @@ fn BackendSettingsPage(kind: BackendKind) -> impl IntoView {
     // page's view selection, and it resets when the user navigates to a
     // different backend page (a new `BackendSettingsPage` instance).
     let active_native_group = RwSignal::new(Option::<String>::None);
+    // Armed managed-projection reset, holding the exact tokens the server
+    // reported in the snapshot the user was looking at. It lives at the page
+    // level, like `active_native_group`, so a server refresh arriving mid-confirm
+    // does not tear the dialog down. It is view state, not a cache of server
+    // state: the recovery card itself is rendered only from the live snapshot,
+    // and `None` here means "no confirmation open", never "already reset".
+    let pending_reset = RwSignal::new(Option::<PendingProjectionReset>::None);
+    // The confirmation belongs to one card, on one host. If the user switches hosts
+    // while it is open, or the server republishes the projection with new tokens,
+    // the thing they were warned about is gone — so the arming goes with it and the
+    // dialog closes rather than sitting there quoting a state that no longer exists.
+    let state_for_arming = state.clone();
+    Effect::new(move |_| {
+        let Some(armed) = pending_reset.get() else {
+            return;
+        };
+        if !reset_arming_is_live(&state_for_arming, kind, &armed) {
+            pending_reset.set(None);
+        }
+    });
     let setup_info = move || {
         state_for_status
             .selected_host_backend_setup()
@@ -2731,7 +2836,75 @@ fn BackendSettingsPage(kind: BackendKind) -> impl IntoView {
 
         <p class="settings-description settings-panel-intro">{intro}</p>
 
-        {move || backend_page_body(&state_for_body, kind, active_native_group)}
+        {move || backend_page_body(&state_for_body, kind, active_native_group, pending_reset)}
+
+        // Explicit confirmation for the one action in this page that deletes
+        // data. Cancelling clears the arming signal and nothing is sent; the
+        // recovery card stays exactly as the server published it either way.
+        {move || {
+            pending_reset.get().map(|armed| {
+                let backend = backend_label(kind);
+                let confirm_state = state_for_reset.clone();
+                let on_cancel = Callback::new(move |()| pending_reset.set(None));
+                let on_confirm = Callback::new(move |()| {
+                    // Re-check the arming against live state before doing anything.
+                    // The effect above closes a stale dialog, but effects run after
+                    // render, so a confirm racing a host switch could still arrive
+                    // here. Nothing is sent in that case: the user's consent named a
+                    // host and a projection, and if either has moved, that consent
+                    // no longer describes anything that exists.
+                    if !reset_arming_is_live(&confirm_state, kind, &armed) {
+                        pending_reset.set(None);
+                        return;
+                    }
+                    // Record the attempt before sending, so the server's answer has
+                    // something to resolve and a refusal can be attributed to the
+                    // reset rather than lost in the global host status line. This
+                    // is not optimism: it says "sent, awaiting the server", and it
+                    // also clears any earlier refusal, so a stale one cannot sit
+                    // next to a fresh attempt. Nothing on screen claims the reset
+                    // happened — only the server can say that, by publishing a
+                    // snapshot that no longer carries the recovery state.
+                    //
+                    // Keyed by the *armed* host, never the currently selected one.
+                    confirm_state.managed_projection_reset.update(|by_host| {
+                        by_host
+                            .entry(armed.host_id.clone())
+                            .or_default()
+                            .insert(kind, ManagedProjectionResetState::Pending);
+                    });
+                    send_host_setting_to(
+                        &confirm_state,
+                        &armed.host_id,
+                        HostSettingValue::ResetTycodeManagedProjection {
+                            backend: kind,
+                            expected_projection_id: armed.projection_id.clone(),
+                            expected_state_hash: armed.state_hash.clone(),
+                        },
+                    );
+                    pending_reset.set(None);
+                });
+                view! {
+                    <SettingsConfirmDialog
+                        title=format!("Reset Tyde's managed {backend} settings")
+                        body=format!(
+                            "Tyde already tried to repair this from its own journal, and that did \
+                             not resolve it. Restarting Tyde retries the same repair, so it only \
+                             clears this if the cause was a transient filesystem failure \u{2014} \
+                             it is not guaranteed to. Resetting instead deletes Tyde's own copy \
+                             of your {backend} settings, its provenance, and its recovery \
+                             journal. Tyde builds a fresh copy the next time it probes {backend}, \
+                             so any {backend} settings you changed in Tyde since the copy was \
+                             made will be lost. Your {backend} CLI and VS Code settings file is \
+                             never touched \u{2014} Tyde does not write it."
+                        )
+                        confirm_label="Reset Tyde's copy".to_string()
+                        on_cancel=on_cancel
+                        on_confirm=on_confirm
+                    />
+                }
+            })
+        }}
     }
 }
 
@@ -2739,6 +2912,7 @@ fn backend_page_body(
     state: &AppState,
     kind: BackendKind,
     active_native_group: RwSignal<Option<String>>,
+    pending_reset: RwSignal<Option<PendingProjectionReset>>,
 ) -> AnyView {
     let Some(host_id) = state.selected_host_id.get() else {
         return view! {
@@ -2765,7 +2939,14 @@ fn backend_page_body(
             .and_then(|m| m.get(&kind))
             .cloned()
         {
-            return backend_native_settings_body(state, kind, &snapshot, active_native_group);
+            return backend_native_settings_body(
+                state,
+                &host_id,
+                kind,
+                &snapshot,
+                active_native_group,
+                pending_reset,
+            );
         }
         return view! {
             <p class="settings-description">
@@ -3484,17 +3665,417 @@ fn commit_native_setting(
     });
 }
 
-/// One backend's native settings page body. Explicit unavailable/ready states —
-/// current values never render as blank/default before the server publishes
-/// them, and an unavailable snapshot shows the server's own reason verbatim.
-fn backend_native_settings_body(
+/// The persistent ownership line for a server-managed native-settings
+/// projection. Shown for **every** managed snapshot, not only the first — the
+/// divergence between Tyde's copy and the backend's own file is permanent, so
+/// the disclosure is permanent too.
+///
+/// Both paths come from the typed provenance. Nothing here is hardcoded, parsed
+/// out of the settings document, or read from the server's message text.
+fn native_projection_ownership(
+    kind: BackendKind,
+    provenance: &BackendNativeSettingsProvenance,
+) -> AnyView {
+    let BackendNativeSettingsProvenance::TycodeManagedProjection {
+        managed_settings_path,
+        source_settings_path,
+        ..
+    } = provenance;
+    let backend = backend_label(kind);
+    view! {
+        <p class="settings-native-ownership">
+            {format!(
+                "Tyde keeps its own {backend} settings in {managed_settings_path}. \
+                 The {backend} CLI and VS Code extension use {source_settings_path}, \
+                 which Tyde never modifies."
+            )}
+        </p>
+    }
+    .into_any()
+}
+
+/// The one-time projection notice, rendered only while the server's typed
+/// provenance says `notice_pending`.
+///
+/// Dismissal sends `AcknowledgeTycodeProjectionNotice` carrying the projection
+/// id from the snapshot currently on screen, and **nothing is hidden locally**.
+/// The notice disappears only when the server publishes a refreshed snapshot
+/// with `notice_pending: false`. That is deliberate on both counts: a stale id
+/// is a server-side conflict, so hiding the notice optimistically would tell the
+/// user their acknowledgement stuck when the server may have rejected it, and
+/// re-reading the id from the live snapshot means a republished projection can
+/// never be acknowledged with a cached, stale one.
+fn native_projection_notice(
+    state: &AppState,
+    kind: BackendKind,
+    provenance: &BackendNativeSettingsProvenance,
+) -> Option<AnyView> {
+    let BackendNativeSettingsProvenance::TycodeManagedProjection {
+        managed_settings_path,
+        source_settings_path,
+        source,
+        tycode_version,
+        projection_id,
+        notice_pending,
+        ..
+    } = provenance;
+
+    if !notice_pending {
+        return None;
+    }
+
+    let backend = backend_label(kind);
+    let origin = match source {
+        TycodeProjectionSource::SharedSettings => format!(
+            "Tyde read {source_settings_path} once to create {managed_settings_path}, then \
+             normalized that copy with {backend} {tycode_version}."
+        ),
+        TycodeProjectionSource::Defaults => format!(
+            "Tyde created {managed_settings_path} from {backend} {tycode_version} defaults, \
+             because {source_settings_path} did not exist."
+        ),
+    };
+
+    let ack_state = state.clone();
+    let ack_id = projection_id.clone();
+    let on_dismiss = move |_| {
+        send_host_setting(
+            &ack_state,
+            HostSettingValue::AcknowledgeTycodeProjectionNotice {
+                backend: kind,
+                projection_id: ack_id.clone(),
+            },
+        );
+    };
+
+    Some(
+        view! {
+            <div class="settings-native-notice" role="status">
+                <p class="settings-native-notice-title">
+                    {format!("Tyde made its own copy of your {backend} settings")}
+                </p>
+                <p class="settings-native-notice-text">{origin}</p>
+                // Every claim below is about *Tyde's own behaviour*, which is
+                // durable and always true. The earlier copy said the original was
+                // "unchanged" and that unmodellable settings were "still there in
+                // your original file" — but `original_unchanged` is established
+                // once at creation and Tyde never re-reads the shared file
+                // afterwards, so those were present-tense claims about a file Tyde
+                // no longer observes. The user, the CLI, or the VS Code extension
+                // can change it at any time and Tyde would never know.
+                <p class="settings-native-notice-text">
+                    {format!(
+                        "Tyde never writes {source_settings_path}. The {backend} CLI and the VS \
+                         Code extension keep using that file; Tyde only ever reads it."
+                    )}
+                </p>
+                <p class="settings-native-notice-text">
+                    {format!(
+                        "Tyde's copy holds only what {backend} {tycode_version} can model. \
+                         Anything it cannot model is simply absent from Tyde's copy \u{2014} Tyde \
+                         did not remove it from {source_settings_path}."
+                    )}
+                </p>
+                <button
+                    type="button"
+                    class="settings-native-notice-dismiss"
+                    on:click=on_dismiss
+                >
+                    "Got it"
+                </button>
+            </div>
+        }
+        .into_any(),
+    )
+}
+
+/// One typed, server-classified advisory.
+///
+/// A `Ready` snapshot stays Ready **and editable** while these are present: the
+/// advisory is the diagnosis and editing the settings below is the remedy, so
+/// none of these disables a control. Each variant is matched by type; the
+/// server's message is rendered verbatim and is never parsed to decide what to
+/// show.
+fn native_advisory_view(kind: BackendKind, advisory: &BackendNativeSettingsAdvisory) -> AnyView {
+    let backend = backend_label(kind);
+    match advisory {
+        BackendNativeSettingsAdvisory::NoProviderConfigured { message } => view! {
+            <div
+                class="settings-native-advisory settings-native-advisory-no-provider"
+                role="status"
+            >
+                <p class="settings-native-advisory-title">"No provider configured"</p>
+                <p class="settings-native-advisory-text">{message.clone()}</p>
+            </div>
+        }
+        .into_any(),
+        // Names the provider *key* and nothing else: never its stored
+        // configuration, never a credential.
+        //
+        // Two corrections live here, both from review.
+        //
+        // `role="status"`, not `role="alert"`: the banner survives every
+        // post-save refresh for the whole length of the remedy, and an assertive
+        // live region would re-announce it on each one — interrupting the very
+        // screen-reader user who is part-way through fixing it.
+        //
+        // And every claim is about *Tyde's own behaviour*. It must not say the
+        // shared file "still contains" the provider: Tyde reads that file exactly
+        // once, when it creates its copy, and never looks at it again. The user,
+        // the CLI, or the VS Code extension may have removed the provider from it
+        // last week and Tyde would have no idea. "Tyde did not remove it" and
+        // "Tyde never writes that file" are things Tyde can actually vouch for.
+        BackendNativeSettingsAdvisory::UnsupportedActiveProvider { provider, message } => view! {
+            <div
+                class="settings-native-advisory settings-native-advisory-unsupported"
+                role="status"
+            >
+                <p class="settings-native-advisory-title">
+                    {format!("Active provider \u{201c}{provider}\u{201d} is not supported")}
+                </p>
+                <p class="settings-native-advisory-text">
+                    {format!(
+                        "{backend} cannot model \u{201c}{provider}\u{201d} in Tyde's managed copy \
+                         of your settings, so that copy carries no configuration for it. Tyde did \
+                         not remove it, and Tyde never writes your {backend} CLI and VS Code \
+                         settings file. Choose a supported provider below \u{2014} these controls \
+                         stay editable."
+                    )}
+                </p>
+                <p class="settings-native-advisory-text">{message.clone()}</p>
+            </div>
+        }
+        .into_any(),
+        BackendNativeSettingsAdvisory::BackendReported { message } => view! {
+            <div class="settings-native-advisory settings-native-advisory-backend" role="status">
+                <p class="settings-native-advisory-title">{format!("{backend} reported")}</p>
+                <p class="settings-native-advisory-text">{message.clone()}</p>
+            </div>
+        }
+        .into_any(),
+    }
+}
+
+/// The typed managed-projection recovery state.
+///
+/// Rendered **only** from `TycodeManagedProjectionRecoveryState::ManagedProjectionResetRequired`
+/// — the UI never reconstructs "a reset is needed" from paths, files, message
+/// text, or a failed save.
+///
+/// The copy is careful about the restart, because the server reaches this state
+/// only *after* its own journal recovery has already failed, and a restart
+/// replays that same journal against the same on-disk state. So a restart is
+/// offered first — it is the non-destructive option, and it does clear the state
+/// if the cause was a transient filesystem failure — but it is offered as a
+/// qualified retry, never as the guaranteed lossless repair the card used to
+/// promise. Promising a repair the runtime has already attempted and failed is
+/// the same class of untruth as claiming what the shared file currently holds.
+///
+/// Reset itself is gated behind an explicit confirmation (see
+/// `BackendSettingsPage`) because it is the one place Tyde deletes data. It
+/// deletes only Tyde's own artifacts, and the copy is lazily re-derived on the
+/// next probe — which is exactly why Tyde-side edits are lost, and why the
+/// warning has to say so.
+///
+/// Like the notice, **nothing here is hidden locally.** The card disappears only
+/// when the server publishes a snapshot without a recovery state. A stale
+/// projection id or state hash is a typed `Conflict`: the server removes nothing
+/// and the card stays up, rather than the UI implying a reset that did not
+/// happen.
+fn native_projection_reset(
+    state: &AppState,
+    host_id: &str,
+    kind: BackendKind,
+    recovery: &TycodeManagedProjectionRecoveryState,
+    pending_reset: RwSignal<Option<PendingProjectionReset>>,
+) -> AnyView {
+    let TycodeManagedProjectionRecoveryState::ManagedProjectionResetRequired {
+        reason,
+        expected_projection_id,
+        expected_state_hash,
+    } = recovery;
+    let backend = backend_label(kind);
+
+    // The server's answer to the last reset, if it has given one. Read from the
+    // same signal graph as the card, so a refusal appears the moment the
+    // dispatcher records it and goes away when the server publishes a snapshot
+    // without the recovery state.
+    //
+    // It has to be *here*, on the card. A rejected reset is otherwise reported
+    // only in the global host status line in the far corner of the window — so
+    // from the point of action the button looks like it did nothing, which is the
+    // one impression a destructive control must never give.
+    //
+    // Keyed by the host this card was rendered for — the one passed in — never by
+    // re-reading the selection. This card *is* that host's card.
+    let refusal = state
+        .managed_projection_reset
+        .get()
+        .get(host_id)
+        .and_then(|by_kind| by_kind.get(&kind))
+        .cloned()
+        .and_then(|outcome| match outcome {
+            ManagedProjectionResetState::Refused { code, message } => Some((code, message)),
+            // Sent, unanswered. Nothing is claimed either way until the server
+            // speaks — and the action stays live, so a lost answer never wedges
+            // the user out of retrying.
+            ManagedProjectionResetState::Pending => None,
+        })
+        .map(|(code, message)| {
+            // Only a typed `Conflict` carries the server's guarantee: it compared
+            // the tokens against what it currently holds, found them stale, and
+            // refused *before* removing anything. No other code lets us promise
+            // that, so for any other code we say only what the server said.
+            let nothing_removed = matches!(code, CommandErrorCode::Conflict).then_some(
+                "Nothing was deleted. The projection changed after this reset was offered, so \
+                 the tokens no longer matched and the server refused before touching anything. \
+                 The state above is the server's current one \u{2014} resetting again will use \
+                 it.",
+            );
+            // `alert`, not `status`: this is the direct answer to something the
+            // user just did, and it must interrupt. That is the opposite case from
+            // the persistent provider advisory, which is `status` precisely because
+            // it is present on every snapshot and would re-announce forever.
+            view! {
+                <div class="settings-native-reset-refusal" role="alert">
+                    <p class="settings-native-reset-refusal-title">"Reset refused"</p>
+                    <p class="settings-native-reset-refusal-text">{message}</p>
+                    {nothing_removed.map(|text| {
+                        view! { <p class="settings-native-reset-refusal-text">{text}</p> }
+                    })}
+                </div>
+            }
+        });
+
+    // Exactly what the user is being shown, captured whole: the host this card
+    // belongs to, and the two tokens the server reported for it. All three travel
+    // into the confirmation together, so the command resets precisely the state the
+    // user was warned about — never whatever host is selected, or whatever tokens
+    // the server holds, by the time they click Confirm. If the server has moved on,
+    // the tokens are stale, the reset is a typed `Conflict`, and nothing is removed;
+    // if the *host* has moved on, the confirmation is no longer live at all and
+    // nothing is sent.
+    let armed = PendingProjectionReset {
+        host_id: host_id.to_owned(),
+        projection_id: expected_projection_id.clone(),
+        state_hash: expected_state_hash.clone(),
+    };
+    let on_reset = move |_| pending_reset.set(Some(armed.clone()));
+
+    view! {
+        <div class="settings-native-reset" role="status">
+            <p class="settings-native-reset-title">
+                {format!("Tyde's managed {backend} settings need recovery")}
+            </p>
+            <p class="settings-native-reset-text">{reason.clone()}</p>
+            <p class="settings-native-reset-text">
+                {"Tyde already tried to repair this from its own journal, and that did not \
+                  resolve it. Restarting Tyde retries the same repair, so it only clears this \
+                  if the cause was a transient filesystem failure \u{2014} it is not \
+                  guaranteed to. If this state remains after a restart, reset Tyde's copy."
+                    .to_string()}
+            </p>
+            {refusal}
+            <button
+                type="button"
+                class="settings-native-reset-action"
+                on:click=on_reset
+            >
+                {format!("Reset Tyde's managed {backend} settings\u{2026}")}
+            </button>
+        </div>
+    }
+    .into_any()
+}
+
+/// Typed, server-owned disclosures for a Ready native-settings snapshot: the
+/// recovery state, the persistent ownership line, the one-time projection
+/// notice, and every advisory.
+///
+/// All of it is a projection of `provenance` and `advisories` alone. A snapshot
+/// carrying neither — every legacy backend, and Tycode before the managed
+/// projection exists — renders nothing here.
+///
+/// Recovery is deliberately *not* handled here. It is published only alongside
+/// `Unavailable`, which returns before this is ever called, so a recovery arm in
+/// this function is unreachable by construction — which is precisely how the
+/// reset card came to ship as code no user could reach. It is rendered on the
+/// unavailable path instead, in `backend_native_settings_body`.
+fn native_settings_disclosures(
     state: &AppState,
     kind: BackendKind,
     snapshot: &BackendNativeSettingsSnapshot,
+) -> Option<AnyView> {
+    let ownership = snapshot
+        .provenance
+        .as_ref()
+        .map(|provenance| native_projection_ownership(kind, provenance));
+    let notice = snapshot
+        .provenance
+        .as_ref()
+        .and_then(|provenance| native_projection_notice(state, kind, provenance));
+    let advisories = snapshot
+        .advisories
+        .iter()
+        .map(|advisory| native_advisory_view(kind, advisory))
+        .collect::<Vec<_>>();
+
+    if ownership.is_none() && notice.is_none() && advisories.is_empty() {
+        return None;
+    }
+
+    Some(
+        view! {
+            <div class="settings-native-disclosures">
+                {ownership}
+                {notice}
+                {advisories}
+            </div>
+        }
+        .into_any(),
+    )
+}
+
+/// One backend's native settings page body. Explicit unavailable/ready states —
+/// current values never render as blank/default before the server publishes
+/// them, and an unavailable snapshot shows the server's own reason verbatim.
+///
+/// An unavailable snapshot that also carries a typed recovery state shows the
+/// reset card in place of that bare paragraph. That is the shape the server
+/// actually publishes for a wedged managed projection, and the card is the only
+/// exit from it; it still renders no value or edit controls.
+fn backend_native_settings_body(
+    state: &AppState,
+    host_id: &str,
+    kind: BackendKind,
+    snapshot: &BackendNativeSettingsSnapshot,
     active_native_group: RwSignal<Option<String>>,
+    pending_reset: RwSignal<Option<PendingProjectionReset>>,
 ) -> AnyView {
     match snapshot.status {
         BackendConfigSnapshotStatus::Unavailable => {
+            // Recovery is only ever published *with* `Unavailable`. The server has
+            // exactly one recovery-snapshot construction (`server/src/backend/
+            // tycode.rs`) and it pairs `ManagedProjectionResetRequired` with
+            // `settings: None`, `groups: []`, and `message: Some(reason.clone())`.
+            //
+            // So the reset card has to render here, on the unavailable path, ahead
+            // of this early return. Reaching it only from `native_settings_
+            // disclosures` — which is what it did — meant it never rendered at all:
+            // an unavailable snapshot returns long before the disclosures, leaving
+            // the user a bare reason paragraph and no way out of the one state that
+            // exists to be escaped.
+            //
+            // Nothing editable appears on this path either way. There are no
+            // settings and no groups on the snapshot to draw, and the card's only
+            // control is the reset action itself.
+            if let Some(recovery) = snapshot.managed_projection_recovery.as_ref() {
+                // The card carries `reason` verbatim — the same string the server
+                // puts in `message` for this snapshot — so the unavailable reason is
+                // still stated, once, and the card adds the exit the bare paragraph
+                // never had.
+                return native_projection_reset(state, host_id, kind, recovery, pending_reset);
+            }
             let message = snapshot.message.clone().unwrap_or_else(|| {
                 format!(
                     "{}'s native settings are unavailable on the selected host.",
@@ -3511,21 +4092,33 @@ fn backend_native_settings_body(
         BackendConfigSnapshotStatus::Ready => {}
     }
 
+    // Server-owned disclosures. `Ready` is authoritative and editable even when
+    // advisories are present, so these never gate the controls below — the
+    // read-only state comes from `status: Unavailable` above and from nothing
+    // else. Never inferred from the message text or the settings document.
+    let disclosures = native_settings_disclosures(state, kind, snapshot);
+
     let Some(settings) = snapshot.settings.clone() else {
         // Ready but no document — never fabricate defaults; say so explicitly.
         return view! {
-            <p class="settings-description">
-                "This backend reported its native settings are ready but sent no current values."
-            </p>
+            <div class="settings-native-settings">
+                {disclosures}
+                <p class="settings-description">
+                    "This backend reported its native settings are ready but sent no current values."
+                </p>
+            </div>
         }
         .into_any();
     };
 
     if snapshot.groups.is_empty() {
         return view! {
-            <p class="settings-description">
-                "This backend exposes native settings but no editable groups."
-            </p>
+            <div class="settings-native-settings">
+                {disclosures}
+                <p class="settings-description">
+                    "This backend exposes native settings but no editable groups."
+                </p>
+            </div>
         }
         .into_any();
     }
@@ -3570,6 +4163,7 @@ fn backend_native_settings_body(
         let group = native_settings_group(state, kind, ordered[0], &settings, saving);
         return view! {
             <div class="settings-native-settings">
+                {disclosures}
                 {error_banner}
                 {saving_banner}
                 {group}
@@ -3649,6 +4243,7 @@ fn backend_native_settings_body(
 
     view! {
         <div class="settings-native-settings">
+            {disclosures}
             {error_banner}
             {saving_banner}
             <div class="settings-native-tabs" role="tablist">{tabs}</div>
@@ -5211,6 +5806,25 @@ fn validate_tool_policy_tools(tools: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The shared confirmation for every destructive settings flow: deleting a launch
+/// profile, a custom agent, an MCP server, or a steering entry, and resetting
+/// Tyde's managed projection.
+///
+/// All five are irreversible, so this is a real modal dialog rather than a styled
+/// `<div>`. It announces itself (`role="alertdialog"`, `aria-modal`, and its
+/// title and warning wired up as the accessible name and description), it takes
+/// focus — onto **Cancel**, never onto the destructive button — it traps Tab
+/// between its two controls, Escape cancels, and focus returns to whatever opened
+/// it when it closes.
+///
+/// None of that used to be true. The keydown handler sat on the overlay and
+/// nothing ever focused the overlay, so Escape was dead; focus stayed on the
+/// button behind the modal, so Tab walked straight into the page underneath. For
+/// an irreversible action the combination is sharp: with no announcement and no
+/// trap, a keyboard user could tab blindly onto "Reset Tyde's copy" — a
+/// `settings-btn-danger` — without ever being told a confirmation had opened.
+///
+/// The mouse flows are unchanged: the backdrop and Cancel both cancel.
 #[component]
 fn SettingsConfirmDialog(
     title: String,
@@ -5219,14 +5833,88 @@ fn SettingsConfirmDialog(
     on_cancel: Callback<()>,
     on_confirm: Callback<()>,
 ) -> impl IntoView {
+    // The accessible name and description are wired by id, so they have to be
+    // unique per dialog instance. Each id is bound twice up front — once for the
+    // element that owns it, once for the reference on the dialog — because the
+    // `view!` macro builds children before it applies the parent's attributes.
+    let title_id = generate_id();
+    let body_id = generate_id();
+    let labelled_by = title_id.clone();
+    let described_by = body_id.clone();
+
+    let cancel_ref = NodeRef::<leptos::html::Button>::new();
+    let confirm_ref = NodeRef::<leptos::html::Button>::new();
+
+    // Whatever holds focus right now — captured here, at construction, while it is
+    // still the control the user activated to open this dialog. Capturing inside
+    // the mount effect below would be too late: focus has moved to Cancel by then,
+    // and a re-run would record Cancel as its own opener. `web_sys` elements are
+    // not `Send`, hence the local storage.
+    let opener: StoredValue<Option<web_sys::HtmlElement>, LocalStorage> = StoredValue::new_local(
+        web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.active_element())
+            .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok()),
+    );
+
+    Effect::new(move |_| {
+        if let Some(cancel) = cancel_ref.get() {
+            // The safe landing. A destructive action is never the initial focus
+            // target, so a keyboard user cannot confirm one by reflex.
+            let _ = cancel.focus();
+        }
+    });
+
+    // …and on close, focus goes back where it came from.
+    on_cleanup(move || {
+        if let Some(opener) = opener.get_value() {
+            let _ = opener.focus();
+        }
+    });
+
     let cancel_on_backdrop = on_cancel;
     let on_backdrop = move |_| cancel_on_backdrop.run(());
 
     let cancel_on_keydown = on_cancel;
-    let on_keydown = move |ev: web_sys::KeyboardEvent| {
-        if ev.key() == "Escape" {
+    let on_keydown = move |ev: web_sys::KeyboardEvent| match ev.key().as_str() {
+        "Escape" => {
+            // A modal owns Escape outright. Without `stop_propagation` the event
+            // carried on up to the app's global `window` keydown listener, whose
+            // Escape arm closes the Settings overlay — so one Escape cancelled the
+            // dialog *and* tore down the page behind it. The recovery card went
+            // with it, and focus fell to `<body>`, because the opener this dialog
+            // restores focus to had been unmounted along with the panel.
+            ev.prevent_default();
+            ev.stop_propagation();
             cancel_on_keydown.run(());
         }
+        // The dialog has exactly two focusable controls, so the trap is a cycle
+        // between them: Tab off the last wraps to the first, Shift+Tab off the
+        // first wraps to the last. Anything else and Tab leaves a modal that is
+        // covering the page.
+        "Tab" => {
+            let (Some(cancel), Some(confirm)) = (cancel_ref.get(), confirm_ref.get()) else {
+                return;
+            };
+            let active = web_sys::window()
+                .and_then(|w| w.document())
+                .and_then(|d| d.active_element());
+            let focused = |button: &web_sys::HtmlButtonElement| {
+                active
+                    .as_ref()
+                    .is_some_and(|el| el.is_same_node(Some(button.unchecked_ref())))
+            };
+            if ev.shift_key() {
+                if focused(&cancel) {
+                    ev.prevent_default();
+                    let _ = confirm.focus();
+                }
+            } else if focused(&confirm) {
+                ev.prevent_default();
+                let _ = cancel.focus();
+            }
+        }
+        _ => {}
     };
 
     let cancel_on_click = on_cancel;
@@ -5236,13 +5924,34 @@ fn SettingsConfirmDialog(
     let on_confirm_click = move |_| confirm_on_click.run(());
 
     view! {
-        <div class="settings-confirm-overlay" on:click=on_backdrop on:keydown=on_keydown tabindex="0">
-            <div class="settings-confirm-modal" on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()>
-                <h3 class="settings-confirm-title">{title}</h3>
-                <p class="settings-confirm-description">{body}</p>
+        <div class="settings-confirm-overlay" on:click=on_backdrop>
+            <div
+                class="settings-confirm-modal settings-confirm-danger"
+                role="alertdialog"
+                aria-modal="true"
+                aria-labelledby=labelled_by
+                aria-describedby=described_by
+                tabindex="-1"
+                on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()
+                on:keydown=on_keydown
+            >
+                <h3 class="settings-confirm-title" id=title_id>{title}</h3>
+                <p class="settings-confirm-description" id=body_id>{body}</p>
                 <div class="settings-form-footer">
-                    <button class="settings-btn" on:click=on_cancel_click>"Cancel"</button>
-                    <button class="settings-btn settings-btn-danger" on:click=on_confirm_click>
+                    <button
+                        type="button"
+                        class="settings-btn"
+                        node_ref=cancel_ref
+                        on:click=on_cancel_click
+                    >
+                        "Cancel"
+                    </button>
+                    <button
+                        type="button"
+                        class="settings-btn settings-btn-danger"
+                        node_ref=confirm_ref
+                        on:click=on_confirm_click
+                    >
                         {confirm_label}
                     </button>
                 </div>
@@ -6575,7 +7284,10 @@ mod wasm_tests {
     use super::*;
     use crate::state::AppState;
     use leptos::mount::mount_to;
-    use protocol::SelectOption;
+    // Only the tests construct command-error payloads, so this stays out of the
+    // production import list — where it would be an unused import on any target that
+    // compiles the crate without the wasm test module.
+    use protocol::{HostSettingErrorTarget, SelectOption};
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
     use web_sys::{HtmlElement, HtmlInputElement, HtmlOptionElement, HtmlSelectElement};
@@ -9810,7 +10522,516 @@ mod wasm_tests {
                 },
             ],
             message: None,
+            provenance: None,
+            advisories: Vec::new(),
+            managed_projection_recovery: None,
         }
+    }
+
+    // ── Tycode managed-projection fixtures ──────────────────────────────────
+    //
+    // Every value here is server-owned typed state. The UI must render these and
+    // nothing else — it may not parse the settings document, read the message
+    // text, or keep any local dismissal state.
+
+    fn tycode_provenance(
+        projection_id: &str,
+        notice_pending: bool,
+    ) -> BackendNativeSettingsProvenance {
+        BackendNativeSettingsProvenance::TycodeManagedProjection {
+            managed_settings_path: protocol::HostAbsPath(
+                "/home/dev/.tycode/tyde-settings.toml".to_owned(),
+            ),
+            source_settings_path: protocol::HostAbsPath(
+                "/home/dev/.tycode/settings.toml".to_owned(),
+            ),
+            source: TycodeProjectionSource::SharedSettings,
+            tycode_version: protocol::Version {
+                major: 0,
+                minor: 10,
+                patch: 0,
+            },
+            projection_id: protocol::types::TycodeProjectionId(projection_id.to_owned()),
+            created_at_ms: 1_760_000_000_000,
+            source_digest: protocol::types::TycodeProjectionSourceDigest(
+                "sha256:abc123".to_owned(),
+            ),
+            original_unchanged: true,
+            notice_pending,
+        }
+    }
+
+    /// The Ready grouped snapshot plus server-owned managed provenance and any
+    /// advisories. The settings document is unchanged, so the existing masking,
+    /// grouping, and save behaviour is exercised alongside the new disclosures.
+    fn tycode_managed_snapshot(
+        provenance: BackendNativeSettingsProvenance,
+        advisories: Vec<BackendNativeSettingsAdvisory>,
+    ) -> BackendNativeSettingsSnapshot {
+        BackendNativeSettingsSnapshot {
+            provenance: Some(provenance),
+            advisories,
+            ..tycode_ready_snapshot()
+        }
+    }
+
+    /// Replace the Tycode native snapshot the server has published, exactly as a
+    /// refreshed `BackendConfigSnapshots` frame would.
+    fn publish_tycode_snapshot(state: &AppState, snapshot: BackendNativeSettingsSnapshot) {
+        state.backend_native_settings.update(|m| {
+            m.entry("host-tyc-native".to_owned())
+                .or_default()
+                .insert(BackendKind::Tycode, snapshot);
+        });
+    }
+
+    /// Every `acknowledge_tycode_projection_notice` SetSetting payload, oldest first.
+    fn recorded_notice_acks(calls: &js_sys::Array) -> Vec<serde_json::Value> {
+        recorded_set_setting_payloads(calls)
+            .into_iter()
+            .filter(|s| {
+                s.get("kind").and_then(|k| k.as_str())
+                    == Some("acknowledge_tycode_projection_notice")
+            })
+            .collect()
+    }
+
+    /// Phrases that assert something about the **current contents** of the shared
+    /// CLI / VS Code settings file.
+    ///
+    /// Tyde reads that file exactly once — while building its managed copy — and
+    /// never looks at it again. Any present-tense claim about what it holds today
+    /// is therefore unverifiable, and in a disclosure surface an unverifiable
+    /// claim about the user's own data is simply a false one. Disclosure copy may
+    /// only vouch for Tyde's own behaviour ("Tyde never writes it", "Tyde did not
+    /// remove it"), which is durable and always true.
+    const UNVERIFIABLE_SHARED_FILE_CLAIMS: [&str; 6] = [
+        "still contains",
+        "still has",
+        "still there",
+        "untouched",
+        "is unchanged",
+        "remains unchanged",
+    ];
+
+    fn assert_no_unverifiable_shared_file_claim(text: &str, surface: &str) {
+        for claim in UNVERIFIABLE_SHARED_FILE_CLAIMS {
+            assert!(
+                !text.contains(claim),
+                "{surface} must not claim what the shared settings file currently holds \
+                 \u{2014} Tyde reads it once at creation and never again. Found {claim:?} in: \
+                 {text:?}"
+            );
+        }
+    }
+
+    /// The host id `install_tycode_native_host` installs on, and selects.
+    const TYCODE_HOST: &str = "host-tyc-native";
+
+    /// A *second* connected Tycode host, wedged in its own right — so a host switch
+    /// has somewhere to go, and "did anything target the wrong host?" has teeth.
+    /// Does not touch the selection.
+    fn install_second_tycode_host(
+        state: &AppState,
+        host_id: &str,
+        snapshot: BackendNativeSettingsSnapshot,
+    ) {
+        state.host_streams.update(|m| {
+            m.insert(
+                host_id.to_owned(),
+                protocol::StreamPath(format!("/host/{host_id}")),
+            );
+        });
+        state.connection_statuses.update(|m| {
+            m.insert(
+                host_id.to_owned(),
+                crate::state::ConnectionStatus::Connected,
+            );
+        });
+        state.host_settings_by_host.update(|m| {
+            m.insert(
+                host_id.to_owned(),
+                host_settings_with_hermes_config(
+                    std::collections::HashMap::new(),
+                    vec![BackendKind::Tycode],
+                ),
+            );
+        });
+        state.backend_setup_by_host.update(|m| {
+            m.insert(
+                host_id.to_owned(),
+                vec![backend_setup_info(
+                    BackendKind::Tycode,
+                    BackendSetupStatus::Installed,
+                )],
+            );
+        });
+        state.backend_native_settings.update(|m| {
+            m.entry(host_id.to_owned())
+                .or_default()
+                .insert(BackendKind::Tycode, snapshot);
+        });
+    }
+
+    /// Open the confirmation from the recovery card and confirm it.
+    async fn arm_and_confirm_reset(container: &HtmlElement) {
+        let action: HtmlElement = container
+            .query_selector(".settings-native-reset-action")
+            .unwrap()
+            .expect("the recovery card must offer a reset action")
+            .dyn_into()
+            .unwrap();
+        action.click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        find_button_by_text(container, "Reset Tyde's copy")
+            .expect("the confirmation must open")
+            .click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+    }
+
+    /// A typed `CommandError`, dispatched through the real dispatcher exactly as the
+    /// server sends one.
+    ///
+    /// `seq` must start at 0 for each host and advance by one: `prime_host_for_tests`
+    /// forgets the host's counters, and the inbound validator **drops** any envelope
+    /// whose seq is not the one it expects (and marks the connection desynced), so an
+    /// off-by-one here silently delivers nothing.
+    fn dispatch_command_error(
+        state: &AppState,
+        host_id: &str,
+        seq: u64,
+        request_kind: FrameKind,
+        setting_target: Option<HostSettingErrorTarget>,
+        code: CommandErrorCode,
+        message: &str,
+    ) {
+        let stream = protocol::StreamPath(format!("/host/{host_id}"));
+        let envelope = protocol::Envelope::from_payload(
+            stream.clone(),
+            FrameKind::CommandError,
+            seq,
+            &protocol::CommandErrorPayload {
+                stream,
+                request_kind,
+                setting_target,
+                operation: "set_setting".to_owned(),
+                code,
+                message: message.to_owned(),
+                fatal: false,
+            },
+        )
+        .expect("envelope serialize");
+        crate::dispatch::dispatch_envelope(state, host_id, envelope);
+    }
+
+    /// The error the server sends for a *rejected reset*: a `SetSetting` failure
+    /// carrying the typed `ResetTycodeManagedProjection` target. This exact shape,
+    /// and nothing else, is this command's answer.
+    fn dispatch_reset_error(state: &AppState, seq: u64, code: CommandErrorCode, message: &str) {
+        dispatch_command_error(
+            state,
+            TYCODE_HOST,
+            seq,
+            FrameKind::SetSetting,
+            Some(HostSettingErrorTarget::ResetTycodeManagedProjection),
+            code,
+            message,
+        );
+    }
+
+    /// The typed reset outcome the dispatcher recorded for a host's Tycode backend.
+    fn reset_state(state: &AppState, host_id: &str) -> Option<ManagedProjectionResetState> {
+        state
+            .managed_projection_reset
+            .get_untracked()
+            .get(host_id)
+            .and_then(|by_kind| by_kind.get(&BackendKind::Tycode))
+            .cloned()
+    }
+
+    /// The native-save state the dispatcher recorded for a host's Tycode backend.
+    fn native_save_state(state: &AppState, host_id: &str) -> Option<NativeSettingsSaveState> {
+        state
+            .native_settings_save_state
+            .get_untracked()
+            .get(host_id)
+            .and_then(|by_kind| by_kind.get(&BackendKind::Tycode))
+            .cloned()
+    }
+
+    /// Mark a native save in flight, exactly as the settings page does when it sends
+    /// one: `base` is the settings document the save was applied to.
+    fn mark_native_save_pending(state: &AppState, host_id: &str) {
+        let base = state
+            .backend_native_settings
+            .get_untracked()
+            .get(host_id)
+            .and_then(|by_kind| by_kind.get(&BackendKind::Tycode))
+            .and_then(|snapshot| snapshot.settings.clone())
+            .expect("the host must have an installed snapshot to save against");
+        state.native_settings_save_state.update(|states| {
+            states.entry(host_id.to_owned()).or_default().insert(
+                BackendKind::Tycode,
+                NativeSettingsSaveState::Pending { base },
+            );
+        });
+    }
+
+    fn tycode_reset_required(
+        reason: &str,
+        projection_id: &str,
+        state_hash: &str,
+    ) -> TycodeManagedProjectionRecoveryState {
+        TycodeManagedProjectionRecoveryState::ManagedProjectionResetRequired {
+            reason: reason.to_owned(),
+            expected_projection_id: TycodeProjectionId(projection_id.to_owned()),
+            expected_state_hash: TycodeProjectionStateHash(state_hash.to_owned()),
+        }
+    }
+
+    /// The recovery snapshot **exactly as the server publishes it**.
+    ///
+    /// `server/src/backend/tycode.rs` has one — and only one — construction site
+    /// for `managed_projection_recovery: Some(..)`, and it pairs the recovery
+    /// state with `status: Unavailable`, `settings: None`, `groups: []`, no
+    /// provenance, no advisories, and `message: Some(reason.clone())`. A `Ready`
+    /// snapshot carrying a recovery state does not exist.
+    ///
+    /// An earlier version of this fixture built one anyway, on a `Ready` base.
+    /// That is precisely why these tests stayed green while the reset card was
+    /// unreachable in production: the page early-returns on `Unavailable`, so the
+    /// card — reached only from the Ready disclosures — never rendered for the
+    /// snapshot a real user gets. A fixture the server cannot emit does not test
+    /// the product; it tests the fixture. This one is the server's shape, and it
+    /// is the only recovery snapshot constructible here.
+    fn tycode_recovery_snapshot(
+        recovery: TycodeManagedProjectionRecoveryState,
+    ) -> BackendNativeSettingsSnapshot {
+        let TycodeManagedProjectionRecoveryState::ManagedProjectionResetRequired { reason, .. } =
+            &recovery;
+        let reason = reason.clone();
+        BackendNativeSettingsSnapshot {
+            backend_kind: BackendKind::Tycode,
+            status: BackendConfigSnapshotStatus::Unavailable,
+            settings: None,
+            groups: Vec::new(),
+            message: Some(reason),
+            provenance: None,
+            advisories: Vec::new(),
+            managed_projection_recovery: Some(recovery),
+        }
+    }
+
+    /// Every `reset_tycode_managed_projection` SetSetting payload, oldest first.
+    fn recorded_resets(calls: &js_sys::Array) -> Vec<serde_json::Value> {
+        recorded_set_setting_payloads(calls)
+            .into_iter()
+            .filter(|s| {
+                s.get("kind").and_then(|k| k.as_str()) == Some("reset_tycode_managed_projection")
+            })
+            .collect()
+    }
+
+    fn confirm_dialog(container: &HtmlElement) -> Option<HtmlElement> {
+        container
+            .query_selector(".settings-confirm-modal")
+            .unwrap()
+            .map(|el| el.dyn_into().unwrap())
+    }
+
+    // ── Destructive-confirmation accessibility ──────────────────────────────
+    //
+    // `SettingsConfirmDialog` is shared by every irreversible settings action:
+    // deleting a launch profile, a custom agent, an MCP server, or a steering
+    // entry, and resetting Tyde's managed projection. The contract below is
+    // asserted against two of those flows, because it is the *component* that has
+    // to hold it, not one caller.
+
+    fn active_element() -> Option<web_sys::Element> {
+        web_sys::window()?.document()?.active_element()
+    }
+
+    fn is_focused(el: &HtmlElement) -> bool {
+        active_element().is_some_and(|active| active.is_same_node(Some(el.unchecked_ref())))
+    }
+
+    fn focused_label() -> String {
+        active_element()
+            .map(|el| el.text_content().unwrap_or_default())
+            .unwrap_or_else(|| "<nothing>".to_owned())
+    }
+
+    /// Installs the app's real global listeners for the life of the guard.
+    ///
+    /// They live in thread-locals shared by the whole wasm test binary, so a leaked
+    /// listener keeps firing against a dead `AppState` in every later test. Cleanup
+    /// therefore cannot be a bare call at the end of the test body: any failing
+    /// assertion jumps straight past it. Tying it to `Drop` means the teardown runs
+    /// on every path out of the scope, including an early `return` or `?`.
+    ///
+    /// Installing also clears first, so a guard is a clean slate regardless of what
+    /// ran before it.
+    struct GlobalListeners;
+
+    impl GlobalListeners {
+        fn install(state: &AppState) -> Self {
+            crate::app::clear_app_listeners();
+            crate::app::install_keydown_listener(
+                state.clone(),
+                crate::components::center_zone::workspace_width(),
+            );
+            Self
+        }
+    }
+
+    impl Drop for GlobalListeners {
+        fn drop(&mut self) {
+            crate::app::clear_app_listeners();
+        }
+    }
+
+    fn key_event(key: &str, shift: bool) -> web_sys::KeyboardEvent {
+        let init = web_sys::KeyboardEventInit::new();
+        init.set_key(key);
+        init.set_shift_key(shift);
+        init.set_bubbles(true);
+        init.set_cancelable(true);
+        web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &init).unwrap()
+    }
+
+    /// The dialog is announced as a modal, its title and warning *are* its
+    /// accessible name and description, and focus has moved onto the safe control.
+    ///
+    /// Returns `(cancel, confirm)` for the keyboard checks that follow.
+    fn assert_confirm_dialog_is_an_accessible_modal(
+        container: &HtmlElement,
+        expected_title: &str,
+        flow: &str,
+    ) -> (HtmlElement, HtmlElement) {
+        let dialog = confirm_dialog(container)
+            .unwrap_or_else(|| panic!("{flow}: the destructive action must open a confirmation"));
+
+        assert_eq!(
+            dialog.get_attribute("role").as_deref(),
+            Some("alertdialog"),
+            "{flow}: an irreversible confirmation must announce itself as an alert dialog"
+        );
+        assert_eq!(
+            dialog.get_attribute("aria-modal").as_deref(),
+            Some("true"),
+            "{flow}: the confirmation covers the page and traps focus, so it must say it is modal"
+        );
+
+        // An `aria-labelledby` pointing at nothing announces nothing, so resolve
+        // both ids against the real DOM rather than just checking they exist.
+        let labelled_by = dialog
+            .get_attribute("aria-labelledby")
+            .unwrap_or_else(|| panic!("{flow}: the confirmation must have an accessible name"));
+        let described_by = dialog.get_attribute("aria-describedby").unwrap_or_else(|| {
+            panic!("{flow}: the confirmation must have an accessible description")
+        });
+        let title_el = container
+            .query_selector(&format!("#{labelled_by}"))
+            .unwrap()
+            .unwrap_or_else(|| panic!("{flow}: aria-labelledby must resolve to a real element"));
+        let description_el = container
+            .query_selector(&format!("#{described_by}"))
+            .unwrap()
+            .unwrap_or_else(|| panic!("{flow}: aria-describedby must resolve to a real element"));
+        assert_eq!(
+            title_el.text_content().as_deref().map(str::trim),
+            Some(expected_title),
+            "{flow}: the accessible name must be the dialog's own title"
+        );
+        assert!(
+            !description_el
+                .text_content()
+                .unwrap_or_default()
+                .trim()
+                .is_empty(),
+            "{flow}: the accessible description must be the warning, not an empty node"
+        );
+
+        // Both scoped to the dialog: the page underneath has its own Cancel and its
+        // own danger buttons (the row's "Delete" is a `settings-btn-danger` too).
+        let cancel = find_button_by_text(&dialog, "Cancel")
+            .unwrap_or_else(|| panic!("{flow}: the confirmation must offer a way out"));
+        let confirm: HtmlElement = dialog
+            .query_selector(".settings-btn-danger")
+            .unwrap()
+            .unwrap_or_else(|| panic!("{flow}: the destructive button must be marked as such"))
+            .dyn_into()
+            .unwrap();
+
+        // Focus is inside the dialog, and it is on the *safe* control. This is the
+        // whole point: previously focus stayed on the button behind the modal, so a
+        // keyboard user was never told anything had opened and could tab straight
+        // onto a `settings-btn-danger` and confirm an irreversible action blind.
+        assert!(
+            is_focused(&cancel),
+            "{flow}: focus must move to Cancel when the confirmation opens \u{2014} never to \
+             the destructive button, and never left behind on the page underneath. Focus is \
+             on: {:?}",
+            focused_label()
+        );
+
+        (cancel, confirm)
+    }
+
+    /// Tab cannot walk out of a modal that is covering the page, and Escape
+    /// cancels from wherever focus actually is.
+    async fn assert_focus_is_trapped_and_escape_cancels(
+        container: &HtmlElement,
+        cancel: &HtmlElement,
+        confirm: &HtmlElement,
+        flow: &str,
+    ) {
+        confirm.focus().unwrap();
+        confirm.dispatch_event(&key_event("Tab", false)).unwrap();
+        next_tick().await;
+        assert!(
+            is_focused(cancel),
+            "{flow}: Tab off the last control must wrap to Cancel, not leave the dialog. \
+             Focus is on: {:?}",
+            focused_label()
+        );
+
+        cancel.focus().unwrap();
+        cancel.dispatch_event(&key_event("Tab", true)).unwrap();
+        next_tick().await;
+        assert!(
+            is_focused(confirm),
+            "{flow}: Shift+Tab off the first control must wrap to the last, not leave the \
+             dialog. Focus is on: {:?}",
+            focused_label()
+        );
+
+        // Escape has to work from where focus *is*. It used to be handled on the
+        // overlay, which nothing ever focused, so it did nothing at all.
+        cancel.focus().unwrap();
+        cancel.dispatch_event(&key_event("Escape", false)).unwrap();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        assert!(
+            confirm_dialog(container).is_none(),
+            "{flow}: Escape must close the confirmation"
+        );
+    }
+
+    fn native_inputs_enabled(container: &HtmlElement) -> bool {
+        let inputs = container
+            .query_selector_all(".settings-native-input")
+            .unwrap();
+        assert!(inputs.length() > 0, "expected native inputs to render");
+        (0..inputs.length()).all(|i| {
+            let input: HtmlInputElement = inputs.item(i).unwrap().dyn_into().unwrap();
+            !input.disabled()
+        })
     }
 
     /// Most recent `backend_native_settings` SetSetting payload, if any.
@@ -9821,14 +11042,13 @@ mod wasm_tests {
             .find(|s| s.get("kind").and_then(|k| k.as_str()) == Some("backend_native_settings"))
     }
 
-    /// When Tycode's native settings are unavailable (e.g. the pinned Tycode
-    /// predates `GetSettingsSchema`), the Tycode page appears in the Backends
-    /// sidebar and shows the server's own reason verbatim — never blank/default
-    /// value controls.
+    /// When Tycode's native settings probe fails, the Tycode page appears in
+    /// the Backends sidebar and shows the server's own reason verbatim — never
+    /// blank/default value controls.
     #[wasm_bindgen_test]
     async fn tycode_native_settings_unavailable_shows_server_message() {
         let container = make_container();
-        let message = "Tycode 0.9.2-pre.1 predates GetSettingsSchema; native settings unavailable";
+        let message = "Tycode native settings probe timed out waiting for SettingsSchema";
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
             install_tycode_native_host(
@@ -9839,6 +11059,9 @@ mod wasm_tests {
                     settings: None,
                     groups: Vec::new(),
                     message: Some(message.to_owned()),
+                    provenance: None,
+                    advisories: Vec::new(),
+                    managed_projection_recovery: None,
                 },
             );
             state.settings_open.set(true);
@@ -10025,6 +11248,9 @@ mod wasm_tests {
                         schema: serde_json::json!({ "type": "object" }),
                     }],
                     message: None,
+                    provenance: None,
+                    advisories: Vec::new(),
+                    managed_projection_recovery: None,
                 },
             );
             provide_context(state);
@@ -10125,6 +11351,9 @@ mod wasm_tests {
                         }),
                     }],
                     message: None,
+                    provenance: None,
+                    advisories: Vec::new(),
+                    managed_projection_recovery: None,
                 },
             );
             provide_context(state);
@@ -10180,6 +11409,9 @@ mod wasm_tests {
                         schema: serde_json::json!({ "type": "object" }),
                     }],
                     message: None,
+                    provenance: None,
+                    advisories: Vec::new(),
+                    managed_projection_recovery: None,
                 },
             );
             provide_context(state);
@@ -10333,6 +11565,2098 @@ mod wasm_tests {
         );
     }
 
+    // ── Tycode managed projection (Work Package U) ──────────────────────────
+
+    /// A snapshot with no provenance and no advisories — every legacy backend,
+    /// and Tycode before a managed projection exists — renders exactly what it
+    /// rendered before: groups, controls, and no disclosure surfaces at all.
+    /// The new UI is driven purely by the typed fields, so their absence is not
+    /// a state the UI invents copy for.
+    #[wasm_bindgen_test]
+    async fn tycode_legacy_snapshot_renders_no_projection_disclosures() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_tycode_native_host(&state, tycode_ready_snapshot());
+            provide_context(state);
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        for selector in [
+            ".settings-native-disclosures",
+            ".settings-native-ownership",
+            ".settings-native-notice",
+            ".settings-native-advisory",
+        ] {
+            assert!(
+                container.query_selector(selector).unwrap().is_none(),
+                "a snapshot without typed provenance/advisories must render no {selector}"
+            );
+        }
+        assert!(
+            native_inputs_enabled(&container),
+            "the existing grouped controls must still render and stay editable"
+        );
+    }
+
+    /// The ownership line is *persistent*: it renders from typed provenance on
+    /// every managed snapshot, including after the one-time notice has been
+    /// acknowledged. Both paths come from the provenance, not from a hardcoded
+    /// string, and the notice is absent while the server says it is not pending.
+    #[wasm_bindgen_test]
+    async fn tycode_managed_projection_shows_persistent_ownership_line() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_tycode_native_host(
+                &state,
+                tycode_managed_snapshot(tycode_provenance("proj-A", false), Vec::new()),
+            );
+            provide_context(state);
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        let ownership = container
+            .query_selector(".settings-native-ownership")
+            .unwrap()
+            .expect("a managed snapshot must always disclose its ownership");
+        let text = ownership.text_content().unwrap_or_default();
+        assert!(
+            text.contains("/home/dev/.tycode/tyde-settings.toml"),
+            "the managed path must come from the typed provenance: {text:?}"
+        );
+        assert!(
+            text.contains("/home/dev/.tycode/settings.toml"),
+            "the source path must come from the typed provenance: {text:?}"
+        );
+        assert!(
+            text.contains("never modifies"),
+            "the line must state that Tyde never writes the shared file: {text:?}"
+        );
+
+        assert!(
+            container
+                .query_selector(".settings-native-notice")
+                .unwrap()
+                .is_none(),
+            "the one-time notice must not render while notice_pending is false"
+        );
+        assert!(
+            native_inputs_enabled(&container),
+            "a managed snapshot stays fully editable"
+        );
+    }
+
+    /// The one-time notice, its acknowledgement, and the stale-conflict surface.
+    ///
+    /// Dismissal sends the typed acknowledgement carrying the projection id of
+    /// the snapshot *currently on screen*, and hides nothing locally. If the
+    /// server rejects a stale id (a typed `Conflict`) it simply does not clear
+    /// `notice_pending`, so the notice stays up — the user is never told an
+    /// acknowledgement stuck when it did not. And because the id is re-read from
+    /// the live snapshot on every render, a republished projection is
+    /// acknowledged with its *new* id, never a cached one.
+    #[wasm_bindgen_test]
+    async fn tycode_projection_notice_acks_live_id_and_never_hides_locally() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let state = AppState::new();
+        install_tycode_native_host(
+            &state,
+            tycode_managed_snapshot(tycode_provenance("proj-A", true), Vec::new()),
+        );
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        let notice = container
+            .query_selector(".settings-native-notice")
+            .unwrap()
+            .expect("a pending notice must render");
+        let notice_text = notice.text_content().unwrap_or_default();
+
+        // CORRECTED. This previously required the notice to say the shared file
+        // "is unchanged".
+        //
+        // Evidence: `original_unchanged` is written once, at projection creation
+        // (`tycode.rs:1918`), and the shared file is read exactly once, while the
+        // copy is being built (`:683`). Tyde never re-reads it. So "is unchanged"
+        // is a present-tense claim about a file Tyde no longer observes — the same
+        // defect C5 found in the provider banner, in milder form. The corrective
+        // production copy dropped the sentence, and
+        // `UNVERIFIABLE_SHARED_FILE_CLAIMS` now forbids that exact phrase, so this
+        // assertion and `tycode_disclosures_never_claim_the_shared_files_current_contents`
+        // could not both hold. The forbidding one is the correct one.
+        //
+        // The contract this was reaching for — "the notice must reassure the user
+        // that Tyde did not damage their file" — is preserved, and stated in terms
+        // Tyde can actually vouch for. It is also strengthened: one now-false
+        // requirement is replaced by two verifiable requirements plus a blanket ban
+        // on all six unverifiable phrasings, scoped tightly to the notice element.
+        assert!(
+            notice_text.contains("never writes"),
+            "the notice must state that Tyde never writes the shared file: {notice_text:?}"
+        );
+        assert!(
+            notice_text.contains("did not remove"),
+            "the notice must carry Tyde's own denial \u{2014} the reassurance it can \
+             actually back: {notice_text:?}"
+        );
+        assert_no_unverifiable_shared_file_claim(&notice_text, "the one-time notice");
+        assert!(
+            notice_text.contains("can model"),
+            "the notice must explain the copy only holds what the backend can model: \
+             {notice_text:?}"
+        );
+
+        let dismiss: HtmlElement = container
+            .query_selector(".settings-native-notice-dismiss")
+            .unwrap()
+            .expect("the notice must be dismissible")
+            .dyn_into()
+            .unwrap();
+        dismiss.click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        let acks = recorded_notice_acks(&calls);
+        assert_eq!(acks.len(), 1, "dismissal must emit exactly one typed ack");
+        assert_eq!(
+            acks[0].get("backend").and_then(|b| b.as_str()),
+            Some("tycode"),
+            "the ack must name the backend: {:?}",
+            acks[0]
+        );
+        assert_eq!(
+            acks[0].get("projection_id").and_then(|p| p.as_str()),
+            Some("proj-A"),
+            "the ack must carry the on-screen projection id: {:?}",
+            acks[0]
+        );
+
+        // The server has not answered yet — and if it answers with a stale-id
+        // Conflict it never clears `notice_pending`. Either way the notice must
+        // still be on screen: hiding it locally would claim a success we do not
+        // have.
+        assert!(
+            container
+                .query_selector(".settings-native-notice")
+                .unwrap()
+                .is_some(),
+            "the notice must not be optimistically hidden before the server agrees"
+        );
+
+        // The server republishes a *different* projection (so the id just acked
+        // is now stale) and the notice is still pending.
+        publish_tycode_snapshot(
+            &state,
+            tycode_managed_snapshot(tycode_provenance("proj-B", true), Vec::new()),
+        );
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        let dismiss: HtmlElement = container
+            .query_selector(".settings-native-notice-dismiss")
+            .unwrap()
+            .expect("the notice must still render for the new projection")
+            .dyn_into()
+            .unwrap();
+        dismiss.click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        let acks = recorded_notice_acks(&calls);
+        assert_eq!(acks.len(), 2, "the second dismissal must emit a second ack");
+        assert_eq!(
+            acks[1].get("projection_id").and_then(|p| p.as_str()),
+            Some("proj-B"),
+            "the ack must carry the republished id, never a cached stale one: {:?}",
+            acks[1]
+        );
+
+        // Only the server clears the notice.
+        publish_tycode_snapshot(
+            &state,
+            tycode_managed_snapshot(tycode_provenance("proj-B", false), Vec::new()),
+        );
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        assert!(
+            container
+                .query_selector(".settings-native-notice")
+                .unwrap()
+                .is_none(),
+            "an acknowledged snapshot from the server hides the notice"
+        );
+        assert!(
+            container
+                .query_selector(".settings-native-ownership")
+                .unwrap()
+                .is_some(),
+            "the ownership line is persistent and survives acknowledgement"
+        );
+    }
+
+    /// A dangling active provider is `Ready`, not an error: the banner names the
+    /// provider *key*, never claims anything was deleted from the original file,
+    /// and leaves every control editable — because editing is the remedy.
+    #[wasm_bindgen_test]
+    async fn tycode_unsupported_active_provider_is_ready_and_editable() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_tycode_native_host(
+                &state,
+                tycode_managed_snapshot(
+                    tycode_provenance("proj-A", false),
+                    vec![BackendNativeSettingsAdvisory::UnsupportedActiveProvider {
+                        provider: "legacy-llm".to_owned(),
+                        message: "Choose a supported provider in Tyde's copy.".to_owned(),
+                    }],
+                ),
+            );
+            provide_context(state);
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        let banner = container
+            .query_selector(".settings-native-advisory-unsupported")
+            .unwrap()
+            .expect("a dangling active provider must be surfaced");
+        // CORRECTED (was `alert`). Evidence: this banner persists across every
+        // post-save refresh for the whole length of the remedy, and an assertive
+        // live region re-announces its entire contents on each one — interrupting
+        // the screen-reader user part-way through fixing it. `status` is polite
+        // and announces once. Nothing about the visual prominence changes.
+        assert_eq!(
+            banner.get_attribute("role").as_deref(),
+            Some("status"),
+            "the dangling-provider banner must be a polite status region, not an \
+             assertive alert that re-announces on every refresh"
+        );
+        let text = banner.text_content().unwrap_or_default();
+        assert!(
+            text.contains("legacy-llm"),
+            "the banner must name the provider key: {text:?}"
+        );
+        assert!(
+            text.contains("Choose a supported provider in Tyde's copy."),
+            "the server's own advisory message must be shown verbatim: {text:?}"
+        );
+
+        // CORRECTED. The previous assertion *required* the copy to say the shared
+        // file "still contains it, untouched".
+        //
+        // Evidence: `original_unchanged` is written once, at projection creation
+        // (`tycode.rs`), and Tyde never re-reads the shared file afterwards — it
+        // reads it only while building the copy. The user, the Tycode CLI, or the
+        // VS Code extension can edit or delete that file at any time and Tyde will
+        // never know. So the old assertion pinned copy that stated, in the present
+        // tense and unconditionally, a fact about a file Tyde no longer observes.
+        // In the one component whose entire job is truthful disclosure, that is a
+        // false statement about the user's data.
+        //
+        // The contract it was reaching for — "do not make the user think Tyde
+        // destroyed their config" — is preserved and strengthened: the copy must
+        // now carry Tyde's *own* verifiable denial, and must additionally make no
+        // claim at all about the shared file's current contents.
+        assert!(
+            text.contains("did not remove"),
+            "the banner must carry Tyde's own denial — the thing Tyde can actually \
+             vouch for: {text:?}"
+        );
+        assert!(
+            text.contains("never writes"),
+            "the banner must state Tyde never writes the shared file: {text:?}"
+        );
+        assert_no_unverifiable_shared_file_claim(&text, "the dangling-provider banner");
+        for destruction in ["deleted", "erased", "wiped"] {
+            assert!(
+                !text.contains(destruction),
+                "the banner must never suggest Tyde destroyed the config \
+                 (found {destruction:?}): {text:?}"
+            );
+        }
+
+        // Ready + advisory means editable. The advisory diagnoses; the controls
+        // below are the cure, so they must not be locked by it.
+        assert!(
+            native_inputs_enabled(&container),
+            "an unsupported active provider must not lock the controls that fix it"
+        );
+        let select: HtmlSelectElement = container
+            .query_selector(".settings-native-group select")
+            .unwrap()
+            .expect("the active-provider control must render")
+            .dyn_into()
+            .unwrap();
+        assert!(
+            !select.disabled(),
+            "the provider selector must stay enabled — it is the remedy"
+        );
+
+        // And an edit still persists through the normal native-settings path.
+        let model: HtmlInputElement = container
+            .query_selector("input[type=\"text\"].settings-native-input")
+            .unwrap()
+            .expect("the model control must render")
+            .dyn_into()
+            .unwrap();
+        set_and_change(&model, "opus");
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        assert!(
+            last_native_settings(&calls).is_some(),
+            "editing must still emit a backend_native_settings save while an advisory is present"
+        );
+    }
+
+    /// A no-provider advisory is rendered from its typed variant with the
+    /// server's message verbatim, and the snapshot stays Ready and editable so
+    /// the user can configure a provider.
+    #[wasm_bindgen_test]
+    async fn tycode_no_provider_advisory_renders_and_keeps_controls_editable() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_tycode_native_host(
+                &state,
+                tycode_managed_snapshot(
+                    tycode_provenance("proj-A", false),
+                    vec![BackendNativeSettingsAdvisory::NoProviderConfigured {
+                        message: "No provider is configured. Add one to start a session."
+                            .to_owned(),
+                    }],
+                ),
+            );
+            provide_context(state);
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        let advisory = container
+            .query_selector(".settings-native-advisory-no-provider")
+            .unwrap()
+            .expect("a no-provider advisory must be surfaced");
+        let text = advisory.text_content().unwrap_or_default();
+        assert!(
+            text.contains("No provider is configured. Add one to start a session."),
+            "the server's advisory message must be shown verbatim: {text:?}"
+        );
+        assert!(
+            native_inputs_enabled(&container),
+            "a no-provider advisory must leave the controls that fix it editable"
+        );
+    }
+
+    /// No disclosure surface may leak a secret. The notice, the ownership line,
+    /// and every advisory render only typed provenance, the provider *key*, and
+    /// server-authored messages — never a value out of the settings document.
+    #[wasm_bindgen_test]
+    async fn tycode_projection_disclosures_never_leak_a_secret_value() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_tycode_native_host(
+                &state,
+                tycode_managed_snapshot(
+                    tycode_provenance("proj-A", true),
+                    vec![
+                        BackendNativeSettingsAdvisory::NoProviderConfigured {
+                            message: "No provider is configured.".to_owned(),
+                        },
+                        BackendNativeSettingsAdvisory::UnsupportedActiveProvider {
+                            provider: "legacy-llm".to_owned(),
+                            message: "Choose a supported provider.".to_owned(),
+                        },
+                        BackendNativeSettingsAdvisory::BackendReported {
+                            message: "Recoverable settings diagnostic.".to_owned(),
+                        },
+                    ],
+                ),
+            );
+            provide_context(state);
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        // The fixture's settings document holds `api_key: "sk-secret-value"`.
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            !text.contains("sk-secret-value"),
+            "no rendered text may contain the stored secret: {text:?}"
+        );
+        let inputs = container
+            .query_selector_all(".settings-native-input")
+            .unwrap();
+        for i in 0..inputs.length() {
+            let input: HtmlInputElement = inputs.item(i).unwrap().dyn_into().unwrap();
+            assert_ne!(
+                input.value(),
+                "sk-secret-value",
+                "no control may be pre-filled with the stored secret"
+            );
+        }
+        // All three disclosure surfaces really are on screen — otherwise the
+        // absence above would prove nothing.
+        assert!(
+            container
+                .query_selector(".settings-native-notice")
+                .unwrap()
+                .is_some(),
+            "the notice must be present for this to be a meaningful check"
+        );
+        assert_eq!(
+            container
+                .query_selector_all(".settings-native-advisory")
+                .unwrap()
+                .length(),
+            3,
+            "all three typed advisories must render"
+        );
+    }
+
+    /// A fatal projection/integrity failure is `Unavailable`, and that state
+    /// comes from the server's typed `status` alone.
+    ///
+    /// Part one: `Unavailable` is read-only — the server's reason verbatim, zero
+    /// controls, and no disclosure surfaces.
+    ///
+    /// Part two, the important half: a `Ready` snapshot whose message *reads*
+    /// like a fatal failure is still Ready and still editable. The UI must never
+    /// downgrade a snapshot by reading message text; only `status` decides.
+    #[wasm_bindgen_test]
+    async fn tycode_unavailable_is_read_only_and_never_inferred_from_text() {
+        let fatal = "Managed projection integrity check failed: provenance references a \
+                     final settings file that is absent.";
+
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_tycode_native_host(
+                &state,
+                BackendNativeSettingsSnapshot {
+                    backend_kind: BackendKind::Tycode,
+                    status: BackendConfigSnapshotStatus::Unavailable,
+                    settings: None,
+                    groups: Vec::new(),
+                    message: Some(fatal.to_owned()),
+                    provenance: None,
+                    advisories: Vec::new(),
+                    managed_projection_recovery: None,
+                },
+            );
+            provide_context(state);
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains(fatal),
+            "the server's fatal reason must be surfaced verbatim: {text:?}"
+        );
+        assert_eq!(
+            container
+                .query_selector_all(".settings-native-input")
+                .unwrap()
+                .length(),
+            0,
+            "a fatal projection failure is read-only — no value controls may render"
+        );
+        assert!(
+            container
+                .query_selector(".settings-native-disclosures")
+                .unwrap()
+                .is_none(),
+            "an unavailable snapshot carries no managed projection to disclose"
+        );
+
+        // The same alarming text on a Ready snapshot must change nothing: status
+        // is the only thing that makes the page read-only.
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_tycode_native_host(
+                &state,
+                BackendNativeSettingsSnapshot {
+                    message: Some(fatal.to_owned()),
+                    ..tycode_managed_snapshot(
+                        tycode_provenance("proj-A", false),
+                        vec![BackendNativeSettingsAdvisory::BackendReported {
+                            message: fatal.to_owned(),
+                        }],
+                    )
+                },
+            );
+            provide_context(state);
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        assert!(
+            native_inputs_enabled(&container),
+            "a Ready snapshot stays editable no matter how fatal its message sounds — \
+             only `status` may make the page read-only"
+        );
+        assert!(
+            container
+                .query_selector(".settings-native-ownership")
+                .unwrap()
+                .is_some(),
+            "a Ready managed snapshot still discloses its ownership"
+        );
+    }
+
+    // ── Corrective Package U: reset, truthfulness, politeness ───────────────
+
+    /// Every disclosure surface may vouch only for Tyde's own behaviour.
+    ///
+    /// Tyde reads the shared CLI / VS Code settings file exactly once, while
+    /// building its managed copy, and never re-reads it. So no disclosure may say
+    /// what that file currently holds — not the banner, not the notice, not the
+    /// ownership line. This is the assertion that would have caught the original
+    /// defect, and it guards all three surfaces at once.
+    ///
+    /// All three are Ready-only surfaces, so this is a plain Ready snapshot. It
+    /// used to bundle a recovery state in as well, which the server cannot pair
+    /// with Ready — the recovery card's own copy is checked where recovery
+    /// actually lives, on the unavailable path.
+    #[wasm_bindgen_test]
+    async fn tycode_disclosures_never_claim_the_shared_files_current_contents() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_tycode_native_host(
+                &state,
+                tycode_managed_snapshot(
+                    // notice pending, so the notice copy is on screen too
+                    tycode_provenance("proj-A", true),
+                    vec![BackendNativeSettingsAdvisory::UnsupportedActiveProvider {
+                        provider: "legacy-llm".to_owned(),
+                        message: "Choose a supported provider.".to_owned(),
+                    }],
+                ),
+            );
+            provide_context(state);
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        let disclosures = container
+            .query_selector(".settings-native-disclosures")
+            .unwrap()
+            .expect("disclosures render");
+        let text = disclosures.text_content().unwrap_or_default();
+        assert_no_unverifiable_shared_file_claim(&text, "the disclosure block");
+
+        // And the durable, verifiable claims *are* present.
+        assert!(
+            text.contains("never writes"),
+            "the disclosures must state that Tyde never writes the shared file: {text:?}"
+        );
+        assert!(
+            text.contains("did not remove"),
+            "the disclosures must carry Tyde's own denial: {text:?}"
+        );
+    }
+
+    /// L2: the unsupported-provider banner is a *polite* status region, and it
+    /// stays polite across the refreshes that punctuate the remedy.
+    ///
+    /// The remedy is "edit the provider", and every edit publishes a fresh
+    /// snapshot. If the banner were `role="alert"`, each of those refreshes would
+    /// re-announce it in full, over the top of the user who is mid-fix. There must
+    /// be exactly one status region and no alert region anywhere in the
+    /// disclosures — before *and* after a refresh.
+    #[wasm_bindgen_test]
+    async fn tycode_unsupported_banner_stays_one_polite_status_across_refresh() {
+        let container = make_container();
+        let state = AppState::new();
+        let advisory = || {
+            vec![BackendNativeSettingsAdvisory::UnsupportedActiveProvider {
+                provider: "legacy-llm".to_owned(),
+                message: "Choose a supported provider.".to_owned(),
+            }]
+        };
+        install_tycode_native_host(
+            &state,
+            tycode_managed_snapshot(tycode_provenance("proj-A", false), advisory()),
+        );
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        let assert_polite = |phase: &str| {
+            let banner = container
+                .query_selector(".settings-native-advisory-unsupported")
+                .unwrap()
+                .unwrap_or_else(|| panic!("the banner must render {phase}"));
+            assert_eq!(
+                banner.get_attribute("role").as_deref(),
+                Some("status"),
+                "the banner must stay a polite status region {phase}"
+            );
+            assert_eq!(
+                container
+                    .query_selector_all(".settings-native-disclosures [role=\"alert\"]")
+                    .unwrap()
+                    .length(),
+                0,
+                "no disclosure may be an assertive alert {phase} — it would re-announce \
+                 over a user who is part-way through the remedy"
+            );
+            assert_eq!(
+                container
+                    .query_selector_all(".settings-native-advisory-unsupported")
+                    .unwrap()
+                    .length(),
+                1,
+                "exactly one unsupported-provider banner {phase}"
+            );
+        };
+        assert_polite("on first render");
+
+        // The server republishes after an edit — the ordinary rhythm of the remedy.
+        publish_tycode_snapshot(
+            &state,
+            tycode_managed_snapshot(tycode_provenance("proj-A", false), advisory()),
+        );
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        assert_polite("after a post-save refresh");
+        assert!(
+            native_inputs_enabled(&container),
+            "the remedy stays available across refreshes"
+        );
+    }
+
+    /// The typed recovery state, its confirmation, and its exact tokens.
+    ///
+    /// Reset is the one action in this page that deletes data, so it is offered
+    /// only for the typed `ManagedProjectionResetRequired` state, it leads with
+    /// the non-destructive remedy (restart → automatic journal recovery), it never
+    /// sends anything until the user confirms an explicit data-loss warning, and
+    /// it carries the exact projection id and state hash the server reported.
+    #[wasm_bindgen_test]
+    async fn tycode_reset_required_confirms_before_sending_exact_tokens() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let state = AppState::new();
+        install_tycode_native_host(
+            &state,
+            tycode_recovery_snapshot(tycode_reset_required(
+                "The managed settings and provenance pair could not be proven.",
+                "proj-A",
+                "sha256:state-a",
+            )),
+        );
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        let card = container
+            .query_selector(".settings-native-reset")
+            .unwrap()
+            .expect("a typed recovery state must surface a reset affordance");
+        assert_eq!(
+            card.get_attribute("role").as_deref(),
+            Some("status"),
+            "the recovery card is a polite status region"
+        );
+        let card_text = card.text_content().unwrap_or_default();
+        assert!(
+            card_text.contains("The managed settings and provenance pair could not be proven."),
+            "the server's reason must be shown verbatim: {card_text:?}"
+        );
+        // The card is a disclosure surface too, so it may vouch only for Tyde's own
+        // behaviour and never for what the shared file currently holds. This used
+        // to be covered incidentally, by an impossible Ready+recovery fixture in
+        // the C5 test; it belongs here, where recovery actually renders.
+        assert_no_unverifiable_shared_file_claim(&card_text, "the recovery card");
+        // F5. This assertion used to require "Restart Tyde first" alongside the
+        // card's promise that a restart "repairs this automatically, without
+        // losing anything". The product cannot keep that promise, and the
+        // assertion was pinning it in place.
+        //
+        // Evidence: the server publishes `ManagedProjectionResetRequired` *only*
+        // after its own journal recovery has already failed — it writes the
+        // recovery record when `recover_tycode_transaction` cannot prove a pair,
+        // and `server/src/backend/tycode.rs` builds this snapshot by reading that
+        // record back. A restart replays the same journal against the same
+        // on-disk state, and recovery is retried on every probe anyway. So the
+        // old copy promised the user a lossless automatic repair that had already
+        // been attempted and had already failed.
+        //
+        // The contract the assertion was reaching for — offer the non-destructive
+        // remedy before the destructive one — is kept, and sharpened: the card
+        // must now also be honest about what that remedy is worth.
+        assert!(
+            card_text.contains("already tried to repair")
+                && card_text.contains("did not resolve it"),
+            "the card must say the automatic journal repair has already failed: {card_text:?}"
+        );
+        assert!(
+            card_text.contains("not guaranteed"),
+            "the card must qualify the restart rather than promise it: {card_text:?}"
+        );
+        assert!(
+            !card_text.contains("without losing anything"),
+            "the card must not promise a lossless automatic repair that has already failed: \
+             {card_text:?}"
+        );
+        // …and the non-destructive remedy still comes before the destructive one.
+        let restart_at = card_text
+            .find("Restarting Tyde")
+            .expect("the card must still offer a restart");
+        let reset_at = card_text
+            .find("reset Tyde's copy")
+            .expect("the card must still offer the reset as the fallback");
+        assert!(
+            restart_at < reset_at,
+            "the restart must be offered before the reset: {card_text:?}"
+        );
+
+        // Arming the reset must not send anything on its own.
+        let reset_button: HtmlElement = container
+            .query_selector(".settings-native-reset-action")
+            .unwrap()
+            .expect("the reset action must render")
+            .dyn_into()
+            .unwrap();
+        reset_button.click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        assert!(
+            recorded_resets(&calls).is_empty(),
+            "opening the confirmation must not send a reset"
+        );
+
+        let dialog = confirm_dialog(&container).expect("an explicit confirmation must open");
+        let body = dialog.text_content().unwrap_or_default();
+        assert!(
+            body.contains("will be lost"),
+            "the confirmation must say Tyde-side edits are lost: {body:?}"
+        );
+        assert!(
+            body.contains("never touched") && body.contains("does not write"),
+            "the confirmation must say the shared CLI/VS Code file is never written: {body:?}"
+        );
+        // The re-derivation exception, stated exactly where it is relevant: this
+        // is the one place Tyde deletes its copy, and the copy comes back on the
+        // next probe — which is *why* Tyde-side edits are lost.
+        assert!(
+            body.contains("builds a fresh copy"),
+            "the confirmation must explain that the copy is re-derived: {body:?}"
+        );
+        assert_no_unverifiable_shared_file_claim(&body, "the reset confirmation");
+        // F5: the confirmation carries the *same* qualified restart wording as the
+        // card. Otherwise the user reads an honest card, clicks through, and is
+        // told at the point of no return that a restart would have fixed it
+        // losslessly — which is the promise the runtime has already failed to keep.
+        assert!(
+            body.contains("already tried to repair")
+                && body.contains("did not resolve it")
+                && body.contains("not guaranteed"),
+            "the confirmation must repeat the qualified restart guidance: {body:?}"
+        );
+        assert!(
+            !body.contains("without losing anything"),
+            "the confirmation must not promise a lossless automatic repair: {body:?}"
+        );
+
+        // Cancel sends nothing and leaves the server-owned card exactly as it was.
+        let cancel = find_button_by_text(&container, "Cancel").expect("cancel button");
+        cancel.click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        assert!(
+            recorded_resets(&calls).is_empty(),
+            "cancelling must not send a reset"
+        );
+        assert!(
+            confirm_dialog(&container).is_none(),
+            "cancelling closes the confirmation"
+        );
+        assert!(
+            container
+                .query_selector(".settings-native-reset")
+                .unwrap()
+                .is_some(),
+            "cancelling never hides the server-owned recovery state"
+        );
+
+        // Confirm sends exactly one reset, carrying both exact tokens.
+        reset_button.click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        let confirm = find_button_by_text(&container, "Reset Tyde's copy").expect("confirm button");
+        confirm.click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        let resets = recorded_resets(&calls);
+        assert_eq!(resets.len(), 1, "confirming sends exactly one reset");
+        assert_eq!(
+            resets[0].get("backend").and_then(|b| b.as_str()),
+            Some("tycode")
+        );
+        assert_eq!(
+            resets[0]
+                .get("expected_projection_id")
+                .and_then(|v| v.as_str()),
+            Some("proj-A"),
+            "the reset must carry the exact projection id the server reported: {:?}",
+            resets[0]
+        );
+        assert_eq!(
+            resets[0]
+                .get("expected_state_hash")
+                .and_then(|v| v.as_str()),
+            Some("sha256:state-a"),
+            "the reset must carry the exact state hash the server reported: {:?}",
+            resets[0]
+        );
+
+        // Nothing is optimistically hidden: the server has not answered, so the
+        // recovery state is still exactly what the server last published.
+        assert!(
+            container
+                .query_selector(".settings-native-reset")
+                .unwrap()
+                .is_some(),
+            "the recovery card must not be hidden before the server clears the state"
+        );
+    }
+
+    /// A stale reset is a server-side `Conflict`: the server removes nothing and
+    /// keeps publishing the recovery state, so the card must stay up. And because
+    /// the tokens are re-read from the live snapshot on every render, a republished
+    /// recovery state is reset with its *new* tokens, never a cached stale pair.
+    #[wasm_bindgen_test]
+    async fn tycode_reset_stale_conflict_keeps_state_visible_and_retries_new_tokens() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let state = AppState::new();
+        install_tycode_native_host(
+            &state,
+            tycode_recovery_snapshot(tycode_reset_required("stale", "proj-A", "sha256:state-a")),
+        );
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        let arm_and_confirm = || {
+            let button: HtmlElement = container
+                .query_selector(".settings-native-reset-action")
+                .unwrap()
+                .expect("reset action")
+                .dyn_into()
+                .unwrap();
+            button.click();
+        };
+
+        arm_and_confirm();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        find_button_by_text(&container, "Reset Tyde's copy")
+            .expect("confirm")
+            .click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        assert_eq!(recorded_resets(&calls).len(), 1);
+
+        // The server rejects the tokens as stale (typed Conflict) and removes
+        // nothing, so it keeps publishing a recovery state — here with fresh
+        // tokens, exactly as it would after re-observing the wedged artifacts.
+        publish_tycode_snapshot(
+            &state,
+            tycode_recovery_snapshot(tycode_reset_required("stale", "proj-B", "sha256:state-b")),
+        );
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        assert!(
+            container
+                .query_selector(".settings-native-reset")
+                .unwrap()
+                .is_some(),
+            "a stale Conflict removes nothing, so the recovery state must stay visible"
+        );
+
+        arm_and_confirm();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        find_button_by_text(&container, "Reset Tyde's copy")
+            .expect("confirm")
+            .click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        let resets = recorded_resets(&calls);
+        assert_eq!(resets.len(), 2, "the second confirm sends a second reset");
+        assert_eq!(
+            resets[1]
+                .get("expected_projection_id")
+                .and_then(|v| v.as_str()),
+            Some("proj-B"),
+            "the retry must carry the republished id, never the cached stale one: {:?}",
+            resets[1]
+        );
+        assert_eq!(
+            resets[1]
+                .get("expected_state_hash")
+                .and_then(|v| v.as_str()),
+            Some("sha256:state-b"),
+            "the retry must carry the republished hash, never the cached stale one: {:?}",
+            resets[1]
+        );
+
+        // Only the server clears it.
+        publish_tycode_snapshot(
+            &state,
+            tycode_managed_snapshot(tycode_provenance("proj-C", false), Vec::new()),
+        );
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        assert!(
+            container
+                .query_selector(".settings-native-reset")
+                .unwrap()
+                .is_none(),
+            "a snapshot without a recovery state hides the card"
+        );
+    }
+
+    /// No disclosure surface may leak a secret — including the recovery card and
+    /// its confirmation.
+    ///
+    /// Driven through the real sequence rather than mounted straight into the
+    /// wedge: the projection is Ready and holding the secret, and *then* it
+    /// breaks. That matters, because on the snapshot the server actually
+    /// publishes for a wedge there are no settings at all (`settings: None`), so
+    /// a leak check that started there would pass without proving anything.
+    /// Starting from Ready makes it prove what it claims: the recovery render
+    /// *replaces* the settings UI, leaving behind neither the stored secret nor
+    /// any value or edit control.
+    #[wasm_bindgen_test]
+    async fn tycode_reset_surfaces_never_leak_a_secret_value() {
+        let _calls = install_settings_send_stub();
+        let container = make_container();
+        let state = AppState::new();
+        // Ready, with `api_key: "sk-secret-value"` in its settings document.
+        install_tycode_native_host(
+            &state,
+            tycode_managed_snapshot(tycode_provenance("proj-A", false), Vec::new()),
+        );
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector_all(".settings-native-input")
+                .unwrap()
+                .length()
+                > 0,
+            "the Ready projection must render its value controls first, so that their \
+             absence after the wedge means something"
+        );
+
+        // Now the managed projection wedges.
+        publish_tycode_snapshot(
+            &state,
+            tycode_recovery_snapshot(tycode_reset_required(
+                "Recovery required.",
+                "proj-A",
+                "sha256:state-a",
+            )),
+        );
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        let reset_button: HtmlElement = container
+            .query_selector(".settings-native-reset-action")
+            .unwrap()
+            .expect("the wedged projection must still offer the reset action")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            container
+                .query_selector_all(".settings-native-input")
+                .unwrap()
+                .length(),
+            0,
+            "the recovery render must replace the value controls, not decorate them"
+        );
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            !text.contains("sk-secret-value"),
+            "the wedged render must not leave the stored secret on screen: {text:?}"
+        );
+
+        reset_button.click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        assert!(
+            confirm_dialog(&container).is_some(),
+            "the confirmation must be open for this to be a meaningful check"
+        );
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            !text.contains("sk-secret-value"),
+            "no rendered text — card, dialog, or fields — may contain the stored secret: {text:?}"
+        );
+    }
+
+    /// The reset must be reachable on the snapshot the server actually publishes.
+    ///
+    /// This is the test that was missing, and its absence is why the reset card
+    /// shipped as dead code. The server pairs `ManagedProjectionResetRequired`
+    /// with `status: Unavailable` and nothing else, and the page early-returns on
+    /// `Unavailable` — so a card reached only from the *Ready* disclosures is a
+    /// card no user can ever see. They get the bare reason paragraph and no way
+    /// out of the one state that exists to be escaped from.
+    ///
+    /// The old fixture hid this by building a `Ready` snapshot that carried a
+    /// recovery state, which the server cannot emit. So this asserts the real
+    /// shape, end to end: the card renders, the reset actually sends, and the
+    /// unavailable page still renders no value or edit controls.
+    #[wasm_bindgen_test]
+    async fn tycode_reset_is_reachable_on_the_unavailable_snapshot_the_server_publishes() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let state = AppState::new();
+        let snapshot = tycode_recovery_snapshot(tycode_reset_required(
+            "The managed settings and provenance pair could not be proven.",
+            "proj-A",
+            "sha256:state-a",
+        ));
+        // Spelled out, because it is the entire point of the test: this is what a
+        // wedged projection looks like on the wire.
+        assert!(
+            matches!(snapshot.status, BackendConfigSnapshotStatus::Unavailable)
+                && snapshot.settings.is_none()
+                && snapshot.groups.is_empty(),
+            "the fixture must be the snapshot the server publishes, not one it cannot"
+        );
+        install_tycode_native_host(&state, snapshot);
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        // Reachable at all — the assertion the old fixture could not make.
+        let card = container
+            .query_selector(".settings-native-reset")
+            .unwrap()
+            .expect(
+                "an Unavailable snapshot carrying a typed recovery state must still offer the \
+                 reset \u{2014} it is the only exit from that state",
+            );
+        let card_text = card.text_content().unwrap_or_default();
+        assert!(
+            card_text.contains("The managed settings and provenance pair could not be proven."),
+            "the server's reason must still be shown verbatim: {card_text:?}"
+        );
+
+        // …and reaching it costs the unavailable page nothing. No settings and no
+        // groups were published, so none may be drawn — no blank or default
+        // control may stand in for a value the server never sent.
+        for selector in [
+            ".settings-native-input",
+            ".settings-native-group",
+            ".settings-native-fields",
+        ] {
+            assert_eq!(
+                container.query_selector_all(selector).unwrap().length(),
+                0,
+                "the unavailable page must render no {selector}"
+            );
+        }
+
+        // The card is an exit, not just a label: the reset sends from here.
+        let reset_button: HtmlElement = container
+            .query_selector(".settings-native-reset-action")
+            .unwrap()
+            .expect("the reset action must render")
+            .dyn_into()
+            .unwrap();
+        reset_button.click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        find_button_by_text(&container, "Reset Tyde's copy")
+            .expect("the confirmation must open from the unavailable page")
+            .click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        let resets = recorded_resets(&calls);
+        assert_eq!(
+            resets.len(),
+            1,
+            "the reset must be sendable from the state it exists to escape"
+        );
+        assert_eq!(
+            resets[0]
+                .get("expected_projection_id")
+                .and_then(|v| v.as_str()),
+            Some("proj-A"),
+            "the reset must carry the exact tokens from the unavailable snapshot: {:?}",
+            resets[0]
+        );
+        assert_eq!(
+            resets[0]
+                .get("expected_state_hash")
+                .and_then(|v| v.as_str()),
+            Some("sha256:state-a"),
+            "the reset must carry the exact tokens from the unavailable snapshot: {:?}",
+            resets[0]
+        );
+    }
+
+    /// The reset confirmation is a real modal: announced, focused, trapped, and
+    /// escapable — and Escape cancels rather than confirming.
+    #[wasm_bindgen_test]
+    async fn tycode_reset_confirmation_is_an_accessible_modal() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let state = AppState::new();
+        install_tycode_native_host(
+            &state,
+            tycode_recovery_snapshot(tycode_reset_required(
+                "Recovery required.",
+                "proj-A",
+                "sha256:state-a",
+            )),
+        );
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        let reset_button: HtmlElement = container
+            .query_selector(".settings-native-reset-action")
+            .unwrap()
+            .expect("reset action")
+            .dyn_into()
+            .unwrap();
+        reset_button.focus().unwrap();
+        reset_button.click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        let (cancel, confirm) = assert_confirm_dialog_is_an_accessible_modal(
+            &container,
+            "Reset Tyde's managed Tycode settings",
+            "reset",
+        );
+        assert_focus_is_trapped_and_escape_cancels(&container, &cancel, &confirm, "reset").await;
+
+        // Escape is a *cancel*. On an irreversible action, a dismiss gesture that
+        // could confirm would be a catastrophe.
+        assert!(
+            recorded_resets(&calls).is_empty(),
+            "Escape must cancel the reset, never send it"
+        );
+        // And focus comes back to where the user was, not to the top of the page.
+        assert!(
+            is_focused(&reset_button),
+            "closing must return focus to the control that opened the dialog. Focus is on: {:?}",
+            focused_label()
+        );
+    }
+
+    /// Escape in the destructive confirmation must dismiss **one** layer.
+    ///
+    /// Production-shaped on purpose: the app's real global `window` keydown
+    /// listener is installed alongside the panel, because that listener is half of
+    /// the defect. The dialog called `prevent_default()` but not
+    /// `stop_propagation()`, and the global Escape arm did not check
+    /// `default_prevented()` — so a single Escape cancelled the dialog *and* set
+    /// `settings_open = false`. The entire Settings overlay came down, the
+    /// server-owned recovery card went with it, and focus landed on `<body>`,
+    /// because the opener that the dialog restores focus to had just been
+    /// unmounted along with the panel.
+    ///
+    /// `tycode_reset_confirmation_is_an_accessible_modal` mounts the dialog with no
+    /// global listener present, so for it there is nothing for the event to escape
+    /// *to* — it cannot see this, and it passed throughout. That is the whole
+    /// reason this test installs the real thing.
+    #[wasm_bindgen_test]
+    async fn reset_confirmation_escape_dismisses_only_the_dialog_not_the_settings_overlay() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let state = AppState::new();
+        install_tycode_native_host(
+            &state,
+            tycode_recovery_snapshot(tycode_reset_required(
+                "Recovery required.",
+                "proj-A",
+                "sha256:state-a",
+            )),
+        );
+        state.settings_open.set(true);
+
+        // The real listener that owns Escape for the whole app. Torn down on drop,
+        // so a failing assertion below cannot leak it into the rest of the suite.
+        let _listeners = GlobalListeners::install(&state);
+
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Tycode");
+        next_tick().await;
+
+        let reset_button: HtmlElement = container
+            .query_selector(".settings-native-reset-action")
+            .unwrap()
+            .expect("reset action")
+            .dyn_into()
+            .unwrap();
+        reset_button.focus().unwrap();
+        reset_button.click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        let dialog = confirm_dialog(&container).expect("the confirmation must open");
+        let cancel = find_button_by_text(&dialog, "Cancel").expect("cancel");
+        assert!(
+            is_focused(&cancel),
+            "focus must be inside the dialog before Escape, or this proves nothing"
+        );
+
+        // Escape, from where focus actually is.
+        cancel.dispatch_event(&key_event("Escape", false)).unwrap();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        assert!(
+            confirm_dialog(&container).is_none(),
+            "Escape must close the confirmation"
+        );
+        // …and must close nothing else.
+        assert!(
+            state.settings_open.get_untracked(),
+            "Escape inside the modal must not also tear down the Settings overlay"
+        );
+        assert!(
+            container
+                .query_selector(".settings-native-reset")
+                .unwrap()
+                .is_some(),
+            "the server-owned recovery card must survive cancelling the confirmation"
+        );
+        // Focus restoration can only work because the opener was never unmounted.
+        assert!(
+            is_focused(&reset_button),
+            "focus must return to the reset button, not fall to <body>. Focus is on: {:?}",
+            focused_label()
+        );
+        assert!(
+            recorded_resets(&calls).is_empty(),
+            "Escape must cancel the reset, never send it"
+        );
+
+        // And the global handler is still the global handler. With no modal open,
+        // Escape closes the Settings overlay exactly as it did before — the fix
+        // narrows the global handler, it does not disable it.
+        reset_button
+            .dispatch_event(&key_event("Escape", false))
+            .unwrap();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        assert!(
+            !state.settings_open.get_untracked(),
+            "with no modal open, Escape must still close the Settings overlay"
+        );
+    }
+
+    /// Switching hosts with the confirmation open must not carry the reset across.
+    ///
+    /// The dialog quotes one host's tokens. Confirm used to re-resolve "the selected
+    /// host" — so arming on host A, switching to host B, and clicking Confirm would
+    /// have fired a *destructive* command at B carrying A's tokens, and marked B
+    /// pending. B's tokens differ, so the server would have refused it — but a UI
+    /// that aims a delete at a machine the user never armed it against is not
+    /// something to leave standing on the strength of a server-side check.
+    ///
+    /// Both hosts are wedged here, so a misdirected reset would land on a card that
+    /// looks like it was asking for one.
+    #[wasm_bindgen_test]
+    async fn host_switch_before_confirm_never_resets_the_new_host() {
+        const HOST_B: &str = "host-tyc-other";
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let state = AppState::new();
+        install_tycode_native_host(
+            &state,
+            tycode_recovery_snapshot(tycode_reset_required(
+                "Host A is wedged.",
+                "proj-A",
+                "sha256:state-a",
+            )),
+        );
+        install_second_tycode_host(
+            &state,
+            HOST_B,
+            tycode_recovery_snapshot(tycode_reset_required(
+                "Host B is wedged.",
+                "proj-B",
+                "sha256:state-b",
+            )),
+        );
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        // Arm on host A.
+        let reset_button: HtmlElement = container
+            .query_selector(".settings-native-reset-action")
+            .unwrap()
+            .expect("host A's reset action")
+            .dyn_into()
+            .unwrap();
+        reset_button.click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        assert!(
+            confirm_dialog(&container).is_some(),
+            "the confirmation must be open on host A"
+        );
+
+        // The user switches to host B, then confirms — in the *same* tick, before the
+        // invalidation effect has had a chance to run. That is precisely the race the
+        // re-check in `on_confirm` exists for, and a test that awaited first would
+        // never reach it.
+        state.selected_host_id.set(Some(HOST_B.to_owned()));
+        if let Some(confirm) = find_button_by_text(&container, "Reset Tyde's copy") {
+            confirm.click();
+        }
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        // Nothing was sent. Not to B, not to A, not at all.
+        assert!(
+            recorded_resets(&calls).is_empty(),
+            "a host switch must cancel the reset, never redirect it: {:?}",
+            recorded_resets(&calls)
+        );
+        // Nothing is in flight against any host, so no refusal can later be
+        // attributed to one.
+        assert!(
+            state.managed_projection_reset.get_untracked().is_empty(),
+            "no reset may be marked in flight against any host: {:?}",
+            state.managed_projection_reset.get_untracked()
+        );
+        // And the confirmation is gone, rather than sitting there quoting a host the
+        // user is no longer looking at.
+        assert!(
+            confirm_dialog(&container).is_none(),
+            "the confirmation must not survive the host switch"
+        );
+
+        // Host B's card is on screen, intact, and un-refused. Nothing about host A's
+        // reset touched it.
+        let card = container
+            .query_selector(".settings-native-reset")
+            .unwrap()
+            .expect("host B's recovery card must render");
+        assert!(
+            card.text_content()
+                .unwrap_or_default()
+                .contains("Host B is wedged."),
+            "the card on screen must be host B's own"
+        );
+        assert!(
+            container
+                .query_selector(".settings-native-reset-refusal")
+                .unwrap()
+                .is_none(),
+            "no refusal may be attributed to a host the user never armed a reset against"
+        );
+    }
+
+    /// The guard the confirmation is built on, exercised directly and deterministically.
+    ///
+    /// An arming describes one host and one projection. It dies the moment either
+    /// moves — consent to reset host A's `proj-A` is not consent to reset host B's
+    /// anything, nor to reset whatever replaced `proj-A`.
+    #[wasm_bindgen_test]
+    fn reset_arming_dies_when_the_host_or_the_projection_moves() {
+        let state = AppState::new();
+        install_tycode_native_host(
+            &state,
+            tycode_recovery_snapshot(tycode_reset_required(
+                "The managed pair could not be proven.",
+                "proj-A",
+                "sha256:state-a",
+            )),
+        );
+        let armed = PendingProjectionReset {
+            host_id: TYCODE_HOST.to_owned(),
+            projection_id: TycodeProjectionId("proj-A".to_owned()),
+            state_hash: TycodeProjectionStateHash("sha256:state-a".to_owned()),
+        };
+        assert!(
+            reset_arming_is_live(&state, BackendKind::Tycode, &armed),
+            "the arming matches the card on screen"
+        );
+
+        // The user switches hosts.
+        state.selected_host_id.set(Some("host-other".to_owned()));
+        assert!(
+            !reset_arming_is_live(&state, BackendKind::Tycode, &armed),
+            "an arming for one host must not stay live while another host is selected"
+        );
+
+        // Back to the armed host — but the server has republished the projection with
+        // new tokens.
+        state.selected_host_id.set(Some(TYCODE_HOST.to_owned()));
+        publish_tycode_snapshot(
+            &state,
+            tycode_recovery_snapshot(tycode_reset_required(
+                "The managed pair could not be proven.",
+                "proj-B",
+                "sha256:state-b",
+            )),
+        );
+        assert!(
+            !reset_arming_is_live(&state, BackendKind::Tycode, &armed),
+            "consent to reset proj-A is not consent to reset whatever replaced it"
+        );
+
+        // And an arming cannot outlive the recovery state it was armed from.
+        publish_tycode_snapshot(
+            &state,
+            tycode_managed_snapshot(tycode_provenance("proj-C", false), Vec::new()),
+        );
+        assert!(
+            !reset_arming_is_live(&state, BackendKind::Tycode, &armed),
+            "a snapshot with no recovery state leaves nothing to reset"
+        );
+    }
+
+    /// A refused reset has to say so on the card the user acted on.
+    ///
+    /// The typed `Conflict` *was* surfaced — but only in the global host status
+    /// line in the top-left corner of the window, far from the reset card. From the
+    /// point of action the button looked inert: the user confirmed a destructive
+    /// action, the card did not change, and nothing said why. For the one control
+    /// in settings that deletes data, "appears to have done nothing" is the worst
+    /// reading available.
+    ///
+    /// Driven through the real dispatcher, with the `CommandError` envelope the
+    /// server actually sends.
+    #[wasm_bindgen_test]
+    async fn stale_reset_conflict_is_refused_inline_on_the_recovery_card() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let state = AppState::new();
+        // Primed first: the bootstrap it dispatches would otherwise overwrite the
+        // host settings the fixture installs.
+        crate::dispatch::prime_host_for_tests(&state, TYCODE_HOST);
+        install_tycode_native_host(
+            &state,
+            tycode_recovery_snapshot(tycode_reset_required(
+                "The managed settings and provenance pair could not be proven.",
+                "proj-A",
+                "sha256:state-a",
+            )),
+        );
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector(".settings-native-reset-refusal")
+                .unwrap()
+                .is_none(),
+            "nothing may be refused before the user has done anything"
+        );
+
+        arm_and_confirm_reset(&container).await;
+        assert_eq!(
+            recorded_resets(&calls).len(),
+            1,
+            "the reset must actually have been sent"
+        );
+
+        // The server refuses: the projection moved after the reset was offered, so
+        // the tokens are stale. It removed nothing.
+        const REFUSAL: &str =
+            "Tycode managed projection changed after reset was offered; refresh before retrying";
+        dispatch_reset_error(&state, 0, CommandErrorCode::Conflict, REFUSAL);
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        let refusal = container
+            .query_selector(".settings-native-reset-refusal")
+            .unwrap()
+            .expect("a refused reset must be reported on the card that offered it");
+        assert_eq!(
+            refusal.get_attribute("role").as_deref(),
+            Some("alert"),
+            "the refusal answers something the user just did, so it must interrupt"
+        );
+        let text = refusal.text_content().unwrap_or_default();
+        assert!(
+            text.contains(REFUSAL),
+            "the server's refusal must be shown verbatim: {text:?}"
+        );
+        // The typed `Conflict` guarantee, stated where it is needed: the user just
+        // confirmed a destructive action and has to know it did not happen.
+        assert!(
+            text.contains("Nothing was deleted"),
+            "a Conflict removed nothing, and the card must say so: {text:?}"
+        );
+
+        // No optimistic state change anywhere: the card, its reason, and its action
+        // are all exactly as the server last published them.
+        let card = container
+            .query_selector(".settings-native-reset")
+            .unwrap()
+            .expect("the recovery card must stay \u{2014} the server removed nothing");
+        assert!(
+            card.text_content()
+                .unwrap_or_default()
+                .contains("The managed settings and provenance pair could not be proven."),
+            "the server's recovery reason must still stand after a refusal"
+        );
+        assert!(
+            container
+                .query_selector(".settings-native-reset-action")
+                .unwrap()
+                .is_some(),
+            "the reset must stay retryable after a refusal"
+        );
+
+        // Retrying clears the stale answer rather than stacking a fresh attempt
+        // underneath it.
+        arm_and_confirm_reset(&container).await;
+        assert_eq!(
+            recorded_resets(&calls).len(),
+            2,
+            "the retry must send a second reset"
+        );
+        assert!(
+            container
+                .query_selector(".settings-native-reset-refusal")
+                .unwrap()
+                .is_none(),
+            "a new attempt must clear the previous refusal"
+        );
+    }
+
+    /// Only a typed reset target is this reset's answer.
+    ///
+    /// Correlation used to be a heuristic: *any* `SetSetting` error arriving while a
+    /// reset was in flight was taken as that reset's refusal. So a native-settings
+    /// save that failed at the same moment would have been reported on the recovery
+    /// card as the reset's answer — the wrong message against the wrong action, and,
+    /// for a non-`Conflict` code, stripped of the "nothing was deleted" guarantee the
+    /// user actually needed.
+    ///
+    /// The server now sends a value-free `setting_target`, and only
+    /// `ResetTycodeManagedProjection` denotes this command. An **absent** target is an
+    /// older host that cannot correlate at all — the absence of a signal, never a weak
+    /// one in favour — and `Malformed` says the payload was not a valid host-setting
+    /// value, so it identifies nothing.
+    ///
+    /// Every negative runs first and the real refusal last, deliberately: if the
+    /// negatives passed because the pipeline was broken end to end, the positive
+    /// would fail. It is the same pipeline throughout, and it ignores all of them and
+    /// answers exactly one.
+    #[wasm_bindgen_test]
+    async fn only_a_typed_reset_target_refuses_the_reset() {
+        const HOST_B: &str = "host-tyc-other";
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let state = AppState::new();
+        crate::dispatch::prime_host_for_tests(&state, TYCODE_HOST);
+        crate::dispatch::prime_host_for_tests(&state, HOST_B);
+        install_tycode_native_host(
+            &state,
+            tycode_recovery_snapshot(tycode_reset_required(
+                "The managed pair could not be proven.",
+                "proj-A",
+                "sha256:state-a",
+            )),
+        );
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        arm_and_confirm_reset(&container).await;
+        assert_eq!(
+            recorded_resets(&calls).len(),
+            1,
+            "the reset must be in flight for any of this to mean anything"
+        );
+        assert_eq!(
+            reset_state(&state, TYCODE_HOST),
+            Some(ManagedProjectionResetState::Pending),
+            "the reset must be recorded as awaiting the server"
+        );
+
+        // Everything that is *not* this command's answer. Each must leave it alone.
+        let not_our_answer: [(&str, FrameKind, Option<HostSettingErrorTarget>, &str); 5] = [
+            (
+                "a native-settings save that failed at the same moment",
+                FrameKind::SetSetting,
+                Some(HostSettingErrorTarget::BackendNativeSettings),
+                "Tycode SaveSettings rejected: provider unavailable",
+            ),
+            (
+                "an unrelated host setting",
+                FrameKind::SetSetting,
+                Some(HostSettingErrorTarget::LaunchProfiles),
+                "launch profile id is reserved",
+            ),
+            (
+                "a malformed SetSetting payload, which denotes no setting at all",
+                FrameKind::SetSetting,
+                Some(HostSettingErrorTarget::Malformed),
+                "host setting payload was not valid",
+            ),
+            (
+                "an older host that sends no target, so cannot correlate at all",
+                FrameKind::SetSetting,
+                None,
+                "set_setting failed for some reason we cannot attribute",
+            ),
+            (
+                "a command that is not a SetSetting",
+                FrameKind::ListSessions,
+                None,
+                "list_sessions failed",
+            ),
+        ];
+
+        let mut seq = 0;
+        for (what, request_kind, setting_target, message) in not_our_answer {
+            dispatch_command_error(
+                &state,
+                TYCODE_HOST,
+                seq,
+                request_kind,
+                setting_target,
+                CommandErrorCode::Internal,
+                message,
+            );
+            seq += 1;
+            for _ in 0..3 {
+                next_tick().await;
+            }
+            assert_eq!(
+                reset_state(&state, TYCODE_HOST),
+                Some(ManagedProjectionResetState::Pending),
+                "{what} must leave the in-flight reset waiting for its own answer"
+            );
+            assert!(
+                container
+                    .query_selector(".settings-native-reset-refusal")
+                    .unwrap()
+                    .is_none(),
+                "{what} must not be reported on the recovery card"
+            );
+            let page = container.text_content().unwrap_or_default();
+            assert!(
+                !page.contains(message),
+                "{what} must not put its message anywhere on the recovery page: {page:?}"
+            );
+        }
+
+        // A real reset refusal — for a *different host*. This host's reset is not it.
+        dispatch_command_error(
+            &state,
+            HOST_B,
+            0,
+            FrameKind::SetSetting,
+            Some(HostSettingErrorTarget::ResetTycodeManagedProjection),
+            CommandErrorCode::Conflict,
+            "another host's projection moved",
+        );
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        assert_eq!(
+            reset_state(&state, TYCODE_HOST),
+            Some(ManagedProjectionResetState::Pending),
+            "a reset refused on another host must not answer this host's reset"
+        );
+        assert!(
+            container
+                .query_selector(".settings-native-reset-refusal")
+                .unwrap()
+                .is_none(),
+            "another host's refusal must never reach this host's card"
+        );
+
+        // …and finally the one shape that *is* this command's answer.
+        const REFUSAL: &str = "Tycode managed projection changed after reset was offered";
+        dispatch_reset_error(&state, seq, CommandErrorCode::Conflict, REFUSAL);
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        assert_eq!(
+            reset_state(&state, TYCODE_HOST),
+            Some(ManagedProjectionResetState::Refused {
+                code: CommandErrorCode::Conflict,
+                message: REFUSAL.to_owned(),
+            }),
+            "the typed reset target, on this host, is this reset's answer"
+        );
+        let text = container
+            .query_selector(".settings-native-reset-refusal")
+            .unwrap()
+            .expect("the matching refusal must reach the card")
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            text.contains(REFUSAL),
+            "the server's refusal, verbatim: {text:?}"
+        );
+        assert!(
+            text.contains("Nothing was deleted"),
+            "a Conflict removed nothing, and the card must still say so: {text:?}"
+        );
+    }
+
+    /// Only a typed native-settings target may fail a pending native save.
+    ///
+    /// The mirror image of `only_a_typed_reset_target_refuses_the_reset`, and it
+    /// closes the mirror-image bug: `fail_native_settings_pending_on_error` matched on
+    /// `request_kind == SetSetting` alone, and a managed-projection **reset** is also a
+    /// `SetSetting`. So a refused reset arriving while a save was in flight would have
+    /// failed that save and printed the *reset's* error on the settings page — against
+    /// a save the server never even refused, unlocking controls on a false report.
+    ///
+    /// Same discipline as its twin: every negative first, the real rejection last, so
+    /// a pipeline that was simply broken end to end could not let the negatives pass.
+    #[wasm_bindgen_test]
+    async fn only_a_typed_native_settings_target_fails_the_pending_save() {
+        const HOST_B: &str = "host-tyc-other";
+        let container = make_container();
+        let state = AppState::new();
+        crate::dispatch::prime_host_for_tests(&state, TYCODE_HOST);
+        crate::dispatch::prime_host_for_tests(&state, HOST_B);
+        install_tycode_native_host(&state, tycode_ready_snapshot());
+        mark_native_save_pending(&state, TYCODE_HOST);
+
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".settings-native-saving")
+                .unwrap()
+                .is_some(),
+            "the page must start in the in-flight saving state, or this proves nothing"
+        );
+
+        // Everything that is *not* this save's answer. Each must leave it in flight.
+        let not_our_answer: [(&str, FrameKind, Option<HostSettingErrorTarget>, &str); 6] = [
+            (
+                "a refused managed-projection reset \u{2014} also a SetSetting",
+                FrameKind::SetSetting,
+                Some(HostSettingErrorTarget::ResetTycodeManagedProjection),
+                "Tycode managed projection changed after reset was offered",
+            ),
+            (
+                "a legacy backend-config setting",
+                FrameKind::SetSetting,
+                Some(HostSettingErrorTarget::BackendConfig),
+                "backend config rejected: unknown key",
+            ),
+            (
+                "an ordinary host setting",
+                FrameKind::SetSetting,
+                Some(HostSettingErrorTarget::LaunchProfiles),
+                "launch profile id is reserved",
+            ),
+            (
+                "a malformed SetSetting payload, which denotes no setting at all",
+                FrameKind::SetSetting,
+                Some(HostSettingErrorTarget::Malformed),
+                "host setting payload was not valid",
+            ),
+            (
+                "an older host that sends no target, so cannot correlate at all",
+                FrameKind::SetSetting,
+                None,
+                "set_setting failed for some reason we cannot attribute",
+            ),
+            (
+                "a command that is not a SetSetting",
+                FrameKind::ListSessions,
+                None,
+                "list_sessions failed",
+            ),
+        ];
+
+        let mut seq = 0;
+        for (what, request_kind, setting_target, message) in not_our_answer {
+            dispatch_command_error(
+                &state,
+                TYCODE_HOST,
+                seq,
+                request_kind,
+                setting_target,
+                CommandErrorCode::Internal,
+                message,
+            );
+            seq += 1;
+            for _ in 0..3 {
+                next_tick().await;
+            }
+            assert!(
+                matches!(
+                    native_save_state(&state, TYCODE_HOST),
+                    Some(NativeSettingsSaveState::Pending { .. })
+                ),
+                "{what} must leave the in-flight save waiting for its own answer, not \
+                 fail it: {:?}",
+                native_save_state(&state, TYCODE_HOST)
+            );
+            assert!(
+                container
+                    .query_selector(".settings-native-saving")
+                    .unwrap()
+                    .is_some(),
+                "{what} must not unlock the controls of a save the server never refused"
+            );
+            let page = container.text_content().unwrap_or_default();
+            assert!(
+                !page.contains(message),
+                "{what} must not put its message on the settings page: {page:?}"
+            );
+        }
+
+        // A real native-save rejection \u{2014} for a *different host*. Not this save's.
+        dispatch_command_error(
+            &state,
+            HOST_B,
+            0,
+            FrameKind::SetSetting,
+            Some(HostSettingErrorTarget::BackendNativeSettings),
+            CommandErrorCode::Internal,
+            "another host's save failed",
+        );
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        assert!(
+            matches!(
+                native_save_state(&state, TYCODE_HOST),
+                Some(NativeSettingsSaveState::Pending { .. })
+            ),
+            "a save rejected on another host must not fail this host's save"
+        );
+
+        // …and finally the one shape that *is* this save's answer.
+        const REJECTION: &str = "Tycode SaveSettings rejected: provider unavailable";
+        dispatch_command_error(
+            &state,
+            TYCODE_HOST,
+            seq,
+            FrameKind::SetSetting,
+            Some(HostSettingErrorTarget::BackendNativeSettings),
+            CommandErrorCode::Internal,
+            REJECTION,
+        );
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        assert_eq!(
+            native_save_state(&state, TYCODE_HOST),
+            Some(NativeSettingsSaveState::Failed {
+                message: REJECTION.to_owned(),
+            }),
+            "the typed native-settings target, on this host, is this save's answer"
+        );
+        assert!(
+            container
+                .query_selector(".settings-native-saving")
+                .unwrap()
+                .is_none(),
+            "the matching rejection must release the save gate \u{2014} no snapshot will"
+        );
+        let error = container
+            .query_selector(".settings-native-error")
+            .unwrap()
+            .expect("the matching rejection must surface an error on the settings page")
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            error.contains(REJECTION),
+            "the server's reason, verbatim: {error:?}"
+        );
+    }
+
+    /// Only a typed `Conflict` carries the server's guarantee that it compared the
+    /// tokens, found them stale, and refused *before* touching anything. Any other
+    /// failure code says nothing about what was or was not removed — so the card
+    /// must report the failure and invent no reassurance to go with it.
+    #[wasm_bindgen_test]
+    async fn a_non_conflict_reset_failure_never_claims_nothing_was_deleted() {
+        let _calls = install_settings_send_stub();
+        let container = make_container();
+        let state = AppState::new();
+        crate::dispatch::prime_host_for_tests(&state, TYCODE_HOST);
+        install_tycode_native_host(
+            &state,
+            tycode_recovery_snapshot(tycode_reset_required(
+                "Recovery required.",
+                "proj-A",
+                "sha256:state-a",
+            )),
+        );
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        arm_and_confirm_reset(&container).await;
+        const FAILURE: &str = "reset failed while cleaning the managed projection";
+        dispatch_reset_error(&state, 0, CommandErrorCode::Internal, FAILURE);
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        let text = container
+            .query_selector(".settings-native-reset-refusal")
+            .unwrap()
+            .expect("any refused reset must be reported on the card")
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            text.contains(FAILURE),
+            "the server's reason must be shown verbatim: {text:?}"
+        );
+        assert!(
+            !text.contains("Nothing was deleted"),
+            "only a typed Conflict may promise that nothing was removed \u{2014} an Internal \
+             failure makes no such guarantee, and the card must not invent one: {text:?}"
+        );
+    }
+
+    /// The same contract, on a destructive flow that predates the reset — the
+    /// dialog is shared, so it has to hold for every caller, not just the newest.
+    #[wasm_bindgen_test]
+    async fn launch_profile_delete_confirmation_is_an_accessible_modal() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_launch_profile_host(
+                &state,
+                vec![
+                    launch_profile_config("hermes:claude", "Hermes \u{b7} Claude"),
+                    launch_profile_config("hermes:codex", "Hermes \u{b7} Codex"),
+                ],
+            );
+            provide_context(state);
+            view! { <LaunchProfilesSection /> }
+        });
+        next_tick().await;
+
+        let delete = find_button_by_text(&container, "Delete").expect("Delete button");
+        delete.focus().unwrap();
+        delete.click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        let (cancel, confirm) = assert_confirm_dialog_is_an_accessible_modal(
+            &container,
+            "Delete launch profile",
+            "launch profile delete",
+        );
+        assert_focus_is_trapped_and_escape_cancels(
+            &container,
+            &cancel,
+            &confirm,
+            "launch profile delete",
+        )
+        .await;
+
+        assert!(
+            last_launch_profiles(&calls).is_none(),
+            "Escape must cancel the delete, never persist it"
+        );
+        assert!(
+            is_focused(&delete),
+            "closing must return focus to the Delete button that opened the dialog. Focus is \
+             on: {:?}",
+            focused_label()
+        );
+    }
+
     /// Absent properties render an explicit unset state (marker + "Not set"
     /// placeholder), never a blank/default control that reads as a real value.
     #[wasm_bindgen_test]
@@ -10362,6 +13686,9 @@ mod wasm_tests {
                         }),
                     }],
                     message: None,
+                    provenance: None,
+                    advisories: Vec::new(),
+                    managed_projection_recovery: None,
                 },
             );
             provide_context(state);
@@ -10419,6 +13746,9 @@ mod wasm_tests {
                         }),
                     }],
                     message: None,
+                    provenance: None,
+                    advisories: Vec::new(),
+                    managed_projection_recovery: None,
                 },
             );
             provide_context(state);
@@ -10468,6 +13798,9 @@ mod wasm_tests {
                         }),
                     }],
                     message: None,
+                    provenance: None,
+                    advisories: Vec::new(),
+                    managed_projection_recovery: None,
                 },
             );
             provide_context(state);
@@ -10555,6 +13888,10 @@ mod wasm_tests {
             &protocol::CommandErrorPayload {
                 stream: protocol::StreamPath("/host/host-tyc-native".to_owned()),
                 request_kind: protocol::FrameKind::SetSetting,
+                // The typed target the server now sends for a rejected native save.
+                // It is what tells the dispatcher this is the save's answer — and,
+                // just as importantly, that it is *not* a managed-projection reset's.
+                setting_target: Some(HostSettingErrorTarget::BackendNativeSettings),
                 operation: "set_setting".to_owned(),
                 code: protocol::CommandErrorCode::Internal,
                 message: "Tycode SaveSettings rejected: provider unavailable".to_owned(),
@@ -10634,6 +13971,9 @@ mod wasm_tests {
                         }),
                     }],
                     message: None,
+                    provenance: None,
+                    advisories: Vec::new(),
+                    managed_projection_recovery: None,
                 },
             );
             provide_context(state);
@@ -10974,6 +14314,9 @@ mod wasm_tests {
                         }),
                     }],
                     message: None,
+                    provenance: None,
+                    advisories: Vec::new(),
+                    managed_projection_recovery: None,
                 },
             );
             provide_context(state);

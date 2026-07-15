@@ -14,13 +14,16 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use protocol::{
-    BackendAccessMode, ExitPlanModeDecision, SendMessageToolResponse, SessionId, ToolPolicy,
-    ToolProgressData, ToolProgressUpdate, WorkflowAgentState, WorkflowAgentStatus,
-    WorkflowRunState, WorkflowRunStatus,
+    BackendAccessMode, CapacityBucket, CapacityBucketId, CapacityBucketStatus, CapacityCoverage,
+    CapacityMeasure, CapacityReport, CapacityReset, CapacityScope, CapacitySource,
+    CapacityUnavailableReason, CapacityWindow, ClaudeLimitType, ExitPlanModeDecision,
+    SendMessageToolResponse, SessionId, ToolPolicy, ToolProgressData, ToolProgressUpdate,
+    ValueProvenance, WorkflowAgentState, WorkflowAgentStatus, WorkflowRunState, WorkflowRunStatus,
 };
 
 use crate::backend::agent_control_progress::{
-    await_progress_data_for_tool, spawn_progress_data_for_tool_result,
+    await_progress_data_for_tool, spawn_progress_data_for_tool_result, tyde_tool_request_type,
+    tyde_tool_result,
 };
 use crate::backend::turn_emitter::{
     AgentName, AssistantMessagePayload, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
@@ -53,12 +56,20 @@ struct SubAgentStream {
     /// Emitter of the PARENT agent, used for the progress updates above.
     parent_emitter: Arc<TurnEmitter>,
     last_progress_emit: std::time::Instant,
-    /// True when the parent spawned this sub-agent with `run_in_background`.
+    /// How the CLI classified this sub-agent's execution lifecycle.
     /// Background agents keep streaming their own output *after* the parent
     /// receives the synthetic "launched" tool_result, so their stream must
     /// be finalized on the `task_notification` completion frame rather than
     /// torn down early when that placeholder tool_result arrives.
-    background: bool,
+    execution: SubAgentExecution,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SubAgentExecution {
+    #[default]
+    Unknown,
+    Foreground,
+    Background,
 }
 
 #[derive(Default)]
@@ -78,9 +89,30 @@ const CLAUDE_DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
 const CLAUDE_READ_ONLY_PERMISSION_MODE: &str = "acceptEdits";
 const CLAUDE_CONVERSATION_COMPACTED_NOTICE: &str = "Conversation compacted.";
 const CLAUDE_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[cfg(test)]
+pub(crate) static FAKE_CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+#[cfg(test)]
+static CLAUDE_PROCESS_SPAWN_OBSERVER: std::sync::Mutex<Option<oneshot::Sender<u32>>> =
+    std::sync::Mutex::new(None);
 const CLAUDE_CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLAUDE_INTERRUPT_QUIESCE_TIMEOUT: Duration = Duration::from_secs(18);
 const TYDE_CLAUDE_BIN_ENV: &str = "TYDE_CLAUDE_BIN";
+
+#[cfg(test)]
+fn observe_claude_process_spawned(pid: Option<u32>) {
+    let Some(pid) = pid else {
+        return;
+    };
+    if let Some(observer) = CLAUDE_PROCESS_SPAWN_OBSERVER
+        .lock()
+        .expect("Claude process spawn observer mutex poisoned")
+        .take()
+    {
+        let _ = observer.send(pid);
+    }
+}
+
 static CLAUDE_TURN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
@@ -237,7 +269,7 @@ impl ClaudeSession {
                 start_session_fresh: false,
                 ephemeral: mode.no_session_persistence,
                 model: None,
-                effort: Some("high".to_string()),
+                effort: Some(ClaudeEffort::High),
                 permission_mode: Some(
                     claude_permission_mode_for_access_mode(mode.access_mode).to_string(),
                 ),
@@ -245,7 +277,8 @@ impl ClaudeSession {
                 steering_content: mode.steering_content.map(|s| s.to_string()),
                 agent_identity: mode.agent_identity.cloned(),
                 tool_policy: mode.tool_policy,
-                last_cumulative_usage: None,
+                cumulative_usage: None,
+                cumulative_usage_complete: true,
                 conversation_bytes_total: 0,
                 active_turn: None,
                 restart_process_after_turn: false,
@@ -301,6 +334,57 @@ struct PendingExitPlanModeControl {
     plan_path: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeEffort {
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+impl ClaudeEffort {
+    const ALL: [Self; 5] = [Self::Low, Self::Medium, Self::High, Self::XHigh, Self::Max];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+            Self::XHigh => "XHigh",
+            Self::Max => "Max",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" => Ok(Self::XHigh),
+            "max" => Ok(Self::Max),
+            value => Err(format!(
+                "unsupported Claude effort '{value}'; expected one of: {}",
+                Self::ALL
+                    .iter()
+                    .map(|effort| effort.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+}
+
 struct ClaudeState {
     workspace_root: String,
     ssh_host: Option<String>,
@@ -309,13 +393,14 @@ struct ClaudeState {
     start_session_fresh: bool,
     ephemeral: bool,
     model: Option<String>,
-    effort: Option<String>,
+    effort: Option<ClaudeEffort>,
     permission_mode: Option<String>,
     startup_mcp_config_json: Option<String>,
     steering_content: Option<String>,
     agent_identity: Option<AgentIdentity>,
     tool_policy: ToolPolicy,
-    last_cumulative_usage: Option<Value>,
+    cumulative_usage: Option<Value>,
+    cumulative_usage_complete: bool,
     conversation_bytes_total: u64,
     active_turn: Option<ActiveTurn>,
     restart_process_after_turn: bool,
@@ -338,7 +423,8 @@ impl Default for ClaudeState {
             steering_content: None,
             agent_identity: None,
             tool_policy: ToolPolicy::Unrestricted,
-            last_cumulative_usage: None,
+            cumulative_usage: None,
+            cumulative_usage_complete: true,
             conversation_bytes_total: 0,
             active_turn: None,
             restart_process_after_turn: false,
@@ -403,6 +489,49 @@ impl Drop for ClaudeProcessRuntime {
     }
 }
 
+struct ClaudeResumeStartupGuard {
+    session: Option<ClaudeSession>,
+}
+
+struct ClaudeDetachedStartupCancelGuard(Option<oneshot::Sender<()>>);
+
+impl ClaudeDetachedStartupCancelGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ClaudeDetachedStartupCancelGuard {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.0.take() {
+            let _ = cancel.send(());
+        }
+    }
+}
+
+impl ClaudeResumeStartupGuard {
+    fn new(session: ClaudeSession) -> Self {
+        Self {
+            session: Some(session),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.session = None;
+    }
+}
+
+impl Drop for ClaudeResumeStartupGuard {
+    fn drop(&mut self) {
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        tokio::spawn(async move {
+            session.shutdown().await;
+        });
+    }
+}
+
 #[derive(Default)]
 struct SegmentState {
     has_content: bool,
@@ -431,9 +560,12 @@ struct ClaudeStdoutSummary {
     session_id: Option<String>,
     /// Per-API-call usage from the most recent stream event or assistant message.
     usage: Option<Value>,
-    /// Cumulative session usage from the `result` event (sum of all API calls).
-    /// Kept separate from `usage` so we don't confuse per-call with cumulative.
-    result_cumulative_usage: Option<Value>,
+    /// Aggregate usage for this CLI invocation from the `result` event.
+    /// Kept separate from `usage` so we don't confuse a turn with one API call.
+    result_turn_usage: Option<Value>,
+    /// Sum of distinct API-call usages observed while relaying a native child.
+    /// Claude does not consistently correlate a `result` frame to native children.
+    accumulated_request_usage: Option<Value>,
     /// Context window extracted from `result.modelUsage[model].contextWindow`.
     result_context_window: Option<u64>,
     errors: Vec<String>,
@@ -540,6 +672,10 @@ enum ClaudeSystemEvent {
     TaskStarted,
     TaskProgress,
     TaskNotification,
+    BackgroundTasksChanged,
+    TaskUpdated,
+    ThinkingTokens,
+    ApiRetry,
     Unknown(String),
 }
 
@@ -552,6 +688,10 @@ impl ClaudeSystemFrame {
             "task_started" => ClaudeSystemEvent::TaskStarted,
             "task_progress" => ClaudeSystemEvent::TaskProgress,
             "task_notification" => ClaudeSystemEvent::TaskNotification,
+            "background_tasks_changed" => ClaudeSystemEvent::BackgroundTasksChanged,
+            "task_updated" => ClaudeSystemEvent::TaskUpdated,
+            "thinking_tokens" => ClaudeSystemEvent::ThinkingTokens,
+            "api_retry" => ClaudeSystemEvent::ApiRetry,
             other => ClaudeSystemEvent::Unknown(other.to_string()),
         }
     }
@@ -675,7 +815,7 @@ struct ClaudePhaseEmission {
 #[derive(Debug, Clone)]
 struct ClaudeTurnUsage {
     turn: Value,
-    cumulative: Value,
+    cumulative: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -693,7 +833,8 @@ enum ClaudeHistoryReplayItem {
 
 struct ClaudeSessionReplay {
     items: Vec<ClaudeHistoryReplayItem>,
-    last_cumulative_usage: Option<Value>,
+    cumulative_usage: Option<Value>,
+    cumulative_usage_complete: bool,
     conversation_bytes_total: u64,
 }
 
@@ -765,7 +906,7 @@ struct RunTurnParams<'a> {
     session_id: Option<String>,
     ephemeral: bool,
     model: Option<String>,
-    effort: Option<String>,
+    effort: Option<ClaudeEffort>,
     permission_mode: Option<String>,
     startup_mcp_config_json: Option<String>,
     steering_content: Option<String>,
@@ -786,7 +927,7 @@ struct ClaudeProcessSpawnConfig {
     resume_existing_session: bool,
     ephemeral: bool,
     model: Option<String>,
-    effort: Option<String>,
+    effort: Option<ClaudeEffort>,
     permission_mode: Option<String>,
     startup_mcp_config_json: Option<String>,
     steering_content: Option<String>,
@@ -869,6 +1010,11 @@ impl ClaudeInner {
             } => {
                 let mut changed_process_setting = false;
                 if let Some(obj) = settings.as_object() {
+                    let effort_update = obj
+                        .get("effort")
+                        .or_else(|| obj.get("reasoning_effort"))
+                        .map(parse_claude_effort_setting)
+                        .transpose()?;
                     let mut state = this.state.lock().await;
                     if let Some(model_value) = obj.get("model") {
                         let next = normalize_optional_string(model_value);
@@ -876,10 +1022,7 @@ impl ClaudeInner {
                         state.model = next;
                     }
 
-                    if let Some(effort_value) =
-                        obj.get("effort").or_else(|| obj.get("reasoning_effort"))
-                    {
-                        let next = normalize_claude_effort(effort_value);
+                    if let Some(next) = effort_update {
                         changed_process_setting |= state.effort != next;
                         state.effort = next;
                     }
@@ -1153,7 +1296,7 @@ impl ClaudeInner {
             } => {
                 let mut summary = summary;
                 let turn_usage = self
-                    .normalize_usage_for_turn(summary.result_cumulative_usage.clone())
+                    .normalize_usage_for_turn(summary.result_turn_usage.clone())
                     .await;
                 let known_context_window = summary.result_context_window;
                 if !self
@@ -1173,7 +1316,7 @@ impl ClaudeInner {
             TurnOutcome::Cancelled { summary } => {
                 let mut summary = summary;
                 let turn_usage = self
-                    .normalize_usage_for_turn(summary.result_cumulative_usage.clone())
+                    .normalize_usage_for_turn(summary.result_turn_usage.clone())
                     .await;
                 let known_context_window = summary.result_context_window;
                 self.emit_terminal_phase_or_placeholder(
@@ -1195,7 +1338,7 @@ impl ClaudeInner {
             TurnOutcome::Failed { summary, error } => {
                 let mut summary = summary;
                 let turn_usage = self
-                    .normalize_usage_for_turn(summary.result_cumulative_usage.take())
+                    .normalize_usage_for_turn(summary.result_turn_usage.take())
                     .await;
                 let known_context_window = summary.result_context_window;
                 let _ = self
@@ -1655,7 +1798,7 @@ impl ClaudeInner {
                 resume_existing_session: !state.start_session_fresh,
                 ephemeral: state.ephemeral,
                 model: state.model.clone(),
-                effort: state.effort.clone(),
+                effort: state.effort,
                 permission_mode: state.permission_mode.clone(),
                 startup_mcp_config_json: state.startup_mcp_config_json.clone(),
                 steering_content: state.steering_content.clone(),
@@ -1665,6 +1808,11 @@ impl ClaudeInner {
         };
 
         let runtime = self.spawn_process(config).await?;
+        #[cfg(test)]
+        let spawned_pid = {
+            let mut child = runtime.child.lock().await;
+            child.as_mut().and_then(|child| child.inner().id())
+        };
         {
             let mut runtime_slot = self.runtime.lock().await;
             if runtime_slot.is_some() {
@@ -1674,6 +1822,8 @@ impl ClaudeInner {
             }
             *runtime_slot = Some(runtime);
         }
+        #[cfg(test)]
+        observe_claude_process_spawned(spawned_pid);
 
         match tokio::time::timeout(
             CLAUDE_INITIALIZE_TIMEOUT,
@@ -2002,7 +2152,7 @@ impl ClaudeInner {
             let state = self.state.lock().await;
             (
                 state.model.clone(),
-                state.effort.clone(),
+                state.effort.map(ClaudeEffort::as_str),
                 state.permission_mode.clone(),
             )
         };
@@ -2039,7 +2189,8 @@ impl ClaudeInner {
             state.session_id = Some(normalized.clone());
             state.fork_from_session_id = None;
             state.start_session_fresh = false;
-            state.last_cumulative_usage = None;
+            state.cumulative_usage = None;
+            state.cumulative_usage_complete = true;
             state.conversation_bytes_total = 0;
             (state.workspace_root.clone(), state.ssh_host.clone())
         };
@@ -2082,7 +2233,8 @@ impl ClaudeInner {
         }
 
         let mut state = self.state.lock().await;
-        state.last_cumulative_usage = replay.last_cumulative_usage;
+        state.cumulative_usage = replay.cumulative_usage;
+        state.cumulative_usage_complete = replay.cumulative_usage_complete;
         state.conversation_bytes_total = replay.conversation_bytes_total;
         state.start_session_fresh = false;
         Ok(())
@@ -2105,7 +2257,8 @@ impl ClaudeInner {
             state.session_id = Some(session_id.to_string());
             state.fork_from_session_id = None;
             state.start_session_fresh = true;
-            state.last_cumulative_usage = None;
+            state.cumulative_usage = None;
+            state.cumulative_usage_complete = true;
             state.conversation_bytes_total = 0;
         }
         self.emitter.warning_message(&format!(
@@ -2122,7 +2275,8 @@ impl ClaudeInner {
                 state.session_id = None;
                 state.fork_from_session_id = None;
                 state.start_session_fresh = false;
-                state.last_cumulative_usage = None;
+                state.cumulative_usage = None;
+                state.cumulative_usage_complete = true;
                 state.conversation_bytes_total = 0;
             }
             (state.workspace_root.clone(), state.ssh_host.clone())
@@ -2156,11 +2310,44 @@ impl ClaudeInner {
         {
             self.emitter.tool_progress(&progress);
         }
-        self.emitter.tool_request(
-            &tool_call.id,
-            &tool_call.name,
-            claude_tool_request_type(&tool_call.name, &tool_call.arguments),
-        );
+        let (tool_type, normalization_failure) =
+            match tyde_tool_request_type(&tool_call.name, &tool_call.arguments) {
+                Ok(Some(tool_type)) => (
+                    serde_json::to_value(tool_type).expect("serialize tool request"),
+                    None,
+                ),
+                Ok(None) => (
+                    claude_tool_request_type(&tool_call.name, &tool_call.arguments),
+                    None,
+                ),
+                Err(error) => {
+                    tracing::error!(
+                        tool = %tool_call.name,
+                        tool_call_id = %tool_call.id,
+                        detail = %error.detail,
+                        "Canonical Tyde tool request normalization failed"
+                    );
+                    self.emitter.backend_error(&format!(
+                        "Failed to normalize canonical tool request '{}' ({}): {}",
+                        tool_call.name, tool_call.id, error
+                    ));
+                    (
+                        claude_tool_request_type(&tool_call.name, &tool_call.arguments),
+                        Some(error.normalization_failure),
+                    )
+                }
+            };
+        if let Some(normalization_failure) = normalization_failure {
+            self.emitter.tool_request_with_normalization_failure(
+                &tool_call.id,
+                &tool_call.name,
+                tool_type,
+                normalization_failure,
+            );
+        } else {
+            self.emitter
+                .tool_request(&tool_call.id, &tool_call.name, tool_type);
+        }
     }
 
     fn emit_tool_execution_completed(
@@ -2177,13 +2364,43 @@ impl ClaudeInner {
         {
             self.emitter.tool_progress(&progress);
         }
-        self.emitter.tool_completed(ToolCompletedPayload {
+        let (tool_result, normalization_failure) = if success {
+            match tyde_tool_result(tool_name, &tool_result) {
+                Ok(Some(typed)) => (
+                    serde_json::to_value(typed).expect("serialize tool result"),
+                    None,
+                ),
+                Ok(None) => (tool_result, None),
+                Err(normalize_error) => {
+                    tracing::error!(
+                        tool = %tool_name,
+                        tool_call_id = %tool_call_id,
+                        detail = %normalize_error.detail,
+                        "Canonical Tyde tool result normalization failed"
+                    );
+                    self.emitter.backend_error(&format!(
+                        "Failed to normalize canonical tool result '{}' ({}): {}",
+                        tool_name, tool_call_id, normalize_error
+                    ));
+                    (tool_result, Some(normalize_error.normalization_failure))
+                }
+            }
+        } else {
+            (tool_result, None)
+        };
+        let completed = ToolCompletedPayload {
             tool_call_id,
             tool_name,
             tool_result,
             success,
             error: error.as_deref(),
-        });
+        };
+        if let Some(normalization_failure) = normalization_failure {
+            self.emitter
+                .tool_completed_with_normalization_failure(completed, normalization_failure);
+        } else {
+            self.emitter.tool_completed(completed);
+        }
     }
 
     async fn shutdown(&self) {
@@ -2235,6 +2452,8 @@ impl ClaudeInner {
         tool_calls: Vec<Value>,
         context_breakdown: Option<Value>,
     ) {
+        let token_usage_unavailable_reason = (usage.turn.is_some() && usage.cumulative.is_none())
+            .then_some(protocol::TokenUsageUnavailableReason::ProviderScopeAmbiguous);
         self.emitter.stream_end(StreamEndPayload {
             content,
             agent: Some(AgentName(CLAUDE_AGENT_NAME)),
@@ -2242,7 +2461,7 @@ impl ClaudeInner {
             request_usage: usage.request,
             turn_usage: usage.turn,
             cumulative_usage: usage.cumulative,
-            token_usage_unavailable_reason: None,
+            token_usage_unavailable_reason,
             reasoning,
             tool_calls,
             context_breakdown,
@@ -2261,7 +2480,7 @@ impl ClaudeInner {
             ClaudeMessageUsage {
                 request: None,
                 turn: turn_usage.as_ref().map(|usage| usage.turn.clone()),
-                cumulative: turn_usage.map(|usage| usage.cumulative),
+                cumulative: turn_usage.and_then(|usage| usage.cumulative),
             },
             None,
             Vec::new(),
@@ -2336,16 +2555,13 @@ impl ClaudeInner {
     }
 
     async fn normalize_usage_for_turn(&self, usage: Option<Value>) -> Option<ClaudeTurnUsage> {
-        let cumulative_usage = usage?;
+        let turn = usage?;
 
         let mut state = self.state.lock().await;
-        let per_turn =
-            derive_turn_token_usage(&cumulative_usage, state.last_cumulative_usage.as_ref());
-        state.last_cumulative_usage = Some(cumulative_usage.clone());
-        per_turn.map(|turn| ClaudeTurnUsage {
-            turn,
-            cumulative: cumulative_usage,
-        })
+        let cumulative = add_token_usage(state.cumulative_usage.as_ref(), &turn);
+        state.cumulative_usage = Some(cumulative.clone());
+        let cumulative = state.cumulative_usage_complete.then_some(cumulative);
+        Some(ClaudeTurnUsage { turn, cumulative })
     }
 
     async fn emit_terminal_phase_or_placeholder(
@@ -2396,7 +2612,9 @@ impl ClaudeInner {
                 ClaudeMessageUsage {
                     request: phase.usage,
                     turn: turn_usage.as_ref().map(|usage| usage.turn.clone()),
-                    cumulative: turn_usage.as_ref().map(|usage| usage.cumulative.clone()),
+                    cumulative: turn_usage
+                        .as_ref()
+                        .and_then(|usage| usage.cumulative.clone()),
                 },
                 phase.reasoning,
                 tool_calls,
@@ -2535,9 +2753,9 @@ fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Vec<String> {
         cli_args.push(model_name);
     }
 
-    if let Some(effort_level) = config.effort.as_deref().and_then(normalize_nonempty) {
+    if let Some(effort_level) = config.effort {
         cli_args.push("--effort".to_string());
-        cli_args.push(effort_level);
+        cli_args.push(effort_level.as_str().to_string());
     }
 
     if let Some(mcp_config_json) = config
@@ -2691,13 +2909,88 @@ fn extract_parent_tool_use_id(value: &Value) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+fn route_subagent_event(
+    streams: &mut HashMap<String, SubAgentStream>,
+    parent_id: &str,
+    value: &Value,
+) -> Result<(), String> {
+    let Some(stream) = streams.get_mut(parent_id) else {
+        let event_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        return Err(format!(
+            "Claude child event could not be routed: parent_tool_use_id={parent_id}, event_type={event_type}"
+        ));
+    };
+    consume_subagent_event(stream, value);
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubAgentCorrelation {
+    Live,
+    Orphaned,
+    Unowned,
+}
+
+fn classify_subagent_correlation(
+    streams: &HashMap<String, SubAgentStream>,
+    known_subagent_ids: &HashSet<String>,
+    parent_id: &str,
+) -> SubAgentCorrelation {
+    if streams.contains_key(parent_id) {
+        SubAgentCorrelation::Live
+    } else if known_subagent_ids.contains(parent_id) {
+        SubAgentCorrelation::Orphaned
+    } else {
+        SubAgentCorrelation::Unowned
+    }
+}
+
+fn handle_correlated_subagent_event(
+    streams: &mut HashMap<String, SubAgentStream>,
+    known_subagent_ids: &HashSet<String>,
+    parent_emitter: &TurnEmitter,
+    parent_id: &str,
+    value: &Value,
+) {
+    match classify_subagent_correlation(streams, known_subagent_ids, parent_id) {
+        SubAgentCorrelation::Live => {
+            route_subagent_event(streams, parent_id, value)
+                .expect("live Claude child correlation must route");
+        }
+        SubAgentCorrelation::Orphaned => {
+            let event_type = value
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let message = format!(
+                "Claude child event arrived after its stream closed: parent_tool_use_id={parent_id}, event_type={event_type}"
+            );
+            tracing::error!("{message}");
+            parent_emitter.subprocess_stderr(&message);
+        }
+        SubAgentCorrelation::Unowned => {
+            let event_type = value
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            tracing::debug!(
+                parent_tool_use_id = parent_id,
+                event_type,
+                "ignoring correlated Claude frame not owned by a sub-agent"
+            );
+        }
+    }
+}
+
 /// Whether a Task/Agent tool_use block requested background execution.
-fn extract_run_in_background(block: &Value) -> bool {
+fn extract_run_in_background(block: &Value) -> Option<bool> {
     block
         .get("input")
         .and_then(|input| input.get("run_in_background"))
         .and_then(Value::as_bool)
-        .unwrap_or(false)
 }
 
 /// Extract sub-agent spawn info from a tool_use content block.
@@ -2767,6 +3060,7 @@ async fn read_claude_stdout_persistent(
     let mut turn_state = PersistentStdoutTurnState::default();
     let mut lines = BufReader::new(stdout).lines();
     let mut subagent_streams: HashMap<String, SubAgentStream> = HashMap::new();
+    let mut known_subagent_ids = HashSet::new();
     let mut pending_subagent_prompts: HashMap<u64, PendingSubAgentPrompt> = HashMap::new();
     // Keyed by task_id; lives at loop scope (not per-turn) because a
     // workflow's task frames keep arriving after its turn completes.
@@ -2808,6 +3102,13 @@ async fn read_claude_stdout_persistent(
             state.subagent_emitter.clone()
         };
 
+        if value.get("type").and_then(Value::as_str) == Some("rate_limit_event") {
+            if let Some(emitter) = subagent_emitter.as_ref() {
+                forward_passive_rate_limit_event(&value, emitter.as_ref());
+            }
+            continue;
+        }
+
         if let Some(ref emitter) = subagent_emitter {
             detect_subagent_task_system_spawns(
                 &value,
@@ -2816,6 +3117,7 @@ async fn read_claude_stdout_persistent(
                 &mut subagent_streams,
             )
             .await;
+            known_subagent_ids.extend(subagent_streams.keys().cloned());
             // A background sub-agent completes via `task_notification`, which
             // arrives on the parent stream after the parent's turn `result`.
             // Handle it pre-gate so it lands even with no active turn.
@@ -2823,9 +3125,13 @@ async fn read_claude_stdout_persistent(
         }
 
         if let Some(parent_id) = extract_parent_tool_use_id(&value) {
-            if let Some(stream) = subagent_streams.get_mut(parent_id) {
-                consume_subagent_event(stream, &value);
-            }
+            handle_correlated_subagent_event(
+                &mut subagent_streams,
+                &known_subagent_ids,
+                &inner.emitter,
+                parent_id,
+                &value,
+            );
             continue;
         }
 
@@ -2838,6 +3144,7 @@ async fn read_claude_stdout_persistent(
                 &mut pending_subagent_prompts,
             )
             .await;
+            known_subagent_ids.extend(subagent_streams.keys().cloned());
         }
 
         let _turn_event_guard = inner.turn_event_gate.lock().await;
@@ -2893,11 +3200,8 @@ async fn read_claude_stdout_persistent(
         }
     }
 
-    for (_tool_use_id, mut stream) in subagent_streams.drain() {
-        flush_pending_tool_uses(&mut stream.summary, &mut stream.segment);
-        if phase_has_pending_output(&stream.summary, &stream.segment) {
-            close_current_subagent_phase(&mut stream.summary, &mut stream.segment, &stream.inner);
-        }
+    for (_tool_use_id, stream) in subagent_streams.drain() {
+        finalize_subagent_stream(stream);
     }
 
     fail_pending_control_waiters(&control_waiters, "Claude CLI process exited").await;
@@ -3719,7 +4023,7 @@ struct SubAgentSpawnSpec {
     description: String,
     agent_type: String,
     session_id_hint: Option<protocol::SessionId>,
-    background: bool,
+    execution: SubAgentExecution,
 }
 
 async fn ensure_subagent_stream(
@@ -3734,7 +4038,7 @@ async fn ensure_subagent_stream(
         description,
         agent_type,
         session_id_hint,
-        background,
+        execution,
     } = spec;
     if streams.contains_key(&tool_use_id) {
         return;
@@ -3743,7 +4047,7 @@ async fn ensure_subagent_stream(
     tracing::info!(
         "registering Claude sub-agent stream tool_use_id={tool_use_id} name={name} agent_type={agent_type}"
     );
-    let handle = emitter
+    let handle = match emitter
         .on_subagent_spawned(
             tool_use_id.clone(),
             name.clone(),
@@ -3751,7 +4055,17 @@ async fn ensure_subagent_stream(
             agent_type,
             session_id_hint,
         )
-        .await;
+        .await
+    {
+        Ok(handle) => handle,
+        Err(error) => {
+            parent_emitter.backend_error(&format!(
+                "Claude child relay registration failed for tool '{}': {error}",
+                tool_use_id
+            ));
+            return;
+        }
+    };
     let (raw_event_tx, raw_event_rx) = mpsc::unbounded_channel();
     spawn_claude_subagent_event_bridge(raw_event_rx, handle.event_tx.clone());
 
@@ -3781,7 +4095,7 @@ async fn ensure_subagent_stream(
         agent_name: name,
         parent_emitter: parent_emitter.clone(),
         last_progress_emit: std::time::Instant::now(),
-        background,
+        execution,
     };
     // Unthrottled spawn update: the Task card learns the sub-agent's id
     // (for its "Open agent" link) as soon as the agent exists.
@@ -4084,10 +4398,7 @@ async fn detect_subagent_task_system_spawns(
             description,
             agent_type: task_type,
             session_id_hint: None,
-            // A `task_started` frame alone doesn't reveal `run_in_background`;
-            // the matching tool_use block (processed in `detect_subagent_spawns`)
-            // upgrades the flag when it does.
-            background: false,
+            execution: SubAgentExecution::Unknown,
         },
     )
     .await;
@@ -4236,7 +4547,13 @@ async fn detect_subagent_spawns(
             "detect_subagent_spawns: found tool_use block: name={block_name} id={block_id}"
         );
         if let Some((tool_use_id, name, description, agent_type)) = extract_spawn_info(&block) {
-            let background = extract_run_in_background(&block);
+            let requested_execution = extract_run_in_background(&block).map(|background| {
+                if background {
+                    SubAgentExecution::Background
+                } else {
+                    SubAgentExecution::Foreground
+                }
+            });
             ensure_subagent_stream(
                 emitter,
                 parent_emitter,
@@ -4247,15 +4564,14 @@ async fn detect_subagent_spawns(
                     description: description.clone(),
                     agent_type,
                     session_id_hint: None,
-                    background,
+                    execution: requested_execution.unwrap_or_default(),
                 },
             )
             .await;
             if let Some(stream) = streams.get_mut(&tool_use_id) {
-                // The full tool_use block carries the complete input, so it
-                // upgrades a stream that was first registered from a
-                // `task_started` frame (which lacks `run_in_background`).
-                stream.background |= background;
+                if let Some(execution) = requested_execution {
+                    stream.execution = execution;
+                }
                 emit_subagent_task_prompt_if_needed(stream, &description);
             }
         }
@@ -4296,11 +4612,9 @@ async fn detect_subagent_completions(value: &Value, streams: &mut HashMap<String
         // placeholder — its real output streams *afterwards*. Keep the stream
         // alive; it is finalized on the `task_notification` completion frame
         // (see `finalize_background_subagent_completion`).
-        if streams
-            .get(tool_use_id)
-            .is_some_and(|stream| stream.background)
-        {
-            continue;
+        match streams.get(tool_use_id).map(|stream| stream.execution) {
+            Some(SubAgentExecution::Background | SubAgentExecution::Unknown) => continue,
+            Some(SubAgentExecution::Foreground) | None => {}
         }
         if let Some(stream) = streams.remove(tool_use_id) {
             finalize_subagent_stream(stream);
@@ -4313,6 +4627,24 @@ fn finalize_subagent_stream(mut stream: SubAgentStream) {
     flush_pending_tool_uses(&mut stream.summary, &mut stream.segment);
     if phase_has_pending_output(&stream.summary, &stream.segment) {
         close_current_subagent_phase(&mut stream.summary, &mut stream.segment, &stream.inner);
+    } else if let Some(turn_usage) = subagent_terminal_usage(&stream.summary) {
+        let base_message_id = stream.message_id.clone();
+        let mut terminal_message_id = base_message_id.clone();
+        let model = stream.summary.model.clone();
+        maybe_emit_next_stream_start(
+            &mut stream.summary,
+            &mut stream.segment,
+            &stream.inner,
+            &base_message_id,
+            &mut terminal_message_id,
+            model,
+        );
+        stream.message_id = terminal_message_id;
+        stream.inner.emit_placeholder_stream_end(
+            stream.summary.model.clone(),
+            Some(turn_usage),
+            None,
+        );
     }
     // Unthrottled final update with the closing stats.
     stream
@@ -4325,14 +4657,25 @@ fn close_current_subagent_phase(
     segment: &mut SegmentState,
     inner: &ClaudeInner,
 ) {
-    let turn_usage = summary
-        .result_cumulative_usage
+    let turn_usage = subagent_terminal_usage(summary);
+    close_current_phase_with_turn_usage(summary, segment, inner, turn_usage);
+}
+
+fn subagent_terminal_usage(summary: &ClaudeStdoutSummary) -> Option<ClaudeTurnUsage> {
+    summary
+        .result_turn_usage
         .clone()
+        .or_else(|| {
+            summary
+                .usage
+                .as_ref()
+                .map(|usage| add_token_usage(summary.accumulated_request_usage.as_ref(), usage))
+        })
+        .or_else(|| summary.accumulated_request_usage.clone())
         .map(|usage| ClaudeTurnUsage {
             turn: usage.clone(),
-            cumulative: usage,
-        });
-    close_current_phase_with_turn_usage(summary, segment, inner, turn_usage);
+            cumulative: Some(usage),
+        })
 }
 
 /// Finalize a background sub-agent when its `task_notification` completion
@@ -4467,9 +4810,12 @@ fn consume_claude_stream_value(
                 // with nothing to render.
                 ClaudeSystemEvent::TaskStarted
                 | ClaudeSystemEvent::TaskProgress
-                | ClaudeSystemEvent::TaskNotification => {
+                | ClaudeSystemEvent::TaskNotification
+                | ClaudeSystemEvent::BackgroundTasksChanged
+                | ClaudeSystemEvent::TaskUpdated => {
                     let _ = (&system.task_id, &system.status, &system.summary);
                 }
+                ClaudeSystemEvent::ThinkingTokens | ClaudeSystemEvent::ApiRetry => {}
                 ClaudeSystemEvent::Unknown(subtype) => {
                     tracing::warn!("Ignoring unrecognized Claude system subtype: {subtype}");
                 }
@@ -4499,11 +4845,10 @@ fn consume_claude_stream_value(
                 summary.result_reasoning = Some(reasoning.clone());
                 append_reasoning_text(summary, &reasoning, true);
             }
-            // result.usage is cumulative across all API calls in the session.
-            // Store it separately — do NOT overwrite summary.usage which holds
-            // per-API-call values from stream events / assistant messages.
+            // result.usage aggregates the API calls made by this CLI invocation.
+            // Store it separately from the latest per-call assistant usage.
             if let Some(usage) = parse_token_usage(value.get("usage")) {
-                summary.result_cumulative_usage = Some(usage);
+                summary.result_turn_usage = Some(usage);
             }
             // Extract contextWindow from result.modelUsage[model].contextWindow.
             // This is the only place Claude Code reports the actual context window.
@@ -4918,8 +5263,14 @@ fn close_current_phase_with_turn_usage(
     enrich_exit_plan_mode_tool_calls(summary);
 
     if let Some(phase) = take_phase_emission(summary) {
+        if let Some(request_usage) = phase.usage.as_ref() {
+            summary.accumulated_request_usage = Some(add_token_usage(
+                summary.accumulated_request_usage.as_ref(),
+                request_usage,
+            ));
+        }
         let turn = turn_usage.as_ref().map(|usage| usage.turn.clone());
-        let cumulative = turn_usage.map(|usage| usage.cumulative);
+        let cumulative = turn_usage.and_then(|usage| usage.cumulative);
         let tool_calls = phase
             .tool_calls
             .iter()
@@ -5614,6 +5965,32 @@ fn usage_value_u64(usage: &Value, key: &str) -> u64 {
     usage.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
 
+fn add_token_usage(accumulated: Option<&Value>, usage: &Value) -> Value {
+    let context_window = usage
+        .get("context_window")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            accumulated.and_then(|value| value.get("context_window").and_then(Value::as_u64))
+        });
+    let summed = |key| {
+        accumulated
+            .map(|value| usage_value_u64(value, key))
+            .unwrap_or(0)
+            .saturating_add(usage_value_u64(usage, key))
+    };
+
+    json!({
+        "input_tokens": summed("input_tokens"),
+        "output_tokens": summed("output_tokens"),
+        "total_tokens": summed("total_tokens"),
+        "cached_prompt_tokens": summed("cached_prompt_tokens"),
+        "cache_creation_input_tokens": summed("cache_creation_input_tokens"),
+        "reasoning_tokens": summed("reasoning_tokens"),
+        "context_window": context_window,
+    })
+}
+
+#[cfg(test)]
 fn derive_turn_token_usage(current: &Value, previous: Option<&Value>) -> Option<Value> {
     let input_tokens = usage_value_u64(current, "input_tokens");
     let output_tokens = usage_value_u64(current, "output_tokens");
@@ -5734,14 +6111,16 @@ fn normalize_optional_string(value: &Value) -> Option<String> {
     value.as_str().and_then(normalize_nonempty)
 }
 
-fn normalize_claude_effort(value: &Value) -> Option<String> {
-    let normalized = normalize_optional_string(value)?.to_ascii_lowercase();
-    match normalized.as_str() {
-        "low" | "medium" | "high" | "max" => Some(normalized),
-        "xhigh" | "extra_high" | "extra-high" => Some("max".to_string()),
-        "minimal" | "none" => Some("low".to_string()),
-        _ => None,
+fn parse_claude_effort_setting(value: &Value) -> Result<Option<ClaudeEffort>, String> {
+    if value.is_null() {
+        return Ok(None);
     }
+    let text = value
+        .as_str()
+        .ok_or_else(|| format!("Claude effort must be a string or null, got {value}"))?;
+    normalize_nonempty(text)
+        .map(|text| ClaudeEffort::parse(&text))
+        .transpose()
 }
 
 fn normalize_claude_permission_mode(value: &Value) -> Option<String> {
@@ -6802,7 +7181,12 @@ fn parse_claude_session_history_contents(contents: &str) -> Vec<ClaudeHistoryRep
 
 fn parse_claude_session_replay(contents: &str) -> ClaudeSessionReplay {
     let mut restored = Vec::new();
-    let mut last_cumulative_usage = None;
+    let mut cumulative_usage = None;
+    let mut cumulative_usage_complete = true;
+    let mut invocation_usage = None;
+    let mut invocation_usage_complete = true;
+    let mut invocation_message_ids = HashSet::new();
+    let mut invocation_prompt_id = None::<String>;
     let mut conversation_bytes_total = 0u64;
     let parsed_values = contents
         .lines()
@@ -6847,10 +7231,37 @@ fn parse_claude_session_replay(contents: &str) -> ClaudeSessionReplay {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        if line_type == "user"
+            && let Some(prompt_id) = replay_top_level_user_prompt_id(&value)
+            && invocation_prompt_id.as_deref() != Some(prompt_id.as_str())
+        {
+            if invocation_prompt_id.is_some() {
+                commit_replay_invocation_usage(
+                    &mut cumulative_usage,
+                    &mut cumulative_usage_complete,
+                    &mut invocation_usage,
+                    &mut invocation_usage_complete,
+                    &mut invocation_message_ids,
+                );
+            }
+            invocation_prompt_id = Some(prompt_id);
+        }
         if line_type == "result" {
             if let Some(usage) = parse_token_usage(value.get("usage")) {
-                last_cumulative_usage = Some(usage);
+                cumulative_usage = Some(add_token_usage(cumulative_usage.as_ref(), &usage));
+                invocation_usage = None;
+                invocation_usage_complete = true;
+                invocation_message_ids.clear();
+            } else {
+                commit_replay_invocation_usage(
+                    &mut cumulative_usage,
+                    &mut cumulative_usage_complete,
+                    &mut invocation_usage,
+                    &mut invocation_usage_complete,
+                    &mut invocation_message_ids,
+                );
             }
+            invocation_prompt_id = None;
             continue;
         }
         if line_type != "assistant" && line_type != "user" {
@@ -6877,6 +7288,21 @@ fn parse_claude_session_replay(contents: &str) -> ClaudeSessionReplay {
             .map(|text| json!({ "text": text }))
             .unwrap_or(Value::Null);
         let token_usage = parse_token_usage(message.get("usage"));
+        if role == "assistant"
+            && let Some(usage) = token_usage.as_ref()
+        {
+            let usage_id = message
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(normalize_nonempty);
+            if let Some(usage_id) = usage_id {
+                if invocation_message_ids.insert(usage_id) {
+                    invocation_usage = Some(add_token_usage(invocation_usage.as_ref(), usage));
+                }
+            } else {
+                invocation_usage_complete = false;
+            }
+        }
         let tool_calls = if role == "assistant" {
             extract_tool_calls_from_message(&message_value)
         } else {
@@ -7024,11 +7450,56 @@ fn parse_claude_session_replay(contents: &str) -> ClaudeSessionReplay {
         );
     }
 
+    commit_replay_invocation_usage(
+        &mut cumulative_usage,
+        &mut cumulative_usage_complete,
+        &mut invocation_usage,
+        &mut invocation_usage_complete,
+        &mut invocation_message_ids,
+    );
+
     ClaudeSessionReplay {
         items: restored,
-        last_cumulative_usage,
+        cumulative_usage,
+        cumulative_usage_complete,
         conversation_bytes_total,
     }
+}
+
+fn replay_top_level_user_prompt_id(value: &Value) -> Option<String> {
+    if value.get("type").and_then(Value::as_str) != Some("user")
+        || value.get("isSidechain").and_then(Value::as_bool) != Some(false)
+        || value
+            .get("uuid")
+            .and_then(Value::as_str)
+            .and_then(normalize_nonempty)
+            .is_none()
+    {
+        return None;
+    }
+    value
+        .get("promptId")
+        .and_then(Value::as_str)
+        .and_then(normalize_nonempty)
+}
+
+fn commit_replay_invocation_usage(
+    cumulative_usage: &mut Option<Value>,
+    cumulative_usage_complete: &mut bool,
+    invocation_usage: &mut Option<Value>,
+    invocation_usage_complete: &mut bool,
+    invocation_message_ids: &mut HashSet<String>,
+) {
+    if *invocation_usage_complete {
+        if let Some(usage) = invocation_usage.take() {
+            *cumulative_usage = Some(add_token_usage(cumulative_usage.as_ref(), &usage));
+        }
+    } else {
+        *cumulative_usage_complete = false;
+        *invocation_usage = None;
+    }
+    *invocation_usage_complete = true;
+    invocation_message_ids.clear();
 }
 
 fn flush_unresolved_replay_tool_requests(
@@ -7776,6 +8247,8 @@ impl ClaudeBackend {
         let session_id_task = Arc::clone(&session_id);
         let (subagent_emitter_tx, mut subagent_emitter_rx) = watch::channel(initial_emitter);
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
+        let (startup_cancel_tx, mut startup_cancel_rx) = oneshot::channel();
+        let mut startup_cancel_guard = ClaudeDetachedStartupCancelGuard(Some(startup_cancel_tx));
 
         tokio::spawn(async move {
             let steering_content = claude_steering_content(&config);
@@ -7877,16 +8350,28 @@ impl ClaudeBackend {
                 .await;
             });
 
-            if let Err(err) = handle.send_message_payload(initial_input).await {
-                tracing::error!("Failed to send initial Claude prompt: {err}");
-                signal_ready(
-                    &ready_tx,
-                    Err(format!("Failed to send initial Claude prompt: {err}")),
-                )
-                .await;
-                session.shutdown().await;
-                let _ = forward_task.await;
-                return;
+            let initial_prompt = handle.send_message_payload(initial_input);
+            tokio::pin!(initial_prompt);
+            tokio::select! {
+                biased;
+                _ = &mut startup_cancel_rx => {
+                    session.shutdown().await;
+                    let _ = forward_task.await;
+                    return;
+                }
+                result = &mut initial_prompt => {
+                    if let Err(err) = result {
+                        tracing::error!("Failed to send initial Claude prompt: {err}");
+                        signal_ready(
+                            &ready_tx,
+                            Err(format!("Failed to send initial Claude prompt: {err}")),
+                        )
+                        .await;
+                        session.shutdown().await;
+                        let _ = forward_task.await;
+                        return;
+                    }
+                }
             }
 
             loop {
@@ -7962,6 +8447,7 @@ impl ClaudeBackend {
             Ok(Err(_)) => return Err("Claude spawn initialization task ended early".to_string()),
             Err(_) => return Err("Timed out waiting for Claude session_id".to_string()),
         }
+        startup_cancel_guard.disarm();
 
         Ok((
             Self {
@@ -7977,12 +8463,12 @@ impl ClaudeBackend {
 
 fn claude_backend_defaults(
     cost_hint: Option<SpawnCostHint>,
-) -> (Option<&'static str>, Option<&'static str>) {
+) -> (Option<&'static str>, Option<ClaudeEffort>) {
     match cost_hint {
-        Some(SpawnCostHint::Low) => (Some("haiku"), Some("low")),
+        Some(SpawnCostHint::Low) => (Some("haiku"), Some(ClaudeEffort::Low)),
         // Medium is a legacy no-op: spawn on the backend's own defaults.
         Some(SpawnCostHint::Medium) => (None, None),
-        Some(SpawnCostHint::High) => (Some("opus"), Some("max")),
+        Some(SpawnCostHint::High) => (Some("opus"), Some(ClaudeEffort::Max)),
         None => (None, None),
     }
 }
@@ -8001,7 +8487,7 @@ pub(crate) fn claude_cost_hint_defaults(
     if let Some(effort) = effort {
         values.0.insert(
             "effort".to_string(),
-            SessionSettingValue::String(effort.to_string()),
+            SessionSettingValue::String(effort.as_str().to_string()),
         );
     }
     values
@@ -8161,6 +8647,214 @@ async fn forward_claude_backend_event(
     true
 }
 
+/// Maps Claude's already-received stream-json frame. The frame contains one
+/// vendor-selected binding bucket, never an inferred account-wide aggregate.
+pub(crate) fn map_passive_rate_limit_event(
+    frame: &Value,
+) -> Result<CapacityReport, CapacityUnavailableReason> {
+    let info = frame
+        .get("rate_limit_info")
+        .filter(|value| value.is_object())
+        .ok_or(CapacityUnavailableReason::MalformedReport)?;
+    let base_status = match info.get("status").and_then(Value::as_str) {
+        Some("allowed") => CapacityBucketStatus::Allowed,
+        Some("allowed_warning") => CapacityBucketStatus::AllowedWarning,
+        Some("rejected") => CapacityBucketStatus::Rejected,
+        _ => return Err(CapacityUnavailableReason::MalformedReport),
+    };
+    let limit = match info.get("rateLimitType").and_then(Value::as_str) {
+        Some("five_hour") => ClaudeLimitType::FiveHour,
+        Some("seven_day") => ClaudeLimitType::SevenDay,
+        Some("seven_day_opus") => ClaudeLimitType::SevenDayOpus,
+        Some("seven_day_sonnet") => ClaudeLimitType::SevenDaySonnet,
+        Some("seven_day_overage_included") => ClaudeLimitType::SevenDayOverageIncluded,
+        Some("overage") => ClaudeLimitType::Overage,
+        _ => return Err(CapacityUnavailableReason::MalformedReport),
+    };
+    let status = if matches!(limit, ClaudeLimitType::Overage) {
+        match info.get("overageStatus").and_then(Value::as_str) {
+            None => base_status,
+            Some("allowed") => CapacityBucketStatus::Allowed,
+            Some("allowed_warning") => CapacityBucketStatus::AllowedWarning,
+            Some("rejected") => CapacityBucketStatus::Rejected,
+            Some(_) => return Err(CapacityUnavailableReason::MalformedReport),
+        }
+    } else {
+        base_status
+    };
+    let label = match limit {
+        ClaudeLimitType::FiveHour => "session limit",
+        ClaudeLimitType::SevenDay => "weekly limit",
+        ClaudeLimitType::SevenDayOverageIncluded => "Fable 5 limit",
+        ClaudeLimitType::SevenDayOpus => "Opus limit",
+        ClaudeLimitType::SevenDaySonnet => "Sonnet limit",
+        ClaudeLimitType::Overage => "overage limit",
+    };
+    let measure = match info.get("utilization") {
+        None | Some(Value::Null) => CapacityMeasure::ReportedWithoutMagnitude,
+        Some(value) => {
+            let utilization = value
+                .as_f64()
+                .filter(|value| (0.0..=1.0).contains(value))
+                .ok_or(CapacityUnavailableReason::MalformedReport)?;
+            let used_percent = (utilization * 100.0).round() as u8;
+            CapacityMeasure::UsedPercent {
+                used_percent,
+                remaining_percent: 100 - used_percent,
+                provenance: ValueProvenance {
+                    vendor_reported: true,
+                },
+            }
+        }
+    };
+    let reset_key = if matches!(limit, ClaudeLimitType::Overage) {
+        "overageResetsAt"
+    } else {
+        "resetsAt"
+    };
+    let reset = match info.get(reset_key) {
+        None | Some(Value::Null) => CapacityReset::NotReported,
+        Some(value) => value
+            .as_u64()
+            .and_then(|seconds| seconds.checked_mul(1000))
+            .map(|at_ms| CapacityReset::At { at_ms })
+            .ok_or(CapacityUnavailableReason::MalformedReport)?,
+    };
+    Ok(CapacityReport {
+        source: CapacitySource::ClaudeRateLimitEvent,
+        observed_at_ms: None,
+        plan: None,
+        buckets: vec![CapacityBucket {
+            id: CapacityBucketId::Claude { limit },
+            label: label.to_string(),
+            measure,
+            scope: CapacityScope::NotReported,
+            window: CapacityWindow::NotReported,
+            reset,
+            status: Some(status),
+        }],
+        coverage: CapacityCoverage::RepresentativeBucketOnly,
+    })
+}
+
+/// Route only Claude's existing stream-json capacity event through the
+/// session-owned emitter. It intentionally performs no read, refresh, or
+/// credential access.
+pub(crate) fn forward_passive_rate_limit_event(
+    frame: &Value,
+    emitter: &dyn SubAgentEmitter,
+) -> bool {
+    if frame.get("type").and_then(Value::as_str) != Some("rate_limit_event") {
+        return false;
+    }
+    let state = match map_passive_rate_limit_event(frame) {
+        Ok(report) => protocol::BackendCapacityState::Known { report },
+        Err(reason) => protocol::BackendCapacityState::Unavailable { reason },
+    };
+    emitter.on_backend_capacity(protocol::BackendKind::Claude, state);
+    true
+}
+
+#[cfg(test)]
+mod capacity_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn representative_rate_limit_event_converts_fraction_and_drops_internal_overage_fields() {
+        let report = map_passive_rate_limit_event(&json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "allowed_warning", "rateLimitType": "seven_day_opus",
+                "utilization": 0.82, "resetsAt": 1_700_000_000,
+                "overageStatus": "rejected", "overagePeriodMonthly": {"utilization": 0.99},
+                "overagePeriodChannel": {"utilization": 0.98}
+            }
+        }))
+        .expect("representative event");
+        assert_eq!(
+            report.coverage,
+            protocol::CapacityCoverage::RepresentativeBucketOnly
+        );
+        assert_eq!(report.buckets.len(), 1);
+        assert_eq!(
+            report.buckets[0].status,
+            Some(protocol::CapacityBucketStatus::AllowedWarning)
+        );
+        assert!(matches!(
+            &report.buckets[0].measure,
+            protocol::CapacityMeasure::UsedPercent {
+                used_percent: 82,
+                remaining_percent: 18,
+                provenance: protocol::ValueProvenance {
+                    vendor_reported: true
+                },
+            }
+        ));
+        assert_eq!(
+            report.buckets[0].measure.used_percent_provenance(),
+            Some(protocol::PercentValueProvenance::VendorReported)
+        );
+        assert_eq!(
+            report.buckets[0].measure.remaining_percent_provenance(),
+            Some(protocol::PercentValueProvenance::DerivedComplement)
+        );
+        assert!(matches!(
+            &report.buckets[0].reset,
+            protocol::CapacityReset::At {
+                at_ms: 1_700_000_000_000
+            }
+        ));
+    }
+
+    #[test]
+    fn malformed_or_out_of_range_rate_limit_event_is_typed_and_sanitized() {
+        assert_eq!(
+            map_passive_rate_limit_event(&json!({"rate_limit_info": {
+                "status":"allowed", "rateLimitType":"five_hour", "utilization":1.01
+            }})),
+            Err(protocol::CapacityUnavailableReason::MalformedReport)
+        );
+        assert_eq!(
+            map_passive_rate_limit_event(&json!({"rate_limit_info": {
+                "status":"allowed", "rateLimitType":"five_hour", "resetsAt":"tomorrow"
+            }})),
+            Err(protocol::CapacityUnavailableReason::MalformedReport)
+        );
+        assert_eq!(
+            map_passive_rate_limit_event(&json!({"rate_limit_info": {
+                "status":"allowed", "rateLimitType":"five_hour", "resetsAt":18446744073709551615_u64
+            }})),
+            Err(protocol::CapacityUnavailableReason::MalformedReport)
+        );
+    }
+
+    #[test]
+    fn overage_bucket_uses_vendor_overage_status_and_reset() {
+        let report = map_passive_rate_limit_event(&json!({"rate_limit_info": {
+            "status":"allowed", "rateLimitType":"overage", "utilization":0.5,
+            "overageStatus":"rejected", "overageResetsAt":42
+        }}))
+        .expect("overage event");
+        assert_eq!(
+            report.buckets[0].status,
+            Some(protocol::CapacityBucketStatus::Rejected)
+        );
+        assert!(matches!(
+            &report.buckets[0].reset,
+            protocol::CapacityReset::At { at_ms: 42_000 }
+        ));
+    }
+
+    #[test]
+    fn overage_included_bucket_keeps_its_distinct_vendor_label() {
+        let report = map_passive_rate_limit_event(&json!({"rate_limit_info": {
+            "status":"allowed", "rateLimitType":"seven_day_overage_included"
+        }}))
+        .expect("overage-included event");
+        assert_eq!(report.buckets[0].label, "Fable 5 limit");
+    }
+}
+
 impl Backend for ClaudeBackend {
     fn session_settings_schema() -> SessionSettingsSchema {
         SessionSettingsSchema {
@@ -8202,24 +8896,13 @@ impl Backend for ClaudeBackend {
                     use_slider: true,
                     select_options_by_setting: None,
                     field_type: SessionSettingFieldType::Select {
-                        options: vec![
-                            SelectOption {
-                                value: "low".to_string(),
-                                label: "Low".to_string(),
-                            },
-                            SelectOption {
-                                value: "medium".to_string(),
-                                label: "Medium".to_string(),
-                            },
-                            SelectOption {
-                                value: "high".to_string(),
-                                label: "High".to_string(),
-                            },
-                            SelectOption {
-                                value: "max".to_string(),
-                                label: "Max".to_string(),
-                            },
-                        ],
+                        options: ClaudeEffort::ALL
+                            .iter()
+                            .map(|effort| SelectOption {
+                                value: effort.as_str().to_string(),
+                                label: effort.label().to_string(),
+                            })
+                            .collect(),
                         default: None,
                         nullable: true,
                     },
@@ -8254,81 +8937,87 @@ impl Backend for ClaudeBackend {
             Arc::new(std::sync::Mutex::new(Some(SessionId(session_id.clone()))));
         let backend_session_id_task = Arc::clone(&backend_session_id);
 
-        tokio::spawn(async move {
-            let steering_content = claude_steering_content(&config);
-            let agent_identity = claude_agent_identity(&config);
-            let (session, mut raw_events) = match ClaudeSession::spawn(
-                &workspace_roots,
-                None,
-                &config.startup_mcp_servers,
-                steering_content.as_deref(),
-                agent_identity.as_ref(),
-                config.resolved_spawn_config.tool_policy.clone(),
-                config.resolved_spawn_config.access_mode,
-            )
-            .await
-            {
-                Ok(value) => value,
-                Err(err) => {
-                    tracing::error!("Failed to spawn Claude resume session: {err}");
-                    return;
-                }
-            };
+        let steering_content = claude_steering_content(&config);
+        let agent_identity = claude_agent_identity(&config);
+        let (session, mut raw_events) = ClaudeSession::spawn(
+            &workspace_roots,
+            None,
+            &config.startup_mcp_servers,
+            steering_content.as_deref(),
+            agent_identity.as_ref(),
+            config.resolved_spawn_config.tool_policy.clone(),
+            config.resolved_spawn_config.access_mode,
+        )
+        .await
+        .map_err(|err| format!("Failed to spawn Claude resume session: {err}"))?;
+        let mut startup_guard = ClaudeResumeStartupGuard::new(session.clone());
 
-            let handle = session.command_handle();
-            let maybe_emitter = subagent_emitter_rx.borrow().clone();
-            if let Some(emitter) = maybe_emitter {
-                session.set_subagent_emitter(emitter).await;
-            }
-            let resolved_settings = resolve_session_settings(&config);
-            let model_override = match resolved_settings.0.get("model") {
-                Some(SessionSettingValue::String(value)) => Some(value.clone()),
-                _ => None,
-            };
-            let effort_override = match resolved_settings.0.get("effort") {
-                Some(SessionSettingValue::String(value)) => Some(value.clone()),
-                _ => None,
-            };
-            if model_override.is_some() || effort_override.is_some() {
-                let settings = json!({
-                    "model": model_override,
-                    "effort": effort_override,
-                    "permission_mode": claude_permission_mode_for_access_mode(
-                        config.resolved_spawn_config.access_mode,
-                    ),
-                });
-                if let Err(err) = handle
-                    .execute(SessionCommand::UpdateSettings {
-                        settings,
-                        persist: false,
-                    })
-                    .await
-                {
-                    tracing::error!("Failed to configure resumed Claude session: {err}");
-                    session.shutdown().await;
-                    return;
-                }
-            }
-
+        let handle = session.command_handle();
+        let maybe_emitter = subagent_emitter_rx.borrow().clone();
+        if let Some(emitter) = maybe_emitter {
+            session.set_subagent_emitter(emitter).await;
+        }
+        let resolved_settings = resolve_session_settings(&config);
+        let model_override = match resolved_settings.0.get("model") {
+            Some(SessionSettingValue::String(value)) => Some(value.clone()),
+            _ => None,
+        };
+        let effort_override = match resolved_settings.0.get("effort") {
+            Some(SessionSettingValue::String(value)) => Some(value.clone()),
+            _ => None,
+        };
+        if model_override.is_some() || effort_override.is_some() {
+            let settings = json!({
+                "model": model_override,
+                "effort": effort_override,
+                "permission_mode": claude_permission_mode_for_access_mode(
+                    config.resolved_spawn_config.access_mode,
+                ),
+            });
             if let Err(err) = handle
-                .execute(SessionCommand::ResumeSession { session_id })
+                .execute(SessionCommand::UpdateSettings {
+                    settings,
+                    persist: false,
+                })
                 .await
             {
-                tracing::error!("Failed to resume Claude session: {err}");
+                startup_guard.disarm();
                 session.shutdown().await;
-                return;
+                return Err(format!("Failed to configure resumed Claude session: {err}"));
             }
+        }
 
-            while let Ok(raw) = raw_events.try_recv() {
-                if !forward_claude_backend_event(raw, &events_tx, &backend_session_id_task, None)
-                    .await
-                {
-                    session.shutdown().await;
-                    return;
-                }
+        if let Err(err) = handle
+            .execute(SessionCommand::ResumeSession { session_id })
+            .await
+        {
+            startup_guard.disarm();
+            session.shutdown().await;
+            return Err(format!("Failed to resume Claude session: {err}"));
+        }
+        // The agent starts its replay-barrier timeout only after `resume`
+        // returns, so the CLI's independent initialization window must finish
+        // before the EventStream and its ready barrier become observable.
+        if let Err(err) = session.inner.ensure_process_ready().await {
+            startup_guard.disarm();
+            session.shutdown().await;
+            return Err(format!(
+                "Failed to initialize resumed Claude session: {err}"
+            ));
+        }
+
+        while let Ok(raw) = raw_events.try_recv() {
+            if !forward_claude_backend_event(raw, &events_tx, &backend_session_id_task, None).await
+            {
+                startup_guard.disarm();
+                session.shutdown().await;
+                return Err("Claude resume event stream closed during replay".to_string());
             }
-            let _ = resume_replay_complete_tx.send(());
+        }
+        let _ = resume_replay_complete_tx.send(());
+        startup_guard.disarm();
 
+        tokio::spawn(async move {
             loop {
                 tokio::select! {
                     biased;
@@ -8475,10 +9164,10 @@ async fn signal_ready(ready_tx: &ClaudeReadyTx, result: Result<(), String>) {
 mod tests {
     use super::*;
     use crate::backend::Backend;
+    use protocol::{ChatEvent, ToolExecutionNormalizationFailure, ToolRequestType};
     use tokio::sync::oneshot;
     use tokio::time::{Duration, timeout};
 
-    static FAKE_CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     const FAKE_CLAUDE_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 
     fn make_image(data: &str, media_type: &str) -> ImageAttachment {
@@ -8525,7 +9214,8 @@ mod tests {
                 steering_content: None,
                 agent_identity: None,
                 tool_policy: ToolPolicy::Unrestricted,
-                last_cumulative_usage: None,
+                cumulative_usage: None,
+                cumulative_usage_complete: true,
                 conversation_bytes_total: 0,
                 active_turn: None,
                 restart_process_after_turn: false,
@@ -8535,6 +9225,53 @@ mod tests {
             turn_event_gate: Mutex::new(()),
         };
         (inner, event_rx)
+    }
+
+    #[test]
+    fn malformed_canonical_claude_request_marks_its_completion() {
+        let (inner, mut rx) = make_test_inner();
+        let tool_call = ClaudeToolCall {
+            id: "claude-normalization".to_owned(),
+            name: "mcp__tyde-agent-control__tyde_send_agent_message".to_owned(),
+            arguments: json!({ "agent_id": "agent-a" }),
+        };
+
+        inner.emit_tool_request(&tool_call);
+        inner.emit_tool_execution_completed(
+            &tool_call.id,
+            &tool_call.name,
+            true,
+            json!({ "kind": "Other", "result": { "ok": true } }),
+            None,
+        );
+
+        let mut fallback_request = None;
+        let mut completion = None;
+        while let Ok(raw) = rx.try_recv() {
+            if !matches!(
+                raw.get("kind").and_then(Value::as_str),
+                Some("ToolRequest" | "ToolExecutionCompleted")
+            ) {
+                continue;
+            }
+            let event: ChatEvent =
+                serde_json::from_value(raw).expect("Claude emitter event is a ChatEvent");
+            match event {
+                ChatEvent::ToolRequest(request) => fallback_request = Some(request),
+                ChatEvent::ToolExecutionCompleted(data) => completion = Some(data),
+                _ => {}
+            }
+        }
+        assert!(matches!(
+            fallback_request.expect("fallback tool request").tool_type,
+            ToolRequestType::Other { .. }
+        ));
+        assert_eq!(
+            completion
+                .expect("marked tool completion")
+                .normalization_failure,
+            Some(ToolExecutionNormalizationFailure::CanonicalRequest)
+        );
     }
 
     #[test]
@@ -8760,12 +9497,27 @@ mod tests {
 
         match &effort_field.field_type {
             SessionSettingFieldType::Select {
-                default, nullable, ..
+                options,
+                default,
+                nullable,
             } => {
                 assert!(*nullable, "Claude effort should remain optional");
                 assert_eq!(
                     default, &None,
                     "Claude effort should stay unset until explicitly chosen"
+                );
+                assert_eq!(
+                    options
+                        .iter()
+                        .map(|option| (option.value.as_str(), option.label.as_str()))
+                        .collect::<Vec<_>>(),
+                    vec![
+                        ("low", "Low"),
+                        ("medium", "Medium"),
+                        ("high", "High"),
+                        ("xhigh", "XHigh"),
+                        ("max", "Max"),
+                    ]
                 );
             }
             other => panic!("expected Claude effort field to be Select, got {other:?}"),
@@ -8881,6 +9633,57 @@ mod tests {
     }
 
     #[test]
+    fn claude_cli_args_serialize_xhigh_exactly() {
+        let args = build_claude_cli_args(&ClaudeProcessSpawnConfig {
+            workspace_root: "/tmp/workspace".to_string(),
+            ssh_host: None,
+            session_id: None,
+            fork_from_session_id: None,
+            resume_existing_session: false,
+            ephemeral: true,
+            model: None,
+            effort: Some(ClaudeEffort::XHigh),
+            permission_mode: None,
+            startup_mcp_config_json: None,
+            steering_content: None,
+            agent_identity: None,
+            tool_policy: ToolPolicy::Unrestricted,
+        });
+
+        let effort_pairs = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--effort")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            effort_pairs.len(),
+            1,
+            "Claude argv should contain exactly one effort pair"
+        );
+        assert_eq!(effort_pairs[0][1], "xhigh");
+    }
+
+    #[test]
+    fn claude_cli_args_omit_unset_effort() {
+        let args = build_claude_cli_args(&ClaudeProcessSpawnConfig {
+            workspace_root: "/tmp/workspace".to_string(),
+            ssh_host: None,
+            session_id: None,
+            fork_from_session_id: None,
+            resume_existing_session: false,
+            ephemeral: true,
+            model: None,
+            effort: None,
+            permission_mode: None,
+            startup_mcp_config_json: None,
+            steering_content: None,
+            agent_identity: None,
+            tool_policy: ToolPolicy::Unrestricted,
+        });
+
+        assert!(!args.iter().any(|arg| arg == "--effort"));
+    }
+
+    #[test]
     fn claude_cli_args_fork_uses_parent_resume_without_preseed() {
         let args = build_claude_cli_args(&ClaudeProcessSpawnConfig {
             workspace_root: "/tmp/workspace".to_string(),
@@ -8992,8 +9795,9 @@ mod tests {
             description: String,
             agent_type: String,
             session_id_hint: Option<protocol::SessionId>,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SubAgentHandle> + Send + '_>>
-        {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<SubAgentHandle, String>> + Send + '_>,
+        > {
             let agent_id = protocol::AgentId(format!(
                 "test-subagent-{}",
                 self.next_id.fetch_add(1, Ordering::SeqCst)
@@ -9014,7 +9818,7 @@ mod tests {
                     session_id_hint,
                     agent_id: agent_id.clone(),
                 });
-            Box::pin(async move { SubAgentHandle { event_tx, agent_id } })
+            Box::pin(async move { Ok(SubAgentHandle { event_tx, agent_id }) })
         }
     }
 
@@ -9088,7 +9892,7 @@ mod tests {
                 state.start_session_fresh,
                 "next Claude process should use --session-id instead of --resume"
             );
-            assert_eq!(state.last_cumulative_usage, None);
+            assert_eq!(state.cumulative_usage, None);
             assert_eq!(state.conversation_bytes_total, 0);
         }
 
@@ -9350,6 +10154,17 @@ for raw_line in sys.stdin:
         rt.block_on(async {
             let (child_inner, mut child_rx) = make_test_inner();
             let child_inner = Arc::new(child_inner);
+            let message_id = "subagent-toolu_1-seg-1";
+            child_inner.emit_stream_start(message_id, Some("claude-test".to_string()));
+            let stream_start = child_rx.recv().await.expect("child StreamStart");
+            assert_eq!(event_kind(&stream_start), Some("StreamStart"));
+            assert_eq!(
+                stream_start
+                    .get("data")
+                    .and_then(|data| data.get("message_id"))
+                    .and_then(Value::as_str),
+                Some(message_id)
+            );
             let (parent_emitter, _parent_rx) = test_parent_emitter();
             let mut stream = SubAgentStream {
                 summary: ClaudeStdoutSummary {
@@ -9363,7 +10178,7 @@ for raw_line in sys.stdin:
                         "cache_creation_input_tokens": 0,
                         "reasoning_tokens": 0
                     })),
-                    result_cumulative_usage: Some(json!({
+                    result_turn_usage: Some(json!({
                         "input_tokens": 7,
                         "output_tokens": 10,
                         "total_tokens": 17,
@@ -9374,7 +10189,7 @@ for raw_line in sys.stdin:
                     ..ClaudeStdoutSummary::default()
                 },
                 segment: SegmentState::default(),
-                message_id: "subagent-toolu_1".to_string(),
+                message_id: message_id.to_string(),
                 has_explicit_task_prompt: false,
                 inner: child_inner,
                 parent_tool_use_id: "toolu_1".to_string(),
@@ -9382,16 +10197,235 @@ for raw_line in sys.stdin:
                 agent_name: "Child".to_string(),
                 parent_emitter,
                 last_progress_emit: std::time::Instant::now(),
-                background: false,
+                execution: SubAgentExecution::Foreground,
             };
 
             close_current_subagent_phase(&mut stream.summary, &mut stream.segment, &stream.inner);
 
-            let stream_end = recv_until_kind(&mut child_rx, "StreamEnd").await;
+            let stream_end = child_rx.recv().await.expect("child StreamEnd");
+            assert_eq!(event_kind(&stream_end), Some("StreamEnd"));
+            assert_eq!(
+                stream_end_message(&stream_end)
+                    .get("message_id")
+                    .and_then(Value::as_str),
+                Some(message_id)
+            );
             assert_eq!(stream_end_request_total_tokens(&stream_end), Some(5));
             assert_eq!(stream_end_turn_total_tokens(&stream_end), Some(17));
             assert_eq!(stream_end_cumulative_total_tokens(&stream_end), Some(17));
+            assert!(
+                child_rx.try_recv().is_err(),
+                "child phase should not emit an identity error or cancellation"
+            );
         });
+    }
+
+    #[test]
+    fn subagent_final_stream_end_uses_accumulated_request_usage_without_result() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (child_inner, mut child_rx) = make_test_inner();
+            let child_inner = Arc::new(child_inner);
+            let message_id = "subagent-toolu_1-seg-1";
+            child_inner.emit_stream_start(message_id, Some("claude-test".to_string()));
+            let stream_start = child_rx.recv().await.expect("child StreamStart");
+            assert_eq!(event_kind(&stream_start), Some("StreamStart"));
+            assert_eq!(
+                stream_start
+                    .get("data")
+                    .and_then(|data| data.get("message_id"))
+                    .and_then(Value::as_str),
+                Some(message_id)
+            );
+            let mut summary = ClaudeStdoutSummary {
+                streamed_text: "child done".to_string(),
+                model: Some("claude-test".to_string()),
+                usage: Some(json!({
+                    "input_tokens": 2,
+                    "output_tokens": 29,
+                    "total_tokens": 31,
+                    "cached_prompt_tokens": 0,
+                    "cache_creation_input_tokens": 12_969,
+                    "reasoning_tokens": 4
+                })),
+                ..ClaudeStdoutSummary::default()
+            };
+            let mut segment = SegmentState::default();
+
+            close_current_subagent_phase(&mut summary, &mut segment, &child_inner);
+
+            let stream_end = child_rx.recv().await.expect("child StreamEnd");
+            assert_eq!(event_kind(&stream_end), Some("StreamEnd"));
+            assert_eq!(
+                stream_end_message(&stream_end)
+                    .get("message_id")
+                    .and_then(Value::as_str),
+                Some(message_id)
+            );
+            assert_eq!(stream_end_request_total_tokens(&stream_end), Some(31));
+            assert_eq!(stream_end_turn_total_tokens(&stream_end), Some(31));
+            assert_eq!(stream_end_cumulative_total_tokens(&stream_end), Some(31));
+            assert_eq!(
+                stream_end
+                    .get("data")
+                    .and_then(|data| data.get("message"))
+                    .and_then(|data| data.get("token_usage"))
+                    .and_then(|usage| usage.get("turn"))
+                    .and_then(|scope| scope.get("usage"))
+                    .and_then(|usage| usage.get("cache_creation_input_tokens"))
+                    .and_then(Value::as_u64),
+                Some(12_969)
+            );
+
+            let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+            let session_id = Arc::new(std::sync::Mutex::new(None));
+            assert!(forward_claude_backend_event(stream_end, &events_tx, &session_id, None).await);
+            let event = events_rx.recv().await.expect("adapted child StreamEnd");
+            let task_usage = crate::agent::task_usage_scope_from_chat_events_for_test(
+                BackendKind::Claude,
+                [event],
+            );
+            let protocol::TaskTokenUsageScope::Known { usage } = task_usage else {
+                panic!("Claude child fallback should produce known public task usage");
+            };
+            assert_eq!(usage.total_tokens, 31);
+            assert_eq!(usage.input_tokens, Some(2));
+            assert_eq!(usage.output_tokens, Some(29));
+            assert_eq!(usage.cached_prompt_tokens, Some(0));
+            assert_eq!(usage.cache_creation_input_tokens, Some(12_969));
+            assert!(
+                child_rx.try_recv().is_err(),
+                "child phase should not emit an identity error or cancellation"
+            );
+        });
+    }
+
+    fn usage_only_subagent_stream(
+        tool_use_id: &str,
+        accumulated: bool,
+    ) -> (SubAgentStream, mpsc::UnboundedReceiver<Value>) {
+        let (child_inner, child_rx) = make_test_inner();
+        let usage = json!({
+            "input_tokens": 2,
+            "output_tokens": 29,
+            "total_tokens": 31,
+            "cached_prompt_tokens": 0,
+            "cache_creation_input_tokens": 12_969,
+            "reasoning_tokens": 0
+        });
+        let summary = if accumulated {
+            ClaudeStdoutSummary {
+                accumulated_request_usage: Some(usage),
+                ..ClaudeStdoutSummary::default()
+            }
+        } else {
+            ClaudeStdoutSummary {
+                usage: Some(usage),
+                ..ClaudeStdoutSummary::default()
+            }
+        };
+        let (parent_emitter, _parent_rx) = test_parent_emitter();
+        (
+            SubAgentStream {
+                summary,
+                segment: SegmentState {
+                    awaiting_stream_start: true,
+                    ..SegmentState::default()
+                },
+                message_id: format!("subagent-{tool_use_id}"),
+                has_explicit_task_prompt: false,
+                inner: Arc::new(child_inner),
+                parent_tool_use_id: tool_use_id.to_string(),
+                agent_id: protocol::AgentId(format!("child-{tool_use_id}")),
+                agent_name: "Child".to_string(),
+                parent_emitter,
+                last_progress_emit: std::time::Instant::now(),
+                execution: SubAgentExecution::Unknown,
+            },
+            child_rx,
+        )
+    }
+
+    async fn assert_usage_only_child_terminal_is_known(
+        child_rx: &mut mpsc::UnboundedReceiver<Value>,
+    ) {
+        let stream_start = child_rx.recv().await.expect("usage-only StreamStart");
+        assert_eq!(event_kind(&stream_start), Some("StreamStart"));
+        let message_id = stream_start
+            .get("data")
+            .and_then(|data| data.get("message_id"))
+            .and_then(Value::as_str)
+            .expect("usage-only stream identity")
+            .to_string();
+
+        let stream_end = child_rx.recv().await.expect("usage-only StreamEnd");
+        assert_eq!(event_kind(&stream_end), Some("StreamEnd"));
+        assert_eq!(
+            stream_end_message(&stream_end)
+                .get("message_id")
+                .and_then(Value::as_str),
+            Some(message_id.as_str())
+        );
+        assert_eq!(stream_end_turn_total_tokens(&stream_end), Some(31));
+        assert_eq!(stream_end_cumulative_total_tokens(&stream_end), Some(31));
+        assert!(
+            child_rx.try_recv().is_err(),
+            "usage-only completion should emit exactly one identified stream"
+        );
+
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let session_id = Arc::new(std::sync::Mutex::new(None));
+        assert!(forward_claude_backend_event(stream_end, &events_tx, &session_id, None).await);
+        let event = events_rx.recv().await.expect("adapted terminal StreamEnd");
+        let usage =
+            crate::agent::task_usage_scope_from_chat_events_for_test(BackendKind::Claude, [event]);
+        assert!(matches!(
+            usage,
+            protocol::TaskTokenUsageScope::Known { usage }
+                if usage.total_tokens == 31
+                    && usage.output_tokens == Some(29)
+                    && usage.cache_creation_input_tokens == Some(12_969)
+        ));
+    }
+
+    #[tokio::test]
+    async fn task_notification_emits_usage_terminal_without_renderable_payload() {
+        for (status, accumulated) in [
+            ("completed", true),
+            ("failed", false),
+            ("error", false),
+            ("cancelled", false),
+        ] {
+            let tool_use_id = format!("toolu-{status}");
+            let (stream, mut child_rx) = usage_only_subagent_stream(&tool_use_id, accumulated);
+            let mut streams = HashMap::from([(tool_use_id.clone(), stream)]);
+
+            finalize_background_subagent_completion(
+                &json!({
+                    "type": "system",
+                    "subtype": "task_notification",
+                    "tool_use_id": tool_use_id,
+                    "status": status
+                }),
+                &mut streams,
+            );
+
+            assert!(streams.is_empty());
+            assert_usage_only_child_terminal_is_known(&mut child_rx).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn stdout_eof_emits_tool_only_usage_terminal_without_renderable_payload() {
+        let (stream, mut child_rx) = usage_only_subagent_stream("toolu-eof", true);
+
+        finalize_subagent_stream(stream);
+
+        assert_usage_only_child_terminal_is_known(&mut child_rx).await;
     }
 
     fn emit_test_phase_end(inner: &ClaudeInner, summary: &mut ClaudeStdoutSummary) {
@@ -9853,6 +10887,11 @@ for raw_line in sys.stdin:
         )
         .await
         .expect("spawn fake Claude session");
+        session
+            .inner
+            .ensure_process_ready()
+            .await
+            .expect("initialize persistent fake Claude process");
         let handle = session.command_handle();
         handle
             .execute(SessionCommand::SendMessage {
@@ -10102,6 +11141,248 @@ for raw_line in sys.stdin:
             !start_line.contains("--resume"),
             "fresh recovery must not ask Claude CLI to resume the missing jsonl: {start_line}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resumed_backend_finishes_delayed_initialization_before_replay_barrier_starts() {
+        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let claude_home = tempfile::tempdir().expect("claude home tempdir");
+        let fake = workspace.path().join("fake-claude-delayed-init.py");
+        let log = workspace.path().join("fake-claude-delayed-init.log");
+        std::fs::write(
+            &fake,
+            r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+import time
+
+log_path = os.environ["TYDE_FAKE_CLAUDE_LOG"]
+for raw_line in sys.stdin:
+    value = json.loads(raw_line)
+    if value.get("type") != "control_request":
+        continue
+    request = value.get("request", {})
+    if request.get("subtype") != "initialize":
+        continue
+    request_id = value.get("request_id") or request.get("request_id")
+    with open(log_path, "a", encoding="utf-8") as handle:
+        handle.write("INIT_START\n")
+    time.sleep(0.1)
+    with open(log_path, "a", encoding="utf-8") as handle:
+        handle.write("INIT_DONE\n")
+    print(json.dumps({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "response": {},
+        },
+    }), flush=True)
+"#,
+        )
+        .expect("write delayed initialize fake");
+        make_executable(&fake);
+
+        let previous_claude_bin = std::env::var_os(TYDE_CLAUDE_BIN_ENV);
+        let previous_fake_log = std::env::var_os("TYDE_FAKE_CLAUDE_LOG");
+        let previous_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
+        unsafe {
+            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
+            std::env::set_var("TYDE_FAKE_CLAUDE_LOG", &log);
+            std::env::set_var("CLAUDE_CONFIG_DIR", claude_home.path());
+        }
+
+        let (backend, mut events) = ClaudeBackend::resume(
+            vec![workspace.path().to_string_lossy().to_string()],
+            BackendSpawnConfig::default(),
+            protocol::SessionId("delayed-valid-init".to_string()),
+        )
+        .await
+        .expect("delayed valid initialization should complete");
+        let log_contents = std::fs::read_to_string(&log).expect("read delayed init log");
+        assert!(log_contents.contains("INIT_START\nINIT_DONE\n"));
+        let mut replay_complete = events
+            .take_resume_replay_complete()
+            .expect("Claude resume replay barrier");
+        assert_eq!(replay_complete.try_recv(), Ok(()));
+
+        backend.shutdown().await;
+        unsafe {
+            if let Some(value) = previous_claude_bin {
+                std::env::set_var(TYDE_CLAUDE_BIN_ENV, value);
+            } else {
+                std::env::remove_var(TYDE_CLAUDE_BIN_ENV);
+            }
+            if let Some(value) = previous_fake_log {
+                std::env::set_var("TYDE_FAKE_CLAUDE_LOG", value);
+            } else {
+                std::env::remove_var("TYDE_FAKE_CLAUDE_LOG");
+            }
+            if let Some(value) = previous_claude_config_dir {
+                std::env::set_var("CLAUDE_CONFIG_DIR", value);
+            } else {
+                std::env::remove_var("CLAUDE_CONFIG_DIR");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_resumed_backend_startup_cleans_claude_process_guard() {
+        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let claude_home = tempfile::tempdir().expect("claude home tempdir");
+        let fake = workspace.path().join("fake-claude-stalled-init.py");
+        std::fs::write(
+            &fake,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+import time
+
+for raw_line in sys.stdin:
+    value = json.loads(raw_line)
+    request = value.get("request", {})
+    if value.get("type") == "control_request" and request.get("subtype") == "initialize":
+        while True:
+            time.sleep(1)
+"#,
+        )
+        .expect("write stalled initialize fake");
+        make_executable(&fake);
+
+        let previous_claude_bin = std::env::var_os(TYDE_CLAUDE_BIN_ENV);
+        let previous_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
+        unsafe {
+            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
+            std::env::set_var("CLAUDE_CONFIG_DIR", claude_home.path());
+        }
+        let (spawned_tx, mut spawned_rx) = oneshot::channel();
+        *CLAUDE_PROCESS_SPAWN_OBSERVER
+            .lock()
+            .expect("Claude process spawn observer mutex poisoned") = Some(spawned_tx);
+        let mut startup = Box::pin(ClaudeBackend::resume(
+            vec![workspace.path().to_string_lossy().to_string()],
+            BackendSpawnConfig::default(),
+            protocol::SessionId("cancelled-delayed-init".to_owned()),
+        ));
+        let pid = timeout(FAKE_CLAUDE_EXIT_TIMEOUT, async {
+            tokio::select! {
+                biased;
+                pid = &mut spawned_rx => pid.expect("Claude spawn observer must retain PID sender"),
+                _ = startup.as_mut() => {
+                    panic!("Claude resume completed before stalled initialization cancellation")
+                }
+            }
+        })
+        .await
+        .expect("Claude resume must spawn its persistent process")
+        .to_string();
+        let is_running = |pid: &str| {
+            std::process::Command::new("kill")
+                .args(["-0", pid])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        assert!(is_running(&pid), "fixture Claude process must be running");
+
+        drop(startup);
+
+        timeout(FAKE_CLAUDE_EXIT_TIMEOUT, async {
+            while is_running(&pid) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping resume startup must trigger the Claude session guard");
+        assert!(
+            !is_running(&pid),
+            "dropping resume startup must trigger the Claude session guard"
+        );
+
+        unsafe {
+            if let Some(value) = previous_claude_bin {
+                std::env::set_var(TYDE_CLAUDE_BIN_ENV, value);
+            } else {
+                std::env::remove_var(TYDE_CLAUDE_BIN_ENV);
+            }
+            if let Some(value) = previous_claude_config_dir {
+                std::env::set_var("CLAUDE_CONFIG_DIR", value);
+            } else {
+                std::env::remove_var("CLAUDE_CONFIG_DIR");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resumed_backend_surfaces_initialize_failure_before_replay_barrier() {
+        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let claude_home = tempfile::tempdir().expect("claude home tempdir");
+        let fake = workspace.path().join("fake-claude-init-failure.py");
+        std::fs::write(
+            &fake,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+for raw_line in sys.stdin:
+    value = json.loads(raw_line)
+    if value.get("type") != "control_request":
+        continue
+    request = value.get("request", {})
+    if request.get("subtype") != "initialize":
+        continue
+    request_id = value.get("request_id") or request.get("request_id")
+    print(json.dumps({
+        "type": "control_response",
+        "response": {
+            "subtype": "error",
+            "request_id": request_id,
+            "error": {"message": "deliberate initialize rejection"},
+        },
+    }), flush=True)
+"#,
+        )
+        .expect("write failed initialize fake");
+        make_executable(&fake);
+
+        let previous_claude_bin = std::env::var_os(TYDE_CLAUDE_BIN_ENV);
+        let previous_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
+        unsafe {
+            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
+            std::env::set_var("CLAUDE_CONFIG_DIR", claude_home.path());
+        }
+
+        let error = match ClaudeBackend::resume(
+            vec![workspace.path().to_string_lossy().to_string()],
+            BackendSpawnConfig::default(),
+            protocol::SessionId("failed-valid-init".to_string()),
+        )
+        .await
+        {
+            Ok(_) => panic!("initialize rejection must fail resume"),
+            Err(error) => error,
+        };
+        assert!(error.contains("Failed to initialize resumed Claude session"));
+        assert!(error.contains("deliberate initialize rejection"));
+
+        unsafe {
+            if let Some(value) = previous_claude_bin {
+                std::env::set_var(TYDE_CLAUDE_BIN_ENV, value);
+            } else {
+                std::env::remove_var(TYDE_CLAUDE_BIN_ENV);
+            }
+            if let Some(value) = previous_claude_config_dir {
+                std::env::set_var("CLAUDE_CONFIG_DIR", value);
+            } else {
+                std::env::remove_var("CLAUDE_CONFIG_DIR");
+            }
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -12367,11 +13648,11 @@ for raw_line in sys.stdin:
                 "output_tokens": 500_000,
                 "total_tokens": 14_500_000,
             }),
-            cumulative: json!({
-            "input_tokens": 14_000_000,
-            "output_tokens": 500_000,
-            "total_tokens": 14_500_000,
-            }),
+            cumulative: Some(json!({
+                "input_tokens": 14_000_000,
+                "output_tokens": 500_000,
+                "total_tokens": 14_500_000,
+            })),
         };
         inner
             .emit_terminal_phase_or_placeholder(
@@ -12773,6 +14054,16 @@ for raw_line in sys.stdin:
         let mut segment = SegmentState::default();
         let base_id = "claude-msg-1".to_string();
         let mut current_id = base_id.clone();
+        inner.emit_stream_start(&base_id, None);
+        let stream_start = rx.recv().await.expect("turn StreamStart");
+        assert_eq!(event_kind(&stream_start), Some("StreamStart"));
+        assert_eq!(
+            stream_start
+                .get("data")
+                .and_then(|data| data.get("message_id"))
+                .and_then(Value::as_str),
+            Some(base_id.as_str())
+        );
 
         consume_claude_stream_value(
             &json!({
@@ -12797,11 +14088,6 @@ for raw_line in sys.stdin:
             summary.best_reasoning(),
             Some("Checking workspace constraints.".to_string())
         );
-        let event = rx.recv().await.expect("synthetic stream start");
-        assert_eq!(
-            event.get("kind").and_then(Value::as_str),
-            Some("StreamStart")
-        );
         let event = rx.recv().await.expect("reasoning stream event");
         assert_eq!(
             event.get("kind").and_then(Value::as_str),
@@ -12813,6 +14099,17 @@ for raw_line in sys.stdin:
                 .and_then(|data| data.get("text"))
                 .and_then(Value::as_str),
             Some("Checking workspace constraints.")
+        );
+        assert_eq!(
+            event
+                .get("data")
+                .and_then(|data| data.get("message_id"))
+                .and_then(Value::as_str),
+            Some(base_id.as_str())
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "wrapped reasoning should not emit an identity error or cancellation"
         );
     }
 
@@ -13220,6 +14517,24 @@ for raw_line in sys.stdin:
         };
         assert_eq!(delta.text, "child says hello");
 
+        let mut pending_prompts = HashMap::new();
+        detect_subagent_spawns(
+            &json!({
+                "type": "assistant", "message": { "content": [{
+                    "type": "tool_use", "id": "toolu_123", "name": "Agent",
+                    "input": {
+                        "prompt": "Trace the end-to-end flow",
+                        "run_in_background": false
+                    }
+                }]}
+            }),
+            &emitter,
+            &parent_emitter,
+            &mut streams,
+            &mut pending_prompts,
+        )
+        .await;
+
         detect_subagent_completions(
             &json!({
                 "type": "user",
@@ -13310,7 +14625,7 @@ for raw_line in sys.stdin:
 
         assert!(streams.contains_key("toolu_bg"));
         assert!(
-            streams.get("toolu_bg").expect("stream").background,
+            streams.get("toolu_bg").expect("stream").execution == SubAgentExecution::Background,
             "run_in_background tool_use must mark the stream as background"
         );
 
@@ -13325,7 +14640,7 @@ for raw_line in sys.stdin:
                         "type": "tool_result",
                         "tool_use_id": "toolu_bg",
                         "is_error": false,
-                        "content": "Agent launched in the background"
+                        "content": "The agent is working in the background. You will be notified automatically when it completes."
                     }]
                 }
             }),
@@ -13362,6 +14677,290 @@ for raw_line in sys.stdin:
         assert!(
             streams.is_empty(),
             "background sub-agent stream should be removed on task_notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn omitted_background_flag_uses_cli_task_lifecycle() {
+        let emitter = TestSubAgentEmitter::default();
+        let (parent_emitter, _parent_rx) = test_parent_emitter();
+        let mut streams = HashMap::new();
+        let mut pending_prompts = HashMap::new();
+        let spawn = json!({
+            "type": "assistant",
+            "message": { "content": [{
+                "type": "tool_use", "id": "toolu_default", "name": "Agent",
+                "input": { "description": "Inspect", "prompt": "Inspect code" }
+            }]}
+        });
+
+        detect_subagent_spawns(
+            &spawn,
+            &emitter,
+            &parent_emitter,
+            &mut streams,
+            &mut pending_prompts,
+        )
+        .await;
+        assert_eq!(
+            streams.get("toolu_default").expect("stream").execution,
+            SubAgentExecution::Unknown
+        );
+
+        detect_subagent_task_system_spawns(
+            &json!({
+                "type": "system", "subtype": "task_started",
+                "task_type": "local_agent", "tool_use_id": "toolu_default"
+            }),
+            &emitter,
+            &parent_emitter,
+            &mut streams,
+        )
+        .await;
+        assert_eq!(
+            streams.get("toolu_default").expect("stream").execution,
+            SubAgentExecution::Unknown
+        );
+
+        detect_subagent_completions(
+            &json!({
+                "type": "user", "message": { "content": [{
+                    "type": "tool_result", "tool_use_id": "toolu_default",
+                    "content": "The agent is working in the background. You will be notified automatically when it completes."
+                }]}
+            }),
+            &mut streams,
+        )
+        .await;
+        assert!(streams.contains_key("toolu_default"));
+
+        let stream = streams.get_mut("toolu_default").expect("stream");
+        consume_subagent_event(
+            stream,
+            &json!({
+                "type": "content_block_start", "parent_tool_use_id": "toolu_default",
+                "index": 0,
+                "content_block": {"type": "text", "text": "tool-first complete"}
+            }),
+        );
+        consume_subagent_event(
+            stream,
+            &json!({
+                "type": "result", "parent_tool_use_id": "toolu_default",
+                "result": "tool-first complete",
+                "usage": {"input_tokens": 12, "output_tokens": 3}
+            }),
+        );
+        finalize_background_subagent_completion(
+            &json!({
+                "type": "system", "subtype": "task_notification",
+                "tool_use_id": "toolu_default", "status": "completed"
+            }),
+            &mut streams,
+        );
+        assert!(streams.is_empty());
+
+        let mut child_events = emitter.take_event_rx("toolu_default");
+        let mut saw_output = false;
+        let mut saw_known_usage = false;
+        for _ in 0..8 {
+            let event = recv_child_chat_event(&mut child_events, "tool-first child event").await;
+            match event {
+                protocol::ChatEvent::StreamDelta(delta) => {
+                    saw_output |= delta.text.contains("tool-first complete");
+                }
+                protocol::ChatEvent::StreamEnd(end) => {
+                    saw_known_usage |= end
+                        .message
+                        .token_usage
+                        .as_ref()
+                        .and_then(|usage| usage.turn.known_usage())
+                        .is_some_and(|usage| usage.total_tokens == 15);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_output);
+        assert!(saw_known_usage);
+    }
+
+    #[tokio::test]
+    async fn task_started_before_omitted_tool_input_survives_launch_and_reports_usage() {
+        let emitter = TestSubAgentEmitter::default();
+        let (parent_emitter, _parent_rx) = test_parent_emitter();
+        let mut streams = HashMap::new();
+        let mut pending_prompts = HashMap::new();
+
+        detect_subagent_task_system_spawns(
+            &json!({
+                "type": "system", "subtype": "task_started",
+                "task_type": "local_agent", "tool_use_id": "toolu_task_first",
+                "prompt": "Inspect code"
+            }),
+            &emitter,
+            &parent_emitter,
+            &mut streams,
+        )
+        .await;
+        detect_subagent_spawns(
+            &json!({
+                "type": "assistant", "message": { "content": [{
+                    "type": "tool_use", "id": "toolu_task_first", "name": "Agent",
+                    "input": { "prompt": "Inspect code" }
+                }]}
+            }),
+            &emitter,
+            &parent_emitter,
+            &mut streams,
+            &mut pending_prompts,
+        )
+        .await;
+        assert_eq!(
+            streams.get("toolu_task_first").expect("stream").execution,
+            SubAgentExecution::Unknown
+        );
+        detect_subagent_completions(
+            &json!({
+                "type": "user", "message": { "content": [{
+                    "type": "tool_result", "tool_use_id": "toolu_task_first",
+                    "content": "The agent is working in the background. You will be notified automatically when it completes."
+                }]}
+            }),
+            &mut streams,
+        )
+        .await;
+        assert!(streams.contains_key("toolu_task_first"));
+
+        let stream = streams.get_mut("toolu_task_first").expect("stream");
+        consume_subagent_event(
+            stream,
+            &json!({
+                "type": "content_block_start", "parent_tool_use_id": "toolu_task_first",
+                "index": 0,
+                "content_block": {"type": "text", "text": "inspection complete"}
+            }),
+        );
+        consume_subagent_event(
+            stream,
+            &json!({
+                "type": "result", "parent_tool_use_id": "toolu_task_first",
+                "result": "inspection complete",
+                "usage": {"input_tokens": 20, "output_tokens": 5}
+            }),
+        );
+        finalize_background_subagent_completion(
+            &json!({
+                "type": "system", "subtype": "task_notification",
+                "tool_use_id": "toolu_task_first", "status": "completed"
+            }),
+            &mut streams,
+        );
+        assert!(streams.is_empty());
+
+        let mut child_events = emitter.take_event_rx("toolu_task_first");
+        let mut saw_output = false;
+        let mut saw_known_usage = false;
+        for _ in 0..8 {
+            let event = recv_child_chat_event(&mut child_events, "task-first child event").await;
+            match event {
+                protocol::ChatEvent::StreamDelta(delta) => {
+                    saw_output |= delta.text.contains("inspection complete");
+                }
+                protocol::ChatEvent::StreamEnd(end) => {
+                    saw_known_usage |= end
+                        .message
+                        .token_usage
+                        .as_ref()
+                        .and_then(|usage| usage.turn.known_usage())
+                        .is_some_and(|usage| usage.total_tokens == 25);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_output);
+        assert!(saw_known_usage);
+    }
+
+    #[tokio::test]
+    async fn explicit_foreground_subagent_finishes_on_tool_result() {
+        let emitter = TestSubAgentEmitter::default();
+        let (parent_emitter, _parent_rx) = test_parent_emitter();
+        let mut streams = HashMap::new();
+        let mut pending_prompts = HashMap::new();
+
+        detect_subagent_spawns(
+            &json!({
+                "type": "assistant", "message": { "content": [{
+                    "type": "tool_use", "id": "toolu_sync", "name": "Agent",
+                    "input": { "prompt": "Inspect", "run_in_background": false }
+                }]}
+            }),
+            &emitter,
+            &parent_emitter,
+            &mut streams,
+            &mut pending_prompts,
+        )
+        .await;
+        detect_subagent_completions(
+            &json!({
+                "type": "user", "message": { "content": [{
+                    "type": "tool_result", "tool_use_id": "toolu_sync", "content": "done"
+                }]}
+            }),
+            &mut streams,
+        )
+        .await;
+        assert!(streams.is_empty());
+    }
+
+    #[test]
+    fn correlated_frames_distinguish_skills_from_orphaned_children() {
+        let streams = HashMap::new();
+        let known = HashSet::from(["toolu_child".to_owned()]);
+        assert_eq!(
+            classify_subagent_correlation(&streams, &known, "toolu_skill"),
+            SubAgentCorrelation::Unowned
+        );
+        assert_eq!(
+            classify_subagent_correlation(&streams, &known, "toolu_child"),
+            SubAgentCorrelation::Orphaned
+        );
+    }
+
+    #[test]
+    fn correlated_skill_is_nonterminal_while_orphan_is_contextual_diagnostic() {
+        let (parent_emitter, mut parent_rx) = test_parent_emitter();
+        let mut streams = HashMap::new();
+        let known = HashSet::from(["toolu_child".to_owned()]);
+
+        handle_correlated_subagent_event(
+            &mut streams,
+            &known,
+            &parent_emitter,
+            "toolu_skill",
+            &json!({"type": "assistant", "parent_tool_use_id": "toolu_skill"}),
+        );
+        assert!(parent_rx.try_recv().is_err());
+
+        handle_correlated_subagent_event(
+            &mut streams,
+            &known,
+            &parent_emitter,
+            "toolu_child",
+            &json!({"type": "assistant", "parent_tool_use_id": "toolu_child"}),
+        );
+        let diagnostic = parent_rx.try_recv().expect("orphan diagnostic");
+        assert_eq!(
+            diagnostic.get("kind").and_then(Value::as_str),
+            Some("SubprocessStderr")
+        );
+        assert!(
+            diagnostic
+                .get("data")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains("parent_tool_use_id=toolu_child"))
         );
     }
 
@@ -13462,6 +15061,19 @@ for raw_line in sys.stdin:
     #[tokio::test]
     async fn compact_boundary_emits_visible_system_message_and_stream_end() {
         let (inner, mut rx) = make_test_inner();
+        let message_id = "claude-msg-compact";
+        inner.emit_stream_start(message_id, None);
+
+        let stream_start = rx.recv().await.expect("stream start");
+        assert_eq!(event_kind(&stream_start), Some("StreamStart"));
+        assert_eq!(
+            stream_start
+                .get("data")
+                .and_then(|data| data.get("message_id"))
+                .and_then(Value::as_str),
+            Some(message_id)
+        );
+
         let mut summary = ClaudeStdoutSummary {
             control_event: Some(ClaudeControlEvent::ConversationCompacted),
             ..ClaudeStdoutSummary::default()
@@ -13492,10 +15104,18 @@ for raw_line in sys.stdin:
             Some("Conversation compacted.")
         );
 
-        let stream_start = rx.recv().await.expect("synthetic stream start");
-        assert_eq!(event_kind(&stream_start), Some("StreamStart"));
         let stream_end = rx.recv().await.expect("stream end");
         assert_eq!(event_kind(&stream_end), Some("StreamEnd"));
+        assert_eq!(
+            stream_end_message(&stream_end)
+                .get("message_id")
+                .and_then(Value::as_str),
+            Some(message_id)
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "compact boundary should not emit an identity error"
+        );
     }
 
     fn make_live_test_inner(
@@ -13516,13 +15136,14 @@ for raw_line in sys.stdin:
                     start_session_fresh: false,
                     ephemeral: true,
                     model: None,
-                    effort: Some("high".to_string()),
+                    effort: Some(ClaudeEffort::High),
                     permission_mode: Some(CLAUDE_DEFAULT_PERMISSION_MODE.to_string()),
                     startup_mcp_config_json: None,
                     steering_content: None,
                     agent_identity: None,
                     tool_policy: ToolPolicy::Unrestricted,
-                    last_cumulative_usage: None,
+                    cumulative_usage: None,
+                    cumulative_usage_complete: true,
                     conversation_bytes_total: 0,
                     active_turn: None,
                     restart_process_after_turn: false,
@@ -13556,7 +15177,7 @@ for raw_line in sys.stdin:
                     session_id,
                     ephemeral,
                     model: None,
-                    effort: Some(effort.to_string()),
+                    effort: Some(ClaudeEffort::parse(effort).expect("valid live test effort")),
                     permission_mode: Some(CLAUDE_DEFAULT_PERMISSION_MODE.to_string()),
                     startup_mcp_config_json: None,
                     steering_content: None,
@@ -13631,7 +15252,7 @@ for raw_line in sys.stdin:
                     "Expected non-empty assistant text from live Claude turn"
                 );
                 assert!(
-                    summary.usage.is_some() || summary.result_cumulative_usage.is_some(),
+                    summary.usage.is_some() || summary.result_turn_usage.is_some(),
                     "Expected token usage from live Claude turn at high effort"
                 );
             }
@@ -13719,7 +15340,7 @@ for raw_line in sys.stdin:
 
     #[tokio::test]
     #[ignore = "requires --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
-    async fn live_claude_resume_tracks_per_turn_and_cumulative_usage() {
+    async fn live_claude_resume_reports_aggregate_turn_usage() {
         if !live_claude_tests_enabled() {
             skip_live_claude_test();
             return;
@@ -13776,27 +15397,27 @@ for raw_line in sys.stdin:
             "Expected non-empty assistant text on resumed Claude turn at high effort"
         );
 
-        let turn_total = second_summary
+        let request_total = second_summary
             .usage
             .as_ref()
             .and_then(|usage| usage.get("total_tokens"))
             .and_then(Value::as_u64)
-            .expect("Expected per-turn usage.total_tokens on resumed turn");
-        let cumulative_total = second_summary
-            .result_cumulative_usage
+            .expect("Expected per-request usage.total_tokens on resumed turn");
+        let turn_total = second_summary
+            .result_turn_usage
             .as_ref()
             .and_then(|usage| usage.get("total_tokens"))
             .and_then(Value::as_u64)
-            .expect("Expected cumulative usage.total_tokens from result event");
+            .expect("Expected aggregate turn usage.total_tokens from result event");
         eprintln!(
-            "LIVE_CLAUDE_TOKEN_USAGE first_usage={} first_cumulative={} second_usage={} second_cumulative={}",
+            "LIVE_CLAUDE_TOKEN_USAGE first_request={} first_turn={} second_request={} second_turn={}",
             first_summary
                 .usage
                 .as_ref()
                 .map(Value::to_string)
                 .unwrap_or_else(|| "null".to_string()),
             first_summary
-                .result_cumulative_usage
+                .result_turn_usage
                 .as_ref()
                 .map(Value::to_string)
                 .unwrap_or_else(|| "null".to_string()),
@@ -13806,14 +15427,14 @@ for raw_line in sys.stdin:
                 .map(Value::to_string)
                 .unwrap_or_else(|| "null".to_string()),
             second_summary
-                .result_cumulative_usage
+                .result_turn_usage
                 .as_ref()
                 .map(Value::to_string)
                 .unwrap_or_else(|| "null".to_string())
         );
         assert!(
-            cumulative_total >= turn_total,
-            "Expected cumulative session usage ({cumulative_total}) to be >= per-turn usage ({turn_total})"
+            turn_total >= request_total,
+            "Expected aggregate turn usage ({turn_total}) to be >= latest request usage ({request_total})"
         );
     }
 
@@ -13947,7 +15568,7 @@ for raw_line in sys.stdin:
             "Question".len() as u64 + "Answer".len() as u64
         );
         let usage = replay
-            .last_cumulative_usage
+            .cumulative_usage
             .as_ref()
             .expect("last cumulative usage");
         assert_eq!(
@@ -13957,6 +15578,408 @@ for raw_line in sys.stdin:
         assert_eq!(
             usage.get("cached_prompt_tokens").and_then(Value::as_u64),
             Some(5000)
+        );
+    }
+
+    #[test]
+    fn parse_claude_session_replay_sums_unique_model_requests_once() {
+        let first = json!({
+            "type": "assistant",
+            "message": {
+                "id": "msg-first",
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "Working" }],
+                "usage": {
+                    "input_tokens": 2,
+                    "output_tokens": 10,
+                    "cache_read_input_tokens": 1_000,
+                    "cache_creation_input_tokens": 200,
+                    "reasoning_tokens": 3
+                }
+            }
+        });
+        let duplicate = json!({
+            "type": "assistant",
+            "message": {
+                "id": "msg-first",
+                "role": "assistant",
+                "content": [{ "type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "a"} }],
+                "usage": first["message"]["usage"].clone()
+            }
+        });
+        let second = json!({
+            "type": "assistant",
+            "message": {
+                "id": "msg-second",
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "Done" }],
+                "usage": {
+                    "input_tokens": 4,
+                    "output_tokens": 20,
+                    "cache_read_input_tokens": 2_000,
+                    "cache_creation_input_tokens": 300,
+                    "reasoning_tokens": 5
+                }
+            }
+        });
+        let replay = parse_claude_session_replay(&format!("{first}\n{duplicate}\n{second}\n"));
+        let usage = replay.cumulative_usage.expect("reconstructed usage");
+
+        assert_eq!(usage_value_u64(&usage, "input_tokens"), 6);
+        assert_eq!(usage_value_u64(&usage, "output_tokens"), 30);
+        assert_eq!(usage_value_u64(&usage, "total_tokens"), 36);
+        assert_eq!(usage_value_u64(&usage, "cached_prompt_tokens"), 3_000);
+        assert_eq!(usage_value_u64(&usage, "cache_creation_input_tokens"), 500);
+        assert_eq!(usage_value_u64(&usage, "reasoning_tokens"), 8);
+        assert!(replay.cumulative_usage_complete);
+    }
+
+    #[test]
+    fn parse_claude_session_replay_combines_result_and_assistant_only_invocations() {
+        let contents = [
+            json!({
+                "type": "assistant",
+                "message": {
+                    "id": "result-backed-request",
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "first" }],
+                    "usage": { "input_tokens": 2, "output_tokens": 3 }
+                }
+            }),
+            json!({
+                "type": "result",
+                "subtype": "success",
+                "usage": { "input_tokens": 4, "output_tokens": 6 }
+            }),
+            json!({
+                "type": "assistant",
+                "message": {
+                    "id": "cancelled-request",
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "partial" }],
+                    "usage": {
+                        "input_tokens": 7,
+                        "output_tokens": 13,
+                        "cache_read_input_tokens": 100,
+                        "reasoning_tokens": 5
+                    }
+                }
+            }),
+            json!({
+                "type": "assistant",
+                "message": {
+                    "id": "cancelled-request",
+                    "role": "assistant",
+                    "content": [{ "type": "tool_use", "id": "toolu_cancel", "name": "Read", "input": {"file_path": "a"} }],
+                    "usage": {
+                        "input_tokens": 7,
+                        "output_tokens": 13,
+                        "cache_read_input_tokens": 100,
+                        "reasoning_tokens": 5
+                    }
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        let replay = parse_claude_session_replay(&contents);
+        let usage = replay.cumulative_usage.expect("mixed replay usage");
+        assert!(replay.cumulative_usage_complete);
+        assert_eq!(usage_value_u64(&usage, "input_tokens"), 11);
+        assert_eq!(usage_value_u64(&usage, "output_tokens"), 19);
+        assert_eq!(usage_value_u64(&usage, "total_tokens"), 30);
+        assert_eq!(usage_value_u64(&usage, "cached_prompt_tokens"), 100);
+        assert_eq!(usage_value_u64(&usage, "reasoning_tokens"), 5);
+    }
+
+    #[test]
+    fn replay_user_prompt_boundary_commits_assistant_only_before_later_result() {
+        let assistant_a = json!({
+            "type": "assistant",
+            "message": {
+                "id": "request-a",
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "cancelled A" }],
+                "usage": {
+                    "input_tokens": 7,
+                    "output_tokens": 13,
+                    "cache_read_input_tokens": 100
+                }
+            }
+        });
+        let assistant_b = json!({
+            "type": "assistant",
+            "message": {
+                "id": "request-b",
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "B" }],
+                "usage": { "input_tokens": 2, "output_tokens": 3 }
+            }
+        });
+        let contents = [
+            json!({
+                "type": "user",
+                "uuid": "user-a",
+                "isSidechain": false,
+                "promptId": "prompt-a",
+                "message": { "role": "user", "content": [{ "type": "text", "text": "A" }] }
+            }),
+            assistant_a.clone(),
+            assistant_a,
+            json!({
+                "type": "user",
+                "uuid": "user-b",
+                "isSidechain": false,
+                "promptId": "prompt-b",
+                "message": { "role": "user", "content": [{ "type": "text", "text": "B" }] }
+            }),
+            assistant_b.clone(),
+            assistant_b,
+            json!({
+                "type": "result",
+                "usage": { "input_tokens": 4, "output_tokens": 6 }
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        let replay = parse_claude_session_replay(&contents);
+        assert!(replay.cumulative_usage_complete);
+        let usage = replay.cumulative_usage.expect("boundary usage");
+        assert_eq!(usage_value_u64(&usage, "input_tokens"), 11);
+        assert_eq!(usage_value_u64(&usage, "output_tokens"), 19);
+        assert_eq!(usage_value_u64(&usage, "total_tokens"), 30);
+        assert_eq!(usage_value_u64(&usage, "cached_prompt_tokens"), 100);
+    }
+
+    #[tokio::test]
+    async fn replay_user_prompt_boundary_preserves_prior_missing_id_ambiguity() {
+        let missing_a = json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "cancelled A" }],
+                "usage": { "input_tokens": 7, "output_tokens": 13 }
+            }
+        });
+        let assistant_b = json!({
+            "type": "assistant",
+            "message": {
+                "id": "request-b",
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "B" }],
+                "usage": { "input_tokens": 2, "output_tokens": 3 }
+            }
+        });
+        let contents = [
+            json!({
+                "type": "user",
+                "uuid": "user-a",
+                "isSidechain": false,
+                "promptId": "prompt-a",
+                "message": { "role": "user", "content": [{ "type": "text", "text": "A" }] }
+            }),
+            missing_a.clone(),
+            missing_a,
+            json!({
+                "type": "user",
+                "uuid": "user-b",
+                "isSidechain": false,
+                "promptId": "prompt-b",
+                "message": { "role": "user", "content": [{ "type": "text", "text": "B" }] }
+            }),
+            assistant_b.clone(),
+            assistant_b,
+            json!({
+                "type": "result",
+                "usage": { "input_tokens": 4, "output_tokens": 6 }
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        let replay = parse_claude_session_replay(&contents);
+        assert!(!replay.cumulative_usage_complete);
+        assert_eq!(
+            replay
+                .cumulative_usage
+                .as_ref()
+                .map(|usage| usage_value_u64(usage, "total_tokens")),
+            Some(10)
+        );
+
+        let (inner, mut rx) = make_test_inner();
+        let message_id = "claude-msg-replay-boundary";
+        inner.emit_stream_start(message_id, None);
+        let stream_start = rx.recv().await.expect("replay boundary StreamStart");
+        assert_eq!(event_kind(&stream_start), Some("StreamStart"));
+        assert_eq!(
+            stream_start
+                .get("data")
+                .and_then(|data| data.get("message_id"))
+                .and_then(Value::as_str),
+            Some(message_id)
+        );
+        {
+            let mut state = inner.state.lock().await;
+            state.cumulative_usage = replay.cumulative_usage;
+            state.cumulative_usage_complete = replay.cumulative_usage_complete;
+        }
+        let usage = inner
+            .normalize_usage_for_turn(Some(json!({
+                "input_tokens": 3,
+                "output_tokens": 2,
+                "total_tokens": 5
+            })))
+            .await
+            .expect("known current turn");
+        inner.emit_placeholder_stream_end(None, Some(usage), None);
+        let raw = rx
+            .recv()
+            .await
+            .expect("identified replay boundary StreamEnd");
+        assert_eq!(event_kind(&raw), Some("StreamEnd"));
+        let event: ChatEvent = serde_json::from_value(raw).expect("typed ambiguous usage");
+        let ChatEvent::StreamEnd(end) = event else {
+            panic!("expected StreamEnd");
+        };
+        assert_eq!(
+            end.message.message_id.as_ref().map(|id| id.0.as_str()),
+            Some(message_id)
+        );
+        assert!(matches!(
+            end.message.token_usage.expect("usage").cumulative,
+            protocol::TokenUsageScope::Unavailable {
+                reason: protocol::TokenUsageUnavailableReason::ProviderScopeAmbiguous
+            }
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "replay boundary should not emit an identity error or cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_claude_session_replay_marks_missing_usage_identity_unreportable() {
+        let covered = [
+            json!({
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "covered" }],
+                    "usage": { "input_tokens": 2, "output_tokens": 3 }
+                }
+            }),
+            json!({
+                "type": "result",
+                "usage": { "input_tokens": 4, "output_tokens": 6 }
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        let covered = parse_claude_session_replay(&covered);
+        assert!(covered.cumulative_usage_complete);
+        assert_eq!(
+            covered
+                .cumulative_usage
+                .as_ref()
+                .map(|usage| usage_value_u64(usage, "total_tokens")),
+            Some(10)
+        );
+
+        let contents = [
+            json!({
+                "type": "result",
+                "usage": { "input_tokens": 4, "output_tokens": 6 }
+            }),
+            json!({
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "partial" }],
+                    "usage": { "input_tokens": 7, "output_tokens": 13 }
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        let replay = parse_claude_session_replay(&contents);
+        assert!(!replay.cumulative_usage_complete);
+        assert_eq!(
+            replay
+                .cumulative_usage
+                .as_ref()
+                .map(|usage| usage_value_u64(usage, "total_tokens")),
+            Some(10)
+        );
+
+        let (inner, mut rx) = make_test_inner();
+        let message_id = "claude-msg-replay-missing-usage-id";
+        inner.emit_stream_start(message_id, None);
+        let stream_start = rx.recv().await.expect("replay usage StreamStart");
+        assert_eq!(event_kind(&stream_start), Some("StreamStart"));
+        assert_eq!(
+            stream_start
+                .get("data")
+                .and_then(|data| data.get("message_id"))
+                .and_then(Value::as_str),
+            Some(message_id)
+        );
+        {
+            let mut state = inner.state.lock().await;
+            state.cumulative_usage = replay.cumulative_usage;
+            state.cumulative_usage_complete = replay.cumulative_usage_complete;
+        }
+        let usage = inner
+            .normalize_usage_for_turn(Some(json!({
+                "input_tokens": 3,
+                "output_tokens": 2,
+                "total_tokens": 5
+            })))
+            .await
+            .expect("known current turn");
+        assert_eq!(usage_value_u64(&usage.turn, "total_tokens"), 5);
+        assert_eq!(usage.cumulative, None);
+        inner.emit_placeholder_stream_end(None, Some(usage), None);
+        let raw = rx.recv().await.expect("identified replay usage StreamEnd");
+        assert_eq!(event_kind(&raw), Some("StreamEnd"));
+        let event: ChatEvent = serde_json::from_value(raw).expect("typed replay usage terminal");
+        let ChatEvent::StreamEnd(end) = event else {
+            panic!("expected StreamEnd");
+        };
+        assert_eq!(
+            end.message.message_id.as_ref().map(|id| id.0.as_str()),
+            Some(message_id)
+        );
+        let token_usage = end.message.token_usage.expect("typed token usage");
+        assert_eq!(
+            token_usage
+                .turn
+                .known_usage()
+                .map(|usage| usage.total_tokens),
+            Some(5)
+        );
+        assert!(matches!(
+            token_usage.cumulative,
+            protocol::TokenUsageScope::Unavailable {
+                reason: protocol::TokenUsageUnavailableReason::ProviderScopeAmbiguous
+            }
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "replay usage terminal should not emit an identity error or cancellation"
         );
     }
 
@@ -14312,6 +16335,64 @@ for raw_line in sys.stdin:
         );
     }
 
+    #[tokio::test]
+    async fn result_usage_accumulates_per_turn_without_overwriting_session_totals() {
+        let (inner, _rx) = make_test_inner();
+        let first = json!({
+            "input_tokens": 5,
+            "output_tokens": 10,
+            "total_tokens": 15,
+            "cached_prompt_tokens": 20_000,
+            "cache_creation_input_tokens": 500,
+            "reasoning_tokens": 2,
+            "context_window": 200_000
+        });
+        let second = json!({
+            "input_tokens": 3,
+            "output_tokens": 7,
+            "total_tokens": 10,
+            "cached_prompt_tokens": 4_000,
+            "cache_creation_input_tokens": 100,
+            "reasoning_tokens": 5,
+            "context_window": 200_000
+        });
+
+        let first_usage = inner
+            .normalize_usage_for_turn(Some(first.clone()))
+            .await
+            .expect("first turn usage");
+        assert_eq!(first_usage.turn, first);
+        assert_eq!(first_usage.cumulative, Some(first));
+
+        let second_usage = inner
+            .normalize_usage_for_turn(Some(second.clone()))
+            .await
+            .expect("second turn usage");
+        assert_eq!(second_usage.turn, second);
+        assert_eq!(
+            second_usage.cumulative,
+            Some(json!({
+                "input_tokens": 8,
+                "output_tokens": 17,
+                "total_tokens": 25,
+                "cached_prompt_tokens": 24_000,
+                "cache_creation_input_tokens": 600,
+                "reasoning_tokens": 7,
+                "context_window": 200_000
+            }))
+        );
+        let first_cumulative = first_usage.cumulative.as_ref().expect("first cumulative");
+        let second_cumulative = second_usage.cumulative.as_ref().expect("second cumulative");
+        assert!(
+            usage_value_u64(second_cumulative, "total_tokens")
+                >= usage_value_u64(first_cumulative, "total_tokens")
+        );
+        assert_eq!(
+            inner.state.lock().await.cumulative_usage,
+            Some(second_cumulative.clone())
+        );
+    }
+
     #[test]
     fn derive_turn_token_usage_deltas_cumulative_snapshots_and_reset() {
         let first = json!({
@@ -14413,9 +16494,40 @@ for raw_line in sys.stdin:
     }
 
     #[test]
-    fn normalize_claude_effort_accepts_max() {
-        let value = Value::String("max".to_string());
-        assert_eq!(normalize_claude_effort(&value), Some("max".to_string()));
+    fn parse_claude_effort_preserves_native_levels_and_unset() {
+        for (input, expected) in [
+            ("low", ClaudeEffort::Low),
+            (" Medium ", ClaudeEffort::Medium),
+            ("HIGH", ClaudeEffort::High),
+            ("xhigh", ClaudeEffort::XHigh),
+            ("max", ClaudeEffort::Max),
+        ] {
+            assert_eq!(
+                parse_claude_effort_setting(&Value::String(input.to_string())),
+                Ok(Some(expected))
+            );
+        }
+        assert_eq!(parse_claude_effort_setting(&Value::Null), Ok(None));
+        assert_eq!(
+            parse_claude_effort_setting(&Value::String("  ".to_string())),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn parse_claude_effort_rejects_aliases_and_unknown_values() {
+        for value in ["extra_high", "extra-high", "minimal", "none", "ultra"] {
+            let error = parse_claude_effort_setting(&Value::String(value.to_string()))
+                .expect_err("non-native Claude effort should fail");
+            assert!(error.contains("Claude effort"));
+            assert!(error.contains(value));
+            for valid in ["low", "medium", "high", "xhigh", "max"] {
+                assert!(
+                    error.contains(valid),
+                    "Claude effort error should list valid value {valid}: {error}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -14538,7 +16650,7 @@ for raw_line in sys.stdin:
     fn result_event_does_not_overwrite_per_api_call_usage() {
         // Simulate the event sequence from a multi-tool-call Claude process:
         // 1. assistant message with per-API-call usage
-        // 2. result event with cumulative usage
+        // 2. result event with aggregate turn usage
         // summary.usage should remain the per-API-call value.
         let mut summary = ClaudeStdoutSummary {
             usage: Some(json!({
@@ -14553,7 +16665,7 @@ for raw_line in sys.stdin:
         };
 
         // Simulate consuming a result event — it should set
-        // result_cumulative_usage, NOT overwrite usage.
+        // result_turn_usage, NOT overwrite usage.
         let result_event = json!({
             "type": "result",
             "result": "Done",
@@ -14587,7 +16699,7 @@ for raw_line in sys.stdin:
             &mut current_id,
         );
 
-        // usage should still be the per-API-call value (not the cumulative)
+        // usage should still be the per-API-call value (not the turn aggregate)
         let usage = summary.usage.as_ref().expect("usage should be set");
         assert_eq!(usage.get("input_tokens").and_then(Value::as_u64), Some(1));
         assert_eq!(
@@ -14595,11 +16707,11 @@ for raw_line in sys.stdin:
             Some(20_000)
         );
 
-        // result_cumulative_usage should hold the cumulative from result
+        // result_turn_usage should hold the turn aggregate from result
         let cum = summary
-            .result_cumulative_usage
+            .result_turn_usage
             .as_ref()
-            .expect("result_cumulative_usage should be set");
+            .expect("result_turn_usage should be set");
         assert_eq!(cum.get("input_tokens").and_then(Value::as_u64), Some(5));
         assert_eq!(
             cum.get("cached_prompt_tokens").and_then(Value::as_u64),
@@ -14772,7 +16884,7 @@ for raw_line in sys.stdin:
                 agent_name: "Agent".to_string(),
                 parent_emitter: test_parent_emitter().0,
                 last_progress_emit: std::time::Instant::now(),
-                background: false,
+                execution: SubAgentExecution::Foreground,
             },
         );
 

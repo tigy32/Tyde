@@ -1,8 +1,53 @@
 use leptos::prelude::*;
+use wasm_bindgen_futures::spawn_local;
 
+use crate::bridge;
 use crate::bridge::AuthProvider;
 use crate::components::ui::{Spinner, StatusDot, StatusTone};
 use crate::state::{AppMode, AppState, ConnectionStatus, PairingScreen};
+
+/// Minimum touch-target size, inline so the recovery control stays tappable
+/// independently of the stylesheet.
+const RECONNECT_TOUCH_TARGET: &str = "min-width:44px;min-height:44px;";
+
+/// Reconnect the active host.
+///
+/// This is the host-scoped terminal recovery. It lives in the banner because the
+/// banner is mounted for the whole workspace and survives every navigation — and
+/// a dropped connection has to remain fixable no matter which screen the user
+/// happens to be on when it happens.
+#[component]
+fn HostReconnectButton() -> impl IntoView {
+    let state = use_context::<AppState>().unwrap();
+    let reconnecting = RwSignal::new(false);
+
+    let on_reconnect = move |_| {
+        let Some(host) = state.active_local_host_id.get_untracked() else {
+            return;
+        };
+        reconnecting.set(true);
+        spawn_local(async move {
+            if let Err(error) = bridge::connect_paired_host(&host).await {
+                log::error!("reconnect: connect_paired_host({host}) failed: {error}");
+            }
+            reconnecting.set(false);
+        });
+    };
+
+    view! {
+        <button
+            type="button"
+            class="connection-banner-reconnect"
+            style=RECONNECT_TOUCH_TARGET
+            data-mobile-test="connection-banner-reconnect"
+            aria-label="Reconnect to this host"
+            disabled=move || reconnecting.get()
+            on:click=on_reconnect
+        >
+            {move || if reconnecting.get() { "Reconnecting…" } else { "Reconnect" }}
+        </button>
+    }
+}
 
 /// Floating connection indicator. The healthy connected state stays
 /// dot-only so it does not take vertical space from the workspace; states
@@ -52,14 +97,19 @@ pub fn ConnectionBanner() -> impl IntoView {
                         }.into_any()
                     }
                     ConnectionStatus::Disconnected => {
+                        // Disconnected is a terminal state: nothing else on screen
+                        // is going to fix it, and it survives wherever the user
+                        // navigates. It used to be a dot and a label — a statement
+                        // of fact with nothing to do about it. Give it the action.
                         view! {
-                            <div class="connection-banner-inner disconnected">
+                            <div class="connection-banner-inner disconnected" role="status">
                                 <StatusDot
                                     label="Disconnected".to_string()
                                     tone=StatusTone::Muted
                                     data_mobile_test="connection-banner-dot-disconnected"
                                 />
                                 <span class="status-text">"Disconnected"</span>
+                                <HostReconnectButton />
                             </div>
                         }.into_any()
                     }
@@ -90,8 +140,7 @@ pub fn ConnectionBanner() -> impl IntoView {
                     // protocol this build cannot. No dismiss — clearing it would
                     // just leave a blank skeleton behind an unusable connection.
                     // The web/PWA loader self-heals by rebooting into the host's
-                    // published bundle; native shells surface this until the app
-                    // is updated.
+                    // published bundle.
                     ConnectionStatus::UpdateRequired { host_protocol, app_protocol, release_version } => {
                         let message = crate::state::update_required_message(
                             host_protocol,
@@ -286,16 +335,7 @@ mod wasm_tests {
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
     }
 
-    fn force_web_backend() {
-        let window = web_sys::window().expect("window");
-        let _ = js_sys::Reflect::delete_property(
-            &window,
-            &wasm_bindgen::JsValue::from_str("__TAURI__"),
-        );
-    }
-
     fn set_service_config(json: &str) {
-        force_web_backend();
         let window = web_sys::window().expect("window");
         let key = wasm_bindgen::JsValue::from_str("__TYDE_MOBILE_SERVICE__");
         if json.is_empty() {
@@ -532,7 +572,6 @@ mod wasm_tests {
     /// A sign-in-required managed failure offers Sign in (not Re-pair).
     #[wasm_bindgen_test]
     async fn needs_action_auth_offers_sign_in_action() {
-        force_web_backend();
         let host = LocalHostId("host-auth".to_owned());
         let host_for_mount = host.clone();
         let container = make_container();
