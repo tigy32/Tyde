@@ -565,7 +565,7 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
             self._log_lines(), [TOOLCHAIN_UPDATE_LOG, TOOLCHAIN_INSTALL_LOG]
         )
 
-    def test_ci_checks_run_only_for_pull_requests(self) -> None:
+    def test_pr_and_local_release_guards_use_canonical_check(self) -> None:
         ci_env = self.env.copy()
         ci_env["CI"] = "true"
         result = self._run(env=ci_env)
@@ -575,7 +575,8 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         release_check = (REPO_ROOT / "tools" / "release_check.sh").read_text(
             encoding="utf-8"
         )
-        self.assertNotIn("./dev.sh check", release_check)
+        self.assertIn("./dev.sh check\n", release_check)
+        self.assertNotIn("./dev.sh check --", release_check)
         release_workflow = (
             REPO_ROOT / ".github" / "workflows" / "release.yml"
         ).read_text(encoding="utf-8")

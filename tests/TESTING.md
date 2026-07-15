@@ -79,11 +79,11 @@ deletion notification. Every other error or event remains a failure.
 
 ## Repository Validation
 
-Full repository validation runs only for pull requests through
-`.github/workflows/check.yml`. Do not run it during local implementation or
-release cutting. If the user explicitly requests a local diagnostic run,
-`./dev.sh check` is the only allowed command; never invoke an underlying stage
-directly.
+Full repository validation runs for pull requests through
+`.github/workflows/check.yml` and through the mandatory local release guard. It
+does not run in the GitHub release workflow. Outside release cutting, run it
+locally only when the user explicitly requests a diagnostic. `./dev.sh check`
+is the only allowed command; never invoke an underlying stage directly.
 
 Normal output is deliberately compact: each stage reports START and PASS/FAIL
 with wall time, repetition counts, and peak RSS. Full lossless output is kept in

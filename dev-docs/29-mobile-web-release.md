@@ -100,18 +100,19 @@ was seen and `4` after a matching run reached a nonterminal state. A deadline
 hit while normalizing status or verifying a completed run exits `5` as a
 network/tool error.
 
-Use the release-coherence guard before release builds. Repository tests run
-only for pull requests and are not repeated here:
+Use the canonical local guard before release builds. It runs the cached full
+repository suite and release-specific coherence tests. The GitHub release
+workflow does not repeat these tests:
 
 ```sh
 tools/release_check.sh [v<release>]
 ```
 
-It validates build/version/protocol/mobile-web coherence by generating a
-temporary manifest entry for the checked version instead of requiring
-`web/loader/manifest.json` to already contain the release. This guard does not
-replace the AGENTS release steps for a clean tree, `main`, tag checks, approval,
-or pushes.
+It validates the repository plus build/version/protocol/mobile-web coherence by
+generating a temporary manifest entry for the checked version instead of
+requiring `web/loader/manifest.json` to already contain the release. This guard
+does not replace the AGENTS release steps for a clean tree, `main`, tag checks,
+approval, or pushes.
 
 The native iOS shell is end-of-life. External distribution is unconfirmed, so
 if an installed native build exists, migrate to the PWA with Add to Home Screen

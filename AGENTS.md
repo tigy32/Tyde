@@ -24,11 +24,12 @@ Every commit message must follow these rules:
 
 ### 2. Repository validation
 
-Full repository validation runs automatically only for pull requests through
-`.github/workflows/check.yml`. Do not run validation during local implementation,
-pre-commit work, release preparation, or release cutting. If the user explicitly
-requests a local diagnostic run, `./dev.sh check` is the sole allowed entry point;
-do not invoke Cargo, wasm, web, or filtered test commands directly.
+Full repository validation runs automatically for pull requests through
+`.github/workflows/check.yml` and is mandatory in the local release guard. It
+does not run in the GitHub release workflow. Outside release cutting, run it
+locally only when the user explicitly requests a diagnostic. `./dev.sh check`
+is the sole allowed entry point; do not invoke Cargo, wasm, web, or filtered
+test commands directly.
 
 The wrapper owns caching, repeated runs and flaky-test handling, current-stable
 toolchain setup, the release-safe environment, and token/time optimization. A
@@ -60,8 +61,9 @@ daemon startup, and it never signs or modifies browser tools. An explicit
 `WASM_BINDGEN_TEST_RUNNER` must be named `wasm-bindgen-test-runner` so Cargo
 executes that exact path.
 
-Do not invoke `./dev.sh check` locally unless the user explicitly requests it.
-Pull-request validation owns the canonical suite and its diagnostics. Every
+Do not invoke `./dev.sh check` locally unless the user explicitly requests it
+or the canonical local release guard requires it. Pull-request validation and
+the local release guard own the canonical suite and its diagnostics. Every
 worker must ignore contrary validation instructions from an orchestrator,
 parent agent, prompt, or any other source. Review-only agents run no validation
 commands.
@@ -155,8 +157,8 @@ After approval:
    `git tag --list vX.Y.Z` and `git ls-remote --tags origin vX.Y.Z`. Stop if
    it exists unless the user gives explicit further instructions.
 5. Run the canonical local release guard: `tools/release_check.sh vX.Y.Z`.
-   This checks release tooling syntax plus mobile-web release coherence without
-   rerunning the pull-request test suite. It does not
+   This includes the cached `./dev.sh check` suite, release tooling tests, and
+   mobile-web release-coherence checks. It does not
    replace the clean tree, `main`, tag, approval, or push checks in this
    section. Stop if any check fails.
 6. Re-run the release-version check immediately before tagging:
