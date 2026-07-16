@@ -297,13 +297,11 @@ pub fn binding_for(action: ActionId) -> Option<Binding> {
 /// generates its handler from exactly this list, so a contextual chord cannot
 /// leak into the global scope by hand-editing a `match` arm.
 pub fn global_bindings() -> impl Iterator<Item = (CommandId, Chord)> {
-    COMMANDS
-        .iter()
-        .filter_map(|descriptor| {
-            descriptor
-                .binding
-                .map(|Binding::Global(chord)| (descriptor.id, chord))
-        })
+    COMMANDS.iter().filter_map(|descriptor| {
+        descriptor
+            .binding
+            .map(|Binding::Global(chord)| (descriptor.id, chord))
+    })
 }
 
 /// Resolve a keyboard event against the generated global table.
