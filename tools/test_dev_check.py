@@ -250,10 +250,6 @@ esac
             "python3",
             """#!/usr/bin/env bash
 if [[ "${1:-}" == "--version" ]]; then
-  if [[ "${DEV_CHECK_FAIL_PYTHON_IDENTITY:-0}" == 1 ]]; then
-    echo "python identity detail from stderr" >&2
-    exit 7
-  fi
   echo "Python ${DEV_CHECK_FAKE_PYTHON_VERSION:-3.test}"
   exit 0
 fi
@@ -655,15 +651,11 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
             any(line.startswith("cargo fmt ") for line in self._log_lines())
         )
 
-    def test_identity_failure_preserves_underlying_diagnostics_and_status(self) -> None:
-        env = self.env.copy()
-        env["DEV_CHECK_FAIL_PYTHON_IDENTITY"] = "1"
-
-        rejected = self._run("--explain-cache", env=env, check=False)
-
-        self.assertEqual(rejected.returncode, 7)
-        self.assertIn("could not read python3 identity (exit 7)", rejected.stderr)
-        self.assertIn("python identity detail from stderr", rejected.stderr)
+    # test_identity_failure_preserves_underlying_diagnostics_and_status was
+    # removed: "Move checks to pull requests" (f604545) deleted
+    # environment_identity from dev.sh — cache identity is now the schema plus
+    # the git worktree fingerprint, and python3 --version is no longer probed —
+    # so the failure path that test pinned no longer exists by design.
 
     def test_sccache_validation_failure_has_log_and_failure_stats(self) -> None:
         env = self.env.copy()
@@ -1204,7 +1196,9 @@ profile = "minimal"
           ./dev.sh rust-toolchain
 """
 
-        self.assertEqual(release_workflow.count(root_install), 3)
+        # Two, not three, since "Move checks to pull requests" (f604545)
+        # removed the release job whose validation now runs on pull requests.
+        self.assertEqual(release_workflow.count(root_install), 2)
         self.assertEqual(mobile_workflow.count(nested_install), 1)
         self.assertNotIn("dtolnay/rust-toolchain@stable", release_workflow)
         self.assertNotIn("dtolnay/rust-toolchain@stable", mobile_workflow)
