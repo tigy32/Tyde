@@ -826,6 +826,36 @@ pub(crate) fn agent_display_name(
         .unwrap_or_else(|| agent_id.0.clone())
 }
 
+/// Open a child agent from a tool card's "Open agent" action.
+///
+/// The child lives on the parent chat's host, so it is looked up in the
+/// server-owned `agents` registry by `(parent_host, agent_id)` — the same record
+/// that renders the child's name and status here. Opening then goes through
+/// [`agents_panel::open_agent_chat`], which switches to the child's authoritative
+/// owning project (and host) *before* opening the tab. That switch is
+/// load-bearing: without it a cross-project child's tab lands in the currently
+/// active project's `center_zone` and is discarded, so the button appears to do
+/// nothing.
+///
+/// A child with no registry record cannot have its owning project resolved.
+/// Because the card's own name and status come from that same record, its
+/// absence is a bug, surfaced rather than papered over with a guessed project.
+pub(crate) fn open_child_agent(state: &AppState, parent_host: &str, agent_id: &protocol::AgentId) {
+    let child = state.agents.with_untracked(|agents| {
+        agents
+            .iter()
+            .find(|agent| agent.host_id.as_str() == parent_host && &agent.agent_id == agent_id)
+            .cloned()
+    });
+    match child {
+        Some(child) => crate::components::agents_panel::open_agent_chat(state, &child),
+        None => log::error!(
+            "Open agent: no registry record for child {agent_id:?} on host {parent_host}; \
+             cannot resolve its owning project"
+        ),
+    }
+}
+
 #[derive(Clone)]
 enum AgentControlDerivedStatus {
     Starting,
@@ -985,14 +1015,7 @@ fn AgentControlAgentRow(
             log::error!("Open agent clicked on an agent-control card with no resolved agent");
             return;
         };
-        open_state.open_tab(
-            TabContent::chat_with_agent(ActiveAgentRef {
-                host_id: parent.host_id,
-                agent_id: open_agent_id.clone(),
-            }),
-            display_name.get_untracked(),
-            true,
-        );
+        open_child_agent(&open_state, &parent.host_id, &open_agent_id);
     };
 
     view! {
@@ -1241,23 +1264,17 @@ fn subagent_status_line(
         )
     };
     let agent_id = progress.agent_id.clone();
-    let agent_name = progress.agent_name.clone();
 
     let on_open = move |_: web_sys::MouseEvent| {
-        // The sub-agent lives on the same host as the chat that spawned
-        // it; the parent's agent_ref is plumbed in explicitly.
+        // The sub-agent lives on the same host as the chat that spawned it; the
+        // parent's agent_ref is plumbed in explicitly. `open_child_agent`
+        // resolves the child's authoritative owning project and switches to it
+        // before opening, so a cross-project sub-agent is not discarded.
         let Some(parent) = agent_ref.get_untracked() else {
             log::error!("Open agent clicked on a card with no resolved agent");
             return;
         };
-        state.open_tab(
-            TabContent::chat_with_agent(ActiveAgentRef {
-                host_id: parent.host_id,
-                agent_id: agent_id.clone(),
-            }),
-            agent_name.clone(),
-            true,
-        );
+        open_child_agent(&state, &parent.host_id, &agent_id);
     };
 
     view! {
@@ -1745,6 +1762,141 @@ mod completion_summary_tests {
         assert_eq!(count_summary_lines("a"), 1);
         assert_eq!(count_summary_lines("a\nb"), 2);
         assert_eq!(count_summary_lines("a\nb\n"), 3);
+    }
+}
+
+#[cfg(test)]
+mod open_child_agent_tests {
+    use super::*;
+    use crate::state::{ActiveProjectRef, AgentInfo};
+    use protocol::{AgentId, AgentOrigin, BackendKind, ProjectId, StreamPath};
+
+    fn child_agent(host: &str, id: &str, name: &str, project: Option<&str>) -> AgentInfo {
+        AgentInfo {
+            host_id: host.to_owned(),
+            agent_id: AgentId(id.to_owned()),
+            name: name.to_owned(),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Claude,
+            workspace_roots: Vec::new(),
+            project_id: project.map(|p| ProjectId(p.to_owned())),
+            parent_agent_id: None,
+            session_id: None,
+            custom_agent_id: None,
+            workflow: None,
+            created_at_ms: 0,
+            instance_stream: StreamPath(format!("/agent/{id}/inst")),
+            started: true,
+            fatal_error: None,
+            activity_summary: Default::default(),
+        }
+    }
+
+    fn active_on(host: &str, project: &str) -> Option<ActiveProjectRef> {
+        Some(ActiveProjectRef {
+            host_id: host.to_owned(),
+            project_id: ProjectId(project.to_owned()),
+        })
+    }
+
+    /// A tool card's Open agent for a child in a *different* project resolves the
+    /// child's authoritative owning project from the registry and switches to it
+    /// before opening — without the switch, the chat tab would land in the active
+    /// project's center zone and be discarded, so the button did nothing.
+    #[test]
+    fn open_child_agent_switches_to_the_childs_project_and_opens_its_chat() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            state.active_project.set(active_on("host-1", "alpha"));
+            state
+                .agents
+                .set(vec![child_agent("host-1", "child-1", "Child", Some("beta"))]);
+
+            // The parent host is host-1 (the child lives on the parent's host);
+            // the child belongs to project "beta", not the active "alpha".
+            open_child_agent(&state, "host-1", &AgentId("child-1".to_owned()));
+
+            let active = state
+                .active_project
+                .get_untracked()
+                .expect("active project stays set");
+            assert_eq!(
+                active.project_id,
+                ProjectId("beta".to_owned()),
+                "Open agent must switch to the child's owning project, not stay on the parent's"
+            );
+            assert_eq!(active.host_id, "host-1");
+
+            let agent = state
+                .active_agent
+                .get_untracked()
+                .expect("the child's chat opened and is active");
+            assert_eq!(
+                agent.agent_id,
+                AgentId("child-1".to_owned()),
+                "the exact child agent's chat is the active tab"
+            );
+            assert_eq!(agent.host_id, "host-1");
+        });
+    }
+
+    /// A same-project child opens its chat without changing the active project —
+    /// the common case must not regress into a spurious switch.
+    #[test]
+    fn open_child_agent_same_project_opens_without_switching() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            state.active_project.set(active_on("host-1", "alpha"));
+            state
+                .agents
+                .set(vec![child_agent("host-1", "child-1", "Child", Some("alpha"))]);
+
+            open_child_agent(&state, "host-1", &AgentId("child-1".to_owned()));
+
+            assert_eq!(
+                state
+                    .active_project
+                    .get_untracked()
+                    .map(|p| p.project_id),
+                Some(ProjectId("alpha".to_owned())),
+                "a same-project child leaves the active project unchanged"
+            );
+            let agent = state
+                .active_agent
+                .get_untracked()
+                .expect("the child's chat opened and is active");
+            assert_eq!(agent.agent_id, AgentId("child-1".to_owned()));
+        });
+    }
+
+    /// A child with no registry record cannot have its owning project resolved.
+    /// The action surfaces the error and performs no navigation — no guessed
+    /// project, no chat opened in the wrong place, no silent fallback.
+    #[test]
+    fn open_child_agent_without_a_registry_record_navigates_nowhere() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            state.active_project.set(active_on("host-1", "alpha"));
+            // The registry has no matching child.
+
+            open_child_agent(&state, "host-1", &AgentId("missing".to_owned()));
+
+            assert_eq!(
+                state
+                    .active_project
+                    .get_untracked()
+                    .map(|p| p.project_id),
+                Some(ProjectId("alpha".to_owned())),
+                "an unresolvable child must not switch the active project"
+            );
+            assert!(
+                state.active_agent.get_untracked().is_none(),
+                "and must not open a chat: no owning project means no navigation"
+            );
+        });
     }
 }
 

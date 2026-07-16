@@ -1294,7 +1294,10 @@ fn render_agent_tree_group(
 /// discarded. A `None` project switches to Home; the chat tab still carries the
 /// agent's `host_id` so host context stays correct. Switching to the already-
 /// active project is a no-op (early-returns inside `switch_active_project`).
-fn open_agent_chat(state: &AppState, agent: &AgentInfo) {
+///
+/// Shared with the tool cards' "Open agent" action so every surface that opens
+/// an agent chat uses the same project-switch-then-open ordering.
+pub(crate) fn open_agent_chat(state: &AppState, agent: &AgentInfo) {
     state.switch_active_project(agent_project_ref(agent));
     state.open_tab(
         TabContent::chat_with_agent(agent_chat_ref(agent)),

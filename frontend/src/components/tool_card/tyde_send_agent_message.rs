@@ -19,7 +19,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 
 use crate::markdown::render_markdown;
-use crate::state::{ActiveAgentRef, AppState, TabContent, ToolOutputMode};
+use crate::state::{ActiveAgentRef, AppState, ToolOutputMode};
 
 use super::agent_display_name;
 
@@ -157,14 +157,7 @@ fn SendAgentMessageCard(
                 log::error!("Open agent clicked on a send-message card with no resolved agent");
                 return;
             };
-            state.open_tab(
-                TabContent::chat_with_agent(ActiveAgentRef {
-                    host_id: parent.host_id,
-                    agent_id: agent_id.clone(),
-                }),
-                display_name.get_untracked(),
-                true,
-            );
+            super::open_child_agent(&state, &parent.host_id, &agent_id);
         }
     };
 
