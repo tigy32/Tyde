@@ -3611,8 +3611,25 @@ mod wasm_tests {
             "a 1200px workspace is wide enough for two panes, so no narrow notice"
         );
 
-        width.set(Some(400.0));
+        // Shrink the real container rather than poking the signal. The live
+        // `ResizeObserver` re-measures the actual panes row on every
+        // (re-)observe, so a faked `width.set(400)` on a genuinely 1200px
+        // container is correctly overwritten back to 1200 during settling —
+        // the component keeping the signal truthful is the desired behavior,
+        // and asserting on a forced lie rejected it. Driving a real resize
+        // proves the same contract end-to-end: the shared handle is live
+        // across the remount boundary AND the observer that feeds it works.
+        container
+            .style()
+            .set_property("width", "400px")
+            .expect("shrink test container");
         settle().await;
+        assert_eq!(
+            width.get_untracked(),
+            Some(400.0),
+            "the real resize reaches the shared width handle across the \
+             remount boundary"
+        );
         assert!(
             query(&container, ".center-narrow-notice").is_some(),
             "a width change still propagates reactively — the signal is \
