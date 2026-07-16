@@ -288,14 +288,18 @@ For each parent root, the worktree path is the parent root's sibling directory
 named:
 
 ```
-<parent-basename>--<percent-encoded-branch>
+<parent-basename>--<sanitized-branch>
 ```
 
-Encoding rules:
+Sanitization rules:
 
 - Preserve `[A-Za-z0-9._-]` literally.
-- Percent-encode every other UTF-8 byte as `%HH`.
-- `/` → `%2F`. `%` → `%25`.
+- Replace every other character with `-`.
+
+Percent-encoding is deliberately not used: LLVM treats `%` in an output path
+as a unique-name placeholder, so rust-lld cannot link inside a directory
+whose name contains `%` (wasm builds inside the worktree fail with
+"cannot open output file").
 
 Examples:
 
@@ -306,10 +310,13 @@ path:        /Users/mike/Tyde2--feature-login
 
 parent root: /Users/mike/Tyde2
 branch:      feature/login
-path:        /Users/mike/Tyde2--feature%2Flogin
+path:        /Users/mike/Tyde2--feature-login
 ```
 
-The mapping is reversible: distinct branches never collide on the same path.
+The mapping is lossy: distinct branches (`feature/login` vs `feature-login`)
+can map to the same path. The existing create preflight rejects a computed
+path that already exists on disk or is registered to another project, so a
+collision surfaces as `CommandErrorCode::Conflict` rather than corruption.
 
 ### 5.2 `ProjectStore`
 
@@ -742,10 +749,10 @@ Rejected (§6.6). The user must remove the workbench first.
 
 ### 9.11 Branch contains a slash
 
-Allowed if git accepts it. Path suffix percent-encodes the slash:
+Allowed if git accepts it. Path suffix replaces the slash with a dash:
 
 ```
-feature/foo  →  <parent>--feature%2Ffoo
+feature/foo  →  <parent>--feature-foo
 ```
 
 ### 9.12 Concurrent `WorkbenchCreate` against the same parent

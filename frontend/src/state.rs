@@ -350,18 +350,28 @@ impl Default for SplitRatio {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenTarget {
     Focused,
+    // Only tests construct `Beside` since the open-to-side controls were
+    // removed; `resolve` and the open-path entry points still honor it.
+    #[allow(dead_code)]
     Beside,
 }
 
 pub const CENTER_TABS_DISABLED_REASON: &str = "Enable tabs to use split view.";
 pub const TAB_SOURCE_MISSING_REASON: &str = "This tab is no longer open.";
+#[cfg(test)]
 pub const DUPLICATE_FILE_TABS_DISABLED_REASON: &str = CENTER_TABS_DISABLED_REASON;
+#[cfg(test)]
 pub const DUPLICATE_FILE_SOURCE_MISSING_REASON: &str = TAB_SOURCE_MISSING_REASON;
+#[cfg(test)]
 pub const DUPLICATE_FILE_NOT_A_FILE_REASON: &str = "Only files can be split.";
+#[cfg(test)]
 pub const DUPLICATE_FILE_NOT_LOADED_REASON: &str = "Wait for the file to finish loading.";
+#[cfg(test)]
 pub const OPEN_TO_SIDE_CROSS_PROJECT_REASON: &str =
     "This resource is in another project — open that project first.";
+#[cfg(test)]
 pub const OPEN_TO_SIDE_NOTHING_WOULD_REMAIN_REASON: &str = "Nothing would be left in this pane.";
+#[cfg(test)]
 pub const AGENT_OPEN_TO_SIDE_CROSS_PROJECT_REASON: &str =
     "This agent is in another project — open that project first.";
 pub const MOVE_ALREADY_IN_TARGET_PANE_REASON: &str = "This tab is already in that pane.";
@@ -385,6 +395,7 @@ impl DuplicateFileEligibility {
         )
     }
 
+    #[cfg(test)]
     pub fn disabled_reason(self) -> Option<&'static str> {
         match self {
             Self::Enabled | Self::TargetAlreadyContainsResource { .. } => None,
@@ -423,6 +434,7 @@ impl DuplicateFileResult {
         }
     }
 
+    #[cfg(test)]
     pub fn disabled_reason(self) -> Option<&'static str> {
         match self {
             Self::Duplicated { .. } | Self::ActivatedExisting { .. } => None,
@@ -481,6 +493,7 @@ impl MoveTabResult {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoveTabRefusal {
     SourceTabMissing,
@@ -488,6 +501,7 @@ pub enum MoveTabRefusal {
     ResourceAlreadyInTarget { existing: TabId },
 }
 
+#[cfg(test)]
 impl MoveTabRefusal {
     pub fn disabled_reason(self) -> &'static str {
         match self {
@@ -498,6 +512,7 @@ impl MoveTabRefusal {
     }
 }
 
+#[cfg(test)]
 impl TryFrom<MoveTabResult> for MoveTabRefusal {
     type Error = MoveTabResult;
 
@@ -513,6 +528,7 @@ impl TryFrom<MoveTabResult> for MoveTabRefusal {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentOpenToSideResult {
     Opened {
@@ -534,6 +550,7 @@ pub enum AgentOpenToSideResult {
     MoveRefused(MoveTabRefusal),
 }
 
+#[cfg(test)]
 impl AgentOpenToSideResult {
     pub fn disabled_reason(self) -> Option<&'static str> {
         match self {
@@ -546,6 +563,7 @@ impl AgentOpenToSideResult {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiffOpenToSideResult {
     Opened {
@@ -567,6 +585,7 @@ pub enum DiffOpenToSideResult {
     MoveRefused(MoveTabRefusal),
 }
 
+#[cfg(test)]
 impl DiffOpenToSideResult {
     pub fn disabled_reason(self) -> Option<&'static str> {
         match self {
@@ -1192,6 +1211,7 @@ impl CenterZoneState {
     }
 }
 
+#[cfg(test)]
 fn agent_open_to_side_block_for(
     tabs_enabled: bool,
     active_project: Option<&ActiveProjectRef>,
@@ -1239,6 +1259,7 @@ fn agent_open_to_side_block_for(
     }
 }
 
+#[cfg(test)]
 fn diff_open_to_side_block_for(
     tabs_enabled: bool,
     active_project: Option<&ActiveProjectRef>,
@@ -1739,6 +1760,7 @@ impl DiffKey {
         }
     }
 
+    #[cfg(test)]
     fn tab_content(&self) -> TabContent {
         TabContent::Diff {
             host_id: self.host_id.clone(),
@@ -4195,6 +4217,7 @@ impl AppState {
         self.duplicate_file_eligibility_in(target_pane, source)
     }
 
+    #[cfg(test)]
     pub fn duplicate_file_eligibility_in(
         &self,
         target: PaneId,
@@ -4303,6 +4326,7 @@ impl AppState {
     /// Returns `None` when the agent chat can open to the side, or the exact
     /// typed refusal the activation API would return from the same state.
     /// Signal reads are tracked so render-time disabled state stays reactive.
+    #[cfg(test)]
     pub fn agent_open_to_side_eligibility(
         &self,
         agent_ref: &ActiveAgentRef,
@@ -4321,6 +4345,7 @@ impl AppState {
         })
     }
 
+    #[cfg(test)]
     pub fn open_agent_chat_to_side(
         &self,
         agent_ref: ActiveAgentRef,
@@ -4395,6 +4420,7 @@ impl AppState {
 
     /// Returns `None` when the exact diff can open to the side, or the typed
     /// refusal the activation API would return from the same state.
+    #[cfg(test)]
     pub fn diff_open_to_side_eligibility(&self, key: &DiffKey) -> Option<DiffOpenToSideResult> {
         let tabs_enabled = self.tabs_enabled.get();
         let active_project = self.active_project.get();
@@ -4403,6 +4429,7 @@ impl AppState {
         })
     }
 
+    #[cfg(test)]
     pub fn open_diff_to_side(&self, key: DiffKey, label: String) -> DiffOpenToSideResult {
         let blocked = {
             let tabs_enabled = self.tabs_enabled.get_untracked();

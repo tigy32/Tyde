@@ -405,7 +405,7 @@ async fn workbench_create_and_remove_round_trip_real_git_repo() {
     let parent = create_project(&mut fixture.client, vec![repo.path()]).await;
 
     let workbench = create_workbench(&mut fixture.client, &parent, "feature/login").await;
-    let expected_path = expected_worktree_path(repo.path(), "feature%2Flogin");
+    let expected_path = expected_worktree_path(repo.path(), "feature-login");
 
     match &workbench.source {
         ProjectSource::GitWorkbench {
@@ -454,7 +454,7 @@ async fn workbench_create_rejects_path_collision_and_existing_branch() {
     let repo = init_git_repo("create-failures");
     let parent = create_project(&mut fixture.client, vec![repo.path()]).await;
 
-    let collision_path = expected_worktree_path(repo.path(), "feature%2Fcollision");
+    let collision_path = expected_worktree_path(repo.path(), "feature-collision");
     fs::create_dir(&collision_path).expect("create collision path");
     fixture
         .client
@@ -485,7 +485,7 @@ async fn workbench_create_rejects_path_collision_and_existing_branch() {
     assert_eq!(error.code, CommandErrorCode::Conflict);
     assert!(error.message.contains("already exists"));
 
-    let registered_path = expected_worktree_path(repo.path(), "feature%2Fregistered");
+    let registered_path = expected_worktree_path(repo.path(), "feature-registered");
     fixture
         .client
         .project_create(ProjectCreatePayload {
@@ -1433,7 +1433,7 @@ async fn agent_control_workbenches_enforce_auth_access_and_scope() {
         let (is_error, body) = call_agent_control_optional(&fixture, None, tool, arguments).await;
         assert!(is_error, "unauthenticated {tool} succeeded: {body}");
     }
-    assert!(!expected_worktree_path(repo.path(), "feature%2Fno-auth").exists());
+    assert!(!expected_worktree_path(repo.path(), "feature-no-auth").exists());
 
     let read_only = spawn_project_caller(
         &mut fixture.client,
@@ -1459,7 +1459,7 @@ async fn agent_control_workbenches_enforce_auth_access_and_scope() {
     .await;
     assert!(is_error, "read-only create succeeded: {body}");
     assert!(body.contains("ReadOnly"));
-    assert!(!expected_worktree_path(repo.path(), "feature%2Fread-only").exists());
+    assert!(!expected_worktree_path(repo.path(), "feature-read-only").exists());
 
     let caller = spawn_project_caller(
         &mut fixture.client,
@@ -1477,7 +1477,7 @@ async fn agent_control_workbenches_enforce_auth_access_and_scope() {
     .await;
     assert!(is_error, "out-of-scope create succeeded: {body}");
     assert!(body.contains("outside caller project scope"));
-    assert!(!expected_worktree_path(other_repo.path(), "feature%2Fout-of-scope").exists());
+    assert!(!expected_worktree_path(other_repo.path(), "feature-out-of-scope").exists());
 }
 
 #[tokio::test]
@@ -1511,7 +1511,7 @@ async fn agent_control_multi_root_preflight_and_removed_spawn_are_atomic() {
     );
     assert!(body.contains(&second.path().display().to_string()));
     for root in [first.path(), second.path()] {
-        assert!(!expected_worktree_path(root, "feature%2Fmulti-fail").exists());
+        assert!(!expected_worktree_path(root, "feature-multi-fail").exists());
         let output = Command::new("git")
             .arg("-C")
             .arg(root)

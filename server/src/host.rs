@@ -10784,7 +10784,7 @@ fn compute_worktree_path(
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("parent root {} has no UTF-8 basename", parent_root))?;
-    let sibling_name = format!("{}--{}", basename, percent_encode_branch(&branch.0));
+    let sibling_name = format!("{}--{}", basename, sanitize_branch_for_path(&branch.0));
     let worktree_path = match parent_path.parent() {
         Some(parent) if parent.as_os_str().is_empty() => PathBuf::from(sibling_name),
         Some(parent) => parent.join(sibling_name),
@@ -10799,29 +10799,21 @@ fn compute_worktree_path(
     Ok(ProjectRootPath(worktree_path.to_owned()))
 }
 
-fn percent_encode_branch(branch: &str) -> String {
-    let mut encoded = String::with_capacity(branch.len());
-    for byte in branch.as_bytes() {
-        match *byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-' => {
-                encoded.push(*byte as char);
+/// Maps a branch name to a directory-name-safe form. Percent-encoding is
+/// deliberately avoided: LLVM's output-file creation treats `%` in a path as
+/// a unique-name placeholder, so rust-lld cannot link inside a directory
+/// whose name contains `%` (wasm builds fail with "cannot open output file").
+fn sanitize_branch_for_path(branch: &str) -> String {
+    let mut sanitized = String::with_capacity(branch.len());
+    for character in branch.chars() {
+        match character {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '_' | '-' => {
+                sanitized.push(character);
             }
-            _ => {
-                encoded.push('%');
-                encoded.push(hex_digit(byte >> 4));
-                encoded.push(hex_digit(byte & 0x0f));
-            }
+            _ => sanitized.push('-'),
         }
     }
-    encoded
-}
-
-fn hex_digit(value: u8) -> char {
-    match value {
-        0..=9 => (b'0' + value) as char,
-        10..=15 => (b'A' + (value - 10)) as char,
-        _ => unreachable!("hex_digit value must be in 0..=15"),
-    }
+    sanitized
 }
 
 async fn preflight_workbench_create(
@@ -18104,7 +18096,7 @@ mod tests {
     }
 
     #[test]
-    fn worktree_path_percent_encodes_branch_bytes() {
+    fn worktree_path_sanitizes_branch_characters() {
         let parent = ProjectRootPath("/Users/mike/Tyde2".to_owned());
 
         let simple = compute_worktree_path(&parent, &GitBranchName("feature-login".to_owned()))
@@ -18113,11 +18105,14 @@ mod tests {
 
         let slash = compute_worktree_path(&parent, &GitBranchName("feature/login".to_owned()))
             .expect("compute slash worktree path");
-        assert_eq!(slash.0, "/Users/mike/Tyde2--feature%2Flogin");
+        assert_eq!(slash.0, "/Users/mike/Tyde2--feature-login");
 
+        // `%` in particular must never appear in the directory name:
+        // rust-lld cannot write output files under a path containing `%`.
         let unicode = compute_worktree_path(&parent, &GitBranchName("café%".to_owned()))
             .expect("compute unicode worktree path");
-        assert_eq!(unicode.0, "/Users/mike/Tyde2--caf%C3%A9%25");
+        assert_eq!(unicode.0, "/Users/mike/Tyde2--caf--");
+        assert!(!unicode.0.contains('%'));
     }
 
     #[tokio::test]

@@ -68,6 +68,7 @@ impl Chord {
         }
     }
 
+    #[cfg(test)]
     const fn cmd_shift(key: &'static str, shifted_key: &'static str) -> Self {
         Self {
             cmd_or_ctrl: true,
@@ -298,9 +299,10 @@ pub fn binding_for(action: ActionId) -> Option<Binding> {
 pub fn global_bindings() -> impl Iterator<Item = (CommandId, Chord)> {
     COMMANDS
         .iter()
-        .filter_map(|descriptor| match descriptor.binding {
-            Some(Binding::Global(chord)) => Some((descriptor.id, chord)),
-            None => None,
+        .filter_map(|descriptor| {
+            descriptor
+                .binding
+                .map(|Binding::Global(chord)| (descriptor.id, chord))
         })
 }
 
