@@ -1,12 +1,16 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
+#[cfg(feature = "test-support")]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow};
+use futures_util::FutureExt;
 use protocol::types::{
     AgentClosedPayload, AgentCompactNotifyPayload, AgentCompactPayload, AgentCompactStatus,
     TeamCompactNotifyPayload, TeamCompactPayload, TeamCompactStatus,
@@ -66,6 +70,8 @@ use protocol::{
     WorkflowStepRunSnapshot, WorkflowTargetDirectory, WorkflowTargetsResponse,
 };
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot, watch};
+use tokio::task::{JoinHandle, JoinSet};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::agent::customization::{
@@ -275,8 +281,9 @@ where
 pub(crate) struct DeferredAgentAttachment {
     host_stream: StreamPath,
     agent_stream: StreamPath,
-    agent_handle: AgentHandle,
-    stream: Stream,
+    reply: Option<oneshot::Receiver<bool>>,
+    agent_handle: Option<AgentHandle>,
+    stream: Option<Stream>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -487,6 +494,12 @@ enum HermesSessionSchemaState {
     Unavailable(String),
 }
 
+enum SessionSchemaResolution {
+    Pending,
+    Ready(SessionSettingsSchema),
+    Unavailable(String),
+}
+
 pub(crate) struct HostState {
     pub registry: AgentRegistry,
     pub review_registry: ReviewRegistryHandle,
@@ -549,6 +562,10 @@ pub(crate) struct HostState {
     /// outside the state lock; agent spawns and terminal creation check
     /// this set so they cannot race into a half-removed workbench.
     removing_projects: HashSet<ProjectId>,
+    #[cfg(feature = "test-support")]
+    agent_name_test_gate: Option<Arc<AgentNameTestGateInner>>,
+    #[cfg(feature = "test-support")]
+    session_schema_probe_count: u64,
 }
 
 impl Drop for HostState {
@@ -560,11 +577,223 @@ impl Drop for HostState {
     }
 }
 
-#[derive(Clone)]
 pub struct HostHandle {
     state: Arc<Mutex<HostState>>,
     workflow_save_lock: Arc<Mutex<()>>,
     backend_setup_refresh_lock: Arc<Mutex<()>>,
+    session_schema_refresh_lock: Arc<Mutex<()>>,
+    spawn_operations: SpawnOperationHandle,
+    spawn_operation_owner: Option<Arc<SpawnOperationOwner>>,
+}
+
+const SPAWN_OPERATION_QUEUE_CAPACITY: usize = 32;
+const MAX_CONCURRENT_SPAWN_OPERATIONS: usize = 8;
+
+struct SpawnOperationOwner {
+    cancel: CancellationToken,
+    worker: StdMutex<Option<SpawnOperationWorker>>,
+    shutdown: StdMutex<SpawnOperationShutdown>,
+    shutdown_complete: tokio::sync::watch::Sender<bool>,
+    #[cfg(feature = "test-support")]
+    completion_test_gate: Arc<StdMutex<Option<Arc<SpawnOperationTestGateInner>>>>,
+    #[cfg(feature = "test-support")]
+    start_test_gate: Arc<StdMutex<Option<Arc<SpawnOperationTestGateInner>>>>,
+    #[cfg(feature = "test-support")]
+    drain_test_gate: Arc<StdMutex<Option<Arc<SpawnOperationTestGateInner>>>>,
+    #[cfg(feature = "test-support")]
+    publication_test_gate: Arc<StdMutex<Option<Arc<SpawnOperationTestGateInner>>>>,
+}
+
+struct SpawnOperationShutdown {
+    started: bool,
+}
+
+enum SpawnOperationWorker {
+    Tokio(JoinHandle<()>),
+    Thread(std::thread::JoinHandle<()>),
+}
+
+impl Drop for SpawnOperationOwner {
+    fn drop(&mut self) {
+        self.begin_shutdown();
+    }
+}
+
+impl SpawnOperationOwner {
+    fn begin_shutdown(&self) {
+        let mut shutdown = self
+            .shutdown
+            .lock()
+            .expect("spawn operation shutdown mutex poisoned");
+        if shutdown.started {
+            return;
+        }
+        shutdown.started = true;
+        self.cancel.cancel();
+        let worker = self
+            .worker
+            .lock()
+            .expect("spawn operation worker mutex poisoned")
+            .take();
+        let shutdown_complete = self.shutdown_complete.clone();
+        match worker {
+            Some(SpawnOperationWorker::Tokio(worker)) => {
+                std::thread::Builder::new()
+                    .name("tyde-host-spawn-operation-drain".to_owned())
+                    .spawn(move || {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("failed to build host spawn operation drain runtime");
+                        let _ = runtime.block_on(worker);
+                        shutdown_complete.send_replace(true);
+                    })
+                    .expect("failed to spawn host spawn operation drain thread");
+            }
+            Some(SpawnOperationWorker::Thread(worker)) => {
+                std::thread::Builder::new()
+                    .name("tyde-host-spawn-operation-drain".to_owned())
+                    .spawn(move || {
+                        let _ = worker.join();
+                        shutdown_complete.send_replace(true);
+                    })
+                    .expect("failed to spawn host spawn operation drain thread");
+            }
+            None => {
+                shutdown_complete.send_replace(true);
+            }
+        }
+    }
+
+    async fn shutdown(&self) {
+        let mut shutdown_complete = self.shutdown_complete.subscribe();
+        self.begin_shutdown();
+        while !*shutdown_complete.borrow_and_update() {
+            if shutdown_complete.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SpawnOperationHandle {
+    tx: mpsc::Sender<SpawnOperation>,
+    owner: Weak<SpawnOperationOwner>,
+}
+
+struct SpawnOperation {
+    payload: SpawnAgentPayload,
+    request_stream: StreamPath,
+    output_stream: Stream,
+}
+
+#[derive(Clone)]
+struct SpawnOperationTerminal {
+    request_stream: StreamPath,
+    output_stream: Stream,
+}
+
+struct ActiveSpawnOperation {
+    terminal: SpawnOperationTerminal,
+    outcome: Arc<StdMutex<Option<SpawnOperationOutcome>>>,
+}
+
+enum SpawnOperationOutcome {
+    Success,
+    Error(AppError),
+    Panicked,
+}
+
+#[derive(Clone)]
+struct SpawnOperationTerminalClaim {
+    outcome: Arc<StdMutex<Option<SpawnOperationOutcome>>>,
+    #[cfg(feature = "test-support")]
+    publication_test_gate: Arc<StdMutex<Option<Arc<SpawnOperationTestGateInner>>>>,
+}
+
+impl SpawnOperationTerminalClaim {
+    fn claim_success_at_publication(&self) -> bool {
+        let mut outcome = self
+            .outcome
+            .lock()
+            .expect("spawn operation outcome mutex poisoned");
+        if outcome.is_some() {
+            false
+        } else {
+            *outcome = Some(SpawnOperationOutcome::Success);
+            true
+        }
+    }
+
+    async fn wait_after_success_publication(&self, claimed: bool) {
+        #[cfg(feature = "test-support")]
+        if claimed {
+            wait_for_spawn_operation_test_gate(&self.publication_test_gate).await;
+        }
+        #[cfg(not(feature = "test-support"))]
+        let _ = claimed;
+    }
+
+    fn claim_resolved_result(
+        &self,
+        result: Result<AppResult<AgentId>, Box<dyn std::any::Any + Send>>,
+    ) {
+        let mut outcome = self
+            .outcome
+            .lock()
+            .expect("spawn operation outcome mutex poisoned");
+        if outcome.is_some() {
+            return;
+        }
+        *outcome = Some(match result {
+            Ok(Ok(_)) => SpawnOperationOutcome::Success,
+            Ok(Err(error)) => SpawnOperationOutcome::Error(error),
+            Err(_) => SpawnOperationOutcome::Panicked,
+        });
+    }
+}
+
+struct WeakHostHandle {
+    state: Weak<Mutex<HostState>>,
+    workflow_save_lock: Weak<Mutex<()>>,
+    backend_setup_refresh_lock: Weak<Mutex<()>>,
+    session_schema_refresh_lock: Weak<Mutex<()>>,
+    spawn_operations: SpawnOperationHandle,
+}
+
+impl WeakHostHandle {
+    fn upgrade(&self) -> Option<HostHandle> {
+        Some(HostHandle {
+            state: self.state.upgrade()?,
+            workflow_save_lock: self.workflow_save_lock.upgrade()?,
+            backend_setup_refresh_lock: self.backend_setup_refresh_lock.upgrade()?,
+            session_schema_refresh_lock: self.session_schema_refresh_lock.upgrade()?,
+            spawn_operations: self.spawn_operations.clone(),
+            spawn_operation_owner: None,
+        })
+    }
+}
+
+impl Clone for HostHandle {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+            workflow_save_lock: Arc::clone(&self.workflow_save_lock),
+            backend_setup_refresh_lock: Arc::clone(&self.backend_setup_refresh_lock),
+            session_schema_refresh_lock: Arc::clone(&self.session_schema_refresh_lock),
+            spawn_operations: self.spawn_operations.clone(),
+            spawn_operation_owner: None,
+        }
+    }
+}
+
+impl Drop for HostHandle {
+    fn drop(&mut self) {
+        if let Some(owner) = self.spawn_operation_owner.as_ref() {
+            owner.begin_shutdown();
+        }
+    }
 }
 
 struct PendingAgentSessionPublication {
@@ -880,6 +1109,118 @@ pub struct InstalledWorkbenchRemoveHook {
 }
 
 #[cfg(feature = "test-support")]
+pub struct InstalledAgentNameGate {
+    inner: Arc<AgentNameTestGateInner>,
+}
+
+#[cfg(feature = "test-support")]
+pub struct InstalledSpawnOperationTestGate {
+    inner: Arc<SpawnOperationTestGateInner>,
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) struct SpawnOperationTestGateInner {
+    entered_tx: mpsc::UnboundedSender<()>,
+    entered_rx: Mutex<mpsc::UnboundedReceiver<()>>,
+    release: Semaphore,
+    panic_on_release: AtomicBool,
+}
+
+#[cfg(feature = "test-support")]
+impl InstalledSpawnOperationTestGate {
+    pub async fn wait_until_entered(&self) {
+        self.inner
+            .entered_rx
+            .lock()
+            .await
+            .recv()
+            .await
+            .expect("spawn operation test gate closed before entry");
+    }
+
+    pub fn release_one(&self) {
+        self.inner.release.add_permits(1);
+    }
+
+    pub fn panic_on_release(&self) {
+        self.inner.panic_on_release.store(true, Ordering::SeqCst);
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl Drop for InstalledSpawnOperationTestGate {
+    fn drop(&mut self) {
+        self.inner.release.close();
+    }
+}
+
+#[cfg(feature = "test-support")]
+struct AgentNameTestGateInner {
+    next_ordinal: AtomicU64,
+    entered_tx: mpsc::UnboundedSender<u64>,
+    entered_rx: Mutex<mpsc::UnboundedReceiver<u64>>,
+    completed_tx: mpsc::UnboundedSender<u64>,
+    completed_rx: Mutex<mpsc::UnboundedReceiver<u64>>,
+    release: Semaphore,
+    panic_ordinals: StdMutex<HashSet<u64>>,
+}
+
+#[cfg(feature = "test-support")]
+struct AgentNameTestCompletion {
+    gate: Arc<AgentNameTestGateInner>,
+    ordinal: u64,
+}
+
+#[cfg(not(feature = "test-support"))]
+type AgentNameTestCompletion = ();
+
+#[cfg(feature = "test-support")]
+impl InstalledAgentNameGate {
+    pub async fn wait_until_entered(&self) -> u64 {
+        self.inner
+            .entered_rx
+            .lock()
+            .await
+            .recv()
+            .await
+            .expect("agent name gate closed before entry")
+    }
+
+    pub async fn wait_until_completed(&self) -> u64 {
+        self.inner
+            .completed_rx
+            .lock()
+            .await
+            .recv()
+            .await
+            .expect("agent name gate closed before completion")
+    }
+
+    pub fn try_next_entry(&self) -> Option<u64> {
+        self.inner.entered_rx.try_lock().ok()?.try_recv().ok()
+    }
+
+    pub fn release_one(&self) {
+        self.inner.release.add_permits(1);
+    }
+
+    pub fn panic_on_release(&self, ordinal: u64) {
+        self.inner
+            .panic_ordinals
+            .lock()
+            .expect("agent name gate panic set poisoned")
+            .insert(ordinal);
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl Drop for InstalledAgentNameGate {
+    fn drop(&mut self) {
+        self.inner.release.close();
+    }
+}
+
+#[cfg(feature = "test-support")]
 struct WorkbenchRemoveHook {
     host_state_ptr: usize,
     reached: tokio::sync::Notify,
@@ -999,7 +1340,249 @@ impl HostHandle {
         *hook = Some(Arc::clone(&inner));
         InstalledWorkbenchRemoveHook { inner }
     }
+
+    pub async fn install_agent_name_test_gate(&self) -> InstalledAgentNameGate {
+        let (entered_tx, entered_rx) = mpsc::unbounded_channel();
+        let (completed_tx, completed_rx) = mpsc::unbounded_channel();
+        let inner = Arc::new(AgentNameTestGateInner {
+            next_ordinal: AtomicU64::new(0),
+            entered_tx,
+            entered_rx: Mutex::new(entered_rx),
+            completed_tx,
+            completed_rx: Mutex::new(completed_rx),
+            release: Semaphore::new(0),
+            panic_ordinals: StdMutex::new(HashSet::new()),
+        });
+        self.state.lock().await.agent_name_test_gate = Some(Arc::clone(&inner));
+        InstalledAgentNameGate { inner }
+    }
+
+    pub async fn set_session_schema_ready_for_test(&self, backend_kind: BackendKind) {
+        let schema = session_settings_schema_for_backend(backend_kind);
+        let _refresh_guard = self.session_schema_refresh_lock.lock().await;
+        let mut state = self.state.lock().await;
+        match backend_kind {
+            BackendKind::Codex => {
+                state.codex_session_schema = CodexSessionSchemaState::Ready(schema)
+            }
+            BackendKind::Kiro => state.kiro_session_schema = KiroSessionSchemaState::Ready(schema),
+            BackendKind::Hermes => {
+                state.hermes_session_schema = HermesSessionSchemaState::Ready(schema)
+            }
+            _ => panic!("backend {backend_kind:?} does not have a dynamic session schema"),
+        }
+        if matches!(
+            &state.codex_session_schema,
+            CodexSessionSchemaState::Pending
+        ) {
+            state.codex_session_schema =
+                CodexSessionSchemaState::Unavailable("test schema not configured".to_owned());
+        }
+        if matches!(&state.kiro_session_schema, KiroSessionSchemaState::Pending) {
+            state.kiro_session_schema =
+                KiroSessionSchemaState::Unavailable("test schema not configured".to_owned());
+        }
+        if matches!(
+            &state.hermes_session_schema,
+            HermesSessionSchemaState::Pending
+        ) {
+            state.hermes_session_schema =
+                HermesSessionSchemaState::Unavailable("test schema not configured".to_owned());
+        }
+    }
+
+    pub async fn set_session_schema_unavailable_for_test(
+        &self,
+        backend_kind: BackendKind,
+        message: &str,
+    ) {
+        let _refresh_guard = self.session_schema_refresh_lock.lock().await;
+        let mut state = self.state.lock().await;
+        match backend_kind {
+            BackendKind::Codex => {
+                state.codex_session_schema =
+                    CodexSessionSchemaState::Unavailable(message.to_owned())
+            }
+            BackendKind::Kiro => {
+                state.kiro_session_schema = KiroSessionSchemaState::Unavailable(message.to_owned())
+            }
+            BackendKind::Hermes => {
+                state.hermes_session_schema =
+                    HermesSessionSchemaState::Unavailable(message.to_owned())
+            }
+            _ => panic!("backend {backend_kind:?} does not have a dynamic session schema"),
+        }
+    }
+
+    pub async fn session_schema_probe_count_for_test(&self) -> u64 {
+        self.state.lock().await.session_schema_probe_count
+    }
+
+    pub fn install_spawn_operation_completion_test_gate(&self) -> InstalledSpawnOperationTestGate {
+        let gate = new_spawn_operation_test_gate();
+        let owner = self
+            .spawn_operations
+            .owner
+            .upgrade()
+            .expect("spawn operation owner must be available while installing test gate");
+        *owner
+            .completion_test_gate
+            .lock()
+            .expect("spawn operation completion test gate mutex poisoned") =
+            Some(Arc::clone(&gate.inner));
+        gate
+    }
+
+    pub fn install_spawn_operation_start_test_gate(&self) -> InstalledSpawnOperationTestGate {
+        let gate = new_spawn_operation_test_gate();
+        let owner = self
+            .spawn_operations
+            .owner
+            .upgrade()
+            .expect("spawn operation owner must be available while installing test gate");
+        *owner
+            .start_test_gate
+            .lock()
+            .expect("spawn operation start test gate mutex poisoned") =
+            Some(Arc::clone(&gate.inner));
+        gate
+    }
+
+    pub fn install_spawn_operation_drain_test_gate(&self) -> InstalledSpawnOperationTestGate {
+        let gate = new_spawn_operation_test_gate();
+        let owner = self
+            .spawn_operations
+            .owner
+            .upgrade()
+            .expect("spawn operation owner must be available while installing test gate");
+        *owner
+            .drain_test_gate
+            .lock()
+            .expect("spawn operation drain test gate mutex poisoned") =
+            Some(Arc::clone(&gate.inner));
+        gate
+    }
+
+    pub fn install_spawn_operation_publication_test_gate(&self) -> InstalledSpawnOperationTestGate {
+        let gate = new_spawn_operation_test_gate();
+        let owner = self
+            .spawn_operations
+            .owner
+            .upgrade()
+            .expect("spawn operation owner must be available while installing test gate");
+        *owner
+            .publication_test_gate
+            .lock()
+            .expect("spawn operation publication test gate mutex poisoned") =
+            Some(Arc::clone(&gate.inner));
+        gate
+    }
+
+    pub fn install_agent_startup_completion_test_gate(
+        &self,
+        agent_name: &str,
+    ) -> InstalledSpawnOperationTestGate {
+        let gate = new_spawn_operation_test_gate();
+        crate::agent::install_startup_completion_test_gate(
+            agent_name.to_owned(),
+            Arc::clone(&gate.inner),
+        );
+        gate
+    }
+
+    pub fn spawn_operation_limits_for_test(&self) -> (usize, usize) {
+        (
+            MAX_CONCURRENT_SPAWN_OPERATIONS,
+            SPAWN_OPERATION_QUEUE_CAPACITY,
+        )
+    }
 }
+
+#[cfg(feature = "test-support")]
+fn new_spawn_operation_test_gate() -> InstalledSpawnOperationTestGate {
+    let (entered_tx, entered_rx) = mpsc::unbounded_channel();
+    InstalledSpawnOperationTestGate {
+        inner: Arc::new(SpawnOperationTestGateInner {
+            entered_tx,
+            entered_rx: Mutex::new(entered_rx),
+            release: Semaphore::new(0),
+            panic_on_release: AtomicBool::new(false),
+        }),
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) async fn wait_for_spawn_operation_test_gate_inner(
+    gate: &Arc<SpawnOperationTestGateInner>,
+) {
+    if gate.entered_tx.send(()).is_err() {
+        return;
+    }
+    let Ok(permit) = gate.release.acquire().await else {
+        return;
+    };
+    permit.forget();
+    if gate.panic_on_release.swap(false, Ordering::SeqCst) {
+        panic!("controlled spawn operation test panic");
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn notify_spawn_operation_test_gate_inner(gate: &Arc<SpawnOperationTestGateInner>) {
+    let _ = gate.entered_tx.send(());
+}
+
+#[cfg(feature = "test-support")]
+async fn wait_for_spawn_operation_test_gate(
+    gate: &Arc<StdMutex<Option<Arc<SpawnOperationTestGateInner>>>>,
+) {
+    let gate = gate
+        .lock()
+        .expect("spawn operation test gate mutex poisoned")
+        .clone();
+    let Some(gate) = gate else {
+        return;
+    };
+    wait_for_spawn_operation_test_gate_inner(&gate).await;
+}
+
+#[cfg(feature = "test-support")]
+async fn wait_for_agent_name_test_gate(host: &HostHandle) -> Option<AgentNameTestCompletion> {
+    let gate = host.state.lock().await.agent_name_test_gate.clone();
+    let gate = gate?;
+    let ordinal = gate.next_ordinal.fetch_add(1, Ordering::SeqCst);
+    if gate.entered_tx.send(ordinal).is_err() {
+        return None;
+    }
+    let Ok(permit) = gate.release.acquire().await else {
+        return None;
+    };
+    permit.forget();
+    if gate
+        .panic_ordinals
+        .lock()
+        .expect("agent name gate panic set poisoned")
+        .remove(&ordinal)
+    {
+        panic!("controlled agent name generation panic at ordinal {ordinal}");
+    }
+    Some(AgentNameTestCompletion { gate, ordinal })
+}
+
+#[cfg(not(feature = "test-support"))]
+async fn wait_for_agent_name_test_gate(_host: &HostHandle) -> Option<AgentNameTestCompletion> {
+    None
+}
+
+#[cfg(feature = "test-support")]
+fn notify_agent_name_test_completion(completion: Option<AgentNameTestCompletion>) {
+    if let Some(completion) = completion {
+        let _ = completion.gate.completed_tx.send(completion.ordinal);
+    }
+}
+
+#[cfg(not(feature = "test-support"))]
+fn notify_agent_name_test_completion(_completion: Option<AgentNameTestCompletion>) {}
 
 #[cfg(feature = "test-support")]
 async fn wait_for_workbench_remove_test_hook(host: &HostHandle) {
@@ -2013,8 +2596,9 @@ impl HostHandle {
                 deferred_attachments.push(DeferredAgentAttachment {
                     host_stream: host_path.clone(),
                     agent_stream: instance_stream.clone(),
-                    agent_handle,
-                    stream: agent_stream,
+                    reply: None,
+                    agent_handle: Some(agent_handle),
+                    stream: Some(agent_stream),
                 });
             }
         }
@@ -2111,9 +2695,7 @@ impl HostHandle {
                 pending.instance_stream,
                 pending.attach_eagerly,
                 pending.activity_summary,
-            )
-            .await
-            {
+            ) {
                 Ok(Some(attachment)) => {
                     agent_visibility
                         .record_new_agent(pending.start.agent_id.clone(), host_path.clone());
@@ -2165,22 +2747,34 @@ impl HostHandle {
     }
 
     pub(crate) async fn attach_deferred_agent_stream(&self, attachment: DeferredAgentAttachment) {
-        let attached = attachment.agent_handle.attach(attachment.stream).await;
+        let DeferredAgentAttachment {
+            host_stream,
+            agent_stream,
+            reply,
+            agent_handle,
+            stream,
+        } = attachment;
+        let reply = match reply {
+            Some(reply) => Some(reply),
+            None => match (agent_handle, stream) {
+                (Some(agent_handle), Some(stream)) => agent_handle.begin_attach(stream),
+                (None, None) => None,
+                _ => unreachable!("deferred agent attachment source must be complete"),
+            },
+        };
+        let attached = match reply {
+            Some(reply) => reply.await.unwrap_or(false),
+            None => false,
+        };
         let mut state = self.state.lock().await;
-        let Some(subscriber) = state.host_streams.get_mut(&attachment.host_stream) else {
+        let Some(subscriber) = state.host_streams.get_mut(&host_stream) else {
             return;
         };
         if attached {
-            subscriber
-                .bootstrapped_agent_streams
-                .insert(attachment.agent_stream);
+            subscriber.bootstrapped_agent_streams.insert(agent_stream);
         } else {
-            subscriber
-                .attached_agent_streams
-                .remove(&attachment.agent_stream);
-            subscriber
-                .bootstrapped_agent_streams
-                .remove(&attachment.agent_stream);
+            subscriber.attached_agent_streams.remove(&agent_stream);
+            subscriber.bootstrapped_agent_streams.remove(&agent_stream);
         }
     }
 
@@ -2269,9 +2863,85 @@ impl HostHandle {
         lock
     }
 
+    #[cfg(test)]
     pub(crate) async fn spawn_agent(&self, payload: SpawnAgentPayload) -> AppResult<AgentId> {
         self.spawn_agent_with_origin(payload, AgentOrigin::User)
             .await
+    }
+
+    fn schedule_generated_agent_name(
+        &self,
+        agent_handle: AgentHandle,
+        request: GenerateAgentNameRequest,
+    ) {
+        let host = self.clone();
+        tokio::spawn(async move {
+            let test_completion = wait_for_agent_name_test_gate(&host).await;
+            let result = await_agent_name_generation(
+                generate_agent_name(request),
+                AGENT_NAME_GENERATION_TIMEOUT,
+            )
+            .await;
+            if agent_handle.apply_generated_name(result).await == Some(true) {
+                host.fan_out_session_lists().await;
+            }
+            notify_agent_name_test_completion(test_completion);
+        });
+    }
+
+    async fn spawn_agent_for_operation(
+        &self,
+        payload: SpawnAgentPayload,
+        terminal_claim: SpawnOperationTerminalClaim,
+    ) -> AppResult<AgentId> {
+        self.spawn_agent_with_origin_config_and_team(
+            payload,
+            AgentOrigin::User,
+            None,
+            None,
+            None,
+            Some(terminal_claim),
+        )
+        .await
+    }
+
+    pub(crate) fn start_spawn_agent_operation(
+        &self,
+        payload: SpawnAgentPayload,
+        request_stream: StreamPath,
+        output_stream: Stream,
+    ) -> AppResult<()> {
+        let Some(owner) = self.spawn_operations.owner.upgrade() else {
+            return Err(AppError::internal(
+                "spawn_agent",
+                anyhow!("host spawn operation owner is unavailable"),
+            ));
+        };
+        if owner.cancel.is_cancelled() {
+            return Err(AppError::internal(
+                "spawn_agent",
+                anyhow!("host spawn operation owner is shut down"),
+            ));
+        }
+        self.spawn_operations
+            .tx
+            .try_send(SpawnOperation {
+                payload,
+                request_stream,
+                output_stream,
+            })
+            .map_err(|error| {
+                AppError::internal(
+                    "spawn_agent",
+                    anyhow!("host spawn operation capacity unavailable: {error}"),
+                )
+            })
+    }
+
+    pub async fn shutdown_spawn_operations(&self) {
+        if let Some(owner) = self.spawn_operations.owner.upgrade() {
+            owner.shutdown().await;
+        }
     }
 
     pub(crate) async fn compact_agent_in_background(
@@ -2856,6 +3526,7 @@ impl HostHandle {
                 None,
                 team_context.clone(),
                 None,
+                None,
             )
             .await;
         let new_agent_id = match new_agent_id {
@@ -3063,6 +3734,7 @@ impl HostHandle {
             resolved_spawn_config_override,
             None,
             workflow,
+            None,
         )
         .await
     }
@@ -3074,6 +3746,7 @@ impl HostHandle {
         resolved_spawn_config_override: Option<ResolvedSpawnConfig>,
         team_context: Option<TeamSpawnContext>,
         workflow: Option<AgentWorkflowMetadata>,
+        operation_terminal_claim: Option<SpawnOperationTerminalClaim>,
     ) -> AppResult<AgentId> {
         tracing::info!(
             parent_agent_id = ?payload.parent_agent_id,
@@ -3093,6 +3766,7 @@ impl HostHandle {
             debug_mcp,
             agent_control_mcp,
             config_mcp,
+            capacity_tx,
             removing_projects,
             parent_session_id,
             antigravity_conversations_dir,
@@ -3110,6 +3784,7 @@ impl HostHandle {
                 state.debug_mcp.clone(),
                 state.agent_control_mcp.clone(),
                 state.config_mcp.clone(),
+                state.capacity_tx.clone(),
                 state.removing_projects.clone(),
                 payload.parent_agent_id.as_ref().map(|agent_id| {
                     if let Some(session_id) = state.agent_sessions.get(agent_id).cloned() {
@@ -3142,9 +3817,7 @@ impl HostHandle {
             .get()
             .unwrap_or_else(|err| panic!("failed to load host settings for spawn: {err}"));
 
-        // Set by the New branch when auto-naming is enabled; the generation
-        // runs in the background after the spawn is visible to clients.
-        let mut background_name_generation: Option<GenerateAgentNameRequest> = None;
+        let mut generated_name_request = None;
         let request = match payload.params {
             SpawnAgentParams::New {
                 workspace_roots,
@@ -3239,19 +3912,11 @@ impl HostHandle {
                 }
                 let startup_mcp_servers =
                     protocol_mcp_servers_to_startup(&resolved_spawn_config.mcp_servers);
-                let session_settings_schema = {
-                    let state = self.state.lock().await;
-                    session_schema_for_backend(&state, backend_kind)
-                };
-                let session_settings_schema = if backend_has_dynamic_session_schema(backend_kind)
-                    && session_settings_schema.is_none()
-                {
-                    self.refresh_session_schema_for_backend(backend_kind).await;
-                    let state = self.state.lock().await;
-                    session_schema_for_backend(&state, backend_kind)
-                } else {
-                    session_settings_schema
-                };
+                let (session_settings_schema, schema_failure) =
+                    match self.resolve_session_schema_for_spawn(backend_kind).await {
+                        Ok(schema) => (schema, None),
+                        Err(failure) => (None, Some(failure)),
+                    };
                 let settings_failure = session_settings.as_ref().and_then(|settings| {
                     session_settings_startup_failure(
                         backend_kind,
@@ -3260,7 +3925,7 @@ impl HostHandle {
                         session_settings_source,
                     )
                 });
-                let startup_failure = startup_failure.or(settings_failure);
+                let startup_failure = startup_failure.or(schema_failure).or(settings_failure);
                 let (resolved_name, initial_alias) = match payload.name.clone() {
                     Some(name) => (
                         name.clone(),
@@ -3270,27 +3935,23 @@ impl HostHandle {
                         }),
                     ),
                     None => {
-                        // Naming must never block or fail the spawn: start with
-                        // the prompt-derived name immediately and upgrade to a
-                        // model-generated name in the background once (and only
-                        // if) generation succeeds.
+                        let generated = derive_agent_name(&prompt);
                         if startup_failure.is_none()
                             && host_settings
                                 .background_agent_features
                                 .auto_generate_agent_names
                         {
-                            background_name_generation = Some(GenerateAgentNameRequest {
+                            generated_name_request = Some(GenerateAgentNameRequest {
                                 backend_kind,
                                 prompt: prompt.clone(),
                                 use_mock_backend,
-                                capacity_tx: self.state.lock().await.capacity_tx.clone(),
+                                capacity_tx: capacity_tx.clone(),
                             });
                         }
-                        let derived = derive_agent_name(&prompt);
                         (
-                            derived.clone(),
+                            generated.clone(),
                             Some(InitialAgentAlias {
-                                name: derived,
+                                name: generated,
                                 persistence: InitialAgentAliasPersistence::GeneratedIfNoUserAlias,
                             }),
                         )
@@ -3566,21 +4227,13 @@ impl HostHandle {
                 };
                 let startup_mcp_servers =
                     protocol_mcp_servers_to_startup(&resolved_spawn_config.mcp_servers);
-                let session_settings_schema = {
-                    let state = self.state.lock().await;
-                    session_schema_for_backend(&state, record.backend_kind)
+                let (session_settings_schema, schema_failure) = match self
+                    .resolve_session_schema_for_spawn(record.backend_kind)
+                    .await
+                {
+                    Ok(schema) => (schema, None),
+                    Err(failure) => (None, Some(failure)),
                 };
-                let session_settings_schema =
-                    if backend_has_dynamic_session_schema(record.backend_kind)
-                        && session_settings_schema.is_none()
-                    {
-                        self.refresh_session_schema_for_backend(record.backend_kind)
-                            .await;
-                        let state = self.state.lock().await;
-                        session_schema_for_backend(&state, record.backend_kind)
-                    } else {
-                        session_settings_schema
-                    };
                 let (resolved_name, initial_alias) = match payload.name.clone() {
                     Some(name) => (
                         name.clone(),
@@ -3647,7 +4300,7 @@ impl HostHandle {
                     resume_session_id: Some(session_id),
                     fork_from_session_id: None,
                     startup_warning: combined_startup_warning,
-                    startup_failure: startup_failure.or(settings_failure),
+                    startup_failure: startup_failure.or(schema_failure).or(settings_failure),
                     initial_alias,
                     use_mock_backend,
                 }
@@ -3871,42 +4524,16 @@ impl HostHandle {
                     access_mode.unwrap_or(protocol::BackendAccessMode::ReadOnly);
                 let startup_mcp_servers =
                     protocol_mcp_servers_to_startup(&resolved_spawn_config.mcp_servers);
-                let session_settings_schema = {
-                    let state = self.state.lock().await;
-                    session_schema_for_backend(&state, backend_kind)
-                };
-                tracing::warn!(
-                    from_session_id = %from_session_id,
-                    backend_kind = ?backend_kind,
-                    schema_present = session_settings_schema.is_some(),
-                    parent_lookup_failed = parent_agent_mismatch_failure.is_some(),
-                    "diagnostic: side-question fork reached dynamic schema decision"
-                );
-                let session_settings_schema = if backend_has_dynamic_session_schema(backend_kind)
-                    && session_settings_schema.is_none()
-                    && parent_agent_mismatch_failure.is_none()
-                {
-                    tracing::warn!(
-                        from_session_id = %from_session_id,
-                        backend_kind = ?backend_kind,
-                        "diagnostic: side-question fork starting inline session schema refresh"
-                    );
-                    self.refresh_session_schema_for_backend(backend_kind).await;
-                    let state = self.state.lock().await;
-                    session_schema_for_backend(&state, backend_kind)
-                } else {
-                    if parent_agent_mismatch_failure.is_some()
-                        && session_settings_schema.is_none()
-                        && backend_has_dynamic_session_schema(backend_kind)
-                    {
-                        tracing::warn!(
-                            from_session_id = %from_session_id,
-                            backend_kind = ?backend_kind,
-                            "diagnostic: side-question fork skipped inline schema refresh because startup already fails"
-                        );
-                    }
-                    session_settings_schema
-                };
+                let (session_settings_schema, schema_failure) =
+                    if parent_agent_mismatch_failure.is_some() {
+                        let state = self.state.lock().await;
+                        (session_schema_for_backend(&state, backend_kind), None)
+                    } else {
+                        match self.resolve_session_schema_for_spawn(backend_kind).await {
+                            Ok(schema) => (schema, None),
+                            Err(failure) => (None, Some(failure)),
+                        }
+                    };
                 let (sanitized_settings, settings_failure) = sanitize_stored_session_settings(
                     backend_kind,
                     session_settings_schema.as_ref(),
@@ -3935,6 +4562,7 @@ impl HostHandle {
                     .or(parent_agent_mismatch_failure)
                     .or(non_resumable_failure)
                     .or(backend_support_failure)
+                    .or(schema_failure)
                     .or(settings_failure);
                 let combined_startup_warning = match (startup_warning, missing_project_warning) {
                     (Some(a), Some(b)) => Some(format!("{a}; {b}")),
@@ -4053,12 +4681,8 @@ impl HostHandle {
         #[cfg(test)]
         notify_startup_failure_fanout_claimed_test_hook(self);
         if !fanout_started {
-            if let Some(request) = background_name_generation.take() {
-                self.spawn_background_agent_naming(request, agent_id.clone(), agent_handle.clone());
-            }
             return Ok(agent_id);
         }
-
         let mut host_streams = {
             let mut state = self.state.lock().await;
             let activity_summary =
@@ -4101,6 +4725,10 @@ impl HostHandle {
         host_streams.sort_by(|left, right| left.0.0.cmp(&right.0.0));
 
         let mut dead_paths = Vec::new();
+        let mut deferred_attachments = Vec::new();
+        let mut publication_claimed = false;
+        #[cfg(test)]
+        let mut successful_fanouts = 0_usize;
         for (path, stream, attach_eagerly, instance_stream, activity_summary) in host_streams {
             if !visibility.may_emit_new_agent() {
                 break;
@@ -4121,35 +4749,25 @@ impl HostHandle {
                 instance_stream,
                 attach_eagerly,
                 activity_summary,
-            )
-            .await
-            {
-                Ok(Some(attachment)) => {
+            ) {
+                Ok(attachment) => {
                     let continue_fanout = visibility.record_new_agent_delivery(path.clone());
+                    if let Some(terminal_claim) = operation_terminal_claim.as_ref() {
+                        publication_claimed |= terminal_claim.claim_success_at_publication();
+                    }
+                    if let Some(attachment) = attachment {
+                        deferred_attachments.push(attachment);
+                    }
                     #[cfg(test)]
-                    wait_after_spawn_new_agent_fanout_test_hook(self).await;
+                    {
+                        successful_fanouts += 1;
+                    }
                     if diagnose_side_question_fanout {
                         tracing::warn!(
                             agent_id = %start.agent_id,
                             host_stream = %path,
-                            "diagnostic: side-question NewAgent fanout succeeded with attachment"
-                        );
-                    }
-                    if continue_fanout {
-                        self.attach_deferred_agent_stream(attachment).await;
-                    } else {
-                        break;
-                    }
-                }
-                Ok(None) => {
-                    let continue_fanout = visibility.record_new_agent_delivery(path.clone());
-                    #[cfg(test)]
-                    wait_after_spawn_new_agent_fanout_test_hook(self).await;
-                    if diagnose_side_question_fanout {
-                        tracing::warn!(
-                            agent_id = %start.agent_id,
-                            host_stream = %path,
-                            "diagnostic: side-question NewAgent fanout succeeded without attachment"
+                            attach_eagerly,
+                            "diagnostic: side-question NewAgent fanout synchronously enqueued"
                         );
                     }
                     if !continue_fanout {
@@ -4169,6 +4787,21 @@ impl HostHandle {
                 }
             }
         }
+        if let Some(request) = generated_name_request {
+            self.schedule_generated_agent_name(agent_handle.clone(), request);
+        }
+        for attachment in deferred_attachments {
+            self.attach_deferred_agent_stream(attachment).await;
+        }
+        if let Some(terminal_claim) = operation_terminal_claim.as_ref() {
+            terminal_claim
+                .wait_after_success_publication(publication_claimed)
+                .await;
+        }
+        #[cfg(test)]
+        for _ in 0..successful_fanouts {
+            wait_after_spawn_new_agent_fanout_test_hook(self).await;
+        }
         if !dead_paths.is_empty() {
             let mut state = self.state.lock().await;
             for path in dead_paths {
@@ -4177,9 +4810,6 @@ impl HostHandle {
             }
         }
         if visibility.finish_new_agent_fanout() {
-            if let Some(request) = background_name_generation.take() {
-                self.spawn_background_agent_naming(request, agent_id.clone(), agent_handle.clone());
-            }
             return Ok(agent_id);
         }
         #[cfg(test)]
@@ -4203,9 +4833,6 @@ impl HostHandle {
 
         session_registration_publish.publish();
         visibility_guard.disarm();
-        if let Some(request) = background_name_generation.take() {
-            self.spawn_background_agent_naming(request, agent_id.clone(), agent_handle.clone());
-        }
         tracing::info!(
             agent_id = %agent_id,
             backend_kind = ?start.backend_kind,
@@ -4214,48 +4841,6 @@ impl HostHandle {
         );
 
         Ok(agent_id)
-    }
-
-    /// Upgrade a freshly spawned agent's prompt-derived name to a
-    /// model-generated one, off the spawn path. Failure is logged and the
-    /// derived name simply remains — name generation must never block a spawn
-    /// or surface as a spawn error. A user rename that lands first wins:
-    /// the generated name is applied with generated-alias persistence, which
-    /// never overrides a user alias.
-    fn spawn_background_agent_naming(
-        &self,
-        request: GenerateAgentNameRequest,
-        agent_id: AgentId,
-        agent_handle: crate::agent::AgentHandle,
-    ) {
-        let host = self.clone();
-        tokio::spawn(async move {
-            let derived = derive_agent_name(&request.prompt);
-            let generated = await_agent_name_generation(
-                generate_agent_name(request),
-                AGENT_NAME_GENERATION_TIMEOUT,
-            )
-            .await;
-            let name = match generated {
-                Ok(name) => name,
-                Err(error) => {
-                    tracing::warn!(
-                        agent_id = %agent_id,
-                        error = %error,
-                        "background agent name generation failed; keeping the prompt-derived name"
-                    );
-                    return;
-                }
-            };
-            // The spawn already carries the prompt-derived name; an identical
-            // generated name would be a no-op rename and fanout.
-            if name == derived {
-                return;
-            }
-            if agent_handle.set_generated_name(name).await == Some(true) {
-                host.fan_out_session_lists().await;
-            }
-        });
     }
 
     async fn resolve_launch_profile_session_settings(
@@ -4482,7 +5067,6 @@ impl HostHandle {
         if !fanout_started {
             return agent_id;
         }
-
         let mut host_streams = {
             let mut state = self.state.lock().await;
             let activity_summary =
@@ -4514,6 +5098,9 @@ impl HostHandle {
         host_streams.sort_by(|left, right| left.0.0.cmp(&right.0.0));
 
         let mut dead_paths = Vec::new();
+        let mut deferred_attachments = Vec::new();
+        #[cfg(test)]
+        let mut successful_fanouts = 0_usize;
         for (path, stream, attach_eagerly, instance_stream, activity_summary) in host_streams {
             if !visibility.may_emit_new_agent() {
                 break;
@@ -4525,29 +5112,29 @@ impl HostHandle {
                 instance_stream,
                 attach_eagerly,
                 activity_summary,
-            )
-            .await
-            {
-                Ok(Some(attachment)) => {
+            ) {
+                Ok(attachment) => {
                     let continue_fanout = visibility.record_new_agent_delivery(path.clone());
-                    #[cfg(test)]
-                    wait_after_spawn_new_agent_fanout_test_hook(self).await;
-                    if continue_fanout {
-                        self.attach_deferred_agent_stream(attachment).await;
-                    } else {
-                        break;
+                    if let Some(attachment) = attachment {
+                        deferred_attachments.push(attachment);
                     }
-                }
-                Ok(None) => {
-                    let continue_fanout = visibility.record_new_agent_delivery(path.clone());
                     #[cfg(test)]
-                    wait_after_spawn_new_agent_fanout_test_hook(self).await;
+                    {
+                        successful_fanouts += 1;
+                    }
                     if !continue_fanout {
                         break;
                     }
                 }
                 Err(_) => dead_paths.push(path),
             }
+        }
+        for attachment in deferred_attachments {
+            self.attach_deferred_agent_stream(attachment).await;
+        }
+        #[cfg(test)]
+        for _ in 0..successful_fanouts {
+            wait_after_spawn_new_agent_fanout_test_hook(self).await;
         }
         if !dead_paths.is_empty() {
             let mut state = self.state.lock().await;
@@ -5883,6 +6470,7 @@ impl HostHandle {
                     team_member_id: plan.member.id.clone(),
                 }),
                 None,
+                None,
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -6775,7 +7363,7 @@ impl HostHandle {
     fn schedule_session_schema_refresh(&self) {
         let host = self.clone();
         tokio::spawn(async move {
-            host.refresh_session_schemas().await;
+            host.refresh_pending_session_schemas().await;
         });
     }
 
@@ -6824,30 +7412,94 @@ impl HostHandle {
     }
 
     pub(crate) async fn refresh_session_schemas(&self) {
-        self.refresh_session_schemas_scoped(None, false).await;
+        self.refresh_session_schemas_with_fanout(false).await;
     }
 
-    /// Probe and refresh the session schema of a single backend, leaving the
-    /// other backends' cached schema states untouched. Spawning a Hermes
-    /// agent must not launch a Codex model-discovery probe (or vice versa) —
-    /// an unrelated backend's probe failure would otherwise surface in flows
-    /// that never asked for it.
     pub(crate) async fn refresh_session_schema_for_backend(
         &self,
         backend_kind: protocol::BackendKind,
     ) {
-        self.refresh_session_schemas_scoped(Some(backend_kind), false)
+        let _refresh_guard = self.session_schema_refresh_lock.lock().await;
+        self.refresh_session_schemas_with_fanout_unlocked(false, true, Some(backend_kind))
             .await;
     }
 
-    async fn refresh_session_schemas_with_fanout(&self, force_emit: bool) {
-        self.refresh_session_schemas_scoped(None, force_emit).await;
+    async fn resolve_session_schema_for_spawn(
+        &self,
+        backend_kind: protocol::BackendKind,
+    ) -> Result<Option<SessionSettingsSchema>, AgentStartupFailure> {
+        if !backend_has_dynamic_session_schema(backend_kind) {
+            return Ok(Some(session_settings_schema_for_backend(backend_kind)));
+        }
+        let _refresh_guard = self.session_schema_refresh_lock.lock().await;
+        let mut resolution = {
+            let state = self.state.lock().await;
+            session_schema_resolution_for_backend(&state, backend_kind)
+        };
+        if matches!(&resolution, SessionSchemaResolution::Pending) {
+            self.refresh_session_schemas_with_fanout_unlocked(false, false, Some(backend_kind))
+                .await;
+            resolution = {
+                let state = self.state.lock().await;
+                session_schema_resolution_for_backend(&state, backend_kind)
+            };
+        }
+        match resolution {
+            SessionSchemaResolution::Ready(schema) => Ok(Some(schema)),
+            SessionSchemaResolution::Unavailable(message) => {
+                Err(AgentStartupFailure::backend_failed(format!(
+                    "{backend_kind:?} session settings schema unavailable: {message}"
+                )))
+            }
+            SessionSchemaResolution::Pending => Err(AgentStartupFailure::backend_failed(format!(
+                "{backend_kind:?} session settings schema unavailable"
+            ))),
+        }
     }
 
-    async fn refresh_session_schemas_scoped(
+    async fn refresh_session_schemas_with_fanout(&self, force_emit: bool) {
+        let _refresh_guard = self.session_schema_refresh_lock.lock().await;
+        self.refresh_session_schemas_with_fanout_unlocked(force_emit, true, None)
+            .await;
+    }
+
+    async fn refresh_pending_session_schemas(&self) {
+        let _refresh_guard = self.session_schema_refresh_lock.lock().await;
+        let (settings_store, codex_pending, kiro_pending, hermes_pending) = {
+            let state = self.state.lock().await;
+            (
+                Arc::clone(&state.settings_store),
+                matches!(
+                    &state.codex_session_schema,
+                    CodexSessionSchemaState::Pending
+                ),
+                matches!(&state.kiro_session_schema, KiroSessionSchemaState::Pending),
+                matches!(
+                    &state.hermes_session_schema,
+                    HermesSessionSchemaState::Pending
+                ),
+            )
+        };
+        let enabled = settings_store
+            .lock()
+            .await
+            .get()
+            .unwrap_or_else(|err| panic!("failed to load host settings for session schemas: {err}"))
+            .enabled_backends;
+        let pending = (codex_pending && enabled.contains(&protocol::BackendKind::Codex))
+            || (kiro_pending && enabled.contains(&protocol::BackendKind::Kiro))
+            || (hermes_pending && enabled.contains(&protocol::BackendKind::Hermes));
+        if pending {
+            self.refresh_session_schemas_with_fanout_unlocked(false, false, None)
+                .await;
+        }
+    }
+
+    async fn refresh_session_schemas_with_fanout_unlocked(
         &self,
-        only: Option<protocol::BackendKind>,
         force_emit: bool,
+        retry_unavailable: bool,
+        only: Option<protocol::BackendKind>,
     ) {
         let probe = |kind: protocol::BackendKind| only.is_none_or(|scoped| scoped == kind);
         let (
@@ -6856,27 +7508,36 @@ impl HostHandle {
             kiro_probe_program,
             configured_kiro_probe_workspace_root,
             skip_real_backend_probe,
+            previous_codex,
+            previous_kiro,
+            previous_hermes,
             prev_hermes_ready,
         ) = {
             let mut state = self.state.lock().await;
-            // Capture the last-known-good Hermes schema before resetting to
-            // Pending, so a transient probe failure below can fall back to it
-            // instead of marking the backend Unavailable (which would block
-            // resuming an already-working session).
+            #[cfg(feature = "test-support")]
+            {
+                state.session_schema_probe_count =
+                    state.session_schema_probe_count.saturating_add(1);
+            }
             let prev_hermes_ready = match &state.hermes_session_schema {
                 HermesSessionSchemaState::Ready(schema) => Some(schema.clone()),
                 HermesSessionSchemaState::Pending | HermesSessionSchemaState::Unavailable(_) => {
                     None
                 }
             };
-            if probe(protocol::BackendKind::Codex) {
-                state.codex_session_schema = CodexSessionSchemaState::Pending;
-            }
-            if probe(protocol::BackendKind::Kiro) {
-                state.kiro_session_schema = KiroSessionSchemaState::Pending;
-            }
-            if probe(protocol::BackendKind::Hermes) {
-                state.hermes_session_schema = HermesSessionSchemaState::Pending;
+            let previous_codex = state.codex_session_schema.clone();
+            let previous_kiro = state.kiro_session_schema.clone();
+            let previous_hermes = state.hermes_session_schema.clone();
+            if retry_unavailable {
+                if probe(protocol::BackendKind::Codex) {
+                    state.codex_session_schema = CodexSessionSchemaState::Pending;
+                }
+                if probe(protocol::BackendKind::Kiro) {
+                    state.kiro_session_schema = KiroSessionSchemaState::Pending;
+                }
+                if probe(protocol::BackendKind::Hermes) {
+                    state.hermes_session_schema = HermesSessionSchemaState::Pending;
+                }
             }
             (
                 Arc::clone(&state.settings_store),
@@ -6884,6 +7545,9 @@ impl HostHandle {
                 state.kiro_probe_program.clone(),
                 state.kiro_probe_workspace_root.clone(),
                 state.skip_real_backend_probe,
+                previous_codex,
+                previous_kiro,
+                previous_hermes,
                 prev_hermes_ready,
             )
         };
@@ -6894,33 +7558,37 @@ impl HostHandle {
             .unwrap_or_else(|err| panic!("failed to load host settings for session schemas: {err}"))
             .enabled_backends;
 
-        let codex_session_schema = if !probe(protocol::BackendKind::Codex) {
-            None
+        let codex_session_schema = if !probe(protocol::BackendKind::Codex)
+            || (!retry_unavailable && !matches!(&previous_codex, CodexSessionSchemaState::Pending))
+        {
+            previous_codex
         } else if enabled_backends.contains(&protocol::BackendKind::Codex) {
             if skip_real_backend_probe && codex_probe_program.is_none() {
-                Some(CodexSessionSchemaState::Unavailable(
+                CodexSessionSchemaState::Unavailable(
                     "Codex model discovery is unavailable because backend probing is disabled"
                         .to_string(),
-                ))
+                )
             } else {
                 match crate::backend::codex::probe_session_settings_schema(
                     codex_probe_program.as_deref(),
                 )
                 .await
                 {
-                    Ok(schema) => Some(CodexSessionSchemaState::Ready(schema)),
+                    Ok(schema) => CodexSessionSchemaState::Ready(schema),
                     Err(err) => {
                         tracing::error!("failed to refresh Codex session schema: {err}");
-                        Some(CodexSessionSchemaState::Unavailable(err))
+                        CodexSessionSchemaState::Unavailable(err)
                     }
                 }
             }
         } else {
-            Some(CodexSessionSchemaState::Pending)
+            CodexSessionSchemaState::Pending
         };
 
-        let kiro_session_schema = if !probe(protocol::BackendKind::Kiro) {
-            None
+        let kiro_session_schema = if !probe(protocol::BackendKind::Kiro)
+            || (!retry_unavailable && !matches!(&previous_kiro, KiroSessionSchemaState::Pending))
+        {
+            previous_kiro
         } else if enabled_backends.contains(&protocol::BackendKind::Kiro) {
             match kiro_probe_workspace_root(configured_kiro_probe_workspace_root.as_deref()) {
                 Ok(workspace_root) => match crate::backend::kiro::probe_session_settings_schema(
@@ -6929,28 +7597,31 @@ impl HostHandle {
                 )
                 .await
                 {
-                    Ok(schema) => Some(KiroSessionSchemaState::Ready(schema)),
+                    Ok(schema) => KiroSessionSchemaState::Ready(schema),
                     Err(err) => {
                         tracing::error!("failed to refresh Kiro session schema: {err}");
-                        Some(KiroSessionSchemaState::Unavailable(err))
+                        KiroSessionSchemaState::Unavailable(err)
                     }
                 },
                 Err(err) => {
                     tracing::error!("failed to resolve Kiro probe workspace root: {err}");
-                    Some(KiroSessionSchemaState::Unavailable(err))
+                    KiroSessionSchemaState::Unavailable(err)
                 }
             }
         } else {
-            Some(KiroSessionSchemaState::Pending)
+            KiroSessionSchemaState::Pending
         };
 
-        let hermes_session_schema = if !probe(protocol::BackendKind::Hermes) {
-            None
+        let hermes_session_schema = if !probe(protocol::BackendKind::Hermes)
+            || (!retry_unavailable
+                && !matches!(&previous_hermes, HermesSessionSchemaState::Pending))
+        {
+            previous_hermes
         } else if enabled_backends.contains(&protocol::BackendKind::Hermes) {
             if skip_real_backend_probe {
-                Some(HermesSessionSchemaState::Ready(
+                HermesSessionSchemaState::Ready(
                     <crate::backend::hermes::HermesBackend as crate::backend::Backend>::session_settings_schema(),
-                ))
+                )
             } else {
                 let hermes_schema_or_last_good = |err: String| match prev_hermes_ready.clone() {
                     Some(schema) => {
@@ -6961,7 +7632,7 @@ impl HostHandle {
                     }
                     None => HermesSessionSchemaState::Unavailable(err),
                 };
-                Some(match hermes_probe_workspace_root() {
+                match hermes_probe_workspace_root() {
                     Ok(workspace_root) => {
                         match crate::backend::hermes::probe_session_settings_schema(&[
                             workspace_root,
@@ -6979,22 +7650,16 @@ impl HostHandle {
                         tracing::error!("failed to resolve Hermes probe workspace root: {err}");
                         hermes_schema_or_last_good(err)
                     }
-                })
+                }
             }
         } else {
-            Some(HermesSessionSchemaState::Pending)
+            HermesSessionSchemaState::Pending
         };
 
         let mut state = self.state.lock().await;
-        if let Some(schema) = codex_session_schema {
-            state.codex_session_schema = schema;
-        }
-        if let Some(schema) = kiro_session_schema {
-            state.kiro_session_schema = schema;
-        }
-        if let Some(schema) = hermes_session_schema {
-            state.hermes_session_schema = schema;
-        }
+        state.codex_session_schema = codex_session_schema;
+        state.kiro_session_schema = kiro_session_schema;
+        state.hermes_session_schema = hermes_session_schema;
         fan_out_session_schemas(&mut state, force_emit).await;
         fan_out_backend_config_schemas(&mut state).await;
         fan_out_launch_profile_catalog(&mut state).await;
@@ -9130,7 +9795,7 @@ impl HostHandle {
             session_id: session_id.clone(),
         };
 
-        let (start, agent_handle, host_streams, agent_visibility) = {
+        let (start, agent_handle, agent_visibility) = {
             let mut state = self.state.lock().await;
             let spawned =
                 state
@@ -9139,16 +9804,25 @@ impl HostHandle {
             state
                 .agent_sessions
                 .insert(spawned.start.agent_id.clone(), session_id.clone());
+            (
+                spawned.start,
+                spawned.handle,
+                state.agent_visibility.clone(),
+            )
+        };
+
+        let host_streams = {
+            let mut state = self.state.lock().await;
             let activity_summary =
-                initial_agent_activity_summary_state(&mut state, &spawned.start.agent_id);
-            let host_streams = state
+                initial_agent_activity_summary_state(&mut state, &start.agent_id);
+            state
                 .host_streams
                 .iter_mut()
                 .filter_map(|(path, subscriber)| {
                     prepare_new_agent_fanout_for_subscriber(
                         subscriber,
-                        &spawned.start,
-                        &spawned.handle,
+                        &start,
+                        &agent_handle,
                         activity_summary.clone(),
                     )
                     .map(
@@ -9163,13 +9837,7 @@ impl HostHandle {
                         },
                     )
                 })
-                .collect::<Vec<_>>();
-            (
-                spawned.start,
-                spawned.handle,
-                host_streams,
-                state.agent_visibility.clone(),
-            )
+                .collect::<Vec<_>>()
         };
 
         if let Err(err) = session_store.lock().await.upsert_backend_session(
@@ -9213,18 +9881,18 @@ impl HostHandle {
                 instance_stream,
                 attach_eagerly,
                 activity_summary,
-            )
-            .await
-            {
-                Ok(Some(attachment)) => {
+            ) {
+                Ok(attachment) => {
                     agent_visibility.record_new_agent(start.agent_id.clone(), path.clone());
-                    deferred_attachments.push(attachment);
-                }
-                Ok(None) => {
-                    agent_visibility.record_new_agent(start.agent_id.clone(), path.clone());
+                    if let Some(attachment) = attachment {
+                        deferred_attachments.push(attachment);
+                    }
                 }
                 Err(_) => dead_paths.push(path),
             }
+        }
+        for attachment in deferred_attachments {
+            self.attach_deferred_agent_stream(attachment).await;
         }
         if !dead_paths.is_empty() {
             let mut state = self.state.lock().await;
@@ -9232,9 +9900,6 @@ impl HostHandle {
                 state.host_streams.remove(&path);
                 state.agent_visibility.remove_host_stream(&path);
             }
-        }
-        for attachment in deferred_attachments {
-            self.attach_deferred_agent_stream(attachment).await;
         }
         {
             let mut state = self.state.lock().await;
@@ -11726,6 +12391,35 @@ fn spawn_host_inner(
         mpsc::channel::<WorkflowCatalogSignal>(crate::workflows::watch::workflow_signal_capacity());
     let workflow_watcher =
         crate::workflows::watch::spawn_workflow_watcher(workflow_watch_targets, workflow_signal_tx);
+    let (spawn_operation_tx, spawn_operation_rx) = mpsc::channel(SPAWN_OPERATION_QUEUE_CAPACITY);
+    let spawn_operation_cancel = CancellationToken::new();
+    let (spawn_operation_shutdown_complete, _) = tokio::sync::watch::channel(false);
+    #[cfg(feature = "test-support")]
+    let spawn_operation_completion_test_gate = Arc::new(StdMutex::new(None));
+    #[cfg(feature = "test-support")]
+    let spawn_operation_start_test_gate = Arc::new(StdMutex::new(None));
+    #[cfg(feature = "test-support")]
+    let spawn_operation_drain_test_gate = Arc::new(StdMutex::new(None));
+    #[cfg(feature = "test-support")]
+    let spawn_operation_publication_test_gate = Arc::new(StdMutex::new(None));
+    let spawn_operations = Arc::new(SpawnOperationOwner {
+        cancel: spawn_operation_cancel.clone(),
+        worker: StdMutex::new(None),
+        shutdown: StdMutex::new(SpawnOperationShutdown { started: false }),
+        shutdown_complete: spawn_operation_shutdown_complete,
+        #[cfg(feature = "test-support")]
+        completion_test_gate: Arc::clone(&spawn_operation_completion_test_gate),
+        #[cfg(feature = "test-support")]
+        start_test_gate: Arc::clone(&spawn_operation_start_test_gate),
+        #[cfg(feature = "test-support")]
+        drain_test_gate: Arc::clone(&spawn_operation_drain_test_gate),
+        #[cfg(feature = "test-support")]
+        publication_test_gate: Arc::clone(&spawn_operation_publication_test_gate),
+    });
+    let spawn_operation_handle = SpawnOperationHandle {
+        tx: spawn_operation_tx,
+        owner: Arc::downgrade(&spawn_operations),
+    };
     let host = HostHandle {
         state: Arc::new(Mutex::new(HostState {
             registry: AgentRegistry::new(),
@@ -11779,10 +12473,41 @@ fn spawn_host_inner(
             project_search_ids: HashMap::new(),
             code_intel_routers: HashMap::new(),
             removing_projects: HashSet::new(),
+            #[cfg(feature = "test-support")]
+            agent_name_test_gate: None,
+            #[cfg(feature = "test-support")]
+            session_schema_probe_count: 0,
         })),
         workflow_save_lock: Arc::new(Mutex::new(())),
         backend_setup_refresh_lock: Arc::new(Mutex::new(())),
+        session_schema_refresh_lock: Arc::new(Mutex::new(())),
+        spawn_operations: spawn_operation_handle.clone(),
+        spawn_operation_owner: Some(Arc::clone(&spawn_operations)),
     };
+
+    let spawn_operation_worker = spawn_host_spawn_operation_task(
+        WeakHostHandle {
+            state: Arc::downgrade(&host.state),
+            workflow_save_lock: Arc::downgrade(&host.workflow_save_lock),
+            backend_setup_refresh_lock: Arc::downgrade(&host.backend_setup_refresh_lock),
+            session_schema_refresh_lock: Arc::downgrade(&host.session_schema_refresh_lock),
+            spawn_operations: spawn_operation_handle,
+        },
+        spawn_operation_rx,
+        spawn_operation_cancel,
+        #[cfg(feature = "test-support")]
+        spawn_operation_completion_test_gate,
+        #[cfg(feature = "test-support")]
+        spawn_operation_start_test_gate,
+        #[cfg(feature = "test-support")]
+        spawn_operation_drain_test_gate,
+        #[cfg(feature = "test-support")]
+        spawn_operation_publication_test_gate,
+    );
+    *spawn_operations
+        .worker
+        .lock()
+        .expect("spawn operation worker mutex poisoned") = Some(spawn_operation_worker);
 
     spawn_mobile_access_actor(
         host.clone(),
@@ -12489,6 +13214,188 @@ fn spawn_host_capacity_task(host: HostHandle, mut rx: HostCapacityRx) {
             runtime.block_on(worker);
         })
         .expect("failed to spawn host capacity task");
+}
+
+fn spawn_host_spawn_operation_task(
+    host: WeakHostHandle,
+    mut rx: mpsc::Receiver<SpawnOperation>,
+    cancel: CancellationToken,
+    #[cfg(feature = "test-support")] completion_test_gate: Arc<
+        StdMutex<Option<Arc<SpawnOperationTestGateInner>>>,
+    >,
+    #[cfg(feature = "test-support")] start_test_gate: Arc<
+        StdMutex<Option<Arc<SpawnOperationTestGateInner>>>,
+    >,
+    #[cfg(feature = "test-support")] drain_test_gate: Arc<
+        StdMutex<Option<Arc<SpawnOperationTestGateInner>>>,
+    >,
+    #[cfg(feature = "test-support")] publication_test_gate: Arc<
+        StdMutex<Option<Arc<SpawnOperationTestGateInner>>>,
+    >,
+) -> SpawnOperationWorker {
+    let worker = async move {
+        let mut operations = JoinSet::new();
+        let mut active = HashMap::new();
+        loop {
+            if operations.len() >= MAX_CONCURRENT_SPAWN_OPERATIONS {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    result = operations.join_next_with_id() => {
+                        if let Some(result) = result {
+                            finish_spawn_operation_result(result, &mut active, false);
+                        }
+                    }
+                }
+                continue;
+            }
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                result = operations.join_next_with_id(), if !operations.is_empty() => {
+                    if let Some(result) = result {
+                        finish_spawn_operation_result(result, &mut active, false);
+                    }
+                }
+                operation = rx.recv() => {
+                    let Some(operation) = operation else {
+                        break;
+                    };
+                    let Some(host) = host.upgrade() else {
+                        break;
+                    };
+                    let terminal = SpawnOperationTerminal {
+                        request_stream: operation.request_stream,
+                        output_stream: operation.output_stream,
+                    };
+                    let outcome = Arc::new(StdMutex::new(None));
+                    let terminal_claim = SpawnOperationTerminalClaim {
+                        outcome: Arc::clone(&outcome),
+                        #[cfg(feature = "test-support")]
+                        publication_test_gate: Arc::clone(&publication_test_gate),
+                    };
+                    #[cfg(feature = "test-support")]
+                    let completion_test_gate = Arc::clone(&completion_test_gate);
+                    #[cfg(feature = "test-support")]
+                    let start_test_gate = Arc::clone(&start_test_gate);
+                    let abort_handle = operations.spawn(async move {
+                        let result = AssertUnwindSafe(async {
+                            #[cfg(feature = "test-support")]
+                            wait_for_spawn_operation_test_gate(&start_test_gate).await;
+                            host.spawn_agent_for_operation(
+                                operation.payload,
+                                terminal_claim.clone(),
+                            )
+                            .await
+                        })
+                        .catch_unwind()
+                        .await;
+                        terminal_claim.claim_resolved_result(result);
+                        #[cfg(feature = "test-support")]
+                        wait_for_spawn_operation_test_gate(&completion_test_gate).await;
+                    });
+                    active.insert(abort_handle.id(), ActiveSpawnOperation { terminal, outcome });
+                }
+            }
+        }
+        rx.close();
+        operations.abort_all();
+        while let Some(result) = operations.join_next_with_id().await {
+            finish_spawn_operation_result(result, &mut active, true);
+        }
+        while let Some(operation) = rx.recv().await {
+            emit_spawn_operation_shutdown(SpawnOperationTerminal {
+                request_stream: operation.request_stream,
+                output_stream: operation.output_stream,
+            });
+        }
+        #[cfg(feature = "test-support")]
+        wait_for_spawn_operation_test_gate(&drain_test_gate).await;
+    };
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return SpawnOperationWorker::Tokio(handle.spawn(worker));
+    }
+
+    SpawnOperationWorker::Thread(
+        std::thread::Builder::new()
+            .name("tyde-host-spawn-operations".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to build host spawn operation runtime");
+                runtime.block_on(worker);
+            })
+            .expect("failed to spawn host spawn operation worker thread"),
+    )
+}
+
+fn finish_spawn_operation_result(
+    result: Result<(tokio::task::Id, ()), tokio::task::JoinError>,
+    active: &mut HashMap<tokio::task::Id, ActiveSpawnOperation>,
+    shutting_down: bool,
+) {
+    let (task_id, join_error) = match result {
+        Ok((task_id, ())) => (task_id, None),
+        Err(error) => (error.id(), Some(error)),
+    };
+    let Some(operation) = active.remove(&task_id) else {
+        return;
+    };
+    let outcome = operation
+        .outcome
+        .lock()
+        .expect("spawn operation outcome mutex poisoned")
+        .take();
+    match outcome {
+        Some(SpawnOperationOutcome::Success) => {}
+        Some(SpawnOperationOutcome::Error(error)) => {
+            emit_spawn_operation_error(&operation.terminal, &error);
+        }
+        Some(SpawnOperationOutcome::Panicked) => {
+            emit_spawn_operation_abnormal(operation.terminal, "spawn operation panicked");
+        }
+        None if shutting_down
+            && join_error
+                .as_ref()
+                .is_some_and(|error| error.is_cancelled()) =>
+        {
+            emit_spawn_operation_shutdown(operation.terminal);
+        }
+        None => {
+            let message = join_error.map_or_else(
+                || "spawn operation completed without an outcome".to_owned(),
+                |error| format!("spawn operation terminated unexpectedly: {error}"),
+            );
+            emit_spawn_operation_abnormal(operation.terminal, &message);
+        }
+    }
+}
+
+fn emit_spawn_operation_error(terminal: &SpawnOperationTerminal, error: &AppError) {
+    crate::connection::emit_command_error(
+        &terminal.output_stream,
+        terminal.request_stream.clone(),
+        FrameKind::SpawnAgent,
+        None,
+        error,
+    );
+}
+
+fn emit_spawn_operation_abnormal(terminal: SpawnOperationTerminal, message: &str) {
+    emit_spawn_operation_error(
+        &terminal,
+        &AppError::internal_message(
+            "spawn_agent",
+            message.to_owned(),
+            anyhow!(message.to_owned()),
+        ),
+    );
+}
+
+fn emit_spawn_operation_shutdown(terminal: SpawnOperationTerminal) {
+    emit_spawn_operation_abnormal(terminal, "host shut down before spawn operation completed");
 }
 
 fn spawn_host_sub_agent_task(host: HostHandle, mut rx: HostSubAgentSpawnRx) {
@@ -13606,7 +14513,7 @@ fn forget_agent_fanout_for_subscriber(subscriber: &mut HostSubscriber, agent_id:
         .retain(|pending| pending.start.agent_id != *agent_id);
 }
 
-async fn emit_new_agent_for_stream(
+fn emit_new_agent_for_stream(
     start: &AgentStartPayload,
     agent_handle: &AgentHandle,
     stream: &Stream,
@@ -13637,11 +14544,15 @@ async fn emit_new_agent_for_stream(
         .expect("failed to serialize NewAgent payload for host stream fanout");
     stream.send_value(FrameKind::NewAgent, payload)?;
 
-    let attachment = attach_eagerly.then(|| DeferredAgentAttachment {
-        host_stream: stream.path().clone(),
-        agent_stream: instance_stream.clone(),
-        agent_handle: agent_handle.clone(),
-        stream: stream.with_path(instance_stream),
+    let attachment = attach_eagerly.then(|| {
+        let agent_stream = stream.with_path(instance_stream.clone());
+        DeferredAgentAttachment {
+            host_stream: stream.path().clone(),
+            agent_stream: instance_stream,
+            reply: agent_handle.begin_attach(agent_stream),
+            agent_handle: None,
+            stream: None,
+        }
     });
 
     Ok(attachment)
@@ -15394,6 +16305,40 @@ fn session_schema_for_backend(
     }
 }
 
+fn session_schema_resolution_for_backend(
+    state: &HostState,
+    backend_kind: protocol::BackendKind,
+) -> SessionSchemaResolution {
+    match backend_kind {
+        protocol::BackendKind::Codex => match &state.codex_session_schema {
+            CodexSessionSchemaState::Pending => SessionSchemaResolution::Pending,
+            CodexSessionSchemaState::Ready(schema) => {
+                SessionSchemaResolution::Ready(schema.clone())
+            }
+            CodexSessionSchemaState::Unavailable(message) => {
+                SessionSchemaResolution::Unavailable(message.clone())
+            }
+        },
+        protocol::BackendKind::Kiro => match &state.kiro_session_schema {
+            KiroSessionSchemaState::Pending => SessionSchemaResolution::Pending,
+            KiroSessionSchemaState::Ready(schema) => SessionSchemaResolution::Ready(schema.clone()),
+            KiroSessionSchemaState::Unavailable(message) => {
+                SessionSchemaResolution::Unavailable(message.clone())
+            }
+        },
+        protocol::BackendKind::Hermes => match &state.hermes_session_schema {
+            HermesSessionSchemaState::Pending => SessionSchemaResolution::Pending,
+            HermesSessionSchemaState::Ready(schema) => {
+                SessionSchemaResolution::Ready(schema.clone())
+            }
+            HermesSessionSchemaState::Unavailable(message) => {
+                SessionSchemaResolution::Unavailable(message.clone())
+            }
+        },
+        _ => SessionSchemaResolution::Ready(session_settings_schema_for_backend(backend_kind)),
+    }
+}
+
 fn tier_values_for_hint(
     hint: protocol::SpawnCostHint,
     config: &protocol::BackendTierConfig,
@@ -17004,7 +17949,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_parent_visibility_closes_only_the_visible_subscriber() {
+    async fn synchronous_parent_fanout_closes_every_advertised_subscriber() {
         let fixture = compact_fixture().await;
         let (first_tx, mut first_rx) = mpsc::unbounded_channel();
         let first_stream = Stream::new(
@@ -17137,9 +18082,10 @@ mod tests {
             vec!["new", "closed"],
             "sorted host fanout must preserve NewAgent before AgentClosed for its visible subscriber"
         );
-        assert!(
-            second_lifecycle.is_empty(),
-            "the not-yet-fanned-out subscriber must see neither NewAgent nor AgentClosed: {second_lifecycle:?}"
+        assert_eq!(
+            second_lifecycle,
+            vec!["new", "closed"],
+            "two-phase fanout advertises every eligible subscriber before cancellation"
         );
     }
 
@@ -18993,7 +19939,6 @@ mod tests {
                 pending.attach_eagerly,
                 pending.activity_summary,
             )
-            .await
             .expect("flush pending NewAgent");
         }
 
@@ -19703,6 +20648,7 @@ mod tests {
                 },
                 AgentOrigin::User,
                 Some(resolved),
+                None,
                 None,
                 None,
             )

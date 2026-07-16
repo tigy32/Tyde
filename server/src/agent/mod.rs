@@ -115,6 +115,7 @@ struct InitialFollowUpContext<'a> {
     replay_state: &'a mut AgentReplayState,
     subscribers: &'a mut Vec<Stream>,
     queue: &'a mut VecDeque<QueuedMessageEntry>,
+    pending_inputs: &'a mut VecDeque<AgentInput>,
     rx: &'a mut mpsc::UnboundedReceiver<AgentCommand>,
 }
 
@@ -124,7 +125,7 @@ struct AgentNameChangeContext<'a> {
     pending_alias: &'a mut Option<InitialAgentAlias>,
     current_start: &'a mut AgentStartPayload,
     start_tx: &'a watch::Sender<AgentStartPayload>,
-    event_log: &'a mut [Envelope],
+    event_log: &'a mut Vec<Envelope>,
     subscribers: &'a mut Vec<Stream>,
 }
 
@@ -174,6 +175,10 @@ enum AgentCommand {
     SetName {
         name: String,
         persistence: InitialAgentAliasPersistence,
+        reply: oneshot::Sender<bool>,
+    },
+    ApplyGeneratedName {
+        result: Result<String, String>,
         reply: oneshot::Sender<bool>,
     },
     ReadOutput {
@@ -420,11 +425,23 @@ struct CompletedStreamHistoryFilter {
 
 impl CompletedStreamHistoryFilter {
     fn matches(&self, event: &ChatEvent) -> bool {
+        let completed_message_id = self
+            .message
+            .as_ref()
+            .and_then(|message| message.message_id.as_ref())
+            .map(|message_id| message_id.0.as_str());
         match event {
             ChatEvent::MessageAdded(message) => self
                 .message
                 .as_ref()
                 .is_some_and(|completed_message| same_chat_message(completed_message, message)),
+            ChatEvent::StreamStart(start) => start.message_id.as_deref() == completed_message_id,
+            ChatEvent::StreamDelta(delta) | ChatEvent::StreamReasoningDelta(delta) => {
+                delta.message_id.as_deref() == completed_message_id
+            }
+            ChatEvent::StreamEnd(end) => self.message.as_ref().is_some_and(|completed_message| {
+                same_chat_message(completed_message, &end.message)
+            }),
             ChatEvent::ToolRequest(_)
             | ChatEvent::ToolProgress(_)
             | ChatEvent::ToolExecutionCompleted(_) => chat_event_tool_call_id(event)
@@ -452,6 +469,7 @@ struct ReplayCompletedStream {
 pub(crate) struct AgentHandle {
     tx: mpsc::UnboundedSender<AgentCommand>,
     accepting_input: Arc<AtomicBool>,
+    closing: Arc<AtomicBool>,
     /// Live view of the actor's `AgentStartPayload`. Populated synchronously at
     /// handle construction and updated by the actor on name changes. Owning a
     /// clone of the receiver here means callers can snapshot the start payload
@@ -893,7 +911,7 @@ pub(crate) enum InterruptOutcome {
 
 impl AgentHandle {
     pub async fn send_input(&self, input: AgentInput) -> bool {
-        if !self.accepting_input.load(Ordering::SeqCst) {
+        if self.closing.load(Ordering::SeqCst) {
             return false;
         }
         self.tx.send(AgentCommand::SendInput(input)).is_ok()
@@ -939,14 +957,6 @@ impl AgentHandle {
             .await
     }
 
-    /// Apply a background-generated name. Unlike a user rename this never
-    /// overrides a user-chosen alias — if the user renamed the agent while the
-    /// name was generating, the generated name is dropped.
-    pub async fn set_generated_name(&self, name: String) -> Option<bool> {
-        self.set_name_with_persistence(name, InitialAgentAliasPersistence::GeneratedIfNoUserAlias)
-            .await
-    }
-
     async fn set_name_with_persistence(
         &self,
         name: String,
@@ -958,6 +968,21 @@ impl AgentHandle {
             .send(AgentCommand::SetName {
                 name,
                 persistence,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return None;
+        }
+        reply_rx.await.ok()
+    }
+
+    pub async fn apply_generated_name(&self, result: Result<String, String>) -> Option<bool> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(AgentCommand::ApplyGeneratedName {
+                result,
                 reply: reply_tx,
             })
             .is_err()
@@ -1066,6 +1091,7 @@ impl AgentHandle {
     }
 
     pub async fn close(&self) -> bool {
+        self.closing.store(true, Ordering::SeqCst);
         self.accepting_input.store(false, Ordering::SeqCst);
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
@@ -1078,19 +1104,75 @@ impl AgentHandle {
         reply_rx.await.is_ok()
     }
 
-    pub async fn attach(&self, stream: Stream) -> bool {
+    pub fn begin_attach(&self, stream: Stream) -> Option<oneshot::Receiver<bool>> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        if self
-            .tx
+        self.tx
             .send(AgentCommand::Attach {
                 stream,
                 reply: reply_tx,
             })
-            .is_err()
-        {
+            .ok()?;
+        Some(reply_rx)
+    }
+
+    pub async fn attach(&self, stream: Stream) -> bool {
+        let Some(reply_rx) = self.begin_attach(stream) else {
             return false;
-        }
+        };
         reply_rx.await.unwrap_or(false)
+    }
+}
+
+#[cfg(feature = "test-support")]
+type StartupCompletionTestGates =
+    std::sync::Mutex<HashMap<String, Arc<crate::host::SpawnOperationTestGateInner>>>;
+
+#[cfg(feature = "test-support")]
+fn startup_completion_test_gates() -> &'static StartupCompletionTestGates {
+    static GATES: std::sync::OnceLock<StartupCompletionTestGates> = std::sync::OnceLock::new();
+    GATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn install_startup_completion_test_gate(
+    agent_name: String,
+    gate: Arc<crate::host::SpawnOperationTestGateInner>,
+) {
+    let replaced = startup_completion_test_gates()
+        .lock()
+        .expect("startup completion test gate mutex poisoned")
+        .insert(agent_name, gate);
+    assert!(
+        replaced.is_none(),
+        "startup completion test gate already installed"
+    );
+}
+
+#[cfg(feature = "test-support")]
+async fn wait_for_startup_completion_test_gate(agent_name: &str) {
+    let gate = startup_completion_test_gates()
+        .lock()
+        .expect("startup completion test gate mutex poisoned")
+        .get(agent_name)
+        .cloned();
+    if let Some(gate) = gate {
+        crate::host::wait_for_spawn_operation_test_gate_inner(&gate).await;
+        startup_completion_test_gates()
+            .lock()
+            .expect("startup completion test gate mutex poisoned")
+            .remove(agent_name);
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn notify_startup_name_stashed_test_gate(agent_name: &str) {
+    let gate = startup_completion_test_gates()
+        .lock()
+        .expect("startup completion test gate mutex poisoned")
+        .get(agent_name)
+        .cloned();
+    if let Some(gate) = gate {
+        crate::host::notify_spawn_operation_test_gate_inner(&gate);
     }
 }
 
@@ -1127,6 +1209,9 @@ pub(crate) async fn generate_agent_name(
     }
 
     if request.use_mock_backend {
+        if prompt.contains("__mock_async_generated_name__") {
+            return Ok("Generated Async Name".to_owned());
+        }
         return generate_mock_name(prompt);
     }
 
@@ -1799,6 +1884,7 @@ pub(crate) fn spawn_agent_actor(
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentCommand>();
     let accepting_input = Arc::new(AtomicBool::new(false));
     let accepting_input_task = Arc::clone(&accepting_input);
+    let closing = Arc::new(AtomicBool::new(false));
     let (startup_tx, startup_rx) = oneshot::channel();
     let (start_tx, start_rx) = watch::channel(start.clone());
     let actor_tx = tx.clone();
@@ -1859,6 +1945,8 @@ pub(crate) fn spawn_agent_actor(
             },
         );
         let mut queue = VecDeque::new();
+        let mut pending_inputs: VecDeque<AgentInput> = VecDeque::new();
+        let mut pending_name_commands = VecDeque::new();
         assert!(
             resume_session_id.is_none() || fork_from_session_id.is_none(),
             "spawn request cannot both resume and fork a session"
@@ -1866,7 +1954,11 @@ pub(crate) fn spawn_agent_actor(
         let starts_with_initial_turn = resume_session_id.is_none();
         let is_resume = resume_session_id.is_some();
 
+        #[cfg(feature = "test-support")]
+        let startup_gate_name = current_start.name.clone();
         let mut startup_future = Box::pin(async {
+            #[cfg(feature = "test-support")]
+            wait_for_startup_completion_test_gate(&startup_gate_name).await;
             #[cfg(test)]
             wait_for_agent_startup_test_gate(&agent_id).await;
             let startup_result: Result<
@@ -1991,23 +2083,8 @@ pub(crate) fn spawn_agent_actor(
                     };
                     match command {
                         AgentCommand::Interrupt { reply } => {
-                            accepting_input_task.store(false, Ordering::SeqCst);
-                            status_handle
-                                .update(|status| {
-                                    status.terminated = true;
-                                    status.is_thinking = false;
-                                    status.turn_completed = true;
-                                    status.pending_user_response = None;
-                                    status.activity_counter =
-                                        status.activity_counter.saturating_add(1);
-                                })
-                                .await;
-                            for (_, attach_reply) in std::mem::take(&mut pending_startup_attaches) {
-                                let _ = attach_reply.send(true);
-                            }
                             let _ = reply.send(InterruptOutcome::Interrupted);
-                            let _ = startup_tx.send(Err("agent startup interrupted".to_owned()));
-                            return;
+                            break Err(AgentStartupFailure::internal("agent startup interrupted"));
                         }
                         AgentCommand::Close { reply } => {
                             accepting_input_task.store(false, Ordering::SeqCst);
@@ -2065,8 +2142,15 @@ pub(crate) fn spawn_agent_actor(
                                 &activity_stats,
                             ));
                         }
-                        AgentCommand::SetName { reply, .. } => {
-                            let _ = reply.send(false);
+                        command @ AgentCommand::SetName { .. } => {
+                            pending_name_commands.push_back(command);
+                            #[cfg(feature = "test-support")]
+                            notify_startup_name_stashed_test_gate(&current_start.name);
+                        }
+                        command @ AgentCommand::ApplyGeneratedName { .. } => {
+                            pending_name_commands.push_back(command);
+                            #[cfg(feature = "test-support")]
+                            notify_startup_name_stashed_test_gate(&current_start.name);
                         }
                         AgentCommand::Compact { reply, .. } => {
                             let _ = reply.send(Err("agent backend is starting".to_owned()));
@@ -2074,12 +2158,18 @@ pub(crate) fn spawn_agent_actor(
                         AgentCommand::ReleaseCompaction { reply } => {
                             let _ = reply.send(());
                         }
-                        AgentCommand::SendInput(_) | AgentCommand::ResumeReplayBarrier { .. } => {}
+                        AgentCommand::SendInput(input) => {
+                            pending_inputs.push_back(input);
+                        }
+                        AgentCommand::ResumeReplayBarrier { .. } => {}
                     }
                 }
             }
         };
         drop(startup_future);
+        for command in pending_name_commands {
+            let _ = actor_tx.send(command);
+        }
 
         let (backend, mut events, actor_session_id, initial_follow_up) = match startup_result {
             Ok(result) => result,
@@ -2136,6 +2226,7 @@ pub(crate) fn spawn_agent_actor(
                     &mut event_log,
                     &mut latest_output,
                     &mut subscribers,
+                    &mut pending_inputs,
                     &mut rx,
                 )
                 .await;
@@ -2277,6 +2368,7 @@ pub(crate) fn spawn_agent_actor(
                     replay_state: &mut replay_state,
                     subscribers: &mut subscribers,
                     queue: &mut queue,
+                    pending_inputs: &mut pending_inputs,
                     rx: &mut rx,
                 },
             )
@@ -2340,6 +2432,7 @@ pub(crate) fn spawn_agent_actor(
                                 &mut event_log,
                                 &mut latest_output,
                                 &mut subscribers,
+                                &mut pending_inputs,
                                 &mut rx,
                             )
                             .await;
@@ -2384,6 +2477,7 @@ pub(crate) fn spawn_agent_actor(
                             &mut event_log,
                             &mut latest_output,
                             &mut subscribers,
+                            &mut pending_inputs,
                             &mut rx,
                         )
                         .await;
@@ -2780,6 +2874,7 @@ pub(crate) fn spawn_agent_actor(
                                 &mut event_log,
                                 &mut latest_output,
                                 &mut subscribers,
+                                &mut pending_inputs,
                                 &mut rx,
                             )
                             .await;
@@ -2809,7 +2904,11 @@ pub(crate) fn spawn_agent_actor(
                         }
                     }
                 }
-                maybe_command = rx.recv() => {
+                maybe_command = next_agent_command(
+                    &mut pending_inputs,
+                    &mut rx,
+                    !resume_replay_gate_pending,
+                ) => {
                     let Some(command) = maybe_command else {
                         break;
                     };
@@ -2890,6 +2989,7 @@ pub(crate) fn spawn_agent_actor(
                                                 replay_state: &mut replay_state,
                                                 subscribers: &mut subscribers,
                                                 queue: &mut queue,
+                                                pending_inputs: &mut pending_inputs,
                                                 rx: &mut rx,
                                             },
                                         )
@@ -2947,6 +3047,7 @@ pub(crate) fn spawn_agent_actor(
                                         &mut event_log,
                                         &mut latest_output,
                                         &mut subscribers,
+                                        &mut pending_inputs,
                                         &mut rx,
                                     )
                                     .await;
@@ -2955,6 +3056,10 @@ pub(crate) fn spawn_agent_actor(
                             }
                         }
                         AgentCommand::SendInput(input) => {
+                            if resume_replay_gate_pending {
+                                pending_inputs.push_back(input);
+                                continue;
+                            }
                             if matches!(lifecycle, ActorLifecycle::Closing) {
                                 continue;
                             }
@@ -3090,6 +3195,7 @@ pub(crate) fn spawn_agent_actor(
                                                 &mut event_log,
                                                 &mut latest_output,
                                                 &mut subscribers,
+                                                &mut pending_inputs,
                                                 &mut rx,
                                             )
                                             .await;
@@ -3320,6 +3426,7 @@ pub(crate) fn spawn_agent_actor(
                                             &mut event_log,
                                             &mut latest_output,
                                             &mut subscribers,
+                                            &mut pending_inputs,
                                             &mut rx,
                                         )
                                         .await;
@@ -3572,6 +3679,22 @@ pub(crate) fn spawn_agent_actor(
                             .await;
                             let _ = reply.send(applied);
                         }
+                        AgentCommand::ApplyGeneratedName { result, reply } => {
+                            let applied = apply_generated_agent_name(
+                                AgentNameChangeContext {
+                                    session_store: &session_store,
+                                    session_id: current_session_id.as_ref(),
+                                    pending_alias: &mut pending_alias,
+                                    current_start: &mut current_start,
+                                    start_tx: &start_tx,
+                                    event_log: &mut event_log,
+                                    subscribers: &mut subscribers,
+                                },
+                                result,
+                            )
+                            .await;
+                            let _ = reply.send(applied);
+                        }
                         AgentCommand::ReadOutput {
                             after_seq,
                             limit,
@@ -3716,6 +3839,7 @@ pub(crate) fn spawn_agent_actor(
         AgentHandle {
             tx,
             accepting_input,
+            closing,
             start: start_rx,
         },
         startup_rx,
@@ -3806,6 +3930,7 @@ pub(crate) fn spawn_relay_agent_actor(
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentCommand>();
     let accepting_input = Arc::new(AtomicBool::new(true));
     let accepting_input_task = Arc::clone(&accepting_input);
+    let closing = Arc::new(AtomicBool::new(false));
     let (start_tx, start_rx) = watch::channel(start.clone());
 
     tokio::spawn(async move {
@@ -4085,6 +4210,22 @@ pub(crate) fn spawn_relay_agent_actor(
                             .await;
                             let _ = reply.send(applied);
                         }
+                        AgentCommand::ApplyGeneratedName { result, reply } => {
+                            let applied = apply_generated_agent_name(
+                                AgentNameChangeContext {
+                                    session_store: &session_store,
+                                    session_id: Some(&session_id),
+                                    pending_alias: &mut pending_alias,
+                                    current_start: &mut current_start,
+                                    start_tx: &start_tx,
+                                    event_log: &mut event_log,
+                                    subscribers: &mut subscribers,
+                                },
+                                result,
+                            )
+                            .await;
+                            let _ = reply.send(applied);
+                        }
                         AgentCommand::ReadOutput {
                             after_seq,
                             limit,
@@ -4162,6 +4303,7 @@ pub(crate) fn spawn_relay_agent_actor(
     AgentHandle {
         tx,
         accepting_input,
+        closing,
         start: start_rx,
     }
 }
@@ -4209,6 +4351,15 @@ fn relay_input_rejected_payload(agent_id: &AgentId) -> AgentErrorPayload {
         agent_id: agent_id.clone(),
         code: AgentErrorCode::Internal,
         message: "backend-native relay agents do not accept direct input".to_owned(),
+        fatal: false,
+    }
+}
+
+fn terminal_input_rejected_payload(agent_id: &AgentId) -> AgentErrorPayload {
+    AgentErrorPayload {
+        agent_id: agent_id.clone(),
+        code: AgentErrorCode::Internal,
+        message: "agent not running".to_owned(),
         fatal: false,
     }
 }
@@ -4300,6 +4451,17 @@ async fn enter_terminal_failure(context: TerminalFailureContext<'_>, payload: &A
     .await;
 }
 
+async fn next_agent_command(
+    pending_inputs: &mut VecDeque<AgentInput>,
+    rx: &mut mpsc::UnboundedReceiver<AgentCommand>,
+    drain_pending: bool,
+) -> Option<AgentCommand> {
+    if drain_pending && let Some(input) = pending_inputs.pop_front() {
+        return Some(AgentCommand::SendInput(input));
+    }
+    rx.recv().await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn park_terminal_agent(
     session_store: &Arc<Mutex<SessionStore>>,
@@ -4307,16 +4469,17 @@ async fn park_terminal_agent(
     pending_alias: &mut Option<InitialAgentAlias>,
     current_start: &mut AgentStartPayload,
     start_tx: &watch::Sender<AgentStartPayload>,
-    event_log: &mut [Envelope],
+    event_log: &mut Vec<Envelope>,
     latest_output: &mut AgentControlLatestOutput,
     subscribers: &mut Vec<Stream>,
+    pending_inputs: &mut VecDeque<AgentInput>,
     rx: &mut mpsc::UnboundedReceiver<AgentCommand>,
 ) {
     loop {
         latest_output
             .observe_event_log(event_log)
             .expect("typed terminal replay log must project latest output");
-        let Some(command) = rx.recv().await else {
+        let Some(command) = next_agent_command(pending_inputs, rx, true).await else {
             break;
         };
         match command {
@@ -4338,6 +4501,22 @@ async fn park_terminal_agent(
                     },
                     name,
                     persistence,
+                )
+                .await;
+                let _ = reply.send(applied);
+            }
+            AgentCommand::ApplyGeneratedName { result, reply } => {
+                let applied = apply_generated_agent_name(
+                    AgentNameChangeContext {
+                        session_store,
+                        session_id,
+                        pending_alias,
+                        current_start,
+                        start_tx,
+                        event_log,
+                        subscribers,
+                    },
+                    result,
                 )
                 .await;
                 let _ = reply.send(applied);
@@ -4392,7 +4571,17 @@ async fn park_terminal_agent(
             AgentCommand::ReleaseCompaction { reply } => {
                 let _ = reply.send(());
             }
-            AgentCommand::SendInput(_) => {}
+            AgentCommand::SendInput(_) => {
+                let payload = terminal_input_rejected_payload(&current_start.agent_id);
+                append_event(
+                    &format!("/agent/{}", current_start.agent_id),
+                    event_log,
+                    subscribers,
+                    FrameKind::AgentError,
+                    &payload,
+                )
+                .await;
+            }
             AgentCommand::Interrupt { reply } => {
                 let _ = reply.send(InterruptOutcome::NotRunning);
             }
@@ -4441,6 +4630,22 @@ async fn park_relay_terminal_agent(
                     },
                     name,
                     persistence,
+                )
+                .await;
+                let _ = reply.send(applied);
+            }
+            AgentCommand::ApplyGeneratedName { result, reply } => {
+                let applied = apply_generated_agent_name(
+                    AgentNameChangeContext {
+                        session_store,
+                        session_id: Some(session_id),
+                        pending_alias,
+                        current_start,
+                        start_tx,
+                        event_log,
+                        subscribers,
+                    },
+                    result,
                 )
                 .await;
                 let _ = reply.send(applied);
@@ -4520,6 +4725,106 @@ async fn park_relay_terminal_agent(
             }
         }
     }
+}
+
+async fn apply_generated_agent_name(
+    context: AgentNameChangeContext<'_>,
+    result: Result<String, String>,
+) -> bool {
+    let name = match result {
+        Ok(name) => name,
+        Err(error) => {
+            let payload = AgentErrorPayload {
+                agent_id: context.current_start.agent_id.clone(),
+                code: AgentErrorCode::Internal,
+                message: format!("automatic agent name generation failed: {error}"),
+                fatal: false,
+            };
+            append_event(
+                &format!("/agent/{}", context.current_start.agent_id),
+                context.event_log,
+                context.subscribers,
+                FrameKind::AgentError,
+                &payload,
+            )
+            .await;
+            return false;
+        }
+    };
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        let payload = AgentErrorPayload {
+            agent_id: context.current_start.agent_id.clone(),
+            code: AgentErrorCode::Internal,
+            message: "automatic agent name generation failed: generated name was empty".to_owned(),
+            fatal: false,
+        };
+        append_event(
+            &format!("/agent/{}", context.current_start.agent_id),
+            context.event_log,
+            context.subscribers,
+            FrameKind::AgentError,
+            &payload,
+        )
+        .await;
+        return false;
+    }
+
+    let applied = if let Some(session_id) = context.session_id {
+        match context
+            .session_store
+            .lock()
+            .await
+            .set_generated_alias_if_no_user_alias(session_id, trimmed.to_owned())
+        {
+            Ok(applied) => applied,
+            Err(error) => {
+                let payload = AgentErrorPayload {
+                    agent_id: context.current_start.agent_id.clone(),
+                    code: AgentErrorCode::Internal,
+                    message: format!("failed to persist generated agent name: {error}"),
+                    fatal: false,
+                };
+                append_event(
+                    &format!("/agent/{}", context.current_start.agent_id),
+                    context.event_log,
+                    context.subscribers,
+                    FrameKind::AgentError,
+                    &payload,
+                )
+                .await;
+                return false;
+            }
+        }
+    } else if context
+        .pending_alias
+        .as_ref()
+        .is_some_and(|alias| alias.persistence == InitialAgentAliasPersistence::User)
+    {
+        false
+    } else {
+        *context.pending_alias = Some(InitialAgentAlias {
+            name: trimmed.to_owned(),
+            persistence: InitialAgentAliasPersistence::GeneratedIfNoUserAlias,
+        });
+        true
+    };
+    if !applied {
+        return false;
+    }
+    if context.current_start.name == trimmed {
+        return true;
+    }
+
+    context.current_start.name = trimmed.to_owned();
+    overwrite_agent_start_payload(context.event_log, context.current_start);
+    let _ = context.start_tx.send_replace(context.current_start.clone());
+    let payload = AgentRenamedPayload {
+        agent_id: context.current_start.agent_id.clone(),
+        name: context.current_start.name.clone(),
+    };
+    broadcast_live_event(context.subscribers, FrameKind::AgentRenamed, &payload).await;
+    true
 }
 
 async fn apply_agent_name_change(
@@ -4940,6 +5245,7 @@ async fn send_initial_follow_up_or_park(
         context.event_log,
         context.latest_output,
         context.subscribers,
+        context.pending_inputs,
         context.rx,
     )
     .await;
@@ -5043,8 +5349,14 @@ fn record_chat_event_for_replay(
                 .active_stream
                 .take()
                 .expect("active stream was checked above");
-            replay_state.terminal_stream_message_ids.insert(message_id);
+            replay_state
+                .terminal_stream_message_ids
+                .insert(message_id.clone());
             let message = data.message.clone();
+            let retains_explicit_stream = !message.tool_calls.is_empty();
+            let stream_start = stream.start.clone();
+            let stream_text = stream.text.clone();
+            let stream_reasoning = stream.reasoning.clone();
             replay_state.recorded_message_senders.insert(
                 message
                     .message_id
@@ -5060,11 +5372,39 @@ fn record_chat_event_for_replay(
                 },
                 post_end_events: Vec::new(),
             });
-            push_chat_event_to_replay_log(
-                canonical_stream,
-                event_log,
-                &ChatEvent::MessageAdded(message),
-            );
+            if retains_explicit_stream {
+                push_chat_event_to_replay_log(
+                    canonical_stream,
+                    event_log,
+                    &ChatEvent::StreamStart(stream_start),
+                );
+                if !stream_reasoning.is_empty() {
+                    push_chat_event_to_replay_log(
+                        canonical_stream,
+                        event_log,
+                        &ChatEvent::StreamReasoningDelta(StreamTextDeltaData {
+                            message_id: Some(message_id.0.clone()),
+                            text: stream_reasoning,
+                        }),
+                    );
+                }
+                if !stream_text.is_empty() {
+                    push_chat_event_to_replay_log(
+                        canonical_stream,
+                        event_log,
+                        &ChatEvent::StreamDelta(StreamTextDeltaData {
+                            message_id: Some(message_id.0.clone()),
+                            text: stream_text,
+                        }),
+                    );
+                }
+            } else {
+                push_chat_event_to_replay_log(
+                    canonical_stream,
+                    event_log,
+                    &ChatEvent::MessageAdded(message.clone()),
+                );
+            }
             for tool_event in tool_events {
                 if let ChatEvent::ToolProgress(data) = &tool_event {
                     coalesce_progress_into_replay_log(
@@ -5078,6 +5418,13 @@ fn record_chat_event_for_replay(
                     push_chat_event_to_replay_log(canonical_stream, event_log, &tool_event);
                 }
             }
+            if retains_explicit_stream {
+                push_chat_event_to_replay_log(
+                    canonical_stream,
+                    event_log,
+                    &ChatEvent::StreamEnd(StreamEndData { message }),
+                );
+            }
         }
         ChatEvent::MessageMetadataUpdated(update) => {
             replay_state.update_completed_stream_metadata(update);
@@ -5087,9 +5434,28 @@ fn record_chat_event_for_replay(
                 &ChatEvent::MessageMetadataUpdated(update.clone()),
             );
         }
-        ChatEvent::ToolRequest(_) | ChatEvent::ToolExecutionCompleted(_) => {
+        ChatEvent::ToolRequest(_) => {
             if let Some(active) = replay_state.active_stream.as_mut() {
                 active.tool_events.push(event.clone());
+            } else {
+                replay_state.update_completed_stream_tool_snapshot(event);
+                push_chat_event_to_replay_log(canonical_stream, event_log, event);
+            }
+        }
+        ChatEvent::ToolExecutionCompleted(completion) => {
+            if let Some(active) = replay_state.active_stream.as_mut() {
+                let belongs_to_active_stream = active.tool_events.iter().any(|buffered| {
+                    matches!(
+                        buffered,
+                        ChatEvent::ToolRequest(request)
+                            if request.tool_call_id == completion.tool_call_id
+                    )
+                });
+                if belongs_to_active_stream {
+                    active.tool_events.push(event.clone());
+                } else {
+                    push_chat_event_to_replay_log(canonical_stream, event_log, event);
+                }
             } else {
                 replay_state.update_completed_stream_tool_snapshot(event);
                 push_chat_event_to_replay_log(canonical_stream, event_log, event);
@@ -5940,7 +6306,7 @@ fn agent_bootstrap_events_from_log(event_log: &[Envelope]) -> Vec<AgentBootstrap
 fn prior_history_message_count(entries: &[(u64, ChatEvent)], before_seq: u64) -> u32 {
     entries
         .iter()
-        .filter(|(seq, event)| *seq < before_seq && matches!(event, ChatEvent::MessageAdded(_)))
+        .filter(|(seq, event)| *seq < before_seq && history_message_terminal(event))
         .count()
         .min(u32::MAX as usize) as u32
 }
@@ -5977,7 +6343,7 @@ fn history_start_for_message_limit(
 ) -> usize {
     let message_count = entries[..end]
         .iter()
-        .filter(|(_, event)| matches!(event, ChatEvent::MessageAdded(_)))
+        .filter(|(_, event)| history_message_terminal(event))
         .count();
     if message_count <= limit {
         return 0;
@@ -5988,7 +6354,7 @@ fn history_start_for_message_limit(
     entries[..end]
         .iter()
         .position(|(_, event)| {
-            if !matches!(event, ChatEvent::MessageAdded(_)) {
+            if !history_message_terminal(event) {
                 return false;
             }
             if skipped == messages_to_skip {
@@ -5997,7 +6363,31 @@ fn history_start_for_message_limit(
             skipped += 1;
             false
         })
+        .map(|terminal_index| history_message_start(entries, terminal_index))
         .expect("message_count > limit requires a history window start message")
+}
+
+fn history_message_terminal(event: &ChatEvent) -> bool {
+    matches!(event, ChatEvent::MessageAdded(_) | ChatEvent::StreamEnd(_))
+}
+
+fn history_message_start(entries: &[(u64, ChatEvent)], terminal_index: usize) -> usize {
+    let ChatEvent::StreamEnd(end) = &entries[terminal_index].1 else {
+        return terminal_index;
+    };
+    let Some(message_id) = end.message.message_id.as_ref() else {
+        return terminal_index;
+    };
+    entries[..terminal_index]
+        .iter()
+        .rposition(|(_, event)| {
+            matches!(
+                event,
+                ChatEvent::StreamStart(start)
+                    if start.message_id.as_deref() == Some(message_id.0.as_str())
+            )
+        })
+        .unwrap_or(terminal_index)
 }
 
 fn session_history_entries_from_log(event_log: &[Envelope]) -> Vec<(u64, ChatEvent)> {
@@ -6029,8 +6419,10 @@ fn fold_message_metadata_update_into_history_events(
     update: &MessageMetadataUpdateData,
 ) -> bool {
     for event in events.iter_mut().rev() {
-        let ChatEvent::MessageAdded(message) = &mut event.1 else {
-            continue;
+        let message = match &mut event.1 {
+            ChatEvent::MessageAdded(message) => message,
+            ChatEvent::StreamEnd(end) => &mut end.message,
+            _ => continue,
         };
         if message.message_id.as_ref() != Some(&update.message_id) {
             continue;
@@ -6317,7 +6709,7 @@ mod tests {
         SessionId, StreamEndData, StreamPath, StreamStartData, StreamTextDeltaData, TaskList,
         TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope,
         TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult, ToolRequest,
-        ToolRequestType,
+        ToolRequestType, ToolUseData,
     };
     use tokio::sync::{Mutex, mpsc, watch};
     use tokio::time::timeout;
@@ -6332,7 +6724,8 @@ mod tests {
         collect_agent_name_events, current_latest_output, generate_mock_name,
         ingest_gated_replay_event, known_turn_usage, output_events_since, replay_envelope,
         resolve_backend_session_settings, sanitize_generated_agent_name, session_history_window,
-        spawn_agent_actor, spawn_relay_agent_actor, upsert_activity_stats_snapshot,
+        spawn_agent_actor, spawn_relay_agent_actor, terminal_input_rejected_payload,
+        upsert_activity_stats_snapshot,
     };
     use crate::agent::customization::ResolvedSpawnConfig;
     use crate::agent::registry::AgentStatusHandle;
@@ -6446,7 +6839,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_interrupt_close_and_simultaneous_ready_preempt_startup_without_publication() {
+    async fn actor_interrupt_parks_terminal_while_close_ends_startup() {
         let _startup_test_guard = AGENT_STARTUP_ACTOR_TEST_LOCK.lock().await;
         for (close, simultaneous_ready) in [(false, false), (true, false), (false, true)] {
             let dir = tempfile::tempdir().expect("agent startup tempdir");
@@ -6637,14 +7030,38 @@ mod tests {
             assert!(status.terminated);
             assert!(!status.is_thinking);
             assert!(status.turn_completed);
-            assert_eq!(status.status(), protocol::AgentControlStatus::Idle);
-            assert!(
-                timeout(Duration::from_secs(1), output_rx.recv())
-                    .await
-                    .expect("startup subscriber must close")
-                    .is_none(),
-                "startup cancellation must not publish AgentStart or replay events"
+            assert_eq!(
+                status.status(),
+                if close {
+                    protocol::AgentControlStatus::Idle
+                } else {
+                    protocol::AgentControlStatus::Failed
+                }
             );
+            if close {
+                assert!(
+                    timeout(Duration::from_secs(1), output_rx.recv())
+                        .await
+                        .expect("closed startup subscriber must close")
+                        .is_none(),
+                    "startup close is completed by the authoritative AgentClosed lifecycle"
+                );
+            } else {
+                let first = timeout(Duration::from_secs(1), output_rx.recv())
+                    .await
+                    .expect("interrupted startup must bootstrap terminal state")
+                    .expect("interrupted startup subscriber remains attached");
+                assert_eq!(first.kind, FrameKind::AgentBootstrap);
+                let bootstrap: AgentBootstrapPayload = first
+                    .parse_payload()
+                    .expect("interrupted startup AgentBootstrap");
+                assert!(bootstrap.events.iter().any(|event| matches!(
+                    event,
+                    AgentBootstrapEvent::AgentError(error)
+                        if error.fatal && error.message.contains("agent startup interrupted")
+                )));
+                assert!(handle.close().await);
+            }
             assert!(
                 session_store
                     .lock()
@@ -6832,6 +7249,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<AgentCommand>();
         let accepting_input = Arc::new(AtomicBool::new(false));
         let accepting_input_task = Arc::clone(&accepting_input);
+        let closing = Arc::new(AtomicBool::new(false));
         let (_start_tx, start_rx) = watch::channel(start.clone());
 
         tokio::spawn(async move {
@@ -6914,6 +7332,9 @@ mod tests {
                     AgentCommand::SetName { reply, .. } => {
                         let _ = reply.send(false);
                     }
+                    AgentCommand::ApplyGeneratedName { reply, .. } => {
+                        let _ = reply.send(false);
+                    }
                     AgentCommand::Close { reply } => {
                         let _ = reply.send(());
                         break;
@@ -6924,7 +7345,17 @@ mod tests {
                     AgentCommand::ReleaseCompaction { reply } => {
                         let _ = reply.send(());
                     }
-                    AgentCommand::SendInput(_) => {}
+                    AgentCommand::SendInput(_) => {
+                        let rejection = terminal_input_rejected_payload(&start.agent_id);
+                        append_event(
+                            &format!("/agent/{}", start.agent_id),
+                            &mut event_log,
+                            &mut subscribers,
+                            FrameKind::AgentError,
+                            &rejection,
+                        )
+                        .await;
+                    }
                     AgentCommand::Interrupt { reply } => {
                         let _ = reply.send(InterruptOutcome::NotRunning);
                     }
@@ -6935,6 +7366,7 @@ mod tests {
         AgentHandle {
             tx,
             accepting_input: accepting_input_task,
+            closing,
             start: start_rx,
         }
     }
@@ -8357,6 +8789,32 @@ mod tests {
             &ChatEvent::StreamEnd(StreamEndData { message }),
         )
         .await;
+
+        let (active_tx, mut active_rx) = mpsc::unbounded_channel();
+        attach_subscriber(
+            &event_log,
+            Some(&replay_state),
+            &mut subscribers,
+            replay_stream(active_tx),
+        );
+        let active_events = recv_agent_bootstrap_events(&mut active_rx, "active tool bootstrap")
+            .await
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentBootstrapEvent::ChatEvent(event) => Some(event),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            active_events.as_slice(),
+            [
+                ChatEvent::TypingStatusChanged(true),
+                ChatEvent::StreamStart(_),
+                ChatEvent::ToolRequest(_),
+                ChatEvent::StreamEnd(_),
+            ]
+        ));
+
         append_chat_event(
             canonical_stream,
             &mut event_log,
@@ -8430,6 +8888,121 @@ mod tests {
             stream_end_index < post_request_index,
             "post-end request should replay after StreamEnd: {chat_events:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn reconnect_persists_prior_tool_completion_outside_later_active_stream() {
+        let canonical_stream = "/agent/replay-agent";
+        let mut event_log = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+        let mut subscribers = Vec::new();
+
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::TypingStatusChanged(true),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamStart(StreamStartData {
+                message_id: Some("message-before-background".to_owned()),
+                agent: "codex".to_owned(),
+                model: Some("gpt-5.6-luna".to_owned()),
+            }),
+        )
+        .await;
+        let mut first_message = assistant_message("starting");
+        first_message.message_id = Some(ChatMessageId("message-before-background".to_owned()));
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamEnd(StreamEndData {
+                message: first_message,
+            }),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &tool_request("background-tool"),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamStart(StreamStartData {
+                message_id: Some("message-while-background-runs".to_owned()),
+                agent: "codex".to_owned(),
+                model: Some("gpt-5.6-luna".to_owned()),
+            }),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &tool_completed("background-tool"),
+        )
+        .await;
+
+        let active_events = replay_state.active_stream_events();
+        assert!(active_events.iter().any(|event| {
+            matches!(
+                event,
+                ChatEvent::StreamStart(start)
+                    if start.message_id.as_deref() == Some("message-while-background-runs")
+            )
+        }));
+        assert!(
+            active_events.iter().all(|event| {
+                !matches!(
+                    event,
+                    ChatEvent::ToolExecutionCompleted(completion)
+                        if completion.tool_call_id == "background-tool"
+                )
+            }),
+            "the earlier completion must not be replayed as a tool owned by the later active message"
+        );
+
+        let persisted_chat_events = event_log
+            .iter()
+            .filter(|envelope| envelope.kind == FrameKind::ChatEvent)
+            .filter_map(|envelope| envelope.parse_payload::<ChatEvent>().ok())
+            .collect::<Vec<_>>();
+        let request_index = persisted_chat_events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ChatEvent::ToolRequest(request)
+                        if request.tool_call_id == "background-tool"
+                )
+            })
+            .expect("background request persists for history replay");
+        let completion_index = persisted_chat_events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ChatEvent::ToolExecutionCompleted(completion)
+                        if completion.tool_call_id == "background-tool"
+                )
+            })
+            .expect("background completion persists for history replay");
+        assert!(request_index < completion_index);
     }
 
     #[tokio::test]
@@ -9772,6 +10345,14 @@ mod tests {
             &mut event_log,
             &mut subscribers,
             &mut replay_state,
+            &ChatEvent::TypingStatusChanged(true),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
             &ChatEvent::StreamStart(StreamStartData {
                 message_id: Some("message-1".to_owned()),
                 agent: "mock".to_owned(),
@@ -9813,14 +10394,30 @@ mod tests {
             }),
         )
         .await;
+        let mut message = assistant_message_with_id("message-1", "");
+        message.tool_calls = vec![ToolUseData {
+            id: "tool-1".to_owned(),
+            name: "run_command".to_owned(),
+            arguments: serde_json::json!({
+                "kind": "RunCommand",
+                "command": "echo hi",
+                "working_directory": "/tmp"
+            }),
+        }];
         append_chat_event(
             canonical_stream,
             &mut event_log,
             &mut subscribers,
             &mut replay_state,
-            &ChatEvent::StreamEnd(StreamEndData {
-                message: assistant_message_with_id("message-1", ""),
-            }),
+            &ChatEvent::StreamEnd(StreamEndData { message }),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::TypingStatusChanged(false),
         )
         .await;
 
@@ -9837,7 +10434,7 @@ mod tests {
             .into_iter();
         assert!(matches!(
             events.next(),
-            Some(AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(_)))
+            Some(AgentBootstrapEvent::ChatEvent(ChatEvent::StreamStart(_)))
         ));
         assert!(matches!(
             events.next(),
@@ -9849,6 +10446,18 @@ mod tests {
                 ChatEvent::ToolExecutionCompleted(_)
             ))
         ));
+        let end = match events.next() {
+            Some(AgentBootstrapEvent::ChatEvent(ChatEvent::StreamEnd(end))) => end,
+            other => panic!("expected declared tool-container StreamEnd, got {other:?}"),
+        };
+        assert_eq!(
+            end.message
+                .tool_calls
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tool-1"]
+        );
         assert!(events.next().is_none());
         assert!(
             timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
@@ -9859,9 +10468,10 @@ mod tests {
         assert!(matches!(
             window.events.as_slice(),
             [
+                ChatEvent::StreamEnd(_),
                 ChatEvent::ToolExecutionCompleted(_),
                 ChatEvent::ToolRequest(_),
-                ChatEvent::MessageAdded(_)
+                ChatEvent::StreamStart(_)
             ]
         ));
     }
@@ -9887,17 +10497,6 @@ mod tests {
         let (status_handle, _rx) = AgentStatusHandle::new();
         let handle =
             spawn_failed_agent_actor(start.clone(), "backend blew up".to_string(), status_handle);
-
-        assert!(
-            !handle
-                .send_input(AgentInput::SendMessage(protocol::SendMessagePayload {
-                    message: "hello".to_string(),
-                    images: None,
-                    origin: None,
-                    tool_response: None,
-                }))
-                .await
-        );
         let snapshot = handle.snapshot();
         assert_eq!(snapshot.agent_id.0, "agent-failed");
         assert_eq!(snapshot.name, "Chat");
@@ -9905,16 +10504,39 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let stream = Stream::new(StreamPath("/agent/agent-failed".to_string()), tx);
         assert!(handle.attach(stream).await);
+        let events = recv_agent_bootstrap_events(&mut rx, "AgentBootstrap").await;
+        assert!(matches!(
+            events.as_slice(),
+            [AgentBootstrapEvent::AgentError(payload)]
+                if payload.fatal && payload.message == "backend blew up"
+        ));
 
-        let mut events = recv_agent_bootstrap_events(&mut rx, "AgentBootstrap")
+        assert!(
+            handle
+                .send_input(AgentInput::SendMessage(protocol::SendMessagePayload {
+                    message: "hello".to_string(),
+                    images: None,
+                    origin: None,
+                    tool_response: None,
+                }))
+                .await,
+            "terminal actors must accept mailbox input for typed rejection"
+        );
+        let rejection = timeout(Duration::from_secs(1), rx.recv())
             .await
-            .into_iter();
-        let payload = match events.next() {
-            Some(AgentBootstrapEvent::AgentError(payload)) => payload,
-            other => panic!("expected AgentError in AgentBootstrap, got {other:?}"),
-        };
-        assert!(events.next().is_none());
-        assert!(payload.fatal);
-        assert_eq!(payload.message, "backend blew up");
+            .expect("terminal rejection must be live")
+            .expect("terminal subscriber remained open");
+        assert_eq!(rejection.kind, FrameKind::AgentError);
+        let rejection: protocol::AgentErrorPayload = rejection
+            .parse_payload()
+            .expect("typed live terminal rejection");
+        assert_eq!(rejection.agent_id, start.agent_id);
+        assert_eq!(rejection.code, protocol::AgentErrorCode::Internal);
+        assert_eq!(rejection.message, "agent not running");
+        assert!(!rejection.fatal);
+        assert!(
+            timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
+            "one terminal input must append exactly one live rejection"
+        );
     }
 }

@@ -99,6 +99,17 @@ reasoning deltas for the in-progress stream. The replayed events have fresh
 sequence numbers (starting at 0) on the new instance — they are not copies of
 sequence numbers from other instances.
 
+A backend may reserve an authoritative provider message identity before it has
+renderable evidence. It publishes `StreamStart` only once text, reasoning, an
+explicit tool container, or images supplied by that backend's authoritative
+schema make the response visible. The shared message model treats schema-backed
+images as renderable, but the current Codex item and `thread/resume` schemas
+expose no authoritative assistant-image path; Codex therefore neither publishes
+nor reconstructs image-only responses, and must not infer them. A truly
+contentless authoritative completion publishes no stream, metadata patch, or
+durable message row. Clients preserve reasoning/tool/image-only messages as
+received and never synthesize fallback response text.
+
 This means:
 - Frontend A spawns an agent. It gets `/agent/<id>/<instance_A>`.
 - Frontend B connects later and subscribes. It gets `/agent/<id>/<instance_B>`
@@ -1012,6 +1023,9 @@ A single response turn goes: `StreamStart` → N × (`StreamDelta` |
 `StreamReasoningDelta` | `ToolRequest` | `ToolExecutionCompleted`) →
 `StreamEnd`. The `StreamStart`/`StreamEnd` bookends delineate turn boundaries.
 Sequence numbers provide ordering. One active turn at a time per agent stream.
+Every published stream closes exactly once. A provider identity reserved but
+never published is not a stream and is cleared on cancellation without a
+fabricated `StreamEnd`.
 
 The agent may produce multiple turns if it's working autonomously (each turn is
 a complete `StreamStart`...`StreamEnd` cycle).
@@ -1080,7 +1094,8 @@ all wrapped in `ChatEvent` frames.
   │                               │
   │←── ChatEvent (StreamStart) ──│  Turn 2 (agent is thinking)
   │←── ChatEvent (StreamDelta) ──│
-  │←── ChatEvent (StreamEnd) ────│  Done, agent idle
+  │←── ChatEvent (StreamEnd) ────│  Final assistant item complete
+  │←── ChatEvent (Typing(false)) │  Done, agent idle
   │                               │
 ```
 

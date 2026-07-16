@@ -6362,8 +6362,11 @@ pub enum OrchestrationWorkflowPhase {
 ///
 /// ### Stream pairing
 /// Every `StreamStart` on a stream must be followed by exactly one
-/// `StreamEnd` (possibly with a placeholder empty message) before the
-/// next `StreamStart` on the same stream. `StreamDelta` /
+/// `StreamEnd` before the next `StreamStart` on the same stream. Backends must
+/// reserve provider identities without publishing a stream until the response
+/// has renderable text, reasoning, tools, or images; clients must not synthesize
+/// fallback content, and backends must not infer evidence their provider schema
+/// does not expose. `StreamDelta` /
 /// `StreamReasoningDelta` are only valid between a `StreamStart` and
 /// its matching `StreamEnd`.
 ///
@@ -6375,8 +6378,8 @@ pub enum OrchestrationWorkflowPhase {
 ///
 /// ### Cancellation ordering
 /// When a turn is cancelled the backend must, in this order:
-///   1. If a stream is currently open, emit `StreamEnd` (with an empty
-///      or error placeholder message) to close it.
+///   1. If a stream is currently open, emit `StreamEnd` to close it. A reserved
+///      identity that was never published has no stream to close.
 ///   2. Emit `ToolExecutionCompleted` for any outstanding
 ///      `ToolRequest`s the backend originated in this turn (mark them
 ///      unsuccessful / cancelled).

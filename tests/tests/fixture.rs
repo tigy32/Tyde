@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use protocol::{
     AgentId, BackendKind, CustomAgentNotifyPayload, Envelope, FrameKind, HostBootstrapPayload,
-    HostSettingValue,
+    HostSettingValue, SessionSchemaEntry, SessionSchemasPayload,
 };
 use tyde_dev_driver::agent_control::AgentControlHandle;
 
@@ -106,6 +106,65 @@ impl Fixture {
     }
 
     #[allow(dead_code)]
+    pub async fn new_with_real_codex_backend_and_probe_program(
+        codex_probe_program: String,
+    ) -> Self {
+        let mut fixture = Self::new_with_runtime_config_inner(
+            server::HostRuntimeConfig {
+                codex_probe_program: Some(codex_probe_program),
+                ..Default::default()
+            },
+            true,
+            Some(vec![BackendKind::Codex]),
+            false,
+        )
+        .await;
+
+        if let Some(entry) = fixture
+            .bootstrap
+            .session_schemas
+            .iter()
+            .find(|entry| entry.backend_kind() == BackendKind::Codex)
+        {
+            match entry {
+                SessionSchemaEntry::Ready { .. } => return fixture,
+                SessionSchemaEntry::Unavailable { message, .. } => {
+                    panic!("fake Codex schema probe failed: {message}")
+                }
+                SessionSchemaEntry::Pending { .. } => {}
+            }
+        }
+
+        loop {
+            let env = fixture
+                .client
+                .next_event()
+                .await
+                .expect("Codex schema event read failed")
+                .expect("connection closed before Codex schema became ready");
+            if env.kind != FrameKind::SessionSchemas {
+                continue;
+            }
+            let schemas: SessionSchemasPayload =
+                env.parse_payload().expect("parse Codex SessionSchemas");
+            let Some(entry) = schemas
+                .schemas
+                .iter()
+                .find(|entry| entry.backend_kind() == BackendKind::Codex)
+            else {
+                continue;
+            };
+            match entry {
+                SessionSchemaEntry::Ready { .. } => return fixture,
+                SessionSchemaEntry::Unavailable { message, .. } => {
+                    panic!("fake Codex schema probe failed: {message}")
+                }
+                SessionSchemaEntry::Pending { .. } => {}
+            }
+        }
+    }
+
+    #[allow(dead_code)]
     pub async fn new_with_runtime_config(runtime_config: server::HostRuntimeConfig) -> Self {
         Self::new_with_runtime_config_inner(runtime_config, true, None, true).await
     }
@@ -172,6 +231,11 @@ impl Fixture {
     }
 
     #[allow(dead_code)]
+    pub async fn reconnect(&mut self) {
+        self.client = connect_client(self.host.clone()).await;
+    }
+
+    #[allow(dead_code)]
     pub async fn connect_with_bootstrap(&self) -> (client::Connection, HostBootstrapPayload) {
         connect_client_with_bootstrap(self.host.clone()).await
     }
@@ -213,6 +277,47 @@ impl Fixture {
     #[allow(dead_code)]
     pub async fn agent_ids(&self) -> Vec<AgentId> {
         self.host.agent_ids().await
+    }
+
+    #[allow(dead_code)]
+    pub async fn install_agent_name_test_gate(&self) -> server::InstalledAgentNameGate {
+        self.host.install_agent_name_test_gate().await
+    }
+
+    #[allow(dead_code)]
+    pub fn install_spawn_operation_completion_test_gate(
+        &self,
+    ) -> server::InstalledSpawnOperationTestGate {
+        self.host.install_spawn_operation_completion_test_gate()
+    }
+
+    #[allow(dead_code)]
+    pub fn install_spawn_operation_drain_test_gate(
+        &self,
+    ) -> server::InstalledSpawnOperationTestGate {
+        self.host.install_spawn_operation_drain_test_gate()
+    }
+
+    #[allow(dead_code)]
+    pub fn install_spawn_operation_publication_test_gate(
+        &self,
+    ) -> server::InstalledSpawnOperationTestGate {
+        self.host.install_spawn_operation_publication_test_gate()
+    }
+
+    #[allow(dead_code)]
+    pub fn host_for_test(&self) -> server::HostHandle {
+        self.host.clone()
+    }
+
+    #[allow(dead_code)]
+    pub fn spawn_operation_limits_for_test(&self) -> (usize, usize) {
+        self.host.spawn_operation_limits_for_test()
+    }
+
+    #[allow(dead_code)]
+    pub async fn shutdown_spawn_operations(&self) {
+        self.host.shutdown_spawn_operations().await;
     }
 
     #[allow(dead_code)]

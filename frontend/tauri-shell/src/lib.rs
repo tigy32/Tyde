@@ -21,7 +21,7 @@ use devtools_protocol::UiDebugResponseSubmission;
 use host_config::RemoteHostLifecycleSnapshot;
 use host_store::{ConfiguredHostStore, HostStore, UpsertConfiguredHostRequest};
 use router::ProxyRouterHandle;
-use tauri::{Manager, RunEvent, Url, WindowEvent};
+use tauri::{AppHandle, Manager, RunEvent, Url, WindowEvent};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 #[cfg(target_os = "macos")]
@@ -161,6 +161,11 @@ struct ShellState {
     host: server::HostHandle,
     host_store: HostStore,
     ui_debug: Arc<devtools::UiDebugBridgeState>,
+}
+
+fn shutdown_managed_host(app: &AppHandle) {
+    let host = app.state::<ShellState>().host.clone();
+    tauri::async_runtime::block_on(host.shutdown_spawn_operations());
 }
 
 #[derive(Default)]
@@ -681,6 +686,7 @@ pub fn run() {
             if code == Some(tauri::RESTART_EXIT_CODE)
                 || quit_confirmation_for_run.consume_confirmed_exit()
             {
+                shutdown_managed_host(app);
                 return;
             }
 

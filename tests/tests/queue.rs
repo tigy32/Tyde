@@ -83,6 +83,7 @@ async fn skip_noise(client: &mut client::Connection, context: &str) -> Envelope 
                 | FrameKind::SessionSchemas
                 | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
+                | FrameKind::BackendCapacity
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionList
                 | FrameKind::WorkflowNotify

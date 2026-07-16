@@ -1149,6 +1149,10 @@ async fn agents_view_preferences_agent_tags_delete_strips_filter_refs() {
 async fn agents_view_preferences_agent_tags_filters_group_mode_and_system_tags_are_snapshotted() {
     let mut fixture = Fixture::new().await;
     let project = create_project(&mut fixture.client, "tags-project").await;
+    fixture
+        .host_for_test()
+        .set_session_schema_ready_for_test(BackendKind::Codex)
+        .await;
     let agent = spawn_agent_for_tags(
         &mut fixture.client,
         BackendKind::Codex,

@@ -23,6 +23,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::config::{ConnectionPlan, ManagedMqttConnectConfig, MqttConnectConfig};
 use crate::error::MqttTransportError;
 use crate::framing::SESSION_SALT_LEN;
+#[cfg(test)]
+use crate::link::{LinkEvent, MqttLink, PublishToken};
 use crate::link_native::NativeMqttLink;
 #[cfg(test)]
 use crate::link_native::TestConnectionDiagnosticContext;
@@ -44,6 +46,8 @@ struct ConnectOverrides {
     subscribe_barrier: Option<Arc<Barrier>>,
     #[cfg(test)]
     accepted_publish_count: Option<Arc<AtomicUsize>>,
+    #[cfg(test)]
+    connection_gate: Option<Arc<tokio::sync::Mutex<()>>>,
     #[cfg(test)]
     diagnostic: Option<TestConnectionDiagnostic>,
 }
@@ -72,6 +76,51 @@ impl TestConnectionDiagnostic {
             phase: "data-room",
             started_at: self.started_at,
         }
+    }
+}
+
+#[cfg(test)]
+struct TestConnectionGatedLink {
+    inner: NativeMqttLink,
+    connection_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+#[cfg(test)]
+impl TestConnectionGatedLink {
+    async fn new(inner: NativeMqttLink, gate: Option<Arc<tokio::sync::Mutex<()>>>) -> Self {
+        let connection_guard = match gate {
+            Some(gate) => Some(gate.lock_owned().await),
+            None => None,
+        };
+        Self {
+            inner,
+            connection_guard,
+        }
+    }
+}
+
+#[cfg(test)]
+impl MqttLink for TestConnectionGatedLink {
+    async fn subscribe(&mut self, topic: &str) -> Result<(), MqttTransportError> {
+        self.inner.subscribe(topic).await
+    }
+
+    async fn publish(
+        &mut self,
+        topic: &str,
+        payload: Vec<u8>,
+    ) -> Result<PublishToken, MqttTransportError> {
+        self.inner.publish(topic, payload).await
+    }
+
+    async fn poll(&mut self) -> Result<LinkEvent, MqttTransportError> {
+        let result = self.inner.poll().await;
+        self.connection_guard.take();
+        result
+    }
+
+    async fn disconnect(&mut self) {
+        self.inner.disconnect().await;
     }
 }
 
@@ -112,6 +161,7 @@ pub(crate) async fn connect_with_test_overrides(
     fixed_session_salt: Option<[u8; SESSION_SALT_LEN]>,
     subscribe_barrier: Option<Arc<Barrier>>,
     accepted_publish_count: Option<Arc<AtomicUsize>>,
+    connection_gate: Option<Arc<tokio::sync::Mutex<()>>>,
 ) -> Result<EnvelopeStream, MqttTransportError> {
     connect_plan(
         ConnectionPlan::legacy(config),
@@ -120,6 +170,7 @@ pub(crate) async fn connect_with_test_overrides(
             fixed_session_salt,
             subscribe_barrier,
             accepted_publish_count,
+            connection_gate,
             diagnostic: None,
         },
     )
@@ -132,6 +183,7 @@ async fn connect_ephemeral_with_test_diagnostic(
     tls_ca_pem: Vec<u8>,
     fixed_session_salt: Option<[u8; SESSION_SALT_LEN]>,
     accepted_publish_count: Option<Arc<AtomicUsize>>,
+    connection_gate: Option<Arc<tokio::sync::Mutex<()>>>,
     label: String,
 ) -> Result<EnvelopeStream, MqttTransportError> {
     connect_ephemeral_plan(
@@ -141,6 +193,7 @@ async fn connect_ephemeral_with_test_diagnostic(
             fixed_session_salt,
             subscribe_barrier: None,
             accepted_publish_count,
+            connection_gate,
             diagnostic: Some(TestConnectionDiagnostic::new(label)),
         },
     )
@@ -181,6 +234,8 @@ async fn connect_plan(
         }
         link
     };
+    #[cfg(test)]
+    let link = TestConnectionGatedLink::new(link, overrides.connection_gate.clone()).await;
 
     let (outbound_tx, outbound_rx) = channel::<OutboundChunk>(OUTBOUND_CHUNK_CAPACITY);
     let (inbound_tx, inbound_rx) = mpsc::channel::<InboundEvent>(INBOUND_EVENT_CAPACITY);
@@ -317,6 +372,8 @@ async fn negotiate_ephemeral_data_room_native(
             });
         }
     }
+    #[cfg(test)]
+    let mut link = TestConnectionGatedLink::new(link, overrides.connection_gate.clone()).await;
     negotiate_ephemeral_data_room(config, &inbound_topic, &outbound_topic, &mut link).await
 }
 
@@ -325,13 +382,15 @@ mod tests {
     use std::collections::HashMap;
     use std::error::Error;
     use std::fs;
-    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::io::ErrorKind;
+    use std::net::{SocketAddr, TcpListener};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
 
     use rcgen::{CertifiedKey, generate_simple_self_signed};
+    use rumqttc::Outgoing;
     use rumqttc::v5::mqttbytes::QoS;
     use rumqttc::v5::mqttbytes::v5::Packet;
     use rumqttc::v5::{AsyncClient, Event};
@@ -360,9 +419,52 @@ mod tests {
         endpoint: BrokerEndpoint,
         ca_pem: Vec<u8>,
         accepted_publish_count: Arc<AtomicUsize>,
+        connection_gate: Arc<tokio::sync::Mutex<()>>,
         started_at: Instant,
         _temp_dir: TempDir,
         _broker_thread: thread::JoinHandle<()>,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    enum BrokerReadinessError {
+        #[error("authenticated MQTT test broker on port {port} has no readiness credential")]
+        MissingCredential { port: u16 },
+        #[error("failed to configure TLS MQTT readiness client for test broker on port {port}")]
+        ClientConfiguration {
+            port: u16,
+            #[source]
+            source: MqttTransportError,
+        },
+        #[error("TLS MQTT readiness failed for test broker on port {port}")]
+        Connect {
+            port: u16,
+            #[source]
+            source: rumqttc::v5::ConnectionError,
+        },
+        #[error("test broker on port {port} produced {event:?} before MQTT CONNACK")]
+        UnexpectedEvent { port: u16, event: Event },
+        #[error("failed to queue MQTT DISCONNECT for ready test broker on port {port}")]
+        DisconnectRequest {
+            port: u16,
+            #[source]
+            source: rumqttc::v5::ClientError,
+        },
+        #[error("MQTT DISCONNECT failed for ready test broker on port {port}")]
+        Disconnect {
+            port: u16,
+            #[source]
+            source: rumqttc::v5::ConnectionError,
+        },
+        #[error("test broker on port {port} produced {event:?} instead of MQTT DISCONNECT")]
+        UnexpectedDisconnectEvent { port: u16, event: Event },
+        #[error(
+            "test broker on port {port} did not complete TLS MQTT readiness within five seconds"
+        )]
+        Timeout {
+            port: u16,
+            #[source]
+            source: tokio::time::error::Elapsed,
+        },
     }
 
     #[test]
@@ -408,7 +510,7 @@ mod tests {
     #[tokio::test]
     async fn real_broker_happy_path() -> Result<(), Box<dyn Error>> {
         let _broker_guard = BROKER_TEST_LOCK.lock().await;
-        let broker = start_tls_broker(None)?;
+        let broker = start_tls_broker(None).await?;
         let room = RoomId([0x31; 16]);
         let psk = PreSharedKey([0x41; 32]);
         let (mut host, mut client) = connect_pair(&broker, room, psk.clone(), psk).await?;
@@ -434,7 +536,7 @@ mod tests {
     async fn ephemeral_connections_share_main_room_without_cross_talk() -> Result<(), Box<dyn Error>>
     {
         let _broker_guard = BROKER_TEST_LOCK.lock().await;
-        let broker = start_tls_broker(None)?;
+        let broker = start_tls_broker(None).await?;
         let main_room = RoomId([0x3c; 16]);
         let psk = PreSharedKey([0xc1; 32]);
         let (mut host_a, mut client_a) =
@@ -459,7 +561,7 @@ mod tests {
     #[tokio::test]
     async fn buffered_small_writes_are_boxcarred_on_flush() -> Result<(), Box<dyn Error>> {
         let _broker_guard = BROKER_TEST_LOCK.lock().await;
-        let broker = start_tls_broker(None)?;
+        let broker = start_tls_broker(None).await?;
         let room = RoomId([0x3a; 16]);
         let psk = PreSharedKey([0xb1; 32]);
         let (mut host, mut client) = connect_pair(&broker, room, psk.clone(), psk).await?;
@@ -486,7 +588,7 @@ mod tests {
     async fn client_retries_handshake_until_delayed_host_subscribes() -> Result<(), Box<dyn Error>>
     {
         let _broker_guard = BROKER_TEST_LOCK.lock().await;
-        let broker = start_tls_broker(None)?;
+        let broker = start_tls_broker(None).await?;
         let room = RoomId([0x38; 16]);
         let psk = PreSharedKey([0xa1; 32]);
         let host_config = MqttConnectConfig {
@@ -508,6 +610,7 @@ mod tests {
             Some(CLIENT_SALT),
             None,
             Some(broker.accepted_publish_count.clone()),
+            Some(broker.connection_gate.clone()),
         ));
         wait_for_accepted_publish_count(&broker, 1).await?;
 
@@ -517,6 +620,7 @@ mod tests {
             Some(HOST_SALT),
             None,
             Some(broker.accepted_publish_count.clone()),
+            Some(broker.connection_gate.clone()),
         );
         let (mut host, mut client) = timeout(Duration::from_secs(10), async {
             let host = host.await?;
@@ -537,7 +641,7 @@ mod tests {
     async fn duplicate_client_handshake_after_ready_preserves_data_stream()
     -> Result<(), Box<dyn Error>> {
         let _broker_guard = BROKER_TEST_LOCK.lock().await;
-        let broker = start_tls_broker(None)?;
+        let broker = start_tls_broker(None).await?;
         let room = RoomId([0x3d; 16]);
         let psk = PreSharedKey([0xd1; 32]);
         let (mut host, mut client) = connect_pair(&broker, room, psk.clone(), psk).await?;
@@ -561,7 +665,7 @@ mod tests {
     #[tokio::test]
     async fn different_client_handshake_after_ready_fails_stream() -> Result<(), Box<dyn Error>> {
         let _broker_guard = BROKER_TEST_LOCK.lock().await;
-        let broker = start_tls_broker(None)?;
+        let broker = start_tls_broker(None).await?;
         let room = RoomId([0x3e; 16]);
         let psk = PreSharedKey([0xd2; 32]);
         let (mut host, _client) = connect_pair(&broker, room, psk.clone(), psk).await?;
@@ -583,7 +687,7 @@ mod tests {
     async fn valid_pre_ready_data_frame_is_delivered_after_session_key()
     -> Result<(), Box<dyn Error>> {
         let _broker_guard = BROKER_TEST_LOCK.lock().await;
-        let broker = start_tls_broker(None)?;
+        let broker = start_tls_broker(None).await?;
         let room = RoomId([0x39; 16]);
         let psk = PreSharedKey([0xa2; 32]);
         let host_config = MqttConnectConfig {
@@ -599,6 +703,7 @@ mod tests {
             Some(HOST_SALT),
             Some(host_subscribed.clone()),
             Some(broker.accepted_publish_count.clone()),
+            Some(broker.connection_gate.clone()),
         ));
 
         host_subscribed.wait().await;
@@ -633,7 +738,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_pre_ready_data_frame_fails_after_session_key() -> Result<(), Box<dyn Error>> {
         let _broker_guard = BROKER_TEST_LOCK.lock().await;
-        let broker = start_tls_broker(None)?;
+        let broker = start_tls_broker(None).await?;
         let room = RoomId([0x3b; 16]);
         let psk = PreSharedKey([0xa3; 32]);
         let host_config = MqttConnectConfig {
@@ -649,6 +754,7 @@ mod tests {
             Some(HOST_SALT),
             Some(host_subscribed.clone()),
             Some(broker.accepted_publish_count.clone()),
+            Some(broker.connection_gate.clone()),
         ));
 
         host_subscribed.wait().await;
@@ -679,7 +785,7 @@ mod tests {
     #[tokio::test]
     async fn real_broker_wrong_psk_fails_with_aead() -> Result<(), Box<dyn Error>> {
         let _broker_guard = BROKER_TEST_LOCK.lock().await;
-        let broker = start_tls_broker(None)?;
+        let broker = start_tls_broker(None).await?;
         let room = RoomId([0x32; 16]);
         let host_psk = PreSharedKey([0x51; 32]);
         let client_psk = PreSharedKey([0x52; 32]);
@@ -697,7 +803,7 @@ mod tests {
     #[tokio::test]
     async fn real_broker_chunking_transparent_for_one_megabyte() -> Result<(), Box<dyn Error>> {
         let _broker_guard = BROKER_TEST_LOCK.lock().await;
-        let broker = start_tls_broker(None)?;
+        let broker = start_tls_broker(None).await?;
         let room = RoomId([0x33; 16]);
         let psk = PreSharedKey([0x61; 32]);
         let (mut host, mut client) = connect_pair(&broker, room, psk.clone(), psk).await?;
@@ -735,7 +841,7 @@ mod tests {
     #[tokio::test]
     async fn real_broker_cross_room_misroute_fails_aead() -> Result<(), Box<dyn Error>> {
         let _broker_guard = BROKER_TEST_LOCK.lock().await;
-        let broker = start_tls_broker(None)?;
+        let broker = start_tls_broker(None).await?;
         let room_a = RoomId([0x34; 16]);
         let room_b = RoomId([0x35; 16]);
         let psk = PreSharedKey([0x71; 32]);
@@ -788,7 +894,7 @@ mod tests {
         let _broker_guard = BROKER_TEST_LOCK.lock().await;
         let mut auth = HashMap::new();
         auth.insert("allowed".to_string(), "secret".to_string());
-        let broker = start_tls_broker(Some(auth))?;
+        let broker = start_tls_broker(Some(auth)).await?;
         let config = MqttConnectConfig {
             endpoint: broker.endpoint.clone(),
             room: RoomId([0x37; 16]),
@@ -802,6 +908,7 @@ mod tests {
             Some(CLIENT_SALT),
             None,
             Some(broker.accepted_publish_count.clone()),
+            Some(broker.connection_gate.clone()),
         )
         .await
         .err();
@@ -875,6 +982,7 @@ mod tests {
             Some(HOST_SALT),
             Some(barrier.clone()),
             Some(broker.accepted_publish_count.clone()),
+            Some(broker.connection_gate.clone()),
         );
         let client = connect_with_test_overrides(
             client_config,
@@ -882,6 +990,7 @@ mod tests {
             Some(CLIENT_SALT),
             Some(barrier),
             Some(broker.accepted_publish_count.clone()),
+            Some(broker.connection_gate.clone()),
         );
         let connected = timeout(Duration::from_secs(10), async {
             tokio::try_join!(host, client)
@@ -920,6 +1029,7 @@ mod tests {
                     broker.ca_pem.clone(),
                     Some(HOST_SALT),
                     Some(broker.accepted_publish_count.clone()),
+                    Some(broker.connection_gate.clone()),
                     format!("{label}/host"),
                 ),
                 connect_ephemeral_with_test_diagnostic(
@@ -927,6 +1037,7 @@ mod tests {
                     broker.ca_pem.clone(),
                     Some(CLIENT_SALT),
                     Some(broker.accepted_publish_count.clone()),
+                    Some(broker.connection_gate.clone()),
                     format!("{label}/client"),
                 )
             )
@@ -997,7 +1108,7 @@ mod tests {
         Ok(())
     }
 
-    fn start_tls_broker(
+    async fn start_tls_broker(
         auth: Option<HashMap<String, String>>,
     ) -> Result<TestBroker, Box<dyn Error>> {
         let started_at = Instant::now();
@@ -1014,6 +1125,19 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let port = listener.local_addr()?.port();
         drop(listener);
+        let readiness_auth = match &auth {
+            None => BrokerAuth::Anonymous,
+            Some(auth) => {
+                let (username, password) = auth
+                    .iter()
+                    .next()
+                    .ok_or(BrokerReadinessError::MissingCredential { port })?;
+                BrokerAuth::UsernamePassword {
+                    username: username.clone(),
+                    password: password.clone(),
+                }
+            }
+        };
 
         let listen = SocketAddr::from(([127, 0, 0, 1], port));
         let mut v5 = HashMap::new();
@@ -1060,33 +1184,73 @@ mod tests {
             let _result = broker.start();
         });
 
-        wait_for_port(port)?;
+        let broker_url = BrokerUrl::new(format!("mqtts://localhost:{port}"))?;
+        wait_for_tls_mqtt_readiness(port, &broker_url, &readiness_auth, cert_pem.as_bytes())
+            .await?;
         eprintln!(
-            "mqtt transport test broker tcp-ready port={port} elapsed_ms={} tls_mqtt_ready=awaiting_connack",
+            "mqtt transport test broker tls-mqtt-ready port={port} elapsed_ms={}",
             started_at.elapsed().as_millis(),
         );
 
         Ok(TestBroker {
             endpoint: BrokerEndpoint {
-                url: BrokerUrl::new(format!("mqtts://localhost:{port}"))?,
+                url: broker_url,
                 auth: BrokerAuth::Anonymous,
             },
             ca_pem: cert_pem.into_bytes(),
             accepted_publish_count,
+            connection_gate: Arc::new(tokio::sync::Mutex::new(())),
             started_at,
             _temp_dir: temp_dir,
             _broker_thread: broker_thread,
         })
     }
 
-    fn wait_for_port(port: u16) -> Result<(), Box<dyn Error>> {
-        for _ in 0..100 {
-            match TcpStream::connect(("127.0.0.1", port)) {
-                Ok(_) => return Ok(()),
-                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+    async fn wait_for_tls_mqtt_readiness(
+        port: u16,
+        broker_url: &BrokerUrl,
+        auth: &BrokerAuth,
+        ca_pem: &[u8],
+    ) -> Result<(), BrokerReadinessError> {
+        let readiness = async {
+            let options = mqtt_options(
+                broker_url,
+                auth,
+                ParticipantRole::Client,
+                Some(ca_pem.to_vec()),
+            )
+            .map_err(|source| BrokerReadinessError::ClientConfiguration { port, source })?;
+            let (client, mut eventloop) = AsyncClient::new(options, 1);
+
+            loop {
+                match eventloop.poll().await {
+                    Ok(Event::Incoming(Packet::ConnAck(_))) => break,
+                    Ok(event) => {
+                        return Err(BrokerReadinessError::UnexpectedEvent { port, event });
+                    }
+                    Err(rumqttc::v5::ConnectionError::Io(source))
+                        if source.kind() == ErrorKind::ConnectionRefused =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    Err(source) => return Err(BrokerReadinessError::Connect { port, source }),
+                }
             }
-        }
-        Err(format!("broker did not listen on port {port}").into())
+
+            client
+                .disconnect()
+                .await
+                .map_err(|source| BrokerReadinessError::DisconnectRequest { port, source })?;
+            match eventloop.poll().await {
+                Ok(Event::Outgoing(Outgoing::Disconnect)) => Ok(()),
+                Ok(event) => Err(BrokerReadinessError::UnexpectedDisconnectEvent { port, event }),
+                Err(source) => Err(BrokerReadinessError::Disconnect { port, source }),
+            }
+        };
+
+        timeout(Duration::from_secs(5), readiness)
+            .await
+            .map_err(|source| BrokerReadinessError::Timeout { port, source })?
     }
 
     async fn wait_for_accepted_publish_count(

@@ -118,7 +118,11 @@ pub(crate) async fn route_client_envelope(
             FrameKind::SpawnAgent => {
                 let payload: SpawnAgentPayload = parse_payload(&envelope, "spawn_agent")?;
                 validate_spawn_agent(&payload)?;
-                host.spawn_agent(payload).await?;
+                host.start_spawn_agent_operation(
+                    payload,
+                    envelope.stream,
+                    host_output_stream.clone(),
+                )?;
             }
             FrameKind::ListSessions => {
                 let payload: ListSessionsPayload = parse_payload(&envelope, "list_sessions")?;

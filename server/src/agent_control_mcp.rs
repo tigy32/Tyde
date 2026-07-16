@@ -259,6 +259,9 @@ struct SpawnAgentToolInput {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct AwaitAgentsToolInput {
+    /// One or more non-empty direct child agent IDs. Pass every child whose
+    /// transition to idle or failed should wake this wait.
+    #[schemars(length(min = 1), inner(length(min = 1)))]
     agent_ids: Vec<String>,
 }
 
@@ -659,7 +662,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Wait without a Tyde tool timer until any supplied direct child becomes idle or failed. Requires the calling agent's bearer credential and returns statuses only."
+        description = "Wait without a Tyde tool timer until any supplied direct child becomes idle or failed. agent_ids is required and must contain at least one non-empty direct child ID. Requires the calling agent's bearer credential and returns statuses only."
     )]
     async fn tyde_await_agents(
         &self,
@@ -2114,6 +2117,15 @@ mod tests {
 
     #[test]
     fn latest_and_await_inputs_reject_legacy_fields() {
+        let await_schema = input_schema::<AwaitAgentsToolInput>();
+        assert_eq!(
+            await_schema.pointer("/properties/agent_ids/minItems"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            await_schema.pointer("/properties/agent_ids/items/minLength"),
+            Some(&json!(1))
+        );
         for field in ["after_seq", "limit", "max_bytes"] {
             let mut input = serde_json::Map::from_iter([(
                 "agent_id".to_owned(),

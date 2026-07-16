@@ -1191,6 +1191,10 @@ async fn team_describe_includes_default_agent_member() {
             .await;
 
     fixture
+        .host_for_test()
+        .set_session_schema_ready_for_test(BackendKind::Codex)
+        .await;
+    fixture
         .client
         .team_member_activate(TeamMemberActivatePayload {
             member_id: manager.id.clone(),

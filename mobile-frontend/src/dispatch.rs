@@ -1554,7 +1554,7 @@ pub fn apply_chat_event(state: &AppState, agent_ref: &AgentRef, event: ChatEvent
             state.push_chat_message_entry(
                 &agent_ref,
                 ChatMessageEntry {
-                    message: present_completed_message(data.message, !tool_requests.is_empty()),
+                    message: data.message,
                     tool_requests,
                 },
             );
@@ -1748,7 +1748,7 @@ impl MobileHistoryReplay {
             }
             ChatEvent::StreamEnd(data) => {
                 self.push_entry(ChatMessageEntry {
-                    message: present_completed_message(data.message, false),
+                    message: data.message,
                     tool_requests: Vec::new(),
                 });
             }
@@ -1811,31 +1811,6 @@ impl MobileHistoryReplay {
         }
         self.rows.push(entry);
     }
-}
-
-fn history_message_has_renderable_content(message: &protocol::ChatMessage) -> bool {
-    !message.content.trim().is_empty()
-        || message
-            .reasoning
-            .as_ref()
-            .is_some_and(|reasoning| !reasoning.text.trim().is_empty())
-        || !message.tool_calls.is_empty()
-        || message
-            .images
-            .as_ref()
-            .is_some_and(|images| !images.is_empty())
-}
-
-const EMPTY_RESPONSE_PLACEHOLDER: &str = "_Empty response._";
-
-fn present_completed_message(
-    mut message: protocol::ChatMessage,
-    has_attached_tools: bool,
-) -> protocol::ChatMessage {
-    if !history_message_has_renderable_content(&message) && !has_attached_tools {
-        message.content = EMPTY_RESPONSE_PLACEHOLDER.to_owned();
-    }
-    message
 }
 
 fn rebuild_chat_message_index(state: &AppState, agent_ref: &AgentRef) {
@@ -2676,6 +2651,95 @@ mod tests {
                     .filter_map(|entry| entry.message.message_id.as_ref().map(|id| id.0.as_str()))
                     .collect::<Vec<_>>(),
                 vec!["first", "second"]
+            );
+        });
+    }
+
+    #[test]
+    fn background_tool_completion_updates_prior_message_during_later_stream() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let agent_ref = AgentRef {
+                local_host_id: LocalHostId("background-host".to_owned()),
+                agent_id: AgentId("background-agent".to_owned()),
+            };
+            let assistant_message = |id: &str, content: &str| protocol::ChatMessage {
+                message_id: Some(protocol::ChatMessageId(id.to_owned())),
+                timestamp: 0,
+                sender: protocol::MessageSender::Assistant {
+                    agent: "codex".to_owned(),
+                },
+                content: content.to_owned(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            };
+
+            apply_chat_event(
+                &state,
+                &agent_ref,
+                ChatEvent::StreamEnd(protocol::StreamEndData {
+                    message: assistant_message("message-first", "starting"),
+                }),
+            );
+            apply_chat_event(
+                &state,
+                &agent_ref,
+                ChatEvent::ToolRequest(protocol::ToolRequest {
+                    tool_call_id: "tool-background".to_owned(),
+                    tool_name: "run_command".to_owned(),
+                    tool_type: protocol::ToolRequestType::RunCommand {
+                        command: "sleep 12".to_owned(),
+                        working_directory: "/tmp".to_owned(),
+                    },
+                }),
+            );
+            apply_chat_event(
+                &state,
+                &agent_ref,
+                ChatEvent::StreamStart(protocol::StreamStartData {
+                    message_id: Some("message-later".to_owned()),
+                    agent: "codex".to_owned(),
+                    model: Some("gpt-5.6-luna".to_owned()),
+                }),
+            );
+            apply_chat_event(
+                &state,
+                &agent_ref,
+                ChatEvent::ToolExecutionCompleted(protocol::ToolExecutionCompletedData {
+                    tool_call_id: "tool-background".to_owned(),
+                    tool_name: "run_command".to_owned(),
+                    tool_result: protocol::ToolExecutionResult::RunCommand {
+                        exit_code: 0,
+                        stdout: "done".to_owned(),
+                        stderr: String::new(),
+                    },
+                    success: true,
+                    error: None,
+                    normalization_failure: None,
+                }),
+            );
+
+            let first_message_has_result = state.chat_messages.with_untracked(|messages| {
+                messages.get(&agent_ref).and_then(|rows| {
+                    rows.first().map(|row| {
+                        row.tool_requests.first().is_some_and(|tool| {
+                            tool.request.tool_call_id == "tool-background"
+                                && tool.result.as_ref().is_some_and(|result| result.success)
+                        })
+                    })
+                })
+            });
+            assert_eq!(first_message_has_result, Some(true));
+            assert!(
+                state
+                    .streaming_text
+                    .with_untracked(|streams| streams.contains_key(&agent_ref)),
+                "the later assistant response must remain independently active"
             );
         });
     }
@@ -4123,7 +4187,7 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    fn empty_completion_and_repeated_server_rows_match_history() {
+    fn completed_messages_are_not_rewritten_and_repeated_server_rows_match_history() {
         let state = AppState::new();
         let agent_ref = AgentRef {
             local_host_id: LocalHostId("mobile-empty-completion".to_owned()),
@@ -4170,8 +4234,7 @@ mod wasm_tests {
             live_empty[0].message.message_id,
             Some(protocol::ChatMessageId("empty-item".to_owned()))
         );
-        assert_eq!(live_empty[0].message.content, EMPTY_RESPONSE_PLACEHOLDER);
-        assert!(!live_empty[0].message.content.trim().is_empty());
+        assert!(live_empty[0].message.content.is_empty());
 
         let mut replay = MobileHistoryReplay::default();
         replay.apply(
@@ -4182,7 +4245,74 @@ mod wasm_tests {
             &agent_ref,
         );
         assert_eq!(replay.rows.len(), 1);
-        assert_eq!(replay.rows[0].message.content, EMPTY_RESPONSE_PLACEHOLDER);
+        assert!(replay.rows[0].message.content.is_empty());
+
+        let mut authoritative = assistant_message("authoritative", "");
+        authoritative.reasoning = Some(protocol::ReasoningData {
+            text: "reasoning only".to_owned(),
+            tokens: None,
+            signature: None,
+            blob: None,
+        });
+        authoritative.tool_calls = vec![protocol::ToolUseData {
+            id: "tool-call".to_owned(),
+            name: "tool".to_owned(),
+            arguments: serde_json::json!({}),
+        }];
+        authoritative.images = Some(vec![protocol::ImageData {
+            media_type: "image/png".to_owned(),
+            data: "image-data".to_owned(),
+        }]);
+        apply_chat_event(
+            &state,
+            &agent_ref,
+            ChatEvent::StreamEnd(protocol::StreamEndData {
+                message: authoritative.clone(),
+            }),
+        );
+        let authoritative_row = state
+            .chat_messages
+            .with_untracked(|rows| rows.get(&agent_ref).and_then(|rows| rows.last()).cloned())
+            .expect("authoritative completion row");
+        assert_eq!(
+            authoritative_row
+                .message
+                .reasoning
+                .as_ref()
+                .map(|value| value.text.as_str()),
+            Some("reasoning only")
+        );
+        assert_eq!(authoritative_row.message.tool_calls.len(), 1);
+        assert_eq!(
+            authoritative_row.message.images.as_ref().map(Vec::len),
+            Some(1)
+        );
+
+        let mut authoritative_replay = MobileHistoryReplay::default();
+        authoritative_replay.apply(
+            ChatEvent::StreamEnd(protocol::StreamEndData {
+                message: authoritative,
+            }),
+            &agent_ref.local_host_id,
+            &agent_ref,
+        );
+        assert_eq!(
+            authoritative_replay.rows[0]
+                .message
+                .reasoning
+                .as_ref()
+                .map(|value| value.text.as_str()),
+            Some("reasoning only")
+        );
+        assert_eq!(authoritative_replay.rows[0].message.tool_calls.len(), 1);
+        assert_eq!(
+            authoritative_replay.rows[0]
+                .message
+                .images
+                .as_ref()
+                .map(Vec::len),
+            Some(1)
+        );
 
         let original = assistant_message("message-added", "original");
         let repeated = assistant_message("message-added", "server second row");

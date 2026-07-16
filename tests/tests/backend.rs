@@ -10,14 +10,15 @@ use fixture::Fixture;
 use protocol::{
     AgentActivityStatsPayload, AgentBootstrapEvent, AgentBootstrapPayload, AgentErrorCode,
     AgentOrigin, AgentStartPayload, BackendKind, ChatEvent, ChatMessage, CommandErrorPayload,
-    CustomAgentId, Envelope, FrameKind, HostSettingValue, ImageData, ListSessionsPayload,
-    MessageMetadataUpdateData, MessageSender, NewAgentPayload, ProtocolValidator, SessionId,
-    SessionListPayload, SessionSchemaEntry, SessionSchemasPayload, SessionSettingFieldType,
-    SessionSettingValue, SessionSettingsValues, SessionSummary, SetSessionSettingsPayload,
-    SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, StreamPath, TokenUsage,
-    TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolRequest,
-    ToolRequestType,
+    CustomAgentId, Envelope, FetchSessionHistoryPayload, FrameKind, HostSettingValue, ImageData,
+    ListSessionsPayload, MessageMetadataUpdateData, MessageSender, NewAgentPayload,
+    ProtocolValidator, SessionHistoryPayload, SessionId, SessionListPayload, SessionSchemaEntry,
+    SessionSchemasPayload, SessionSettingFieldType, SessionSettingValue, SessionSettingsValues,
+    SessionSummary, SetSessionSettingsPayload, SetSettingPayload, SpawnAgentParams,
+    SpawnAgentPayload, SpawnCostHint, StreamPath, TokenUsage, TokenUsageScope,
+    TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolRequest, ToolRequestType,
 };
+use serde_json::{Value, json};
 use server::backend::{Backend, BackendSession};
 use uuid::Uuid;
 
@@ -536,6 +537,8 @@ struct CodexIdentityFake {
     _dir: tempfile::TempDir,
     binary: PathBuf,
     late_events_written: PathBuf,
+    settings_update: PathBuf,
+    followup_release: PathBuf,
 }
 
 impl CodexIdentityFake {
@@ -546,7 +549,9 @@ impl CodexIdentityFake {
             &binary,
             r#"#!/usr/bin/env python3
 import json
+import os
 import sys
+import time
 
 def send(value):
     sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
@@ -560,22 +565,31 @@ for line in sys.stdin:
         continue
     request_id = request.get("id")
     method = request.get("method")
+    params = request.get("params", {})
     if method == "initialize":
         send({"jsonrpc":"2.0","id":request_id,"result":{"userAgent":"fake-codex/identity","codexHome":"/tmp/fake-codex-home","platformFamily":"unix","platformOs":"test"}})
+    elif method == "model/list":
+        send({"jsonrpc":"2.0","id":request_id,"result":{"data":[{"model":"fake-codex-model","isDefault":True,"supportedReasoningEfforts":[{"reasoningEffort":"high"}]}]}})
     elif method == "thread/start":
         send({"jsonrpc":"2.0","id":request_id,"result":{"thread":{"id":"identity-thread","sessionId":"identity-thread","turns":[]},"model":"fake-codex-model"}})
     elif method == "turn/start":
         turn_count += 1
         if turn_count == 1:
             send({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"identity-thread","turn":{"id":"identity-turn-one"}}})
+            send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"identity-thread","item":{"id":"parent-tool","type":"commandExecution","command":"pwd","cwd":"/tmp"}}})
+            send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"identity-thread","item":{"id":"parent-tool","type":"commandExecution","exitCode":0,"aggregatedOutput":"/tmp"}}})
             send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"identity-thread","item":{"id":"parent-one","type":"agentMessage"}}})
             send({"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"identity-thread","itemId":"parent-one","delta":"First "}})
             send({"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"identity-thread","itemId":"parent-one","delta":"response"}})
+            send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"identity-thread","item":{"id":"parent-one","type":"agentMessage","text":" \n"}}})
+            send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"identity-thread","item":{"id":"parent-one","type":"agentMessage","text":" \n"}}})
             send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"identity-thread","item":{"id":"parent-one","type":"agentMessage","text":"First response"}}})
             send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"identity-thread","item":{"id":"parent-two","type":"agentMessage","text":"Second response"}}})
             send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"identity-thread","item":{"id":"parent-empty","type":"agentMessage","text":""}}})
             send({"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"identity-thread","turn":{"id":"identity-turn-one","status":"completed"}}})
         else:
+            while not os.path.exists(__file__ + ".followup-release"):
+                time.sleep(0.01)
             send({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"identity-thread","turn":{"id":"identity-turn-two"}}})
             send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"identity-thread","item":{"id":"parent-followup","type":"agentMessage","text":"Starting child"}}})
             send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"identity-thread","item":{"id":"spawn-child","type":"collabAgentToolCall","tool":"spawn","senderThreadId":"identity-thread","receiverThreadId":"identity-child","prompt":"identity child","receiverAgentType":"worker","receiverAgentName":"Identity child"}}})
@@ -595,7 +609,9 @@ for line in sys.stdin:
         send({"jsonrpc":"2.0","id":request_id,"result":{"turn":{"id":"identity-turn"}}})
     elif method == "turn/interrupt":
         send({"jsonrpc":"2.0","id":request_id,"result":{}})
-    elif method == "thread/update":
+    elif method == "thread/settings/update":
+        with open(__file__ + ".settings-update", "w", encoding="utf-8") as settings_file:
+            json.dump(params, settings_file, separators=(",", ":"))
         send({"jsonrpc":"2.0","id":request_id,"result":{}})
 "#,
         )
@@ -611,10 +627,16 @@ for line in sys.stdin:
         }
         let late_events_written =
             PathBuf::from(format!("{}.late-events-written", binary.to_string_lossy()));
+        let settings_update =
+            PathBuf::from(format!("{}.settings-update", binary.to_string_lossy()));
+        let followup_release =
+            PathBuf::from(format!("{}.followup-release", binary.to_string_lossy()));
         Self {
             _dir: dir,
             binary,
             late_events_written,
+            settings_update,
+            followup_release,
         }
     }
 }
@@ -631,6 +653,8 @@ struct CodexIdentityObservation {
     idle_transitions: usize,
     cancel_idle_transitions: usize,
     active_transitions: usize,
+    tool_requests: Vec<String>,
+    stream_end_tool_calls: HashMap<String, Vec<String>>,
 }
 
 fn prohibited_post_cancel_event(event: &ChatEvent) -> Option<&'static str> {
@@ -679,13 +703,22 @@ impl CodexIdentityObservation {
                     .expect("Codex StreamDelta must carry message identity"),
                 delta.text,
             )),
-            ChatEvent::StreamEnd(end) => self.stream_ends.push((
-                end.message
+            ChatEvent::StreamEnd(end) => {
+                let message_id = end
+                    .message
                     .message_id
                     .expect("Codex StreamEnd must carry message identity")
-                    .0,
-                end.message.content,
-            )),
+                    .0;
+                self.stream_end_tool_calls.insert(
+                    message_id.clone(),
+                    end.message
+                        .tool_calls
+                        .into_iter()
+                        .map(|call| call.id)
+                        .collect(),
+                );
+                self.stream_ends.push((message_id, end.message.content));
+            }
             ChatEvent::MessageAdded(ChatMessage {
                 sender: MessageSender::Error,
                 content,
@@ -697,6 +730,7 @@ impl CodexIdentityObservation {
                 }
             }
             ChatEvent::OperationCancelled(_) => self.cancellations += 1,
+            ChatEvent::ToolRequest(request) => self.tool_requests.push(request.tool_call_id),
             ChatEvent::TypingStatusChanged(false) => {
                 self.idle_transitions += 1;
                 if self.cancellations > 0 {
@@ -794,6 +828,27 @@ fn replayed_success_messages(
     replayed_assistant_messages(bootstrap)
 }
 
+fn assert_replayed_tool_container_declares_card(
+    bootstrap: &AgentBootstrapPayload,
+    tool_call_id: &str,
+    context: &str,
+) {
+    let mut observation = CodexIdentityObservation::default();
+    observation.observe_bootstrap(bootstrap.clone());
+    assert!(
+        observation
+            .tool_requests
+            .iter()
+            .any(|request_id| request_id == tool_call_id),
+        "{context} must replay the tool request"
+    );
+    assert_eq!(
+        observation.stream_end_tool_calls.get(tool_call_id),
+        Some(&vec![tool_call_id.to_owned()]),
+        "{context} tool container must declare its card for history attachment"
+    );
+}
+
 #[tokio::test]
 async fn fake_codex_provider_items_keep_identity_live_late_and_same_host_reconnect() {
     init_tracing();
@@ -806,7 +861,19 @@ async fn fake_codex_provider_items_keep_identity_live_late_and_same_host_reconne
         "Codex identity test workspace",
     )
     .expect("seed Codex identity workspace");
-    let mut fixture = Fixture::new_with_test_backend(BackendKind::Codex).await;
+    let mut fixture = Fixture::new_with_real_codex_backend_and_probe_program(
+        fake.binary.to_string_lossy().into_owned(),
+    )
+    .await;
+    let mut session_settings = SessionSettingsValues::default();
+    session_settings.0.insert(
+        "model".to_owned(),
+        SessionSettingValue::String("fake-codex-model".to_owned()),
+    );
+    session_settings.0.insert(
+        "reasoning_effort".to_owned(),
+        SessionSettingValue::String("high".to_owned()),
+    );
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -822,7 +889,7 @@ async fn fake_codex_provider_items_keep_identity_live_late_and_same_host_reconne
                 launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
-                session_settings: None,
+                session_settings: Some(session_settings),
             },
         })
         .await
@@ -841,11 +908,24 @@ async fn fake_codex_provider_items_keep_identity_live_late_and_same_host_reconne
             }
         }
     };
+    fixture
+        .client
+        .send_message(
+            &parent.instance_stream,
+            "exercise child identity quarantine".to_owned(),
+        )
+        .await
+        .expect("queue fake Codex follow-up before authoritative idle");
 
+    let expected_parent = vec![
+        ("parent-tool".to_owned(), String::new()),
+        ("parent-one".to_owned(), "First response".to_owned()),
+        ("parent-two".to_owned(), "Second response".to_owned()),
+    ];
     let mut parent_live = CodexIdentityObservation::default();
-    while parent_live.stream_ends.len() < 3 || parent_live.idle_transitions < 1 {
+    loop {
         let env =
-            expect_fixture_event(&mut fixture.client, "three live Codex provider items").await;
+            expect_fixture_event(&mut fixture.client, "completed live Codex provider turn").await;
         if env.kind == FrameKind::CommandError {
             let error: CommandErrorPayload = env.parse_payload().expect("parse CommandError");
             panic!("command error during fake Codex turn: {error:?}");
@@ -853,24 +933,42 @@ async fn fake_codex_provider_items_keep_identity_live_late_and_same_host_reconne
         if env.stream != parent.instance_stream {
             continue;
         }
-        match env.kind {
-            FrameKind::AgentBootstrap => parent_live
-                .observe_bootstrap(env.parse_payload().expect("parse parent AgentBootstrap")),
-            FrameKind::ChatEvent => {
-                parent_live.observe(env.parse_payload().expect("parse parent ChatEvent"))
+        let reached_idle = match env.kind {
+            FrameKind::AgentBootstrap => {
+                let bootstrap: AgentBootstrapPayload =
+                    env.parse_payload().expect("parse parent AgentBootstrap");
+                let mut reached_idle = false;
+                for event in bootstrap.events {
+                    if let AgentBootstrapEvent::ChatEvent(event) = event {
+                        reached_idle = matches!(&event, ChatEvent::TypingStatusChanged(false));
+                        parent_live.observe(event);
+                        if reached_idle {
+                            break;
+                        }
+                    }
+                }
+                reached_idle
             }
-            _ => {}
+            FrameKind::ChatEvent => {
+                let event: ChatEvent = env.parse_payload().expect("parse parent ChatEvent");
+                let reached_idle = matches!(&event, ChatEvent::TypingStatusChanged(false));
+                parent_live.observe(event);
+                reached_idle
+            }
+            _ => false,
+        };
+        if reached_idle {
+            assert_eq!(
+                parent_live.stream_ends, expected_parent,
+                "every published provider terminal must precede authoritative idle"
+            );
+            break;
         }
     }
 
-    let expected_parent = vec![
-        ("parent-one".to_owned(), "First response".to_owned()),
-        ("parent-two".to_owned(), "Second response".to_owned()),
-        ("parent-empty".to_owned(), String::new()),
-    ];
     assert_eq!(
         parent_live.stream_starts,
-        vec!["parent-one", "parent-two", "parent-empty"]
+        vec!["parent-tool", "parent-one", "parent-two"]
     );
     assert_eq!(
         parent_live.stream_deltas,
@@ -880,18 +978,112 @@ async fn fake_codex_provider_items_keep_identity_live_late_and_same_host_reconne
         ]
     );
     assert_eq!(parent_live.stream_ends, expected_parent);
+    assert!(
+        parent_live
+            .stream_starts
+            .iter()
+            .all(|id| id != "parent-empty")
+    );
+    assert_eq!(parent_live.tool_requests, vec!["parent-tool"]);
+    assert_eq!(
+        parent_live.stream_end_tool_calls.get("parent-tool"),
+        Some(&vec!["parent-tool".to_owned()])
+    );
     assert_eq!(parent_live.errors, 0);
     assert_eq!(parent_live.identity_errors, 0);
     assert_eq!(parent_live.cancellations, 0);
     assert_eq!(parent_live.idle_transitions, 1);
+    let settings_update: Value = serde_json::from_slice(
+        &std::fs::read(&fake.settings_update).expect("read captured Codex settings update"),
+    )
+    .expect("parse captured Codex settings update");
+    assert_eq!(
+        settings_update,
+        json!({
+            "threadId": "identity-thread",
+            "model": "fake-codex-model",
+            "effort": "high",
+            "approvalPolicy": "never"
+        })
+    );
 
-    let (late_client, late_agent, late_bootstrap) =
+    let (mut late_client, late_agent, late_bootstrap) =
         connect_and_replay_agent(&fixture, &parent.agent_id, "late Codex attach").await;
     assert_ne!(late_agent.instance_stream, parent.instance_stream);
     assert_eq!(
         replayed_success_messages(&late_bootstrap, "late Codex attach replay"),
         expected_parent
     );
+    assert_replayed_tool_container_declares_card(
+        &late_bootstrap,
+        "parent-tool",
+        "late Codex attach replay",
+    );
+    late_client
+        .fetch_session_history(
+            &late_agent.instance_stream,
+            FetchSessionHistoryPayload {
+                agent_id: parent.agent_id.clone(),
+                before_seq: None,
+                limit: 100,
+            },
+        )
+        .await
+        .expect("fetch fake Codex paged history");
+    let paged_history = loop {
+        let env = expect_fixture_event(&mut late_client, "fake Codex paged history").await;
+        if env.kind == FrameKind::SessionHistory && env.stream == late_agent.instance_stream {
+            break env
+                .parse_payload::<SessionHistoryPayload>()
+                .expect("parse fake Codex paged history");
+        }
+    };
+    let mut paged_observation = CodexIdentityObservation::default();
+    for event in paged_history.events.clone() {
+        paged_observation.observe(event);
+    }
+    assert_eq!(
+        paged_history
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::MessageAdded(message)
+                    if matches!(message.sender, MessageSender::Assistant { .. }) =>
+                {
+                    Some((
+                        message
+                            .message_id
+                            .as_ref()
+                            .expect("paged assistant message identity")
+                            .0
+                            .clone(),
+                        message.content.clone(),
+                    ))
+                }
+                ChatEvent::StreamEnd(end) => Some((
+                    end.message
+                        .message_id
+                        .as_ref()
+                        .expect("paged stream identity")
+                        .0
+                        .clone(),
+                    end.message.content.clone(),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            ("parent-two".to_owned(), "Second response".to_owned()),
+            ("parent-one".to_owned(), "First response".to_owned()),
+            ("parent-tool".to_owned(), String::new()),
+        ]
+    );
+    assert_eq!(
+        paged_observation.stream_end_tool_calls.get("parent-tool"),
+        Some(&vec!["parent-tool".to_owned()]),
+        "paged Codex history tool container must declare its card"
+    );
+    assert_eq!(paged_observation.tool_requests, vec!["parent-tool"]);
     drop(late_client);
 
     let (same_host_reconnect_client, same_host_reconnect_agent, same_host_reconnect_bootstrap) =
@@ -912,16 +1104,15 @@ async fn fake_codex_provider_items_keep_identity_live_late_and_same_host_reconne
         ),
         expected_parent
     );
+    assert_replayed_tool_container_declares_card(
+        &same_host_reconnect_bootstrap,
+        "parent-tool",
+        "fresh Codex connection to same host replay",
+    );
     drop(same_host_reconnect_client);
 
-    fixture
-        .client
-        .send_message(
-            &parent.instance_stream,
-            "exercise child identity quarantine".to_owned(),
-        )
-        .await
-        .expect("send fake Codex follow-up");
+    std::fs::write(&fake.followup_release, b"release")
+        .expect("release queued fake Codex follow-up");
 
     let mut child = None;
     let mut child_live = CodexIdentityObservation::default();
@@ -1201,6 +1392,13 @@ async fn empty_workspace_spawn_is_accepted_for_all_backends() {
     init_tracing();
 
     let mut fixture = Fixture::new().await;
+    let host = fixture.host_for_test();
+    host.set_session_schema_ready_for_test(BackendKind::Codex)
+        .await;
+    host.set_session_schema_ready_for_test(BackendKind::Kiro)
+        .await;
+    host.set_session_schema_ready_for_test(BackendKind::Hermes)
+        .await;
     let backends = [
         BackendKind::Claude,
         BackendKind::Codex,
@@ -2740,7 +2938,7 @@ impl ValidatedConnection {
 }
 
 impl RealBackendFixture {
-    async fn new() -> Self {
+    async fn new(backend_kind: BackendKind) -> Self {
         init_tracing();
 
         let session_store_dir = tempfile::tempdir().expect("create session tempdir");
@@ -2758,7 +2956,14 @@ impl RealBackendFixture {
         // enabled, so seed the settings store with the feature on.
         std::fs::write(
             &settings_path,
-            r#"{"settings":{"complexity_tiers_enabled":true}}"#,
+            serde_json::to_vec(&json!({
+                "settings": {
+                    "enabled_backends": [backend_kind],
+                    "default_backend": backend_kind,
+                    "complexity_tiers_enabled": true
+                }
+            }))
+            .expect("serialize real backend settings"),
         )
         .expect("seed settings store with complexity tiers enabled");
         // Real backends — NOT mock
@@ -3508,7 +3713,7 @@ async fn backend_ready_or_skip(backend_kind: BackendKind) -> bool {
 }
 
 async fn assert_backend_reports_cumulative_turn_token_usage(backend_kind: BackendKind) {
-    let mut fixture = RealBackendFixture::new().await;
+    let mut fixture = RealBackendFixture::new(backend_kind).await;
     let workspace_roots = fixture.workspace_roots();
     let first_prompt = "Say hi in one word.";
     let agent_stream = spawn_agent_via_protocol(
@@ -3580,7 +3785,7 @@ async fn assert_backend_reports_cumulative_turn_token_usage(backend_kind: Backen
 }
 
 async fn assert_backend_turn_usage_contract_if_reported(backend_kind: BackendKind) {
-    let mut fixture = RealBackendFixture::new().await;
+    let mut fixture = RealBackendFixture::new(backend_kind).await;
     let workspace_roots = fixture.workspace_roots();
     let first_prompt = "Say hi in one word.";
     let agent_stream = spawn_agent_via_protocol(
@@ -3908,14 +4113,10 @@ async fn assert_backend_emits_typing_status(
     let mut saw_typing_true = false;
     let mut saw_stream_start = false;
     let mut saw_stream_end = false;
-    let mut saw_typing_false = false;
 
-    // TypingStatusChanged(true) must arrive before StreamStart, and both StreamEnd and
-    // TypingStatusChanged(false) must arrive after StreamStart.  However the relative
-    // order of StreamEnd vs TypingStatusChanged(false) is backend-dependent (e.g. Codex
-    // may emit TypingStatusChanged(false) before StreamEnd), so we wait until we have
-    // seen *both* before breaking.
-    loop {
+    // TypingStatusChanged(true) opens activity, StreamEnd completes the final
+    // assistant item, and only then may TypingStatusChanged(false) publish idle.
+    let saw_typing_false = loop {
         let env = expect_next_event(&mut fixture.client, "typing status ChatEvent").await;
         if env.kind != FrameKind::ChatEvent || env.stream != agent_stream {
             continue;
@@ -3944,20 +4145,18 @@ async fn assert_backend_emits_typing_status(
             ChatEvent::StreamEnd(_) => {
                 if got_user_message_echo && saw_stream_start {
                     saw_stream_end = true;
-                    if saw_typing_false {
-                        break;
-                    }
                 }
             }
             ChatEvent::TypingStatusChanged(false) if got_user_message_echo && saw_typing_true => {
-                saw_typing_false = true;
-                if saw_stream_end {
-                    break;
-                }
+                assert!(
+                    saw_stream_end,
+                    "TypingStatusChanged(false) arrived before final StreamEnd for {backend_kind:?}"
+                );
+                break true;
             }
             _ => {}
         }
-    }
+    };
 
     assert!(
         saw_typing_true,
@@ -4018,16 +4217,8 @@ async fn assert_codex_emits_token_usage(fixture: &mut RealBackendFixture) {
                         panic!("expected Codex StreamEnd to include message_id")
                     });
                 assert!(
-                    matches!(
-                        data.message
-                            .token_usage
-                            .as_ref()
-                            .map(|usage| &usage.request),
-                        Some(TokenUsageScope::Unavailable {
-                            reason: TokenUsageUnavailableReason::BackendDidNotReport
-                        })
-                    ),
-                    "Codex StreamEnd should leave late token usage for MessageMetadataUpdated; message_id={message_id}"
+                    data.message.token_usage.is_none(),
+                    "Codex StreamEnd should not fabricate usage before MessageMetadataUpdated; message_id={message_id}"
                 );
                 assert!(
                     data.message.context_breakdown.is_none(),
@@ -4788,7 +4979,7 @@ async fn real_claude_resumes_parent_after_background_subagent() {
          launching it, wait for it to finish, then reply with exactly: \
          'The background agent result is 637.'";
 
-    let mut fixture = RealBackendFixture::new().await;
+    let mut fixture = RealBackendFixture::new(backend_kind).await;
     let workspace_roots = fixture.workspace_roots();
     // Use the backend default model (no low-cost hint): reliable tool use is
     // required to actually drive a background sub-agent spawn.
@@ -5072,7 +5263,7 @@ async fn resumable_real_backends_remember_secret() {
         }
 
         let handle = tokio::spawn(async move {
-            let mut fixture = RealBackendFixture::new().await;
+            let mut fixture = RealBackendFixture::new(backend_kind).await;
             resume_secret_via_protocol(&mut fixture, backend_kind).await;
         });
 
@@ -5121,7 +5312,7 @@ async fn real_backends_emit_stream_deltas() {
         }
 
         let handle = tokio::spawn(async move {
-            let mut fixture = RealBackendFixture::new().await;
+            let mut fixture = RealBackendFixture::new(backend_kind).await;
             assert_backend_emits_stream_deltas(&mut fixture, backend_kind).await;
         });
 
@@ -5170,7 +5361,7 @@ async fn real_backends_emit_typing_status() {
         }
 
         let handle = tokio::spawn(async move {
-            let mut fixture = RealBackendFixture::new().await;
+            let mut fixture = RealBackendFixture::new(backend_kind).await;
             assert_backend_emits_typing_status(&mut fixture, backend_kind).await;
         });
 
@@ -5211,7 +5402,7 @@ async fn real_claude_first_turn_native_subagent_appears_in_host_stream() {
     }
 
     let handle = tokio::spawn(async move {
-        let mut fixture = RealBackendFixture::new().await;
+        let mut fixture = RealBackendFixture::new(backend_kind).await;
         let workspace_roots = fixture.workspace_roots();
         let prompt = "Test harness: in your very first action, call the Task tool exactly once. Ask the sub-agent to read README.txt in the current working directory and reply with exactly the first line. Wait for that Task to finish. Afterward, reply exactly with: parent complete";
 
@@ -5308,7 +5499,7 @@ async fn real_codex_emits_tool_events_for_file_copy() {
         }
 
         let handle = tokio::spawn(async move {
-            let mut fixture = RealBackendFixture::new().await;
+            let mut fixture = RealBackendFixture::new(backend_kind).await;
             assert_backend_emits_tool_events_for_file_copy(&mut fixture, backend_kind).await;
         });
 
@@ -5349,8 +5540,20 @@ async fn real_codex_emits_token_usage() {
         return;
     }
 
-    let mut fixture = RealBackendFixture::new().await;
+    let mut fixture = RealBackendFixture::new(backend_kind).await;
     assert_codex_emits_token_usage(&mut fixture).await;
+}
+
+#[tokio::test]
+#[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
+async fn real_codex_interrupts_long_running_command() {
+    let backend_kind = BackendKind::Codex;
+    if !backend_ready_or_skip(backend_kind).await {
+        return;
+    }
+
+    let mut fixture = RealBackendFixture::new(backend_kind).await;
+    assert_backend_interrupts_long_running_command(&mut fixture, backend_kind).await;
 }
 
 #[tokio::test]
@@ -5381,7 +5584,7 @@ async fn real_backends_interrupt_long_running_command() {
         }
 
         let handle = tokio::spawn(async move {
-            let mut fixture = RealBackendFixture::new().await;
+            let mut fixture = RealBackendFixture::new(backend_kind).await;
             assert_backend_interrupts_long_running_command(&mut fixture, backend_kind).await;
         });
 
@@ -5422,7 +5625,7 @@ async fn real_kiro_emits_typing_and_streaming_on_follow_up_turns() {
         return;
     }
 
-    let mut fixture = RealBackendFixture::new().await;
+    let mut fixture = RealBackendFixture::new(backend_kind).await;
     assert_backend_emits_typing_and_streaming_on_follow_up_turns(&mut fixture, backend_kind).await;
 }
 
@@ -5451,7 +5654,7 @@ async fn real_kiro_follow_up_user_message_echo_is_not_duplicated() {
         return;
     }
 
-    let mut fixture = RealBackendFixture::new().await;
+    let mut fixture = RealBackendFixture::new(backend_kind).await;
     assert_backend_follow_up_user_echo_not_duplicated(&mut fixture, backend_kind).await;
 }
 
@@ -5483,7 +5686,7 @@ async fn real_codex_describes_image_input() {
         }
 
         let handle = tokio::spawn(async move {
-            let mut fixture = RealBackendFixture::new().await;
+            let mut fixture = RealBackendFixture::new(backend_kind).await;
             assert_backend_describes_image_input(&mut fixture, backend_kind).await;
         });
 
@@ -5527,7 +5730,7 @@ async fn real_codex_low_cost_name_generation_prompt_returns_non_empty_response()
         }
 
         let handle = tokio::spawn(async move {
-            let mut fixture = RealBackendFixture::new().await;
+            let mut fixture = RealBackendFixture::new(backend_kind).await;
             assert_backend_returns_non_empty_name_for_name_prompt(&mut fixture, backend_kind).await;
         });
 

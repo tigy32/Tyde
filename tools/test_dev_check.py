@@ -18,6 +18,48 @@ TOOLCHAIN_UPDATE_LOG = "rustup update stable toolchain=unset"
 TOOLCHAIN_INSTALL_LOG = "rustup toolchain install toolchain=unset"
 
 
+class TrunkCommandTests(unittest.TestCase):
+    def test_percent_encoded_checkout_uses_safe_wasm_target_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp) / "repo%2Fworktree"
+            tools = root / "tools"
+            frontend = root / "frontend"
+            fake_bin = root / "bin"
+            tools.mkdir(parents=True)
+            frontend.mkdir()
+            fake_bin.mkdir()
+            shutil.copy2(REPO_ROOT / "tools" / "trunk-command.mjs", tools)
+            (frontend / "Trunk.toml").write_text("", encoding="utf-8")
+            capture = root / "trunk-env.txt"
+            trunk = fake_bin / "trunk"
+            trunk.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' \"${CARGO_TARGET_DIR-}\" > \"$TRUNK_ENV_CAPTURE\"\n",
+                encoding="utf-8",
+            )
+            trunk.chmod(0o755)
+            env = os.environ.copy()
+            env.pop("CARGO_TARGET_DIR", None)
+            env["PATH"] = f"{fake_bin}:{env['PATH']}"
+            env["TRUNK_ENV_CAPTURE"] = str(capture)
+
+            result = subprocess.run(
+                ["node", str(tools / "trunk-command.mjs"), "build"],
+                cwd=root,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            alias = pathlib.Path(capture.read_text(encoding="utf-8").strip())
+            self.assertNotIn("%", str(alias))
+            self.assertTrue(alias.is_symlink())
+            self.assertEqual(alias.readlink().resolve(), (root / "target").resolve())
+            alias.unlink()
+
+
 class DevCheckCacheTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -70,6 +112,11 @@ if [[ "${1:-}" == "--prepare" ]]; then
   exit 0
 fi
 [[ "${TYDE_WASM_TOOLS_PREPARED:-0}" == 1 ]]
+if [[ -n "${DEV_CHECK_EXPECT_WASM_TARGET:-}" ]]; then
+  [[ "${CARGO_TARGET_DIR:-}" != *%* ]]
+  [[ -L "${CARGO_TARGET_DIR:-}" ]]
+  [[ "$(readlink "$CARGO_TARGET_DIR")" == "$DEV_CHECK_EXPECT_WASM_TARGET" ]]
+fi
 echo "wasm" >> "$DEV_CHECK_TEST_LOG"
 if [[ "${DEV_CHECK_FAIL_COMMAND:-}" == "wasm" ]]; then exit 9; fi
 """,
@@ -401,6 +448,27 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         deleted_key = self._explain_key()
         self.assertNotEqual(deleted_key, committed_key)
         self.assertEqual(self._index_digest(), index_after_commit)
+
+    def test_percent_encoded_checkout_uses_safe_wasm_target_alias(self) -> None:
+        encoded_root = self.root.with_name("repo%2Fworktree")
+        self.root.rename(encoded_root)
+        self.root = encoded_root
+        env = self.env.copy()
+        env["DEV_CHECK_EXPECT_WASM_TARGET"] = str(self.root / "target")
+
+        result = self._run(env=env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run_dir = max((self.root / "target" / "dev-check-logs").glob("run-*"))
+        metadata = (run_dir / "metadata.txt").read_text(encoding="utf-8")
+        alias_line = next(
+            line
+            for line in metadata.splitlines()
+            if line.startswith("wasm.cargo_target_directory=")
+        )
+        alias = pathlib.Path(alias_line.split("=", 1)[1])
+        self.assertNotIn("%", str(alias))
+        self.assertFalse(alias.exists())
 
     def test_fingerprint_ignores_environment_and_tool_identities(self) -> None:
         base_key = self._explain_key()

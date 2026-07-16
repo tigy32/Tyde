@@ -4530,7 +4530,7 @@ impl HistoryReplay {
             }
             ChatEvent::StreamEnd(data) => {
                 self.push_entry(ChatMessageEntry {
-                    message: present_completed_message(data.message, false),
+                    message: data.message,
                     tool_requests: Vec::new(),
                 });
             }
@@ -4630,31 +4630,6 @@ impl HistoryReplay {
         }
         self.rows.push(handle);
     }
-}
-
-fn history_message_has_renderable_content(message: &protocol::ChatMessage) -> bool {
-    !message.content.trim().is_empty()
-        || message
-            .reasoning
-            .as_ref()
-            .is_some_and(|reasoning| !reasoning.text.trim().is_empty())
-        || !message.tool_calls.is_empty()
-        || message
-            .images
-            .as_ref()
-            .is_some_and(|images| !images.is_empty())
-}
-
-const EMPTY_RESPONSE_PLACEHOLDER: &str = "_Empty response._";
-
-fn present_completed_message(
-    mut message: protocol::ChatMessage,
-    has_attached_tools: bool,
-) -> protocol::ChatMessage {
-    if !history_message_has_renderable_content(&message) && !has_attached_tools {
-        message.content = EMPTY_RESPONSE_PLACEHOLDER.to_owned();
-    }
-    message
 }
 
 /// Apply an already-parsed `ChatEvent` to the per-agent state.
@@ -4805,7 +4780,7 @@ pub fn apply_chat_event(state: &AppState, host_id: &str, agent_id: &AgentId, eve
                 map.remove(&agent_id);
             });
             let entry = ChatMessageEntry {
-                message: present_completed_message(data.message, !tool_requests.is_empty()),
+                message: data.message,
                 tool_requests,
             };
             state.push_chat_entry(agent_id.clone(), entry);
@@ -6253,6 +6228,75 @@ mod tests {
                 rows_tool_call_ids(&state, &agent_id),
                 vec![vec!["toolu_x".to_owned()]],
                 "an undeclared call still lands on the last row"
+            );
+        });
+    }
+
+    #[test]
+    fn background_tool_completion_updates_prior_row_during_later_stream() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let agent_id = AgentId("a-background-tool".to_owned());
+
+            apply_chat_event(
+                &state,
+                "host-1",
+                &agent_id,
+                ChatEvent::StreamEnd(protocol::StreamEndData {
+                    message: assistant_message_with_tool_calls("starting", Vec::new()),
+                }),
+            );
+            apply_chat_event(
+                &state,
+                "host-1",
+                &agent_id,
+                tool_request("tool-background", "run_command"),
+            );
+            apply_chat_event(
+                &state,
+                "host-1",
+                &agent_id,
+                ChatEvent::StreamStart(protocol::StreamStartData {
+                    message_id: Some("message-later".to_owned()),
+                    agent: "codex".to_owned(),
+                    model: Some("gpt-5.6-luna".to_owned()),
+                }),
+            );
+            apply_chat_event(
+                &state,
+                "host-1",
+                &agent_id,
+                ChatEvent::ToolExecutionCompleted(protocol::ToolExecutionCompletedData {
+                    tool_call_id: "tool-background".to_owned(),
+                    tool_name: "run_command".to_owned(),
+                    tool_result: protocol::ToolExecutionResult::Other {
+                        result: serde_json::json!({ "exit_code": 0, "stdout": "done" }),
+                    },
+                    success: true,
+                    error: None,
+                    normalization_failure: None,
+                }),
+            );
+
+            let first_row_has_result = state.chat_rows.with_untracked(|map| {
+                map.get(&agent_id).and_then(|rows| {
+                    rows.first().map(|row| {
+                        row.entry.with_untracked(|entry| {
+                            entry.tool_requests.first().is_some_and(|tool| {
+                                tool.request.tool_call_id == "tool-background"
+                                    && tool.result.as_ref().is_some_and(|result| result.success)
+                            })
+                        })
+                    })
+                })
+            });
+            assert_eq!(first_row_has_result, Some(true));
+            assert!(
+                state
+                    .streaming_text
+                    .with_untracked(|streams| streams.contains_key(&agent_id)),
+                "the later assistant response must remain independently active"
             );
         });
     }
@@ -8236,7 +8280,7 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    fn empty_completion_and_repeated_server_rows_match_history() {
+    fn completed_messages_are_not_rewritten_and_repeated_server_rows_match_history() {
         let state = AppState::new();
         let agent_id = AgentId("desktop-empty-completion".to_owned());
         let assistant_message = |id: &str, content: &str| protocol::ChatMessage {
@@ -8283,8 +8327,7 @@ mod wasm_tests {
                 entry.message.message_id,
                 Some(protocol::ChatMessageId("empty-item".to_owned()))
             );
-            assert_eq!(entry.message.content, EMPTY_RESPONSE_PLACEHOLDER);
-            assert!(!entry.message.content.trim().is_empty());
+            assert!(entry.message.content.is_empty());
         });
 
         let mut replay = HistoryReplay::default();
@@ -8297,7 +8340,69 @@ mod wasm_tests {
         );
         assert_eq!(replay.rows.len(), 1);
         replay.rows[0].entry.with_untracked(|entry| {
-            assert_eq!(entry.message.content, EMPTY_RESPONSE_PLACEHOLDER);
+            assert!(entry.message.content.is_empty());
+        });
+
+        let mut authoritative = assistant_message("authoritative", "");
+        authoritative.reasoning = Some(protocol::ReasoningData {
+            text: "reasoning only".to_owned(),
+            tokens: None,
+            signature: None,
+            blob: None,
+        });
+        authoritative.tool_calls = vec![protocol::ToolUseData {
+            id: "tool-call".to_owned(),
+            name: "tool".to_owned(),
+            arguments: serde_json::json!({}),
+        }];
+        authoritative.images = Some(vec![protocol::ImageData {
+            media_type: "image/png".to_owned(),
+            data: "image-data".to_owned(),
+        }]);
+        apply_chat_event(
+            &state,
+            "host",
+            &agent_id,
+            ChatEvent::StreamEnd(protocol::StreamEndData {
+                message: authoritative.clone(),
+            }),
+        );
+        let authoritative_row = state
+            .chat_rows
+            .with_untracked(|rows| rows.get(&agent_id).and_then(|rows| rows.last()).cloned())
+            .expect("authoritative completion row");
+        authoritative_row.entry.with_untracked(|entry| {
+            assert_eq!(
+                entry
+                    .message
+                    .reasoning
+                    .as_ref()
+                    .map(|value| value.text.as_str()),
+                Some("reasoning only")
+            );
+            assert_eq!(entry.message.tool_calls.len(), 1);
+            assert_eq!(entry.message.images.as_ref().map(Vec::len), Some(1));
+        });
+
+        let mut authoritative_replay = HistoryReplay::default();
+        authoritative_replay.apply(
+            ChatEvent::StreamEnd(protocol::StreamEndData {
+                message: authoritative,
+            }),
+            "host",
+            &agent_id,
+        );
+        authoritative_replay.rows[0].entry.with_untracked(|entry| {
+            assert_eq!(
+                entry
+                    .message
+                    .reasoning
+                    .as_ref()
+                    .map(|value| value.text.as_str()),
+                Some("reasoning only")
+            );
+            assert_eq!(entry.message.tool_calls.len(), 1);
+            assert_eq!(entry.message.images.as_ref().map(Vec::len), Some(1));
         });
 
         let original = assistant_message("message-added", "original");

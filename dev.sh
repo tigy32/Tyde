@@ -26,6 +26,8 @@ CLEANUP_RECLAIMED_BYTES=0
 SCCACHE_STATS_BEFORE=""
 SCCACHE_CONFIGURED=false
 TIME_FLAVOR=""
+WASM_CARGO_TARGET_ALIAS=""
+WASM_CARGO_TARGET_DIR=""
 
 die() {
     printf 'ERROR: %s\n' "$1" >&2
@@ -88,6 +90,10 @@ finish_on_exit() {
                     "$PWD/$RUN_DIR/sccache-failure.json" >>"$RUN_METADATA"
             fi
         fi
+    fi
+    if [[ -n "$WASM_CARGO_TARGET_ALIAS" ]]; then
+        rm -f "$WASM_CARGO_TARGET_ALIAS"
+        WASM_CARGO_TARGET_ALIAS=""
     fi
     release_check_lock
 }
@@ -448,6 +454,28 @@ SCRIPT
     printf 'cargo.incremental=%s\n' "$CARGO_INCREMENTAL" >>"$RUN_METADATA"
 }
 
+configure_wasm_cargo_target() {
+    local repository_hash alias_path
+
+    if [[ "$PWD" != *%* ]]; then
+        WASM_CARGO_TARGET_DIR="$PWD/target"
+        return
+    fi
+
+    repository_hash="$(printf '%s' "$PWD" | hash_text)"
+    alias_path="/tmp/tyde-wasm-target-$repository_hash"
+    if [[ -e "$alias_path" || -L "$alias_path" ]]; then
+        [[ -L "$alias_path" && "$(readlink "$alias_path")" == "$PWD/target" ]] ||
+            die "wasm target alias is occupied by another path: $alias_path"
+    else
+        ln -s "$PWD/target" "$alias_path" ||
+            die "could not create wasm target alias: $alias_path"
+    fi
+    WASM_CARGO_TARGET_ALIAS="$alias_path"
+    WASM_CARGO_TARGET_DIR="$alias_path"
+    printf 'wasm.cargo_target_directory=%s\n' "$alias_path" >>"$RUN_METADATA"
+}
+
 worktree_identity() {
     local temp_dir temp_index head_commit head_tree worktree_tree
     temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/tyde-dev-check-index.XXXXXX")"
@@ -719,7 +747,9 @@ check() {
     run_stage "cargo clippy --all-targets -- -D warnings" 1 \
         cargo clippy --all-targets -- -D warnings
     run_stage "cargo nextest run" "$repetitions" cargo nextest run
-    run_stage "wasm browser tests" "$repetitions" tools/run-wasm-tests.sh
+    configure_wasm_cargo_target
+    run_stage "wasm browser tests" "$repetitions" \
+        env CARGO_TARGET_DIR="$WASM_CARGO_TARGET_DIR" tools/run-wasm-tests.sh
     run_stage "web loader tests" "$repetitions" \
         bash -c 'cd web/loader && exec node --test test/*.test.js'
     run_stage "dev check contract tests" 1 python3 tools/test_dev_check.py

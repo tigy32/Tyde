@@ -250,6 +250,24 @@ where
     let seq = outgoing_seq.get(&envelope.stream).copied().unwrap_or(0);
     outgoing_seq.insert(envelope.stream.clone(), seq + 1);
     envelope.seq = seq;
+    if envelope.stream.0.starts_with("/agent/") {
+        if envelope.seq == 0 && envelope.kind != FrameKind::AgentBootstrap {
+            tracing::warn!(
+                stream = %envelope.stream,
+                seq = envelope.seq,
+                kind = %envelope.kind,
+                "agent stream first envelope is not AgentBootstrap"
+            );
+        }
+        if envelope.kind == FrameKind::AgentBootstrap && envelope.seq != 0 {
+            tracing::error!(
+                stream = %envelope.stream,
+                seq = envelope.seq,
+                kind = %envelope.kind,
+                "AgentBootstrap assigned nonzero sequence"
+            );
+        }
+    }
     if is_high_volume_code_intel_frame(envelope.kind) {
         tracing::debug!(
             stream = %envelope.stream,
@@ -393,7 +411,7 @@ fn is_high_volume_code_intel_frame(kind: FrameKind) -> bool {
     )
 }
 
-fn emit_command_error(
+pub(crate) fn emit_command_error(
     host_output_stream: &Stream,
     request_stream: protocol::StreamPath,
     request_kind: FrameKind,

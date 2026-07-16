@@ -1361,15 +1361,6 @@ fn validate_chat_event(
             register_message_id(recent_frames, envelope, state, message)?;
             match &message.sender {
                 crate::MessageSender::Assistant { .. } => {
-                    if !state.pending_tool_calls.is_empty() {
-                        return Err(build_violation(
-                            recent_frames,
-                            envelope,
-                            Some(state.backend_kind),
-                            "received assistant MessageAdded while previous tool requests are still unresolved"
-                                .to_owned(),
-                        ));
-                    }
                     state.assistant_turn_open = true;
                     Ok(())
                 }
@@ -1410,15 +1401,6 @@ fn validate_chat_event(
                     state.backend_kind,
                     StreamIdentityViolation::ForeignActiveMessageId,
                     "received StreamStart while previous assistant stream is still open".to_owned(),
-                ));
-            }
-            if !state.pending_tool_calls.is_empty() {
-                return Err(build_violation(
-                    recent_frames,
-                    envelope,
-                    Some(state.backend_kind),
-                    "received StreamStart while previous tool requests are still unresolved"
-                        .to_owned(),
                 ));
             }
             let message_id = required_stream_message_id(
@@ -3141,7 +3123,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_next_turn_when_tool_request_is_unresolved() {
+    fn accepts_next_message_while_tool_request_is_unresolved() {
         let mut validator = ProtocolValidator::new();
 
         validator.validate_envelope(&new_agent_envelope()).unwrap();
@@ -3169,7 +3151,7 @@ mod tests {
         validator
             .validate_envelope(&chat_envelope(3, &tool_request("call-1")))
             .unwrap();
-        let violation = validator
+        validator
             .validate_envelope(&chat_envelope(
                 4,
                 &ChatEvent::StreamStart(StreamStartData {
@@ -3178,13 +3160,46 @@ mod tests {
                     model: None,
                 }),
             ))
-            .expect_err("next turn should not start while tool request is unresolved");
+            .expect("a later assistant message may start while a background tool is unresolved");
+        validator
+            .validate_envelope(&chat_envelope(5, &tool_completed("call-1")))
+            .expect("the earlier tool may complete during the later assistant message");
+        validator
+            .validate_envelope(&chat_envelope(
+                6,
+                &ChatEvent::StreamEnd(StreamEndData {
+                    message: assistant_message_with_id("msg-2", "done"),
+                }),
+            ))
+            .expect("the later assistant message remains independently paired");
+    }
 
-        assert!(
-            violation
-                .to_string()
-                .contains("previous tool requests are still unresolved")
-        );
+    #[test]
+    fn accepts_assistant_message_added_while_tool_request_is_unresolved() {
+        let mut validator = ProtocolValidator::new();
+
+        validator.validate_envelope(&new_agent_envelope()).unwrap();
+        validator
+            .validate_envelope(&agent_bootstrap_start_envelope())
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(
+                1,
+                &ChatEvent::MessageAdded(assistant_message_with_id("msg-1", "starting")),
+            ))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(2, &tool_request("call-1")))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(
+                3,
+                &ChatEvent::MessageAdded(assistant_message_with_id("msg-2", "checking progress")),
+            ))
+            .expect("a non-streamed assistant response may overlap a pending background tool");
+        validator
+            .validate_envelope(&chat_envelope(4, &tool_completed("call-1")))
+            .expect("the earlier background tool may complete after the later response");
     }
 
     #[test]

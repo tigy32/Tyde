@@ -1051,6 +1051,10 @@ async fn generated_name_isolates_configured_http_mcp_from_setup() {
     let _ = expect_next_event(&mut fixture.client, "McpServerNotify upsert").await;
 
     fixture
+        .host_for_test()
+        .set_session_schema_ready_for_test(BackendKind::Codex)
+        .await;
+    fixture
         .client
         .spawn_agent(SpawnAgentPayload {
             name: None,

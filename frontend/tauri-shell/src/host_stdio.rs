@@ -26,14 +26,19 @@ pub fn run() -> Result<(), String> {
             },
         )?;
 
-        let transport = StdioTransport::new();
-        let connection = server::accept(&server::ServerConfig::current(), transport)
-            .await
-            .map_err(|err| format!("host stdio handshake failed: {err:?}"))?;
+        let result = async {
+            let transport = StdioTransport::new();
+            let connection = server::accept(&server::ServerConfig::current(), transport)
+                .await
+                .map_err(|err| format!("host stdio handshake failed: {err:?}"))?;
 
-        server::run_connection(connection, host)
-            .await
-            .map_err(|err| format!("host stdio connection failed: {err:?}"))
+            server::run_connection(connection, host.clone())
+                .await
+                .map_err(|err| format!("host stdio connection failed: {err:?}"))
+        }
+        .await;
+        host.shutdown_spawn_operations().await;
+        result
     })
 }
 

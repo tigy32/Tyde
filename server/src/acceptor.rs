@@ -166,38 +166,43 @@ pub async fn listen_uds(
 ) -> io::Result<()> {
     #[cfg(unix)]
     {
-        let path = path.as_ref();
-        prepare_uds_path(path).await?;
+        let result = async {
+            let path = path.as_ref();
+            prepare_uds_path(path).await?;
 
-        let _cleanup = UdsPathCleanup {
-            path: path.to_path_buf(),
-        };
-        let listener = UnixListener::bind(path)?;
-        loop {
-            let (stream, _) = listener.accept().await?;
-            let host = host.clone();
+            let _cleanup = UdsPathCleanup {
+                path: path.to_path_buf(),
+            };
+            let listener = UnixListener::bind(path)?;
+            loop {
+                let (stream, _) = listener.accept().await?;
+                let host = host.clone();
 
-            tokio::spawn(async move {
-                let connection = match accept(&config, stream).await {
-                    Ok(connection) => connection,
-                    Err(err) => {
-                        tracing::error!("handshake failed: {err:?}");
-                        return;
+                tokio::spawn(async move {
+                    let connection = match accept(&config, stream).await {
+                        Ok(connection) => connection,
+                        Err(err) => {
+                            tracing::error!("handshake failed: {err:?}");
+                            return;
+                        }
+                    };
+
+                    if let Err(err) = run_connection(connection, host).await {
+                        tracing::error!("connection loop failed: {err:?}");
                     }
-                };
-
-                if let Err(err) = run_connection(connection, host).await {
-                    tracing::error!("connection loop failed: {err:?}");
-                }
-            });
+                });
+            }
         }
+        .await;
+        host.shutdown_spawn_operations().await;
+        result
     }
 
     #[cfg(not(unix))]
     {
         let _ = path;
         let _ = config;
-        let _ = host;
+        host.shutdown_spawn_operations().await;
         Err(io::Error::new(
             ErrorKind::Unsupported,
             "Unix domain sockets are not supported on this platform",

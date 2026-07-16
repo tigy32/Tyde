@@ -13,10 +13,10 @@ use protocol::{
     MessageSender, MessageTokenUsage, NewAgentPayload, OrchestrationAgentOrigin,
     OrchestrationPayload, Project, ProjectAddRootPayload, ProjectCreatePayload,
     ProjectDeletePayload, ProjectId, ProjectNotifyPayload, ProjectRenamePayload, ProjectRootPath,
-    SendMessagePayload, SendMessageToolResponse, SessionHistoryPayload, SessionListPayload,
-    SessionSettingValue, SessionSettingsValues, SetSettingPayload, SpawnAgentParams,
-    SpawnAgentPayload, StreamEndData, StreamPath, TaskTokenUsagePayload, TaskTokenUsageScope,
-    TaskTokenUsageStatus, TaskTokenUsageUnavailableReason, TokenUsageScope,
+    SendMessagePayload, SendMessageToolResponse, SessionHistoryPayload, SessionId,
+    SessionListPayload, SessionSettingValue, SessionSettingsValues, SetSettingPayload,
+    SpawnAgentParams, SpawnAgentPayload, StreamEndData, StreamPath, TaskTokenUsagePayload,
+    TaskTokenUsageScope, TaskTokenUsageStatus, TaskTokenUsageUnavailableReason, TokenUsageScope,
     TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult, ToolRequest,
     ToolRequestType, write_envelope,
 };
@@ -338,33 +338,6 @@ async fn expect_no_event(client: &mut client::Connection, duration: Duration, co
                 env.kind, env.stream
             ),
             Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-        }
-    }
-}
-
-/// Drain events for `duration`, tolerating everything except an
-/// `AgentRenamed` frame. Background name generation applies renames
-/// asynchronously, so its absence can only be asserted with a window.
-async fn expect_no_agent_rename(
-    client: &mut client::Connection,
-    duration: Duration,
-    context: &str,
-) {
-    let deadline = tokio::time::Instant::now() + duration;
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return;
-        }
-        match tokio::time::timeout(remaining, client.next_event()).await {
-            Err(_) => return,
-            Ok(Ok(None)) => return,
-            Ok(Ok(Some(env))) => assert_ne!(
-                env.kind,
-                FrameKind::AgentRenamed,
-                "unexpected AgentRenamed during {context}"
-            ),
-            Ok(Err(err)) => panic!("next_event failed during {context}: {err:?}"),
         }
     }
 }
@@ -1908,6 +1881,67 @@ fn bootstrapped_agent(
         .find(|agent| &agent.agent_id == agent_id)
         .cloned()
         .expect("agent missing from HostBootstrap")
+}
+
+async fn spawn_named_session(
+    fixture: &mut Fixture,
+    name: &str,
+    backend_kind: BackendKind,
+) -> (NewAgentPayload, SessionId) {
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some(name.to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: format!("create session for {name}"),
+                images: None,
+                backend_kind,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn named session");
+    let env = expect_kind(&mut fixture.client, FrameKind::NewAgent, "named NewAgent").await;
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse named NewAgent");
+    let _ = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "named AgentStart",
+    )
+    .await;
+    expect_turn(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        &format!("mock backend response to: create session for {name}"),
+    )
+    .await;
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list named session");
+    let env = expect_kind(
+        &mut fixture.client,
+        FrameKind::SessionList,
+        "named SessionList",
+    )
+    .await;
+    let list: SessionListPayload = env.parse_payload().expect("parse named SessionList");
+    let session_id = list
+        .sessions
+        .iter()
+        .find(|session| session.user_alias.as_deref() == Some(name))
+        .expect("named session missing")
+        .id
+        .clone();
+    (new_agent, session_id)
 }
 
 async fn expect_agent_start_on_stream(
@@ -5438,6 +5472,10 @@ async fn backend_native_child_with_closed_event_stream_still_replays_to_late_cli
 #[tokio::test]
 async fn cancelling_parent_terminally_closes_live_native_child_and_replays_idle() {
     let mut fixture = Fixture::new().await;
+    fixture
+        .host_for_test()
+        .set_session_schema_ready_for_test(BackendKind::Codex)
+        .await;
     let prompt = format!("__mock_hold_until_interrupt__ {MOCK_LIVE_NATIVE_CHILD_SENTINEL}");
     fixture
         .client
@@ -5882,14 +5920,1310 @@ async fn spawn_without_name_generates_short_name_and_persists_alias() {
     assert_eq!(list.sessions[0].user_alias, None);
 }
 
-// Name generation is intentionally non-fatal and off the spawn path
-// (dev-docs/13 §2): a naming failure used to fail the whole spawn and
-// silently discard the user's first message. The spawn now succeeds
-// immediately under the prompt-derived name and a failed generation is a
-// logged no-op, which is the contract this pins.
+// Naming is actor-owned and off the spawn path so NewAgent and AgentStart are
+// published under a provisional name before the generated rename arrives.
 #[tokio::test]
-async fn failed_generated_name_keeps_prompt_derived_name() {
+async fn generated_name_publishes_provisionally_then_renames_authoritatively() {
     let mut fixture = Fixture::new().await;
+    let gate = fixture.install_agent_name_test_gate().await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: None,
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "review logs __mock_async_generated_name__".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("send gated generated-name spawn");
+    assert_eq!(gate.wait_until_entered().await, 0);
+    let env = expect_kind(
+        &mut fixture.client,
+        FrameKind::NewAgent,
+        "provisional NewAgent",
+    )
+    .await;
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse gated NewAgent");
+    assert_eq!(new_agent.backend_kind, BackendKind::Claude);
+    assert_ne!(new_agent.name, "Generated Async Name");
+    let start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "provisional AgentStart",
+    )
+    .await;
+    assert_eq!(start.name, new_agent.name);
+
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list sessions while generated name is held");
+    let env = expect_kind(
+        &mut fixture.client,
+        FrameKind::SessionList,
+        "provisional SessionList",
+    )
+    .await;
+    let list: SessionListPayload = env.parse_payload().expect("parse provisional SessionList");
+    assert_eq!(
+        list.sessions[0].alias.as_deref(),
+        Some(new_agent.name.as_str())
+    );
+    assert_eq!(list.sessions[0].user_alias, None);
+
+    gate.release_one();
+    let env = expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentRenamed,
+        "generated AgentRenamed",
+    )
+    .await;
+    let renamed: AgentRenamedPayload = env.parse_payload().expect("parse generated rename");
+    assert_eq!(renamed.agent_id, new_agent.agent_id);
+    assert_eq!(renamed.name, "Generated Async Name");
+    let env = expect_kind(
+        &mut fixture.client,
+        FrameKind::SessionList,
+        "generated SessionList",
+    )
+    .await;
+    let list: SessionListPayload = env.parse_payload().expect("parse generated SessionList");
+    assert_eq!(
+        list.sessions[0].alias.as_deref(),
+        Some("Generated Async Name")
+    );
+    assert_eq!(list.sessions[0].user_alias, None);
+    assert_eq!(gate.wait_until_completed().await, 0);
+}
+
+#[tokio::test]
+async fn user_rename_wins_race_with_generated_name() {
+    let mut fixture = Fixture::new().await;
+    let name_gate = fixture.install_agent_name_test_gate().await;
+    let startup_gate = fixture
+        .host_for_test()
+        .install_agent_startup_completion_test_gate("Rename Race Mock-async-generated-name");
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: None,
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "rename race __mock_async_generated_name__".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("send generated-name race spawn");
+    assert_eq!(name_gate.wait_until_entered().await, 0);
+    startup_gate.wait_until_entered().await;
+    let env = expect_kind(&mut fixture.client, FrameKind::NewAgent, "race NewAgent").await;
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse race NewAgent");
+    assert_eq!(new_agent.name, "Rename Race Mock-async-generated-name");
+
+    fixture
+        .client
+        .set_agent_name(&new_agent.instance_stream, "User Wins".to_owned())
+        .await
+        .expect("send user rename before Bootstrap");
+    startup_gate.wait_until_entered().await;
+
+    name_gate.release_one();
+    startup_gate.wait_until_entered().await;
+    startup_gate.release_one();
+    let bootstrap = expect_raw_agent_bootstrap_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "rename race AgentBootstrap",
+    )
+    .await;
+    assert!(matches!(
+        bootstrap.events.first(),
+        Some(AgentBootstrapEvent::AgentStart(start))
+            if start.name == "Rename Race Mock-async-generated-name"
+    ));
+    assert_eq!(name_gate.wait_until_completed().await, 0);
+
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("generated-name race barrier");
+    let mut user_renames = 0;
+    loop {
+        let env = fixture
+            .client
+            .next_event()
+            .await
+            .expect("read generated-name race barrier")
+            .expect("connection remained open");
+        if env.kind == FrameKind::AgentRenamed {
+            let renamed: AgentRenamedPayload = env.parse_payload().expect("parse race rename");
+            assert_eq!(renamed.name, "User Wins");
+            user_renames += 1;
+        }
+        if env.kind == FrameKind::SessionList {
+            let list: SessionListPayload = env.parse_payload().expect("parse race SessionList");
+            if list.sessions[0].user_alias.as_deref() == Some("User Wins") {
+                assert_eq!(
+                    list.sessions[0].alias.as_deref(),
+                    Some("Rename Race Mock-async-generated-name")
+                );
+                break;
+            }
+        }
+    }
+    assert_eq!(user_renames, 1, "pre-Bootstrap user rename must apply once");
+}
+
+#[tokio::test]
+async fn spawn_operation_capacity_and_shutdown_are_typed_and_drained() {
+    let mut fixture = Fixture::new().await;
+    let gate = fixture
+        .host_for_test()
+        .install_spawn_operation_start_test_gate();
+    let (active_limit, queue_capacity) = fixture.spawn_operation_limits_for_test();
+    let spawn_payload = |index: usize| SpawnAgentPayload {
+        name: Some(format!("Capacity Spawn {index}")),
+        custom_agent_id: None,
+        parent_agent_id: None,
+        project_id: None,
+        params: SpawnAgentParams::New {
+            workspace_roots: vec!["/tmp/test".to_owned()],
+            prompt: format!("review logs {index}"),
+            images: None,
+            backend_kind: BackendKind::Claude,
+            launch_profile_id: None,
+            cost_hint: None,
+            access_mode: Default::default(),
+            session_settings: None,
+        },
+    };
+
+    for index in 0..active_limit {
+        fixture
+            .client
+            .spawn_agent(spawn_payload(index))
+            .await
+            .expect("submit active gated spawn");
+    }
+    for _ in 0..active_limit {
+        gate.wait_until_entered().await;
+    }
+    for index in active_limit..=active_limit + queue_capacity {
+        fixture
+            .client
+            .spawn_agent(spawn_payload(index))
+            .await
+            .expect("submit queued or saturated gated spawn");
+    }
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("capacity routing barrier");
+
+    let mut saturation_errors = 0;
+    loop {
+        let env = fixture
+            .client
+            .next_event()
+            .await
+            .expect("read capacity barrier event")
+            .expect("connection remained open");
+        if env.kind == FrameKind::CommandError {
+            let error: CommandErrorPayload = env.parse_payload().expect("parse saturation error");
+            assert_eq!(error.request_kind, FrameKind::SpawnAgent);
+            assert_eq!(error.code, CommandErrorCode::Internal);
+            assert!(error.message.contains("capacity unavailable"));
+            saturation_errors += 1;
+        }
+        assert_ne!(env.kind, FrameKind::NewAgent);
+        if env.kind == FrameKind::SessionList {
+            break;
+        }
+    }
+    assert_eq!(saturation_errors, 1);
+    fixture.shutdown_spawn_operations().await;
+    let accepted = active_limit + queue_capacity;
+    let mut shutdown_errors = 0;
+    while shutdown_errors < accepted {
+        let env = fixture
+            .client
+            .next_event()
+            .await
+            .expect("read shutdown terminal")
+            .expect("connection remained open");
+        assert_ne!(
+            env.kind,
+            FrameKind::NewAgent,
+            "cancelled spawn must not publish"
+        );
+        if env.kind != FrameKind::CommandError {
+            continue;
+        }
+        let error: CommandErrorPayload = env.parse_payload().expect("parse shutdown error");
+        assert_eq!(error.request_kind, FrameKind::SpawnAgent);
+        assert!(error.message.contains("host shut down"));
+        shutdown_errors += 1;
+    }
+    assert_eq!(shutdown_errors, accepted);
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("post-shutdown publication barrier");
+    loop {
+        let env = fixture
+            .client
+            .next_event()
+            .await
+            .expect("read post-shutdown barrier")
+            .expect("connection remained open");
+        assert_ne!(
+            env.kind,
+            FrameKind::NewAgent,
+            "drained spawn published after cancellation"
+        );
+        if env.kind == FrameKind::SessionList {
+            let list: SessionListPayload = env.parse_payload().expect("parse shutdown SessionList");
+            assert!(list.sessions.is_empty());
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn spawn_operation_panic_and_reconnect_have_one_typed_terminal() {
+    let mut fixture = Fixture::new().await;
+    let gate = fixture.install_agent_name_test_gate().await;
+    let payload = SpawnAgentPayload {
+        name: None,
+        custom_agent_id: None,
+        parent_agent_id: None,
+        project_id: None,
+        params: SpawnAgentParams::New {
+            workspace_roots: vec!["/tmp/test".to_owned()],
+            prompt: "review reconnect logs".to_owned(),
+            images: None,
+            backend_kind: BackendKind::Claude,
+            launch_profile_id: None,
+            cost_hint: None,
+            access_mode: Default::default(),
+            session_settings: None,
+        },
+    };
+    fixture
+        .client
+        .spawn_agent(payload.clone())
+        .await
+        .expect("submit reconnect spawn");
+    assert_eq!(gate.wait_until_entered().await, 0);
+    let new_agent = expect_kind(
+        &mut fixture.client,
+        FrameKind::NewAgent,
+        "pre-reconnect exact-once NewAgent",
+    )
+    .await;
+    let new_agent: NewAgentPayload = new_agent.parse_payload().expect("parse reconnect NewAgent");
+    let (reconnected, bootstrap) = fixture.connect_with_bootstrap().await;
+    let reconnected_agent = bootstrapped_agent(&bootstrap, &new_agent.agent_id);
+    fixture.client = reconnected;
+    gate.release_one();
+    assert_eq!(gate.wait_until_completed().await, 0);
+    let _ = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &reconnected_agent.instance_stream,
+        "reconnected AgentStart",
+    )
+    .await;
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("reconnect publication barrier");
+    let mut duplicate_publications = 0;
+    loop {
+        let env = fixture
+            .client
+            .next_event()
+            .await
+            .expect("read reconnect barrier")
+            .expect("connection remained open");
+        if env.kind == FrameKind::NewAgent {
+            duplicate_publications += 1;
+        }
+        if env.kind == FrameKind::SessionList {
+            break;
+        }
+    }
+    assert_eq!(duplicate_publications, 0);
+
+    let panic_gate = fixture
+        .host_for_test()
+        .install_spawn_operation_start_test_gate();
+    let mut panic_payload = payload;
+    panic_payload.name = Some("Controlled Spawn Panic".to_owned());
+    fixture
+        .client
+        .spawn_agent(panic_payload)
+        .await
+        .expect("submit controlled panic spawn");
+    panic_gate.wait_until_entered().await;
+    panic_gate.panic_on_release();
+    panic_gate.release_one();
+    let env = expect_kind(
+        &mut fixture.client,
+        FrameKind::CommandError,
+        "controlled abnormal spawn terminal",
+    )
+    .await;
+    let error: CommandErrorPayload = env.parse_payload().expect("parse abnormal terminal");
+    assert_eq!(error.request_kind, FrameKind::SpawnAgent);
+    assert_eq!(error.code, CommandErrorCode::Internal);
+    assert!(error.message.contains("panicked"));
+}
+
+#[tokio::test]
+async fn completed_spawn_is_not_reclassified_as_shutdown_cancellation() {
+    let mut fixture = Fixture::new().await;
+    let gate = fixture.install_spawn_operation_completion_test_gate();
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("Completed Spawn".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "review completed spawn".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("submit spawn held after recording successful outcome");
+    gate.wait_until_entered().await;
+
+    fixture.shutdown_spawn_operations().await;
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("completed spawn shutdown barrier");
+
+    let mut publications = 0;
+    let mut terminals = 0;
+    loop {
+        let env = fixture
+            .client
+            .next_event()
+            .await
+            .expect("read completed spawn shutdown event")
+            .expect("connection remained open");
+        match env.kind {
+            FrameKind::NewAgent => publications += 1,
+            FrameKind::CommandError => terminals += 1,
+            FrameKind::SessionList => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        publications, 1,
+        "successful spawn must publish exactly once"
+    );
+    assert_eq!(
+        terminals, 0,
+        "successful spawn must not receive a shutdown terminal"
+    );
+}
+
+#[tokio::test]
+async fn published_spawn_is_not_reclassified_when_post_fanout_work_is_cancelled() {
+    let mut fixture = Fixture::new().await;
+    let gate = fixture.install_spawn_operation_publication_test_gate();
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("Published Spawn".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "review published spawn".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("submit spawn held immediately after NewAgent publication");
+    gate.wait_until_entered().await;
+
+    fixture.shutdown_spawn_operations().await;
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("published spawn shutdown barrier");
+
+    let mut publications = 0;
+    let mut terminals = 0;
+    loop {
+        let env = fixture
+            .client
+            .next_event()
+            .await
+            .expect("read post-publication shutdown event")
+            .expect("connection remained open");
+        match env.kind {
+            FrameKind::NewAgent => publications += 1,
+            FrameKind::CommandError => terminals += 1,
+            FrameKind::SessionList => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        publications, 1,
+        "published spawn must remain visible exactly once"
+    );
+    assert_eq!(
+        terminals, 0,
+        "post-publication cancellation must not emit an error"
+    );
+}
+
+#[tokio::test]
+async fn detached_spawn_bootstraps_before_follow_up_is_admitted() {
+    let mut fixture = Fixture::new().await;
+    let startup_gate = fixture
+        .host_for_test()
+        .install_agent_startup_completion_test_gate("Bootstrap First");
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("Bootstrap First".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "initial detached spawn turn".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("submit spawn held during backend startup");
+    startup_gate.wait_until_entered().await;
+
+    let env = expect_kind(&mut fixture.client, FrameKind::NewAgent, "early NewAgent").await;
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse NewAgent");
+    for message in ["first immediate follow-up", "second immediate follow-up"] {
+        fixture
+            .client
+            .send_message(&new_agent.instance_stream, message.to_owned())
+            .await
+            .expect("send immediate follow-up during startup");
+    }
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list sessions while advertised agent is still starting");
+    loop {
+        let env = fixture
+            .client
+            .next_event()
+            .await
+            .expect("read command while advertised agent is starting")
+            .expect("connection remained open");
+        assert_ne!(env.kind, FrameKind::CommandError);
+        assert_ne!(env.kind, FrameKind::AgentError);
+        if env.stream == new_agent.instance_stream {
+            assert_ne!(
+                env.kind,
+                FrameKind::AgentBootstrap,
+                "startup gate must still hold the actor bootstrap"
+            );
+        }
+        if env.kind == FrameKind::SessionList {
+            break;
+        }
+    }
+
+    startup_gate.release_one();
+    let bootstrap = loop {
+        let env = fixture
+            .client
+            .next_event()
+            .await
+            .expect("read startup AgentBootstrap")
+            .expect("connection remained open");
+        assert_ne!(env.kind, FrameKind::CommandError);
+        if env.stream != new_agent.instance_stream {
+            continue;
+        }
+        assert_eq!(
+            env.kind,
+            FrameKind::AgentBootstrap,
+            "AgentBootstrap must be the first frame on the advertised agent stream"
+        );
+        assert_eq!(env.seq, 0);
+        break env
+            .parse_payload::<AgentBootstrapPayload>()
+            .expect("parse startup AgentBootstrap");
+    };
+    assert!(
+        bootstrap
+            .events
+            .iter()
+            .all(|event| !matches!(event, AgentBootstrapEvent::AgentError(_))),
+        "startup input admission must not synthesize an error"
+    );
+
+    let expected = [
+        "[startup_mcp_servers: tyde-agent-control(http), tyde-agent-await(http)] mock backend response to: initial detached spawn turn",
+        "[startup_mcp_servers: tyde-agent-control(http), tyde-agent-await(http)] mock backend response to: first immediate follow-up",
+        "[startup_mcp_servers: tyde-agent-control(http), tyde-agent-await(http)] mock backend response to: second immediate follow-up",
+    ];
+    let mut completed = Vec::new();
+    while completed.len() < expected.len() {
+        let env = fixture
+            .client
+            .next_event()
+            .await
+            .expect("read live startup and pending-input turns")
+            .expect("connection remained open");
+        assert_ne!(env.kind, FrameKind::CommandError);
+        if env.stream != new_agent.instance_stream {
+            continue;
+        }
+        assert_ne!(env.kind, FrameKind::AgentError);
+        if env.kind != FrameKind::ChatEvent {
+            continue;
+        }
+        let event: ChatEvent = env.parse_payload().expect("parse live ChatEvent");
+        if let ChatEvent::StreamEnd(end) = event {
+            completed.push(end.message.content);
+        }
+    }
+    assert_eq!(
+        completed,
+        expected.map(|value| value.to_owned()),
+        "initial turn must stay first and startup inputs must drain FIFO"
+    );
+}
+
+#[tokio::test]
+async fn startup_fanout_advertises_all_subscribers_before_any_attach_wait() {
+    let mut fixture = Fixture::new().await;
+    let (mut second_client, second_bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(second_bootstrap.agents.is_empty());
+    let startup_gate = fixture
+        .host_for_test()
+        .install_agent_startup_completion_test_gate("Two Subscriber Startup");
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("Two Subscriber Startup".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "held two-subscriber startup".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn held two-subscriber agent");
+    startup_gate.wait_until_entered().await;
+
+    let first_env = expect_kind(
+        &mut fixture.client,
+        FrameKind::NewAgent,
+        "first subscriber early NewAgent",
+    )
+    .await;
+    let first: NewAgentPayload = first_env.parse_payload().expect("parse first NewAgent");
+    let second_env = expect_kind(
+        &mut second_client,
+        FrameKind::NewAgent,
+        "second subscriber early NewAgent",
+    )
+    .await;
+    let second: NewAgentPayload = second_env.parse_payload().expect("parse second NewAgent");
+    assert_eq!(second.agent_id, first.agent_id);
+
+    for (client, stream, label) in [
+        (
+            &mut fixture.client,
+            first.instance_stream.clone(),
+            "first subscriber",
+        ),
+        (
+            &mut second_client,
+            second.instance_stream.clone(),
+            "second subscriber",
+        ),
+    ] {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, client.next_event()).await {
+                Err(_) => break,
+                Ok(Ok(Some(env))) if env.stream != stream => continue,
+                Ok(Ok(Some(env))) => panic!(
+                    "{label} received pre-bootstrap agent event {} while startup was held",
+                    env.kind
+                ),
+                Ok(Ok(None)) => panic!("{label} connection closed while startup was held"),
+                Ok(Err(error)) => panic!("{label} read failed while startup was held: {error:?}"),
+            }
+        }
+    }
+
+    startup_gate.release_one();
+    for (client, stream, label) in [
+        (
+            &mut fixture.client,
+            first.instance_stream.clone(),
+            "first subscriber",
+        ),
+        (
+            &mut second_client,
+            second.instance_stream.clone(),
+            "second subscriber",
+        ),
+    ] {
+        loop {
+            let env = client
+                .next_event()
+                .await
+                .expect("read released startup event")
+                .expect("connection remained open");
+            if env.stream != stream {
+                continue;
+            }
+            assert_eq!(env.kind, FrameKind::AgentBootstrap, "{label}");
+            assert_eq!(env.seq, 0, "{label} Bootstrap must be seq0");
+            let bootstrap: AgentBootstrapPayload =
+                env.parse_payload().expect("parse released AgentBootstrap");
+            assert!(matches!(
+                bootstrap.events.first(),
+                Some(AgentBootstrapEvent::AgentStart(_))
+            ));
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn held_resume_does_not_block_later_connection_request() {
+    let mut fixture = Fixture::new().await;
+    let (original, session_id) =
+        spawn_named_session(&mut fixture, "Resume HOL Source", BackendKind::Claude).await;
+    fixture
+        .client
+        .close_agent(&original.instance_stream)
+        .await
+        .expect("close resume source");
+    let _ = expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentClosed,
+        "resume source AgentClosed",
+    )
+    .await;
+    expect_no_event(
+        &mut fixture.client,
+        Duration::from_millis(50),
+        "resume source close drain",
+    )
+    .await;
+
+    let startup_gate = fixture
+        .host_for_test()
+        .install_agent_startup_completion_test_gate("Held Resume");
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("Held Resume".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id,
+                prompt: Some("resume while startup is held".to_owned()),
+            },
+        })
+        .await
+        .expect("send held resume");
+    startup_gate.wait_until_entered().await;
+    let env = expect_kind(
+        &mut fixture.client,
+        FrameKind::NewAgent,
+        "held resume NewAgent",
+    )
+    .await;
+    let resumed: NewAgentPayload = env.parse_payload().expect("parse held resume NewAgent");
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list sessions behind held resume");
+    loop {
+        let env = fixture
+            .client
+            .next_event()
+            .await
+            .expect("read request behind held resume")
+            .expect("connection remained open");
+        if env.stream == resumed.instance_stream {
+            panic!("held resume emitted {} before Bootstrap release", env.kind);
+        }
+        if env.kind == FrameKind::SessionList {
+            break;
+        }
+    }
+    startup_gate.release_one();
+}
+
+#[tokio::test]
+async fn held_fork_does_not_block_later_connection_request() {
+    let mut fixture = Fixture::new().await;
+    let (parent, session_id) =
+        spawn_named_session(&mut fixture, "Fork HOL Source", BackendKind::Claude).await;
+    let startup_gate = fixture
+        .host_for_test()
+        .install_agent_startup_completion_test_gate("Held Fork");
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("Held Fork".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: Some(parent.agent_id.clone()),
+            project_id: None,
+            params: SpawnAgentParams::Fork {
+                from_session_id: session_id,
+                prompt: "fork while startup is held".to_owned(),
+                images: None,
+                access_mode: Default::default(),
+            },
+        })
+        .await
+        .expect("send held fork");
+    startup_gate.wait_until_entered().await;
+    let env = expect_kind(
+        &mut fixture.client,
+        FrameKind::NewAgent,
+        "held fork NewAgent",
+    )
+    .await;
+    let forked: NewAgentPayload = env.parse_payload().expect("parse held fork NewAgent");
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list sessions behind held fork");
+    loop {
+        let env = fixture
+            .client
+            .next_event()
+            .await
+            .expect("read request behind held fork")
+            .expect("connection remained open");
+        if env.stream == forked.instance_stream {
+            panic!("held fork emitted {} before Bootstrap release", env.kind);
+        }
+        if env.kind == FrameKind::SessionList {
+            break;
+        }
+    }
+    startup_gate.release_one();
+}
+
+#[tokio::test]
+async fn unavailable_new_schema_without_settings_is_typed_and_not_reprobed() {
+    let mut fixture = Fixture::new().await;
+    let host = fixture.host_for_test();
+    host.set_session_schema_unavailable_for_test(
+        BackendKind::Codex,
+        "controlled unavailable New schema",
+    )
+    .await;
+    let probe_count = host.session_schema_probe_count_for_test().await;
+
+    for attempt in 0..2 {
+        fixture
+            .client
+            .spawn_agent(SpawnAgentPayload {
+                name: Some(format!("Unavailable New {attempt}")),
+                custom_agent_id: None,
+                parent_agent_id: None,
+                project_id: None,
+                params: SpawnAgentParams::New {
+                    workspace_roots: vec!["/tmp/test".to_owned()],
+                    prompt: format!("unavailable New attempt {attempt}"),
+                    images: None,
+                    backend_kind: BackendKind::Codex,
+                    launch_profile_id: None,
+                    cost_hint: None,
+                    access_mode: Default::default(),
+                    session_settings: None,
+                },
+            })
+            .await
+            .expect("send unavailable-schema New");
+        let env = expect_kind(
+            &mut fixture.client,
+            FrameKind::NewAgent,
+            "unavailable-schema NewAgent",
+        )
+        .await;
+        let spawned: NewAgentPayload = env
+            .parse_payload()
+            .expect("parse unavailable-schema NewAgent");
+        let bootstrap = loop {
+            let env = fixture
+                .client
+                .next_event()
+                .await
+                .expect("read unavailable-schema New AgentBootstrap")
+                .expect("connection remained open");
+            assert_ne!(
+                env.kind,
+                FrameKind::CommandError,
+                "schema startup failure must not be a router frame"
+            );
+            if env.stream != spawned.instance_stream {
+                continue;
+            }
+            assert_eq!(env.kind, FrameKind::AgentBootstrap);
+            assert_eq!(env.seq, 0);
+            break env
+                .parse_payload::<AgentBootstrapPayload>()
+                .expect("parse unavailable-schema New AgentBootstrap");
+        };
+        let errors = bootstrap
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                AgentBootstrapEvent::AgentError(error) => Some(error),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            errors.len(),
+            1,
+            "schema failure must be emitted exactly once"
+        );
+        assert!(errors[0].fatal);
+        assert_eq!(errors[0].code, AgentErrorCode::BackendFailed);
+        assert!(
+            errors[0]
+                .message
+                .contains("controlled unavailable New schema")
+        );
+        assert_eq!(
+            host.session_schema_probe_count_for_test().await,
+            probe_count,
+            "authoritative Unavailable schema must not trigger another New probe"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unavailable_resume_schema_is_typed_and_not_reprobed() {
+    let mut fixture = Fixture::new().await;
+    let host = fixture.host_for_test();
+    host.set_session_schema_ready_for_test(BackendKind::Codex)
+        .await;
+    let (original, session_id) = spawn_named_session(
+        &mut fixture,
+        "Unavailable Schema Source",
+        BackendKind::Codex,
+    )
+    .await;
+    fixture
+        .client
+        .close_agent(&original.instance_stream)
+        .await
+        .expect("close unavailable-schema source");
+    let _ = expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentClosed,
+        "unavailable-schema source AgentClosed",
+    )
+    .await;
+    expect_no_event(
+        &mut fixture.client,
+        Duration::from_millis(50),
+        "unavailable-schema source close drain",
+    )
+    .await;
+
+    host.set_session_schema_unavailable_for_test(
+        BackendKind::Codex,
+        "controlled unavailable schema",
+    )
+    .await;
+    let probe_count = host.session_schema_probe_count_for_test().await;
+    for attempt in 0..2 {
+        fixture
+            .client
+            .spawn_agent(SpawnAgentPayload {
+                name: Some(format!("Unavailable Resume {attempt}")),
+                custom_agent_id: None,
+                parent_agent_id: None,
+                project_id: None,
+                params: SpawnAgentParams::Resume {
+                    session_id: session_id.clone(),
+                    prompt: Some(format!("unavailable attempt {attempt}")),
+                },
+            })
+            .await
+            .expect("send unavailable-schema resume");
+        let env = expect_kind(
+            &mut fixture.client,
+            FrameKind::NewAgent,
+            "unavailable-schema NewAgent",
+        )
+        .await;
+        let resumed: NewAgentPayload = env
+            .parse_payload()
+            .expect("parse unavailable-schema NewAgent");
+        let bootstrap = expect_raw_agent_bootstrap_on_stream(
+            &mut fixture.client,
+            &resumed.instance_stream,
+            "unavailable-schema AgentBootstrap",
+        )
+        .await;
+        let error = bootstrap
+            .events
+            .iter()
+            .find_map(|event| match event {
+                AgentBootstrapEvent::AgentError(error) => Some(error),
+                _ => None,
+            })
+            .expect("unavailable schema must be fatal in Bootstrap");
+        assert!(error.fatal);
+        assert_eq!(error.code, AgentErrorCode::BackendFailed);
+        assert!(error.message.contains("controlled unavailable schema"));
+        assert_eq!(
+            host.session_schema_probe_count_for_test().await,
+            probe_count,
+            "authoritative Unavailable schema must not trigger another probe"
+        );
+    }
+}
+
+#[tokio::test]
+async fn terminal_startup_failure_bootstraps_before_immediate_rejection() {
+    let mut fixture = Fixture::new().await;
+    let startup_gate = fixture
+        .host_for_test()
+        .install_agent_startup_completion_test_gate("Terminal Bootstrap First");
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("Terminal Bootstrap First".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "__mock_fail_spawn__".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Tycode,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("submit terminal startup failure");
+    startup_gate.wait_until_entered().await;
+
+    let env = expect_kind(
+        &mut fixture.client,
+        FrameKind::NewAgent,
+        "terminal startup-failure NewAgent",
+    )
+    .await;
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse terminal NewAgent");
+    fixture
+        .client
+        .send_message(
+            &new_agent.instance_stream,
+            "immediate terminal follow-up".to_owned(),
+        )
+        .await
+        .expect("enqueue immediate input for terminal actor");
+    startup_gate.release_one();
+
+    let bootstrap = loop {
+        let env = fixture
+            .client
+            .next_event()
+            .await
+            .expect("read terminal AgentBootstrap")
+            .expect("connection remained open");
+        assert_ne!(
+            env.kind,
+            FrameKind::CommandError,
+            "terminal input rejection must not be a router frame"
+        );
+        if env.stream != new_agent.instance_stream {
+            continue;
+        }
+        assert_eq!(env.kind, FrameKind::AgentBootstrap);
+        assert_eq!(env.seq, 0);
+        break env
+            .parse_payload::<AgentBootstrapPayload>()
+            .expect("parse terminal AgentBootstrap");
+    };
+    assert_eq!(
+        bootstrap
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                AgentBootstrapEvent::AgentError(error)
+                    if error.fatal
+                        && error.code == AgentErrorCode::BackendFailed
+                        && error.message.contains("mock backend forced spawn failure")
+            ))
+            .count(),
+        1,
+        "terminal Bootstrap must contain the fatal startup error exactly once"
+    );
+    assert!(
+        bootstrap.events.iter().all(|event| !matches!(
+            event,
+            AgentBootstrapEvent::AgentError(error)
+                if !error.fatal && error.message == "agent not running"
+        )),
+        "the immediate input rejection must follow Bootstrap as a live actor event"
+    );
+
+    let rejection = loop {
+        let env = fixture
+            .client
+            .next_event()
+            .await
+            .expect("read live terminal input rejection")
+            .expect("connection remained open");
+        assert_ne!(
+            env.kind,
+            FrameKind::CommandError,
+            "terminal input rejection must never come from the router"
+        );
+        if env.stream != new_agent.instance_stream {
+            continue;
+        }
+        assert_eq!(env.kind, FrameKind::AgentError);
+        break env
+            .parse_payload::<protocol::AgentErrorPayload>()
+            .expect("parse live terminal rejection");
+    };
+    assert_eq!(rejection.agent_id, new_agent.agent_id);
+    assert_eq!(rejection.code, AgentErrorCode::Internal);
+    assert_eq!(rejection.message, "agent not running");
+    assert!(!rejection.fatal);
+
+    let (mut late_client, late_host_bootstrap) = fixture.connect_with_bootstrap().await;
+    let late_agent = bootstrapped_agent(&late_host_bootstrap, &new_agent.agent_id);
+    let late_bootstrap = loop {
+        let env = late_client
+            .next_event()
+            .await
+            .expect("read late terminal replay")
+            .expect("late connection remained open");
+        if env.stream != late_agent.instance_stream {
+            continue;
+        }
+        assert_eq!(env.kind, FrameKind::AgentBootstrap);
+        assert_eq!(env.seq, 0);
+        break env
+            .parse_payload::<AgentBootstrapPayload>()
+            .expect("parse late terminal AgentBootstrap");
+    };
+    assert_eq!(
+        late_bootstrap
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                AgentBootstrapEvent::AgentError(error)
+                    if error.fatal
+                        && error.code == AgentErrorCode::BackendFailed
+                        && error.message.contains("mock backend forced spawn failure")
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        late_bootstrap
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                AgentBootstrapEvent::AgentError(error)
+                    if !error.fatal
+                        && error.code == AgentErrorCode::Internal
+                        && error.message == "agent not running"
+            ))
+            .count(),
+        1,
+        "late replay proves the live rejection came from the actor log, not the router"
+    );
+
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("terminal exact-once barrier");
+    loop {
+        let env = fixture
+            .client
+            .next_event()
+            .await
+            .expect("read terminal exact-once barrier")
+            .expect("connection remained open");
+        assert_ne!(env.kind, FrameKind::CommandError);
+        if env.stream == new_agent.instance_stream {
+            assert_ne!(env.kind, FrameKind::AgentBootstrap);
+            assert_ne!(
+                env.kind,
+                FrameKind::AgentError,
+                "one input must append exactly one typed rejection"
+            );
+        }
+        if env.kind == FrameKind::SessionList {
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn concurrent_spawn_shutdown_waiters_share_one_drain() {
+    let fixture = Fixture::new().await;
+    let gate = fixture.install_spawn_operation_drain_test_gate();
+    let first_host = fixture.host_for_test();
+    let second_host = fixture.host_for_test();
+    let first = tokio::spawn(async move {
+        first_host.shutdown_spawn_operations().await;
+    });
+    let second = tokio::spawn(async move {
+        second_host.shutdown_spawn_operations().await;
+    });
+
+    gate.wait_until_entered().await;
+    assert!(!first.is_finished());
+    assert!(!second.is_finished());
+    gate.release_one();
+    first.await.expect("first shutdown waiter completed");
+    second.await.expect("second shutdown waiter completed");
+}
+
+#[tokio::test]
+async fn cancelled_first_spawn_shutdown_waiter_does_not_own_drain() {
+    let fixture = Fixture::new().await;
+    let gate = fixture.install_spawn_operation_drain_test_gate();
+    let first_host = fixture.host_for_test();
+    let first = tokio::spawn(async move {
+        first_host.shutdown_spawn_operations().await;
+    });
+
+    gate.wait_until_entered().await;
+    first.abort();
+    assert!(
+        first
+            .await
+            .expect_err("first shutdown waiter was cancelled")
+            .is_cancelled()
+    );
+
+    let second_host = fixture.host_for_test();
+    let second = tokio::spawn(async move {
+        second_host.shutdown_spawn_operations().await;
+    });
+    assert!(!second.is_finished());
+    gate.release_one();
+    second.await.expect("replacement shutdown waiter completed");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn uds_host_owner_waits_for_spawn_operation_drain_on_entry_failure() {
+    let fixture = Fixture::new().await;
+    let gate = fixture.install_spawn_operation_drain_test_gate();
+    let occupied_path = tempfile::NamedTempFile::new().expect("create occupied UDS path");
+    let socket_path = occupied_path.path().to_path_buf();
+    let host = fixture.host_for_test();
+    let listener = tokio::spawn(async move {
+        server::listen_uds(socket_path, server::ServerConfig::current(), host).await
+    });
+
+    gate.wait_until_entered().await;
+    assert!(
+        !listener.is_finished(),
+        "UDS lifecycle owner returned before the shared drain completed"
+    );
+    gate.release_one();
+    assert!(
+        listener
+            .await
+            .expect("UDS lifecycle task completed")
+            .is_err(),
+        "occupied UDS path must preserve the entry-point error"
+    );
+}
+
+#[tokio::test]
+async fn failed_generated_name_keeps_agent_and_emits_typed_nonfatal_error() {
+    let mut fixture = Fixture::new().await;
+    let gate = fixture.install_agent_name_test_gate().await;
 
     fixture
         .client
@@ -5902,7 +7236,7 @@ async fn failed_generated_name_keeps_prompt_derived_name() {
                 workspace_roots: vec!["/tmp/test".to_owned()],
                 prompt: "__mock_fail_agent_name__".to_owned(),
                 images: None,
-                backend_kind: BackendKind::Codex,
+                backend_kind: BackendKind::Claude,
                 launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
@@ -5910,34 +7244,58 @@ async fn failed_generated_name_keeps_prompt_derived_name() {
             },
         })
         .await
-        .expect("spawn with failing generated name must still write");
-
-    let env = expect_next_event(&mut fixture.client, "prompt-derived NewAgent").await;
-    assert_eq!(
-        env.kind,
-        FrameKind::NewAgent,
-        "a naming failure must not block or fail the spawn"
-    );
-    let new_agent: NewAgentPayload = env.parse_payload().expect("parse NewAgent");
-    assert_eq!(
-        new_agent.name, "Image Review Task",
-        "the spawn keeps the prompt-derived fallback name"
-    );
-
-    expect_no_agent_rename(
+        .expect("failed generated-name spawn write");
+    assert_eq!(gate.wait_until_entered().await, 0);
+    let env = expect_kind(
         &mut fixture.client,
-        Duration::from_millis(200),
-        "failed name generation",
+        FrameKind::NewAgent,
+        "name failure provisional NewAgent",
     )
     .await;
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse provisional NewAgent");
+    let start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "name failure AgentStart",
+    )
+    .await;
+    assert_eq!(start.name, new_agent.name);
 
-    let (_late_client, bootstrap) = fixture.connect_with_bootstrap().await;
-    assert_eq!(
-        bootstrap.agents.len(),
-        1,
-        "the agent stays registered and visible despite the naming failure"
-    );
-    assert_eq!(bootstrap.agents[0].name, "Image Review Task");
+    gate.release_one();
+    let error = loop {
+        let env = fixture
+            .client
+            .next_event()
+            .await
+            .expect("read typed generated-name failure")
+            .expect("connection remained open");
+        assert_ne!(
+            env.kind,
+            FrameKind::CommandError,
+            "name generation failure must not become a router frame"
+        );
+        if env.kind == FrameKind::AgentError && env.stream == new_agent.instance_stream {
+            break env
+                .parse_payload::<AgentErrorPayload>()
+                .expect("parse generated-name AgentError");
+        }
+    };
+    assert_eq!(error.code, AgentErrorCode::Internal);
+    assert!(!error.fatal);
+    assert!(error.message.contains("mock agent name generation failure"));
+    assert_eq!(gate.wait_until_completed().await, 0);
+
+    let (mut late_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    let late_agent = bootstrapped_agent(&bootstrap, &new_agent.agent_id);
+    assert_eq!(late_agent.name, new_agent.name);
+    let replayed = expect_agent_error_containing(
+        &mut late_client,
+        &late_agent.instance_stream,
+        "mock agent name generation failure",
+        "replayed generated-name failure",
+    )
+    .await;
+    assert!(!replayed.fatal);
 }
 
 #[tokio::test]

@@ -420,9 +420,11 @@ The server:
 2. Merges with current settings (partial update).
 3. Forwards to the agent actor as `AgentInput::UpdateSessionSettings`.
 4. The agent actor waits for the backend to acknowledge the update; Codex does
-   not acknowledge until `thread/update` succeeds. This applies to fresh,
-   resumed, and forked Codex sessions; each session updates the live values
-   used by later `turn/start` calls only after that provider acknowledgement.
+   not acknowledge until the flat camelCase `thread/settings/update` request
+   succeeds. Omitted fields remain omitted and explicit nulls remain null in
+   that provider request. This applies to fresh, resumed, and forked Codex
+   sessions; each session updates the live values used by later `turn/start`
+   calls only after that provider acknowledgement.
 5. Only after acknowledgement does it persist and emit the full effective
    settings as `SessionSettings`. A provider rejection emits `AgentError` and
    leaves the prior settings unchanged.

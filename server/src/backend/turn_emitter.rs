@@ -54,11 +54,18 @@ struct TurnEmitterState {
     stream_open: bool,
     assistant_turn_open: bool,
     current_stream_message_id: Option<ChatMessageId>,
+    synthetic_tool_container_id: Option<ChatMessageId>,
+    synthetic_tool_call_ids: Vec<String>,
     terminal_stream_message_ids: HashSet<ChatMessageId>,
     identity_violation_reported: bool,
-    emitted_tool_requests: IndexMap<String, String>,
+    emitted_tool_requests: IndexMap<String, EmittedToolRequest>,
     completed_tool_requests: HashSet<String>,
     normalization_failures: HashMap<String, ToolExecutionNormalizationFailure>,
+}
+
+struct EmittedToolRequest {
+    name: String,
+    arguments: Value,
 }
 
 // =============================================================================
@@ -143,6 +150,8 @@ impl TurnEmitter {
                 stream_open: false,
                 assistant_turn_open: false,
                 current_stream_message_id: None,
+                synthetic_tool_container_id: None,
+                synthetic_tool_call_ids: Vec::new(),
                 terminal_stream_message_ids: HashSet::new(),
                 identity_violation_reported: false,
                 emitted_tool_requests: IndexMap::new(),
@@ -232,11 +241,32 @@ impl TurnEmitter {
             .discard_open_stream_with_identity_violation(violation);
     }
 
+    /// Rejects a provider identity reserved before any Tyde stream was
+    /// published. The failure remains visible, but there is no stream to close.
+    pub fn reject_reserved_stream_with_identity_violation(
+        &self,
+        violation: StreamIdentityViolation,
+    ) {
+        self.lock()
+            .reject_reserved_stream_with_identity_violation(violation);
+    }
+
     // ---------- Tool pairing (protocol-ordered) ----------
 
     pub fn tool_request(&self, tool_call_id: &str, tool_name: &str, tool_type: Value) {
-        self.lock()
+        let _ = self
+            .lock()
             .tool_request(tool_call_id, tool_name, tool_type, None);
+    }
+
+    pub fn tool_request_in_container(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        tool_type: Value,
+    ) -> Option<ChatMessageId> {
+        self.lock()
+            .tool_request(tool_call_id, tool_name, tool_type, None)
     }
 
     pub fn tool_request_with_normalization_failure(
@@ -246,7 +276,7 @@ impl TurnEmitter {
         tool_type: Value,
         normalization_failure: ToolExecutionNormalizationFailure,
     ) {
-        self.lock().tool_request(
+        let _ = self.lock().tool_request(
             tool_call_id,
             tool_name,
             tool_type,
@@ -254,17 +284,60 @@ impl TurnEmitter {
         );
     }
 
-    pub fn tool_completed(&self, data: ToolCompletedPayload<'_>) {
-        self.lock().tool_completed(data, None);
+    pub fn tool_request_in_container_with_normalization_failure(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        tool_type: Value,
+        normalization_failure: ToolExecutionNormalizationFailure,
+    ) -> Option<ChatMessageId> {
+        self.lock().tool_request(
+            tool_call_id,
+            tool_name,
+            tool_type,
+            Some(normalization_failure),
+        )
+    }
+
+    pub fn close_tool_container(&self, message_id: ChatMessageId) {
+        self.lock().close_tool_container(message_id);
+    }
+
+    pub fn tool_call_declarations(&self, tool_call_ids: &[String]) -> Vec<Value> {
+        let state = self.lock();
+        tool_call_ids
+            .iter()
+            .filter_map(|tool_call_id| {
+                state
+                    .emitted_tool_requests
+                    .get(tool_call_id)
+                    .map(|request| {
+                        json!({
+                            "id": tool_call_id,
+                            "name": request.name.clone(),
+                            "arguments": request.arguments.clone(),
+                        })
+                    })
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_open_stream(&self) -> bool {
+        self.lock().stream_open
+    }
+
+    pub fn tool_completed(&self, data: ToolCompletedPayload<'_>) -> Option<ChatMessageId> {
+        self.lock().tool_completed(data, None)
     }
 
     pub fn tool_completed_with_normalization_failure(
         &self,
         data: ToolCompletedPayload<'_>,
         normalization_failure: ToolExecutionNormalizationFailure,
-    ) {
+    ) -> Option<ChatMessageId> {
         self.lock()
-            .tool_completed(data, Some(normalization_failure));
+            .tool_completed(data, Some(normalization_failure))
     }
 
     /// Live progress snapshot for a tool call. Deliberately stateless:
@@ -554,8 +627,6 @@ impl TurnEmitterState {
             self.stream_identity_violation(StreamIdentityViolation::ForeignActiveMessageId);
             return;
         }
-        self.complete_pending_tools_as_cancelled("Tool execution was cancelled before new stream");
-
         self.identity_violation_reported = false;
         self.stream_open = true;
         self.assistant_turn_open = true;
@@ -626,6 +697,9 @@ impl TurnEmitterState {
         }
         self.stream_open = false;
         self.current_stream_message_id = None;
+        if self.synthetic_tool_container_id.as_ref() == Some(&message_id) {
+            self.synthetic_tool_container_id = None;
+        }
         self.terminal_stream_message_ids.insert(message_id.clone());
         self.send(build_stream_end_value(
             &payload,
@@ -635,9 +709,6 @@ impl TurnEmitterState {
     }
 
     fn assistant_message(&mut self, payload: AssistantMessagePayload<'_>) {
-        self.complete_pending_tools_as_cancelled(
-            "Tool execution was cancelled before assistant message",
-        );
         self.assistant_turn_open = true;
         self.identity_violation_reported = false;
         self.send(build_assistant_message_value(&payload));
@@ -679,15 +750,17 @@ impl TurnEmitterState {
         tool_name: &str,
         tool_type: Value,
         normalization_failure: Option<ToolExecutionNormalizationFailure>,
-    ) {
-        if !self.assistant_turn_open {
-            self.ensure_assistant_turn_open(tool_call_id);
-        }
+    ) -> Option<ChatMessageId> {
+        let opened_container = if !self.assistant_turn_open {
+            self.ensure_assistant_turn_open(tool_call_id)
+        } else {
+            None
+        };
         if self.is_tool_pending(tool_call_id) {
             let existing_name = self
                 .emitted_tool_requests
                 .get(tool_call_id)
-                .cloned()
+                .map(|request| request.name.clone())
                 .unwrap_or_else(|| tool_name.to_string());
             self.send_tool_completed(
                 tool_call_id,
@@ -707,8 +780,21 @@ impl TurnEmitterState {
                 self.normalization_failures.remove(tool_call_id);
             }
         }
-        self.emitted_tool_requests
-            .insert(tool_call_id.to_string(), tool_name.to_string());
+        self.emitted_tool_requests.insert(
+            tool_call_id.to_string(),
+            EmittedToolRequest {
+                name: tool_name.to_string(),
+                arguments: tool_type.clone(),
+            },
+        );
+        if self.synthetic_tool_container_id.is_some()
+            && !self
+                .synthetic_tool_call_ids
+                .iter()
+                .any(|id| id == tool_call_id)
+        {
+            self.synthetic_tool_call_ids.push(tool_call_id.to_string());
+        }
         self.send(json!({
             "kind": "ToolRequest",
             "data": {
@@ -717,13 +803,15 @@ impl TurnEmitterState {
                 "tool_type": tool_type,
             },
         }));
+        opened_container
     }
 
     fn tool_completed(
         &mut self,
         data: ToolCompletedPayload<'_>,
         normalization_failure: Option<ToolExecutionNormalizationFailure>,
-    ) {
+    ) -> Option<ChatMessageId> {
+        let mut opened_container = None;
         match self.pending_tool_name(data.tool_call_id).cloned() {
             Some(expected_name) if expected_name != data.tool_name => {
                 self.send_tool_completed(
@@ -733,7 +821,7 @@ impl TurnEmitterState {
                     false,
                     Some("Tool completion name mismatch was superseded"),
                 );
-                self.tool_request(
+                opened_container = self.tool_request(
                     data.tool_call_id,
                     data.tool_name,
                     json!({
@@ -748,7 +836,7 @@ impl TurnEmitterState {
             }
             Some(_) => {}
             None => {
-                self.tool_request(
+                opened_container = self.tool_request(
                     data.tool_call_id,
                     data.tool_name,
                     json!({
@@ -774,6 +862,7 @@ impl TurnEmitterState {
             data.error,
             normalization_failure,
         );
+        opened_container
     }
 
     fn send_tool_completed(
@@ -828,7 +917,11 @@ impl TurnEmitterState {
 
     fn abort(&mut self, cancellation_message: &str) {
         if let Some(message_id) = self.current_stream_message_id.clone() {
-            self.stream_end(message_id, StreamEndPayload::default());
+            if self.synthetic_tool_container_id.as_ref() == Some(&message_id) {
+                self.close_tool_container(message_id);
+            } else {
+                self.stream_end(message_id, StreamEndPayload::default());
+            }
         }
 
         self.complete_pending_tools_as_cancelled("Tool execution was cancelled by user");
@@ -852,16 +945,57 @@ impl TurnEmitterState {
         Some(message_id)
     }
 
-    fn ensure_assistant_turn_open(&mut self, message_id: &str) {
+    fn ensure_assistant_turn_open(&mut self, message_id: &str) -> Option<ChatMessageId> {
         if !self.assistant_turn_open {
-            self.open_synthetic_stream(message_id);
+            return self.open_synthetic_stream(message_id);
+        }
+        None
+    }
+
+    fn open_synthetic_stream(&mut self, message_id: &str) -> Option<ChatMessageId> {
+        let message_id = required_message_id(message_id)?;
+        let agent = self.default_agent.clone();
+        let model = self.default_model.clone();
+        self.stream_start(message_id.clone(), AgentName(&agent), model.as_deref());
+        if self.stream_open && self.current_stream_message_id.as_ref() == Some(&message_id) {
+            self.synthetic_tool_container_id = Some(message_id.clone());
+            Some(message_id)
+        } else {
+            None
         }
     }
 
-    fn open_synthetic_stream(&mut self, message_id: &str) {
-        let agent = self.default_agent.clone();
-        let model = self.default_model.clone();
-        self.stream_start_legacy(message_id, AgentName(&agent), model.as_deref());
+    fn close_tool_container(&mut self, message_id: ChatMessageId) {
+        if self.synthetic_tool_container_id.as_ref() != Some(&message_id)
+            || !self.stream_open
+            || self.current_stream_message_id.as_ref() != Some(&message_id)
+        {
+            self.stream_identity_violation(StreamIdentityViolation::MismatchedEndMessageId);
+            return;
+        }
+        let tool_calls = self
+            .synthetic_tool_call_ids
+            .iter()
+            .filter_map(|tool_call_id| {
+                self.emitted_tool_requests.get(tool_call_id).map(|request| {
+                    json!({
+                        "id": tool_call_id,
+                        "name": request.name.clone(),
+                        "arguments": request.arguments.clone(),
+                    })
+                })
+            })
+            .collect();
+        self.stream_end(
+            message_id,
+            StreamEndPayload {
+                tool_calls,
+                ..StreamEndPayload::default()
+            },
+        );
+        self.synthetic_tool_container_id = None;
+        self.synthetic_tool_call_ids.clear();
+        self.assistant_turn_open = false;
     }
 
     fn stream_identity_violation(&mut self, violation: StreamIdentityViolation) {
@@ -902,12 +1036,39 @@ impl TurnEmitterState {
         }));
     }
 
+    fn reject_reserved_stream_with_identity_violation(
+        &mut self,
+        violation: StreamIdentityViolation,
+    ) {
+        if self.identity_violation_reported {
+            return;
+        }
+        if self.stream_open {
+            self.discard_open_stream_with_identity_violation(violation);
+            return;
+        }
+        self.identity_violation_reported = true;
+        self.reset_turn_state();
+        self.send(json!({
+            "kind": "Error",
+            "data": stream_identity_violation_message(violation),
+        }));
+        self.send(json!({
+            "kind": "OperationCancelled",
+            "data": { "message": "Stream identity violation" },
+        }));
+        self.send(json!({
+            "kind": "TypingStatusChanged",
+            "data": false,
+        }));
+    }
+
     fn complete_pending_tools_as_cancelled(&mut self, detailed_message: &str) {
         let pending: Vec<(String, String)> = self
             .emitted_tool_requests
             .iter()
             .filter(|(id, _)| !self.completed_tool_requests.contains(*id))
-            .map(|(id, name)| (id.clone(), name.clone()))
+            .map(|(id, request)| (id.clone(), request.name.clone()))
             .collect();
 
         for (tool_call_id, tool_name) in pending {
@@ -924,6 +1085,7 @@ impl TurnEmitterState {
     fn pending_tool_name(&self, tool_call_id: &str) -> Option<&String> {
         self.emitted_tool_requests
             .get(tool_call_id)
+            .map(|request| &request.name)
             .filter(|_| !self.completed_tool_requests.contains(tool_call_id))
     }
 
@@ -935,6 +1097,8 @@ impl TurnEmitterState {
         self.stream_open = false;
         self.assistant_turn_open = false;
         self.current_stream_message_id = None;
+        self.synthetic_tool_container_id = None;
+        self.synthetic_tool_call_ids.clear();
         self.emitted_tool_requests.clear();
         self.completed_tool_requests.clear();
         self.normalization_failures.clear();
@@ -1878,6 +2042,160 @@ mod tests {
         let events = recv_events(&mut rx);
         assert_protocol_valid(&events);
         assert_eq!(event_kinds(&events), vec!["StreamStart", "ToolRequest"]);
+    }
+
+    #[test]
+    fn explicit_tool_container_closes_before_real_stream_without_losing_tool_card() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new_for_agent(tx, AgentName("codex"));
+        let container = emitter
+            .tool_request_in_container("tool-a", "run_command", run_command_request())
+            .expect("tool-first request must open an explicit container");
+        emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id: "tool-a",
+            tool_name: "run_command",
+            tool_result: json!({
+                "kind": "RunCommand",
+                "exit_code": 0,
+                "stdout": "",
+                "stderr": "",
+            }),
+            success: true,
+            error: None,
+        });
+        emitter.close_tool_container(container);
+        let real_message_id = ChatMessageId("msg-real".to_owned());
+        emitter.stream_start_with_id(real_message_id.clone(), AgentName("codex"), Some("model-a"));
+        emitter.stream_delta_with_id(real_message_id.clone(), "done");
+        emitter.stream_end_with_id(
+            real_message_id,
+            StreamEndPayload {
+                content: "done".to_owned(),
+                ..StreamEndPayload::default()
+            },
+        );
+        drop(emitter);
+        let events = recv_events(&mut rx);
+        assert_protocol_valid(&events);
+        assert_eq!(
+            event_kinds(&events),
+            vec![
+                "StreamStart",
+                "ToolRequest",
+                "ToolExecutionCompleted",
+                "StreamEnd",
+                "StreamStart",
+                "StreamDelta",
+                "StreamEnd",
+            ]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.get("kind").and_then(Value::as_str) == Some("ToolRequest"))
+                .count(),
+            1
+        );
+        let container_end = events
+            .iter()
+            .find(|event| {
+                event.get("kind").and_then(Value::as_str) == Some("StreamEnd")
+                    && event
+                        .pointer("/data/message/message_id")
+                        .and_then(Value::as_str)
+                        == Some("tool-a")
+            })
+            .expect("tool container StreamEnd");
+        assert_eq!(
+            container_end
+                .pointer("/data/message/tool_calls/0/id")
+                .and_then(Value::as_str),
+            Some("tool-a")
+        );
+    }
+
+    #[test]
+    fn pending_tool_completes_during_later_message_without_cancellation() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new_for_agent(tx, AgentName("codex"));
+
+        let first_message_id = ChatMessageId("msg-first".to_owned());
+        emitter.stream_start_with_id(
+            first_message_id.clone(),
+            AgentName("codex"),
+            Some("gpt-5.6-luna"),
+        );
+        emitter.stream_end_with_id(
+            first_message_id,
+            StreamEndPayload {
+                content: "Starting the command.".to_owned(),
+                ..StreamEndPayload::default()
+            },
+        );
+        emitter.tool_request("tool-background", "run_command", run_command_request());
+
+        let second_message_id = ChatMessageId("msg-second".to_owned());
+        emitter.stream_start_with_id(
+            second_message_id.clone(),
+            AgentName("codex"),
+            Some("gpt-5.6-luna"),
+        );
+        emitter
+            .stream_reasoning_delta_with_id(second_message_id.clone(), "Waiting for the process.");
+        emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id: "tool-background",
+            tool_name: "run_command",
+            tool_result: json!({
+                "kind": "RunCommand",
+                "exit_code": 0,
+                "stdout": "done",
+                "stderr": "",
+            }),
+            success: true,
+            error: None,
+        });
+        emitter.stream_end_with_id(
+            second_message_id,
+            StreamEndPayload {
+                content: "Done.".to_owned(),
+                ..StreamEndPayload::default()
+            },
+        );
+
+        drop(emitter);
+        let events = recv_events(&mut rx);
+        assert_protocol_valid(&events);
+        assert_eq!(
+            event_kinds(&events),
+            vec![
+                "StreamStart",
+                "StreamEnd",
+                "ToolRequest",
+                "StreamStart",
+                "StreamReasoningDelta",
+                "ToolExecutionCompleted",
+                "StreamEnd",
+            ]
+        );
+        let completions = events
+            .iter()
+            .filter(|event| {
+                event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(
+            completions[0]
+                .pointer("/data/tool_call_id")
+                .and_then(Value::as_str),
+            Some("tool-background")
+        );
+        assert_eq!(
+            completions[0]
+                .pointer("/data/success")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]

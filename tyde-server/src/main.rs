@@ -169,14 +169,19 @@ fn run_host_stdio() -> Result<(), String> {
 
     runtime.block_on(async {
         let host = spawn_host()?;
-        let transport = StdioTransport::new();
-        let connection = server::accept(&server::ServerConfig::current(), transport)
-            .await
-            .map_err(|err| format!("host stdio handshake failed: {err:?}"))?;
+        let result = async {
+            let transport = StdioTransport::new();
+            let connection = server::accept(&server::ServerConfig::current(), transport)
+                .await
+                .map_err(|err| format!("host stdio handshake failed: {err:?}"))?;
 
-        server::run_connection(connection, host)
-            .await
-            .map_err(|err| format!("host stdio connection failed: {err:?}"))
+            server::run_connection(connection, host.clone())
+                .await
+                .map_err(|err| format!("host stdio connection failed: {err:?}"))
+        }
+        .await;
+        host.shutdown_spawn_operations().await;
+        result
     })
 }
 
