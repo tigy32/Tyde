@@ -44,6 +44,7 @@ jobs:
         run: python tools/check_release_version.py "${{ env.RELEASE_TAG }}"
 
       - name: Create draft release
+        if: github.event_name == 'push'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
