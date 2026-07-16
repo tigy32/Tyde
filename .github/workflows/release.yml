@@ -25,6 +25,8 @@ jobs:
       RELEASE_TAG: ${{ github.event.inputs.version || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Verify release tag format
         run: |
@@ -45,6 +47,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          release_sha=$(git rev-parse HEAD)
           if [[ "$RELEASE_TAG" == *-* ]]; then
             edit_prerelease_flag=(--prerelease)
             create_prerelease_flag=(--prerelease)
@@ -54,9 +57,9 @@ jobs:
           fi
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release edit "$RELEASE_TAG" --draft --title "Tyde $RELEASE_TAG" --notes '' --target "$GITHUB_SHA" "${edit_prerelease_flag[@]}"
+            gh release edit "$RELEASE_TAG" --draft --title "Tyde $RELEASE_TAG" --notes '' --target "$release_sha" "${edit_prerelease_flag[@]}"
           else
-            gh release create "$RELEASE_TAG" --draft --title "Tyde $RELEASE_TAG" --notes '' --target "$GITHUB_SHA" "${create_prerelease_flag[@]}"
+            gh release create "$RELEASE_TAG" --draft --title "Tyde $RELEASE_TAG" --notes '' --target "$release_sha" "${create_prerelease_flag[@]}"
           fi
 
   build:
@@ -93,6 +96,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -114,11 +119,8 @@ jobs:
         if: startsWith(matrix.platform, 'macos')
         run: brew install create-dmg
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: lts/*
-          cache: npm
+      - name: Verify runner Node.js
+        run: node --version && npm --version
 
       - name: Install frontend dependencies
         run: npm ci
@@ -524,6 +526,8 @@ jobs:
       RELEASE_TAG: ${{ github.event.inputs.version || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -533,10 +537,8 @@ jobs:
       - name: Verify release version matches tag
         run: python tools/check_release_version.py "${{ env.RELEASE_TAG }}"
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: lts/*
+      - name: Verify runner Node.js
+        run: node --version && npm --version
 
       - name: Install repository Rust toolchain
         run: ./dev.sh rust-toolchain
