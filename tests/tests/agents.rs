@@ -342,6 +342,33 @@ async fn expect_no_event(client: &mut client::Connection, duration: Duration, co
     }
 }
 
+/// Drain events for `duration`, tolerating everything except an
+/// `AgentRenamed` frame. Background name generation applies renames
+/// asynchronously, so its absence can only be asserted with a window.
+async fn expect_no_agent_rename(
+    client: &mut client::Connection,
+    duration: Duration,
+    context: &str,
+) {
+    let deadline = tokio::time::Instant::now() + duration;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        match tokio::time::timeout(remaining, client.next_event()).await {
+            Err(_) => return,
+            Ok(Ok(None)) => return,
+            Ok(Ok(Some(env))) => assert_ne!(
+                env.kind,
+                FrameKind::AgentRenamed,
+                "unexpected AgentRenamed during {context}"
+            ),
+            Ok(Err(err)) => panic!("next_event failed during {context}: {err:?}"),
+        }
+    }
+}
+
 async fn set_activity_summaries(client: &mut client::Connection, enabled: bool) {
     client
         .set_setting(SetSettingPayload {
@@ -5855,8 +5882,13 @@ async fn spawn_without_name_generates_short_name_and_persists_alias() {
     assert_eq!(list.sessions[0].user_alias, None);
 }
 
+// Name generation is intentionally non-fatal and off the spawn path
+// (dev-docs/13 §2): a naming failure used to fail the whole spawn and
+// silently discard the user's first message. The spawn now succeeds
+// immediately under the prompt-derived name and a failed generation is a
+// logged no-op, which is the contract this pins.
 #[tokio::test]
-async fn failed_generated_name_prevents_agent_exposure() {
+async fn failed_generated_name_keeps_prompt_derived_name() {
     let mut fixture = Fixture::new().await;
 
     fixture
@@ -5878,23 +5910,34 @@ async fn failed_generated_name_prevents_agent_exposure() {
             },
         })
         .await
-        .expect("failed generated-name spawn write");
-    let error =
-        expect_command_error(&mut fixture.client, "generated-name failure CommandError").await;
-    assert_eq!(error.operation, "spawn_agent");
-    assert_eq!(error.code, CommandErrorCode::Internal);
-    assert!(error.message.contains("mock agent name generation failure"));
-    expect_no_event(
+        .expect("spawn with failing generated name must still write");
+
+    let env = expect_next_event(&mut fixture.client, "prompt-derived NewAgent").await;
+    assert_eq!(
+        env.kind,
+        FrameKind::NewAgent,
+        "a naming failure must not block or fail the spawn"
+    );
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse NewAgent");
+    assert_eq!(
+        new_agent.name, "Image Review Task",
+        "the spawn keeps the prompt-derived fallback name"
+    );
+
+    expect_no_agent_rename(
         &mut fixture.client,
-        Duration::from_millis(100),
-        "NewAgent after name generation failure",
+        Duration::from_millis(200),
+        "failed name generation",
     )
     .await;
+
     let (_late_client, bootstrap) = fixture.connect_with_bootstrap().await;
-    assert!(
-        bootstrap.agents.is_empty(),
-        "name generation failure must not appear in host bootstrap"
+    assert_eq!(
+        bootstrap.agents.len(),
+        1,
+        "the agent stays registered and visible despite the naming failure"
     );
+    assert_eq!(bootstrap.agents[0].name, "Image Review Task");
 }
 
 #[tokio::test]

@@ -37,10 +37,15 @@ The design must preserve the existing architectural rules:
 - No best-effort random fallback if automatic name generation fails.
 - No backend-specific naming semantics visible to the client.
 
-If automatic naming fails, `spawn_agent` fails visibly. The caller can retry
-with an explicit name. The host returns a typed `CommandError` for
-`spawn_agent`, does not register the real agent, and emits no `NewAgent` or
-`AgentStart` carrying a provisional name.
+Automatic naming never blocks and never fails a spawn. The agent spawns
+immediately under the prompt-derived name (the same derivation used when
+auto-naming is disabled), and name generation runs in the background. When
+generation succeeds, the server applies the generated name through the
+existing rename path (`AgentRenamed` + session-list fanout) with
+generated-alias persistence, so a user rename that lands first always wins.
+When generation fails or times out, the failure is logged and the
+prompt-derived name simply remains — the user's typed message and the spawn
+itself are never sacrificed to a naming helper.
 
 ---
 
@@ -191,16 +196,21 @@ For `SpawnAgentParams::New`:
 1. Validate the spawn payload.
 2. Resolve backend settings and workspace roots normally.
 3. If `name` is `Some`, use it as `user_alias`.
-4. If `name` is `None`, run the internal name-generation flow.
+4. If `name` is `None`, derive the provisional name from the prompt and, when
+   auto-naming is enabled, schedule the internal name-generation flow to run
+   in the background.
 5. Create the real live agent using the resolved effective name.
 6. Persist the session record with:
    - `user_alias = Some(name)` for explicit user names
-   - `alias = Some(name)` for generated names
+   - `alias = Some(name)` for prompt-derived (and later generated) names
 7. Fan out `NewAgent` and replay `AgentStart` with that resolved name.
+8. When background generation later succeeds, apply the generated name via the
+   rename path: `AgentRenamed` + refreshed session lists, with generated-alias
+   persistence so a user rename in the interim wins.
 
-The key point is ordering: the real agent is not created until the name is
-known. That guarantees that the first visible agent event already contains the
-correct name.
+The key point is ordering: the spawn is never gated on name generation. The
+first visible agent event carries the prompt-derived name; a generated name
+arrives as an ordinary rename.
 
 ### 6.2 Resume Flow
 
@@ -279,27 +289,33 @@ The server then sanitizes the returned text:
 - trim outer whitespace
 - strip surrounding quotes
 - collapse internal whitespace
-- validate the final result is 2-4 words
+- truncate to at most 4 words
 
-If the result is invalid, the whole spawn fails.
+The 2-4 word request is a prompt instruction, not an acceptance gate: any
+answer that still contains usable words after sanitizing is accepted (a
+one-word answer like "Greeting" is a better name than a discarded
+generation), and an overlong answer is truncated rather than rejected. Only
+an answer that sanitizes to nothing fails; the agent then keeps its
+prompt-derived name. Generation runs after the spawn is already visible to
+clients, so a naming failure is a logged no-op, never a spawn failure.
 
 Backends may emit a completed reasoning-only display segment before the final
 assistant answer. An empty-content `StreamEnd` for such a segment is not a name
 generation result; the collector must continue until a completed assistant
 answer contains usable text. If the turn completes or the backend event stream
-ends first, name generation fails visibly and must not report a prompt-derived
+ends first, name generation fails and must not report a prompt-derived
 fallback as a successful generated name.
 
-This is intentionally different from retaining a prompt-derived provisional
-name with a warning: a warning would still make the failed helper look like a
-successful unnamed spawn. Tyde instead preserves the existing spawn UX while
-the helper is running, then either reveals the fully named agent or returns the
-typed spawn failure.
+A successful generation is applied with generated-alias persistence
+(`set_generated_alias_if_no_user_alias`): if the user renamed the agent while
+the helper was running, the generated name is dropped rather than overriding
+the user's choice. An applied generated name broadcasts `AgentRenamed` and
+fans out updated session lists, exactly like a user rename.
 
-The synchronous helper is bounded by a server-owned timeout. If backend startup,
-tool activity, or answer collection exceeds that bound, the host treats the
-timeout as generation failure and returns the same typed `spawn_agent`
-`CommandError`; it still registers and exposes no real agent.
+The background helper is bounded by a server-owned timeout. If backend
+startup, tool activity, or answer collection exceeds that bound, the host
+treats the timeout as generation failure: it logs and leaves the
+prompt-derived name in place.
 
 ### 7.4 Backend Interface
 
@@ -444,7 +460,7 @@ Expected implementation touch points:
   - validate optional spawn names
   - route `SetAgentName`
 - `server/src/host.rs`
-  - resolve generated names before spawn
+  - derive provisional names at spawn; upgrade to generated names in the background
   - persist `alias` vs `user_alias` correctly
   - synthesize host-facing views from live agent snapshots
   - push refreshed `SessionList` snapshots after naming changes

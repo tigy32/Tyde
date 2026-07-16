@@ -173,6 +173,7 @@ enum AgentCommand {
     },
     SetName {
         name: String,
+        persistence: InitialAgentAliasPersistence,
         reply: oneshot::Sender<bool>,
     },
     ReadOutput {
@@ -934,11 +935,29 @@ impl AgentHandle {
     }
 
     pub async fn set_name(&self, name: String) -> Option<bool> {
+        self.set_name_with_persistence(name, InitialAgentAliasPersistence::User)
+            .await
+    }
+
+    /// Apply a background-generated name. Unlike a user rename this never
+    /// overrides a user-chosen alias — if the user renamed the agent while the
+    /// name was generating, the generated name is dropped.
+    pub async fn set_generated_name(&self, name: String) -> Option<bool> {
+        self.set_name_with_persistence(name, InitialAgentAliasPersistence::GeneratedIfNoUserAlias)
+            .await
+    }
+
+    async fn set_name_with_persistence(
+        &self,
+        name: String,
+        persistence: InitialAgentAliasPersistence,
+    ) -> Option<bool> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .tx
             .send(AgentCommand::SetName {
                 name,
+                persistence,
                 reply: reply_tx,
             })
             .is_err()
@@ -3534,6 +3553,7 @@ pub(crate) fn spawn_agent_actor(
                         }
                         AgentCommand::SetName {
                             name,
+                            persistence,
                             reply,
                         } => {
                             let applied = apply_agent_name_change(
@@ -3547,6 +3567,7 @@ pub(crate) fn spawn_agent_actor(
                                     subscribers: &mut subscribers,
                                 },
                                 name,
+                                persistence,
                             )
                             .await;
                             let _ = reply.send(applied);
@@ -4045,6 +4066,7 @@ pub(crate) fn spawn_relay_agent_actor(
                         }
                         AgentCommand::SetName {
                             name,
+                            persistence,
                             reply,
                         } => {
                             let applied = apply_agent_name_change(
@@ -4058,6 +4080,7 @@ pub(crate) fn spawn_relay_agent_actor(
                                     subscribers: &mut subscribers,
                                 },
                                 name,
+                                persistence,
                             )
                             .await;
                             let _ = reply.send(applied);
@@ -4298,7 +4321,11 @@ async fn park_terminal_agent(
         };
         match command {
             AgentCommand::ResumeReplayBarrier { .. } => {}
-            AgentCommand::SetName { name, reply } => {
+            AgentCommand::SetName {
+                name,
+                persistence,
+                reply,
+            } => {
                 let applied = apply_agent_name_change(
                     AgentNameChangeContext {
                         session_store,
@@ -4310,6 +4337,7 @@ async fn park_terminal_agent(
                         subscribers,
                     },
                     name,
+                    persistence,
                 )
                 .await;
                 let _ = reply.send(applied);
@@ -4396,7 +4424,11 @@ async fn park_relay_terminal_agent(
         };
         match command {
             AgentCommand::ResumeReplayBarrier { .. } => {}
-            AgentCommand::SetName { name, reply } => {
+            AgentCommand::SetName {
+                name,
+                persistence,
+                reply,
+            } => {
                 let applied = apply_agent_name_change(
                     AgentNameChangeContext {
                         session_store,
@@ -4408,6 +4440,7 @@ async fn park_relay_terminal_agent(
                         subscribers,
                     },
                     name,
+                    persistence,
                 )
                 .await;
                 let _ = reply.send(applied);
@@ -4489,37 +4522,66 @@ async fn park_relay_terminal_agent(
     }
 }
 
-async fn apply_agent_name_change(context: AgentNameChangeContext<'_>, name: String) -> bool {
+async fn apply_agent_name_change(
+    context: AgentNameChangeContext<'_>,
+    name: String,
+    persistence: InitialAgentAliasPersistence,
+) -> bool {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return false;
     }
 
     if let Some(session_id) = context.session_id {
-        if let Err(err) = context
-            .session_store
-            .lock()
-            .await
-            .set_user_alias(session_id, trimmed.to_string())
-        {
-            tracing::error!(
-                "failed to persist renamed agent {}: {}",
-                context.current_start.agent_id,
-                err
-            );
-            let payload = AgentErrorPayload {
-                agent_id: context.current_start.agent_id.clone(),
-                code: AgentErrorCode::Internal,
-                message: format!("failed to persist agent name: {err}"),
-                fatal: false,
-            };
-            broadcast_live_event(context.subscribers, FrameKind::AgentError, &payload).await;
-            return false;
+        let persist_result = {
+            let store = context.session_store.lock().await;
+            match persistence {
+                InitialAgentAliasPersistence::User => store
+                    .set_user_alias(session_id, trimmed.to_string())
+                    .map(|()| true),
+                InitialAgentAliasPersistence::GeneratedIfNoUserAlias => {
+                    store.set_generated_alias_if_no_user_alias(session_id, trimmed.to_string())
+                }
+            }
+        };
+        match persist_result {
+            Ok(true) => {}
+            // A user alias already exists (or the session is unknown); a
+            // generated name never overrides it.
+            Ok(false) => return false,
+            Err(err) => {
+                tracing::error!(
+                    "failed to persist renamed agent {}: {}",
+                    context.current_start.agent_id,
+                    err
+                );
+                let payload = AgentErrorPayload {
+                    agent_id: context.current_start.agent_id.clone(),
+                    code: AgentErrorCode::Internal,
+                    message: format!("failed to persist agent name: {err}"),
+                    fatal: false,
+                };
+                broadcast_live_event(context.subscribers, FrameKind::AgentError, &payload).await;
+                return false;
+            }
         }
     } else {
+        // No session yet: stage the alias. A generated name must not clobber
+        // a user rename staged while the generator was running.
+        if persistence == InitialAgentAliasPersistence::GeneratedIfNoUserAlias
+            && matches!(
+                context.pending_alias,
+                Some(InitialAgentAlias {
+                    persistence: InitialAgentAliasPersistence::User,
+                    ..
+                })
+            )
+        {
+            return false;
+        }
         *context.pending_alias = Some(InitialAgentAlias {
             name: trimmed.to_string(),
-            persistence: InitialAgentAliasPersistence::User,
+            persistence,
         });
     }
 
@@ -6164,12 +6226,17 @@ fn sanitize_generated_agent_name(name: &str) -> Result<String, String> {
         .filter(|word| !word.is_empty())
         .collect::<Vec<_>>();
 
-    if words.len() < 2 || words.len() > 4 {
+    // Accept whatever usable text the model produced. The prompt asks for 2-4
+    // words, but a short answer ("Greeting") is still a better name than
+    // discarding the generation; an overlong one is truncated rather than
+    // rejected.
+    if words.is_empty() {
         return Err(format!(
-            "generated agent name must contain 2-4 words, got {:?}",
+            "generated agent name contained no usable words, got {:?}",
             stripped
         ));
     }
+    words.truncate(4);
 
     for word in &mut words {
         *word = title_case_word(word);
@@ -8038,18 +8105,39 @@ mod tests {
         );
     }
 
+    // The 2-4 word rule is a prompt instruction, not an acceptance gate: a
+    // model that answers "Greeting" for "hi" produced a perfectly good name,
+    // and rejecting it used to discard the generation (and, before naming
+    // went async, fail the whole spawn). Any answer with usable words is
+    // accepted; overlong answers are truncated instead of rejected.
     #[tokio::test]
-    async fn generated_name_invalid_answer_fails_without_prompt_fallback() {
+    async fn generated_name_accepts_single_word_answer() {
         let (tx, rx) = mpsc::unbounded_channel();
-        tx.send(generated_name_stream_end("Project", None))
-            .expect("invalid assistant StreamEnd");
+        tx.send(generated_name_stream_end("Greeting", None))
+            .expect("single-word assistant StreamEnd");
         drop(tx);
         let mut events = EventStream::new(rx);
 
-        let error = collect_agent_name_events(&mut events)
-            .await
-            .expect_err("invalid completion must fail");
-        assert!(error.contains("must contain 2-4 words"));
+        assert_eq!(
+            collect_agent_name_events(&mut events).await.unwrap(),
+            "Greeting"
+        );
+    }
+
+    #[test]
+    fn generated_name_sanitizer_truncates_overlong_answer() {
+        assert_eq!(
+            sanitize_generated_agent_name("fix the login flow for the mobile app").unwrap(),
+            "Fix The Login Flow"
+        );
+    }
+
+    #[test]
+    fn generated_name_sanitizer_rejects_answer_with_no_usable_words() {
+        let error = sanitize_generated_agent_name("\"\u{201c}\u{201d}\"").expect_err(
+            "an answer that sanitizes to nothing must fail rather than produce an empty name",
+        );
+        assert!(error.contains("no usable words") || error.contains("empty"));
     }
 
     #[test]

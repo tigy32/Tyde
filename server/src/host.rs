@@ -3142,6 +3142,9 @@ impl HostHandle {
             .get()
             .unwrap_or_else(|err| panic!("failed to load host settings for spawn: {err}"));
 
+        // Set by the New branch when auto-naming is enabled; the generation
+        // runs in the background after the spawn is visible to clients.
+        let mut background_name_generation: Option<GenerateAgentNameRequest> = None;
         let request = match payload.params {
             SpawnAgentParams::New {
                 workspace_roots,
@@ -3267,35 +3270,27 @@ impl HostHandle {
                         }),
                     ),
                     None => {
-                        let generated = if startup_failure.is_none()
+                        // Naming must never block or fail the spawn: start with
+                        // the prompt-derived name immediately and upgrade to a
+                        // model-generated name in the background once (and only
+                        // if) generation succeeds.
+                        if startup_failure.is_none()
                             && host_settings
                                 .background_agent_features
                                 .auto_generate_agent_names
                         {
-                            await_agent_name_generation(
-                                generate_agent_name(GenerateAgentNameRequest {
-                                    backend_kind,
-                                    prompt: prompt.clone(),
-                                    use_mock_backend,
-                                    capacity_tx: self.state.lock().await.capacity_tx.clone(),
-                                }),
-                                AGENT_NAME_GENERATION_TIMEOUT,
-                            )
-                            .await
-                            .map_err(|error| {
-                                AppError::internal_message(
-                                    "spawn_agent",
-                                    format!("automatic agent name generation failed: {error}"),
-                                    anyhow!(error),
-                                )
-                            })?
-                        } else {
-                            derive_agent_name(&prompt)
-                        };
+                            background_name_generation = Some(GenerateAgentNameRequest {
+                                backend_kind,
+                                prompt: prompt.clone(),
+                                use_mock_backend,
+                                capacity_tx: self.state.lock().await.capacity_tx.clone(),
+                            });
+                        }
+                        let derived = derive_agent_name(&prompt);
                         (
-                            generated.clone(),
+                            derived.clone(),
                             Some(InitialAgentAlias {
-                                name: generated,
+                                name: derived,
                                 persistence: InitialAgentAliasPersistence::GeneratedIfNoUserAlias,
                             }),
                         )
@@ -4057,6 +4052,9 @@ impl HostHandle {
         #[cfg(test)]
         notify_startup_failure_fanout_claimed_test_hook(self);
         if !fanout_started {
+            if let Some(request) = background_name_generation.take() {
+                self.spawn_background_agent_naming(request, agent_id.clone(), agent_handle.clone());
+            }
             return Ok(agent_id);
         }
 
@@ -4178,6 +4176,9 @@ impl HostHandle {
             }
         }
         if visibility.finish_new_agent_fanout() {
+            if let Some(request) = background_name_generation.take() {
+                self.spawn_background_agent_naming(request, agent_id.clone(), agent_handle.clone());
+            }
             return Ok(agent_id);
         }
         #[cfg(test)]
@@ -4201,6 +4202,9 @@ impl HostHandle {
 
         session_registration_publish.publish();
         visibility_guard.disarm();
+        if let Some(request) = background_name_generation.take() {
+            self.spawn_background_agent_naming(request, agent_id.clone(), agent_handle.clone());
+        }
         tracing::info!(
             agent_id = %agent_id,
             backend_kind = ?start.backend_kind,
@@ -4209,6 +4213,48 @@ impl HostHandle {
         );
 
         Ok(agent_id)
+    }
+
+    /// Upgrade a freshly spawned agent's prompt-derived name to a
+    /// model-generated one, off the spawn path. Failure is logged and the
+    /// derived name simply remains — name generation must never block a spawn
+    /// or surface as a spawn error. A user rename that lands first wins:
+    /// the generated name is applied with generated-alias persistence, which
+    /// never overrides a user alias.
+    fn spawn_background_agent_naming(
+        &self,
+        request: GenerateAgentNameRequest,
+        agent_id: AgentId,
+        agent_handle: crate::agent::AgentHandle,
+    ) {
+        let host = self.clone();
+        tokio::spawn(async move {
+            let derived = derive_agent_name(&request.prompt);
+            let generated = await_agent_name_generation(
+                generate_agent_name(request),
+                AGENT_NAME_GENERATION_TIMEOUT,
+            )
+            .await;
+            let name = match generated {
+                Ok(name) => name,
+                Err(error) => {
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        error = %error,
+                        "background agent name generation failed; keeping the prompt-derived name"
+                    );
+                    return;
+                }
+            };
+            // The spawn already carries the prompt-derived name; an identical
+            // generated name would be a no-op rename and fanout.
+            if name == derived {
+                return;
+            }
+            if agent_handle.set_generated_name(name).await == Some(true) {
+                host.fan_out_session_lists().await;
+            }
+        });
     }
 
     async fn resolve_launch_profile_session_settings(
