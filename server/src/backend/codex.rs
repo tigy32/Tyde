@@ -7342,9 +7342,20 @@ async fn terminate_codex_child(child: &mut AsyncGroupChild) -> Result<(), String
         .await
         .err();
 
+    codex_terminate_outcome(kill_error, wait_error)
+}
+
+fn codex_terminate_outcome(
+    kill_error: Option<String>,
+    wait_error: Option<String>,
+) -> Result<(), String> {
     match (kill_error, wait_error) {
-        (None, None) => Ok(()),
-        (Some(error), None) | (None, Some(error)) => Err(error),
+        // A failed kill is moot when the child was still reaped: killing an
+        // already-exited process reports "No such process" (ESRCH) even
+        // though cleanup fully succeeded. Only a child that then also fails
+        // to exit turns the kill failure into a real error.
+        (_, None) => Ok(()),
+        (None, Some(error)) => Err(error),
         (Some(kill_error), Some(wait_error)) => Err(format!("{kill_error}; {wait_error}")),
     }
 }
@@ -9941,6 +9952,29 @@ for line in sys.stdin:
 
         assert!(error.contains("Codex model discovery app-server cleanup failed"));
         assert!(error.contains("timed out reaping test app-server"));
+    }
+
+    #[test]
+    fn codex_terminate_ignores_kill_failure_when_child_was_reaped() {
+        codex_terminate_outcome(
+            Some(
+                "failed to kill Codex app-server process group: No such process (os error 3)"
+                    .to_string(),
+            ),
+            None,
+        )
+        .expect("killing an already-exited child must not report a cleanup failure");
+    }
+
+    #[test]
+    fn codex_terminate_surfaces_kill_failure_when_child_never_exits() {
+        let error = codex_terminate_outcome(
+            Some("failed to kill Codex app-server process group: permission denied".to_string()),
+            Some("timed out after 3s reaping Codex app-server process group".to_string()),
+        )
+        .expect_err("an unkillable, unreaped child must fail cleanup");
+        assert!(error.contains("permission denied"));
+        assert!(error.contains("timed out"));
     }
 
     #[test]

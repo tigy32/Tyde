@@ -3246,7 +3246,7 @@ impl HostHandle {
                 let session_settings_schema = if backend_has_dynamic_session_schema(backend_kind)
                     && session_settings_schema.is_none()
                 {
-                    self.refresh_session_schemas().await;
+                    self.refresh_session_schema_for_backend(backend_kind).await;
                     let state = self.state.lock().await;
                     session_schema_for_backend(&state, backend_kind)
                 } else {
@@ -3574,7 +3574,8 @@ impl HostHandle {
                     if backend_has_dynamic_session_schema(record.backend_kind)
                         && session_settings_schema.is_none()
                     {
-                        self.refresh_session_schemas().await;
+                        self.refresh_session_schema_for_backend(record.backend_kind)
+                            .await;
                         let state = self.state.lock().await;
                         session_schema_for_backend(&state, record.backend_kind)
                     } else {
@@ -3890,7 +3891,7 @@ impl HostHandle {
                         backend_kind = ?backend_kind,
                         "diagnostic: side-question fork starting inline session schema refresh"
                     );
-                    self.refresh_session_schemas().await;
+                    self.refresh_session_schema_for_backend(backend_kind).await;
                     let state = self.state.lock().await;
                     session_schema_for_backend(&state, backend_kind)
                 } else {
@@ -6823,10 +6824,32 @@ impl HostHandle {
     }
 
     pub(crate) async fn refresh_session_schemas(&self) {
-        self.refresh_session_schemas_with_fanout(false).await;
+        self.refresh_session_schemas_scoped(None, false).await;
+    }
+
+    /// Probe and refresh the session schema of a single backend, leaving the
+    /// other backends' cached schema states untouched. Spawning a Hermes
+    /// agent must not launch a Codex model-discovery probe (or vice versa) —
+    /// an unrelated backend's probe failure would otherwise surface in flows
+    /// that never asked for it.
+    pub(crate) async fn refresh_session_schema_for_backend(
+        &self,
+        backend_kind: protocol::BackendKind,
+    ) {
+        self.refresh_session_schemas_scoped(Some(backend_kind), false)
+            .await;
     }
 
     async fn refresh_session_schemas_with_fanout(&self, force_emit: bool) {
+        self.refresh_session_schemas_scoped(None, force_emit).await;
+    }
+
+    async fn refresh_session_schemas_scoped(
+        &self,
+        only: Option<protocol::BackendKind>,
+        force_emit: bool,
+    ) {
+        let probe = |kind: protocol::BackendKind| only.is_none_or(|scoped| scoped == kind);
         let (
             settings_store,
             codex_probe_program,
@@ -6846,9 +6869,15 @@ impl HostHandle {
                     None
                 }
             };
-            state.codex_session_schema = CodexSessionSchemaState::Pending;
-            state.kiro_session_schema = KiroSessionSchemaState::Pending;
-            state.hermes_session_schema = HermesSessionSchemaState::Pending;
+            if probe(protocol::BackendKind::Codex) {
+                state.codex_session_schema = CodexSessionSchemaState::Pending;
+            }
+            if probe(protocol::BackendKind::Kiro) {
+                state.kiro_session_schema = KiroSessionSchemaState::Pending;
+            }
+            if probe(protocol::BackendKind::Hermes) {
+                state.hermes_session_schema = HermesSessionSchemaState::Pending;
+            }
             (
                 Arc::clone(&state.settings_store),
                 state.codex_probe_program.clone(),
@@ -6865,30 +6894,34 @@ impl HostHandle {
             .unwrap_or_else(|err| panic!("failed to load host settings for session schemas: {err}"))
             .enabled_backends;
 
-        let codex_session_schema = if enabled_backends.contains(&protocol::BackendKind::Codex) {
+        let codex_session_schema = if !probe(protocol::BackendKind::Codex) {
+            None
+        } else if enabled_backends.contains(&protocol::BackendKind::Codex) {
             if skip_real_backend_probe && codex_probe_program.is_none() {
-                CodexSessionSchemaState::Unavailable(
+                Some(CodexSessionSchemaState::Unavailable(
                     "Codex model discovery is unavailable because backend probing is disabled"
                         .to_string(),
-                )
+                ))
             } else {
                 match crate::backend::codex::probe_session_settings_schema(
                     codex_probe_program.as_deref(),
                 )
                 .await
                 {
-                    Ok(schema) => CodexSessionSchemaState::Ready(schema),
+                    Ok(schema) => Some(CodexSessionSchemaState::Ready(schema)),
                     Err(err) => {
                         tracing::error!("failed to refresh Codex session schema: {err}");
-                        CodexSessionSchemaState::Unavailable(err)
+                        Some(CodexSessionSchemaState::Unavailable(err))
                     }
                 }
             }
         } else {
-            CodexSessionSchemaState::Pending
+            Some(CodexSessionSchemaState::Pending)
         };
 
-        let kiro_session_schema = if enabled_backends.contains(&protocol::BackendKind::Kiro) {
+        let kiro_session_schema = if !probe(protocol::BackendKind::Kiro) {
+            None
+        } else if enabled_backends.contains(&protocol::BackendKind::Kiro) {
             match kiro_probe_workspace_root(configured_kiro_probe_workspace_root.as_deref()) {
                 Ok(workspace_root) => match crate::backend::kiro::probe_session_settings_schema(
                     &[workspace_root],
@@ -6896,26 +6929,28 @@ impl HostHandle {
                 )
                 .await
                 {
-                    Ok(schema) => KiroSessionSchemaState::Ready(schema),
+                    Ok(schema) => Some(KiroSessionSchemaState::Ready(schema)),
                     Err(err) => {
                         tracing::error!("failed to refresh Kiro session schema: {err}");
-                        KiroSessionSchemaState::Unavailable(err)
+                        Some(KiroSessionSchemaState::Unavailable(err))
                     }
                 },
                 Err(err) => {
                     tracing::error!("failed to resolve Kiro probe workspace root: {err}");
-                    KiroSessionSchemaState::Unavailable(err)
+                    Some(KiroSessionSchemaState::Unavailable(err))
                 }
             }
         } else {
-            KiroSessionSchemaState::Pending
+            Some(KiroSessionSchemaState::Pending)
         };
 
-        let hermes_session_schema = if enabled_backends.contains(&protocol::BackendKind::Hermes) {
+        let hermes_session_schema = if !probe(protocol::BackendKind::Hermes) {
+            None
+        } else if enabled_backends.contains(&protocol::BackendKind::Hermes) {
             if skip_real_backend_probe {
-                HermesSessionSchemaState::Ready(
+                Some(HermesSessionSchemaState::Ready(
                     <crate::backend::hermes::HermesBackend as crate::backend::Backend>::session_settings_schema(),
-                )
+                ))
             } else {
                 let hermes_schema_or_last_good = |err: String| match prev_hermes_ready.clone() {
                     Some(schema) => {
@@ -6926,7 +6961,7 @@ impl HostHandle {
                     }
                     None => HermesSessionSchemaState::Unavailable(err),
                 };
-                match hermes_probe_workspace_root() {
+                Some(match hermes_probe_workspace_root() {
                     Ok(workspace_root) => {
                         match crate::backend::hermes::probe_session_settings_schema(&[
                             workspace_root,
@@ -6944,16 +6979,22 @@ impl HostHandle {
                         tracing::error!("failed to resolve Hermes probe workspace root: {err}");
                         hermes_schema_or_last_good(err)
                     }
-                }
+                })
             }
         } else {
-            HermesSessionSchemaState::Pending
+            Some(HermesSessionSchemaState::Pending)
         };
 
         let mut state = self.state.lock().await;
-        state.codex_session_schema = codex_session_schema;
-        state.kiro_session_schema = kiro_session_schema;
-        state.hermes_session_schema = hermes_session_schema;
+        if let Some(schema) = codex_session_schema {
+            state.codex_session_schema = schema;
+        }
+        if let Some(schema) = kiro_session_schema {
+            state.kiro_session_schema = schema;
+        }
+        if let Some(schema) = hermes_session_schema {
+            state.hermes_session_schema = schema;
+        }
         fan_out_session_schemas(&mut state, force_emit).await;
         fan_out_backend_config_schemas(&mut state).await;
         fan_out_launch_profile_catalog(&mut state).await;
@@ -10415,7 +10456,7 @@ impl HostHandle {
         let session_settings_schema = if backend_has_dynamic_session_schema(backend_kind)
             && session_settings_schema.is_none()
         {
-            self.refresh_session_schemas().await;
+            self.refresh_session_schema_for_backend(backend_kind).await;
             let state = self.state.lock().await;
             session_schema_for_backend(&state, backend_kind)
         } else {
