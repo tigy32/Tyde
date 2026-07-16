@@ -821,41 +821,39 @@ pub fn CommandPalette() -> impl IntoView {
     // The last refusal, shown inline on the still-open surface.
     let notice: RwSignal<Option<&'static str>> = RwSignal::new(None);
 
-    let on_keydown = move |ev: web_sys::KeyboardEvent| {
-        match ev.key().as_str() {
-            "Escape" => {
-                ev.prevent_default();
-                open.set(false);
-            }
-            "ArrowDown" => {
-                ev.prevent_default();
-                notice.set(None);
-                let count = result_count.get();
-                if count > 0 {
-                    selected_index.update(|i: &mut usize| *i = (*i + 1) % count);
-                }
-            }
-            "ArrowUp" => {
-                ev.prevent_default();
-                notice.set(None);
-                let count = result_count.get();
-                if count > 0 {
-                    selected_index.update(|i: &mut usize| {
-                        *i = if *i == 0 { count - 1 } else { *i - 1 };
-                    });
-                }
-            }
-            "Enter" => {
-                ev.prevent_default();
-                do_select(
-                    results,
-                    selected_index.get_untracked(),
-                    width.get_untracked(),
-                    notice,
-                );
-            }
-            _ => {}
+    let on_keydown = move |ev: web_sys::KeyboardEvent| match ev.key().as_str() {
+        "Escape" => {
+            ev.prevent_default();
+            open.set(false);
         }
+        "ArrowDown" => {
+            ev.prevent_default();
+            notice.set(None);
+            let count = result_count.get();
+            if count > 0 {
+                selected_index.update(|i: &mut usize| *i = (*i + 1) % count);
+            }
+        }
+        "ArrowUp" => {
+            ev.prevent_default();
+            notice.set(None);
+            let count = result_count.get();
+            if count > 0 {
+                selected_index.update(|i: &mut usize| {
+                    *i = if *i == 0 { count - 1 } else { *i - 1 };
+                });
+            }
+        }
+        "Enter" => {
+            ev.prevent_default();
+            do_select(
+                results,
+                selected_index.get_untracked(),
+                width.get_untracked(),
+                notice,
+            );
+        }
+        _ => {}
     };
 
     let on_input = move |ev: web_sys::Event| {

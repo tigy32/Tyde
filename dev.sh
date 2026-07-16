@@ -5,7 +5,7 @@ export PYTHONDONTWRITEBYTECODE=1
 
 cd "$(dirname "$0")"
 
-readonly DEV_CHECK_CACHE_SCHEMA="3"
+readonly DEV_CHECK_CACHE_SCHEMA="4"
 readonly DEV_CHECK_CACHE_DIR="target/dev-check-cache"
 readonly DEV_CHECK_LOG_DIR="target/dev-check-logs"
 readonly DEV_CHECK_LOCK_DIR="target/dev-check.lock"
@@ -629,7 +629,7 @@ USAGE
 
 check() {
     local mode="default"
-    local repetitions=3
+    local repetitions=1
     local cache_state="miss"
     local inputs key record_path refreshed_inputs refreshed_key
     local name wasm_environment

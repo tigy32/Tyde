@@ -31,16 +31,15 @@ locally only when the user explicitly requests a diagnostic. `./dev.sh check`
 is the sole allowed entry point; do not invoke Cargo, wasm, web, or filtered
 test commands directly.
 
-The wrapper owns caching, repeated runs and flaky-test handling, current-stable
+The wrapper owns caching, test execution and failure handling, current-stable
 toolchain setup, the release-safe environment, and token/time optimization. A
-cache miss runs the compile/lint stages once and each native, wasm, and
-web-loader test stage three times; a cache hit prints the prior successful stage
-summary and does no validation work. Successful stages print only START/PASS,
+cache miss runs each compile, lint, native, wasm, and web-loader stage once; a
+cache hit prints the prior successful stage summary and does no validation
+work. Successful stages print only START/PASS,
 wall time, repetitions, and peak RSS. Complete stage output and metadata are
 retained in bounded `target/dev-check-logs/` runs; failures print the complete
-captured output for the failing repetition plus the complete stage-log path,
-without truncation. Repeated stages print a lightweight progress line before
-each run. Validation keys the cache only by schema, `HEAD` commit, and current
+captured output for the failing run plus the complete stage-log path, without
+truncation. Validation keys the cache only by schema, `HEAD` commit, and current
 tracked plus unignored worktree content. There is no cache-bypass mode for
 local, release, or CI validation.
 
@@ -54,7 +53,7 @@ clean shared Cargo targets.
 
 Before cache evaluation, the wrapper provisions Chrome, chromedriver, and the
 lockfile-pinned wasm-bindgen runner once through `tools/run-wasm-tests.sh` and
-then uses those exact paths for all wasm repetitions. Explicit `CHROME` and
+then uses those exact paths for the wasm stage. Explicit `CHROME` and
 `CHROMEDRIVER` overrides are authoritative and invalid overrides fail. Cache
 explanation mode is read-only: it performs no cleanup, network provisioning, or
 daemon startup, and it never signs or modifies browser tools. An explicit
@@ -74,9 +73,9 @@ fix the root cause. Do not fall back to serial `cargo test`, increase the
 timeout, split the canonical suite, reduce coverage, or skip, weaken, or delete
 tests to get under the limit. Install the runner with
 `cargo install cargo-nextest --locked` if `cargo nextest` is unavailable.
-Within a failed native repetition, nextest runs all independent tests so the
+Within a failed native run, nextest runs all independent tests so the
 retained diagnostics include every failure reached before that authoritative
-limit. The failed repetition still blocks repetitions 2–3 and all later stages.
+limit. A failed native run blocks all later stages.
 
 For clippy: **fix the underlying issue**. Do not paper over violations with
 `_`-prefixed unused names, `#[allow(...)]` attributes, or other suppressions

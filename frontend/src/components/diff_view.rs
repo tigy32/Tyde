@@ -3608,9 +3608,9 @@ mod tests {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
-    use crate::wasm_test_support::Mounted;
     use crate::state::DiffViewState;
     use crate::syntax_highlight::{compute_hunk_tokens, syntax_for_path};
+    use crate::wasm_test_support::Mounted;
     use leptos::mount::mount_to;
     use protocol::ProjectGitDiffHunk;
     use wasm_bindgen::JsCast;

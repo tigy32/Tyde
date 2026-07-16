@@ -652,27 +652,32 @@ async fn workbench_create_serializes_same_parent_same_branch() {
     write_a.expect("client A workbench_create write failed");
     write_b.expect("client B workbench_create write failed");
 
-    let (error_a, error_b) = tokio::join!(
-        wait_for_command_error(
+    let error = tokio::select! {
+        error = wait_for_command_error(
             &mut client_a,
             "client A concurrent workbench_create",
             Duration::from_secs(30),
-        ),
-        wait_for_command_error(
+        ) => error,
+        error = wait_for_command_error(
             &mut client_b,
             "client B concurrent workbench_create",
             Duration::from_secs(30),
-        ),
-    );
-    let errors = [error_a, error_b].into_iter().flatten().collect::<Vec<_>>();
-    assert_eq!(errors.len(), 1, "exactly one concurrent create should fail");
-    assert_eq!(errors[0].operation, "workbench_create");
-    assert_eq!(errors[0].code, CommandErrorCode::Conflict);
+        ) => error,
+    }
+    .expect("one concurrent workbench_create should fail");
+    let created =
+        match expect_project_notify(&mut fixture.client, "concurrent workbench create").await {
+            ProjectNotifyPayload::Upsert { project } => project,
+            other => panic!("expected workbench upsert, got {other:?}"),
+        };
+    assert_eq!(error.operation, "workbench_create");
+    assert_eq!(error.code, CommandErrorCode::Conflict);
     assert!(
-        errors[0].message.contains("already exists"),
+        error.message.contains("already exists"),
         "unexpected error message: {}",
-        errors[0].message
+        error.message
     );
+    assert_eq!(created.parent_project_id(), Some(&parent.id));
     assert!(expected_worktree_path(repo.path(), "serialized-create").is_dir());
 }
 

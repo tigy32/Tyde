@@ -104,9 +104,7 @@ pub fn ReferencesPanel() -> impl IntoView {
             });
             files
                 .into_iter()
-                .map(|(file, row_start)| {
-                    file_group(state.clone(), collapsed, file, row_start)
-                })
+                .map(|(file, row_start)| file_group(state.clone(), collapsed, file, row_start))
                 .collect_view()
         }
     };

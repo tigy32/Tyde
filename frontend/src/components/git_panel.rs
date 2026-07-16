@@ -869,9 +869,9 @@ fn send_commit(root: ProjectRootPath, message: String) {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
-    use crate::wasm_test_support::Mounted;
     use crate::components::center_zone::CenterWorkspaceWidth;
     use crate::state::{ActiveProjectRef, CenterZoneState, PaneId, TabContent, TabId};
+    use crate::wasm_test_support::Mounted;
     use leptos::mount::mount_to;
     use protocol::{
         AgentId, Envelope, FrameKind, Project, ProjectBootstrapPayload, ProjectEventPayload,

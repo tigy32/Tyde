@@ -317,9 +317,9 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         self.assertEqual(sum(line.startswith("cargo fmt ") for line in lines), 1)
         self.assertEqual(sum(line.startswith("cargo check ") for line in lines), 1)
         self.assertEqual(sum(line.startswith("cargo clippy ") for line in lines), 1)
-        self.assertEqual(sum(line.startswith("cargo nextest run ") for line in lines), 3)
-        self.assertEqual(lines.count("wasm"), 3)
-        self.assertEqual(sum(line.startswith("node --test ") for line in lines), 3)
+        self.assertEqual(sum(line.startswith("cargo nextest run ") for line in lines), 1)
+        self.assertEqual(lines.count("wasm"), 1)
+        self.assertEqual(sum(line.startswith("node --test ") for line in lines), 1)
         self.assertTrue(
             all(
                 "real-ai=unset/unset/unset" in line
@@ -337,7 +337,7 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         records = list((self.root / "target" / "dev-check-cache").glob("*.success"))
         self.assertEqual(len(records), 1)
         record = records[0].read_text(encoding="utf-8")
-        self.assertIn("schema=3", record)
+        self.assertIn("schema=4", record)
         self.assertIn("complete=true", record)
         self.assertTrue(record.endswith("record.end=true\n"))
         self.assertEqual(
@@ -360,7 +360,7 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         second = self._run()
 
         self.assertIn("CACHE HIT", second.stdout)
-        self.assertIn("PRIOR PASS  cargo nextest run (3/3", second.stdout)
+        self.assertIn("PRIOR PASS  cargo nextest run (1/1", second.stdout)
         self.assertEqual(
             self._log_lines(),
             before + [TOOLCHAIN_UPDATE_LOG, TOOLCHAIN_INSTALL_LOG, "wasm-prepare"],
@@ -474,24 +474,22 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         (self.root / "failure.txt").write_text("new key\n", encoding="utf-8")
         failing_env = self.env.copy()
         failing_env["DEV_CHECK_FAIL_COMMAND"] = "cargo nextest run"
-        failing_env["DEV_CHECK_FAIL_ON_RUN"] = "2"
+        failing_env["DEV_CHECK_FAIL_ON_RUN"] = "1"
         failed = self._run(env=failing_env, check=False)
         self.assertEqual(failed.returncode, 9)
-        self.assertIn("FAIL  cargo nextest run (2/3", failed.stderr)
+        self.assertIn("FAIL  cargo nextest run (1/1", failed.stderr)
         self.assertIn(
             "complete actionable failure from cargo nextest run", failed.stderr
         )
         self.assertIn("Failing repetition diagnostics:", failed.stderr)
         self.assertIn("Complete stage log:", failed.stderr)
-        self.assertIn("failure-controlled invocation=2", failed.stderr)
-        self.assertNotIn("failure-controlled invocation=1", failed.stderr)
+        self.assertIn("failure-controlled invocation=1", failed.stderr)
         failure_run = max(
             (self.root / "target" / "dev-check-logs").glob("run-*")
         )
         nextest_log = next(failure_run.glob("*-cargo-nextest-run.log"))
         full_log = nextest_log.read_text(encoding="utf-8")
         self.assertIn("failure-controlled invocation=1", full_log)
-        self.assertIn("failure-controlled invocation=2", full_log)
         failure_metadata = (failure_run / "metadata.txt").read_text(encoding="utf-8")
         self.assertIn("failure_log=", failure_metadata)
         self.assertEqual(
@@ -510,7 +508,7 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         failed = self._run(env=env, check=False)
 
         self.assertEqual(failed.returncode, 9)
-        self.assertIn("FAIL  cargo nextest run (1/3", failed.stderr)
+        self.assertIn("FAIL  cargo nextest run (1/1", failed.stderr)
         for diagnostic in (
             "first_independent_failure",
             "first independent failure diagnostics",
@@ -709,7 +707,7 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
 
         self.assertIn("PASS  Provision wasm test tools", result.stdout)
         self.assertEqual(self._log_lines().count("wasm-prepare"), 1)
-        self.assertEqual(self._log_lines().count("wasm"), 3)
+        self.assertEqual(self._log_lines().count("wasm"), 1)
         self.assertEqual(
             len(list((self.root / "target" / "dev-check-cache").glob("*.success"))),
             1,

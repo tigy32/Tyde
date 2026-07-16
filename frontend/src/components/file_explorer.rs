@@ -701,8 +701,8 @@ fn node_matches_filter(node: &TreeNode, filter: &str, show_hidden: bool) -> bool
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
-    use crate::wasm_test_support::Mounted;
     use crate::state::ActiveProjectRef;
+    use crate::wasm_test_support::Mounted;
     use leptos::mount::mount_to;
     use protocol::{
         CodeIntelLanguageId, CodeIntelOverviewHeadline, CodeIntelOverviewPayload,
@@ -851,10 +851,7 @@ mod wasm_tests {
     /// Pre-loading matters: it is the state in which opening a file resolves
     /// synchronously, so the test observes the destination pane directly instead
     /// of an unresolvable cold-open round trip.
-    fn mount_explorer_with_files(
-        container: HtmlElement,
-        files: &[&str],
-    ) -> Mounted<AppState> {
+    fn mount_explorer_with_files(container: HtmlElement, files: &[&str]) -> Mounted<AppState> {
         // The shape the server actually emits: one entry per path, `Add` for a
         // path present in the listing (server/src/project_stream.rs). The
         // directory rides along so the tree is exercised against the protocol's
@@ -1026,7 +1023,10 @@ mod wasm_tests {
 
         // Splits are drag-only now: the row carries no side-open control.
         assert!(
-            container.query_selector("button.fe-open-side").unwrap().is_none(),
+            container
+                .query_selector("button.fe-open-side")
+                .unwrap()
+                .is_none(),
             "the file row must not render an open-to-the-side action"
         );
 

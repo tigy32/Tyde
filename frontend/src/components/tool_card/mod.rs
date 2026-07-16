@@ -1809,9 +1809,12 @@ mod open_child_agent_tests {
         owner.with(|| {
             let state = AppState::new();
             state.active_project.set(active_on("host-1", "alpha"));
-            state
-                .agents
-                .set(vec![child_agent("host-1", "child-1", "Child", Some("beta"))]);
+            state.agents.set(vec![child_agent(
+                "host-1",
+                "child-1",
+                "Child",
+                Some("beta"),
+            )]);
 
             // The parent host is host-1 (the child lives on the parent's host);
             // the child belongs to project "beta", not the active "alpha".
@@ -1849,17 +1852,17 @@ mod open_child_agent_tests {
         owner.with(|| {
             let state = AppState::new();
             state.active_project.set(active_on("host-1", "alpha"));
-            state
-                .agents
-                .set(vec![child_agent("host-1", "child-1", "Child", Some("alpha"))]);
+            state.agents.set(vec![child_agent(
+                "host-1",
+                "child-1",
+                "Child",
+                Some("alpha"),
+            )]);
 
             open_child_agent(&state, "host-1", &AgentId("child-1".to_owned()));
 
             assert_eq!(
-                state
-                    .active_project
-                    .get_untracked()
-                    .map(|p| p.project_id),
+                state.active_project.get_untracked().map(|p| p.project_id),
                 Some(ProjectId("alpha".to_owned())),
                 "a same-project child leaves the active project unchanged"
             );
@@ -1885,10 +1888,7 @@ mod open_child_agent_tests {
             open_child_agent(&state, "host-1", &AgentId("missing".to_owned()));
 
             assert_eq!(
-                state
-                    .active_project
-                    .get_untracked()
-                    .map(|p| p.project_id),
+                state.active_project.get_untracked().map(|p| p.project_id),
                 Some(ProjectId("alpha".to_owned())),
                 "an unresolvable child must not switch the active project"
             );

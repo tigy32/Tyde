@@ -88,20 +88,20 @@ is the only allowed command; never invoke an underlying stage directly.
 Normal output is deliberately compact: each stage reports START and PASS/FAIL
 with wall time, repetition counts, and peak RSS. Full lossless output is kept in
 bounded `target/dev-check-logs/` directories. A failed stage prints the complete
-failing-repetition output and the complete stage-log path. Per-run metadata
+failing-run output and the complete stage-log path. Per-run metadata
 includes disk snapshots, cache hit/miss state, cleanup bytes, overall timing,
-and check-local sccache metrics. Cache misses keep compile/lint stages at one
-run and native, wasm, and web-loader tests at three sequential runs. The
+and check-local sccache metrics. Cache misses run every compile, lint, native,
+wasm, and web-loader stage once. The
 dev-check contract suite itself is reached through the wrapper without
 recursively invoking the real check.
 
 Both nextest profiles report only slow test status, never emit successful test
 output, and defer failure output to nextest's final report. This keeps source
 output concise without weakening diagnostics: `dev.sh` still retains the full
-stage log and replays the complete failing repetition. Nextest continues all
-independent native tests within that repetition, retaining every failure reached
-before the authoritative five-minute limit. The failed repetition still blocks
-repetitions 2–3 and every later stage.
+stage log and replays the complete failing run. Nextest continues all
+independent native tests within that run, retaining every failure reached
+before the authoritative five-minute limit. A failed test stage blocks every
+later stage.
 
 Only one check may run in a repository at once; contention fails immediately.
 The wrapper uses pinned sccache 0.16.0 with a bounded local-only 10 GiB cache,
@@ -115,7 +115,7 @@ clones are preserved between checks. Shared `target/debug`,
 wasm build output, user files, and sibling-worktree targets are never cleaned.
 
 The normal wrapper provisions browser and wasm-bindgen tools once before cache
-evaluation and reuses those exact paths for all repetitions. Cache identity is
+evaluation and reuses those exact paths for the wasm stage. Cache identity is
 only the schema, `HEAD` commit, and tracked plus unignored worktree content.
 Explicit browser overrides never fall back. `--explain-cache` reads only that
 Git state: it does not acquire the check lock, clean artifacts, access the
