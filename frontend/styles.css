@@ -348,7 +348,7 @@ details summary:focus:not(:focus-visible) {
 
 .new-chat-menu-trigger {
     height: 26px;
-    width: 20px;
+    width: 24px;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1141,6 +1141,7 @@ details summary:focus:not(:focus-visible) {
     min-width: 0;
     min-height: 0;
     overflow: hidden;
+    position: relative;
 }
 
 .editor-pane {
@@ -1231,6 +1232,31 @@ details summary:focus:not(:focus-visible) {
     border: 2px dashed var(--accent-primary);
 }
 
+.split-drop-zone {
+    position: absolute;
+    top: 8px;
+    bottom: 8px;
+    z-index: 6;
+    width: calc(50% - 12px);
+    pointer-events: none;
+    background: color-mix(in srgb, var(--accent-primary) 8%, transparent);
+    border: 2px dashed color-mix(in srgb, var(--accent-primary) 55%, transparent);
+    border-radius: 6px;
+}
+
+.split-drop-zone-left {
+    left: 8px;
+}
+
+.split-drop-zone-right {
+    right: 8px;
+}
+
+.split-drop-zone-active {
+    background: color-mix(in srgb, var(--accent-primary) 20%, transparent);
+    border-color: var(--accent-primary);
+}
+
 .center-narrow-notice {
     display: flex;
     align-items: center;
@@ -1289,7 +1315,7 @@ details summary:focus:not(:focus-visible) {
     flex-direction: column;
     justify-content: center;
     gap: 2px;
-    min-height: 44px;
+    min-height: 45px;
     padding: 8px 12px;
 }
 
@@ -9427,8 +9453,6 @@ kbd {
 
 .session-task-popover {
     position: absolute;
-    /* Flush against the header top — a gap here would break the hover
-       region (pointerleave fires while crossing it). */
     bottom: 100%;
     right: 4px;
     z-index: 1000;

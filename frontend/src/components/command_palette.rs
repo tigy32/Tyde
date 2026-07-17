@@ -25,6 +25,7 @@ pub enum CommandId {
     ToggleRightPanel,
     ToggleBottomPanel,
     OpenWorkflows,
+    OpenAgentMonitor,
     GoToHome,
     GoToChat,
     ToggleSettings,
@@ -227,6 +228,11 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         binding: None,
     },
     CommandDescriptor {
+        id: CommandId::OpenAgentMonitor,
+        name: "Open Agent Monitor",
+        binding: None,
+    },
+    CommandDescriptor {
         id: CommandId::ToggleBottomPanel,
         name: "Toggle Bottom Panel",
         binding: None,
@@ -339,20 +345,6 @@ fn width_allows_split(workspace_width: Option<f64>) -> bool {
     workspace_width.is_none_or(|width| width >= MIN_SPLIT_WIDTH)
 }
 
-/// Availability of a command **aimed at a specific tab** — what a tab context
-/// menu needs, since it acts on the tab it was opened for and not on whatever
-/// happens to be active. No remaining command is tab-specific, so this delegates
-/// to [`command_availability`]; the `tab` parameter is kept for call sites that
-/// still name the tab they act on.
-pub fn command_availability_for(
-    state: &AppState,
-    id: CommandId,
-    _tab: Option<TabId>,
-    workspace_width: Option<f64>,
-) -> CommandAvailability {
-    command_availability(state, id, workspace_width)
-}
-
 pub fn command_availability(
     state: &AppState,
     id: CommandId,
@@ -373,6 +365,7 @@ pub fn command_availability(
         | CommandId::ToggleRightPanel
         | CommandId::ToggleBottomPanel
         | CommandId::OpenWorkflows
+        | CommandId::OpenAgentMonitor
         | CommandId::GoToHome
         | CommandId::GoToChat
         | CommandId::ToggleSettings
@@ -538,6 +531,9 @@ pub fn execute_command(state: &AppState, id: CommandId, workspace_width: Option<
         CommandId::OpenWorkflows => {
             state.right_dock.set(DockVisibility::Visible);
             state.right_tab.set(RightTab::Workflows);
+        }
+        CommandId::OpenAgentMonitor => {
+            state.open_tab(TabContent::AgentMonitor, "Agent Monitor".to_owned(), true)
         }
         CommandId::GoToHome => state.open_tab(TabContent::Home, "Home".to_string(), false),
         // "Go to Chat" means: take me to the chat I would be typing into.

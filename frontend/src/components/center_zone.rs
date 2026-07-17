@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 
 use leptos::prelude::*;
 use wasm_bindgen::{JsCast, closure::Closure};
@@ -10,8 +10,7 @@ use crate::bridge::{self, SetSelectedHostRequest};
 use crate::components::agent_monitor_view::AgentMonitorView;
 use crate::components::chat_view::ChatView;
 use crate::components::command_palette::{
-    ActionId, CommandId, binding_for, command_availability_for, conflicting_occurrence,
-    execute_command, move_tab, move_tab_availability,
+    ActionId, CommandId, binding_for, conflicting_occurrence, move_tab, move_tab_availability,
 };
 use crate::components::diff_view::ReviewableDiffView;
 use crate::components::file_view::FileView;
@@ -145,23 +144,6 @@ fn pane_accessible_name(state: &AppState, pane: PaneId) -> String {
     })
 }
 
-thread_local! {
-    /// Monotonic source of DOM ids for menu reason text. Two menus can be open
-    /// at once (a pane menu and a tab menu), and both may list the same command
-    /// — so an id derived from the command's label would collide, and
-    /// `aria-describedby` would resolve to whichever element happened to come
-    /// first. A counter makes the ids unique by construction.
-    static NEXT_MENU_REASON_ID: Cell<u64> = const { Cell::new(0) };
-}
-
-fn next_menu_reason_id() -> String {
-    NEXT_MENU_REASON_ID.with(|cell| {
-        let id = cell.get();
-        cell.set(id + 1);
-        format!("menu-reason-{id}")
-    })
-}
-
 /// The live region's message signal.
 ///
 /// Reference-counted for the same reason as the width: refusals originate where
@@ -201,6 +183,12 @@ pub fn reveal_tab(state: &AppState, tab: TabId) -> bool {
 struct TabDrag {
     source: PaneId,
     tab: TabId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitDropSide {
+    Left,
+    Right,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -393,87 +381,6 @@ fn apply_ratio(state: &AppState, requested: f64, measured: Option<f64>) {
     announce(format!("Primary pane {} percent.", as_percent(next)));
 }
 
-/// A disabled-but-visible menu item: the reason is the point, so it is both the
-/// visible text and the accessible description (dev-docs/32 §12).
-/// A menu item for one typed command.
-///
-/// An unavailable item is **not** removed and **not** `disabled`: it keeps its
-/// place, stays in the tab order, and is reachable by keyboard, because a
-/// control the user cannot even focus cannot tell them why it is unavailable.
-/// It is marked `aria-disabled`, described by its own reason text through
-/// `aria-describedby`, refuses to act, and announces that reason
-/// (dev-docs/32 §12).
-#[component]
-fn CommandMenuItem(
-    id: CommandId,
-    label: &'static str,
-    /// The tab this item acts on. A tab context menu is opened *for a tab* —
-    /// often a background tab, or one in the other pane — so both its
-    /// availability and its activation must name that tab, never "whatever is
-    /// active". `None` means the focused pane's active tab (the pane menu).
-    #[prop(optional)]
-    target: Option<TabId>,
-    #[prop(optional)] on_run: Option<Callback<()>>,
-    context_menu: RwSignal<Option<TabMenu>>,
-) -> impl IntoView {
-    let state = expect_context::<AppState>();
-    let width = workspace_width();
-    let availability =
-        Memo::new(move |_| command_availability_for(&state, id, target, width.get()));
-    let disabled = move || !availability.get().is_enabled();
-    let reason = move || availability.get().reason().unwrap_or_default().to_owned();
-    let reason_id = next_menu_reason_id();
-    let described_by = {
-        let reason_id = reason_id.clone();
-        move || disabled().then(|| reason_id.clone())
-    };
-    // Hint and matcher come from the one binding, resolved through the unified
-    // action lookup — so what a menu says and what the key does cannot drift.
-    let hint = binding_for(ActionId::Command(id)).map(|binding| binding.chord().hint());
-
-    let run_state = expect_context::<AppState>();
-    let activate = move || {
-        if let Some(reason) = availability.get_untracked().reason() {
-            announce(reason);
-            return;
-        }
-        context_menu.set(None);
-        match on_run {
-            Some(callback) => callback.run(()),
-            None => execute_command(&run_state, id, width.get_untracked()),
-        }
-    };
-    let on_click = {
-        let activate = activate.clone();
-        move |_: web_sys::MouseEvent| activate()
-    };
-    let on_keydown = move |ev: web_sys::KeyboardEvent| {
-        if matches!(ev.key().as_str(), "Enter" | " ") {
-            ev.prevent_default();
-            activate();
-        }
-    };
-
-    view! {
-        <button
-            class="context-menu-item"
-            role="menuitem"
-            class:disabled=disabled
-            aria-disabled=move || disabled().then_some("true")
-            aria-describedby=described_by
-            title=reason
-            on:click=on_click
-            on:keydown=on_keydown
-        >
-            <span class="context-menu-label">{label}</span>
-            {hint.map(|hint| view! { <kbd class="context-menu-shortcut">{hint}</kbd> })}
-            <Show when=disabled>
-                <span class="context-menu-reason" id=reason_id.clone()>{reason}</span>
-            </Show>
-        </button>
-    }
-}
-
 #[component]
 fn TabContextMenu(
     tab_id: TabId,
@@ -644,62 +551,6 @@ fn TabContextMenu(
     }
 }
 
-/// The pane-level action menu, reachable from every pane's tab strip. Carries
-/// the pane close/join commands so they are discoverable without the palette.
-/// Splits and tab moves are created by dragging tabs, not from this menu.
-#[component]
-fn PaneActionsMenu(pane: PaneId, context_menu: RwSignal<Option<TabMenu>>) -> impl IntoView {
-    let open = RwSignal::new(false);
-    let state = expect_context::<AppState>();
-
-    let close_state = expect_context::<AppState>();
-    let close_this_pane = Callback::new(move |_| {
-        close_state.close_pane(pane);
-        open.set(false);
-    });
-
-    view! {
-        <div class="pane-actions">
-            <button
-                class="pane-actions-trigger"
-                title=format!("{} pane actions", pane_name(pane))
-                aria-label=format!("{} pane actions", pane_name(pane))
-                aria-haspopup="menu"
-                aria-expanded=move || if open.get() { "true" } else { "false" }
-                on:click=move |ev: web_sys::MouseEvent| {
-                    ev.stop_propagation();
-                    // Focus the pane the menu belongs to, so its commands read
-                    // the pane the user is acting on.
-                    state.focus_pane(pane);
-                    open.update(|value| *value = !*value);
-                }
-            >
-                "\u{22ef}"
-            </button>
-            <Show when=move || open.get()>
-                <div class="pane-actions-backdrop" on:click=move |_| open.set(false)></div>
-                <div
-                    class="context-menu center-menu pane-actions-menu"
-                    role="menu"
-                    aria-label="Pane actions"
-                >
-                    <CommandMenuItem
-                        id=CommandId::CloseEditorPane
-                        label="Close Editor Pane"
-                        on_run=close_this_pane
-                        context_menu=context_menu
-                    />
-                    <CommandMenuItem
-                        id=CommandId::CloseOtherPane
-                        label="Return to Single Pane"
-                        context_menu=context_menu
-                    />
-                </div>
-            </Show>
-        </div>
-    }
-}
-
 #[component]
 fn TabButton(
     tab_id: TabId,
@@ -708,6 +559,7 @@ fn TabButton(
     editing_tab_id: RwSignal<Option<TabId>>,
     drag: RwSignal<Option<TabDrag>>,
     drop_target: RwSignal<Option<PaneId>>,
+    split_drop_target: RwSignal<Option<SplitDropSide>>,
     drag_conflict: RwSignal<Option<TabId>>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -724,7 +576,6 @@ fn TabButton(
             .center_zone
             .with(|center_zone| center_zone.pane_active_tab_id(pane) == Some(tab_id))
     };
-    let is_split = move || state.center_zone.with(|center_zone| center_zone.is_split());
     let is_closeable = move || tab_data().is_some_and(|t| t.closeable);
     let is_home_tab = move || tab_data().is_some_and(|t| matches!(t.content, TabContent::Home));
     let is_editing = move || editing_tab_id.get() == Some(tab_id);
@@ -737,10 +588,20 @@ fn TabButton(
                 .unwrap_or_default()
         })
     };
+    let can_drag_state = state.clone();
+    let can_drag = move || {
+        can_drag_state.center_zone.with(|center_zone| {
+            center_zone.is_split()
+                || center_zone
+                    .pane(pane)
+                    .is_some_and(|pane| pane.tabs.len() > 1)
+        })
+    };
 
     // Clicking a tab reveals it: active in its own pane, and that pane focused.
+    let click_state = state.clone();
     let on_click = move |_| {
-        reveal_tab(&state, tab_id);
+        reveal_tab(&click_state, tab_id);
     };
 
     let on_contextmenu = move |ev: web_sys::MouseEvent| {
@@ -787,15 +648,32 @@ fn TabButton(
         focus_tab_element(target);
     };
 
-    // Cross-pane drag is move-only and needs an existing split. It never starts
-    // from the close affordance or from a tab being renamed.
+    let pointer_state = state.clone();
+    let on_pointer_down = move |ev: web_sys::PointerEvent| {
+        if ev.button() != 0 || is_editing() {
+            return;
+        }
+        let from_close = ev
+            .target()
+            .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+            .and_then(|element| element.closest(".tab-close").ok().flatten())
+            .is_some();
+        if !from_close {
+            reveal_tab(&pointer_state, tab_id);
+        }
+    };
+
+    // Native dragging can suppress the eventual click after even a small
+    // pointer movement, so ordinary activation happens on pointer-down above.
+    // The drag itself remains move-only and never starts from the close
+    // affordance or from a tab being renamed.
     let on_dragstart = move |ev: web_sys::DragEvent| {
         let from_close = ev
             .target()
             .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
             .and_then(|element| element.closest(".tab-close").ok().flatten())
             .is_some();
-        if !is_split() || is_editing() || from_close {
+        if !can_drag() || is_editing() || from_close {
             ev.prevent_default();
             return;
         }
@@ -812,6 +690,7 @@ fn TabButton(
     let on_dragend = move |_: web_sys::DragEvent| {
         drag.set(None);
         drop_target.set(None);
+        split_drop_target.set(None);
         drag_conflict.set(None);
     };
 
@@ -867,11 +746,12 @@ fn TabButton(
             aria-selected=move || if is_active() { "true" } else { "false" }
             aria-controls=tabpanel_element_id(tab_id)
             tabindex=move || if is_active() { "0" } else { "-1" }
-            draggable=move || if is_split() && !is_editing() { "true" } else { "false" }
+            draggable=move || if can_drag() && !is_editing() { "true" } else { "false" }
             title=move || tab_data().map(|t| t.label).unwrap_or_default()
             aria-label=move || tab_data().map(|t| t.label).unwrap_or_default()
             data-tab-id=tab_id.0.to_string()
             on:click=on_click
+            on:pointerdown=on_pointer_down
             on:contextmenu=on_contextmenu
             on:keydown=on_keydown
             on:dragstart=on_dragstart
@@ -1106,8 +986,8 @@ fn TabMount(tab_id: TabId, pane: PaneId) -> impl IntoView {
     }
 }
 
-/// The shared action cluster (host picker / Agents / New Chat). Rendered once,
-/// in the primary strip, so a split does not duplicate global actions.
+/// The shared action cluster (host picker / New Chat). Rendered once, in the
+/// primary strip, so a split does not duplicate global actions.
 #[component]
 fn PaneToolActions() -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -1128,13 +1008,10 @@ fn PaneToolActions() -> impl IntoView {
         begin_new_chat_default(&state_for_new_chat);
     };
 
-    let state_for_agent_monitor = state.clone();
-
     // On the Home context (no active agent and no active project) a new chat's
     // host comes from `selected_host_id` — the same value the Settings host
     // picker controls. Surfacing that picker here makes the otherwise-hidden
-    // choice explicit. For project/agent contexts the host is pinned by the
-    // project or the existing agent, so we keep the Agents button instead.
+    // choice explicit. For project/agent contexts the host is already pinned.
     let is_home_state = state.clone();
     let is_home = Memo::new(move |_| {
         is_home_state.active_agent.get().is_none() && is_home_state.active_project.get().is_none()
@@ -1205,29 +1082,7 @@ fn PaneToolActions() -> impl IntoView {
 
     view! {
         <>
-            <Show
-                when=move || is_home.get()
-                fallback=move || {
-                    let state_am = state_for_agent_monitor.clone();
-                    let on_agent_monitor = move |_| {
-                        state_am.open_tab(
-                            TabContent::AgentMonitor,
-                            "Agent Monitor".to_owned(),
-                            true,
-                        );
-                    };
-                    view! {
-                        <button
-                            class="center-tool-btn"
-                            title="Open Agent Monitor"
-                            aria-label="Open Agent Monitor"
-                            on:click=on_agent_monitor
-                        >
-                            "Agents"
-                        </button>
-                    }
-                }
-            >
+            <Show when=move || is_home.get()>
                 <select
                     class="center-host-select"
                     title="Host for new chats"
@@ -1294,6 +1149,7 @@ fn EditorPane(
     editing_tab_id: RwSignal<Option<TabId>>,
     drag: RwSignal<Option<TabDrag>>,
     drop_target: RwSignal<Option<PaneId>>,
+    split_drop_target: RwSignal<Option<SplitDropSide>>,
     drag_conflict: RwSignal<Option<TabId>>,
     hidden: Signal<bool>,
     style: Signal<String>,
@@ -1535,6 +1391,7 @@ fn EditorPane(
                                     editing_tab_id=editing_tab_id
                                     drag=drag
                                     drop_target=drop_target
+                                    split_drop_target=split_drop_target
                                     drag_conflict=drag_conflict
                                 />
                             }
@@ -1559,6 +1416,7 @@ fn EditorPane(
                                 editing_tab_id=editing_tab_id
                                 drag=drag
                                 drop_target=drop_target
+                                split_drop_target=split_drop_target
                                 drag_conflict=drag_conflict
                             />
                         </For>
@@ -1567,7 +1425,6 @@ fn EditorPane(
 
                 <div class="pinned-tab-actions">
                     <span class="tab-bar-divider" aria-hidden="true"></span>
-                    <PaneActionsMenu pane=pane context_menu=context_menu />
                     <Show when=move || pane == PaneId::Primary>
                         <PaneToolActions />
                     </Show>
@@ -1608,6 +1465,7 @@ pub fn CenterZone() -> impl IntoView {
     let editing_tab_id: RwSignal<Option<TabId>> = RwSignal::new(None);
     let drag: RwSignal<Option<TabDrag>> = RwSignal::new(None);
     let drop_target: RwSignal<Option<PaneId>> = RwSignal::new(None);
+    let split_drop_target: RwSignal<Option<SplitDropSide>> = RwSignal::new(None);
     // The occurrence already sitting in the pane a drag is hovering, if any.
     // A drag over it is refused, not accepted-then-undone.
     let drag_conflict: RwSignal<Option<TabId>> = RwSignal::new(None);
@@ -1806,6 +1664,80 @@ pub fn CenterZone() -> impl IntoView {
     let primary_hint = pane_hint(CommandId::FocusPrimaryPane);
     let secondary_hint = pane_hint(CommandId::FocusSecondaryPane);
 
+    let on_workspace_dragover = move |ev: web_sys::DragEvent| {
+        if is_split.get_untracked()
+            || drag.get_untracked().is_none()
+            || width
+                .get_untracked()
+                .is_some_and(|workspace| workspace < MIN_SPLIT_WIDTH)
+        {
+            split_drop_target.set(None);
+            return;
+        }
+        let Some(panes) = panes_ref.get_untracked() else {
+            return;
+        };
+        let rect = panes.get_bounding_client_rect();
+        let side = if f64::from(ev.client_x()) < rect.left() + rect.width() / 2.0 {
+            SplitDropSide::Left
+        } else {
+            SplitDropSide::Right
+        };
+        ev.prevent_default();
+        if let Some(transfer) = ev.data_transfer() {
+            transfer.set_drop_effect("move");
+        }
+        split_drop_target.set(Some(side));
+    };
+    let on_workspace_dragleave = move |ev: web_sys::DragEvent| {
+        let still_inside = ev
+            .current_target()
+            .and_then(|current| current.dyn_into::<web_sys::Node>().ok())
+            .zip(
+                ev.related_target()
+                    .and_then(|related| related.dyn_into::<web_sys::Node>().ok()),
+            )
+            .is_some_and(|(workspace, related)| workspace.contains(Some(&related)));
+        if !still_inside {
+            split_drop_target.set(None);
+        }
+    };
+    let split_state = state.clone();
+    let on_workspace_drop = move |ev: web_sys::DragEvent| {
+        let Some(side) = split_drop_target.get_untracked() else {
+            return;
+        };
+        ev.prevent_default();
+        let Some(active_drag) = drag.get_untracked() else {
+            return;
+        };
+        let target = match side {
+            SplitDropSide::Left => PaneId::Primary,
+            SplitDropSide::Right => PaneId::Secondary,
+        };
+        let label = split_state.center_zone.with_untracked(|center_zone| {
+            center_zone
+                .tab(active_drag.tab)
+                .map(|tab| tab.label.clone())
+                .unwrap_or_default()
+        });
+        let result = split_state.split_tab_to(target, active_drag.tab);
+        match result.disabled_reason() {
+            Some(reason) => announce(reason),
+            None => announce(format!(
+                "Split view opened with {label} on the {}.",
+                match side {
+                    SplitDropSide::Left => "left",
+                    SplitDropSide::Right => "right",
+                }
+            )),
+        }
+        drag.set(None);
+        drop_target.set(None);
+        split_drop_target.set(None);
+        drag_conflict.set(None);
+    };
+
     view! {
         <div class="center-zone">
             <Show when=move || narrow.get()>
@@ -1839,13 +1771,21 @@ pub fn CenterZone() -> impl IntoView {
 
             // DOM order is primary strip and content, divider, secondary strip
             // and content (dev-docs/32 §11).
-            <div class="center-panes" class:center-panes-narrow=move || narrow.get() node_ref=panes_ref>
+            <div
+                class="center-panes"
+                class:center-panes-narrow=move || narrow.get()
+                node_ref=panes_ref
+                on:dragover=on_workspace_dragover
+                on:dragleave=on_workspace_dragleave
+                on:drop=on_workspace_drop
+            >
                 <EditorPane
                     pane=PaneId::Primary
                     context_menu=context_menu
                     editing_tab_id=editing_tab_id
                     drag=drag
                     drop_target=drop_target
+                    split_drop_target=split_drop_target
                     drag_conflict=drag_conflict
                     hidden=primary_hidden
                     style=primary_style
@@ -1879,10 +1819,31 @@ pub fn CenterZone() -> impl IntoView {
                         editing_tab_id=editing_tab_id
                         drag=drag
                         drop_target=drop_target
+                        split_drop_target=split_drop_target
                         drag_conflict=drag_conflict
                         hidden=secondary_hidden
                         style=secondary_style
                     />
+                </Show>
+                <Show when=move || {
+                    !is_split.get()
+                        && drag.get().is_some()
+                        && width.get().is_none_or(|workspace| workspace >= MIN_SPLIT_WIDTH)
+                }>
+                    <div
+                        class="split-drop-zone split-drop-zone-left"
+                        class:split-drop-zone-active=move || {
+                            split_drop_target.get() == Some(SplitDropSide::Left)
+                        }
+                        aria-hidden="true"
+                    ></div>
+                    <div
+                        class="split-drop-zone split-drop-zone-right"
+                        class:split-drop-zone-active=move || {
+                            split_drop_target.get() == Some(SplitDropSide::Right)
+                        }
+                        aria-hidden="true"
+                    ></div>
                 </Show>
             </div>
 
@@ -2274,9 +2235,14 @@ mod wasm_tests {
     /// `data_transfer()` only through an `Option`, exactly as they must for a
     /// synthetic or cross-browser drag.
     fn drag_event(kind: &str) -> web_sys::MouseEvent {
+        drag_event_at(kind, 0)
+    }
+
+    fn drag_event_at(kind: &str, client_x: i32) -> web_sys::MouseEvent {
         let init = web_sys::MouseEventInit::new();
         init.set_bubbles(true);
         init.set_cancelable(true);
+        init.set_client_x(client_x);
         web_sys::MouseEvent::new_with_mouse_event_init_dict(kind, &init).unwrap()
     }
 
@@ -3364,11 +3330,10 @@ mod wasm_tests {
         );
     }
 
-    /// Two menus can be open at once (a pane menu and a tab menu), and both may
-    /// list the same command. Reason ids derived from the label would collide,
-    /// and `aria-describedby` would resolve to whichever came first.
+    /// The global title-bar actions stay limited to host selection and New
+    /// Chat; Agents and the pane overflow menu live elsewhere in the product.
     #[wasm_bindgen_test]
-    async fn menu_reason_ids_are_unique_even_with_two_menus_open() {
+    async fn removed_title_bar_actions_do_not_render() {
         let container = make_container();
         let state = AppState::new();
         let state_for_mount = state.clone();
@@ -3379,49 +3344,21 @@ mod wasm_tests {
         });
         settle().await;
 
-        // A single pane: the pane menu's Close Editor Pane / Return to Single
-        // Pane commands are both unavailable, so each renders its reason element.
         state.open_tab(TabContent::empty_chat(), "Chat".to_owned(), true);
         settle().await;
-
-        query(&container, ".pane-actions-trigger")
-            .expect("pane actions trigger")
-            .click();
-        settle().await;
-        tab_button_named(&container, "Chat")
-            .dispatch_event(&web_sys::MouseEvent::new("contextmenu").unwrap())
-            .unwrap();
-        settle().await;
-
-        let described: Vec<String> = query_all(&container, "[aria-describedby]")
-            .iter()
-            .filter_map(|element| element.get_attribute("aria-describedby"))
-            .collect();
         assert!(
-            described.len() >= 2,
-            "precondition: two menus are open, each describing an unavailable \
-             command, got {described:?}"
+            query(&container, ".pane-actions-trigger").is_none(),
+            "the pane overflow control must not render in the title bar"
         );
-
-        let document = web_sys::window().unwrap().document().unwrap();
-        for id in &described {
-            let matches = document
-                .query_selector_all(&format!("[id=\"{id}\"]"))
-                .unwrap()
-                .length();
-            assert_eq!(
-                matches, 1,
-                "aria-describedby={id:?} must resolve to exactly one element, \
-                 found {matches}"
-            );
-        }
-        let mut unique = described.clone();
-        unique.sort();
-        unique.dedup();
-        assert_eq!(
-            unique.len(),
-            described.len(),
-            "menu reason ids must be unique by construction, got {described:?}"
+        assert!(
+            query_all(&container, ".pinned-tab-actions button")
+                .iter()
+                .all(|button| text_of(button).trim() != "Agents"),
+            "the Agents shortcut must not render in the title bar"
+        );
+        assert!(
+            query(&container, ".new-chat-btn").is_some(),
+            "removing the extra title actions must preserve New Chat"
         );
     }
 
@@ -3439,7 +3376,7 @@ mod wasm_tests {
         });
         settle().await;
 
-        for selector in [".pane-actions-trigger"] {
+        for selector in [".new-chat-btn", ".new-chat-menu-trigger"] {
             let control = query(&container, selector).unwrap_or_else(|| panic!("{selector}"));
             let rect = control.get_bounding_client_rect();
             assert!(
@@ -3450,12 +3387,14 @@ mod wasm_tests {
             );
         }
 
-        query(&container, ".pane-actions-trigger")
-            .expect("pane actions trigger")
-            .click();
+        state.open_tab(TabContent::empty_chat(), "Chat".to_owned(), true);
         settle().await;
-        let items = query_all(&container, ".pane-actions-menu [role=\"menuitem\"]");
-        assert!(!items.is_empty(), "the pane menu lists its commands");
+        tab_button_named(&container, "Chat")
+            .dispatch_event(&web_sys::MouseEvent::new("contextmenu").unwrap())
+            .unwrap();
+        settle().await;
+        let items = query_all(&container, ".context-menu [role=\"menuitem\"]");
+        assert!(!items.is_empty(), "the tab menu lists its commands");
         for item in &items {
             let rect = item.get_bounding_client_rect();
             assert!(
@@ -4052,7 +3991,7 @@ mod wasm_tests {
     /// Splits and cross-pane moves are created by dragging tabs — never by a
     /// button, menu item, or palette command. With a loaded file (which used to
     /// enable Split Right), no split/move control renders anywhere: not on the
-    /// tab strip, not in the pane-actions menu, not in the tab context menu.
+    /// tab strip or in the tab context menu.
     #[wasm_bindgen_test]
     async fn no_split_or_move_controls_are_rendered() {
         let container = make_container();
@@ -4074,23 +4013,7 @@ mod wasm_tests {
             "the tab-strip split control is gone — splits are created by dragging"
         );
 
-        // The pane-actions menu lists only pane focus/close commands now.
-        query(&container, ".pane-actions-trigger")
-            .expect("pane actions trigger")
-            .click();
-        settle().await;
-        let pane_items = query_all(&container, ".pane-actions-menu [role=\"menuitem\"]");
-        assert!(
-            !pane_items.is_empty(),
-            "the pane menu still lists its close/join commands"
-        );
-        for item in &pane_items {
-            let label = text_of(item);
-            assert!(
-                !label.contains("Split Right") && !label.contains("Move Tab to Other Pane"),
-                "no split/move command remains in the pane menu, found {label:?}"
-            );
-        }
+        assert!(query(&container, ".pane-actions-trigger").is_none());
 
         // The tab context menu carries no split/move item either.
         tab_button_named(&container, "alpha.rs")
@@ -4104,6 +4027,94 @@ mod wasm_tests {
                 "no split/move command remains in the tab menu, found {label:?}"
             );
         }
+    }
+
+    /// A tab can create a split from the ordinary single-pane layout. Both
+    /// sides are visible targets, and pointer-down activates draggable tabs so
+    /// native drag gesture detection cannot turn a small movement into a dead
+    /// click.
+    #[wasm_bindgen_test]
+    async fn single_pane_drag_exposes_both_sides_and_splits() {
+        let container = make_container();
+        let state = AppState::new();
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            install_tab_lru_effect(&state_for_mount);
+            view! { <CenterZone /> }
+        });
+        settle().await;
+
+        open_file_tab(&state, "alpha.rs", "fn alpha() {}");
+        open_file_tab(&state, "beta.rs", "fn beta() {}");
+        settle().await;
+        let alpha = tab_button_named(&container, "alpha.rs");
+        assert_eq!(
+            alpha.get_attribute("draggable").as_deref(),
+            Some("true"),
+            "single-pane tabs must be draggable so they can create a split"
+        );
+
+        alpha
+            .dispatch_event(&pointer_event("pointerdown", 0))
+            .unwrap();
+        settle().await;
+        assert_eq!(
+            alpha.get_attribute("aria-selected").as_deref(),
+            Some("true"),
+            "pointer-down activates before native dragging can suppress click"
+        );
+
+        alpha.dispatch_event(&drag_event("dragstart")).unwrap();
+        settle().await;
+        assert_eq!(
+            query_all(&container, ".split-drop-zone").len(),
+            2,
+            "dragging in a single pane reveals left and right split targets"
+        );
+
+        let workspace = query(&container, ".center-panes").expect("center workspace");
+        let rect = workspace.get_bounding_client_rect();
+        workspace
+            .dispatch_event(&drag_event_at(
+                "dragover",
+                (rect.left() + rect.width() * 0.25).round() as i32,
+            ))
+            .unwrap();
+        settle().await;
+        assert!(
+            query(&container, ".split-drop-zone-left.split-drop-zone-active").is_some(),
+            "the left half highlights the left target"
+        );
+
+        workspace
+            .dispatch_event(&drag_event_at(
+                "dragover",
+                (rect.left() + rect.width() * 0.75).round() as i32,
+            ))
+            .unwrap();
+        settle().await;
+        assert!(
+            query(&container, ".split-drop-zone-right.split-drop-zone-active").is_some(),
+            "the right half highlights the right target"
+        );
+        workspace.dispatch_event(&drag_event("drop")).unwrap();
+        settle().await;
+
+        assert_eq!(
+            panes(&container).len(),
+            2,
+            "dropping opens side-by-side panes"
+        );
+        assert!(
+            tab_labels_in(&pane_element(&container, PaneId::Secondary))
+                .contains(&"alpha.rs".to_owned()),
+            "the dragged tab lands on the chosen right side"
+        );
+        assert!(
+            query(&container, ".split-drop-zone").is_none(),
+            "split drop affordances clear after the drop"
+        );
     }
 
     /// Cross-pane drag is move-only, refuses its own pane, and collapses the
@@ -4439,11 +4450,10 @@ mod wasm_tests {
         );
     }
 
-    /// An unavailable menu item is not inert: it keeps its place, stays
-    /// keyboard reachable, describes its reason, refuses to act, and announces
-    /// that reason.
+    /// Removing the title-bar overflow does not remove the pane commands from
+    /// their keyboard/command-palette path.
     #[wasm_bindgen_test]
-    async fn an_unavailable_menu_item_stays_reachable_refuses_and_says_why() {
+    async fn pane_commands_survive_title_bar_cleanup() {
         let container = make_container();
         let state = AppState::new();
         let state_for_mount = state.clone();
@@ -4454,53 +4464,29 @@ mod wasm_tests {
         });
         settle().await;
 
-        // A single pane: "Return to Single Pane" cannot run and must say so
-        // rather than vanish from the pane-actions menu.
         state.open_tab(TabContent::empty_chat(), "Chat".to_owned(), true);
+        state.open_tab_in(
+            PaneId::Secondary,
+            TabContent::empty_chat(),
+            "Other Chat".to_owned(),
+            true,
+        );
         settle().await;
-        query(&container, ".pane-actions-trigger")
-            .expect("pane actions trigger")
-            .click();
-        settle().await;
-
-        let item = query_all(&container, ".pane-actions-menu button[role=\"menuitem\"]")
-            .into_iter()
-            .find(|button| text_of(button).contains("Return to Single Pane"))
-            .expect("the join command stays listed even when it cannot run");
-
-        assert_eq!(
-            item.get_attribute("aria-disabled").as_deref(),
-            Some("true"),
-            "unavailable items are aria-disabled, not removed"
-        );
         assert!(
-            !item.has_attribute("disabled"),
-            "the item must stay focusable — a control you cannot reach cannot \
-             tell you why it is unavailable"
+            query(&container, ".pane-actions-trigger").is_none(),
+            "the title-bar overflow stays removed in split view"
         );
-        let described_by = item
-            .get_attribute("aria-describedby")
-            .expect("an unavailable item is described by its reason");
-        let description =
-            query(&container, &format!("#{described_by}")).expect("the description element exists");
-        assert!(
-            text_of(&description).contains("There is only one pane."),
-            "the description is the specific reason, got {:?}",
-            text_of(&description)
+        crate::components::command_palette::execute_command(
+            &state,
+            CommandId::CloseOtherPane,
+            None,
         );
-
-        item.click();
         settle().await;
         assert!(
             !state
                 .center_zone
                 .with_untracked(|center_zone| center_zone.is_split()),
-            "activating an unavailable item performs no work"
-        );
-        assert!(
-            live_region_text(&container).contains("There is only one pane."),
-            "the refusal is announced, got {:?}",
-            live_region_text(&container)
+            "the command path still joins the panes"
         );
     }
 

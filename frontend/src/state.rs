@@ -1178,6 +1178,46 @@ impl CenterZoneState {
         }
     }
 
+    pub fn split_tab_to(&mut self, target: PaneId, id: TabId, ratio: SplitRatio) -> MoveTabResult {
+        let CenterLayout::Single(primary) = &self.layout else {
+            return self.move_tab_to(target, id, ratio);
+        };
+        if !primary.tabs.iter().any(|tab| tab.id == id) {
+            return MoveTabResult::SourceTabMissing;
+        }
+
+        let old_layout =
+            std::mem::replace(&mut self.layout, CenterLayout::Single(PaneState::empty()));
+        let CenterLayout::Single(mut remaining) = old_layout else {
+            unreachable!("the layout was checked as single above");
+        };
+        let Some(tab) = remaining.tabs.iter().find(|tab| tab.id == id).cloned() else {
+            self.layout = CenterLayout::Single(remaining);
+            return MoveTabResult::SourceTabMissing;
+        };
+        let mut moved = HashSet::new();
+        moved.insert(id);
+        remaining.remove_tabs(&moved);
+
+        let dragged = PaneState::from_tab(tab);
+        let (primary, secondary) = match target {
+            PaneId::Primary => (dragged, remaining),
+            PaneId::Secondary => (remaining, dragged),
+        };
+        self.layout = CenterLayout::Split {
+            primary,
+            secondary,
+            focused: target,
+            ratio,
+        };
+        self.collapse_empty_pane();
+        MoveTabResult::Moved {
+            tab: id,
+            source: PaneId::Primary,
+            target,
+        }
+    }
+
     pub fn remove_tabs(&mut self, doomed: &HashSet<TabId>) {
         match &mut self.layout {
             CenterLayout::Single(primary) => primary.remove_tabs(doomed),
@@ -4319,6 +4359,15 @@ impl AppState {
         let mut result = MoveTabResult::SourceTabMissing;
         self.center_zone.update(|center_zone| {
             result = center_zone.move_tab_to(target, id, ratio);
+        });
+        result
+    }
+
+    pub fn split_tab_to(&self, target: PaneId, id: TabId) -> MoveTabResult {
+        let ratio = self.center_split_ratio.get_untracked();
+        let mut result = MoveTabResult::SourceTabMissing;
+        self.center_zone.update(|center_zone| {
+            result = center_zone.split_tab_to(target, id, ratio);
         });
         result
     }
@@ -7752,6 +7801,39 @@ mod tests {
                     .map(|scroll| scroll.scroll_top),
                 Some(33)
             );
+        });
+    }
+
+    #[test]
+    fn split_tab_to_left_places_dragged_tab_in_primary_pane() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let first = install_loaded_file(
+                &state,
+                PaneId::Primary,
+                resource_key("h", "p", test_path("first")),
+            );
+            let second = install_loaded_file(
+                &state,
+                PaneId::Primary,
+                resource_key("h", "p", test_path("second")),
+            );
+
+            assert!(matches!(
+                state.split_tab_to(PaneId::Primary, second),
+                MoveTabResult::Moved {
+                    tab,
+                    source: PaneId::Primary,
+                    target: PaneId::Primary,
+                } if tab == second
+            ));
+            state.center_zone.with_untracked(|center_zone| {
+                assert!(center_zone.is_split());
+                assert_eq!(center_zone.locate_tab(second), Some(PaneId::Primary));
+                assert_eq!(center_zone.locate_tab(first), Some(PaneId::Secondary));
+                assert_eq!(center_zone.focused_id(), PaneId::Primary);
+            });
         });
     }
 

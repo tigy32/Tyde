@@ -639,10 +639,6 @@ fn task_scope_view(scope: &TaskTokenUsageScope) -> AnyView {
     }
 }
 
-/// How long the popover survives the mouse leaving the badge/popover region,
-/// so hover users can cross into it and scroll/copy without it vanishing.
-const HOVER_CLOSE_DELAY_MS: u64 = 250;
-
 /// The single task-wide token usage display for the active agent's whole task
 /// (root + sub-agents), rendered once at the right edge of the session-settings
 /// footer. It shows a left-style `↑input ↓output` string sourced from the
@@ -650,9 +646,8 @@ const HOVER_CLOSE_DELAY_MS: u64 = 250;
 /// chat rows — and appends `including N agents` for multi-agent tasks (N is the
 /// breakdown length). Partial totals carry a subtle `partial` marker; an
 /// all-unavailable total shows a muted marker rather than a fabricated zero.
-/// Click/Enter toggles the per-agent breakdown popover; mouse hover also
-/// reveals it (with a close delay so the pointer can travel into it); touch
-/// pointers never latch hover state. Escape and pointer-down outside dismiss it.
+/// Click/Enter toggles the per-agent breakdown popover. Escape and pointer-down
+/// outside dismiss it; hovering alone never opens it.
 ///
 /// The popover also carries the compact subscription-capacity row for the
 /// current agent's backend, in a *separate* labelled region below the task
@@ -665,17 +660,7 @@ fn TaskUsageBadge(
     binding: Memo<Option<(String, BackendKind)>>,
 ) -> impl IntoView {
     let open = RwSignal::new(false);
-    let hovering = RwSignal::new(false);
-    let visible = Memo::new(move |_| open.get() || hovering.get());
     let wrapper_ref: NodeRef<leptos::html::Span> = NodeRef::new();
-    let close_timer: StoredValue<Option<TimeoutHandle>> = StoredValue::new(None);
-
-    let cancel_scheduled_close = move || {
-        if let Some(handle) = close_timer.get_value() {
-            handle.clear();
-            close_timer.set_value(None);
-        }
-    };
 
     // Dismissal listeners live on the window: a pointer-down anywhere outside
     // the badge/popover region closes it, as does Escape regardless of focus.
@@ -683,7 +668,7 @@ fn TaskUsageBadge(
     // disposal, and are explicitly removed on cleanup (window listeners are
     // not tied to the ownership tree).
     let outside_pointer = window_event_listener(leptos::ev::pointerdown, move |ev| {
-        if !visible.try_get_untracked().unwrap_or(false) {
+        if !open.try_get_untracked().unwrap_or(false) {
             return;
         }
         let inside = wrapper_ref
@@ -696,19 +681,16 @@ fn TaskUsageBadge(
             });
         if !inside {
             open.try_set(false);
-            hovering.try_set(false);
         }
     });
     let escape_key = window_event_listener(leptos::ev::keydown, move |ev| {
-        if ev.key() == "Escape" && visible.try_get_untracked().unwrap_or(false) {
+        if ev.key() == "Escape" && open.try_get_untracked().unwrap_or(false) {
             open.try_set(false);
-            hovering.try_set(false);
         }
     });
     on_cleanup(move || {
         outside_pointer.remove();
         escape_key.remove();
-        cancel_scheduled_close();
     });
 
     view! {
@@ -742,35 +724,11 @@ fn TaskUsageBadge(
                 <span
                     class="session-task-usage"
                     node_ref=wrapper_ref
-                    on:pointerenter=move |ev: web_sys::PointerEvent| {
-                        if ev.pointer_type() != "mouse" {
-                            return;
-                        }
-                        cancel_scheduled_close();
-                        hovering.set(true);
-                    }
-                    on:pointerleave=move |ev: web_sys::PointerEvent| {
-                        if ev.pointer_type() != "mouse" {
-                            return;
-                        }
-                        cancel_scheduled_close();
-                        match set_timeout_with_handle(
-                            move || {
-                                hovering.try_set(false);
-                            },
-                            std::time::Duration::from_millis(HOVER_CLOSE_DELAY_MS),
-                        ) {
-                            Ok(handle) => close_timer.set_value(Some(handle)),
-                            Err(error) => {
-                                log::error!("failed to schedule popover close: {error:?}");
-                            }
-                        }
-                    }
                 >
                     <button
                         class="session-task-toggle"
                         aria-haspopup="dialog"
-                        aria-expanded=move || visible.get().to_string()
+                        aria-expanded=move || open.get().to_string()
                         aria-controls=popover_id_attr
                         on:click=move |_| open.update(|o| *o = !*o)
                     >
@@ -798,7 +756,7 @@ fn TaskUsageBadge(
                             </span>
                         })}
                     </button>
-                    <Show when=move || visible.get()>
+                    <Show when=move || open.get()>
                         <div
                             class="session-task-popover"
                             id=popover_id.clone()
@@ -957,16 +915,6 @@ mod wasm_tests {
             web_sys::window()
                 .unwrap()
                 .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
-                .unwrap();
-        });
-        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
-    }
-
-    async fn sleep_ms(ms: i32) {
-        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
-            web_sys::window()
-                .unwrap()
-                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms)
                 .unwrap();
         });
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
@@ -1812,10 +1760,9 @@ mod wasm_tests {
     }
 
     /// Dismissal paths: pointer-down outside closes the popover, Escape
-    /// closes it without the toggle being focused, touch taps toggle it
-    /// without latching hover state, and mouse hover keeps it reachable
-    /// (delayed close) then releases it. `aria-expanded` tracks the actual
-    /// visible state throughout.
+    /// closes it without the toggle being focused, click/tap toggles it, and
+    /// neither mouse nor touch hover opens it. `aria-expanded` tracks the
+    /// actual visible state throughout.
     #[wasm_bindgen_test]
     async fn task_popover_dismissal_paths() {
         let container = make_container();
@@ -1889,18 +1836,23 @@ mod wasm_tests {
             "Escape must close the popover regardless of focus"
         );
 
-        // Touch: pointerenter must not latch hover, and taps toggle cleanly.
+        // Hover is inert for both touch and mouse; only click/tap opens it.
         let wrapper = query(&container, ".session-task-usage").expect("badge wrapper");
-        wrapper
-            .dispatch_event(&pointer_event("pointerenter", "touch", false))
-            .unwrap();
-        for _ in 0..2 {
-            next_tick().await;
+        for pointer_type in ["touch", "mouse"] {
+            wrapper
+                .dispatch_event(&pointer_event("pointerenter", pointer_type, false))
+                .unwrap();
+            wrapper
+                .dispatch_event(&pointer_event("pointerleave", pointer_type, false))
+                .unwrap();
+            for _ in 0..2 {
+                next_tick().await;
+            }
+            assert!(
+                query(&container, ".session-task-popover").is_none(),
+                "{pointer_type} hover must not open the click-only popover"
+            );
         }
-        assert!(
-            query(&container, ".session-task-popover").is_none(),
-            "a touch pointer must not hover-open the popover"
-        );
         badge.click();
         for _ in 0..2 {
             next_tick().await;
@@ -1916,42 +1868,11 @@ mod wasm_tests {
         }
         assert!(
             query(&container, ".session-task-popover").is_none(),
-            "a second tap must close the popover even after a touch pointerenter"
+            "a second click must close the popover"
         );
         assert_eq!(
             badge.get_attribute("aria-expanded").as_deref(),
             Some("false")
-        );
-
-        // Mouse hover opens it, aria-expanded reflects that, and leaving
-        // closes it only after the grace delay (so the pointer can travel
-        // into the popover).
-        wrapper
-            .dispatch_event(&pointer_event("pointerenter", "mouse", false))
-            .unwrap();
-        for _ in 0..2 {
-            next_tick().await;
-        }
-        assert!(
-            query(&container, ".session-task-popover").is_some(),
-            "mouse hover must reveal the popover"
-        );
-        assert_eq!(
-            badge.get_attribute("aria-expanded").as_deref(),
-            Some("true")
-        );
-        wrapper
-            .dispatch_event(&pointer_event("pointerleave", "mouse", false))
-            .unwrap();
-        next_tick().await;
-        assert!(
-            query(&container, ".session-task-popover").is_some(),
-            "the popover must survive pointerleave for the grace delay"
-        );
-        sleep_ms(450).await;
-        assert!(
-            query(&container, ".session-task-popover").is_none(),
-            "the popover must close after the hover grace delay"
         );
     }
 }
