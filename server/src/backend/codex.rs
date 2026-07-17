@@ -634,11 +634,9 @@ impl CodexSession {
             emitter,
             state: Mutex::new(CodexState {
                 thread_id,
-                model,
-                reasoning_effort: thread_response
-                    .get("reasoningEffort")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
+                effective_model: model,
+                model_override: None,
+                reasoning_effort_override: None,
                 approval_policy: None,
                 access_mode: config.access_mode,
                 execution_mode: config.execution_mode,
@@ -1347,8 +1345,9 @@ enum CodexNotificationOwner {
 
 struct CodexState {
     thread_id: String,
-    model: Option<String>,
-    reasoning_effort: Option<String>,
+    effective_model: Option<String>,
+    model_override: Option<String>,
+    reasoning_effort_override: Option<String>,
     approval_policy: Option<String>,
     access_mode: BackendAccessMode,
     execution_mode: BackendExecutionMode,
@@ -1456,14 +1455,17 @@ impl CodexInner {
 
         if let Some(model_value) = obj.get("model") {
             if model_value.is_null() {
-                state.model = None;
+                state.model_override = None;
             } else if let Some(model) = model_value.as_str() {
                 let normalized = model.trim();
-                state.model = if normalized.is_empty() {
+                state.model_override = if normalized.is_empty() {
                     None
                 } else {
                     Some(normalized.to_string())
                 };
+                if state.model_override.is_some() {
+                    state.effective_model = state.model_override.clone();
+                }
             }
         }
 
@@ -1472,9 +1474,9 @@ impl CodexInner {
             .or_else(|| obj.get("reasoningEffort"))
         {
             if effort_value.is_null() {
-                state.reasoning_effort = None;
+                state.reasoning_effort_override = None;
             } else if let Some(raw) = effort_value.as_str() {
-                state.reasoning_effort = normalize_reasoning_effort(raw);
+                state.reasoning_effort_override = normalize_reasoning_effort(raw);
             }
         }
 
@@ -1616,7 +1618,10 @@ impl CodexInner {
         if state.quarantined_turn_id.is_some() {
             return None;
         }
-        let model = state.model.clone().unwrap_or_else(|| "codex".to_string());
+        let model = state
+            .effective_model
+            .clone()
+            .unwrap_or_else(|| "codex".to_string());
         let stream = state
             .active_stream
             .as_mut()
@@ -1694,7 +1699,10 @@ impl CodexInner {
             if state.quarantined_turn_id.is_some() {
                 return;
             }
-            let model = state.model.clone().unwrap_or_else(|| "codex".to_string());
+            let model = state
+                .effective_model
+                .clone()
+                .unwrap_or_else(|| "codex".to_string());
             let (emission, appended) = if let Some(stream) = state.active_stream.as_mut() {
                 if stream.reasoning.split('\n').any(|line| line == reasoning) {
                     (None, false)
@@ -1832,9 +1840,10 @@ impl CodexInner {
                     let mut state = self.state.lock().await;
                     state.pending_user_input_bytes = message.len() as u64;
                     let (model_override, effort_override) = match state.execution_mode {
-                        BackendExecutionMode::Agent => {
-                            (state.model.clone(), state.reasoning_effort.clone())
-                        }
+                        BackendExecutionMode::Agent => (
+                            state.model_override.clone(),
+                            state.reasoning_effort_override.clone(),
+                        ),
                         BackendExecutionMode::InferenceOnly => (None, None),
                     };
                     (
@@ -2015,7 +2024,7 @@ impl CodexInner {
             let mut state = self.state.lock().await;
             state.thread_id = resumed_thread_id;
             if let Some(model) = resumed_model.clone() {
-                state.model = Some(model);
+                state.effective_model = Some(model);
             }
             state.active_turn_id = None;
             state.active_stream = None;
@@ -2410,6 +2419,17 @@ impl CodexInner {
                     emitter.on_backend_capacity(protocol::BackendKind::Codex, capacity);
                 }
             }
+            "thread/settings/updated" => {
+                if let Some(model) = params
+                    .get("threadSettings")
+                    .and_then(|settings| settings.get("model"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                {
+                    self.state.lock().await.effective_model = Some(model.to_string());
+                }
+            }
             "turn/started" => {
                 self.close_tool_container_if_open().await;
                 let turn_id = params
@@ -2557,7 +2577,7 @@ impl CodexInner {
             "model/rerouted" => {
                 if let Some(model) = params.get("toModel").and_then(Value::as_str) {
                     let mut state = self.state.lock().await;
-                    state.model = Some(model.to_string());
+                    state.effective_model = Some(model.to_string());
                 }
             }
             "turn/completed" => {
@@ -2697,7 +2717,7 @@ impl CodexInner {
     async fn handle_root_token_usage_updated(&self, params: &Value) {
         let (metadata_update, model_usage) = {
             let mut state = self.state.lock().await;
-            let model = state.model.clone();
+            let model = state.effective_model.clone();
             let model_usage = extract_model_request_token_usage(params, model.as_deref()).and_then(
                 |(turn_id, request, cumulative, context_window)| {
                     record_model_request_token_usage(
@@ -2777,7 +2797,7 @@ impl CodexInner {
                     .state
                     .lock()
                     .await
-                    .model
+                    .effective_model
                     .clone()
                     .unwrap_or_else(|| "codex".to_string());
                 tracing::debug!(
@@ -2794,7 +2814,7 @@ impl CodexInner {
                     .state
                     .lock()
                     .await
-                    .model
+                    .effective_model
                     .clone()
                     .unwrap_or_else(|| "codex".to_string());
                 tracing::warn!(
@@ -5119,7 +5139,10 @@ impl CodexInner {
                             .conversation_bytes_total
                             .saturating_add(content.len() as u64);
                     }
-                    let model = state.model.clone().unwrap_or_else(|| "codex".to_string());
+                    let model = state
+                        .effective_model
+                        .clone()
+                        .unwrap_or_else(|| "codex".to_string());
                     let turn_context = state
                         .turn_context_by_turn
                         .get(&stream.turn_id)
@@ -5293,7 +5316,10 @@ impl CodexInner {
                 };
                 let model = {
                     let mut state = self.state.lock().await;
-                    let model = state.model.clone().unwrap_or_else(|| "codex".to_string());
+                    let model = state
+                        .effective_model
+                        .clone()
+                        .unwrap_or_else(|| "codex".to_string());
                     let turn_context = state
                         .turn_context_by_turn
                         .get(&stream.turn_id)
@@ -5946,7 +5972,7 @@ impl CodexInner {
             .to_string();
         let model_hint = {
             let state = self.state.lock().await;
-            state.model.clone()
+            state.effective_model.clone()
         };
         let turn_usage = extract_turn_token_usage(params, model_hint.as_deref());
         let model_usage = extract_model_request_token_usage(params, model_hint.as_deref());
@@ -6392,7 +6418,11 @@ fn extract_notification_thread_id(params: &Value) -> Option<String> {
 fn is_thread_scoped_codex_notification(method: &str) -> bool {
     matches!(
         method,
-        "turn/started" | "turn/completed" | "turn/plan/updated" | "thread/tokenUsage/updated"
+        "turn/started"
+            | "turn/completed"
+            | "turn/plan/updated"
+            | "thread/tokenUsage/updated"
+            | "thread/settings/updated"
     ) || method.starts_with("item/")
         || is_reasoning_notification_method(method)
 }
@@ -8759,30 +8789,6 @@ impl CodexBackend {
                         return;
                     }
                 }
-            } else {
-                let local_settings = json!({
-                    "model": Value::Null,
-                    "reasoning_effort": Value::Null,
-                });
-                if let Err(err) = handle
-                    .execute(SessionCommand::UpdateSettings {
-                        settings: local_settings,
-                        persist: false,
-                    })
-                    .await
-                {
-                    let message = format!("Failed to apply Codex startup settings: {err}");
-                    tracing::error!(
-                        %message,
-                        "Codex startup settings failed after session publication"
-                    );
-                    let _ = events_tx.send(BackendEvent::Chat(backend_error_message(message)));
-                    let _ =
-                        events_tx.send(BackendEvent::Chat(ChatEvent::TypingStatusChanged(false)));
-                    drop(events_tx);
-                    session.shutdown().await;
-                    return;
-                }
             }
 
             let images = protocol_images_to_attachments(initial_input.images);
@@ -9480,6 +9486,14 @@ impl Backend for CodexBackend {
                 Some(SessionSettingValue::String(value)) => Some(value.clone()),
                 _ => None,
             };
+            if let Err(err) = handle
+                .execute(SessionCommand::ResumeSession { session_id })
+                .await
+            {
+                tracing::error!("Failed to resume Codex session: {err}");
+                session.shutdown().await;
+                return;
+            }
             if model_override.is_some() || effort_override.is_some() {
                 let settings = json!({
                     "model": model_override,
@@ -9497,15 +9511,6 @@ impl Backend for CodexBackend {
                     session.shutdown().await;
                     return;
                 }
-            }
-
-            if let Err(err) = handle
-                .execute(SessionCommand::ResumeSession { session_id })
-                .await
-            {
-                tracing::error!("Failed to resume Codex session: {err}");
-                session.shutdown().await;
-                return;
             }
 
             let mut normalization_failures = HashMap::new();
@@ -11422,6 +11427,51 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
+    async fn codex_auto_model_preserves_effective_model_without_turn_override() {
+        let fake = CodexFakeAppServer::new("runtime_settings", "unused");
+        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (backend, mut events) = <CodexBackend as Backend>::spawn(
+            vec![workspace.path().to_string_lossy().to_string()],
+            BackendSpawnConfig::default(),
+            protocol::SendMessagePayload {
+                message: "initial".to_owned(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+        )
+        .await
+        .expect("spawn fake Codex backend");
+
+        let completion = wait_for_codex_test_stream_end(&mut events).await;
+        assert_eq!(
+            completion
+                .message
+                .model_info
+                .as_ref()
+                .map(|model| model.model.as_str()),
+            Some("fake-codex-model")
+        );
+
+        let requests = fake.requests();
+        assert!(
+            !requests.iter().any(|request| {
+                request.get("method").and_then(Value::as_str) == Some("thread/settings/update")
+            }),
+            "Auto settings must not dispatch an empty provider update"
+        );
+        let turn = requests
+            .iter()
+            .find(|request| request.get("method").and_then(Value::as_str) == Some("turn/start"))
+            .expect("initial turn/start request");
+        assert!(turn.pointer("/params/model").is_none());
+        assert!(turn.pointer("/params/effort").is_none());
+
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn codex_runtime_settings_update_changes_followup_turn_overrides() {
         let fake = CodexFakeAppServer::new("runtime_settings", "unused");
         let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
@@ -11491,6 +11541,86 @@ for line in sys.stdin:
             followup.pointer("/params/effort").and_then(Value::as_str),
             Some("max")
         );
+    }
+
+    #[tokio::test]
+    async fn codex_auto_update_clears_overrides_without_forgetting_effective_model() {
+        let fake = CodexFakeAppServer::new("runtime_settings", "unused");
+        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut initial_values = protocol::SessionSettingsValues::default();
+        initial_values.0.insert(
+            "model".to_owned(),
+            SessionSettingValue::String("gpt-initial".to_owned()),
+        );
+        initial_values.0.insert(
+            "reasoning_effort".to_owned(),
+            SessionSettingValue::String("low".to_owned()),
+        );
+        let (mut backend, mut events) = <CodexBackend as Backend>::spawn(
+            vec![workspace.path().to_string_lossy().to_string()],
+            BackendSpawnConfig {
+                session_settings: Some(initial_values),
+                ..BackendSpawnConfig::default()
+            },
+            protocol::SendMessagePayload {
+                message: "initial".to_owned(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+        )
+        .await
+        .expect("spawn fake Codex backend");
+        let _ = wait_for_codex_test_stream_end(&mut events).await;
+
+        let mut auto_values = protocol::SessionSettingsValues::default();
+        auto_values
+            .0
+            .insert("model".to_owned(), SessionSettingValue::Null);
+        auto_values
+            .0
+            .insert("reasoning_effort".to_owned(), SessionSettingValue::Null);
+        Backend::update_session_settings(
+            &mut backend,
+            protocol::SetSessionSettingsPayload {
+                values: auto_values,
+            },
+        )
+        .await
+        .expect("provider should acknowledge Auto settings");
+        assert!(
+            Backend::send(
+                &backend,
+                AgentInput::SendMessage(protocol::SendMessagePayload {
+                    message: "followup".to_owned(),
+                    images: None,
+                    origin: None,
+                    tool_response: None,
+                }),
+            )
+            .await
+        );
+        let followup_end = wait_for_codex_test_stream_end(&mut events).await;
+        assert_eq!(
+            followup_end
+                .message
+                .model_info
+                .as_ref()
+                .map(|model| model.model.as_str()),
+            Some("gpt-initial")
+        );
+
+        let turn_requests = fake
+            .requests()
+            .into_iter()
+            .filter(|request| request.get("method").and_then(Value::as_str) == Some("turn/start"))
+            .collect::<Vec<_>>();
+        let followup = turn_requests.last().expect("followup turn/start request");
+        assert!(followup.pointer("/params/model").is_none());
+        assert!(followup.pointer("/params/effort").is_none());
+
+        backend.shutdown().await;
     }
 
     #[tokio::test]
@@ -12059,8 +12189,9 @@ for line in sys.stdin:
     fn test_codex_state() -> CodexState {
         CodexState {
             thread_id: "thread-test".to_string(),
-            model: Some("codex".to_string()),
-            reasoning_effort: Some("xhigh".to_string()),
+            effective_model: Some("codex".to_string()),
+            model_override: None,
+            reasoning_effort_override: Some("xhigh".to_string()),
             approval_policy: None,
             access_mode: BackendAccessMode::Unrestricted,
             execution_mode: BackendExecutionMode::Agent,
@@ -16431,6 +16562,71 @@ Do not describe the tool, and do not skip the tool call."#;
     }
 
     #[test]
+    fn codex_thread_settings_notification_updates_effective_model_only() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut rx) = test_codex_inner();
+            inner
+                .handle_notification(
+                    "thread/settings/updated",
+                    &json!({
+                        "threadId": "thread-test",
+                        "threadSettings": {
+                            "model": "gpt-effective",
+                            "modelProvider": "openai"
+                        }
+                    }),
+                )
+                .await;
+            assert!(drain_events(&mut rx).is_empty());
+            {
+                let state = inner.state.lock().await;
+                assert_eq!(state.effective_model.as_deref(), Some("gpt-effective"));
+                assert!(state.model_override.is_none());
+            }
+
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-effective" } }),
+                )
+                .await;
+            drain_events(&mut rx);
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "item": {
+                            "type": "agentMessage",
+                            "id": "message-effective",
+                            "text": "effective model"
+                        }
+                    }),
+                )
+                .await;
+            let events = drain_events(&mut rx);
+            assert_eq!(event_kinds(&events), vec!["StreamStart", "StreamEnd"]);
+            assert_eq!(
+                events[0].pointer("/data/model").and_then(Value::as_str),
+                Some("gpt-effective")
+            );
+            assert_eq!(
+                events[1]
+                    .pointer("/data/message/model_info/model")
+                    .and_then(Value::as_str),
+                Some("gpt-effective")
+            );
+
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
     fn wrong_completed_item_id_discards_once_without_typed_end() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -16550,7 +16746,10 @@ Do not describe the tool, and do not skip the tool call."#;
                 drain_events(&mut rx).is_empty(),
                 "quarantine must suppress every later root response notification"
             );
-            assert_eq!(inner.state.lock().await.model.as_deref(), Some("codex"));
+            assert_eq!(
+                inner.state.lock().await.effective_model.as_deref(),
+                Some("codex")
+            );
             inner.rpc.shutdown().await;
         });
     }
