@@ -24,10 +24,7 @@ use protocol::{
 };
 
 use crate::agent_control_mcp::AGENT_CONTROL_AWAIT_MCP_SERVER_NAME;
-use crate::backend::agent_control_progress::{
-    await_progress_data_for_tool, is_tyde_agent_control_await_tool_name, parse_await_agent_refs,
-    spawn_progress_data_for_tool_result, tyde_tool_request_type, tyde_tool_result,
-};
+use crate::backend::agent_control_progress::normalize_tyde_chat_event;
 use crate::backend::turn_emitter::{
     AgentName, MessageMetadataUpdatePayload, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
 };
@@ -1326,8 +1323,9 @@ fn completed_codex_subagent_stream(stream: CodexSubAgentStream) -> CompletedCode
 #[derive(Clone)]
 struct CodexSubAgentSpawnInfo {
     item_id: String,
+    tool_name: String,
     name: String,
-    description: String,
+    prompt: Option<String>,
     agent_type: String,
     receiver_thread_id: String,
     sender_thread_id: String,
@@ -2640,12 +2638,6 @@ impl CodexInner {
         let item_status = item
             .and_then(|item| item.get("status"))
             .and_then(Value::as_str);
-        let tool_name = item
-            .and_then(|item| item.get("tool"))
-            .and_then(Value::as_str);
-        let await_ref_count = tool_name
-            .filter(|tool_name| is_tyde_agent_control_await_tool_name(tool_name))
-            .and_then(|_| item.map(|item| parse_await_agent_refs(item).len()));
         let (sequence, active_turn_id, active_item_id, tool_container_id, pending_tool_count) = {
             let mut state = self.state.lock().await;
             state.notification_sequence = state.notification_sequence.saturating_add(1);
@@ -2672,7 +2664,6 @@ impl CodexInner {
             ?active_item_id,
             ?tool_container_id,
             pending_tool_count,
-            ?await_ref_count,
             "Codex notification structure"
         );
     }
@@ -5465,9 +5456,6 @@ impl CodexInner {
                     .unwrap_or(item_type);
                 let success = item.get("status").and_then(Value::as_str) == Some("completed")
                     || item.get("success").and_then(Value::as_bool) == Some(true);
-                if success {
-                    self.emit_agent_control_spawn_progress_if_needed(&item_id, tool_name, item);
-                }
                 self.emit_tool_execution_completed(
                     &item_id,
                     tool_name,
@@ -5485,6 +5473,13 @@ impl CodexInner {
                 .await;
             }
             "collabToolCall" | "collabAgentToolCall" => {
+                tracing::debug!(
+                    item_id = item_id,
+                    tool = item.get("tool").and_then(|value| value.as_str()),
+                    status = item.get("status").and_then(|value| value.as_str()),
+                    receiver_count = codex_native_wait_thread_ids(item).len(),
+                    "Codex native collaboration completion"
+                );
                 let item_id = item_id.unwrap_or("item").to_string();
                 self.add_active_turn_tool_bytes(estimate_generic_tool_bytes(item))
                     .await;
@@ -5493,9 +5488,6 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or("collab_tool");
                 let success = codex_item_success(item);
-                if success {
-                    self.emit_agent_control_spawn_progress_if_needed(&item_id, tool_name, item);
-                }
                 self.emit_tool_execution_completed(
                     &item_id,
                     tool_name,
@@ -5594,6 +5586,19 @@ impl CodexInner {
     }
 
     async fn register_codex_subagent_activity_if_needed(&self, item: &Value) {
+        tracing::debug!(
+            item_id = item.get("id").and_then(|value| value.as_str()),
+            agent_thread_id = item
+                .get("agentThreadId")
+                .or_else(|| item.get("agent_thread_id"))
+                .and_then(|value| value.as_str()),
+            agent_path = item
+                .get("agentPath")
+                .or_else(|| item.get("agent_path"))
+                .and_then(|value| value.as_str()),
+            kind = item.get("kind").and_then(|value| value.as_str()),
+            "Codex native sub-agent registration input"
+        );
         let Some(activity) = parse_codex_subagent_activity(item) else {
             return;
         };
@@ -5608,10 +5613,10 @@ impl CodexInner {
         }
 
         let thread_id = activity.agent_thread_id.clone();
-        let (spawn, subagent_sink, rejection, idempotent) = {
+        let (spawn, subagent_sink, rejection, idempotent, needs_synthetic_request) = {
             let mut state = self.state.lock().await;
             if let Some(message) = state.conflicting_subagent_threads.get(&thread_id) {
-                (None, None, Some(message.clone()), false)
+                (None, None, Some(message.clone()), false, false)
             } else if let Some(stream) = state.subagent_streams.get(&thread_id) {
                 if (stream.activity_item_id.is_none() || stream.agent_path == activity.agent_path)
                     && stream.sender_thread_id == state.thread_id
@@ -5620,7 +5625,7 @@ impl CodexInner {
                         || activity.item_id.is_none()
                         || stream.activity_item_id == activity.item_id)
                 {
-                    (None, None, None, true)
+                    (None, None, None, true, false)
                 } else {
                     (
                         None,
@@ -5629,6 +5634,7 @@ impl CodexInner {
                             "Codex ownership invariant failed: child thread '{}' was re-registered with contradictory activity metadata",
                             thread_id
                         )),
+                        false,
                         false,
                     )
                 }
@@ -5640,7 +5646,7 @@ impl CodexInner {
                         || activity.item_id.is_none()
                         || stream.activity_item_id == activity.item_id)
                 {
-                    (None, None, None, true)
+                    (None, None, None, true, false)
                 } else {
                     (
                         None,
@@ -5649,6 +5655,7 @@ impl CodexInner {
                             "Codex ownership invariant failed: completed child thread '{}' was re-registered with contradictory activity metadata",
                             thread_id
                         )),
+                        false,
                         false,
                     )
                 }
@@ -5661,20 +5668,30 @@ impl CodexInner {
                         thread_id
                     )),
                     false,
+                    false,
                 )
             } else {
-                let spawn = state
-                    .pending_subagent_spawns
-                    .remove(&thread_id)
-                    .unwrap_or_else(|| CodexSubAgentSpawnInfo {
-                        item_id: thread_id.clone(),
-                        name: activity.agent_path.clone(),
-                        description: activity.agent_path.clone(),
-                        agent_type: "sub-agent".to_string(),
-                        receiver_thread_id: thread_id.clone(),
-                        sender_thread_id: state.thread_id.clone(),
-                    });
-                (Some(spawn), state.subagent_emitter.clone(), None, false)
+                let pending = state.pending_subagent_spawns.remove(&thread_id);
+                let needs_synthetic_request = pending.is_none();
+                let spawn = pending.unwrap_or_else(|| CodexSubAgentSpawnInfo {
+                    item_id: activity
+                        .item_id
+                        .clone()
+                        .unwrap_or_else(|| thread_id.clone()),
+                    tool_name: "spawnAgent".to_owned(),
+                    name: activity.agent_path.clone(),
+                    prompt: None,
+                    agent_type: "sub-agent".to_string(),
+                    receiver_thread_id: thread_id.clone(),
+                    sender_thread_id: state.thread_id.clone(),
+                });
+                (
+                    Some(spawn),
+                    state.subagent_emitter.clone(),
+                    None,
+                    false,
+                    needs_synthetic_request,
+                )
             }
         };
         if idempotent {
@@ -5703,12 +5720,17 @@ impl CodexInner {
         };
 
         let spawn_item_id = spawn.item_id.clone();
+        let progress_tool_call_id = spawn_item_id.clone();
+        let spawn_tool_name = spawn.tool_name.clone();
+        let spawn_prompt = spawn.prompt.clone();
         let sender_thread_id = spawn.sender_thread_id.clone();
         let handle = match subagent_sink
             .on_subagent_spawned(
                 spawn.item_id,
                 spawn.name,
-                spawn.description,
+                spawn_prompt
+                    .clone()
+                    .unwrap_or_else(|| activity.agent_path.clone()),
                 spawn.agent_type,
                 Some(SessionId(thread_id.clone())),
             )
@@ -5732,6 +5754,7 @@ impl CodexInner {
             }
         };
         let child_agent_id = handle.agent_id.clone();
+        let spawned_agent = child_agent_id.clone();
         let (raw_event_tx, raw_event_rx) = mpsc::unbounded_channel();
         spawn_codex_subagent_event_bridge(raw_event_rx, handle.event_tx);
         let emitter = Arc::new(TurnEmitter::new_for_agent(
@@ -5759,7 +5782,7 @@ impl CodexInner {
                     CodexSubAgentStream {
                         emitter,
                         agent_id: child_agent_id,
-                        spawn_item_id,
+                        spawn_item_id: spawn_item_id.clone(),
                         activity_item_id: activity.item_id.clone(),
                         agent_path: activity.agent_path.clone(),
                         sender_thread_id,
@@ -5792,6 +5815,55 @@ impl CodexInner {
             );
             tracing::error!(agent_thread_id = thread_id.as_str(), "{message}");
             self.emitter.backend_error(&message);
+        } else if needs_synthetic_request {
+            let synthetic_tool_call_id = format!("codex-native-spawn:{}", spawn_item_id);
+            self.emit_tool_request(
+                &synthetic_tool_call_id,
+                &spawn_tool_name,
+                serde_json::to_value(protocol::ToolRequestType::AgentSpawn {
+                    prompt: spawn_prompt,
+                    name: Some(activity.agent_path.clone()),
+                })
+                .expect("serialize native Codex agent spawn"),
+            )
+            .await;
+            self.emitter.tool_progress(&ToolProgressData {
+                tool_call_id: synthetic_tool_call_id.clone(),
+                tool_name: spawn_tool_name.clone(),
+                update: ToolProgressUpdate::AgentControl(AgentControlProgress {
+                    progress_kind: AgentControlProgressKind::Spawn,
+                    agents: vec![AgentControlAgentRef {
+                        agent_id: spawned_agent.clone(),
+                        name: Some(activity.agent_path.clone()),
+                    }],
+                }),
+            });
+            self.emit_tool_execution_completed(
+                &synthetic_tool_call_id,
+                &spawn_tool_name,
+                true,
+                json!({
+                    "kind": "Other",
+                    "result": {
+                        "agent_id": spawned_agent.0,
+                        "name": activity.agent_path,
+                    }
+                }),
+                None,
+            )
+            .await;
+        } else {
+            self.emitter.tool_progress(&ToolProgressData {
+                tool_call_id: progress_tool_call_id,
+                tool_name: spawn_tool_name,
+                update: ToolProgressUpdate::AgentControl(AgentControlProgress {
+                    progress_kind: AgentControlProgressKind::Spawn,
+                    agents: vec![AgentControlAgentRef {
+                        agent_id: spawned_agent,
+                        name: Some(activity.agent_path),
+                    }],
+                }),
+            });
         }
     }
 
@@ -6175,17 +6247,17 @@ impl CodexInner {
         tool_name: &str,
         arguments: &Value,
     ) {
-        if is_tyde_agent_control_await_tool_name(tool_name) {
-            emit_agent_control_await_progress_to(&self.emitter, tool_call_id, tool_name, arguments);
-            return;
-        }
         if !is_codex_native_wait_tool(tool_name) {
             return;
         }
 
-        let thread_ids = codex_native_wait_thread_ids(arguments);
+        let mut thread_ids = codex_native_wait_thread_ids(arguments);
         let agents = {
             let state = self.state.lock().await;
+            if thread_ids.is_empty() {
+                thread_ids.extend(state.subagent_streams.keys().cloned());
+                thread_ids.sort();
+            }
             thread_ids
                 .iter()
                 .filter_map(|thread_id| {
@@ -6227,15 +6299,6 @@ impl CodexInner {
                 agents,
             }),
         });
-    }
-
-    fn emit_agent_control_spawn_progress_if_needed(
-        &self,
-        tool_call_id: &str,
-        tool_name: &str,
-        tool_result: &Value,
-    ) {
-        emit_agent_control_spawn_progress_to(&self.emitter, tool_call_id, tool_name, tool_result);
     }
 
     async fn emit_tool_request(&self, tool_call_id: &str, tool_name: &str, tool_type: Value) {
@@ -6570,11 +6633,17 @@ fn parse_codex_subagent_collabs(item: &Value) -> Vec<CodexSubAgentSpawnInfo> {
         .and_then(Value::as_str)
         .unwrap_or("sub-agent")
         .to_string();
-    let description = item
+    let tool_name = item
+        .get("tool")
+        .and_then(Value::as_str)
+        .unwrap_or("spawnAgent")
+        .to_string();
+    let prompt = item
         .get("prompt")
         .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+        .map(str::to_owned);
     let name = item
         .get("receiverAgentName")
         .and_then(Value::as_str)
@@ -6585,8 +6654,9 @@ fn parse_codex_subagent_collabs(item: &Value) -> Vec<CodexSubAgentSpawnInfo> {
         .into_iter()
         .map(|receiver_thread_id| CodexSubAgentSpawnInfo {
             item_id: item_id.clone(),
+            tool_name: tool_name.clone(),
             name: name.clone(),
-            description: description.clone(),
+            prompt: prompt.clone(),
             agent_type: agent_type.clone(),
             receiver_thread_id,
             sender_thread_id: sender_thread_id.clone(),
@@ -9013,122 +9083,34 @@ fn codex_ssh_fork_unsupported_error(workspace_roots: &[String]) -> Option<Backen
     )))
 }
 
-fn emit_agent_control_await_progress_to(
-    emitter: &TurnEmitter,
-    tool_call_id: &str,
-    tool_name: &str,
-    arguments: &Value,
-) {
-    if let Some(progress) = await_progress_data_for_tool(tool_call_id, tool_name, arguments) {
-        emitter.tool_progress(&progress);
-    }
-}
-
 fn emit_codex_tool_request(
     emitter: &TurnEmitter,
     tool_call_id: &str,
     tool_name: &str,
     arguments: &Value,
 ) -> Option<ChatMessageId> {
-    let normalization = tyde_tool_request_type(tool_name, arguments);
-    if is_tyde_agent_control_await_tool_name(tool_name) {
-        let top_level = arguments.as_object();
-        tracing::debug!(
-            tool_call_id,
-            argument_kind = match arguments {
-                serde_json::Value::Object(_) => "object",
-                serde_json::Value::Array(_) => "array",
-                serde_json::Value::String(_) => "string",
-                serde_json::Value::Null => "null",
-                serde_json::Value::Bool(_) => "bool",
-                serde_json::Value::Number(_) => "number",
-            },
-            has_agent_ids = top_level.is_some_and(|value| value.contains_key("agent_ids")),
-            has_agent_ids_camel = top_level.is_some_and(|value| value.contains_key("agentIds")),
-            has_arguments_wrapper = top_level.is_some_and(|value| value.contains_key("arguments")),
-            parsed_agent_ref_count = parse_await_agent_refs(arguments).len(),
-            normalization_succeeded = normalization.is_ok(),
-            "Codex await request normalization structure"
-        );
-    }
-    let (tool_type, normalization_failure) = match normalization {
-        Ok(Some(typed)) => (
-            serde_json::to_value(typed).expect("serialize tool request"),
-            None,
-        ),
-        Ok(None) => (json!({ "kind": "Other", "args": arguments }), None),
-        Err(error) => {
-            tracing::error!(
-                tool = %tool_name,
-                tool_call_id = %tool_call_id,
-                detail = %error.detail,
-                "Canonical Tyde tool request normalization failed"
-            );
-            emitter.backend_error(&format!(
-                "Failed to normalize canonical tool request '{}' ({}): {}",
-                tool_name, tool_call_id, error
-            ));
-            (
-                json!({ "kind": "Other", "args": arguments }),
-                Some(error.normalization_failure),
-            )
-        }
-    };
-    if let Some(normalization_failure) = normalization_failure {
-        emitter.tool_request_in_container_with_normalization_failure(
-            tool_call_id,
-            tool_name,
-            tool_type,
-            normalization_failure,
-        )
-    } else {
-        emitter.tool_request_in_container(tool_call_id, tool_name, tool_type)
-    }
+    let tool_type = parse_codex_subagent_collabs(arguments)
+        .into_iter()
+        .next()
+        .map(|spawn| {
+            serde_json::to_value(protocol::ToolRequestType::AgentSpawn {
+                prompt: spawn.prompt,
+                name: Some(spawn.name),
+            })
+            .expect("serialize native Codex agent spawn")
+        })
+        .unwrap_or_else(|| json!({ "kind": "Other", "args": arguments }));
+    emitter.tool_request_in_container(tool_call_id, tool_name, tool_type)
 }
 
 fn normalize_codex_tool_result(
-    emitter: &TurnEmitter,
-    tool_call_id: &str,
-    tool_name: &str,
+    _emitter: &TurnEmitter,
+    _tool_call_id: &str,
+    _tool_name: &str,
     tool_result: Value,
-    success: bool,
+    _success: bool,
 ) -> (Value, Option<ToolExecutionNormalizationFailure>) {
-    if !success {
-        return (tool_result, None);
-    }
-    match tyde_tool_result(tool_name, &tool_result) {
-        Ok(Some(typed)) => (
-            serde_json::to_value(typed).expect("serialize tool result"),
-            None,
-        ),
-        Ok(None) => (tool_result, None),
-        Err(error) => {
-            tracing::error!(
-                tool = %tool_name,
-                tool_call_id = %tool_call_id,
-                detail = %error.detail,
-                "Canonical Tyde tool result normalization failed"
-            );
-            emitter.backend_error(&format!(
-                "Failed to normalize canonical tool result '{}' ({}): {}",
-                tool_name, tool_call_id, error
-            ));
-            (tool_result, Some(error.normalization_failure))
-        }
-    }
-}
-
-fn emit_agent_control_spawn_progress_to(
-    emitter: &TurnEmitter,
-    tool_call_id: &str,
-    tool_name: &str,
-    tool_result: &Value,
-) {
-    if let Some(progress) =
-        spawn_progress_data_for_tool_result(tool_call_id, tool_name, tool_result)
-    {
-        emitter.tool_progress(&progress);
-    }
+    (tool_result, None)
 }
 
 fn spawn_codex_subagent_event_bridge(
@@ -9209,16 +9191,16 @@ struct CodexForwardedBackendEvent {
 
 fn codex_backend_event_from_raw(
     value: &Value,
-    normalization_failures: &mut HashMap<String, ToolExecutionNormalizationFailure>,
+    _normalization_failures: &mut HashMap<String, ToolExecutionNormalizationFailure>,
 ) -> Option<CodexForwardedBackendEvent> {
     match serde_json::from_value::<ChatEvent>(value.clone()) {
         Ok(event) => {
             let (chat_event, normalization_error) =
-                normalize_codex_chat_event(event, normalization_failures);
+                normalize_tyde_chat_event(event, _normalization_failures);
             Some(CodexForwardedBackendEvent {
                 chat_event,
                 terminal: false,
-                normalization_error,
+                normalization_error: normalization_error.map(backend_error_message),
             })
         }
         Err(err) => {
@@ -9270,100 +9252,6 @@ fn codex_backend_event_from_raw(
                 }
             }
         }
-    }
-}
-
-fn normalize_codex_chat_event(
-    event: ChatEvent,
-    normalization_failures: &mut HashMap<String, ToolExecutionNormalizationFailure>,
-) -> (ChatEvent, Option<ChatEvent>) {
-    match event {
-        ChatEvent::ToolRequest(mut request) => {
-            let protocol::ToolRequestType::Other { args } = &request.tool_type else {
-                return (ChatEvent::ToolRequest(request), None);
-            };
-            match tyde_tool_request_type(&request.tool_name, args) {
-                Ok(Some(typed)) => {
-                    request.tool_type = typed;
-                    (ChatEvent::ToolRequest(request), None)
-                }
-                Ok(None) => (ChatEvent::ToolRequest(request), None),
-                Err(error) => {
-                    tracing::error!(
-                        tool = %request.tool_name,
-                        tool_call_id = %request.tool_call_id,
-                        detail = %error.detail,
-                        "Canonical Tyde tool request normalization failed"
-                    );
-                    let visible = backend_error_message(format!(
-                        "Failed to normalize canonical tool request '{}' ({}): {}",
-                        request.tool_name, request.tool_call_id, error
-                    ));
-                    normalization_failures
-                        .insert(request.tool_call_id.clone(), error.normalization_failure);
-                    (ChatEvent::ToolRequest(request), Some(visible))
-                }
-            }
-        }
-        ChatEvent::ToolExecutionCompleted(mut completion) => {
-            let request_failure = normalization_failures.remove(&completion.tool_call_id);
-            let mut normalization_error = None;
-            let result_failure = if completion.success {
-                match &completion.tool_result {
-                    protocol::ToolExecutionResult::Other { .. } => match tyde_tool_result(
-                        &completion.tool_name,
-                        &serde_json::to_value(&completion.tool_result)
-                            .expect("serialize tool result"),
-                    ) {
-                        Ok(Some(typed)) => {
-                            completion.tool_result = typed;
-                            None
-                        }
-                        Ok(None) => None,
-                        Err(error) => {
-                            tracing::error!(
-                                tool = %completion.tool_name,
-                                tool_call_id = %completion.tool_call_id,
-                                detail = %error.detail,
-                                "Canonical Tyde tool result normalization failed"
-                            );
-                            normalization_error = Some(backend_error_message(format!(
-                                "Failed to normalize canonical tool result '{}' ({}): {}",
-                                completion.tool_name, completion.tool_call_id, error
-                            )));
-                            Some(error.normalization_failure)
-                        }
-                    },
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            completion.normalization_failure = merge_completion_normalization_failure(
-                completion.normalization_failure,
-                request_failure,
-            );
-            completion.normalization_failure = merge_completion_normalization_failure(
-                completion.normalization_failure,
-                result_failure,
-            );
-            (
-                ChatEvent::ToolExecutionCompleted(completion),
-                normalization_error,
-            )
-        }
-        event => (event, None),
-    }
-}
-
-fn merge_completion_normalization_failure(
-    existing: Option<ToolExecutionNormalizationFailure>,
-    incoming: Option<ToolExecutionNormalizationFailure>,
-) -> Option<ToolExecutionNormalizationFailure> {
-    match (existing, incoming) {
-        (None, None) => None,
-        (Some(failure), None) | (None, Some(failure)) => Some(failure),
-        (Some(existing), Some(incoming)) => Some(existing.combined_with(incoming)),
     }
 }
 
@@ -18979,6 +18867,25 @@ Do not describe the tool, and do not skip the tool call."#;
                     .subagent_streams
                     .contains_key("thread-child")
             );
+            let events = drain_events(&mut parent_rx);
+            assert_eq!(
+                events.len(),
+                1,
+                "native spawn emits one typed progress event"
+            );
+            let event: ChatEvent = serde_json::from_value(events[0].clone())
+                .expect("native spawn progress is a chat event");
+            let ChatEvent::ToolProgress(progress) = event else {
+                panic!("native spawn must emit typed ToolProgress: {events:?}");
+            };
+            assert_eq!(progress.tool_call_id, "spawn-array");
+            assert_eq!(progress.tool_name, "spawnAgent");
+            let ToolProgressUpdate::AgentControl(spawn) = progress.update else {
+                panic!("native spawn must use AgentControl progress");
+            };
+            assert_eq!(spawn.progress_kind, AgentControlProgressKind::Spawn);
+            assert_eq!(spawn.agents.len(), 1);
+            assert_eq!(spawn.agents[0].agent_id, AgentId("subagent-1".to_owned()));
 
             inner
                 .handle_notification(
@@ -18990,6 +18897,82 @@ Do not describe the tool, and do not skip the tool call."#;
                 )
                 .await;
             assert!(drain_events(&mut parent_rx).is_empty());
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn activity_only_native_spawn_gets_a_typed_synthetic_tool() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (inner, mut parent_rx) = test_codex_inner();
+            let emitter = Arc::new(RecordingSubAgentEmitter::new());
+            {
+                let mut state = inner.state.lock().await;
+                state.thread_id = "thread-parent".to_owned();
+                state.subagent_emitter = Some(emitter.clone() as Arc<dyn SubAgentEmitter>);
+            }
+
+            inner
+                .handle_notification(
+                    "subAgentActivity",
+                    &json!({
+                        "id": "call-native-spawn",
+                        "kind": "started",
+                        "agentThreadId": "thread-child",
+                        "agentPath": "/root/reviewer"
+                    }),
+                )
+                .await;
+
+            assert_eq!(emitter.spawn_count().await, 1);
+            let raw_events = drain_events(&mut parent_rx);
+            assert!(
+                raw_events
+                    .iter()
+                    .all(|event| event.get("kind").and_then(Value::as_str) != Some("Error"))
+            );
+            let events = raw_events
+                .into_iter()
+                .filter_map(|event| serde_json::from_value::<ChatEvent>(event).ok())
+                .collect::<Vec<_>>();
+            let request = events.iter().find_map(|event| match event {
+                ChatEvent::ToolRequest(request) => Some(request),
+                _ => None,
+            });
+            let request = request.expect("activity-only spawn emits a typed request");
+            assert_eq!(request.tool_call_id, "codex-native-spawn:call-native-spawn");
+            assert_eq!(request.tool_name, "spawnAgent");
+            assert!(matches!(
+                &request.tool_type,
+                protocol::ToolRequestType::AgentSpawn {
+                    prompt: None,
+                    name: Some(name),
+                } if name == "/root/reviewer"
+            ));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                ChatEvent::ToolProgress(ToolProgressData {
+                    tool_call_id,
+                    tool_name,
+                    update: ToolProgressUpdate::AgentControl(AgentControlProgress {
+                        progress_kind: AgentControlProgressKind::Spawn,
+                        agents,
+                    }),
+                }) if tool_call_id == "codex-native-spawn:call-native-spawn"
+                    && tool_name == "spawnAgent"
+                    && agents.len() == 1
+            )));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                ChatEvent::ToolExecutionCompleted(completion)
+                    if completion.tool_call_id == "codex-native-spawn:call-native-spawn"
+                        && completion.tool_name == "spawnAgent"
+                        && completion.success
+            )));
             inner.rpc.shutdown().await;
         });
     }
@@ -19045,7 +19028,7 @@ Do not describe the tool, and do not skip the tool call."#;
                 .emit_agent_control_await_progress_if_needed(
                     "native-wait",
                     "wait",
-                    &json!({"receiverThreadIds": ["child-a", "child-b"]}),
+                    &json!({"receiverThreadIds": []}),
                 )
                 .await;
 

@@ -22,10 +22,6 @@ use protocol::{
     ValueProvenance, WorkflowAgentState, WorkflowAgentStatus, WorkflowRunState, WorkflowRunStatus,
 };
 
-use crate::backend::agent_control_progress::{
-    await_progress_data_for_tool, spawn_progress_data_for_tool_result, tyde_tool_request_type,
-    tyde_tool_result,
-};
 use crate::backend::turn_emitter::{
     AgentName, AssistantMessagePayload, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
 };
@@ -50,6 +46,7 @@ struct SubAgentStream {
     /// The parent's Task tool_use id — the `tool_call_id` for live
     /// `ToolProgress` updates on the parent's Task tool card.
     parent_tool_use_id: String,
+    parent_tool_name: String,
     /// Id of the spawned sub-agent (from `SubAgentHandle`), included in
     /// progress updates so the frontend can link to the sub-agent view.
     agent_id: protocol::AgentId,
@@ -2414,49 +2411,11 @@ impl ClaudeInner {
         {
             self.emitter.task_update(&tasks);
         }
-        if let Some(progress) =
-            await_progress_data_for_tool(&tool_call.id, &tool_call.name, &tool_call.arguments)
-        {
-            self.emitter.tool_progress(&progress);
-        }
-        let (tool_type, normalization_failure) =
-            match tyde_tool_request_type(&tool_call.name, &tool_call.arguments) {
-                Ok(Some(tool_type)) => (
-                    serde_json::to_value(tool_type).expect("serialize tool request"),
-                    None,
-                ),
-                Ok(None) => (
-                    claude_tool_request_type(&tool_call.name, &tool_call.arguments),
-                    None,
-                ),
-                Err(error) => {
-                    tracing::error!(
-                        tool = %tool_call.name,
-                        tool_call_id = %tool_call.id,
-                        detail = %error.detail,
-                        "Canonical Tyde tool request normalization failed"
-                    );
-                    self.emitter.backend_error(&format!(
-                        "Failed to normalize canonical tool request '{}' ({}): {}",
-                        tool_call.name, tool_call.id, error
-                    ));
-                    (
-                        claude_tool_request_type(&tool_call.name, &tool_call.arguments),
-                        Some(error.normalization_failure),
-                    )
-                }
-            };
-        if let Some(normalization_failure) = normalization_failure {
-            self.emitter.tool_request_with_normalization_failure(
-                &tool_call.id,
-                &tool_call.name,
-                tool_type,
-                normalization_failure,
-            );
-        } else {
-            self.emitter
-                .tool_request(&tool_call.id, &tool_call.name, tool_type);
-        }
+        self.emitter.tool_request(
+            &tool_call.id,
+            &tool_call.name,
+            claude_tool_request_type(&tool_call.name, &tool_call.arguments),
+        );
     }
 
     fn emit_tool_execution_completed(
@@ -2467,36 +2426,6 @@ impl ClaudeInner {
         tool_result: Value,
         error: Option<String>,
     ) {
-        if success
-            && let Some(progress) =
-                spawn_progress_data_for_tool_result(tool_call_id, tool_name, &tool_result)
-        {
-            self.emitter.tool_progress(&progress);
-        }
-        let (tool_result, normalization_failure) = if success {
-            match tyde_tool_result(tool_name, &tool_result) {
-                Ok(Some(typed)) => (
-                    serde_json::to_value(typed).expect("serialize tool result"),
-                    None,
-                ),
-                Ok(None) => (tool_result, None),
-                Err(normalize_error) => {
-                    tracing::error!(
-                        tool = %tool_name,
-                        tool_call_id = %tool_call_id,
-                        detail = %normalize_error.detail,
-                        "Canonical Tyde tool result normalization failed"
-                    );
-                    self.emitter.backend_error(&format!(
-                        "Failed to normalize canonical tool result '{}' ({}): {}",
-                        tool_name, tool_call_id, normalize_error
-                    ));
-                    (tool_result, Some(normalize_error.normalization_failure))
-                }
-            }
-        } else {
-            (tool_result, None)
-        };
         let completed = ToolCompletedPayload {
             tool_call_id,
             tool_name,
@@ -2504,12 +2433,7 @@ impl ClaudeInner {
             success,
             error: error.as_deref(),
         };
-        if let Some(normalization_failure) = normalization_failure {
-            self.emitter
-                .tool_completed_with_normalization_failure(completed, normalization_failure);
-        } else {
-            self.emitter.tool_completed(completed);
-        }
+        self.emitter.tool_completed(completed);
     }
 
     async fn shutdown(&self) {
@@ -4090,7 +4014,7 @@ const SUBAGENT_PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(250);
 fn subagent_progress_data(stream: &SubAgentStream, completed: bool) -> ToolProgressData {
     ToolProgressData {
         tool_call_id: stream.parent_tool_use_id.clone(),
-        tool_name: "Task".to_string(),
+        tool_name: stream.parent_tool_name.clone(),
         update: ToolProgressUpdate::SubAgent(protocol::SubAgentProgress {
             agent_id: stream.agent_id.clone(),
             agent_name: stream.agent_name.clone(),
@@ -4126,6 +4050,7 @@ fn emit_subagent_task_prompt_if_needed(stream: &mut SubAgentStream, description:
 
 struct SubAgentSpawnSpec {
     tool_use_id: String,
+    parent_tool_name: Option<String>,
     name: String,
     description: String,
     agent_type: String,
@@ -4141,13 +4066,17 @@ async fn ensure_subagent_stream(
 ) {
     let SubAgentSpawnSpec {
         tool_use_id,
+        parent_tool_name,
         name,
         description,
         agent_type,
         session_id_hint,
         execution,
     } = spec;
-    if streams.contains_key(&tool_use_id) {
+    if let Some(stream) = streams.get_mut(&tool_use_id) {
+        if let Some(parent_tool_name) = parent_tool_name {
+            stream.parent_tool_name = parent_tool_name;
+        }
         return;
     }
 
@@ -4198,6 +4127,7 @@ async fn ensure_subagent_stream(
         has_explicit_task_prompt: false,
         inner: sa_inner,
         parent_tool_use_id: tool_use_id.clone(),
+        parent_tool_name: parent_tool_name.unwrap_or_else(|| "Task".to_owned()),
         agent_id: handle.agent_id,
         agent_name: name,
         parent_emitter: parent_emitter.clone(),
@@ -4501,6 +4431,7 @@ async fn detect_subagent_task_system_spawns(
         streams,
         SubAgentSpawnSpec {
             tool_use_id: tool_use_id.clone(),
+            parent_tool_name: None,
             name,
             description,
             agent_type: task_type,
@@ -4667,6 +4598,7 @@ async fn detect_subagent_spawns(
                 streams,
                 SubAgentSpawnSpec {
                     tool_use_id: tool_use_id.clone(),
+                    parent_tool_name: Some(block_name.to_owned()),
                     name,
                     description: description.clone(),
                     agent_type,
@@ -10523,6 +10455,7 @@ for raw_line in sys.stdin:
                 has_explicit_task_prompt: false,
                 inner: child_inner,
                 parent_tool_use_id: "toolu_1".to_string(),
+                parent_tool_name: "Task".to_string(),
                 agent_id: protocol::AgentId("child-agent".to_string()),
                 agent_name: "Child".to_string(),
                 parent_emitter,
@@ -10670,6 +10603,7 @@ for raw_line in sys.stdin:
                 has_explicit_task_prompt: false,
                 inner: Arc::new(child_inner),
                 parent_tool_use_id: tool_use_id.to_string(),
+                parent_tool_name: "Task".to_string(),
                 agent_id: protocol::AgentId(format!("child-{tool_use_id}")),
                 agent_name: "Child".to_string(),
                 parent_emitter,
@@ -10678,6 +10612,16 @@ for raw_line in sys.stdin:
             },
             child_rx,
         )
+    }
+
+    #[test]
+    fn subagent_progress_preserves_parent_tool_identity() {
+        let (mut stream, _child_rx) = usage_only_subagent_stream("toolu-agent", false);
+        stream.parent_tool_name = "Agent".to_owned();
+
+        let progress = subagent_progress_data(&stream, false);
+        assert_eq!(progress.tool_call_id, "toolu-agent");
+        assert_eq!(progress.tool_name, "Agent");
     }
 
     async fn assert_usage_only_child_terminal_is_known(
@@ -17214,6 +17158,7 @@ for raw_line in sys.stdin:
                     turn_event_gate: Mutex::new(()),
                 }),
                 parent_tool_use_id: "toolu_spawn".to_string(),
+                parent_tool_name: "Task".to_string(),
                 agent_id: protocol::AgentId("test-subagent".to_string()),
                 agent_name: "Agent".to_string(),
                 parent_emitter: test_parent_emitter().0,

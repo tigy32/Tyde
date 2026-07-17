@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use protocol::{
-    AgentControlAgentRef, AgentControlProgress, AgentControlProgressKind, AgentId,
+    AgentControlAgentRef, AgentControlProgress, AgentControlProgressKind, AgentId, ChatEvent,
     ToolExecutionNormalizationFailure, ToolExecutionResult, ToolProgressData, ToolProgressUpdate,
     ToolRequestType, TydeAgentWaitStatus,
 };
@@ -68,7 +68,19 @@ pub(crate) fn tyde_tool_request_type(
     tool_name: &str,
     arguments: &Value,
 ) -> Result<Option<ToolRequestType>, ToolNormalizeError> {
-    let typed = if is_tyde_agent_control_send_message_tool_name(tool_name) {
+    let typed = if is_tyde_agent_control_spawn_tool_name(tool_name) {
+        let (prompt, name) = find_spawn_request_arguments(arguments, 0).ok_or_else(|| {
+            normalize_error(
+                tool_name,
+                ToolExecutionNormalizationFailure::CanonicalRequest,
+                "expected a non-empty prompt in canonical arguments",
+            )
+        })?;
+        ToolRequestType::AgentSpawn {
+            prompt: Some(prompt),
+            name,
+        }
+    } else if is_tyde_agent_control_send_message_tool_name(tool_name) {
         let (agent_id, message) = find_send_message_arguments(arguments, 0).ok_or_else(|| {
             normalize_error(
                 tool_name,
@@ -94,6 +106,37 @@ pub(crate) fn tyde_tool_request_type(
         return Ok(None);
     };
     Ok(Some(typed))
+}
+
+fn find_spawn_request_arguments(value: &Value, depth: usize) -> Option<(String, Option<String>)> {
+    if depth > MAX_PARSE_DEPTH {
+        return None;
+    }
+    match value {
+        Value::Object(map) => {
+            if let Some(prompt) = map
+                .get("prompt")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|prompt| !prompt.is_empty())
+            {
+                let name = map
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned);
+                return Some((prompt.to_owned(), name));
+            }
+            ARGUMENT_WRAPPER_KEYS.iter().find_map(|key| {
+                map.get(*key)
+                    .and_then(|nested| find_spawn_request_arguments(nested, depth + 1))
+            })
+        }
+        Value::String(text) => parse_embedded_json(text)
+            .and_then(|parsed| find_spawn_request_arguments(&parsed, depth + 1)),
+        _ => None,
+    }
 }
 
 fn find_send_message_arguments(value: &Value, depth: usize) -> Option<(AgentId, String)> {
@@ -157,6 +200,84 @@ pub(crate) fn tyde_tool_result(
         return Ok(None);
     };
     Ok(Some(typed))
+}
+
+pub(crate) fn normalize_tyde_chat_event(
+    event: ChatEvent,
+    normalization_failures: &mut std::collections::HashMap<
+        String,
+        ToolExecutionNormalizationFailure,
+    >,
+) -> (ChatEvent, Option<String>) {
+    match event {
+        ChatEvent::ToolRequest(mut request) => {
+            let ToolRequestType::Other { args } = &request.tool_type else {
+                return (ChatEvent::ToolRequest(request), None);
+            };
+            match tyde_tool_request_type(&request.tool_name, args) {
+                Ok(Some(typed)) => {
+                    request.tool_type = typed;
+                    (ChatEvent::ToolRequest(request), None)
+                }
+                Ok(None) => (ChatEvent::ToolRequest(request), None),
+                Err(error) => {
+                    normalization_failures
+                        .insert(request.tool_call_id.clone(), error.normalization_failure);
+                    let visible = format!(
+                        "Failed to normalize canonical tool request '{}' ({}): {}",
+                        request.tool_name, request.tool_call_id, error
+                    );
+                    (ChatEvent::ToolRequest(request), Some(visible))
+                }
+            }
+        }
+        ChatEvent::ToolExecutionCompleted(mut completion) => {
+            let request_failure = normalization_failures.remove(&completion.tool_call_id);
+            let mut visible = None;
+            let result_failure = if completion.success {
+                match &completion.tool_result {
+                    ToolExecutionResult::Other { .. } => match tyde_tool_result(
+                        &completion.tool_name,
+                        &serde_json::to_value(&completion.tool_result)
+                            .expect("serialize tool result"),
+                    ) {
+                        Ok(Some(typed)) => {
+                            completion.tool_result = typed;
+                            None
+                        }
+                        Ok(None) => None,
+                        Err(error) => {
+                            visible = Some(format!(
+                                "Failed to normalize canonical tool result '{}' ({}): {}",
+                                completion.tool_name, completion.tool_call_id, error
+                            ));
+                            Some(error.normalization_failure)
+                        }
+                    },
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            completion.normalization_failure =
+                merge_normalization_failure(completion.normalization_failure, request_failure);
+            completion.normalization_failure =
+                merge_normalization_failure(completion.normalization_failure, result_failure);
+            (ChatEvent::ToolExecutionCompleted(completion), visible)
+        }
+        event => (event, None),
+    }
+}
+
+fn merge_normalization_failure(
+    existing: Option<ToolExecutionNormalizationFailure>,
+    incoming: Option<ToolExecutionNormalizationFailure>,
+) -> Option<ToolExecutionNormalizationFailure> {
+    match (existing, incoming) {
+        (None, None) => None,
+        (Some(failure), None) | (None, Some(failure)) => Some(failure),
+        (Some(existing), Some(incoming)) => Some(existing.combined_with(incoming)),
+    }
 }
 
 fn parse_canonical<T: for<'de> Deserialize<'de>>(

@@ -6758,6 +6758,14 @@ pub enum ToolRequestType {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         plan_path: Option<String>,
     },
+    /// A child-agent spawn, regardless of whether it originated from Tyde's
+    /// agent-control MCP or a backend's native collaboration protocol.
+    AgentSpawn {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
     /// `tyde_send_agent_message`: a follow-up message delivered to a direct
     /// child agent. The message is human-authored prose, so it is carried as
     /// canonical typed data rather than an opaque args blob — the UI renders it

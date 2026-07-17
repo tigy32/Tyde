@@ -41,6 +41,11 @@ use protocol::{
     TokenUsageUnavailableReason, ToolExecutionNormalizationFailure,
 };
 
+use super::agent_control_progress::{
+    await_progress_data_for_tool, spawn_progress_data_for_tool_result, tyde_tool_request_type,
+    tyde_tool_result,
+};
+
 /// Sender half of the wire channel. Kept private to this module; every
 /// emission must go through the typed methods below.
 pub struct TurnEmitter {
@@ -354,17 +359,7 @@ impl TurnEmitter {
             );
             return;
         }
-        let payload = match serde_json::to_value(data) {
-            Ok(value) => value,
-            Err(err) => {
-                tracing::warn!("failed to serialize ToolProgressData: {err}");
-                return;
-            }
-        };
-        self.lock().send(json!({
-            "kind": "ToolProgress",
-            "data": payload,
-        }));
+        self.lock().send_tool_progress(data);
     }
 
     // ---------- Cancellation & lifecycle ----------
@@ -748,9 +743,33 @@ impl TurnEmitterState {
         &mut self,
         tool_call_id: &str,
         tool_name: &str,
-        tool_type: Value,
-        normalization_failure: Option<ToolExecutionNormalizationFailure>,
+        provider_tool_type: Value,
+        mut normalization_failure: Option<ToolExecutionNormalizationFailure>,
     ) -> Option<ChatMessageId> {
+        let tool_type = match tyde_tool_request_type(tool_name, &provider_tool_type) {
+            Ok(Some(typed)) => serde_json::to_value(typed).expect("serialize tool request"),
+            Ok(None) => provider_tool_type,
+            Err(error) => {
+                tracing::error!(
+                    tool = tool_name,
+                    tool_call_id,
+                    detail = %error.detail,
+                    "Canonical Tyde tool request normalization failed"
+                );
+                self.send(json!({
+                    "kind": "Error",
+                    "data": format!(
+                        "Failed to normalize canonical tool request '{}' ({}): {}",
+                        tool_name, tool_call_id, error
+                    ),
+                }));
+                normalization_failure = merge_normalization_failures(
+                    normalization_failure,
+                    Some(error.normalization_failure),
+                );
+                provider_tool_type
+            }
+        };
         if let Some(request) = self.emitted_tool_requests.get(tool_call_id)
             && (self.completed_tool_requests.contains(tool_call_id)
                 || (request.name == tool_name && request.arguments == tool_type))
@@ -816,13 +835,19 @@ impl TurnEmitterState {
                 "tool_type": tool_type,
             },
         }));
+        if normalization_failure.is_none()
+            && let Some(progress) =
+                await_progress_data_for_tool(tool_call_id, tool_name, &tool_type)
+        {
+            self.send_tool_progress(&progress);
+        }
         opened_container
     }
 
     fn tool_completed(
         &mut self,
-        data: ToolCompletedPayload<'_>,
-        normalization_failure: Option<ToolExecutionNormalizationFailure>,
+        mut data: ToolCompletedPayload<'_>,
+        mut normalization_failure: Option<ToolExecutionNormalizationFailure>,
     ) -> Option<ChatMessageId> {
         if self.completed_tool_requests.contains(data.tool_call_id) {
             tracing::debug!(
@@ -831,6 +856,41 @@ impl TurnEmitterState {
                 "Ignoring duplicate terminal tool completion"
             );
             return None;
+        }
+        let mut spawn_progress = None;
+        if data.success {
+            match tyde_tool_result(data.tool_name, &data.tool_result) {
+                Ok(Some(typed)) => {
+                    data.tool_result = serde_json::to_value(typed).expect("serialize tool result");
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(
+                        tool = data.tool_name,
+                        tool_call_id = data.tool_call_id,
+                        detail = %error.detail,
+                        "Canonical Tyde tool result normalization failed"
+                    );
+                    self.send(json!({
+                        "kind": "Error",
+                        "data": format!(
+                            "Failed to normalize canonical tool result '{}' ({}): {}",
+                            data.tool_name, data.tool_call_id, error
+                        ),
+                    }));
+                    normalization_failure = merge_normalization_failures(
+                        normalization_failure,
+                        Some(error.normalization_failure),
+                    );
+                }
+            }
+            if normalization_failure.is_none() {
+                spawn_progress = spawn_progress_data_for_tool_result(
+                    data.tool_call_id,
+                    data.tool_name,
+                    &data.tool_result,
+                );
+            }
         }
         let mut opened_container = None;
         match self.pending_tool_name(data.tool_call_id).cloned() {
@@ -875,6 +935,9 @@ impl TurnEmitterState {
             self.normalization_failures.remove(data.tool_call_id),
             normalization_failure,
         );
+        if let Some(progress) = spawn_progress {
+            self.send_tool_progress(&progress);
+        }
         self.send_tool_completed_with_normalization_failure(
             data.tool_call_id,
             data.tool_name,
@@ -884,6 +947,38 @@ impl TurnEmitterState {
             normalization_failure,
         );
         opened_container
+    }
+
+    fn send_tool_progress(&self, data: &protocol::ToolProgressData) {
+        if let Some(request) = self.emitted_tool_requests.get(&data.tool_call_id)
+            && request.name != data.tool_name
+        {
+            tracing::error!(
+                tool_call_id = data.tool_call_id,
+                request_tool_name = request.name,
+                progress_tool_name = data.tool_name,
+                "Rejecting tool progress with conflicting tool identity"
+            );
+            self.send(json!({
+                "kind": "Error",
+                "data": format!(
+                    "Tool progress identity mismatch for '{}': request is '{}', progress is '{}'",
+                    data.tool_call_id, request.name, data.tool_name
+                ),
+            }));
+            return;
+        }
+        let payload = match serde_json::to_value(data) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::warn!("failed to serialize ToolProgressData: {error}");
+                return;
+            }
+        };
+        self.send(json!({
+            "kind": "ToolProgress",
+            "data": payload,
+        }));
     }
 
     fn send_tool_completed(
@@ -2063,6 +2158,91 @@ mod tests {
         let events = recv_events(&mut rx);
         assert_protocol_valid(&events);
         assert_eq!(event_kinds(&events), vec!["StreamStart", "ToolRequest"]);
+    }
+
+    #[test]
+    fn shared_emitter_normalizes_tyde_spawn_and_emits_typed_progress() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new_for_agent(tx, AgentName("provider"));
+        emitter.tool_request(
+            "spawn-1",
+            "mcp__tyde-agent-control__tyde_spawn_agent",
+            json!({
+                "kind": "Other",
+                "args": {"arguments": {"prompt": "Inspect the parser", "name": "Parser"}}
+            }),
+        );
+        emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id: "spawn-1",
+            tool_name: "mcp__tyde-agent-control__tyde_spawn_agent",
+            tool_result: json!({
+                "kind": "Other",
+                "result": {"agent_id": "child-1", "name": "Parser"}
+            }),
+            success: true,
+            error: None,
+        });
+        drop(emitter);
+
+        let events = recv_events(&mut rx);
+        assert_eq!(
+            events[1]
+                .pointer("/data/tool_type/kind")
+                .and_then(Value::as_str),
+            Some("AgentSpawn")
+        );
+        assert_eq!(
+            events[1]
+                .pointer("/data/tool_type/prompt")
+                .and_then(Value::as_str),
+            Some("Inspect the parser")
+        );
+        assert_eq!(
+            events[2].get("kind").and_then(Value::as_str),
+            Some("ToolProgress")
+        );
+        assert_eq!(
+            events[2]
+                .pointer("/data/update/progress_kind")
+                .and_then(Value::as_str),
+            Some("spawn")
+        );
+        assert_eq!(
+            events[2]
+                .pointer("/data/update/agents/0/agent_id")
+                .and_then(Value::as_str),
+            Some("child-1")
+        );
+    }
+
+    #[test]
+    fn shared_emitter_rejects_progress_for_a_different_tool_identity() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new_for_agent(tx, AgentName("provider"));
+        emitter.tool_request("shared-id", "run_command", run_command_request());
+        emitter.tool_progress(&protocol::ToolProgressData {
+            tool_call_id: "shared-id".to_owned(),
+            tool_name: "tyde_spawn_agent".to_owned(),
+            update: protocol::ToolProgressUpdate::AgentControl(protocol::AgentControlProgress {
+                progress_kind: protocol::AgentControlProgressKind::Spawn,
+                agents: vec![protocol::AgentControlAgentRef {
+                    agent_id: protocol::AgentId("child-1".to_owned()),
+                    name: Some("Child".to_owned()),
+                }],
+            }),
+        });
+        drop(emitter);
+
+        let events = recv_events(&mut rx);
+        assert_eq!(
+            event_kinds(&events),
+            vec!["StreamStart", "ToolRequest", "Error"]
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| { event.get("kind").and_then(Value::as_str) != Some("ToolProgress") })
+        );
     }
 
     #[test]

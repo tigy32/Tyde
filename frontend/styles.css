@@ -11691,6 +11691,16 @@ pre.tool-error-pre {
     background: var(--accent-subtle);
 }
 
+.tool-agent-spawn-prompt {
+    color: var(--text-primary);
+    white-space: pre-wrap;
+}
+
+.tool-agent-spawn-prompt-unavailable {
+    color: var(--text-muted);
+    font-style: italic;
+}
+
 /* ── Tyde orchestration: tyde_send_agent_message ─────────────────────────
    The message is content, not debug output, so it renders as real Markdown in
    `--text-primary` rather than as an escaped-JSON <pre> in `--text-secondary`.

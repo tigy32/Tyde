@@ -662,6 +662,18 @@ fn render_body(
         ToolRequestType::ExitPlanMode { .. } => {
             exit_plan_mode::render(agent_ref, tool_call_id, req, result, mode).into_any()
         }
+        ToolRequestType::AgentSpawn { prompt, .. } => match prompt {
+            Some(prompt) => view! {
+                <div class="tool-agent-spawn-prompt">{prompt.clone()}</div>
+            }
+            .into_any(),
+            None => view! {
+                <div class="tool-agent-spawn-prompt-unavailable">
+                    "Codex did not expose this native sub-agent's prompt."
+                </div>
+            }
+            .into_any(),
+        },
         ToolRequestType::Other { .. } => {
             other::render(req, result, malformed_payload, mode).into_any()
         }
@@ -1026,7 +1038,7 @@ fn AgentControlAgentRow(
                     {move || derived_status.get().label()}
                 </span>
             </div>
-            <button class="tool-live-link" on:click=on_open>"Open agent"</button>
+            <button type="button" class="tool-live-link" on:click=on_open>"Open agent"</button>
             // Spawn shows the live streaming preview. The Await card derives its
             // output line from server stats instead (below), never streaming.
             {move || {
@@ -1280,7 +1292,7 @@ fn subagent_status_line(
     view! {
         <div class="tool-live-subagent">
             <span class="tool-live-title">{status_text}</span>
-            <button class="tool-live-link" on:click=on_open>"Open agent"</button>
+            <button type="button" class="tool-live-link" on:click=on_open>"Open agent"</button>
         </div>
     }
 }
@@ -1324,6 +1336,10 @@ fn tool_icon_and_detail(name: &str, tool_type: &ToolRequestType) -> (&'static st
         ToolRequestType::ExitPlanMode { plan_path, .. } => (
             "\u{1f4dd}",
             plan_path.clone().or_else(|| Some("Plan".to_owned())),
+        ),
+        ToolRequestType::AgentSpawn { name, .. } => (
+            "\u{1f916}",
+            name.clone().or_else(|| Some("Spawning agent".to_owned())),
         ),
         // The recipient's live name needs app state, so the shell resolves it
         // (see `recipient_detail`). The request alone carries only a uuid, which
@@ -2363,6 +2379,45 @@ mod live_card_wasm_tests {
         assert!(
             body.contains("Open agent"),
             "native wait exposes the shared open-agent action: {body}"
+        );
+
+        let button = container
+            .query_selector(".tool-live-agent-row .tool-live-link")
+            .expect("query open-agent button")
+            .expect("open-agent button is rendered")
+            .dyn_into::<HtmlElement>()
+            .expect("open-agent button is an HTML element");
+        button.click();
+        next_tick().await;
+
+        let opened = state
+            .active_agent
+            .get_untracked()
+            .expect("clicking the rendered action opens the native child");
+        assert_eq!(opened.agent_id, AgentId("native-child".to_owned()));
+        assert_eq!(opened.host_id, "host-1");
+    }
+
+    #[wasm_bindgen_test]
+    async fn native_spawn_card_includes_the_assigned_prompt() {
+        let entry = ToolRequestEntry {
+            request: ToolRequest {
+                tool_call_id: "native-spawn".to_owned(),
+                tool_name: "spawnAgent".to_owned(),
+                tool_type: ToolRequestType::AgentSpawn {
+                    prompt: Some("Inspect the storage scan regression".to_owned()),
+                    name: Some("scan-reviewer".to_owned()),
+                },
+            },
+            result: None,
+        };
+        let (container, _state) = mount_card(entry, None);
+        next_tick().await;
+
+        let body = text(&container);
+        assert!(
+            body.contains("Inspect the storage scan regression"),
+            "native spawn renders the prompt assigned to the child: {body}"
         );
     }
 
