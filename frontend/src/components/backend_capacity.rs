@@ -4,8 +4,7 @@
 //! Everything here is a pure projection of `state.backend_capacity`, which the
 //! server replays on host-stream subscribe and re-emits on every change. The
 //! frontend runs no freshness clock (staleness is `CapacityFreshness`, computed
-//! server-side), keeps no cache, infers nothing, and offers no refresh action —
-//! both phase-1 sources are passive, so there is nothing to refresh.
+//! server-side), keeps no cache, infers nothing, and offers no refresh action.
 //!
 //! Two rules keep this honest and are load-bearing:
 //!
@@ -278,13 +277,11 @@ fn state_explanation(state: &BackendCapacityState, kind: BackendKind) -> Option<
     match state {
         BackendCapacityState::Known { .. } => None,
         BackendCapacityState::Stale { .. } => Some(format!(
-            "{vendor} reports capacity passively, so this figure ages while the account is idle. \
-             Run a turn to refresh it."
+            "This {vendor} figure is stale and will update when the backend reports capacity again."
         )),
         BackendCapacityState::Unavailable { reason } => Some(match reason {
             CapacityUnavailableReason::AwaitingFirstReport => format!(
-                "No report from {vendor} yet. It reports capacity passively, only after a turn \
-                 completes. This is not zero usage \u{2014} nothing has been reported."
+                "No report from {vendor} yet. This is not zero usage \u{2014} nothing has been reported."
             ),
             // Covers both a vendor payload that failed validation and a Codex
             // notification that arrived without the complete snapshot: the
@@ -633,7 +630,7 @@ fn plan_text(report: &CapacityReport) -> String {
     }
 }
 
-fn snapshot_card(snapshot: &BackendCapacitySnapshot) -> AnyView {
+fn snapshot_card(snapshot: &BackendCapacitySnapshot, embedded: bool) -> AnyView {
     let kind = snapshot.backend_kind;
     let state = &snapshot.state;
     let headline = state_headline(state, kind);
@@ -646,11 +643,14 @@ fn snapshot_card(snapshot: &BackendCapacitySnapshot) -> AnyView {
     view! {
         <div
             class="capacity-card"
+            class:capacity-card-embedded=embedded
             data-capacity-backend=format!("{kind:?}").to_lowercase()
             data-capacity-state=slug
         >
             <div class="capacity-card-head">
-                <span class="capacity-backend">{backend_label(kind)}</span>
+                {(!embedded).then(|| view! {
+                    <span class="capacity-backend">{backend_label(kind)}</span>
+                })}
                 <span class="capacity-state" data-capacity-state=slug>{headline}</span>
             </div>
 
@@ -693,6 +693,32 @@ fn snapshot_card(snapshot: &BackendCapacitySnapshot) -> AnyView {
     .into_any()
 }
 
+/// Capacity embedded in one backend's enable/install card. Backends and auth
+/// modes without subscription capacity render nothing rather than repeating an
+/// unsupported explanation on every provider card.
+#[component]
+pub fn BackendSubscriptionCapacity(kind: BackendKind) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let snapshot = Memo::new(move |_| -> Option<BackendCapacitySnapshot> {
+        let host_id = state.selected_host_id.get()?;
+        let snapshot = state
+            .backend_capacity
+            .get()
+            .get(&host_id)
+            .and_then(|by_kind| by_kind.get(&kind))
+            .cloned()?;
+        if matches!(snapshot.state, BackendCapacityState::Unsupported { .. }) {
+            None
+        } else {
+            Some(snapshot)
+        }
+    });
+
+    view! {
+        {move || snapshot.get().map(|snapshot| snapshot_card(&snapshot, true))}
+    }
+}
+
 /// The full authoritative Settings view: every backend the selected host
 /// reports, including the ones with no capacity source at all. `Unsupported` is
 /// a rendered row, not a hidden one — a missing row reads as "fine".
@@ -722,9 +748,7 @@ pub fn SubscriptionCapacitySection() -> impl IntoView {
             <p class="settings-description">
                 "Quota reported by each backend for the account it is signed in to on the selected \
                  host. This is advisory only \u{2014} Tyde never reroutes, downgrades, or switches \
-                 backends based on it. Both sources report passively, as a side effect of turns \
-                 you already ran, so there is nothing to refresh and no figure is ever inferred \
-                 from Tyde's own token usage."
+                 backends based on it, and no figure is ever inferred from Tyde's own token usage."
             </p>
             {move || {
                 let snapshots = snapshots.get();
@@ -738,7 +762,7 @@ pub fn SubscriptionCapacitySection() -> impl IntoView {
                 }
                 view! {
                     <div class="capacity-cards">
-                        {snapshots.iter().map(snapshot_card).collect_view()}
+                        {snapshots.iter().map(|snapshot| snapshot_card(snapshot, false)).collect_view()}
                     </div>
                 }
                 .into_any()
@@ -1808,10 +1832,11 @@ mod wasm_tests {
             !text.contains("82% used"),
             "the superseded figure must be gone, got: {text}"
         );
-        // There is nothing to refresh: both phase-1 sources are passive.
+        // Capacity refresh is backend-owned; the frontend never invents a
+        // refresh action or fetch path of its own.
         assert!(
             query(&container, "button").is_none(),
-            "phase 1 must not offer a refresh button"
+            "the frontend must not offer its own refresh button"
         );
     }
 }

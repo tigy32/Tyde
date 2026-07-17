@@ -12479,6 +12479,15 @@ pre.tool-error-pre {
     border-left-color: var(--error);
 }
 
+.settings-backend-card > .capacity-card-embedded {
+    margin-top: var(--space-3);
+    padding: var(--space-3) 0 0;
+    background: transparent;
+    border: 0;
+    border-top: 1px solid var(--border-primary);
+    border-radius: 0;
+}
+
 .capacity-card-head {
     display: flex;
     align-items: baseline;

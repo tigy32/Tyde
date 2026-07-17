@@ -28,7 +28,7 @@ use protocol::{
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 
-use crate::components::backend_capacity::SubscriptionCapacitySection;
+use crate::components::backend_capacity::BackendSubscriptionCapacity;
 use crate::components::session_settings::{
     SessionSettingsControls, clear_invalid_dependent_select_values,
 };
@@ -822,6 +822,7 @@ const SETTINGS_GROUP_TABS: [SettingsTab; 9] = [
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsPage {
     Tab(SettingsTab),
+    Complexity,
     Backend(BackendKind),
 }
 
@@ -1013,6 +1014,9 @@ pub fn SettingsPanel() -> impl IntoView {
                                 SettingsPage::Backend(kind) => {
                                     view! { <BackendSettingsPage kind /> }.into_any()
                                 }
+                                SettingsPage::Complexity => {
+                                    view! { <TaskComplexityPage /> }.into_any()
+                                }
                             }}
                         </div>
                     </div>
@@ -1033,6 +1037,7 @@ fn BackendsNavGroup(
     let visible = move || {
         let query = search_query.get();
         SettingsTab::Backends.matches_query(&query)
+            || complexity_page_matches_query(&query)
             || schema_backends(&state)
                 .into_iter()
                 .any(|kind| backend_page_matches_query(&state, kind, &query))
@@ -1053,6 +1058,15 @@ fn BackendsNavGroup(
                             }
                         >
                             "Overview"
+                        </button>
+                    </Show>
+                    <Show when=move || complexity_page_matches_query(&search_query.get())>
+                        <button
+                            class="settings-nav-item"
+                            class:active=move || active_page.get() == SettingsPage::Complexity
+                            on:click=move |_| active_page.set(SettingsPage::Complexity)
+                        >
+                            "Task Complexity"
                         </button>
                     </Show>
                     <BackendNavItems active_page search_query />
@@ -2057,9 +2071,37 @@ fn BackendsTab(active_page: RwSignal<SettingsPage>) -> impl IntoView {
             </div>
         </div>
 
-        <SubscriptionCapacitySection />
-        <ComplexityTiersSection />
         <LaunchProfilesSection />
+    }
+}
+
+fn complexity_page_matches_query(query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let query = query.to_lowercase();
+    [
+        "Task Complexity",
+        "Task complexity tiers",
+        "Low tier",
+        "High tier",
+        "Cheaper faster setup",
+        "Most capable setup",
+    ]
+    .iter()
+    .any(|text| text.to_lowercase().contains(&query))
+}
+
+#[component]
+fn TaskComplexityPage() -> impl IntoView {
+    view! {
+        <div class="settings-panel-header">
+            <h2 class="settings-panel-title">"Task Complexity"</h2>
+        </div>
+        <p class="settings-description settings-panel-intro">
+            "Choose whether agent and spawn flows can request low- or high-complexity backend configurations."
+        </p>
+        <ComplexityTiersSection />
     }
 }
 
@@ -5476,6 +5518,8 @@ fn BackendCard(kind: BackendKind, active_page: RwSignal<SettingsPage>) -> impl I
                     </button>
                 </div>
             })}
+
+            <BackendSubscriptionCapacity kind />
         </div>
     }
 }
@@ -9410,6 +9454,8 @@ mod wasm_tests {
             find_button_by_text(&container, "Hermes").is_some(),
             "a backend in the host's schema catalog must get its own nav item"
         );
+        let task_complexity = find_button_by_text(&container, "Task Complexity")
+            .expect("Task Complexity must have its own Backends nav item");
         assert!(
             find_button_by_text(&container, "Claude").is_none(),
             "a backend without a schema must not get a nav item"
@@ -9432,6 +9478,22 @@ mod wasm_tests {
             0,
             "backend config fields must no longer render on the overview"
         );
+        assert!(
+            !text.contains("Task complexity tiers"),
+            "complexity controls must not remain on the Backends overview: {text:?}"
+        );
+
+        task_complexity.click();
+        next_tick().await;
+        let text = container.text_content().unwrap_or_default();
+        assert_eq!(panel_title(&container), "Task Complexity");
+        assert!(
+            text.contains("Task complexity tiers"),
+            "the dedicated page must contain the existing complexity controls: {text:?}"
+        );
+
+        overview.click();
+        next_tick().await;
 
         // The configurable backend's card links to its settings page.
         find_button_by_text(&container, "Configure Hermes")
@@ -9451,6 +9513,104 @@ mod wasm_tests {
                 .length(),
             3,
             "the backend page renders one control per schema field"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn backend_cards_embed_subscription_capacity_and_hide_unsupported_backends() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_backend_config_host(
+                &state,
+                BackendConfigValues::default(),
+                vec![BackendKind::Claude, BackendKind::Hermes],
+            );
+            state.backend_capacity.update(|hosts| {
+                let snapshots = hosts.entry("host-cfg".to_owned()).or_default();
+                snapshots.insert(
+                    BackendKind::Claude,
+                    protocol::BackendCapacitySnapshot {
+                        backend_kind: BackendKind::Claude,
+                        state: protocol::BackendCapacityState::Known {
+                            report: protocol::CapacityReport {
+                                source: protocol::CapacitySource::ClaudeRateLimitEvent,
+                                observed_at_ms: None,
+                                plan: None,
+                                buckets: vec![protocol::CapacityBucket {
+                                    id: protocol::CapacityBucketId::Claude {
+                                        limit: protocol::ClaudeLimitType::FiveHour,
+                                    },
+                                    label: "session limit".to_owned(),
+                                    measure: protocol::CapacityMeasure::UsedPercent {
+                                        used_percent: 20,
+                                        remaining_percent: 80,
+                                        provenance: protocol::ValueProvenance {
+                                            vendor_reported: true,
+                                        },
+                                    },
+                                    scope: protocol::CapacityScope::NotReported,
+                                    window: protocol::CapacityWindow::NotReported,
+                                    reset: protocol::CapacityReset::NotReported,
+                                    status: Some(protocol::CapacityBucketStatus::Allowed),
+                                }],
+                                coverage: protocol::CapacityCoverage::RepresentativeBucketOnly,
+                            },
+                        },
+                        retrieved_at_ms: js_sys::Date::now() as u64,
+                        freshness: protocol::CapacityFreshness::Fresh { age_ms: 0 },
+                    },
+                );
+                snapshots.insert(
+                    BackendKind::Hermes,
+                    protocol::BackendCapacitySnapshot {
+                        backend_kind: BackendKind::Hermes,
+                        state: protocol::BackendCapacityState::Unsupported {
+                            reason: protocol::CapacityUnsupportedReason::BackendHasNoCapacitySource,
+                        },
+                        retrieved_at_ms: js_sys::Date::now() as u64,
+                        freshness: protocol::CapacityFreshness::Fresh { age_ms: 0 },
+                    },
+                );
+            });
+            provide_context(state);
+            view! { <BackendsTab active_page=RwSignal::new(SettingsPage::Tab(SettingsTab::Backends)) /> }
+        });
+        next_tick().await;
+
+        let cards = container
+            .query_selector_all(".settings-backend-card")
+            .expect("backend cards");
+        let mut claude_capacity = false;
+        let mut hermes_capacity = false;
+        for index in 0..cards.length() {
+            let card: HtmlElement = cards.item(index).unwrap().dyn_into().unwrap();
+            let text = card.text_content().unwrap_or_default();
+            let has_capacity = card
+                .query_selector(".capacity-card-embedded")
+                .unwrap()
+                .is_some();
+            if text.contains("Claude") {
+                claude_capacity = has_capacity && text.contains("20% used");
+            }
+            if text.contains("Hermes") {
+                hermes_capacity = has_capacity;
+            }
+        }
+        assert!(
+            claude_capacity,
+            "Claude's subscription usage must be embedded in its backend card"
+        );
+        assert!(
+            !hermes_capacity,
+            "backends without subscription capacity must render no capacity block"
+        );
+        assert!(
+            !container
+                .text_content()
+                .unwrap_or_default()
+                .contains("Subscription capacity"),
+            "the old standalone subscription section must be removed"
         );
     }
 
