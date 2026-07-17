@@ -2335,6 +2335,37 @@ mod live_card_wasm_tests {
         );
     }
 
+    #[wasm_bindgen_test]
+    async fn native_codex_wait_card_opens_awaited_agent() {
+        let entry = completed_other_request("native-wait", "wait");
+        let progress = ToolProgressData {
+            tool_call_id: "native-wait".to_owned(),
+            tool_name: "wait".to_owned(),
+            update: ToolProgressUpdate::AgentControl(AgentControlProgress {
+                progress_kind: AgentControlProgressKind::Await,
+                agents: vec![AgentControlAgentRef {
+                    agent_id: AgentId("native-child".to_owned()),
+                    name: Some("/root/sleeper".to_owned()),
+                }],
+            }),
+        };
+        let (container, state) = mount_card(entry, Some(progress));
+        let mut child = agent_info("native-child", "Sleeper", true);
+        child.origin = AgentOrigin::BackendNative;
+        state.agents.update(|agents| agents.push(child));
+        next_tick().await;
+
+        let body = text(&container);
+        assert!(
+            body.contains("Sleeper"),
+            "awaited native child visible: {body}"
+        );
+        assert!(
+            body.contains("Open agent"),
+            "native wait exposes the shared open-agent action: {body}"
+        );
+    }
+
     /// The await-agents card surfaces the server-owned activity summary so the
     /// user can glance at "what is this agent doing?". A summary with text shows
     /// verbatim; an enabled no-text state shows a status placeholder and NEVER

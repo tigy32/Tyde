@@ -1371,6 +1371,24 @@ async fn expect_turn_on_stream(
     expect_live_turn_after_typing_true_on_stream(client, stream, expected_text).await;
 }
 
+async fn expect_native_child_prompt_on_stream(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    expected_prompt: &str,
+) {
+    let env = expect_chat_event_on_stream(client, stream, "native child prompt").await;
+    let event: ChatEvent = env.parse_payload().expect("parse native child prompt");
+    assert!(
+        matches!(
+            event,
+            ChatEvent::MessageAdded(ref message)
+                if matches!(message.sender, MessageSender::User)
+                    && message.content == expected_prompt
+        ),
+        "expected native child prompt {expected_prompt:?} on {stream}, got {event:?}"
+    );
+}
+
 async fn expect_live_turn_after_typing_true_on_stream(
     client: &mut client::Connection,
     stream: &StreamPath,
@@ -2065,6 +2083,7 @@ async fn spawn_parent_with_native_child(
     let child_start: AgentStartPayload =
         env.parse_payload().expect("parse native child AgentStart");
 
+    expect_native_child_prompt_on_stream(client, &child_new.instance_stream, "parent prompt").await;
     expect_turn_on_stream(
         client,
         &child_new.instance_stream,
@@ -2261,6 +2280,12 @@ async fn subagent_turn_token_usage_is_strictly_self() {
         &mut fixture.client,
         &child_new.instance_stream,
         "strict-self child start",
+    )
+    .await;
+    expect_native_child_prompt_on_stream(
+        &mut fixture.client,
+        &child_new.instance_stream,
+        "parent prompt",
     )
     .await;
     let child_end = expect_completed_turn_on_stream(
@@ -5441,6 +5466,12 @@ async fn backend_native_child_with_closed_event_stream_still_replays_to_late_cli
     let child_start_env = expect_next_event(&mut fixture.client, "native child AgentStart").await;
     assert_eq!(child_start_env.kind, FrameKind::AgentStart);
 
+    expect_native_child_prompt_on_stream(
+        &mut fixture.client,
+        &child_new.instance_stream,
+        "parent prompt",
+    )
+    .await;
     expect_turn_on_stream(
         &mut fixture.client,
         &child_new.instance_stream,
@@ -5514,6 +5545,12 @@ async fn cancelling_parent_terminally_closes_live_native_child_and_replays_idle(
     let child_env = expect_kind(&mut fixture.client, FrameKind::NewAgent, "child NewAgent").await;
     let child: NewAgentPayload = child_env.parse_payload().expect("parse child NewAgent");
     expect_agent_start_on_stream(&mut fixture.client, &child.instance_stream, "child start").await;
+    expect_native_child_prompt_on_stream(
+        &mut fixture.client,
+        &child.instance_stream,
+        "live native child task",
+    )
+    .await;
     for context in ["child typing", "child stream start", "child stream delta"] {
         let _ =
             expect_chat_event_on_stream(&mut fixture.client, &child.instance_stream, context).await;
@@ -5622,6 +5659,12 @@ async fn interrupting_parked_backend_native_child_emits_relay_rejection() {
     let child_start_env = expect_next_event(&mut fixture.client, "native child AgentStart").await;
     assert_eq!(child_start_env.kind, FrameKind::AgentStart);
 
+    expect_native_child_prompt_on_stream(
+        &mut fixture.client,
+        &child_new.instance_stream,
+        "parent prompt",
+    )
+    .await;
     expect_turn_on_stream(
         &mut fixture.client,
         &child_new.instance_stream,

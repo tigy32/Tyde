@@ -751,6 +751,19 @@ impl TurnEmitterState {
         tool_type: Value,
         normalization_failure: Option<ToolExecutionNormalizationFailure>,
     ) -> Option<ChatMessageId> {
+        if let Some(request) = self.emitted_tool_requests.get(tool_call_id)
+            && (self.completed_tool_requests.contains(tool_call_id)
+                || (request.name == tool_name && request.arguments == tool_type))
+        {
+            tracing::debug!(
+                tool_call_id,
+                tool_name,
+                completed = self.completed_tool_requests.contains(tool_call_id),
+                same_request = request.name == tool_name && request.arguments == tool_type,
+                "Ignoring duplicate tool request"
+            );
+            return None;
+        }
         let opened_container = if !self.assistant_turn_open {
             self.ensure_assistant_turn_open(tool_call_id)
         } else {
@@ -811,6 +824,14 @@ impl TurnEmitterState {
         data: ToolCompletedPayload<'_>,
         normalization_failure: Option<ToolExecutionNormalizationFailure>,
     ) -> Option<ChatMessageId> {
+        if self.completed_tool_requests.contains(data.tool_call_id) {
+            tracing::debug!(
+                tool_call_id = data.tool_call_id,
+                tool_name = data.tool_name,
+                "Ignoring duplicate terminal tool completion"
+            );
+            return None;
+        }
         let mut opened_container = None;
         match self.pending_tool_name(data.tool_call_id).cloned() {
             Some(expected_name) if expected_name != data.tool_name => {
@@ -2042,6 +2063,64 @@ mod tests {
         let events = recv_events(&mut rx);
         assert_protocol_valid(&events);
         assert_eq!(event_kinds(&events), vec!["StreamStart", "ToolRequest"]);
+    }
+
+    #[test]
+    fn exact_duplicate_completed_tool_request_is_idempotent() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new_for_agent(tx, AgentName("codex"));
+        let request = run_command_request();
+        let container = emitter
+            .tool_request_in_container("tool-a", "run_command", request.clone())
+            .expect("tool-first request must open a container");
+        emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id: "tool-a",
+            tool_name: "run_command",
+            tool_result: json!({
+                "kind": "RunCommand",
+                "exit_code": 0,
+                "stdout": "",
+                "stderr": "",
+            }),
+            success: true,
+            error: None,
+        });
+        emitter.close_tool_container(container);
+        emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id: "tool-a",
+            tool_name: "run_command",
+            tool_result: json!({
+                "kind": "RunCommand",
+                "exit_code": 0,
+                "stdout": "",
+                "stderr": "",
+            }),
+            success: true,
+            error: None,
+        });
+        assert!(
+            emitter
+                .tool_request_in_container("tool-a", "run_command", request)
+                .is_none()
+        );
+        drop(emitter);
+
+        let events = recv_events(&mut rx);
+        assert_protocol_valid(&events);
+        assert_eq!(
+            event_kinds(&events),
+            vec![
+                "StreamStart",
+                "ToolRequest",
+                "ToolExecutionCompleted",
+                "StreamEnd",
+            ]
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| { event.get("kind").and_then(Value::as_str) != Some("Error") })
+        );
     }
 
     #[test]

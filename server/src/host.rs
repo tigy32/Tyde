@@ -24,7 +24,7 @@ use protocol::{
     AgentsViewPreferencesSnapshot, AgentsViewPreferencesUpdate, BackendCapacityPayload,
     BackendCapacitySnapshot, BackendCapacityState, BackendConfigSnapshot,
     BackendConfigSnapshotsPayload, BackendKind, BackendNativeSettingsSnapshot, BackendSetupPayload,
-    BrowseBootstrapListing, BrowseBootstrapPayload, CancelWorkflowPayload,
+    BrowseBootstrapListing, BrowseBootstrapPayload, CancelWorkflowPayload, ChatEvent, ChatMessage,
     CodeIntelCancelReferencesPayload, CodeIntelFindReferencesPayload, CodeIntelHoverPayload,
     CodeIntelNavigatePayload, CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
     CodeIntelUnsubscribeFilePayload, CustomAgent, CustomAgentDeletePayload,
@@ -34,7 +34,7 @@ use protocol::{
     HostSettingsPayload, ImageData, LOCAL_HOST_ID, LaunchProfile, LaunchProfileCatalog,
     LaunchProfileCatalogPayload, LaunchProfileEntry, LaunchProfileId, LaunchProfileKind,
     ListSessionsPayload, MAX_SESSION_LIST_PAGE_LIMIT, McpServerConfig, McpServerDeletePayload,
-    McpServerId, McpServerNotifyPayload, McpServerUpsertPayload, McpTransportConfig,
+    McpServerId, McpServerNotifyPayload, McpServerUpsertPayload, McpTransportConfig, MessageSender,
     MobileDeviceRenamePayload, MobileDeviceRevokePayload, MobilePairingCancelPayload,
     NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
     ProjectDeleteRootPayload, ProjectDiscardFilePayload, ProjectGitCommitPayload,
@@ -9783,6 +9783,22 @@ impl HostHandle {
             .clone()
             .unwrap_or_else(|| SessionId(Uuid::new_v4().to_string()));
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        if !request.description.trim().is_empty() {
+            event_tx
+                .send(ChatEvent::MessageAdded(ChatMessage {
+                    message_id: None,
+                    timestamp: crate::agent::now_ms(),
+                    sender: MessageSender::User,
+                    content: request.description.clone(),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    model_info: None,
+                    token_usage: None,
+                    context_breakdown: None,
+                    images: None,
+                }))
+                .map_err(|_| "backend-native child prompt channel closed".to_owned())?;
+        }
         let relay_request = RelaySpawnRequest {
             name: request.name.clone(),
             origin: AgentOrigin::BackendNative,
@@ -17112,7 +17128,7 @@ mod tests {
             emitter.on_subagent_spawned(
                 "019f60f0-7a69-73f0-9ab3-7ddc24062e30".to_owned(),
                 "/root/quick_child".to_owned(),
-                "/root/quick_child".to_owned(),
+                "reply exactly QUICK_DONE".to_owned(),
                 "sub-agent".to_owned(),
                 Some(child_session_id.clone()),
             ),
@@ -17120,6 +17136,64 @@ mod tests {
         .await
         .expect("early child relay must not wait for the five-second parent-session poll")
         .expect("early child relay must be created while later parent spawn work is blocked");
+
+        let child_handle = {
+            let state = fixture.host.state.lock().await;
+            state
+                .registry
+                .agent_handle(&child.agent_id)
+                .expect("registered native child relay")
+        };
+        let prompt_events = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let events = child_handle
+                    .read_output(None, 100)
+                    .await
+                    .expect("native child output");
+                let prompt_count = events
+                    .iter()
+                    .filter_map(|event| event.parse_payload::<ChatEvent>().ok())
+                    .filter(|event| {
+                        matches!(
+                            event,
+                            ChatEvent::MessageAdded(ChatMessage {
+                                sender: MessageSender::User,
+                                content,
+                                ..
+                            }) if content == "reply exactly QUICK_DONE"
+                        )
+                    })
+                    .count();
+                if prompt_count > 0 {
+                    break (events, prompt_count);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native child prompt must enter its relay history");
+        assert_eq!(prompt_events.1, 1, "the child prompt is recorded once");
+        let replayed_prompt_count = child_handle
+            .read_output(None, 100)
+            .await
+            .expect("replayed native child output")
+            .iter()
+            .filter_map(|event| event.parse_payload::<ChatEvent>().ok())
+            .filter(|event| {
+                matches!(
+                    event,
+                    ChatEvent::MessageAdded(ChatMessage {
+                        sender: MessageSender::User,
+                        content,
+                        ..
+                    }) if content == "reply exactly QUICK_DONE"
+                )
+            })
+            .count();
+        assert_eq!(
+            replayed_prompt_count, 1,
+            "replay must not duplicate the prompt"
+        );
 
         {
             let state = fixture.host.state.lock().await;

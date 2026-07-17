@@ -14,12 +14,13 @@ use tokio::task::JoinHandle;
 
 use protocol::types::StreamIdentityViolation;
 use protocol::{
-    BackendAccessMode, CapacityBucket, CapacityBucketId, CapacityCoverage, CapacityMeasure,
-    CapacityPlanLabel, CapacityReport, CapacityReset, CapacityScope, CapacitySource,
-    CapacityUnavailableReason, CapacityWindow, ChatMessageId, CodexLimitSlot, ModelRequestId,
-    ModelRequestTokenUsage, ModelTurnId, ServerGeneratedChatMessageIdOrigin,
-    ServerGeneratedChatMessageIdentity, TokenUsage, TokenUsageUnavailableReason,
-    ToolExecutionNormalizationFailure, ValueProvenance,
+    AgentControlAgentRef, AgentControlProgress, AgentControlProgressKind, BackendAccessMode,
+    CapacityBucket, CapacityBucketId, CapacityCoverage, CapacityMeasure, CapacityPlanLabel,
+    CapacityReport, CapacityReset, CapacityScope, CapacitySource, CapacityUnavailableReason,
+    CapacityWindow, ChatMessageId, CodexLimitSlot, ModelRequestId, ModelRequestTokenUsage,
+    ModelTurnId, ServerGeneratedChatMessageIdOrigin, ServerGeneratedChatMessageIdentity,
+    TokenUsage, TokenUsageUnavailableReason, ToolExecutionNormalizationFailure, ToolProgressData,
+    ToolProgressUpdate, ValueProvenance,
 };
 
 use crate::agent_control_mcp::AGENT_CONTROL_AWAIT_MCP_SERVER_NAME;
@@ -1159,6 +1160,7 @@ struct CodexTurnTokenUsage {
 
 struct CodexSubAgentStream {
     emitter: Arc<TurnEmitter>,
+    agent_id: protocol::AgentId,
     spawn_item_id: String,
     activity_item_id: Option<String>,
     agent_path: String,
@@ -1184,6 +1186,7 @@ struct CodexSubAgentStream {
 
 struct CompletedCodexSubAgentStream {
     emitter: Arc<TurnEmitter>,
+    agent_id: protocol::AgentId,
     spawn_item_id: String,
     activity_item_id: Option<String>,
     agent_path: String,
@@ -1194,6 +1197,7 @@ struct CompletedCodexSubAgentStream {
 fn completed_codex_subagent_stream(stream: CodexSubAgentStream) -> CompletedCodexSubAgentStream {
     CompletedCodexSubAgentStream {
         emitter: stream.emitter,
+        agent_id: stream.agent_id,
         spawn_item_id: stream.spawn_item_id,
         activity_item_id: stream.activity_item_id,
         agent_path: stream.agent_path,
@@ -4808,7 +4812,8 @@ impl CodexInner {
                     .await;
                 let container = emit_codex_tool_request(&self.emitter, &item_id, &tool_name, item);
                 self.record_tool_container(container).await;
-                self.emit_agent_control_await_progress_if_needed(&item_id, &tool_name, item);
+                self.emit_agent_control_await_progress_if_needed(&item_id, &tool_name, item)
+                    .await;
                 self.record_codex_subagent_spawn_metadata_if_needed(item)
                     .await;
             }
@@ -4826,7 +4831,8 @@ impl CodexInner {
                     .await;
                 let container = emit_codex_tool_request(&self.emitter, &item_id, &tool_name, item);
                 self.record_tool_container(container).await;
-                self.emit_agent_control_await_progress_if_needed(&item_id, &tool_name, item);
+                self.emit_agent_control_await_progress_if_needed(&item_id, &tool_name, item)
+                    .await;
             }
             _ => {}
         }
@@ -5549,6 +5555,7 @@ impl CodexInner {
                 return;
             }
         };
+        let child_agent_id = handle.agent_id.clone();
         let (raw_event_tx, raw_event_rx) = mpsc::unbounded_channel();
         spawn_codex_subagent_event_bridge(raw_event_rx, handle.event_tx);
         let emitter = Arc::new(TurnEmitter::new_for_agent(
@@ -5575,6 +5582,7 @@ impl CodexInner {
                     thread_id.clone(),
                     CodexSubAgentStream {
                         emitter,
+                        agent_id: child_agent_id,
                         spawn_item_id,
                         activity_item_id: activity.item_id.clone(),
                         agent_path: activity.agent_path.clone(),
@@ -5985,13 +5993,64 @@ impl CodexInner {
         self.mark_tool_completed(tool_call_id).await;
     }
 
-    fn emit_agent_control_await_progress_if_needed(
+    async fn emit_agent_control_await_progress_if_needed(
         &self,
         tool_call_id: &str,
         tool_name: &str,
         arguments: &Value,
     ) {
-        emit_agent_control_await_progress_to(&self.emitter, tool_call_id, tool_name, arguments);
+        if is_tyde_agent_control_await_tool_name(tool_name) {
+            emit_agent_control_await_progress_to(&self.emitter, tool_call_id, tool_name, arguments);
+            return;
+        }
+        if !is_codex_native_wait_tool(tool_name) {
+            return;
+        }
+
+        let thread_ids = codex_native_wait_thread_ids(arguments);
+        let agents = {
+            let state = self.state.lock().await;
+            thread_ids
+                .iter()
+                .filter_map(|thread_id| {
+                    state
+                        .subagent_streams
+                        .get(thread_id)
+                        .map(|stream| AgentControlAgentRef {
+                            agent_id: stream.agent_id.clone(),
+                            name: Some(stream.agent_path.clone()),
+                        })
+                        .or_else(|| {
+                            state
+                                .completed_subagent_streams
+                                .get(thread_id)
+                                .map(|stream| AgentControlAgentRef {
+                                    agent_id: stream.agent_id.clone(),
+                                    name: Some(stream.agent_path.clone()),
+                                })
+                        })
+                })
+                .collect::<Vec<_>>()
+        };
+        if agents.len() != thread_ids.len() {
+            tracing::warn!(
+                tool_call_id,
+                resolved = agents.len(),
+                requested = thread_ids.len(),
+                "Codex native wait referenced an unregistered child thread"
+            );
+        }
+        if agents.is_empty() {
+            return;
+        }
+        self.emitter.tool_progress(&ToolProgressData {
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: tool_name.to_owned(),
+            update: ToolProgressUpdate::AgentControl(AgentControlProgress {
+                progress_kind: AgentControlProgressKind::Await,
+                agents,
+            }),
+        });
     }
 
     fn emit_agent_control_spawn_progress_if_needed(
@@ -6223,6 +6282,54 @@ fn codex_item_success(item: &Value) -> bool {
         Some("failed" | "error" | "cancelled" | "canceled" | "interrupted" | "denied") => false,
         _ => true,
     }
+}
+
+fn is_codex_native_wait_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .map(|ch| ch.to_ascii_lowercase())
+            .collect::<String>()
+            .as_str(),
+        "wait" | "waitagent"
+    )
+}
+
+fn codex_native_wait_thread_ids(item: &Value) -> Vec<String> {
+    let mut thread_ids = Vec::new();
+    if let Some(thread_id) = item
+        .get("receiverThreadId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|thread_id| !thread_id.is_empty())
+    {
+        thread_ids.push(thread_id.to_owned());
+    }
+    thread_ids.extend(
+        item.get("receiverThreadIds")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|thread_id| !thread_id.is_empty())
+            .map(str::to_owned),
+    );
+    if thread_ids.is_empty() {
+        let mut state_ids = item
+            .get("agentsStates")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|states| states.keys().cloned())
+            .filter(|thread_id| !thread_id.trim().is_empty())
+            .collect::<Vec<_>>();
+        state_ids.sort();
+        thread_ids.extend(state_ids);
+    }
+    let mut seen = HashSet::new();
+    thread_ids.retain(|thread_id| seen.insert(thread_id.clone()));
+    thread_ids
 }
 
 fn parse_codex_subagent_collabs(item: &Value) -> Vec<CodexSubAgentSpawnInfo> {
@@ -10142,7 +10249,9 @@ for line in sys.stdin:
             send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"fresh-thread-id","item":{"id":"spawn-call","type":"collabAgentToolCall","tool":"spawn","senderThreadId":"fresh-thread-id","receiverThreadId":CHILD_THREAD_ID,"prompt":"inspect ownership","receiverAgentType":"worker","receiverAgentName":"Worker"}}})
             send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"fresh-thread-id","item":{"id":"activity-child","type":"subAgentActivity","kind":"started","agentThreadId":CHILD_THREAD_ID,"agentPath":"/root/worker"}}})
             send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"fresh-thread-id","item":{"id":"activity-child","type":"subAgentActivity","kind":"started","agentThreadId":CHILD_THREAD_ID,"agentPath":"/root/worker"}}})
+            send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"fresh-thread-id","item":{"id":"spawn-call","type":"collabAgentToolCall","tool":"spawn","senderThreadId":"fresh-thread-id","receiverThreadId":CHILD_THREAD_ID,"prompt":"inspect ownership","receiverAgentType":"worker","receiverAgentName":"Worker","status":"completed"}}})
             send({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"fresh-thread-id","item":{"id":"wait-call","type":"collabAgentToolCall","tool":"wait","senderThreadId":"fresh-thread-id","receiverThreadId":CHILD_THREAD_ID}}})
+            send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"fresh-thread-id","item":{"id":"spawn-call","type":"collabAgentToolCall","tool":"spawn","senderThreadId":"fresh-thread-id","receiverThreadId":CHILD_THREAD_ID,"prompt":"inspect ownership","receiverAgentType":"worker","receiverAgentName":"Worker","status":"completed"}}})
             send({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":CHILD_THREAD_ID,"turn":{"id":"turn-child"}}})
             send({"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":CHILD_THREAD_ID,"itemId":"message-child","delta":"child-only"}})
             send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":CHILD_THREAD_ID,"item":{"id":"message-child","type":"agentMessage","text":"child-only"}}})
@@ -12007,6 +12116,7 @@ for line in sys.stdin:
                     subagent_tx,
                     AgentName(CODEX_AGENT_NAME),
                 )),
+                agent_id: protocol::AgentId(format!("agent-{receiver_thread_id}")),
                 spawn_item_id: receiver_thread_id.to_string(),
                 activity_item_id: None,
                 agent_path: receiver_thread_id.to_string(),
@@ -12418,7 +12528,9 @@ for line in sys.stdin:
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut parent_events = Vec::new();
         let mut saw_wait_request = false;
+        let mut saw_wait_progress = false;
         let mut saw_wait_completion = false;
+        let mut spawn_completion_count = 0;
         let mut saw_parent_terminal = false;
         while tokio::time::Instant::now() < deadline && !saw_parent_terminal {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -12428,6 +12540,19 @@ for line in sys.stdin:
                         &event,
                         ChatEvent::ToolRequest(request) if request.tool_call_id == "wait-call"
                     );
+                    saw_wait_progress |= matches!(
+                        &event,
+                        ChatEvent::ToolProgress(ToolProgressData {
+                            tool_call_id,
+                            update: ToolProgressUpdate::AgentControl(AgentControlProgress {
+                                progress_kind: AgentControlProgressKind::Await,
+                                agents,
+                            }),
+                            ..
+                        }) if tool_call_id == "wait-call"
+                            && agents.len() == 1
+                            && agents[0].agent_id == AgentId("subagent-1".to_owned())
+                    );
                     saw_wait_completion |= matches!(
                         &event,
                         ChatEvent::ToolExecutionCompleted(completion)
@@ -12435,6 +12560,13 @@ for line in sys.stdin:
                                 && completion.success
                                 && completion.error.is_none()
                     );
+                    if matches!(
+                        &event,
+                        ChatEvent::ToolExecutionCompleted(completion)
+                            if completion.tool_call_id == "spawn-call"
+                    ) {
+                        spawn_completion_count += 1;
+                    }
                     saw_parent_terminal |= matches!(&event, ChatEvent::TypingStatusChanged(false));
                     parent_events.push(event);
                 }
@@ -12460,8 +12592,16 @@ for line in sys.stdin:
             "fixture must exercise the parent's pending wait card"
         );
         assert!(
+            saw_wait_progress,
+            "native wait must identify the Tyde child behind Codex's thread id"
+        );
+        assert!(
             saw_wait_completion,
             "wait must complete with Codex's result, not cancellation"
+        );
+        assert_eq!(
+            spawn_completion_count, 1,
+            "replayed terminal spawn completion must remain idempotent"
         );
         assert!(
             saw_parent_terminal,
@@ -18689,6 +18829,69 @@ Do not describe the tool, and do not skip the tool call."#;
         assert_eq!(parsed.kind, "started");
         assert_eq!(parsed.agent_thread_id, "thread-child");
         assert_eq!(parsed.agent_path, "/root/reviewer");
+    }
+
+    #[test]
+    fn native_wait_thread_ids_cover_live_and_completed_shapes() {
+        assert_eq!(
+            codex_native_wait_thread_ids(&json!({
+                "receiverThreadId": "child-a",
+                "receiverThreadIds": ["child-a", "child-b", ""]
+            })),
+            vec!["child-a", "child-b"]
+        );
+        assert_eq!(
+            codex_native_wait_thread_ids(&json!({
+                "agentsStates": {
+                    "child-b": {"status": "completed"},
+                    "child-a": {"status": "completed"}
+                }
+            })),
+            vec!["child-a", "child-b"]
+        );
+    }
+
+    #[test]
+    fn native_wait_progress_maps_all_codex_threads_to_tyde_agents() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (inner, mut parent_rx) = test_codex_inner();
+            let (child_a_tx, _child_a_rx) = mpsc::unbounded_channel();
+            let (child_b_tx, _child_b_rx) = mpsc::unbounded_channel();
+            attach_test_codex_subagent(&inner, child_a_tx, "child-a").await;
+            attach_test_codex_subagent(&inner, child_b_tx, "child-b").await;
+
+            inner
+                .emit_agent_control_await_progress_if_needed(
+                    "native-wait",
+                    "wait",
+                    &json!({"receiverThreadIds": ["child-a", "child-b"]}),
+                )
+                .await;
+
+            let events = drain_events(&mut parent_rx);
+            assert_eq!(events.len(), 1);
+            let event: ChatEvent =
+                serde_json::from_value(events.into_iter().next().expect("wait progress"))
+                    .expect("typed wait progress");
+            assert!(matches!(
+                event,
+                ChatEvent::ToolProgress(ToolProgressData {
+                    tool_call_id,
+                    update: ToolProgressUpdate::AgentControl(AgentControlProgress {
+                        progress_kind: AgentControlProgressKind::Await,
+                        agents,
+                    }),
+                    ..
+                }) if tool_call_id == "native-wait"
+                    && agents.iter().map(|agent| agent.agent_id.0.as_str()).collect::<Vec<_>>()
+                        == vec!["agent-child-a", "agent-child-b"]
+            ));
+            inner.rpc.shutdown().await;
+        });
     }
 
     #[test]
