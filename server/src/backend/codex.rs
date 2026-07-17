@@ -151,6 +151,79 @@ mod capacity_mapping_tests {
     }
 
     #[test]
+    fn sparse_subscription_notification_maps_only_reported_buckets() {
+        let report = map_passive_rate_limits_updated(&json!({
+            "rateLimits": {
+                "credits": {"balance": "0", "hasCredits": false, "unlimited": false},
+                "individualLimit": null,
+                "limitId": "codex",
+                "limitName": null,
+                "planType": "pro",
+                "primary": {
+                    "resetsAt": 1_784_780_142,
+                    "usedPercent": 20,
+                    "windowDurationMins": 10_080
+                },
+                "rateLimitReachedType": null,
+                "secondary": null
+            }
+        }))
+        .expect("current sparse Codex subscription notification");
+
+        assert_eq!(
+            report.coverage,
+            protocol::CapacityCoverage::RepresentativeBucketOnly
+        );
+        assert_eq!(report.buckets.len(), 2);
+        assert_eq!(report.buckets[0].label, "primary limit");
+        assert_eq!(
+            report.buckets[0].scope,
+            protocol::CapacityScope::NotReported
+        );
+        assert!(matches!(
+            report.buckets[0].measure,
+            protocol::CapacityMeasure::UsedPercent {
+                used_percent: 20,
+                remaining_percent: 80,
+                ..
+            }
+        ));
+        assert!(matches!(
+            report.buckets[1].measure,
+            protocol::CapacityMeasure::Credits {
+                has_credits: false,
+                unlimited: false,
+                balance: Some(ref balance),
+            } if balance == "0"
+        ));
+    }
+
+    #[test]
+    fn account_mode_distinguishes_chatgpt_from_api_usage() {
+        assert_eq!(
+            codex_capacity_account_mode(&json!({
+                "account": {"type": "chatgpt", "planType": "pro"},
+                "requiresOpenaiAuth": true
+            })),
+            CodexCapacityAccountMode::ChatGpt
+        );
+        assert_eq!(
+            codex_capacity_account_mode(&json!({
+                "account": {"type": "apiKey"},
+                "requiresOpenaiAuth": true
+            })),
+            CodexCapacityAccountMode::Unsupported
+        );
+        assert_eq!(
+            codex_capacity_account_mode(&json!({
+                "account": {"type": "amazonBedrock", "usesCodexManagedCredentials": false},
+                "requiresOpenaiAuth": false
+            })),
+            CodexCapacityAccountMode::Unsupported
+        );
+    }
+
+    #[test]
     fn incomplete_or_out_of_range_passive_notification_never_claims_full_coverage() {
         assert_eq!(
             map_passive_rate_limits_updated(&json!({"rateLimits": {}})),
@@ -558,6 +631,7 @@ impl CodexSession {
             AgentName(CODEX_AGENT_NAME),
         ));
 
+        let initial_capacity_emitter = subagent_emitter.clone();
         let inner = Arc::new(CodexInner {
             rpc,
             emitter,
@@ -593,6 +667,7 @@ impl CodexSession {
                 pending_user_input_bytes: 0,
                 conversation_bytes_total: 0,
                 subagent_emitter,
+                capacity_refresh_in_flight: false,
                 pending_subagent_spawns: HashMap::new(),
                 conflicting_subagent_threads: HashMap::new(),
                 registering_subagent_threads: HashSet::new(),
@@ -610,6 +685,10 @@ impl CodexSession {
                 forward_inner.handle_inbound(msg).await;
             }
         });
+
+        if let Some(emitter) = initial_capacity_emitter {
+            inner.spawn_capacity_refresh(emitter);
+        }
 
         Ok((Self { inner, session_id }, event_rx))
     }
@@ -669,7 +748,9 @@ impl CodexSession {
         emitter: Arc<dyn SubAgentEmitter>,
     ) -> Result<(), String> {
         let mut state = self.inner.state.lock().await;
-        state.subagent_emitter = Some(emitter);
+        state.subagent_emitter = Some(emitter.clone());
+        drop(state);
+        self.inner.spawn_capacity_refresh(emitter);
         Ok(())
     }
 
@@ -704,26 +785,19 @@ pub(crate) fn map_passive_rate_limits_updated(
     params: &Value,
 ) -> Result<CapacityReport, CapacityUnavailableReason> {
     let snapshot = params.get("rateLimits").unwrap_or(params);
-    const REQUIRED: [&str; 8] = [
-        "limitId",
-        "limitName",
-        "primary",
-        "secondary",
-        "credits",
-        "individualLimit",
-        "planType",
-        "rateLimitReachedType",
-    ];
-    if !snapshot.is_object() || REQUIRED.iter().any(|field| snapshot.get(field).is_none()) {
+    if !snapshot.is_object() {
         return Err(CapacityUnavailableReason::MalformedReport);
     }
-    if snapshot.get("limitId").and_then(Value::as_str).is_none()
-        || !matches!(snapshot.get("individualLimit"), Some(Value::Bool(_)))
+    if let Some(limit_id) = snapshot.get("limitId")
+        && !matches!(limit_id, Value::Null)
+        && !limit_id.as_str().is_some_and(|value| {
+            !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+        })
     {
         return Err(CapacityUnavailableReason::MalformedReport);
     }
     let reached_scope = match snapshot.get("rateLimitReachedType") {
-        Some(Value::Null) => CapacityScope::NotReported,
+        None | Some(Value::Null) => CapacityScope::NotReported,
         Some(Value::String(value))
             if value.len() <= 128 && !value.chars().any(char::is_control) =>
         {
@@ -737,21 +811,34 @@ pub(crate) fn map_passive_rate_limits_updated(
         }
         _ => return Err(CapacityUnavailableReason::MalformedReport),
     };
-    let limit_name = snapshot
-        .get("limitName")
-        .and_then(Value::as_str)
-        .filter(|value| {
-            !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
-        })
-        .ok_or(CapacityUnavailableReason::MalformedReport)?;
+    let limit_name = match snapshot.get("limitName") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value))
+            if !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control) =>
+        {
+            Some(value.as_str())
+        }
+        _ => return Err(CapacityUnavailableReason::MalformedReport),
+    };
+    let window_scope = match snapshot.get("individualLimit") {
+        None | Some(Value::Null) => CapacityScope::NotReported,
+        Some(Value::Bool(true)) => CapacityScope::Individual,
+        Some(Value::Bool(false)) => CapacityScope::Account,
+        _ => return Err(CapacityUnavailableReason::MalformedReport),
+    };
     let mut buckets = Vec::new();
     for (field, slot, label) in [
         ("primary", CodexLimitSlot::Primary, "primary limit"),
         ("secondary", CodexLimitSlot::Secondary, "secondary limit"),
     ] {
-        let window = snapshot
-            .get(field)
-            .and_then(Value::as_object)
+        let Some(window_value) = snapshot.get(field) else {
+            continue;
+        };
+        if window_value.is_null() {
+            continue;
+        }
+        let window = window_value
+            .as_object()
             .ok_or(CapacityUnavailableReason::MalformedReport)?;
         let used = window
             .get("usedPercent")
@@ -773,7 +860,7 @@ pub(crate) fn map_passive_rate_limits_updated(
         };
         buckets.push(CapacityBucket {
             id: CapacityBucketId::Codex { slot },
-            label: format!("{limit_name} {label}"),
+            label: limit_name.map_or_else(|| label.to_string(), |name| format!("{name} {label}")),
             measure: CapacityMeasure::UsedPercent {
                 used_percent: used,
                 remaining_percent: 100 - used,
@@ -781,65 +868,71 @@ pub(crate) fn map_passive_rate_limits_updated(
                     vendor_reported: true,
                 },
             },
-            scope: if snapshot.get("individualLimit").and_then(Value::as_bool) == Some(true) {
-                CapacityScope::Individual
-            } else {
-                CapacityScope::Account
-            },
+            scope: window_scope.clone(),
             window: CapacityWindow::Rolling { duration_minutes },
             reset,
             status: None,
         });
     }
-    let credits = snapshot
-        .get("credits")
-        .and_then(Value::as_object)
-        .ok_or(CapacityUnavailableReason::MalformedReport)?;
-    let has_credits = credits
-        .get("hasCredits")
-        .and_then(Value::as_bool)
-        .ok_or(CapacityUnavailableReason::MalformedReport)?;
-    let unlimited = credits
-        .get("unlimited")
-        .and_then(Value::as_bool)
-        .ok_or(CapacityUnavailableReason::MalformedReport)?;
-    let balance = match credits.get("balance") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(value))
-            if !value.is_empty() && value.len() <= 64 && !value.chars().any(char::is_control) =>
-        {
-            Some(value.clone())
-        }
-        Some(Value::Number(value)) => {
-            let value = value.to_string();
-            Some(
-                (value.len() <= 64)
-                    .then_some(value)
-                    .ok_or(CapacityUnavailableReason::MalformedReport)?,
-            )
-        }
-        Some(_) => return Err(CapacityUnavailableReason::MalformedReport),
-    };
-    buckets.push(CapacityBucket {
-        id: CapacityBucketId::Codex {
-            slot: CodexLimitSlot::Credits,
-        },
-        label: "credits".to_string(),
-        measure: CapacityMeasure::Credits {
-            has_credits,
-            unlimited,
-            balance,
-        },
-        scope: reached_scope,
-        window: CapacityWindow::NotReported,
-        reset: CapacityReset::NotReported,
-        status: None,
-    });
+    if let Some(credits_value) = snapshot.get("credits")
+        && !credits_value.is_null()
+    {
+        let credits = credits_value
+            .as_object()
+            .ok_or(CapacityUnavailableReason::MalformedReport)?;
+        let has_credits = credits
+            .get("hasCredits")
+            .and_then(Value::as_bool)
+            .ok_or(CapacityUnavailableReason::MalformedReport)?;
+        let unlimited = credits
+            .get("unlimited")
+            .and_then(Value::as_bool)
+            .ok_or(CapacityUnavailableReason::MalformedReport)?;
+        let balance = match credits.get("balance") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value))
+                if !value.is_empty()
+                    && value.len() <= 64
+                    && !value.chars().any(char::is_control) =>
+            {
+                Some(value.clone())
+            }
+            Some(Value::Number(value)) => {
+                let value = value.to_string();
+                Some(
+                    (value.len() <= 64)
+                        .then_some(value)
+                        .ok_or(CapacityUnavailableReason::MalformedReport)?,
+                )
+            }
+            Some(_) => return Err(CapacityUnavailableReason::MalformedReport),
+        };
+        buckets.push(CapacityBucket {
+            id: CapacityBucketId::Codex {
+                slot: CodexLimitSlot::Credits,
+            },
+            label: "credits".to_string(),
+            measure: CapacityMeasure::Credits {
+                has_credits,
+                unlimited,
+                balance,
+            },
+            scope: reached_scope,
+            window: CapacityWindow::NotReported,
+            reset: CapacityReset::NotReported,
+            status: None,
+        });
+    }
+    if buckets.is_empty() {
+        return Err(CapacityUnavailableReason::MalformedReport);
+    }
+    let complete_windows = snapshot.get("primary").is_some_and(Value::is_object)
+        && snapshot.get("secondary").is_some_and(Value::is_object);
     Ok(CapacityReport {
         source: CapacitySource::CodexAccountRateLimitsUpdated,
         observed_at_ms: None,
         plan: match snapshot.get("planType") {
-            Some(Value::Null) => None,
+            None | Some(Value::Null) => None,
             Some(Value::String(label))
                 if !label.is_empty()
                     && label.len() <= 128
@@ -852,7 +945,11 @@ pub(crate) fn map_passive_rate_limits_updated(
             _ => return Err(CapacityUnavailableReason::MalformedReport),
         },
         buckets,
-        coverage: CapacityCoverage::AllVendorBuckets,
+        coverage: if complete_windows {
+            CapacityCoverage::AllVendorBuckets
+        } else {
+            CapacityCoverage::RepresentativeBucketOnly
+        },
     })
 }
 
@@ -864,6 +961,26 @@ pub(crate) fn forward_passive_rate_limits_updated(params: &Value, emitter: &dyn 
         Err(reason) => protocol::BackendCapacityState::Unavailable { reason },
     };
     emitter.on_backend_capacity(protocol::BackendKind::Codex, state);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexCapacityAccountMode {
+    ChatGpt,
+    Unsupported,
+    Unauthenticated,
+}
+
+fn codex_capacity_account_mode(account_response: &Value) -> CodexCapacityAccountMode {
+    match account_response
+        .get("account")
+        .and_then(Value::as_object)
+        .and_then(|account| account.get("type"))
+        .and_then(Value::as_str)
+    {
+        Some("chatgpt" | "personalAccessToken") => CodexCapacityAccountMode::ChatGpt,
+        Some(_) => CodexCapacityAccountMode::Unsupported,
+        None => CodexCapacityAccountMode::Unauthenticated,
+    }
 }
 
 pub(crate) async fn probe_session_settings_schema(
@@ -1259,6 +1376,7 @@ struct CodexState {
     pending_user_input_bytes: u64,
     conversation_bytes_total: u64,
     subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
+    capacity_refresh_in_flight: bool,
     pending_subagent_spawns: HashMap<String, CodexSubAgentSpawnInfo>,
     conflicting_subagent_threads: HashMap<String, String>,
     registering_subagent_threads: HashSet<String>,
@@ -1275,6 +1393,63 @@ struct CodexInner {
 }
 
 impl CodexInner {
+    fn spawn_capacity_refresh(self: &Arc<Self>, emitter: Arc<dyn SubAgentEmitter>) {
+        let inner = Arc::clone(self);
+        tokio::spawn(async move {
+            {
+                let mut state = inner.state.lock().await;
+                if state.capacity_refresh_in_flight {
+                    return;
+                }
+                state.capacity_refresh_in_flight = true;
+            }
+            let capacity = inner.read_backend_capacity().await;
+            inner.state.lock().await.capacity_refresh_in_flight = false;
+            emitter.on_backend_capacity(protocol::BackendKind::Codex, capacity);
+        });
+    }
+
+    async fn read_backend_capacity(&self) -> protocol::BackendCapacityState {
+        let account = match self
+            .rpc
+            .request("account/read", json!({ "refreshToken": false }))
+            .await
+        {
+            Ok(account) => account,
+            Err(_) => {
+                return protocol::BackendCapacityState::Unavailable {
+                    reason: protocol::CapacityUnavailableReason::SourceUnreachable,
+                };
+            }
+        };
+        match codex_capacity_account_mode(&account) {
+            CodexCapacityAccountMode::ChatGpt => {}
+            CodexCapacityAccountMode::Unsupported => {
+                return protocol::BackendCapacityState::Unsupported {
+                    reason: protocol::CapacityUnsupportedReason::AccountTypeNotReported,
+                };
+            }
+            CodexCapacityAccountMode::Unauthenticated => {
+                return protocol::BackendCapacityState::AuthError {
+                    detail: protocol::CapacityErrorDetail {
+                        summary: "Codex account information is unavailable".to_string(),
+                        code: protocol::CapacityErrorCode::NotAuthenticated,
+                    },
+                };
+            }
+        }
+
+        match self.rpc.request("account/rateLimits/read", json!({})).await {
+            Ok(snapshot) => match map_passive_rate_limits_updated(&snapshot) {
+                Ok(report) => protocol::BackendCapacityState::Known { report },
+                Err(reason) => protocol::BackendCapacityState::Unavailable { reason },
+            },
+            Err(_) => protocol::BackendCapacityState::Unavailable {
+                reason: protocol::CapacityUnavailableReason::SourceUnreachable,
+            },
+        }
+    }
+
     async fn apply_local_settings(&self, settings: &Value) {
         let Some(obj) = settings.as_object() else {
             return;
@@ -2233,7 +2408,8 @@ impl CodexInner {
             "account/rateLimits/updated" => {
                 let emitter = self.state.lock().await.subagent_emitter.clone();
                 if let Some(emitter) = emitter {
-                    forward_passive_rate_limits_updated(params, emitter.as_ref());
+                    let capacity = self.read_backend_capacity().await;
+                    emitter.on_backend_capacity(protocol::BackendKind::Codex, capacity);
                 }
             }
             "turn/started" => {
@@ -12030,6 +12206,7 @@ for line in sys.stdin:
             pending_user_input_bytes: 0,
             conversation_bytes_total: 0,
             subagent_emitter: None,
+            capacity_refresh_in_flight: false,
             pending_subagent_spawns: HashMap::new(),
             conflicting_subagent_threads: HashMap::new(),
             registering_subagent_threads: HashSet::new(),
