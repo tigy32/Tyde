@@ -31,10 +31,17 @@ use protocol::{
 pub fn resume_session(
     state: &AppState,
     host_id: String,
+    backend_kind: BackendKind,
     session_id: SessionId,
     project_id: Option<ProjectId>,
 ) {
-    if open_existing_session_agent(state, &host_id, &session_id, project_id.clone()) {
+    if open_existing_session_agent(
+        state,
+        &host_id,
+        backend_kind,
+        &session_id,
+        project_id.clone(),
+    ) {
         return;
     }
 
@@ -69,6 +76,7 @@ pub fn resume_session(
 fn open_existing_session_agent(
     state: &AppState,
     host_id: &str,
+    backend_kind: BackendKind,
     session_id: &SessionId,
     project_id: Option<ProjectId>,
 ) -> bool {
@@ -77,7 +85,7 @@ fn open_existing_session_agent(
             .iter()
             .find(|agent| {
                 agent.host_id == host_id
-                    && agent.backend_kind == BackendKind::Antigravity
+                    && agent.backend_kind == backend_kind
                     && agent.session_id.as_ref() == Some(session_id)
             })
             .cloned()
@@ -1508,15 +1516,15 @@ mod wasm_tests {
         let owner = leptos::reactive::owner::Owner::new();
         owner.with(|| {
             let state = AppState::new();
-            let session_id = SessionId("antigravity-session".to_owned());
-            let agent_id = AgentId("antigravity-agent".to_owned());
+            let session_id = SessionId("codex-session".to_owned());
+            let agent_id = AgentId("codex-agent".to_owned());
             state.agents.update(|agents| {
                 agents.push(crate::state::AgentInfo {
                     host_id: "host-a".to_owned(),
-                    agent_id: agent_id.clone(),
-                    name: "Antigravity chat".to_owned(),
+                    agent_id: AgentId("claude-agent".to_owned()),
+                    name: "Claude collision".to_owned(),
                     origin: protocol::AgentOrigin::User,
-                    backend_kind: BackendKind::Antigravity,
+                    backend_kind: BackendKind::Claude,
                     workspace_roots: vec!["/repo".to_owned()],
                     project_id: Some(ProjectId("project-a".to_owned())),
                     parent_agent_id: None,
@@ -1524,7 +1532,25 @@ mod wasm_tests {
                     custom_agent_id: None,
                     workflow: None,
                     created_at_ms: 0,
-                    instance_stream: StreamPath("/agent/antigravity-agent".to_owned()),
+                    instance_stream: StreamPath("/agent/claude-agent".to_owned()),
+                    started: true,
+                    fatal_error: None,
+                    activity_summary: Default::default(),
+                });
+                agents.push(crate::state::AgentInfo {
+                    host_id: "host-a".to_owned(),
+                    agent_id: agent_id.clone(),
+                    name: "Codex chat".to_owned(),
+                    origin: protocol::AgentOrigin::User,
+                    backend_kind: BackendKind::Codex,
+                    workspace_roots: vec!["/repo".to_owned()],
+                    project_id: Some(ProjectId("project-a".to_owned())),
+                    parent_agent_id: None,
+                    session_id: Some(session_id.clone()),
+                    custom_agent_id: None,
+                    workflow: None,
+                    created_at_ms: 0,
+                    instance_stream: StreamPath("/agent/codex-agent".to_owned()),
                     started: true,
                     fatal_error: None,
                     activity_summary: Default::default(),
@@ -1534,6 +1560,7 @@ mod wasm_tests {
             resume_session(
                 &state,
                 "host-a".to_owned(),
+                BackendKind::Codex,
                 session_id,
                 Some(ProjectId("project-a".to_owned())),
             );

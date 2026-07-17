@@ -305,6 +305,7 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
         resume_session(
             &resume_state,
             resume_host.clone(),
+            backend,
             resume_sid.clone(),
             resume_project_id.clone(),
         );
