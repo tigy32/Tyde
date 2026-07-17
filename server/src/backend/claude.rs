@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use chrono::DateTime;
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -283,6 +284,10 @@ impl ClaudeSession {
                 active_turn: None,
                 restart_process_after_turn: false,
                 subagent_emitter: None,
+                capacity_access: ClaudeCapacityAccess::Unknown,
+                capacity_refresh_in_flight: false,
+                capacity_report_emitted: false,
+                authoritative_capacity_emitted: false,
             }),
             runtime: Mutex::new(None),
             turn_event_gate: Mutex::new(()),
@@ -405,6 +410,19 @@ struct ClaudeState {
     active_turn: Option<ActiveTurn>,
     restart_process_after_turn: bool,
     subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
+    capacity_access: ClaudeCapacityAccess,
+    capacity_refresh_in_flight: bool,
+    capacity_report_emitted: bool,
+    authoritative_capacity_emitted: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ClaudeCapacityAccess {
+    #[default]
+    Unknown,
+    Subscription,
+    ApiKey,
+    ExternalProvider,
 }
 
 impl Default for ClaudeState {
@@ -429,6 +447,10 @@ impl Default for ClaudeState {
             active_turn: None,
             restart_process_after_turn: false,
             subagent_emitter: None,
+            capacity_access: ClaudeCapacityAccess::Unknown,
+            capacity_refresh_in_flight: false,
+            capacity_report_emitted: false,
+            authoritative_capacity_emitted: false,
         }
     }
 }
@@ -1831,7 +1853,11 @@ impl ClaudeInner {
         )
         .await
         {
-            Ok(Ok(_)) => Ok(()),
+            Ok(Ok(response)) => {
+                self.configure_capacity_from_initialize(&response).await;
+                self.schedule_capacity_refresh().await;
+                Ok(())
+            }
             Ok(Err(err)) => {
                 self.shutdown_process().await;
                 Err(err)
@@ -1841,6 +1867,89 @@ impl ClaudeInner {
                 Err("Timed out initializing Claude CLI control protocol".to_string())
             }
         }
+    }
+
+    async fn configure_capacity_from_initialize(&self, response: &Value) {
+        let access = claude_capacity_access_from_initialize(response);
+        let emitter = {
+            let mut state = self.state.lock().await;
+            state.capacity_access = access;
+            state.subagent_emitter.clone()
+        };
+        let Some(emitter) = emitter else {
+            return;
+        };
+        let capacity = match access {
+            ClaudeCapacityAccess::ApiKey => Some(protocol::BackendCapacityState::Unsupported {
+                reason: protocol::CapacityUnsupportedReason::AccountTypeNotReported,
+            }),
+            ClaudeCapacityAccess::ExternalProvider => {
+                Some(protocol::BackendCapacityState::Unsupported {
+                    reason: protocol::CapacityUnsupportedReason::ExternalProvider,
+                })
+            }
+            ClaudeCapacityAccess::Unknown | ClaudeCapacityAccess::Subscription => None,
+        };
+        if let Some(capacity) = capacity {
+            emitter.on_backend_capacity(protocol::BackendKind::Claude, capacity);
+        }
+    }
+
+    async fn schedule_capacity_refresh(self: &Arc<Self>) {
+        let should_refresh = {
+            let mut state = self.state.lock().await;
+            if state.capacity_access != ClaudeCapacityAccess::Subscription
+                || state.capacity_refresh_in_flight
+            {
+                false
+            } else {
+                state.capacity_refresh_in_flight = true;
+                true
+            }
+        };
+        if !should_refresh {
+            return;
+        }
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let result = this.send_control_request("get_usage").await;
+            let capacity = match result {
+                Ok(response) => map_claude_control_usage(&response),
+                Err(_) => Err(CapacityUnavailableReason::SourceUnreachable),
+            };
+            let (emitter, should_emit) = {
+                let mut state = this.state.lock().await;
+                state.capacity_refresh_in_flight = false;
+                let should_emit = capacity.is_ok() || !state.capacity_report_emitted;
+                if capacity.is_ok() {
+                    state.authoritative_capacity_emitted = true;
+                    state.capacity_report_emitted = true;
+                }
+                (state.subagent_emitter.clone(), should_emit)
+            };
+            if should_emit && let Some(emitter) = emitter {
+                let capacity = match capacity {
+                    Ok(report) => protocol::BackendCapacityState::Known { report },
+                    Err(reason) => protocol::BackendCapacityState::Unavailable { reason },
+                };
+                emitter.on_backend_capacity(protocol::BackendKind::Claude, capacity);
+            }
+        });
+    }
+
+    async fn handle_passive_capacity(self: &Arc<Self>, frame: &Value) {
+        let (emitter, should_forward) = {
+            let mut state = self.state.lock().await;
+            let should_forward = !state.authoritative_capacity_emitted;
+            if should_forward {
+                state.capacity_report_emitted = true;
+            }
+            (state.subagent_emitter.clone(), should_forward)
+        };
+        if should_forward && let Some(emitter) = emitter {
+            forward_passive_rate_limit_event(frame, emitter.as_ref());
+        }
+        self.schedule_capacity_refresh().await;
     }
 
     async fn spawn_process(
@@ -3103,9 +3212,7 @@ async fn read_claude_stdout_persistent(
         };
 
         if value.get("type").and_then(Value::as_str) == Some("rate_limit_event") {
-            if let Some(emitter) = subagent_emitter.as_ref() {
-                forward_passive_rate_limit_event(&value, emitter.as_ref());
-            }
+            inner.handle_passive_capacity(&value).await;
             continue;
         }
 
@@ -8647,6 +8754,152 @@ async fn forward_claude_backend_event(
     true
 }
 
+fn claude_capacity_access_from_initialize(response: &Value) -> ClaudeCapacityAccess {
+    let Some(account) = response.get("account").filter(|value| value.is_object()) else {
+        return ClaudeCapacityAccess::Unknown;
+    };
+    match account.get("apiProvider").and_then(Value::as_str) {
+        Some("firstParty") => {
+            if account
+                .get("subscriptionType")
+                .and_then(Value::as_str)
+                .and_then(normalize_nonempty)
+                .is_some()
+            {
+                ClaudeCapacityAccess::Subscription
+            } else {
+                ClaudeCapacityAccess::ApiKey
+            }
+        }
+        Some(_) => ClaudeCapacityAccess::ExternalProvider,
+        None => ClaudeCapacityAccess::Unknown,
+    }
+}
+
+fn parse_claude_usage_reset(
+    value: Option<&Value>,
+) -> Result<CapacityReset, CapacityUnavailableReason> {
+    let Some(value) = value else {
+        return Ok(CapacityReset::NotReported);
+    };
+    if value.is_null() {
+        return Ok(CapacityReset::NotReported);
+    }
+    let timestamp = value
+        .as_str()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .and_then(|value| u64::try_from(value.timestamp_millis()).ok())
+        .ok_or(CapacityUnavailableReason::MalformedReport)?;
+    Ok(CapacityReset::At { at_ms: timestamp })
+}
+
+pub(crate) fn map_claude_control_usage(
+    response: &Value,
+) -> Result<CapacityReport, CapacityUnavailableReason> {
+    if response
+        .get("rate_limits_available")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Err(CapacityUnavailableReason::MalformedReport);
+    }
+    let rate_limits = response
+        .get("rate_limits")
+        .filter(|value| value.is_object())
+        .ok_or(CapacityUnavailableReason::MalformedReport)?;
+    let limits = rate_limits
+        .get("limits")
+        .and_then(Value::as_array)
+        .ok_or(CapacityUnavailableReason::MalformedReport)?;
+    let mut buckets = Vec::with_capacity(limits.len());
+    for limit in limits {
+        let kind = limit
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or(CapacityUnavailableReason::MalformedReport)?;
+        let percent = limit
+            .get("percent")
+            .and_then(Value::as_f64)
+            .filter(|value| (0.0..=100.0).contains(value))
+            .ok_or(CapacityUnavailableReason::MalformedReport)?;
+        let used_percent = percent.round() as u8;
+        let (id, label, window) = match kind {
+            "session" => (
+                CapacityBucketId::Claude {
+                    limit: ClaudeLimitType::FiveHour,
+                },
+                "session limit".to_string(),
+                CapacityWindow::Rolling {
+                    duration_minutes: 5 * 60,
+                },
+            ),
+            "weekly_all" => (
+                CapacityBucketId::Claude {
+                    limit: ClaudeLimitType::SevenDay,
+                },
+                "weekly limit".to_string(),
+                CapacityWindow::Rolling {
+                    duration_minutes: 7 * 24 * 60,
+                },
+            ),
+            "weekly_scoped" => {
+                let model = limit
+                    .pointer("/scope/model/display_name")
+                    .and_then(Value::as_str)
+                    .and_then(normalize_nonempty)
+                    .ok_or(CapacityUnavailableReason::MalformedReport)?;
+                (
+                    CapacityBucketId::ClaudeModel {
+                        name: model.clone(),
+                    },
+                    format!("{model} limit"),
+                    CapacityWindow::Rolling {
+                        duration_minutes: 7 * 24 * 60,
+                    },
+                )
+            }
+            "overage" | "extra_usage" => (
+                CapacityBucketId::Claude {
+                    limit: ClaudeLimitType::Overage,
+                },
+                "usage credits".to_string(),
+                CapacityWindow::NotReported,
+            ),
+            _ => return Err(CapacityUnavailableReason::MalformedReport),
+        };
+        buckets.push(CapacityBucket {
+            id,
+            label,
+            measure: CapacityMeasure::UsedPercent {
+                used_percent,
+                remaining_percent: 100 - used_percent,
+                provenance: ValueProvenance {
+                    vendor_reported: true,
+                },
+            },
+            scope: CapacityScope::Account,
+            window,
+            reset: parse_claude_usage_reset(limit.get("resets_at"))?,
+            status: None,
+        });
+    }
+    if buckets.is_empty() {
+        return Err(CapacityUnavailableReason::MalformedReport);
+    }
+    let plan = response
+        .get("subscription_type")
+        .and_then(Value::as_str)
+        .and_then(normalize_nonempty)
+        .map(|label| protocol::CapacityPlanLabel { label });
+    Ok(CapacityReport {
+        source: CapacitySource::ClaudeControlUsage,
+        observed_at_ms: None,
+        plan,
+        buckets,
+        coverage: CapacityCoverage::AllVendorBuckets,
+    })
+}
+
 /// Maps Claude's already-received stream-json frame. The frame contains one
 /// vendor-selected binding bucket, never an inferred account-wide aggregate.
 pub(crate) fn map_passive_rate_limit_event(
@@ -8758,6 +9011,79 @@ pub(crate) fn forward_passive_rate_limit_event(
 #[cfg(test)]
 mod capacity_mapping_tests {
     use super::*;
+
+    #[test]
+    fn initialize_account_distinguishes_subscription_api_key_and_external_provider() {
+        assert_eq!(
+            claude_capacity_access_from_initialize(&json!({"account": {
+                "apiProvider": "firstParty", "subscriptionType": "Claude Max"
+            }})),
+            ClaudeCapacityAccess::Subscription
+        );
+        assert_eq!(
+            claude_capacity_access_from_initialize(&json!({"account": {
+                "apiProvider": "firstParty", "subscriptionType": null
+            }})),
+            ClaudeCapacityAccess::ApiKey
+        );
+        assert_eq!(
+            claude_capacity_access_from_initialize(&json!({"account": {
+                "apiProvider": "bedrock", "subscriptionType": null
+            }})),
+            ClaudeCapacityAccess::ExternalProvider
+        );
+    }
+
+    #[test]
+    fn control_usage_maps_all_cli_reported_limits() {
+        let report = map_claude_control_usage(&json!({
+            "subscription_type": "max",
+            "rate_limits_available": true,
+            "rate_limits": {"limits": [
+                {"kind": "session", "percent": 2,
+                 "resets_at": "2026-07-17T21:20:00.325356+00:00"},
+                {"kind": "weekly_all", "percent": 15,
+                 "resets_at": "2026-07-22T18:00:00.325379+00:00"},
+                {"kind": "weekly_scoped", "percent": 8,
+                 "resets_at": "2026-07-22T18:00:00.325737+00:00",
+                 "scope": {"model": {"display_name": "Fable"}}}
+            ]}
+        }))
+        .expect("authoritative Claude usage");
+        assert_eq!(report.source, CapacitySource::ClaudeControlUsage);
+        assert_eq!(report.coverage, CapacityCoverage::AllVendorBuckets);
+        assert_eq!(report.buckets.len(), 3);
+        assert_eq!(report.buckets[0].label, "session limit");
+        assert_eq!(report.buckets[1].label, "weekly limit");
+        assert_eq!(report.buckets[2].label, "Fable limit");
+        assert!(matches!(
+            report.buckets[2].id,
+            CapacityBucketId::ClaudeModel { ref name } if name == "Fable"
+        ));
+        assert!(matches!(
+            report.buckets[2].measure,
+            CapacityMeasure::UsedPercent {
+                used_percent: 8,
+                remaining_percent: 92,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn control_usage_rejects_partial_or_unavailable_reports() {
+        assert_eq!(
+            map_claude_control_usage(&json!({"rate_limits_available": false})),
+            Err(CapacityUnavailableReason::MalformedReport)
+        );
+        assert_eq!(
+            map_claude_control_usage(&json!({
+                "rate_limits_available": true,
+                "rate_limits": {"limits": [{"kind": "session", "percent": 101}]}
+            })),
+            Err(CapacityUnavailableReason::MalformedReport)
+        );
+    }
 
     #[test]
     fn representative_rate_limit_event_converts_fraction_and_drops_internal_overage_fields() {
@@ -9220,6 +9546,10 @@ mod tests {
                 active_turn: None,
                 restart_process_after_turn: false,
                 subagent_emitter: None,
+                capacity_access: ClaudeCapacityAccess::Unknown,
+                capacity_refresh_in_flight: false,
+                capacity_report_emitted: false,
+                authoritative_capacity_emitted: false,
             }),
             runtime: Mutex::new(None),
             turn_event_gate: Mutex::new(()),
@@ -15148,6 +15478,10 @@ for raw_line in sys.stdin:
                     active_turn: None,
                     restart_process_after_turn: false,
                     subagent_emitter: None,
+                    capacity_access: ClaudeCapacityAccess::Unknown,
+                    capacity_refresh_in_flight: false,
+                    capacity_report_emitted: false,
+                    authoritative_capacity_emitted: false,
                 }),
                 runtime: Mutex::new(None),
                 turn_event_gate: Mutex::new(()),

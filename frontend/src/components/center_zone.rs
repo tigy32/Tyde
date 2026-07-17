@@ -1343,16 +1343,19 @@ fn EditorPane(
     };
     let drop_state = expect_context::<AppState>();
     let on_drop = move |ev: web_sys::DragEvent| {
-        ev.prevent_default();
         let Some(active_drag) = drag.get_untracked() else {
             return;
         };
-        drag.set(None);
-        drop_target.set(None);
-        drag_conflict.set(None);
+        // In a single-pane workspace the primary pane is below the split drop
+        // target. Let that same-pane drop bubble to the workspace handler;
+        // consuming it here would clear the drag before the split can open.
         if active_drag.source == pane {
             return;
         }
+        ev.prevent_default();
+        drag.set(None);
+        drop_target.set(None);
+        drag_conflict.set(None);
         // `move_tab` announces the outcome — moved, or the state layer's own
         // reason for refusing.
         move_tab(&drop_state, pane, active_drag.tab);
@@ -4098,7 +4101,9 @@ mod wasm_tests {
             query(&container, ".split-drop-zone-right.split-drop-zone-active").is_some(),
             "the right half highlights the right target"
         );
-        workspace.dispatch_event(&drag_event("drop")).unwrap();
+        pane_element(&container, PaneId::Primary)
+            .dispatch_event(&drag_event("drop"))
+            .unwrap();
         settle().await;
 
         assert_eq!(

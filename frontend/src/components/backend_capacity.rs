@@ -124,6 +124,7 @@ fn now_ms() -> u64 {
 fn source_label(source: CapacitySource) -> &'static str {
     match source {
         CapacitySource::ClaudeRateLimitEvent => "Claude",
+        CapacitySource::ClaudeControlUsage => "Claude",
         CapacitySource::CodexAccountRateLimitsUpdated => "Codex",
     }
 }
@@ -228,6 +229,7 @@ fn bucket_vendor_id_text(id: &CapacityBucketId) -> &'static str {
             ClaudeLimitType::SevenDayOverageIncluded => "claude seven_day_overage_included",
             ClaudeLimitType::Overage => "claude overage",
         },
+        CapacityBucketId::ClaudeModel { .. } => "claude model",
     }
 }
 
@@ -308,6 +310,10 @@ fn state_explanation(state: &BackendCapacityState, kind: BackendKind) -> Option<
             CapacityUnsupportedReason::AccountTypeNotReported => format!(
                 "This {vendor} account does not report subscription quota (for example, API-key \
                  auth rather than a subscription)."
+            ),
+            CapacityUnsupportedReason::ExternalProvider => format!(
+                "This {vendor} session uses an external provider. Capacity is managed by that \
+                 provider rather than {vendor}."
             ),
         }),
         BackendCapacityState::AuthError { detail } => Some(format!(

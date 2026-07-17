@@ -2606,6 +2606,7 @@ pub enum CapacityUnsupportedReason {
     BackendHasNoCapacitySource,
     BackendVersionTooOld,
     AccountTypeNotReported,
+    ExternalProvider,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2646,6 +2647,7 @@ pub struct CapacityReport {
 pub enum CapacitySource {
     CodexAccountRateLimitsUpdated,
     ClaudeRateLimitEvent,
+    ClaudeControlUsage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2677,6 +2679,7 @@ pub struct CapacityBucket {
 pub enum CapacityBucketId {
     Codex { slot: CodexLimitSlot },
     Claude { limit: ClaudeLimitType },
+    ClaudeModel { name: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

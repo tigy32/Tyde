@@ -20,6 +20,7 @@ mqtt-transport = { path = "../mqtt-transport" }
 axum = "0.8"
 base64 = "0.22"
 command-group = { version = "5", features = ["with-tokio"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
