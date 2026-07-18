@@ -1,6 +1,8 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
@@ -121,6 +123,10 @@ async fn heartbeat_tick(state: &AppState) {
 }
 
 fn unix_time_ms() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    return js_sys::Date::now().max(0.0) as u64;
+
+    #[cfg(not(target_arch = "wasm32"))]
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

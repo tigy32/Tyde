@@ -65,7 +65,13 @@ struct TurnEmitterState {
     identity_violation_reported: bool,
     emitted_tool_requests: IndexMap<String, EmittedToolRequest>,
     completed_tool_requests: HashSet<String>,
-    normalization_failures: HashMap<String, ToolExecutionNormalizationFailure>,
+    normalization_failures: HashMap<String, PendingToolNormalizationFailure>,
+}
+
+#[derive(Clone)]
+struct PendingToolNormalizationFailure {
+    kind: ToolExecutionNormalizationFailure,
+    detail: String,
 }
 
 struct EmittedToolRequest {
@@ -345,6 +351,21 @@ impl TurnEmitter {
             .tool_completed(data, Some(normalization_failure))
     }
 
+    pub fn fail_pending_tool(&self, tool_call_id: &str, error: &str) -> bool {
+        let mut state = self.lock();
+        let Some(tool_name) = state.pending_tool_name(tool_call_id).cloned() else {
+            return false;
+        };
+        state.send_tool_completed(
+            tool_call_id,
+            &tool_name,
+            failed_tool_result("Tool execution failed", error),
+            false,
+            Some(error),
+        );
+        true
+    }
+
     /// Live progress snapshot for a tool call. Deliberately stateless:
     /// background tasks (workflows, sub-agents) keep emitting progress
     /// after their tool call completes and across turn boundaries, when
@@ -472,7 +493,11 @@ impl TurnEmitter {
     // ---------- Misc chat events ----------
 
     pub fn typing_status_changed(&self, typing: bool) {
-        self.lock().send(json!({
+        let mut state = self.lock();
+        if !typing {
+            state.complete_pending_normalization_failures();
+        }
+        state.send(json!({
             "kind": "TypingStatusChanged",
             "data": typing,
         }));
@@ -744,8 +769,13 @@ impl TurnEmitterState {
         tool_call_id: &str,
         tool_name: &str,
         provider_tool_type: Value,
-        mut normalization_failure: Option<ToolExecutionNormalizationFailure>,
+        normalization_failure: Option<ToolExecutionNormalizationFailure>,
     ) -> Option<ChatMessageId> {
+        let mut normalization_failure =
+            normalization_failure.map(|kind| PendingToolNormalizationFailure {
+                kind,
+                detail: normalization_failure_detail(kind),
+            });
         let tool_type = match tyde_tool_request_type(tool_name, &provider_tool_type) {
             Ok(Some(typed)) => serde_json::to_value(typed).expect("serialize tool request"),
             Ok(None) => provider_tool_type,
@@ -756,16 +786,12 @@ impl TurnEmitterState {
                     detail = %error.detail,
                     "Canonical Tyde tool request normalization failed"
                 );
-                self.send(json!({
-                    "kind": "Error",
-                    "data": format!(
-                        "Failed to normalize canonical tool request '{}' ({}): {}",
-                        tool_name, tool_call_id, error
-                    ),
-                }));
                 normalization_failure = merge_normalization_failures(
                     normalization_failure,
-                    Some(error.normalization_failure),
+                    Some(PendingToolNormalizationFailure {
+                        kind: error.normalization_failure,
+                        detail: error.to_string(),
+                    }),
                 );
                 provider_tool_type
             }
@@ -803,6 +829,7 @@ impl TurnEmitterState {
             );
         }
         self.completed_tool_requests.remove(tool_call_id);
+        let normalization_failed = normalization_failure.is_some();
         match normalization_failure {
             Some(failure) => {
                 self.normalization_failures
@@ -835,7 +862,7 @@ impl TurnEmitterState {
                 "tool_type": tool_type,
             },
         }));
-        if normalization_failure.is_none()
+        if !normalization_failed
             && let Some(progress) =
                 await_progress_data_for_tool(tool_call_id, tool_name, &tool_type)
         {
@@ -847,8 +874,13 @@ impl TurnEmitterState {
     fn tool_completed(
         &mut self,
         mut data: ToolCompletedPayload<'_>,
-        mut normalization_failure: Option<ToolExecutionNormalizationFailure>,
+        normalization_failure: Option<ToolExecutionNormalizationFailure>,
     ) -> Option<ChatMessageId> {
+        let mut normalization_failure =
+            normalization_failure.map(|kind| PendingToolNormalizationFailure {
+                kind,
+                detail: normalization_failure_detail(kind),
+            });
         if self.completed_tool_requests.contains(data.tool_call_id) {
             tracing::debug!(
                 tool_call_id = data.tool_call_id,
@@ -871,16 +903,12 @@ impl TurnEmitterState {
                         detail = %error.detail,
                         "Canonical Tyde tool result normalization failed"
                     );
-                    self.send(json!({
-                        "kind": "Error",
-                        "data": format!(
-                            "Failed to normalize canonical tool result '{}' ({}): {}",
-                            data.tool_name, data.tool_call_id, error
-                        ),
-                    }));
                     normalization_failure = merge_normalization_failures(
                         normalization_failure,
-                        Some(error.normalization_failure),
+                        Some(PendingToolNormalizationFailure {
+                            kind: error.normalization_failure,
+                            detail: error.to_string(),
+                        }),
                     );
                 }
             }
@@ -938,12 +966,17 @@ impl TurnEmitterState {
         if let Some(progress) = spawn_progress {
             self.send_tool_progress(&progress);
         }
+        let success = normalization_failure.is_none() && data.success;
+        let error = normalization_failure
+            .as_ref()
+            .map(|failure| failure.detail.clone())
+            .or_else(|| data.error.map(str::to_owned));
         self.send_tool_completed_with_normalization_failure(
             data.tool_call_id,
             data.tool_name,
             data.tool_result,
-            data.success,
-            data.error,
+            success,
+            error.as_deref(),
             normalization_failure,
         );
         opened_container
@@ -990,12 +1023,17 @@ impl TurnEmitterState {
         error: Option<&str>,
     ) {
         let normalization_failure = self.normalization_failures.remove(tool_call_id);
+        let success = normalization_failure.is_none() && success;
+        let error = normalization_failure
+            .as_ref()
+            .map(|failure| failure.detail.clone())
+            .or_else(|| error.map(str::to_owned));
         self.send_tool_completed_with_normalization_failure(
             tool_call_id,
             tool_name,
             tool_result,
             success,
-            error,
+            error.as_deref(),
             normalization_failure,
         );
     }
@@ -1007,7 +1045,7 @@ impl TurnEmitterState {
         tool_result: Value,
         success: bool,
         error: Option<&str>,
-        normalization_failure: Option<ToolExecutionNormalizationFailure>,
+        normalization_failure: Option<PendingToolNormalizationFailure>,
     ) {
         self.completed_tool_requests
             .insert(tool_call_id.to_string());
@@ -1022,7 +1060,7 @@ impl TurnEmitterState {
             "error": error_value,
         });
         if let Some(normalization_failure) = normalization_failure {
-            data["normalization_failure"] = serde_json::to_value(normalization_failure)
+            data["normalization_failure"] = serde_json::to_value(normalization_failure.kind)
                 .expect("serialize normalization failure");
         }
         self.send(json!({
@@ -1198,6 +1236,31 @@ impl TurnEmitterState {
         }
     }
 
+    fn complete_pending_normalization_failures(&mut self) {
+        let pending = self
+            .normalization_failures
+            .iter()
+            .filter_map(|(tool_call_id, failure)| {
+                self.pending_tool_name(tool_call_id).map(|tool_name| {
+                    (
+                        tool_call_id.clone(),
+                        tool_name.clone(),
+                        failure.detail.clone(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        for (tool_call_id, tool_name, detail) in pending {
+            self.send_tool_completed(
+                &tool_call_id,
+                &tool_name,
+                failed_tool_result("Invalid tool request", &detail),
+                false,
+                None,
+            );
+        }
+    }
+
     fn pending_tool_name(&self, tool_call_id: &str) -> Option<&String> {
         self.emitted_tool_requests
             .get(tool_call_id)
@@ -1222,13 +1285,34 @@ impl TurnEmitterState {
 }
 
 fn merge_normalization_failures(
-    existing: Option<ToolExecutionNormalizationFailure>,
-    incoming: Option<ToolExecutionNormalizationFailure>,
-) -> Option<ToolExecutionNormalizationFailure> {
+    existing: Option<PendingToolNormalizationFailure>,
+    incoming: Option<PendingToolNormalizationFailure>,
+) -> Option<PendingToolNormalizationFailure> {
     match (existing, incoming) {
         (None, None) => None,
         (Some(failure), None) | (None, Some(failure)) => Some(failure),
-        (Some(existing), Some(incoming)) => Some(existing.combined_with(incoming)),
+        (Some(existing), Some(incoming)) => Some(PendingToolNormalizationFailure {
+            kind: existing.kind.combined_with(incoming.kind),
+            detail: if existing.detail == incoming.detail {
+                existing.detail
+            } else {
+                format!("{}; {}", existing.detail, incoming.detail)
+            },
+        }),
+    }
+}
+
+fn normalization_failure_detail(failure: ToolExecutionNormalizationFailure) -> String {
+    match failure {
+        ToolExecutionNormalizationFailure::CanonicalRequest => {
+            "Canonical tool request failed typed validation".to_string()
+        }
+        ToolExecutionNormalizationFailure::CanonicalResult => {
+            "Canonical tool result failed typed validation".to_string()
+        }
+        ToolExecutionNormalizationFailure::CanonicalRequestAndResult => {
+            "Canonical tool request and result failed typed validation".to_string()
+        }
     }
 }
 
@@ -1302,9 +1386,13 @@ fn stream_identity_violation_message(violation: StreamIdentityViolation) -> &'st
 }
 
 fn cancelled_tool_result(detailed_message: &str) -> Value {
+    failed_tool_result("Cancelled", detailed_message)
+}
+
+fn failed_tool_result(short_message: &str, detailed_message: &str) -> Value {
     json!({
         "kind": "Error",
-        "short_message": "Cancelled",
+        "short_message": short_message,
         "detailed_message": detailed_message,
     })
 }
@@ -1457,6 +1545,125 @@ mod tests {
             completion.normalization_failure,
             Some(ToolExecutionNormalizationFailure::CanonicalRequestAndResult)
         );
+    }
+
+    #[test]
+    fn malformed_canonical_request_emits_failed_tool_completion_without_chat_error() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new(tx);
+        emitter.tool_request(
+            "tool-malformed",
+            "tyde_send_agent_message",
+            json!({ "kind": "Other", "args": { "agent_id": "agent-a" } }),
+        );
+        emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id: "tool-malformed",
+            tool_name: "tyde_send_agent_message",
+            tool_result: json!({ "kind": "Other", "result": { "ok": true } }),
+            success: true,
+            error: None,
+        });
+
+        let events = recv_events(&mut rx);
+        assert!(
+            events
+                .iter()
+                .all(|event| { event.get("kind").and_then(Value::as_str) != Some("Error") })
+        );
+        let completion = events
+            .iter()
+            .find(|event| {
+                event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
+            })
+            .expect("failed tool completion");
+        assert_eq!(
+            completion.pointer("/data/success").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            completion
+                .pointer("/data/normalization_failure")
+                .and_then(Value::as_str),
+            Some("canonical_request")
+        );
+        assert!(
+            completion
+                .pointer("/data/error")
+                .and_then(Value::as_str)
+                .is_some_and(|error| error.contains("expected non-empty agent_id/agentId"))
+        );
+        assert_protocol_valid(&events);
+    }
+
+    #[test]
+    fn idle_finalizes_malformed_request_without_provider_completion() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new(tx);
+        let container = emitter.tool_request_in_container(
+            "tool-malformed-idle",
+            "tyde_send_agent_message",
+            json!({ "kind": "Other", "args": {} }),
+        );
+        emitter.close_tool_container(container.expect("synthetic malformed tool container"));
+        emitter.typing_status_changed(false);
+
+        let events = recv_events(&mut rx);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
+                })
+                .count(),
+            1
+        );
+        let completion = events
+            .iter()
+            .find(|event| {
+                event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
+            })
+            .expect("idle failed tool completion");
+        assert_eq!(
+            completion.pointer("/data/success").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| { event.get("kind").and_then(Value::as_str) != Some("Error") })
+        );
+        assert_protocol_valid(&events);
+    }
+
+    #[test]
+    fn correlated_provider_error_completes_malformed_tool_without_chat_error() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new(tx);
+        emitter.tool_request(
+            "tool-provider-error",
+            "tyde_send_agent_message",
+            json!({ "kind": "Other", "args": {} }),
+        );
+
+        assert!(emitter.fail_pending_tool("tool-provider-error", "invalid arguments"));
+        assert!(!emitter.fail_pending_tool("tool-provider-error", "duplicate error"));
+
+        let events = recv_events(&mut rx);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
+                })
+                .count(),
+            1
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| { event.get("kind").and_then(Value::as_str) != Some("Error") })
+        );
+        assert_protocol_valid(&events);
     }
 
     #[test]

@@ -283,7 +283,9 @@ struct ReadAgentDebugToolInput {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SendAgentMessageToolInput {
+    #[schemars(length(min = 1))]
     agent_id: String,
+    #[schemars(length(min = 1))]
     message: String,
 }
 
@@ -765,6 +767,9 @@ impl TydeAgentControlMcpServer {
             Ok(id) => id,
             Err(err) => return Ok(err_text(err)),
         };
+        if input.message.trim().is_empty() {
+            return Ok(err_text("message must not be empty"));
+        }
         if let Err(error) = authorize_direct_children(
             &self.host,
             &request_agent_id,
@@ -773,9 +778,6 @@ impl TydeAgentControlMcpServer {
         .await
         {
             return Ok(err_text(error));
-        }
-        if input.message.trim().is_empty() {
-            return Ok(err_text("message must not be empty"));
         }
         match do_send_message(&self.host, &agent_id, input.message, Some(request_agent_id)).await {
             Ok(()) => ok_json(json!({ "ok": true })),
@@ -2146,6 +2148,23 @@ mod tests {
                 .expect_err("await must reject timeout fields");
             assert!(err.to_string().contains("unknown field") && err.to_string().contains(field));
         }
+    }
+
+    #[test]
+    fn send_message_schema_requires_non_empty_fields() {
+        let schema = input_schema::<SendAgentMessageToolInput>();
+        assert_eq!(
+            schema.pointer("/properties/agent_id/minLength"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            schema.pointer("/properties/message/minLength"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            schema.get("required"),
+            Some(&json!(["agent_id", "message"]))
+        );
     }
 
     #[test]

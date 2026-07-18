@@ -41,6 +41,12 @@ pub(crate) struct ToolNormalizeError {
     pub(crate) detail: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PendingToolNormalizationFailure {
+    pub(crate) kind: ToolExecutionNormalizationFailure,
+    pub(crate) detail: String,
+}
+
 impl std::fmt::Display for ToolNormalizeError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -204,10 +210,7 @@ pub(crate) fn tyde_tool_result(
 
 pub(crate) fn normalize_tyde_chat_event(
     event: ChatEvent,
-    normalization_failures: &mut std::collections::HashMap<
-        String,
-        ToolExecutionNormalizationFailure,
-    >,
+    normalization_failures: &mut std::collections::HashMap<String, PendingToolNormalizationFailure>,
 ) -> (ChatEvent, Option<String>) {
     match event {
         ChatEvent::ToolRequest(mut request) => {
@@ -221,19 +224,19 @@ pub(crate) fn normalize_tyde_chat_event(
                 }
                 Ok(None) => (ChatEvent::ToolRequest(request), None),
                 Err(error) => {
-                    normalization_failures
-                        .insert(request.tool_call_id.clone(), error.normalization_failure);
-                    let visible = format!(
-                        "Failed to normalize canonical tool request '{}' ({}): {}",
-                        request.tool_name, request.tool_call_id, error
+                    normalization_failures.insert(
+                        request.tool_call_id.clone(),
+                        PendingToolNormalizationFailure {
+                            kind: error.normalization_failure,
+                            detail: error.to_string(),
+                        },
                     );
-                    (ChatEvent::ToolRequest(request), Some(visible))
+                    (ChatEvent::ToolRequest(request), None)
                 }
             }
         }
         ChatEvent::ToolExecutionCompleted(mut completion) => {
             let request_failure = normalization_failures.remove(&completion.tool_call_id);
-            let mut visible = None;
             let result_failure = if completion.success {
                 match &completion.tool_result {
                     ToolExecutionResult::Other { .. } => match tyde_tool_result(
@@ -246,37 +249,70 @@ pub(crate) fn normalize_tyde_chat_event(
                             None
                         }
                         Ok(None) => None,
-                        Err(error) => {
-                            visible = Some(format!(
-                                "Failed to normalize canonical tool result '{}' ({}): {}",
-                                completion.tool_name, completion.tool_call_id, error
-                            ));
-                            Some(error.normalization_failure)
-                        }
+                        Err(error) => Some(PendingToolNormalizationFailure {
+                            kind: error.normalization_failure,
+                            detail: error.to_string(),
+                        }),
                     },
                     _ => None,
                 }
             } else {
                 None
             };
-            completion.normalization_failure =
-                merge_normalization_failure(completion.normalization_failure, request_failure);
-            completion.normalization_failure =
-                merge_normalization_failure(completion.normalization_failure, result_failure);
-            (ChatEvent::ToolExecutionCompleted(completion), visible)
+            let reported_failure = if request_failure.is_none() && result_failure.is_none() {
+                completion
+                    .normalization_failure
+                    .map(|kind| PendingToolNormalizationFailure {
+                        kind,
+                        detail: normalization_failure_detail(kind),
+                    })
+            } else {
+                None
+            };
+            let failure = merge_pending_normalization_failure(
+                merge_pending_normalization_failure(reported_failure, request_failure),
+                result_failure,
+            );
+            if let Some(failure) = failure {
+                completion.success = false;
+                completion.error = Some(failure.detail);
+                completion.normalization_failure = Some(failure.kind);
+            }
+            (ChatEvent::ToolExecutionCompleted(completion), None)
         }
         event => (event, None),
     }
 }
 
-fn merge_normalization_failure(
-    existing: Option<ToolExecutionNormalizationFailure>,
-    incoming: Option<ToolExecutionNormalizationFailure>,
-) -> Option<ToolExecutionNormalizationFailure> {
+fn merge_pending_normalization_failure(
+    existing: Option<PendingToolNormalizationFailure>,
+    incoming: Option<PendingToolNormalizationFailure>,
+) -> Option<PendingToolNormalizationFailure> {
     match (existing, incoming) {
         (None, None) => None,
         (Some(failure), None) | (None, Some(failure)) => Some(failure),
-        (Some(existing), Some(incoming)) => Some(existing.combined_with(incoming)),
+        (Some(existing), Some(incoming)) => Some(PendingToolNormalizationFailure {
+            kind: existing.kind.combined_with(incoming.kind),
+            detail: if existing.detail == incoming.detail {
+                existing.detail
+            } else {
+                format!("{}; {}", existing.detail, incoming.detail)
+            },
+        }),
+    }
+}
+
+fn normalization_failure_detail(failure: ToolExecutionNormalizationFailure) -> String {
+    match failure {
+        ToolExecutionNormalizationFailure::CanonicalRequest => {
+            "Canonical tool request failed typed validation".to_string()
+        }
+        ToolExecutionNormalizationFailure::CanonicalResult => {
+            "Canonical tool result failed typed validation".to_string()
+        }
+        ToolExecutionNormalizationFailure::CanonicalRequestAndResult => {
+            "Canonical tool request and result failed typed validation".to_string()
+        }
     }
 }
 

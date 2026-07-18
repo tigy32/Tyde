@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use leptos::prelude::{GetUntracked, Set, Update, WithUntracked};
@@ -12,17 +13,16 @@ use protocol::{
     AgentRenamedPayload, AgentStartPayload, BackendCapacityPayload, BackendConfigSchemasPayload,
     BackendSetupPayload, BrowseBootstrapListing, BrowseBootstrapPayload, ChatEvent,
     ClientErrorCode, CodeIntelOverviewPayload, CommandErrorPayload, CustomAgentNotifyPayload,
-    Envelope, FrameKind, HostBootstrapPayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
-    HeartbeatPayload, HostBrowseOpenedPayload, HostSettingsPayload, LaunchProfileCatalogPayload,
-    ListSessionsPayload, McpServerNotifyPayload, NewAgentPayload, ProjectBootstrapPayload,
-    ProjectEventPayload,
-    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
-    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, QueuedMessagesPayload, RejectCode,
-    RejectPayload, ReviewBootstrapPayload, ReviewEventPayload, ReviewId, SeqMismatch,
-    SessionHistoryPayload, SessionListPayload, SessionSchemasPayload, SessionSettingsPayload,
-    SkillNotifyPayload, SteeringNotifyPayload, StreamPath, TaskTokenUsagePayload,
-    TeamCompactNotifyPayload, TeamCompactStatus, TeamDraftNotifyPayload,
-    TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
+    Envelope, FrameKind, HeartbeatPayload, HostBootstrapPayload, HostBrowseEntriesPayload,
+    HostBrowseErrorPayload, HostBrowseOpenedPayload, HostSettingsPayload,
+    LaunchProfileCatalogPayload, ListSessionsPayload, McpServerNotifyPayload, NewAgentPayload,
+    ProjectBootstrapPayload, ProjectEventPayload, ProjectFileContentsPayload,
+    ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
+    ProjectNotifyPayload, QueuedMessagesPayload, RejectCode, RejectPayload, ReviewBootstrapPayload,
+    ReviewEventPayload, ReviewId, SeqMismatch, SessionHistoryPayload, SessionListPayload,
+    SessionSchemasPayload, SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload,
+    StreamPath, TaskTokenUsagePayload, TeamCompactNotifyPayload, TeamCompactStatus,
+    TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
     TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
 };
 
@@ -1017,6 +1017,10 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
 }
 
 fn unix_time_ms() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    return js_sys::Date::now().max(0.0) as u64;
+
+    #[cfg(not(target_arch = "wasm32"))]
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

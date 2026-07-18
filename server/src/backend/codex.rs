@@ -24,7 +24,9 @@ use protocol::{
 };
 
 use crate::agent_control_mcp::AGENT_CONTROL_AWAIT_MCP_SERVER_NAME;
-use crate::backend::agent_control_progress::normalize_tyde_chat_event;
+use crate::backend::agent_control_progress::{
+    PendingToolNormalizationFailure, normalize_tyde_chat_event,
+};
 use crate::backend::turn_emitter::{
     AgentName, MessageMetadataUpdatePayload, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
 };
@@ -3518,6 +3520,13 @@ impl CodexInner {
                 let Some(emitter) = self.codex_subagent_emitter(stream_key).await else {
                     return;
                 };
+                if let Some(tool_call_id) = codex_error_tool_call_id(params)
+                    && emitter.fail_pending_tool(tool_call_id, &message)
+                {
+                    self.complete_subagent_tool_calls(stream_key, &[tool_call_id.to_string()])
+                        .await;
+                    return;
+                }
                 emitter.backend_error(&message);
                 emitter.typing_status_changed(false);
             }
@@ -4675,6 +4684,12 @@ impl CodexInner {
             .and_then(Value::as_str)
             .unwrap_or("Codex error")
             .to_string();
+        if let Some(tool_call_id) = codex_error_tool_call_id(params)
+            && self.emitter.fail_pending_tool(tool_call_id, &message)
+        {
+            self.mark_tool_completed(tool_call_id).await;
+            return;
+        }
         let terminal = {
             let state = self.state.lock().await;
             is_terminal_codex_error_notification(&state, params)
@@ -6639,6 +6654,20 @@ fn extract_notification_thread_id(params: &Value) -> Option<String> {
         })
         .or_else(|| params.get("senderThreadId").and_then(Value::as_str))
         .map(|id| id.to_string())
+}
+
+fn codex_error_tool_call_id(params: &Value) -> Option<&str> {
+    [
+        "/toolCallId",
+        "/tool_call_id",
+        "/callId",
+        "/call_id",
+        "/item/id",
+    ]
+    .into_iter()
+    .find_map(|pointer| params.pointer(pointer).and_then(Value::as_str))
+    .map(str::trim)
+    .filter(|tool_call_id| !tool_call_id.is_empty())
 }
 
 fn is_thread_scoped_codex_notification(method: &str) -> bool {
@@ -9362,7 +9391,7 @@ fn spawn_codex_subagent_event_bridge(
 fn forward_codex_backend_stream_event(
     raw: Value,
     events_tx: &mpsc::UnboundedSender<BackendEvent>,
-    normalization_failures: &mut HashMap<String, ToolExecutionNormalizationFailure>,
+    normalization_failures: &mut HashMap<String, PendingToolNormalizationFailure>,
 ) -> bool {
     if let Some(usage) = model_request_token_usage_from_raw(&raw) {
         return events_tx
@@ -9389,7 +9418,7 @@ fn forward_codex_backend_stream_event(
 fn forward_codex_backend_event(
     raw: Value,
     events_tx: &mpsc::UnboundedSender<ChatEvent>,
-    normalization_failures: &mut HashMap<String, ToolExecutionNormalizationFailure>,
+    normalization_failures: &mut HashMap<String, PendingToolNormalizationFailure>,
 ) -> bool {
     if model_request_token_usage_from_raw(&raw).is_some() {
         return true;
@@ -9423,7 +9452,7 @@ struct CodexForwardedBackendEvent {
 
 fn codex_backend_event_from_raw(
     value: &Value,
-    _normalization_failures: &mut HashMap<String, ToolExecutionNormalizationFailure>,
+    _normalization_failures: &mut HashMap<String, PendingToolNormalizationFailure>,
 ) -> Option<CodexForwardedBackendEvent> {
     match serde_json::from_value::<ChatEvent>(value.clone()) {
         Ok(event) => {
@@ -12606,7 +12635,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn malformed_canonical_codex_tool_request_is_visible_and_inspectable() {
+    fn malformed_canonical_codex_tool_request_stays_in_tool_lifecycle() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut normalization_failures = HashMap::new();
         assert!(forward_codex_backend_event(
@@ -12625,13 +12654,6 @@ for line in sys.stdin:
             &mut normalization_failures,
         ));
 
-        let ChatEvent::MessageAdded(error) = rx.try_recv().expect("visible invariant error") else {
-            panic!("malformed canonical request must emit a visible error");
-        };
-        assert!(matches!(error.sender, MessageSender::Error));
-        assert!(error.content.contains("tyde_send_agent_message"));
-        assert!(error.content.contains("call-malformed"));
-
         let ChatEvent::ToolRequest(request) = rx.try_recv().expect("inspectable raw request")
         else {
             panic!("malformed canonical request must remain inspectable");
@@ -12640,6 +12662,7 @@ for line in sys.stdin:
             request.tool_type,
             protocol::ToolRequestType::Other { .. }
         ));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -12661,7 +12684,6 @@ for line in sys.stdin:
             &tx,
             &mut normalization_failures,
         ));
-        let _ = rx.try_recv().expect("visible normalization diagnostic");
         let _ = rx.try_recv().expect("inspectable fallback request");
 
         assert!(forward_codex_backend_event(
@@ -12687,6 +12709,10 @@ for line in sys.stdin:
             completion.normalization_failure,
             Some(ToolExecutionNormalizationFailure::CanonicalRequest)
         );
+        assert!(!completion.success);
+        assert!(completion.error.as_deref().is_some_and(|error| {
+            error.contains("expected non-empty agent_id/agentId and message")
+        }));
         let encoded = serde_json::to_string(&completion).expect("serialize marked completion");
         assert!(!encoded.contains("request-secret"));
     }
@@ -12735,15 +12761,6 @@ for line in sys.stdin:
             &tx,
             &mut normalization_failures,
         ));
-        let ChatEvent::MessageAdded(error) = rx.try_recv().expect("result diagnostic") else {
-            panic!("expected visible result diagnostic");
-        };
-        assert!(matches!(error.sender, MessageSender::Error));
-        assert!(
-            !serde_json::to_string(&error)
-                .expect("serialize result diagnostic")
-                .contains("result-secret")
-        );
         let ChatEvent::ToolExecutionCompleted(completion) =
             rx.try_recv().expect("marked completion")
         else {
@@ -12753,6 +12770,8 @@ for line in sys.stdin:
             completion.normalization_failure,
             Some(ToolExecutionNormalizationFailure::CanonicalResult)
         );
+        assert!(!completion.success);
+        assert!(completion.error.is_some());
     }
 
     #[test]
@@ -19179,6 +19198,19 @@ Do not describe the tool, and do not skip the tool call."#;
             &state,
             &json!({ "message": "Tool warning" })
         ));
+    }
+
+    #[test]
+    fn codex_error_tool_call_id_accepts_provider_aliases() {
+        assert_eq!(
+            codex_error_tool_call_id(&json!({ "toolCallId": "call-1" })),
+            Some("call-1")
+        );
+        assert_eq!(
+            codex_error_tool_call_id(&json!({ "item": { "id": "call-2" } })),
+            Some("call-2")
+        );
+        assert_eq!(codex_error_tool_call_id(&json!({ "call_id": " " })), None);
     }
 
     #[test]

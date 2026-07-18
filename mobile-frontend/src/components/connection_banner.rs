@@ -381,11 +381,9 @@ mod wasm_tests {
             state.connection_statuses.update(|statuses| {
                 statuses.insert(host_for_mount.clone(), ConnectionStatus::Connected);
             });
-            state
-                .heartbeat_round_trip_ms_by_host
-                .update(|round_trips| {
-                    round_trips.insert(host_for_mount.clone(), 42);
-                });
+            state.heartbeat_round_trip_ms_by_host.update(|round_trips| {
+                round_trips.insert(host_for_mount.clone(), 42);
+            });
             provide_context(state);
             view! { <ConnectionBanner /> }
         });
