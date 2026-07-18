@@ -49,9 +49,9 @@ fn HostReconnectButton() -> impl IntoView {
     }
 }
 
-/// Floating connection indicator. The healthy connected state stays
-/// dot-only so it does not take vertical space from the workspace; states
-/// needing attention expand to a compact pill.
+/// Floating connection indicator. Healthy connections show a compact
+/// end-to-end round-trip measurement; states needing attention expand to a
+/// larger action pill.
 #[component]
 pub fn ConnectionBanner() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
@@ -64,13 +64,37 @@ pub fn ConnectionBanner() -> impl IntoView {
                 let status = status_state.active_host_connection_status();
                 match status {
                     ConnectionStatus::Connected => {
+                        let round_trip_ms = status_state
+                            .active_local_host_id
+                            .get()
+                            .and_then(|host| {
+                                status_state
+                                    .heartbeat_round_trip_ms_by_host
+                                    .get()
+                                    .get(&host)
+                                    .copied()
+                            });
+                        let round_trip_label = round_trip_ms
+                            .map(|milliseconds| format!("{milliseconds} ms"))
+                            .unwrap_or_else(|| "Checking…".to_owned());
+                        let aria_label = round_trip_ms
+                            .map(|milliseconds| {
+                                format!("Connected, {milliseconds} millisecond round trip")
+                            })
+                            .unwrap_or_else(|| "Connected, checking round-trip time".to_owned());
                         view! {
-                            <div class="connection-banner-inner connected" aria-label="Connected">
+                            <div class="connection-banner-inner connected" aria-label=aria_label>
                                 <StatusDot
                                     label="Connected".to_string()
                                     tone=StatusTone::Online
                                     data_mobile_test="connection-banner-dot-connected"
                                 />
+                                <span
+                                    class="status-text"
+                                    data-mobile-test="connection-banner-rtt"
+                                >
+                                    {round_trip_label}
+                                </span>
                             </div>
                         }.into_any()
                     }
@@ -347,7 +371,7 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn connected_status_is_dot_only() {
+    async fn connected_status_shows_round_trip_time() {
         let host = LocalHostId("host-1".to_owned());
         let host_for_mount = host.clone();
         let container = make_container();
@@ -357,6 +381,11 @@ mod wasm_tests {
             state.connection_statuses.update(|statuses| {
                 statuses.insert(host_for_mount.clone(), ConnectionStatus::Connected);
             });
+            state
+                .heartbeat_round_trip_ms_by_host
+                .update(|round_trips| {
+                    round_trips.insert(host_for_mount.clone(), 42);
+                });
             provide_context(state);
             view! { <ConnectionBanner /> }
         });
@@ -370,14 +399,11 @@ mod wasm_tests {
             dot.get_attribute("aria-label").as_deref(),
             Some("Connected")
         );
-        assert!(
-            container
-                .text_content()
-                .unwrap_or_default()
-                .trim()
-                .is_empty(),
-            "connected state should not render a text status bar"
-        );
+        let round_trip = container
+            .query_selector("[data-mobile-test='connection-banner-rtt']")
+            .unwrap()
+            .expect("connected indicator should render round-trip feedback");
+        assert_eq!(round_trip.text_content().as_deref(), Some("42 ms"));
     }
 
     #[wasm_bindgen_test]

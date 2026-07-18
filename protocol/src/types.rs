@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 37;
+pub const PROTOCOL_VERSION: u32 = 38;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -1069,6 +1069,7 @@ pub enum FrameKind {
     MobileDeviceRevoke,
     MobileDeviceRename,
     ClientError,
+    Heartbeat,
 
     SetSessionSettings,
     TriggerWorkflow,
@@ -1150,6 +1151,7 @@ pub enum FrameKind {
     ProjectEvent,
     WorkflowNotify,
     WorkflowRunNotify,
+    HeartbeatAck,
 }
 
 impl fmt::Display for FrameKind {
@@ -1239,6 +1241,7 @@ impl fmt::Display for FrameKind {
             Self::MobileDeviceRevoke => f.write_str("mobile_device_revoke"),
             Self::MobileDeviceRename => f.write_str("mobile_device_rename"),
             Self::ClientError => f.write_str("client_error"),
+            Self::Heartbeat => f.write_str("heartbeat"),
             Self::TriggerWorkflow => f.write_str("trigger_workflow"),
             Self::CancelWorkflow => f.write_str("cancel_workflow"),
             Self::WorkflowRefresh => f.write_str("workflow_refresh"),
@@ -1319,6 +1322,7 @@ impl fmt::Display for FrameKind {
             Self::ProjectEvent => f.write_str("project_event"),
             Self::WorkflowNotify => f.write_str("workflow_notify"),
             Self::WorkflowRunNotify => f.write_str("workflow_run_notify"),
+            Self::HeartbeatAck => f.write_str("heartbeat_ack"),
         }
     }
 }
@@ -2902,6 +2906,11 @@ pub struct ClientErrorPayload {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_context: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeartbeatPayload {
+    pub client_sent_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -7304,8 +7313,8 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_thirty_seven() {
-        assert_eq!(PROTOCOL_VERSION, 37);
+    fn protocol_version_is_thirty_eight() {
+        assert_eq!(PROTOCOL_VERSION, 38);
     }
 
     #[test]

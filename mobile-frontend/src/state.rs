@@ -843,6 +843,8 @@ pub struct AppState {
     /// distinct from cached host settings so a fresh stream cannot be marked
     /// ready by stale state from an older connection.
     pub bootstrapped_host_streams: RwSignal<HashMap<LocalHostId, StreamPath>>,
+    pub heartbeat_pending_since_by_host: RwSignal<HashMap<LocalHostId, u64>>,
+    pub heartbeat_round_trip_ms_by_host: RwSignal<HashMap<LocalHostId, u64>>,
     pub host_settings_by_host: RwSignal<HashMap<LocalHostId, HostSettings>>,
     pub command_errors_by_host: RwSignal<HashMap<LocalHostId, String>>,
     pub backend_setup_by_host: RwSignal<HashMap<LocalHostId, Vec<BackendSetupInfo>>>,
@@ -1008,6 +1010,8 @@ impl AppState {
             active_connection_instance_ids: RwSignal::new(HashMap::new()),
             host_streams: RwSignal::new(HashMap::new()),
             bootstrapped_host_streams: RwSignal::new(HashMap::new()),
+            heartbeat_pending_since_by_host: RwSignal::new(HashMap::new()),
+            heartbeat_round_trip_ms_by_host: RwSignal::new(HashMap::new()),
             host_settings_by_host: RwSignal::new(HashMap::new()),
             command_errors_by_host: RwSignal::new(HashMap::new()),
             backend_setup_by_host: RwSignal::new(HashMap::new()),
@@ -1538,6 +1542,12 @@ impl AppState {
             m.remove(host);
         });
         self.bootstrapped_host_streams.update(|m| {
+            m.remove(host);
+        });
+        self.heartbeat_pending_since_by_host.update(|m| {
+            m.remove(host);
+        });
+        self.heartbeat_round_trip_ms_by_host.update(|m| {
             m.remove(host);
         });
         self.host_settings_by_host.update(|m| {

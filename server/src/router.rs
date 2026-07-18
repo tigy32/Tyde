@@ -9,7 +9,7 @@ use protocol::{
     CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
     CodeIntelUnsubscribeFilePayload, CustomAgentDeletePayload, CustomAgentUpsertPayload,
     DeleteSessionPayload, EditQueuedMessagePayload, Envelope, FetchSessionHistoryPayload,
-    FrameKind, HostBrowseClosePayload, HostBrowseInitial, HostBrowseListPayload,
+    FrameKind, HeartbeatPayload, HostBrowseClosePayload, HostBrowseInitial, HostBrowseListPayload,
     HostBrowseStartPayload, InterruptPayload, ListSessionsPayload, LoadAgentPayload,
     McpServerDeletePayload, McpServerUpsertPayload, MobileDeviceRenamePayload,
     MobileDeviceRevokePayload, MobilePairingCancelPayload, MobilePairingStartPayload,
@@ -114,6 +114,17 @@ pub(crate) async fn route_client_envelope(
                 let payload: ClientErrorPayload = parse_payload(&envelope, "client_error")?;
                 ensure_non_empty("client_error", "message", payload.message.as_str())?;
                 log_client_error_report(connection_host_stream, &envelope, &payload);
+            }
+            FrameKind::Heartbeat => {
+                let payload: HeartbeatPayload = parse_payload(&envelope, "heartbeat")?;
+                let payload = serde_json::to_value(payload).map_err(|error| {
+                    AppError::internal("heartbeat", anyhow!("failed to encode heartbeat: {error}"))
+                })?;
+                host_output_stream
+                    .send_value(FrameKind::HeartbeatAck, payload)
+                    .map_err(|_| {
+                        AppError::internal("heartbeat", anyhow!("host output stream closed"))
+                    })?;
             }
             FrameKind::SpawnAgent => {
                 let payload: SpawnAgentPayload = parse_payload(&envelope, "spawn_agent")?;

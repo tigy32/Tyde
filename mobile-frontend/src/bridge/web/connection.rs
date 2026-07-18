@@ -775,9 +775,6 @@ impl ConnectionManager {
         );
     }
 
-    /// Repeated same-code retryable failures: the reconnect loop keeps running,
-    /// but the surfaced status becomes a persistent `Failed` card (instead of
-    /// `Connecting`) that names the latest failure and the attempt count.
     fn emit_persistent_failure(
         &self,
         local_host_id: &LocalHostId,
@@ -788,18 +785,11 @@ impl ConnectionManager {
         if !self.is_current_actor(local_host_id, actor_instance_id) {
             return;
         }
-        let message = format!(
-            "{error} ({attempts} consecutive attempts failed; still retrying in background)"
+        log::warn!(
+            "mobile host {local_host_id} has failed {attempts} consecutive reconnect attempts; \
+             still retrying: {error}"
         );
-        self.emit_host_error(local_host_id, actor_instance_id, message.clone());
-        self.set_status_and_emit(
-            local_host_id.clone(),
-            PairedHostConnectionStatus::Failed {
-                code: error.error_code(),
-                message,
-            },
-            None,
-        );
+        self.emit_connecting(local_host_id, actor_instance_id);
     }
 }
 
@@ -863,9 +853,11 @@ impl ConnectErr {
                 .map(transport_error_code)
                 .unwrap_or(MobileAccessErrorCode::TransportFailed),
             Self::Timeout => MobileAccessErrorCode::TransportFailed,
-            Self::WriterDeadline { .. } | Self::Invalidated(_) => {
-                MobileAccessErrorCode::BrokerProtocol
+            Self::WriterDeadline { .. } => MobileAccessErrorCode::BrokerProtocol,
+            Self::Invalidated(ConnectionInvalidation::HeartbeatTimeout { .. }) => {
+                MobileAccessErrorCode::TransportFailed
             }
+            Self::Invalidated(_) => MobileAccessErrorCode::BrokerProtocol,
             Self::NeedsRepair(_) => MobileAccessErrorCode::RepairRequired,
             Self::ManagedCredentials(error) => error.code,
         }
@@ -1015,11 +1007,6 @@ async fn run_connection_actor(
                 if matches!(&error, ConnectErr::Invalidated(_)) {
                     control_tx.send_replace(ConnectionControl::Running);
                 }
-                manager.emit_disconnected(
-                    &local_host_id,
-                    actor_instance_id,
-                    format!("connected session ended: {error}"),
-                );
                 if !handle_retryable_connect_failure(
                     &manager,
                     &local_host_id,
@@ -1066,11 +1053,8 @@ fn handle_retryable_connect_failure(
     if failures.is_persistent() {
         manager.emit_persistent_failure(local_host_id, actor_instance_id, error, attempts);
     } else {
-        manager.emit_host_error(
-            local_host_id,
-            actor_instance_id,
-            format!("MQTT connection failed; retrying: {error}"),
-        );
+        log::warn!("MQTT connection to {local_host_id} failed; retrying: {error}");
+        manager.emit_connecting(local_host_id, actor_instance_id);
     }
     true
 }
@@ -2233,12 +2217,8 @@ mod tests {
         );
     }
 
-    /// Emission path: with the actor registered as current, a persistent
-    /// failure must pin a `Failed` status (with the typed code and the latest
-    /// error's message plus the retrying notice) that `connection_statuses`
-    /// then reports — this is what replaces the spinner in the UI.
     #[test]
-    fn emit_persistent_failure_pins_failed_status_with_latest_message() {
+    fn emit_persistent_failure_keeps_reconnecting_status() {
         let manager = ConnectionManager {
             inner: Rc::new(RefCell::new(ManagerInner::default())),
         };
@@ -2263,24 +2243,7 @@ mod tests {
             .iter()
             .find(|event| event.local_host_id == host)
             .expect("a status must be stored for the failing host");
-        match &event.status {
-            PairedHostConnectionStatus::Failed { code, message } => {
-                assert_eq!(*code, MobileAccessErrorCode::TransportFailed);
-                assert!(
-                    message.contains("host never completed the rendezvous"),
-                    "the latest error's own message must be displayed: {message}"
-                );
-                assert!(
-                    message.contains("still retrying"),
-                    "the card must say retries continue: {message}"
-                );
-                assert!(
-                    message.contains(&PERSISTENT_FAILURE_THRESHOLD.to_string()),
-                    "the attempt count must be visible: {message}"
-                );
-            }
-            other => panic!("expected a persistent Failed status, got {other:?}"),
-        }
+        assert_eq!(event.status, PairedHostConnectionStatus::Connecting);
 
         // A stale actor must not be able to pin anything.
         let other_host = LocalHostId("h-stale".to_owned());

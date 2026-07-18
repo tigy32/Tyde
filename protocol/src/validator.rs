@@ -17,28 +17,28 @@ use crate::{
     CodeIntelReferencesCompletePayload, CodeIntelReferencesResultsPayload, CodeIntelStatusPayload,
     CommandErrorPayload, CustomAgentDeletePayload, CustomAgentNotifyPayload,
     CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FetchSessionHistoryPayload,
-    FrameKind, HostBootstrapPayload, HostBrowseClosePayload, HostBrowseEntriesPayload,
-    HostBrowseErrorPayload, HostBrowseListPayload, HostBrowseOpenedPayload, HostBrowseStartPayload,
-    HostSettingsPayload, LaunchProfileCatalogPayload, ListSessionsPayload, LoadAgentPayload,
-    McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
-    MobileAccessStatePayload, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
-    MobilePairingCancelPayload, MobilePairingOfferPayload, MobilePairingStartPayload,
-    NewAgentPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
-    ProjectDeleteRootPayload, ProjectEventPayload, ProjectFileContentsPayload,
-    ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectNotifyPayload,
-    ProjectRenamePayload, ProjectReorderPayload, ProjectSearchCompletePayload,
-    ProjectSearchResultsPayload, ReviewEventPayload, RunBackendSetupPayload, SessionHistoryPayload,
-    SessionListPayload, SessionSchemasPayload, SetAgentGroupsPayload, SetAgentPinsPayload,
-    SetAgentTagsPayload, SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload,
-    SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentPayload,
-    SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload, StreamPath,
-    TaskTokenUsagePayload, TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload,
-    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload,
-    TeamDraftNotifyPayload, TeamDraftShufflePayload, TeamDraftUpdatePayload,
-    TeamMemberActivatePayload, TeamMemberBindingNotifyPayload, TeamMemberCreatePayload,
-    TeamMemberDeletePayload, TeamMemberNotifyPayload, TeamMemberShufflePayload,
-    TeamMemberShuffleSuggestionNotifyPayload, TeamMemberUpdatePayload, TeamNotifyPayload,
-    TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
+    FrameKind, HeartbeatPayload, HostBootstrapPayload, HostBrowseClosePayload,
+    HostBrowseEntriesPayload, HostBrowseErrorPayload, HostBrowseListPayload,
+    HostBrowseOpenedPayload, HostBrowseStartPayload, HostSettingsPayload,
+    LaunchProfileCatalogPayload, ListSessionsPayload, LoadAgentPayload, McpServerDeletePayload,
+    McpServerNotifyPayload, McpServerUpsertPayload, MobileAccessStatePayload,
+    MobileDeviceRenamePayload, MobileDeviceRevokePayload, MobilePairingCancelPayload,
+    MobilePairingOfferPayload, MobilePairingStartPayload, NewAgentPayload, ProjectAddRootPayload,
+    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
+    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
+    ProjectGitStatusPayload, ProjectNotifyPayload, ProjectRenamePayload, ProjectReorderPayload,
+    ProjectSearchCompletePayload, ProjectSearchResultsPayload, ReviewEventPayload,
+    RunBackendSetupPayload, SessionHistoryPayload, SessionListPayload, SessionSchemasPayload,
+    SetAgentGroupsPayload, SetAgentPinsPayload, SetAgentTagsPayload, SetAgentsSmartViewsPayload,
+    SetAgentsViewPreferencesPayload, SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload,
+    SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload,
+    StreamPath, TaskTokenUsagePayload, TeamCreatePayload, TeamDeletePayload,
+    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
+    TeamDraftDiscardPayload, TeamDraftNotifyPayload, TeamDraftShufflePayload,
+    TeamDraftUpdatePayload, TeamMemberActivatePayload, TeamMemberBindingNotifyPayload,
+    TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberNotifyPayload,
+    TeamMemberShufflePayload, TeamMemberShuffleSuggestionNotifyPayload, TeamMemberUpdatePayload,
+    TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
     TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
     ToolExecutionCompletedData, ToolRequest, TriggerWorkflowPayload, WelcomePayload,
     WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowNotifyPayload, WorkflowRefreshPayload,
@@ -424,6 +424,12 @@ impl ProtocolValidator {
             ),
             FrameKind::ClientError => {
                 parse_host_payload::<ClientErrorPayload>(self, envelope, "ClientError")
+            }
+            FrameKind::Heartbeat => {
+                parse_host_payload::<HeartbeatPayload>(self, envelope, "Heartbeat")
+            }
+            FrameKind::HeartbeatAck => {
+                parse_host_payload::<HeartbeatPayload>(self, envelope, "HeartbeatAck")
             }
             FrameKind::TriggerWorkflow => {
                 parse_host_payload::<TriggerWorkflowPayload>(self, envelope, "TriggerWorkflow")

@@ -37,7 +37,7 @@ use crate::types::BrokerAuth;
 use protocol::BrokerUrl;
 use std::time::Duration;
 
-const KEEP_ALIVE: Duration = Duration::from_secs(30);
+const KEEP_ALIVE: Duration = Duration::from_secs(10);
 const EVENTLOOP_REQUEST_CAPACITY: usize = 128;
 const MAX_MQTT_PACKET_SIZE: u32 = (MAX_PLAINTEXT_CHUNK_LEN as u32) + 1024;
 

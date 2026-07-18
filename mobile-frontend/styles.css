@@ -194,10 +194,15 @@ input, textarea, select {
 }
 
 .connection-banner-inner.connected {
-    padding: 0;
-    background: transparent;
-    border: 0;
-    opacity: 0.85;
+    padding: 4px 8px;
+    color: var(--text-muted);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-full);
+    box-shadow: var(--shadow-sm);
+    opacity: 0.92;
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
 }
 
 .connection-banner-inner.connected .ui-status-dot {

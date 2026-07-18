@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use leptos::prelude::{GetUntracked, Set, Update, WithUntracked};
 
@@ -12,8 +13,9 @@ use protocol::{
     BackendSetupPayload, BrowseBootstrapListing, BrowseBootstrapPayload, ChatEvent,
     ClientErrorCode, CodeIntelOverviewPayload, CommandErrorPayload, CustomAgentNotifyPayload,
     Envelope, FrameKind, HostBootstrapPayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
-    HostBrowseOpenedPayload, HostSettingsPayload, LaunchProfileCatalogPayload, ListSessionsPayload,
-    McpServerNotifyPayload, NewAgentPayload, ProjectBootstrapPayload, ProjectEventPayload,
+    HeartbeatPayload, HostBrowseOpenedPayload, HostSettingsPayload, LaunchProfileCatalogPayload,
+    ListSessionsPayload, McpServerNotifyPayload, NewAgentPayload, ProjectBootstrapPayload,
+    ProjectEventPayload,
     ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
     ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, QueuedMessagesPayload, RejectCode,
     RejectPayload, ReviewBootstrapPayload, ReviewEventPayload, ReviewId, SeqMismatch,
@@ -194,6 +196,12 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
             state.command_errors_by_host.update(|map| {
                 map.remove(host);
             });
+            state.heartbeat_pending_since_by_host.update(|map| {
+                map.remove(host);
+            });
+            state.heartbeat_round_trip_ms_by_host.update(|map| {
+                map.remove(host);
+            });
             state.connection_statuses.update(|map| {
                 map.insert(host.clone(), ConnectionStatus::Bootstrapping);
             });
@@ -218,6 +226,34 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                     bridge::ConnectionInvalidation::ProtocolViolation { message },
                 );
             }
+        },
+        FrameKind::HeartbeatAck => match envelope.parse_payload::<HeartbeatPayload>() {
+            Ok(payload) => {
+                let pending_since = state
+                    .heartbeat_pending_since_by_host
+                    .with_untracked(|pending| pending.get(host).copied());
+                if pending_since == Some(payload.client_sent_at_ms) {
+                    state.heartbeat_pending_since_by_host.update(|pending| {
+                        pending.remove(host);
+                    });
+                    let round_trip_ms = unix_time_ms().saturating_sub(payload.client_sent_at_ms);
+                    state.heartbeat_round_trip_ms_by_host.update(|round_trips| {
+                        round_trips.insert(host.clone(), round_trip_ms);
+                    });
+                } else {
+                    log::warn!(
+                        "ignoring stale heartbeat acknowledgment from host {host}: sent_at_ms={}",
+                        payload.client_sent_at_ms
+                    );
+                }
+            }
+            Err(error) => log::error!(
+                "failed to parse HeartbeatAck host={} stream={} seq={}: {}",
+                host,
+                envelope.stream,
+                envelope.seq,
+                error
+            ),
         },
         FrameKind::AgentBootstrap => match envelope.parse_payload::<AgentBootstrapPayload>() {
             Ok(payload) => apply_agent_bootstrap(state, host, &envelope.stream, payload),
@@ -978,6 +1014,15 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
             log::warn!("unhandled frame kind: {}", envelope.kind);
         }
     }
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 /// Surface a sequence/protocol violation **and terminate the connection**.
@@ -2802,6 +2847,41 @@ mod wasm_tests {
         payload: &T,
     ) -> Envelope {
         Envelope::from_payload(StreamPath(stream.to_owned()), kind, seq, payload).expect("envelope")
+    }
+
+    #[wasm_bindgen_test]
+    fn heartbeat_ack_records_end_to_end_round_trip() {
+        let state = AppState::new();
+        let host = primed_host(&state, "mobile-heartbeat");
+        let sent_at_ms = unix_time_ms().saturating_sub(42);
+        state.heartbeat_pending_since_by_host.update(|pending| {
+            pending.insert(host.clone(), sent_at_ms);
+        });
+
+        dispatch_envelope(
+            &state,
+            &host,
+            envelope(
+                "/host/mobile-heartbeat",
+                FrameKind::HeartbeatAck,
+                0,
+                &HeartbeatPayload {
+                    client_sent_at_ms: sent_at_ms,
+                },
+            ),
+        );
+
+        assert!(
+            !state
+                .heartbeat_pending_since_by_host
+                .with_untracked(|pending| pending.contains_key(&host))
+        );
+        assert!(
+            state
+                .heartbeat_round_trip_ms_by_host
+                .with_untracked(|round_trips| round_trips.get(&host).copied())
+                .is_some_and(|round_trip_ms| round_trip_ms >= 42)
+        );
     }
 
     #[wasm_bindgen_test]

@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
@@ -13,6 +14,10 @@ use crate::state::{
     MobileTab, PairedHostConnectionStatus, PairedHostSummary, PairingOffer, PairingScreen,
 };
 use protocol::MobileAccessErrorCode;
+use protocol::{FrameKind, HeartbeatPayload};
+
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(20);
 
 thread_local! {
     static SEEN_HOST_LINES: RefCell<HashSet<(LocalHostId, u64)>> =
@@ -29,6 +34,7 @@ pub fn App() -> impl IntoView {
     spawn_initial_paired_hosts_load(state.clone());
     install_app_mode_effect(state.clone());
     spawn_boot_pairing_handoff(state.clone());
+    spawn_heartbeat_loop(state.clone());
 
     view! {
         <div class="mobile-app" data-theme=move || state.theme.get()>
@@ -51,6 +57,86 @@ pub fn App() -> impl IntoView {
             }}
         </div>
     }
+}
+
+fn spawn_heartbeat_loop(state: AppState) {
+    spawn_local(async move {
+        loop {
+            sleep(HEARTBEAT_INTERVAL).await;
+            heartbeat_tick(&state).await;
+        }
+    });
+}
+
+async fn heartbeat_tick(state: &AppState) {
+    let hosts = state.connection_statuses.with_untracked(|statuses| {
+        statuses
+            .iter()
+            .filter_map(|(host, status)| {
+                matches!(status, ConnectionStatus::Connected).then_some(host.clone())
+            })
+            .collect::<Vec<_>>()
+    });
+
+    for host in hosts {
+        let now = unix_time_ms();
+        let pending_since = state
+            .heartbeat_pending_since_by_host
+            .with_untracked(|pending| pending.get(&host).copied());
+        if let Some(pending_since) = pending_since {
+            let elapsed_ms = now.saturating_sub(pending_since);
+            if elapsed_ms >= HEARTBEAT_TIMEOUT.as_millis() as u64 {
+                state.heartbeat_pending_since_by_host.update(|pending| {
+                    pending.remove(&host);
+                });
+                state.heartbeat_round_trip_ms_by_host.update(|round_trips| {
+                    round_trips.remove(&host);
+                });
+                if let Err(error) = bridge::invalidate_host_connection(
+                    &host,
+                    bridge::ConnectionInvalidation::HeartbeatTimeout { elapsed_ms },
+                ) {
+                    log::warn!("heartbeat timeout could not invalidate host {host}: {error}");
+                }
+            }
+            continue;
+        }
+
+        let Some(stream) = state.host_stream_untracked(&host) else {
+            continue;
+        };
+        state.heartbeat_pending_since_by_host.update(|pending| {
+            pending.insert(host.clone(), now);
+        });
+        let payload = HeartbeatPayload {
+            client_sent_at_ms: now,
+        };
+        if let Err(error) = send_frame(&host, stream, FrameKind::Heartbeat, &payload).await {
+            state.heartbeat_pending_since_by_host.update(|pending| {
+                pending.remove(&host);
+            });
+            log::warn!("failed to send heartbeat to host {host}: {error}");
+        }
+    }
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn sleep(duration: Duration) {
+    tokio::time::sleep(duration).await;
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn sleep(duration: Duration) {
+    wasmtimer::tokio::sleep(duration).await;
 }
 
 #[component]
@@ -770,6 +856,12 @@ fn apply_disconnect(state: &AppState, host: &LocalHostId, _reason: Option<String
         m.remove(host);
     });
     state.bootstrapped_host_streams.update(|m| {
+        m.remove(host);
+    });
+    state.heartbeat_pending_since_by_host.update(|m| {
+        m.remove(host);
+    });
+    state.heartbeat_round_trip_ms_by_host.update(|m| {
         m.remove(host);
     });
     state.host_settings_by_host.update(|m| {

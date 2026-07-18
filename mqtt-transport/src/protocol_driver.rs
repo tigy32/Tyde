@@ -52,7 +52,6 @@ const CLIENT_HANDSHAKE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const PUBLISH_RETRY_INITIAL: Duration = Duration::from_millis(250);
 const PUBLISH_RETRY_MAX: Duration = Duration::from_secs(30);
 const PUBLISH_RETRY_ATTEMPTS: u8 = 5;
-const OUTBOUND_BOXCAR_DELAY: Duration = Duration::from_millis(100);
 const RENDEZVOUS_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const CREDIT_EMIT_THRESHOLD: u64 = (DATA_CREDIT_WINDOW / 2) as u64;
 const CREDIT_DEBOUNCE: Duration = Duration::from_millis(25);
@@ -295,33 +294,15 @@ impl<L: MqttLink> ProtocolDriver<L> {
                 && let Some(outbound) = deferred_outbound.take()
             {
                 credit_blocked_since = None;
-                match self
-                    .boxcar_outbound(
-                        outbound,
-                        &mut cipher,
-                        &mut deferred_outbound,
-                        &mut in_flight,
-                        &mut credit,
-                    )
+                let batch = self.boxcar_outbound(outbound, &mut deferred_outbound);
+                if let Err(failure) = self
+                    .publish_boxcar_batch(&mut cipher, batch, &mut in_flight)
                     .await
                 {
-                    Ok(batch) => {
-                        if let Err(failure) = self
-                            .publish_boxcar_batch(&mut cipher, batch, &mut in_flight)
-                            .await
-                        {
-                            failure.batch.ack_error(&failure.error);
-                            ack_deferred_outbound(&mut deferred_outbound, &failure.error);
-                            self.fail_stream(&mut in_flight, failure.error).await;
-                            return;
-                        }
-                    }
-                    Err(failure) => {
-                        failure.batch.ack_error(&failure.error);
-                        ack_deferred_outbound(&mut deferred_outbound, &failure.error);
-                        self.fail_stream(&mut in_flight, failure.error).await;
-                        return;
-                    }
+                    failure.batch.ack_error(&failure.error);
+                    ack_deferred_outbound(&mut deferred_outbound, &failure.error);
+                    self.fail_stream(&mut in_flight, failure.error).await;
+                    return;
                 }
                 continue;
             }
@@ -397,21 +378,7 @@ impl<L: MqttLink> ProtocolDriver<L> {
                                 deferred_outbound = Some(outbound);
                                 continue;
                             }
-                            let batch = match self.boxcar_outbound(
-                                outbound,
-                                &mut cipher,
-                                &mut deferred_outbound,
-                                &mut in_flight,
-                                &mut credit,
-                            ).await {
-                                Ok(batch) => batch,
-                                Err(failure) => {
-                                    failure.batch.ack_error(&failure.error);
-                                    ack_deferred_outbound(&mut deferred_outbound, &failure.error);
-                                    self.fail_stream(&mut in_flight, failure.error).await;
-                                    return;
-                                }
-                            };
+                            let batch = self.boxcar_outbound(outbound, &mut deferred_outbound);
                             if let Err(failure) = self.publish_boxcar_batch(
                                 &mut cipher,
                                 batch,
@@ -432,68 +399,23 @@ impl<L: MqttLink> ProtocolDriver<L> {
         }
     }
 
-    async fn boxcar_outbound(
+    fn boxcar_outbound(
         &mut self,
         first: OutboundChunk,
-        cipher: &mut SessionCipher,
         deferred_outbound: &mut Option<OutboundChunk>,
-        in_flight: &mut InflightPublishes,
-        credit: &mut ReceiverCreditState,
-    ) -> Result<BoxcarBatch, BoxcarFailure> {
+    ) -> BoxcarBatch {
         let mut batch = BoxcarBatch::new(first);
-        let delay = sleep(OUTBOUND_BOXCAR_DELAY);
-        tokio::pin!(delay);
-
-        loop {
-            while batch.plaintext.len() < MAX_PLAINTEXT_CHUNK_LEN {
-                match self.outbound_rx.try_recv() {
-                    Ok(next) => {
-                        if !append_or_defer(&mut batch, next, deferred_outbound) {
-                            return Ok(batch);
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-
-            if batch.plaintext.len() >= MAX_PLAINTEXT_CHUNK_LEN {
-                return Ok(batch);
-            }
-
-            tokio::select! {
-                _ = &mut delay => return Ok(batch),
-                event = self.link.poll() => {
-                    let event = match event {
-                        Ok(event) => event,
-                        Err(error) => {
-                            return Err(BoxcarFailure {
-                                batch,
-                                error: poll_error_to_disconnect(error),
-                            });
-                        }
-                    };
-                    if let Err(error) = self
-                        .handle_stream_event(event, cipher, in_flight, credit)
-                        .await
-                    {
-                        return Err(BoxcarFailure {
-                            batch,
-                            error,
-                        });
+        while batch.plaintext.len() < MAX_PLAINTEXT_CHUNK_LEN {
+            match self.outbound_rx.try_recv() {
+                Ok(next) => {
+                    if !append_or_defer(&mut batch, next, deferred_outbound) {
+                        break;
                     }
                 }
-                outbound = self.outbound_rx.next() => {
-                    match outbound {
-                        Some(next) => {
-                            if !append_or_defer(&mut batch, next, deferred_outbound) {
-                                return Ok(batch);
-                            }
-                        }
-                        None => return Ok(batch),
-                    }
-                }
+                Err(_) => break,
             }
         }
+        batch
     }
 
     async fn publish_boxcar_batch(
@@ -1156,11 +1078,6 @@ fn has_receiver_credit(cipher: &SessionCipher) -> bool {
 
 fn can_publish_data(cipher: &SessionCipher, in_flight: &InflightPublishes) -> bool {
     in_flight.has_data_slot() && in_flight.has_broker_capacity() && has_receiver_credit(cipher)
-}
-
-struct BoxcarFailure {
-    batch: BoxcarBatch,
-    error: MqttTransportError,
 }
 
 struct PublishBatchFailure {

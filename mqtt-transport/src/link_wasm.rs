@@ -39,7 +39,8 @@ use crate::wasm_codec::{
     incoming_publish_puback,
 };
 
-const KEEP_ALIVE: Duration = Duration::from_secs(30);
+const KEEP_ALIVE: Duration = Duration::from_secs(10);
+const PING_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_MQTT_PACKET_SIZE: usize = MAX_PLAINTEXT_CHUNK_LEN + 1024;
 
 /// A signal produced by one of the WebSocket JS callbacks.
@@ -86,6 +87,7 @@ pub(crate) struct WasmMqttLink {
     events: UnboundedReceiver<WsSignal>,
     incoming: BytesMut,
     ping: Interval,
+    awaiting_ping_since: Option<Instant>,
     next_pkid: u16,
     next_publish_token: u64,
     /// QoS1 PUBLISH packet identifiers currently awaiting PUBACK, mapped to the
@@ -165,6 +167,7 @@ impl WasmMqttLink {
             events: rx,
             incoming: BytesMut::new(),
             ping,
+            awaiting_ping_since: None,
             next_pkid: 0,
             next_publish_token: 0,
             outstanding_publish_pkids: HashMap::new(),
@@ -302,7 +305,11 @@ impl WasmMqttLink {
             Packet::Disconnect(disconnect) => Ok(LinkEvent::Disconnect {
                 reason: format!("{disconnect:?}"),
             }),
-            // PINGRESP, a stray CONNACK, … — the driver ignores these.
+            Packet::PingResp => {
+                self.awaiting_ping_since = None;
+                Ok(LinkEvent::Other)
+            }
+            // A stray CONNACK, … — the driver ignores these.
             _ => Ok(LinkEvent::Other),
         }
     }
@@ -385,7 +392,20 @@ impl MqttLink for WasmMqttLink {
 
             tokio::select! {
                 _ = self.ping.tick() => {
+                    let now = Instant::now();
+                    if let Some(sent_at) = self.awaiting_ping_since
+                        && now.duration_since(sent_at) >= PING_RESPONSE_TIMEOUT
+                    {
+                        return Err(MqttTransportError::BrokerDisconnected {
+                            reason: format!(
+                                "MQTT broker did not answer PINGREQ within {PING_RESPONSE_TIMEOUT:?}"
+                            ),
+                        });
+                    }
                     self.send_pingreq()?;
+                    if self.awaiting_ping_since.is_none() {
+                        self.awaiting_ping_since = Some(now);
+                    }
                 }
                 signal = self.events.next() => {
                     match signal {
