@@ -113,7 +113,6 @@ input, textarea, select {
     height: 100dvh;
     overflow: hidden;
     padding-top: var(--safe-area-top);
-    padding-bottom: var(--safe-area-bottom);
 }
 
 /* ── Mobile Shell Error Banner ──────────────────────────────────────── */
@@ -173,7 +172,7 @@ input, textarea, select {
 
 .connection-banner {
     position: fixed;
-    top: calc(var(--safe-area-top) + var(--space-2));
+    top: calc(var(--safe-area-top) + var(--header-height) + var(--space-2));
     right: var(--space-3);
     z-index: 90;
     display: flex;
@@ -351,7 +350,8 @@ input, textarea, select {
 .bottom-nav {
     display: flex;
     align-items: stretch;
-    height: var(--nav-height);
+    height: calc(var(--nav-height) + var(--safe-area-bottom));
+    padding-bottom: var(--safe-area-bottom);
     flex-shrink: 0;
     background: var(--bg-surface);
     border-top: 1px solid var(--border-default);
@@ -1793,7 +1793,7 @@ input, textarea, select {
 
 .chat-input-container {
     flex-shrink: 0;
-    padding: var(--space-2) var(--space-3);
+    padding: var(--space-2) var(--space-3) calc(var(--space-2) + var(--safe-area-bottom));
     border-top: 1px solid var(--border-default);
     background: var(--bg-surface);
 }
