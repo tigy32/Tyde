@@ -3365,10 +3365,10 @@ mod wasm_tests {
         );
     }
 
-    /// The tab-strip controls need a real target, and the commands they carry
-    /// also reach a full-size (>=44px) target in the menus.
+    /// The tab-strip controls need a real target, while their desktop menu
+    /// remains compact enough to scan without making commands fiddly.
     #[wasm_bindgen_test]
-    async fn strip_controls_and_menu_items_meet_their_target_sizes() {
+    async fn strip_controls_and_menu_items_use_compact_targets() {
         let container = make_container();
         let state = AppState::new();
         let state_for_mount = state.clone();
@@ -3401,9 +3401,9 @@ mod wasm_tests {
         for item in &items {
             let rect = item.get_bounding_client_rect();
             assert!(
-                rect.height() >= 44.0,
-                "menu items are the full-size target for these commands: expected \
-                 >=44px tall, got {}px",
+                (32.0..=36.0).contains(&rect.height()),
+                "desktop menu items must stay compact but clickable: expected \
+                 32-36px tall, got {}px",
                 rect.height()
             );
         }

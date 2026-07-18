@@ -1309,14 +1309,14 @@ details summary:focus:not(:focus-visible) {
     z-index: 1001;
 }
 
-/* The >=44px target for every command these menus carry. */
+/* Keep desktop tab commands compact without making the hit area fiddly. */
 .center-menu .context-menu-item {
     display: flex;
     flex-direction: column;
     justify-content: center;
     gap: 2px;
-    min-height: 45px;
-    padding: 8px 12px;
+    min-height: 34px;
+    padding: 5px 10px;
 }
 
 /* Screen-reader-only live region: announcements without visible chrome. */
