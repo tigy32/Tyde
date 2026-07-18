@@ -646,6 +646,7 @@ impl CodexSession {
                 tool_container: None,
                 notification_sequence: 0,
                 completed_agent_messages: HashMap::new(),
+                retired_unpublished_message_ids: HashSet::new(),
                 quarantined_turn_id: None,
                 generated_identity_epoch,
                 next_generated_identity_ordinal: 1,
@@ -1216,6 +1217,15 @@ struct ActiveStreamState {
     stream_published: bool,
 }
 
+impl ActiveStreamState {
+    fn is_replaceable_provider_reservation(&self) -> bool {
+        self.generated_identity.is_none()
+            && !self.stream_published
+            && self.text.is_empty()
+            && self.reasoning.is_empty()
+    }
+}
+
 struct InterruptedPublishedStream {
     message_id: ChatMessageId,
     content: String,
@@ -1241,6 +1251,7 @@ impl CompletedCodexAgentMessage {
 enum CodexAgentMessageOpen {
     Open,
     Existing,
+    Retired,
     Terminal,
     Foreign,
     Quarantined,
@@ -1288,12 +1299,41 @@ struct CodexSubAgentStream {
     tool_container: Option<ChatMessageId>,
     pending_tool_call_ids: HashSet<String>,
     completed_agent_messages: HashMap<ChatMessageId, CompletedCodexAgentMessage>,
+    retired_unpublished_message_ids: HashSet<ChatMessageId>,
     quarantined_turn_id: Option<String>,
     quarantined: bool,
     generated_identity_epoch: u64,
     next_generated_identity_ordinal: u64,
     pending_message_metadata: Option<PendingCodexMessageMetadata>,
     token_usage_by_turn: HashMap<String, Value>,
+}
+
+impl CodexSubAgentStream {
+    fn has_replaceable_provider_reservation(&self) -> bool {
+        self.current_message_id.is_some()
+            && self.current_generated_identity.is_none()
+            && !self.current_stream_published
+            && self.current_text.is_empty()
+            && self.current_reasoning.is_empty()
+    }
+
+    fn retire_replaceable_provider_reservation(&mut self) -> bool {
+        if !self.has_replaceable_provider_reservation() {
+            return false;
+        }
+        let message_id = self
+            .current_message_id
+            .take()
+            .expect("replaceable child reservation has an id");
+        self.retired_unpublished_message_ids.insert(message_id);
+        self.current_generated_identity = None;
+        self.current_reasoning_only = false;
+        self.current_stream_published = false;
+        self.current_text.clear();
+        self.current_reasoning.clear();
+        self.current_tool_call_ids.clear();
+        true
+    }
 }
 
 struct CompletedCodexSubAgentStream {
@@ -1357,6 +1397,7 @@ struct CodexState {
     tool_container: Option<ChatMessageId>,
     notification_sequence: u64,
     completed_agent_messages: HashMap<ChatMessageId, CompletedCodexAgentMessage>,
+    retired_unpublished_message_ids: HashSet<ChatMessageId>,
     quarantined_turn_id: Option<String>,
     generated_identity_epoch: u64,
     next_generated_identity_ordinal: u64,
@@ -1502,12 +1543,19 @@ impl CodexInner {
         if state.completed_agent_messages.contains_key(&message_id) {
             return CodexAgentMessageOpen::Terminal;
         }
+        if state.retired_unpublished_message_ids.contains(&message_id) {
+            return CodexAgentMessageOpen::Retired;
+        }
         if let Some(stream) = state.active_stream.as_ref() {
-            return if stream.message_id == message_id {
-                CodexAgentMessageOpen::Existing
-            } else {
-                CodexAgentMessageOpen::Foreign
-            };
+            if stream.message_id == message_id {
+                return CodexAgentMessageOpen::Existing;
+            }
+            if !stream.is_replaceable_provider_reservation() {
+                return CodexAgentMessageOpen::Foreign;
+            }
+            let retired_id = stream.message_id.clone();
+            state.active_stream = None;
+            state.retired_unpublished_message_ids.insert(retired_id);
         }
 
         let turn_id = state
@@ -1535,6 +1583,12 @@ impl CodexInner {
         if state.quarantined_turn_id.is_some() {
             return CodexAgentMessageOpen::Quarantined;
         }
+        if provider_message_id
+            .as_ref()
+            .is_some_and(|message_id| state.retired_unpublished_message_ids.contains(message_id))
+        {
+            return CodexAgentMessageOpen::Retired;
+        }
         if let Some(stream) = state.active_stream.as_ref() {
             let same_identity = match provider_message_id.as_ref() {
                 Some(message_id) => stream.message_id == *message_id,
@@ -1545,11 +1599,15 @@ impl CodexInner {
                         })
                 }
             };
-            return if same_identity {
-                CodexAgentMessageOpen::Existing
-            } else {
-                CodexAgentMessageOpen::Foreign
-            };
+            if same_identity {
+                return CodexAgentMessageOpen::Existing;
+            }
+            if provider_message_id.is_none() || !stream.is_replaceable_provider_reservation() {
+                return CodexAgentMessageOpen::Foreign;
+            }
+            let retired_id = stream.message_id.clone();
+            state.active_stream = None;
+            state.retired_unpublished_message_ids.insert(retired_id);
         }
         let generated_identity = provider_message_id.is_none().then(|| {
             let identity = ServerGeneratedChatMessageIdentity {
@@ -2443,6 +2501,7 @@ impl CodexInner {
                     state.active_turn_id = Some(turn_id.clone());
                     state.quarantined_turn_id = None;
                     state.active_stream = None;
+                    state.retired_unpublished_message_ids.clear();
                     state.pending_tool_call_ids.clear();
                     state.close_active_stream_when_tools_idle = false;
                     state.pending_message_metadata = None;
@@ -2499,7 +2558,7 @@ impl CodexInner {
                         return;
                     }
                     CodexAgentMessageOpen::Quarantined => (),
-                    CodexAgentMessageOpen::Foreign => {
+                    CodexAgentMessageOpen::Retired | CodexAgentMessageOpen::Foreign => {
                         self.reject_agent_message_identity(
                             StreamIdentityViolation::ForeignActiveMessageId,
                             method,
@@ -2550,7 +2609,7 @@ impl CodexInner {
                         return;
                     }
                     CodexAgentMessageOpen::Quarantined => (),
-                    CodexAgentMessageOpen::Foreign => {
+                    CodexAgentMessageOpen::Retired | CodexAgentMessageOpen::Foreign => {
                         self.reject_agent_message_identity(
                             StreamIdentityViolation::ForeignActiveMessageId,
                             method,
@@ -2899,6 +2958,7 @@ impl CodexInner {
                         stream.current_reasoning.clear();
                         stream.current_tool_call_ids.clear();
                         stream.pending_tool_call_ids.clear();
+                        stream.retired_unpublished_message_ids.clear();
                         stream.quarantined_turn_id = None;
                         stream.quarantined = false;
                         stream.pending_message_metadata = None;
@@ -2948,6 +3008,13 @@ impl CodexInner {
                             None,
                             Some(StreamIdentityViolation::DuplicateTerminalMessageId),
                         )
+                    } else if stream.retired_unpublished_message_ids.contains(&message_id) {
+                        (
+                            Arc::clone(&stream.emitter),
+                            false,
+                            None,
+                            Some(StreamIdentityViolation::ForeignActiveMessageId),
+                        )
                     } else if let Some(active_id) = stream.current_message_id.as_ref() {
                         if active_id == &message_id && !stream.current_reasoning_only {
                             let was_published = stream.current_stream_published;
@@ -2970,6 +3037,16 @@ impl CodexInner {
                                 emitted,
                                 None,
                             )
+                        } else if stream.retire_replaceable_provider_reservation() {
+                            stream.current_message_id = Some(message_id.clone());
+                            stream.current_generated_identity = None;
+                            stream.current_reasoning_only = false;
+                            stream.current_text = delta.clone();
+                            stream.current_stream_published =
+                                contains_non_whitespace(&stream.current_text);
+                            let published = stream.current_stream_published;
+                            let emitted = published.then(|| stream.current_text.clone());
+                            (Arc::clone(&stream.emitter), published, emitted, None)
                         } else {
                             (
                                 Arc::clone(&stream.emitter),
@@ -3028,7 +3105,18 @@ impl CodexInner {
                     if stream.quarantined {
                         return;
                     }
-                    if let Some(active_message_id) = stream.current_message_id.clone() {
+                    if provider_item_id.as_ref().is_some_and(|message_id| {
+                        stream.retired_unpublished_message_ids.contains(message_id)
+                    }) {
+                        (
+                            Arc::clone(&stream.emitter),
+                            None,
+                            None,
+                            false,
+                            None,
+                            Some(StreamIdentityViolation::ForeignActiveMessageId),
+                        )
+                    } else if let Some(active_message_id) = stream.current_message_id.clone() {
                         let matches_idless_reasoning = stream.current_reasoning_only
                             && stream
                                 .current_generated_identity
@@ -3043,7 +3131,30 @@ impl CodexInner {
                             }
                             None => matches_idless_reasoning,
                         };
-                        if !matches {
+                        if !matches
+                            && provider_item_id.is_some()
+                            && stream.retire_replaceable_provider_reservation()
+                        {
+                            let message_id = provider_item_id
+                                .clone()
+                                .expect("provider reasoning replacement has an id");
+                            stream.current_message_id = Some(message_id.clone());
+                            stream.current_generated_identity = None;
+                            stream.current_reasoning_only = true;
+                            stream.current_reasoning = delta.clone();
+                            stream.current_stream_published =
+                                contains_non_whitespace(&stream.current_reasoning);
+                            let published = stream.current_stream_published;
+                            let emitted = published.then(|| stream.current_reasoning.clone());
+                            (
+                                Arc::clone(&stream.emitter),
+                                Some(message_id),
+                                None,
+                                published,
+                                emitted,
+                                None,
+                            )
+                        } else if !matches {
                             (
                                 Arc::clone(&stream.emitter),
                                 None,
@@ -3160,7 +3271,11 @@ impl CodexInner {
                         if stream.quarantined {
                             return;
                         }
-                        if let Some(active_message_id) = stream.current_message_id.clone() {
+                        if provider_message_id.as_ref().is_some_and(|message_id| {
+                            stream.retired_unpublished_message_ids.contains(message_id)
+                        }) {
+                            None
+                        } else if let Some(active_message_id) = stream.current_message_id.clone() {
                             let matches = stream.current_reasoning_only
                                 && match provider_message_id.as_ref() {
                                     Some(message_id) => message_id == &active_message_id,
@@ -3171,7 +3286,18 @@ impl CodexInner {
                                         },
                                     ),
                                 };
-                            (!matches).then_some(StreamIdentityViolation::ForeignActiveMessageId)
+                            if matches {
+                                None
+                            } else if provider_message_id.is_some()
+                                && stream.retire_replaceable_provider_reservation()
+                            {
+                                stream.current_message_id = provider_message_id.clone();
+                                stream.current_generated_identity = None;
+                                stream.current_reasoning_only = true;
+                                None
+                            } else {
+                                Some(StreamIdentityViolation::ForeignActiveMessageId)
+                            }
                         } else {
                             let generated_identity = provider_message_id.is_none().then(|| {
                                 let identity = ServerGeneratedChatMessageIdentity {
@@ -3238,8 +3364,15 @@ impl CodexInner {
                         }
                         if stream.completed_agent_messages.contains_key(&message_id) {
                             Some(StreamIdentityViolation::DuplicateTerminalMessageId)
+                        } else if stream.retired_unpublished_message_ids.contains(&message_id) {
+                            None
                         } else if let Some(active_id) = stream.current_message_id.as_ref() {
                             if active_id == &message_id && !stream.current_reasoning_only {
+                                None
+                            } else if stream.retire_replaceable_provider_reservation() {
+                                stream.current_message_id = Some(message_id.clone());
+                                stream.current_generated_identity = None;
+                                stream.current_reasoning_only = false;
                                 None
                             } else {
                                 Some(StreamIdentityViolation::ForeignActiveMessageId)
@@ -3900,7 +4033,22 @@ impl CodexInner {
             if stream.quarantined {
                 return None;
             }
-            if let Some(previous) = stream.completed_agent_messages.get(&message_id) {
+            if stream.retired_unpublished_message_ids.contains(&message_id) {
+                if contains_non_whitespace(&completion_text)
+                    || completion_reasoning
+                        .as_deref()
+                        .is_some_and(contains_non_whitespace)
+                {
+                    Err(StreamIdentityViolation::ForeignActiveMessageId)
+                } else {
+                    tracing::debug!(
+                        child_thread_id = stream_key,
+                        provider_item_id = message_id.0.as_str(),
+                        "Ignoring contentless completion for retired Codex child reservation"
+                    );
+                    return None;
+                }
+            } else if let Some(previous) = stream.completed_agent_messages.get(&message_id) {
                 if previous.matches_replay(&completion_text, &completion_reasoning) {
                     Ok(None)
                 } else {
@@ -4014,102 +4162,127 @@ impl CodexInner {
             if stream.quarantined {
                 return;
             }
-            let matches_active = stream.current_reasoning_only
-                && match provider_message_id.as_ref() {
-                    Some(message_id) => stream.current_message_id.as_ref() == Some(message_id),
-                    None => stream
-                        .current_generated_identity
-                        .as_ref()
-                        .is_some_and(|identity| {
-                            identity.origin == ServerGeneratedChatMessageIdOrigin::IdlessReasoning
-                        }),
-                };
-            if stream.current_message_id.is_some() && !matches_active {
-                Err(StreamIdentityViolation::ForeignActiveMessageId)
-            } else {
-                let generated_identity = if stream.current_message_id.is_some() {
-                    stream.current_generated_identity.clone()
+            if provider_message_id.as_ref().is_some_and(|message_id| {
+                stream.retired_unpublished_message_ids.contains(message_id)
+            }) {
+                if completion_reasoning
+                    .as_deref()
+                    .is_some_and(contains_non_whitespace)
+                {
+                    Err(StreamIdentityViolation::ForeignActiveMessageId)
                 } else {
-                    provider_message_id.is_none().then(|| {
-                        let identity = ServerGeneratedChatMessageIdentity {
-                            origin: ServerGeneratedChatMessageIdOrigin::IdlessReasoning,
-                            stream_epoch: stream.generated_identity_epoch,
-                            item_ordinal: stream.next_generated_identity_ordinal,
-                        };
-                        stream.next_generated_identity_ordinal =
-                            stream.next_generated_identity_ordinal.saturating_add(1);
-                        identity
-                    })
-                };
-                let message_id = stream.current_message_id.clone().unwrap_or_else(|| {
-                    provider_message_id.clone().unwrap_or_else(|| {
-                        generated_identity
+                    tracing::debug!(
+                        child_thread_id = stream_key,
+                        provider_item_id = provider_message_id
                             .as_ref()
-                            .expect("generated child reasoning identity")
-                            .message_id()
-                    })
-                });
-                let stream_published = stream.current_stream_published;
-                let reported_reasoning = completion_reasoning.clone();
-                let reasoning = completion_reasoning.or_else(|| {
-                    contains_non_whitespace(&stream.current_reasoning)
-                        .then_some(stream.current_reasoning.clone())
-                });
-                let completion = CompletedCodexAgentMessage {
-                    reported_text: String::new(),
-                    reported_reasoning: reported_reasoning.clone(),
-                    completion_text: String::new(),
-                    completion_reasoning: reasoning.clone(),
-                };
-                if let Some(previous) = stream.completed_agent_messages.get(&message_id) {
-                    if previous.matches_replay("", &reported_reasoning) {
-                        return;
-                    }
-                    Err(StreamIdentityViolation::ConflictingDuplicateCompletion)
-                } else {
-                    let turn_id = turn_id_from_params
-                        .or_else(|| stream.active_turn_id.clone())
-                        .unwrap_or_else(|| "turn".to_string());
-                    stream.current_message_id = None;
-                    stream.current_generated_identity = None;
-                    stream.current_reasoning_only = false;
-                    stream.current_stream_published = false;
-                    stream.current_text.clear();
-                    stream.current_reasoning.clear();
-                    stream.current_tool_call_ids.clear();
-                    stream
-                        .completed_agent_messages
-                        .insert(message_id.clone(), completion);
-                    if reasoning.is_none() && !stream_published {
-                        tracing::debug!(
-                            provider_item_id = message_id.0.as_str(),
-                            item_type = "reasoning",
-                            reasoning_bytes = 0,
-                            "Suppressed contentless Codex child completion"
-                        );
-                        return;
-                    }
-                    let token_usage = stream.token_usage_by_turn.remove(&turn_id);
-                    let unavailable_reason = if token_usage.is_some() {
-                        None
-                    } else {
-                        stream.pending_message_metadata = Some(PendingCodexMessageMetadata {
-                            turn_id,
-                            message_id: message_id.clone(),
-                            model: model.to_string(),
-                            turn_context: TurnContextEstimate::default(),
-                        });
-                        Some(TokenUsageUnavailableReason::BackendDidNotReport)
+                            .expect("retired provider reasoning id")
+                            .0
+                            .as_str(),
+                        "Ignoring contentless completion for retired Codex child reservation"
+                    );
+                    return;
+                }
+            } else {
+                let matches_active = stream.current_reasoning_only
+                    && match provider_message_id.as_ref() {
+                        Some(message_id) => stream.current_message_id.as_ref() == Some(message_id),
+                        None => {
+                            stream
+                                .current_generated_identity
+                                .as_ref()
+                                .is_some_and(|identity| {
+                                    identity.origin
+                                        == ServerGeneratedChatMessageIdOrigin::IdlessReasoning
+                                })
+                        }
                     };
-                    Ok((
-                        Arc::clone(&stream.emitter),
-                        message_id,
-                        generated_identity,
-                        !stream_published,
-                        reasoning,
-                        token_usage,
-                        unavailable_reason,
-                    ))
+                if stream.current_message_id.is_some() && !matches_active {
+                    Err(StreamIdentityViolation::ForeignActiveMessageId)
+                } else {
+                    let generated_identity = if stream.current_message_id.is_some() {
+                        stream.current_generated_identity.clone()
+                    } else {
+                        provider_message_id.is_none().then(|| {
+                            let identity = ServerGeneratedChatMessageIdentity {
+                                origin: ServerGeneratedChatMessageIdOrigin::IdlessReasoning,
+                                stream_epoch: stream.generated_identity_epoch,
+                                item_ordinal: stream.next_generated_identity_ordinal,
+                            };
+                            stream.next_generated_identity_ordinal =
+                                stream.next_generated_identity_ordinal.saturating_add(1);
+                            identity
+                        })
+                    };
+                    let message_id = stream.current_message_id.clone().unwrap_or_else(|| {
+                        provider_message_id.clone().unwrap_or_else(|| {
+                            generated_identity
+                                .as_ref()
+                                .expect("generated child reasoning identity")
+                                .message_id()
+                        })
+                    });
+                    let stream_published = stream.current_stream_published;
+                    let reported_reasoning = completion_reasoning.clone();
+                    let reasoning = completion_reasoning.or_else(|| {
+                        contains_non_whitespace(&stream.current_reasoning)
+                            .then_some(stream.current_reasoning.clone())
+                    });
+                    let completion = CompletedCodexAgentMessage {
+                        reported_text: String::new(),
+                        reported_reasoning: reported_reasoning.clone(),
+                        completion_text: String::new(),
+                        completion_reasoning: reasoning.clone(),
+                    };
+                    if let Some(previous) = stream.completed_agent_messages.get(&message_id) {
+                        if previous.matches_replay("", &reported_reasoning) {
+                            return;
+                        }
+                        Err(StreamIdentityViolation::ConflictingDuplicateCompletion)
+                    } else {
+                        let turn_id = turn_id_from_params
+                            .or_else(|| stream.active_turn_id.clone())
+                            .unwrap_or_else(|| "turn".to_string());
+                        stream.current_message_id = None;
+                        stream.current_generated_identity = None;
+                        stream.current_reasoning_only = false;
+                        stream.current_stream_published = false;
+                        stream.current_text.clear();
+                        stream.current_reasoning.clear();
+                        stream.current_tool_call_ids.clear();
+                        stream
+                            .completed_agent_messages
+                            .insert(message_id.clone(), completion);
+                        if reasoning.is_none() && !stream_published {
+                            tracing::debug!(
+                                provider_item_id = message_id.0.as_str(),
+                                item_type = "reasoning",
+                                reasoning_bytes = 0,
+                                "Suppressed contentless Codex child completion"
+                            );
+                            return;
+                        }
+                        let token_usage = stream.token_usage_by_turn.remove(&turn_id);
+                        let unavailable_reason = if token_usage.is_some() {
+                            None
+                        } else {
+                            stream.pending_message_metadata = Some(PendingCodexMessageMetadata {
+                                turn_id,
+                                message_id: message_id.clone(),
+                                model: model.to_string(),
+                                turn_context: TurnContextEstimate::default(),
+                            });
+                            Some(TokenUsageUnavailableReason::BackendDidNotReport)
+                        };
+                        Ok((
+                            Arc::clone(&stream.emitter),
+                            message_id,
+                            generated_identity,
+                            !stream_published,
+                            reasoning,
+                            token_usage,
+                            unavailable_reason,
+                        ))
+                    }
                 }
             }
         };
@@ -4472,6 +4645,7 @@ impl CodexInner {
         match self.open_reasoning_message_item(None).await {
             CodexAgentMessageOpen::Open => {}
             CodexAgentMessageOpen::Existing => {}
+            CodexAgentMessageOpen::Retired => return,
             CodexAgentMessageOpen::Quarantined => return,
             CodexAgentMessageOpen::Terminal => {
                 self.reject_agent_message_identity(
@@ -4879,6 +5053,7 @@ impl CodexInner {
                 match self.open_agent_message_item(message_id.clone()).await {
                     CodexAgentMessageOpen::Open => {}
                     CodexAgentMessageOpen::Existing => {}
+                    CodexAgentMessageOpen::Retired => {}
                     CodexAgentMessageOpen::Terminal => {
                         self.reject_agent_message_identity(
                             StreamIdentityViolation::DuplicateTerminalMessageId,
@@ -4908,6 +5083,7 @@ impl CodexInner {
                 {
                     CodexAgentMessageOpen::Open => {}
                     CodexAgentMessageOpen::Existing => {}
+                    CodexAgentMessageOpen::Retired => {}
                     CodexAgentMessageOpen::Terminal => {
                         self.reject_agent_message_identity(
                             StreamIdentityViolation::DuplicateTerminalMessageId,
@@ -5056,6 +5232,32 @@ impl CodexInner {
                     .map(str::to_string)
                     .unwrap_or_else(|| extract_codex_item_text(item));
                 let completion_reasoning = extract_codex_item_reasoning(item);
+                if self
+                    .state
+                    .lock()
+                    .await
+                    .retired_unpublished_message_ids
+                    .contains(&message_id)
+                {
+                    if contains_non_whitespace(&text)
+                        || completion_reasoning
+                            .as_deref()
+                            .is_some_and(contains_non_whitespace)
+                    {
+                        self.reject_agent_message_identity(
+                            StreamIdentityViolation::ForeignActiveMessageId,
+                            "item/completed",
+                            Some(&message_id.0),
+                        )
+                        .await;
+                    } else {
+                        tracing::debug!(
+                            provider_item_id = message_id.0.as_str(),
+                            "Ignoring contentless completion for retired Codex reservation"
+                        );
+                    }
+                    return;
+                }
                 let reported_text = text.clone();
                 let reported_reasoning = completion_reasoning.clone();
                 let result = {
@@ -5221,6 +5423,29 @@ impl CodexInner {
                 let provider_message_id = item_id
                     .filter(|item_id| !item_id.trim().is_empty())
                     .map(|item_id| ChatMessageId(item_id.to_string()));
+                if let Some(message_id) = provider_message_id.as_ref()
+                    && self
+                        .state
+                        .lock()
+                        .await
+                        .retired_unpublished_message_ids
+                        .contains(message_id)
+                {
+                    if completion_reasoning.is_some() {
+                        self.reject_agent_message_identity(
+                            StreamIdentityViolation::ForeignActiveMessageId,
+                            "item/completed",
+                            Some(&message_id.0),
+                        )
+                        .await;
+                    } else {
+                        tracing::debug!(
+                            provider_item_id = message_id.0.as_str(),
+                            "Ignoring contentless completion for retired Codex reservation"
+                        );
+                    }
+                    return;
+                }
                 let result = {
                     let mut state = self.state.lock().await;
                     let matches_active = |stream: &ActiveStreamState| {
@@ -5823,6 +6048,7 @@ impl CodexInner {
                         tool_container: None,
                         pending_tool_call_ids: HashSet::new(),
                         completed_agent_messages: HashMap::new(),
+                        retired_unpublished_message_ids: HashSet::new(),
                         quarantined_turn_id: None,
                         quarantined: false,
                         generated_identity_epoch: codex_generated_identity_epoch(&thread_id),
@@ -12209,6 +12435,7 @@ for line in sys.stdin:
             tool_container: None,
             notification_sequence: 0,
             completed_agent_messages: HashMap::new(),
+            retired_unpublished_message_ids: HashSet::new(),
             quarantined_turn_id: None,
             generated_identity_epoch: codex_generated_identity_epoch("thread-test"),
             next_generated_identity_ordinal: 1,
@@ -12328,6 +12555,7 @@ for line in sys.stdin:
                 tool_container: None,
                 pending_tool_call_ids: HashSet::new(),
                 completed_agent_messages: HashMap::new(),
+                retired_unpublished_message_ids: HashSet::new(),
                 quarantined_turn_id: None,
                 quarantined: false,
                 generated_identity_epoch: codex_generated_identity_epoch(receiver_thread_id),
@@ -17587,6 +17815,155 @@ Do not describe the tool, and do not skip the tool call."#;
     }
 
     #[test]
+    fn codex_replaces_abandoned_unpublished_provider_item() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut rx) = test_codex_inner();
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({ "threadId": "thread-test", "turn": { "id": "rollover" } }),
+                )
+                .await;
+            drain_events(&mut rx);
+            for item_id in ["abandoned-reasoning", "replacement-reasoning"] {
+                inner
+                    .handle_notification(
+                        "item/started",
+                        &json!({
+                            "threadId": "thread-test",
+                            "item": { "type": "reasoning", "id": item_id }
+                        }),
+                    )
+                    .await;
+            }
+            inner
+                .handle_notification(
+                    "item/reasoning/delta",
+                    &json!({
+                        "threadId": "thread-test",
+                        "itemId": "replacement-reasoning",
+                        "delta": "replacement survived"
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "item": {
+                            "type": "reasoning",
+                            "id": "replacement-reasoning",
+                            "summary": "replacement survived"
+                        }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "item": {
+                            "type": "reasoning",
+                            "id": "abandoned-reasoning",
+                            "summary": ""
+                        }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "turn/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turn": { "id": "rollover", "status": "completed" }
+                    }),
+                )
+                .await;
+
+            let events = drain_events(&mut rx);
+            assert_eq!(
+                event_kinds(&events),
+                vec![
+                    "TypingStatusChanged",
+                    "StreamStart",
+                    "StreamReasoningDelta",
+                    "StreamEnd",
+                    "MessageMetadataUpdated",
+                    "TypingStatusChanged"
+                ]
+            );
+            assert!(events.iter().all(|event| {
+                event
+                    .pointer("/data/message_id")
+                    .or_else(|| event.pointer("/data/message/message_id"))
+                    .and_then(Value::as_str)
+                    .is_none_or(|id| id == "replacement-reasoning")
+            }));
+            assert_codex_protocol_valid(&events);
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn codex_rejects_late_content_for_retired_item() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut rx) = test_codex_inner();
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({ "threadId": "thread-test", "turn": { "id": "late-content" } }),
+                )
+                .await;
+            drain_events(&mut rx);
+            for item_id in ["retired-item", "current-item"] {
+                inner
+                    .handle_notification(
+                        "item/started",
+                        &json!({
+                            "threadId": "thread-test",
+                            "item": { "type": "reasoning", "id": item_id }
+                        }),
+                    )
+                    .await;
+            }
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "item": {
+                            "type": "reasoning",
+                            "id": "retired-item",
+                            "summary": "late provider content"
+                        }
+                    }),
+                )
+                .await;
+            let events = drain_events(&mut rx);
+            assert!(events.iter().any(|event| {
+                event.get("kind").and_then(Value::as_str) == Some("MessageAdded")
+                    && event
+                        .pointer("/data/content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|content| content.contains("foreign active message id"))
+            }));
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
     fn codex_resume_preserves_reasoning_only_and_skips_contentless_items() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -17923,6 +18300,92 @@ Do not describe the tool, and do not skip the tool call."#;
                 events.iter().all(|event| event.get("kind").and_then(Value::as_str) != Some("Error")),
                 "child item streams must not emit identity errors: {events:?}"
             );
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn codex_child_replaces_abandoned_unpublished_item() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (inner, mut parent_rx) = test_codex_inner();
+            let (child_tx, mut child_rx) = mpsc::unbounded_channel();
+            attach_test_codex_subagent(&inner, child_tx, "child-rollover").await;
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({
+                        "threadId": "child-rollover",
+                        "turn": { "id": "child-rollover-turn" }
+                    }),
+                )
+                .await;
+            assert!(drain_events(&mut parent_rx).is_empty());
+            drain_events(&mut child_rx);
+            for item_id in ["child-abandoned", "child-replacement"] {
+                inner
+                    .handle_notification(
+                        "item/started",
+                        &json!({
+                            "threadId": "child-rollover",
+                            "item": { "type": "reasoning", "id": item_id }
+                        }),
+                    )
+                    .await;
+            }
+            inner
+                .handle_notification(
+                    "item/reasoning/delta",
+                    &json!({
+                        "threadId": "child-rollover",
+                        "itemId": "child-replacement",
+                        "delta": "child replacement survived"
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "child-rollover",
+                        "item": {
+                            "type": "reasoning",
+                            "id": "child-replacement",
+                            "summary": "child replacement survived"
+                        }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "child-rollover",
+                        "item": {
+                            "type": "reasoning",
+                            "id": "child-abandoned",
+                            "summary": ""
+                        }
+                    }),
+                )
+                .await;
+
+            let events = drain_events(&mut child_rx);
+            assert_eq!(
+                event_kinds(&events),
+                vec!["StreamStart", "StreamReasoningDelta", "StreamEnd"]
+            );
+            assert!(events.iter().all(|event| {
+                event
+                    .pointer("/data/message_id")
+                    .or_else(|| event.pointer("/data/message/message_id"))
+                    .and_then(Value::as_str)
+                    .is_none_or(|id| id == "child-replacement")
+            }));
+            assert_codex_protocol_valid(&events);
             inner.rpc.shutdown().await;
         });
     }
