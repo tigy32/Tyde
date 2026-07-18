@@ -166,36 +166,14 @@ pub async fn listen_uds(
 ) -> io::Result<()> {
     #[cfg(unix)]
     {
-        let result = async {
-            let path = path.as_ref();
-            prepare_uds_path(path).await?;
-
-            let _cleanup = UdsPathCleanup {
-                path: path.to_path_buf(),
-            };
-            let listener = UnixListener::bind(path)?;
-            loop {
-                let (stream, _) = listener.accept().await?;
-                let host = host.clone();
-
-                tokio::spawn(async move {
-                    let connection = match accept(&config, stream).await {
-                        Ok(connection) => connection,
-                        Err(err) => {
-                            tracing::error!("handshake failed: {err:?}");
-                            return;
-                        }
-                    };
-
-                    if let Err(err) = run_connection(connection, host).await {
-                        tracing::error!("connection loop failed: {err:?}");
-                    }
-                });
+        let listener = match bind_uds(path).await {
+            Ok(listener) => listener,
+            Err(err) => {
+                host.shutdown_spawn_operations().await;
+                return Err(err);
             }
-        }
-        .await;
-        host.shutdown_spawn_operations().await;
-        result
+        };
+        serve_uds(listener, config, host).await
     }
 
     #[cfg(not(unix))]
@@ -208,6 +186,57 @@ pub async fn listen_uds(
             "Unix domain sockets are not supported on this platform",
         ))
     }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct BoundUdsListener {
+    listener: UnixListener,
+    _cleanup: UdsPathCleanup,
+}
+
+#[cfg(unix)]
+pub async fn bind_uds(path: impl AsRef<Path>) -> io::Result<BoundUdsListener> {
+    let path = path.as_ref();
+    prepare_uds_path(path).await?;
+    let listener = UnixListener::bind(path)?;
+    Ok(BoundUdsListener {
+        listener,
+        _cleanup: UdsPathCleanup {
+            path: path.to_path_buf(),
+        },
+    })
+}
+
+#[cfg(unix)]
+pub async fn serve_uds(
+    listener: BoundUdsListener,
+    config: ServerConfig,
+    host: HostHandle,
+) -> io::Result<()> {
+    let result = async {
+        loop {
+            let (stream, _) = listener.listener.accept().await?;
+            let host = host.clone();
+
+            tokio::spawn(async move {
+                let connection = match accept(&config, stream).await {
+                    Ok(connection) => connection,
+                    Err(err) => {
+                        tracing::error!("handshake failed: {err:?}");
+                        return;
+                    }
+                };
+
+                if let Err(err) = run_connection(connection, host).await {
+                    tracing::error!("connection loop failed: {err:?}");
+                }
+            });
+        }
+    }
+    .await;
+    host.shutdown_spawn_operations().await;
+    result
 }
 
 async fn send_reject<W: AsyncWrite + Unpin>(
@@ -264,6 +293,7 @@ async fn prepare_uds_path(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
+#[derive(Debug)]
 struct UdsPathCleanup {
     path: PathBuf,
 }
@@ -272,5 +302,42 @@ struct UdsPathCleanup {
 impl Drop for UdsPathCleanup {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::bind_uds;
+    use std::io::ErrorKind;
+
+    #[tokio::test]
+    async fn concurrent_uds_binding_has_exactly_one_owner() {
+        let dir = tempfile::tempdir().expect("socket tempdir");
+        let path = dir.path().join("tyde.sock");
+
+        let (left, right) = tokio::join!(bind_uds(&path), bind_uds(&path));
+        let (owner, rejected) = match (left, right) {
+            (Ok(owner), Err(rejected)) | (Err(rejected), Ok(owner)) => (owner, rejected),
+            (left, right) => panic!("exactly one bind must win: left={left:?}, right={right:?}"),
+        };
+        assert_eq!(rejected.kind(), ErrorKind::AddrInUse);
+        assert!(path.exists(), "the winning owner keeps the socket path");
+
+        drop(owner);
+        assert!(!path.exists(), "dropping the owner removes its socket path");
+    }
+
+    #[tokio::test]
+    async fn stale_uds_path_is_recovered_before_binding() {
+        let dir = tempfile::tempdir().expect("socket tempdir");
+        let path = dir.path().join("tyde.sock");
+        let stale = tokio::net::UnixListener::bind(&path).expect("stale listener");
+        drop(stale);
+        assert!(path.exists(), "fixture leaves a stale socket path");
+
+        let owner = bind_uds(&path).await.expect("replace stale socket");
+        assert!(path.exists());
+        drop(owner);
+        assert!(!path.exists());
     }
 }

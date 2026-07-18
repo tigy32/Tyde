@@ -27,6 +27,8 @@ pub(crate) mod workflows;
 
 pub use backend::{acp, antigravity, claude, codex, kiro, subprocess};
 
+#[cfg(unix)]
+pub use acceptor::{BoundUdsListener, bind_uds, serve_uds};
 pub use acceptor::{HandshakeError, accept, listen_uds};
 pub use agent_control_mcp::AgentControlMcpCaller;
 pub use connection::{run_connection, run_mobile_connection};

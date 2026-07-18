@@ -3,6 +3,21 @@ use std::time::{Duration, Instant};
 
 const HOST_SOCKET_PATH_ENV: &str = "TYDE_SOCKET_PATH";
 
+#[cfg(unix)]
+async fn bind_host_socket_before_start<T>(
+    socket_path: &Path,
+    start: impl FnOnce() -> Result<T, String>,
+) -> Result<(server::BoundUdsListener, T), String> {
+    let listener = server::bind_uds(socket_path).await.map_err(|err| {
+        format!(
+            "host UDS listener failed at {}: {err}",
+            socket_path.display()
+        )
+    })?;
+    let host = start()?;
+    Ok((listener, host))
+}
+
 pub fn run() -> Result<(), String> {
     #[cfg(not(unix))]
     {
@@ -24,17 +39,22 @@ pub fn run() -> Result<(), String> {
             .map_err(|err| format!("failed to create tokio runtime for host UDS mode: {err}"))?;
 
         runtime.block_on(async move {
-            let host = server::spawn_host_with_store_paths_and_runtime_config(
-                server::store::session::SessionStore::default_path()?,
-                server::store::project::ProjectStore::default_path()?,
-                server::store::settings::HostSettingsStore::default_path()?,
-                server::HostRuntimeConfig {
-                    agents_view_preferences_primary: false,
-                    ..server::HostRuntimeConfig::default()
-                },
-            )?;
+            // Host construction starts mobile access, so socket ownership must
+            // be settled first or two starters can split desktop and mobile.
+            let (listener, host) = bind_host_socket_before_start(&socket_path, || {
+                server::spawn_host_with_store_paths_and_runtime_config(
+                    server::store::session::SessionStore::default_path()?,
+                    server::store::project::ProjectStore::default_path()?,
+                    server::store::settings::HostSettingsStore::default_path()?,
+                    server::HostRuntimeConfig {
+                        agents_view_preferences_primary: false,
+                        ..server::HostRuntimeConfig::default()
+                    },
+                )
+            })
+            .await?;
 
-            server::listen_uds(&socket_path, server::ServerConfig::current(), host)
+            server::serve_uds(listener, server::ServerConfig::current(), host)
                 .await
                 .map_err(|err| {
                     format!(
@@ -137,4 +157,32 @@ fn resolve_socket_path() -> Result<PathBuf, String> {
     }
 
     Ok(server::paths::home_dir()?.join(".tyde").join("tyde.sock"))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::bind_host_socket_before_start;
+    use std::cell::Cell;
+
+    #[tokio::test]
+    async fn socket_contention_rejects_before_host_start() {
+        let path =
+            std::path::PathBuf::from(format!("/tmp/tyde-uds-test-{}.sock", uuid::Uuid::new_v4()));
+        let owner = server::bind_uds(&path).await.expect("first socket owner");
+        let started = Cell::new(false);
+
+        let result = bind_host_socket_before_start(&path, || {
+            started.set(true);
+            Ok(())
+        })
+        .await;
+
+        assert!(
+            result.is_err(),
+            "the second starter must lose at the socket"
+        );
+        assert!(!started.get(), "a socket loser must not construct a host");
+        drop(owner);
+        assert!(!path.exists(), "the socket owner must clean up its path");
+    }
 }
