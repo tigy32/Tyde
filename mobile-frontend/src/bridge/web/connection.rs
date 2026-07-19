@@ -857,6 +857,10 @@ impl ConnectErr {
             Self::Invalidated(ConnectionInvalidation::HeartbeatTimeout { .. }) => {
                 MobileAccessErrorCode::TransportFailed
             }
+            #[cfg(target_arch = "wasm32")]
+            Self::Invalidated(ConnectionInvalidation::ForegroundResume { .. }) => {
+                MobileAccessErrorCode::TransportFailed
+            }
             Self::Invalidated(_) => MobileAccessErrorCode::BrokerProtocol,
             Self::NeedsRepair(_) => MobileAccessErrorCode::RepairRequired,
             Self::ManagedCredentials(error) => error.code,

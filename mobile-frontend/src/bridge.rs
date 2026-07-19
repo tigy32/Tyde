@@ -60,9 +60,19 @@ pub struct SubmissionTransportOutcomeEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionInvalidation {
-    SequenceViolation { message: String },
-    ProtocolViolation { message: String },
-    HeartbeatTimeout { elapsed_ms: u64 },
+    SequenceViolation {
+        message: String,
+    },
+    ProtocolViolation {
+        message: String,
+    },
+    HeartbeatTimeout {
+        elapsed_ms: u64,
+    },
+    #[cfg(target_arch = "wasm32")]
+    ForegroundResume {
+        background_ms: u64,
+    },
 }
 
 impl std::fmt::Display for ConnectionInvalidation {
@@ -76,6 +86,10 @@ impl std::fmt::Display for ConnectionInvalidation {
             }
             Self::HeartbeatTimeout { elapsed_ms } => {
                 write!(f, "host heartbeat timed out after {elapsed_ms} ms")
+            }
+            #[cfg(target_arch = "wasm32")]
+            Self::ForegroundResume { background_ms } => {
+                write!(f, "app resumed after {background_ms} ms in the background")
             }
         }
     }

@@ -1,3 +1,5 @@
+#[cfg(target_arch = "wasm32")]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -20,10 +22,17 @@ use protocol::{FrameKind, HeartbeatPayload};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(20);
+#[cfg(target_arch = "wasm32")]
+const BACKGROUND_RECONNECT_AFTER: Duration = Duration::from_secs(15);
 
 thread_local! {
     static SEEN_HOST_LINES: RefCell<HashSet<(LocalHostId, u64)>> =
         RefCell::new(HashSet::new());
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static PAGE_HIDDEN_SINCE_MS: Cell<Option<u64>> = const { Cell::new(None) };
 }
 
 #[component]
@@ -33,6 +42,7 @@ pub fn App() -> impl IntoView {
     provide_context(state.clone());
 
     install_event_listeners(state.clone());
+    install_page_visibility_recovery(state.clone());
     spawn_initial_paired_hosts_load(state.clone());
     install_app_mode_effect(state.clone());
     spawn_boot_pairing_handoff(state.clone());
@@ -58,6 +68,96 @@ pub fn App() -> impl IntoView {
                 }
             }}
         </div>
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForegroundRecovery {
+    Probe,
+    Reconnect,
+}
+
+#[cfg(target_arch = "wasm32")]
+fn foreground_recovery(background_ms: u64) -> ForegroundRecovery {
+    if background_ms >= BACKGROUND_RECONNECT_AFTER.as_millis() as u64 {
+        ForegroundRecovery::Reconnect
+    } else {
+        ForegroundRecovery::Probe
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn install_page_visibility_recovery(state: AppState) {
+    use wasm_bindgen::{JsCast, closure::Closure};
+
+    let Some(document) = web_sys::window().and_then(|window| window.document()) else {
+        report_shell_error(
+            &state,
+            MobileAccessErrorCode::Internal,
+            "Failed to install foreground recovery: browser document is unavailable.".to_owned(),
+        );
+        return;
+    };
+    let document_for_callback = document.clone();
+    let state_for_callback = state.clone();
+    let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+        let hidden = js_sys::Reflect::get(document_for_callback.as_ref(), &"hidden".into())
+            .ok()
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        if hidden {
+            PAGE_HIDDEN_SINCE_MS.with(|hidden_since| hidden_since.set(Some(unix_time_ms())));
+            return;
+        }
+
+        let Some(hidden_since_ms) = PAGE_HIDDEN_SINCE_MS.with(|hidden_since| hidden_since.take())
+        else {
+            return;
+        };
+        let background_ms = unix_time_ms().saturating_sub(hidden_since_ms);
+        let state = state_for_callback.clone();
+        spawn_local(async move {
+            recover_after_foreground(&state, background_ms).await;
+        });
+    });
+    if let Err(error) = document
+        .add_event_listener_with_callback("visibilitychange", callback.as_ref().unchecked_ref())
+    {
+        report_shell_error(
+            &state,
+            MobileAccessErrorCode::Internal,
+            format!("Failed to install foreground recovery: {error:?}"),
+        );
+        return;
+    }
+    callback.forget();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn install_page_visibility_recovery(_state: AppState) {}
+
+#[cfg(target_arch = "wasm32")]
+async fn recover_after_foreground(state: &AppState, background_ms: u64) {
+    let Some(host) = state.active_local_host_id.get_untracked() else {
+        return;
+    };
+    match foreground_recovery(background_ms) {
+        ForegroundRecovery::Probe => heartbeat_tick(state).await,
+        ForegroundRecovery::Reconnect => {
+            state.heartbeat_pending_since_by_host.update(|pending| {
+                pending.remove(&host);
+            });
+            state.heartbeat_round_trip_ms_by_host.update(|round_trips| {
+                round_trips.remove(&host);
+            });
+            let reason = bridge::ConnectionInvalidation::ForegroundResume { background_ms };
+            if bridge::invalidate_host_connection(&host, reason).is_err()
+                && let Err(error) = bridge::connect_paired_host(&host).await
+            {
+                log::warn!("foreground recovery could not reconnect host {host}: {error}");
+            }
+        }
     }
 }
 
@@ -1002,6 +1102,23 @@ mod wasm_tests {
     use web_sys::HtmlElement;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    fn foreground_recovery_reconnects_only_after_the_grace_period() {
+        assert_eq!(foreground_recovery(0), ForegroundRecovery::Probe);
+        assert_eq!(
+            foreground_recovery(BACKGROUND_RECONNECT_AFTER.as_millis() as u64 - 1),
+            ForegroundRecovery::Probe
+        );
+        assert_eq!(
+            foreground_recovery(BACKGROUND_RECONNECT_AFTER.as_millis() as u64),
+            ForegroundRecovery::Reconnect
+        );
+        assert_eq!(
+            foreground_recovery(Duration::from_secs(60).as_millis() as u64),
+            ForegroundRecovery::Reconnect
+        );
+    }
 
     fn make_container() -> HtmlElement {
         let document = web_sys::window().unwrap().document().unwrap();
