@@ -78,3 +78,20 @@ test("photo selection can be removed before sending", async ({ page }) => {
   await expect(page.locator("[data-mobile-test='chat-photo-tray']")).toHaveCount(0);
   await expect(page.locator("[data-mobile-test='chat-send']")).toBeDisabled();
 });
+
+test("return inserts a new line instead of sending", async ({ page }) => {
+  await openFixture(page, "chat");
+
+  const composer = page.locator("[data-mobile-test='chat-input']");
+  await expect(composer).toHaveAttribute("enterkeyhint", "enter");
+  await composer.fill("first line");
+  await composer.press("Enter");
+  await composer.type("second line");
+
+  await expect(composer).toHaveValue("first line\nsecond line");
+  await expect
+    .poll(() =>
+      page.evaluate(() => window.__TYDE_FIXTURE_SENT_LINES__?.length ?? 0),
+    )
+    .toBe(0);
+});

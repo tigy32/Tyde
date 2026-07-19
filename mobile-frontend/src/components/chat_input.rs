@@ -448,7 +448,7 @@ pub fn ChatInput() -> impl IntoView {
 
     let send_for_key = do_send.clone();
     let on_keydown = move |ev: web_sys::KeyboardEvent| {
-        if ev.key() == "Enter" && !ev.shift_key() {
+        if ev.key() == "Enter" && (ev.meta_key() || ev.ctrl_key()) {
             ev.prevent_default();
             send_for_key();
         }
@@ -856,6 +856,7 @@ pub fn ChatInput() -> impl IntoView {
                     class="chat-input-field"
                     placeholder="Message..."
                     aria-label="Message composer"
+                    enterkeyhint="enter"
                     rows=1
                     data-mobile-test="chat-input"
                     node_ref=textarea_ref
