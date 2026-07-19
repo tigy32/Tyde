@@ -3,9 +3,14 @@
   "private": true,
   "version": "0.8.19-beta.34",
   "scripts": {
-    "tauri": "cargo tauri"
+    "tauri": "cargo tauri",
+    "mobile:ui:serve": "cd mobile-frontend && NO_COLOR=true trunk serve --features ui-fixtures --address 127.0.0.1 --port 4173",
+    "mobile:ui:test": "playwright test --config playwright.mobile.config.mjs",
+    "mobile:ui:screenshots": "playwright test --config playwright.mobile.config.mjs --grep @visual",
+    "mobile:ui:report": "playwright show-report test-results/mobile-playwright-report"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@tauri-apps/cli": "^2"
   }
 }

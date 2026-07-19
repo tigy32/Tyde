@@ -270,6 +270,11 @@ pub async fn send_host_line(
     local_host_id: &LocalHostId,
     line: &str,
 ) -> Result<Accepted, SendRejected> {
+    #[cfg(all(feature = "ui-fixtures", debug_assertions))]
+    if crate::fixtures::is_requested() {
+        return Ok(crate::fixtures::capture_send(line));
+    }
+
     connection::manager()
         .send_line(local_host_id.clone(), line.to_owned())
         .await

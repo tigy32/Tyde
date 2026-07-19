@@ -2,6 +2,8 @@
 /old
 /build
 /node_modules
+/test-results
+/playwright-report
 
 # Python cache artifacts
 __pycache__/

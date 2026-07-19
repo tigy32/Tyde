@@ -48,8 +48,33 @@ pub fn App() -> impl IntoView {
     spawn_boot_pairing_handoff(state.clone());
     spawn_heartbeat_loop(state.clone());
 
+    view! { <AppSurface /> }
+}
+
+#[cfg(all(feature = "ui-fixtures", debug_assertions))]
+#[component]
+pub fn FixtureApp() -> impl IntoView {
+    let state = AppState::new();
+    crate::fixtures::seed_state(&state);
+    provide_context(state);
+
+    view! { <AppSurface /> }
+}
+
+#[component]
+fn AppSurface() -> impl IntoView {
+    let state = use_context::<AppState>().unwrap();
     view! {
-        <div class="mobile-app" data-theme=move || state.theme.get()>
+        <div
+            class="mobile-app"
+            data-theme=move || state.theme.get()
+            data-mobile-fixture={
+                #[cfg(all(feature = "ui-fixtures", debug_assertions))]
+                { crate::fixtures::fixture_name() }
+                #[cfg(not(all(feature = "ui-fixtures", debug_assertions)))]
+                { String::new() }
+            }
+        >
             // Mounted in every app mode so a paste-failed-during-pairing or
             // listener-registration failure stays visible. (Phase C HIGH 4.)
             <components::MobileShellErrorBanner />

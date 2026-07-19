@@ -3,6 +3,8 @@ mod app;
 mod bridge;
 mod components;
 mod dispatch;
+#[cfg(all(feature = "ui-fixtures", debug_assertions))]
+mod fixtures;
 mod markdown;
 mod send;
 pub mod state;
@@ -17,6 +19,14 @@ fn main() {
         show_boot_error("Tyde Mobile could not mount: #app-root is missing");
         return;
     };
+
+    #[cfg(all(feature = "ui-fixtures", debug_assertions))]
+    if fixtures::is_requested() {
+        leptos::mount::mount_to(root, app::FixtureApp).forget();
+        remove_boot_screen();
+        fixtures::mark_ready();
+        return;
+    }
 
     leptos::mount::mount_to(root, app::App).forget();
     remove_boot_screen();

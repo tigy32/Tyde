@@ -677,12 +677,12 @@ pub fn ChatInput() -> impl IntoView {
     let on_photos_chosen = move |ev| {
         let input = event_target::<web_sys::HtmlInputElement>(&ev);
         let files = input.files();
-        input.set_value("");
 
         if !selected_backend_kind(&choose_photo_state)
             .map(protocol::BackendKind::supports_image_input)
             .unwrap_or(false)
         {
+            input.set_value("");
             attachment_error.set(Some(
                 "The selected agent backend does not support photo input.".to_owned(),
             ));
@@ -695,6 +695,7 @@ pub fn ChatInput() -> impl IntoView {
         let files = (0..files.length())
             .filter_map(|index| files.get(index))
             .collect::<Vec<_>>();
+        input.set_value("");
         if files.is_empty() {
             return;
         }
