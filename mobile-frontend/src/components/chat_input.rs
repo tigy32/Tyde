@@ -1,6 +1,7 @@
+use base64::Engine;
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::spawn_local;
+use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use crate::bridge::Accepted;
 use crate::send::SendFrameError;
@@ -10,6 +11,13 @@ use crate::state::{
 
 const CHAT_INPUT_MIN_HEIGHT_PX: i32 = 36;
 const CHAT_INPUT_MAX_HEIGHT_PX: i32 = 132;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingImage {
+    name: String,
+    media_type: String,
+    data: String,
+}
 
 /// Visually hidden, still announced. Inline because this is an accessibility
 /// invariant of the composer, not a theming choice.
@@ -47,14 +55,16 @@ struct OutboundSubmission {
     images: Vec<protocol::ImageData>,
 }
 
-/// The composer's own handles: the textarea, the live region that announces a
-/// move, and the in-flight latch.
+/// The composer's own handles: its text and photos, the live region that
+/// announces a move, and the in-flight latch.
 ///
 /// `Copy`, so it can be handed to a `spawn_local` future without cloning
 /// ceremony at every call site.
 #[derive(Clone, Copy)]
 struct Composer {
     textarea: NodeRef<leptos::html::Textarea>,
+    images: RwSignal<Vec<PendingImage>>,
+    attachment_error: RwSignal<Option<String>>,
     announcement: RwSignal<String>,
     /// Set while a submission is unsettled.
     ///
@@ -74,6 +84,8 @@ impl Composer {
     fn new() -> Self {
         Self {
             textarea: NodeRef::new(),
+            images: RwSignal::new(Vec::new()),
+            attachment_error: RwSignal::new(None),
             announcement: RwSignal::new(String::new()),
             submitting: RwSignal::new(false),
         }
@@ -92,14 +104,80 @@ impl Composer {
     }
 
     /// Empty the composer. Called only from [`settle_submission`], and only once
-    /// the text has a holder.
+    /// the complete submission has a holder.
     fn clear(&self, state: &AppState) {
         state.chat_input.set(String::new());
+        self.images.set(Vec::new());
+        self.attachment_error.set(None);
         if let Some(textarea) = self.textarea.get_untracked() {
             textarea.set_value("");
             resize_chat_input(&textarea);
         }
     }
+
+    fn image_payload(&self) -> Vec<protocol::ImageData> {
+        self.images.with_untracked(|images| {
+            images
+                .iter()
+                .map(|image| protocol::ImageData {
+                    media_type: image.media_type.clone(),
+                    data: image.data.clone(),
+                })
+                .collect()
+        })
+    }
+}
+
+fn selected_backend_kind(state: &AppState) -> Option<protocol::BackendKind> {
+    if let Some(active) = state.active_agent.get_untracked() {
+        if let Some(kind) = state.agents.with_untracked(|agents| {
+            agents
+                .iter()
+                .find(|agent| {
+                    agent.local_host_id == active.local_host_id
+                        && agent.agent_id == active.agent_id
+                })
+                .map(|agent| agent.backend_kind)
+        }) {
+            return Some(kind);
+        }
+    }
+
+    state
+        .draft_backend_override
+        .get_untracked()
+        .or_else(|| {
+            state
+                .active_host_settings_untracked()
+                .and_then(|settings| settings.default_backend)
+        })
+        .or_else(|| {
+            state
+                .active_host_settings_untracked()
+                .and_then(|settings| settings.enabled_backends.first().copied())
+        })
+}
+
+async fn read_image_file(file: web_sys::File) -> Result<PendingImage, String> {
+    let name = file.name();
+    let media_type = file.type_();
+    if !media_type.starts_with("image/") {
+        return Err(format!("{name} is not an image file"));
+    }
+
+    let buffer = JsFuture::from(file.array_buffer())
+        .await
+        .map_err(|error| {
+            error
+                .as_string()
+                .unwrap_or_else(|| format!("Failed to read {name}"))
+        })?;
+    let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
+    Ok(PendingImage {
+        name,
+        media_type,
+        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
 }
 
 fn queued_message_preview(entry: &protocol::QueuedMessageEntry) -> String {
@@ -264,6 +342,9 @@ pub fn ChatInput() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
     let composer = Composer::new();
     let textarea_ref = composer.textarea;
+    let photo_input_ref = NodeRef::<leptos::html::Input>::new();
+    let attachment_error = composer.attachment_error;
+    let loading_photos = RwSignal::new(false);
     let submitting = composer.submitting;
 
     let do_send = {
@@ -275,11 +356,12 @@ pub fn ChatInput() -> impl IntoView {
             // second tap read empty text and short-circuit. That was never a
             // guard, it was a side effect, and a second `SpawnAgent` costs a
             // second agent and a second paid turn. Guard it explicitly.
-            if composer.is_busy() {
+            if composer.is_busy() || loading_photos.get_untracked() {
                 return;
             }
             let text = state.chat_input.get_untracked().trim().to_string();
-            if text.is_empty() {
+            let images = composer.image_payload();
+            if text.is_empty() && images.is_empty() {
                 return;
             }
 
@@ -323,7 +405,7 @@ pub fn ChatInput() -> impl IntoView {
                     Some((active, stream)) => {
                         let payload = protocol::SendMessagePayload {
                             message: text.clone(),
-                            images: None,
+                            images: (!images.is_empty()).then(|| images.clone()),
                             origin: None,
                             tool_response: None,
                         };
@@ -340,8 +422,12 @@ pub fn ChatInput() -> impl IntoView {
                         // A new chat has no agent yet, and the client must not
                         // guess which `NewAgent` is its own — so this record is
                         // host-scoped, not attached to any agent.
-                        let outcome =
-                            crate::actions::spawn_new_chat(&state, text.clone(), vec![]).await;
+                        let outcome = crate::actions::spawn_new_chat(
+                            &state,
+                            text.clone(),
+                            images.clone(),
+                        )
+                        .await;
                         (SubmissionTarget::NewChat, outcome)
                     }
                 };
@@ -352,7 +438,7 @@ pub fn ChatInput() -> impl IntoView {
                         local_host_id: host,
                         target,
                         text,
-                        images: Vec::new(),
+                        images,
                     },
                     outcome,
                 );
@@ -371,7 +457,7 @@ pub fn ChatInput() -> impl IntoView {
     let do_steer = {
         let state = state.clone();
         move || {
-            if composer.is_busy() {
+            if composer.is_busy() || loading_photos.get_untracked() {
                 return;
             }
             let Some(active) = state.active_agent.get_untracked() else {
@@ -383,8 +469,9 @@ pub fn ChatInput() -> impl IntoView {
             };
 
             let text = state.chat_input.get_untracked().trim().to_string();
+            let images = composer.image_payload();
             let host = active.local_host_id.clone();
-            if !text.is_empty() && refuse_unholdable(&state, &host) {
+            if (!text.is_empty() || !images.is_empty()) && refuse_unholdable(&state, &host) {
                 return;
             }
 
@@ -406,13 +493,13 @@ pub fn ChatInput() -> impl IntoView {
                     report_send_error(&state, format!("Failed to interrupt current turn: {error}"));
                     return;
                 }
-                if text.is_empty() {
+                if text.is_empty() && images.is_empty() {
                     composer.finish();
                     return;
                 }
                 let payload = protocol::SendMessagePayload {
                     message: text.clone(),
-                    images: None,
+                    images: (!images.is_empty()).then(|| images.clone()),
                     origin: None,
                     tool_response: None,
                 };
@@ -430,7 +517,7 @@ pub fn ChatInput() -> impl IntoView {
                         local_host_id: host,
                         target: SubmissionTarget::Agent(active.as_agent_ref()),
                         text,
-                        images: Vec::new(),
+                        images,
                     },
                     outcome,
                 );
@@ -478,11 +565,12 @@ pub fn ChatInput() -> impl IntoView {
     let do_btw = {
         let state = state.clone();
         move || {
-            if composer.is_busy() {
+            if composer.is_busy() || loading_photos.get_untracked() {
                 return;
             }
             let text = state.chat_input.get_untracked().trim().to_string();
-            if text.is_empty() {
+            let images = composer.image_payload();
+            if text.is_empty() && images.is_empty() {
                 return;
             }
             let Some(host) = state
@@ -502,8 +590,12 @@ pub fn ChatInput() -> impl IntoView {
             let state = state.clone();
             composer.begin();
             spawn_local(async move {
-                let outcome =
-                    crate::actions::spawn_side_question(&state, text.clone(), vec![]).await;
+                let outcome = crate::actions::spawn_side_question(
+                    &state,
+                    text.clone(),
+                    images.clone(),
+                )
+                .await;
                 settle_submission(
                     &state,
                     composer,
@@ -511,7 +603,7 @@ pub fn ChatInput() -> impl IntoView {
                         local_host_id: host,
                         target: SubmissionTarget::NewChat,
                         text,
-                        images: Vec::new(),
+                        images,
                     },
                     outcome,
                 );
@@ -533,15 +625,17 @@ pub fn ChatInput() -> impl IntoView {
     let s_input = state.clone();
     let running_state = state.clone();
     let is_running = Memo::new(move |_| active_agent_is_running_tracked(&running_state));
-    let has_text_state = state.clone();
-    let has_text = Memo::new(move |_| has_text_state.chat_input.with(|t| !t.trim().is_empty()));
+    let has_input_state = state.clone();
+    let has_input = Memo::new(move |_| {
+        has_input_state.chat_input.with(|text| !text.trim().is_empty())
+            || composer.images.with(|images| !images.is_empty())
+    });
     let btw_state = state.clone();
     let can_btw = Memo::new(move |_| {
-        btw_state.chat_input.with(|t| !t.trim().is_empty())
-            && active_agent_has_session_id_tracked(&btw_state)
+        has_input.get() && active_agent_has_session_id_tracked(&btw_state)
     });
-    // Steer = thinking + draft typed.
-    let is_steer = Memo::new(move |_| is_running.get() && has_text.get());
+    // Steer = thinking + draft text or photos.
+    let is_steer = Memo::new(move |_| is_running.get() && has_input.get());
     // Menu holds items only for: Fork + send (input+session) or Steer+Cancel (thinking+input).
     // Steer and Fork + send are submissions too, and both spend money (Fork + send
     // creates an agent). The in-flight latch closes the whole surface, not just
@@ -559,6 +653,71 @@ pub fn ChatInput() -> impl IntoView {
             ev.prevent_default();
             menu_open.set(false);
         }
+    };
+
+    let add_photo_state = state.clone();
+    let on_add_photo = move |_| {
+        if !selected_backend_kind(&add_photo_state)
+            .map(protocol::BackendKind::supports_image_input)
+            .unwrap_or(false)
+        {
+            attachment_error.set(Some(
+                "The selected agent backend does not support photo input.".to_owned(),
+            ));
+            return;
+        }
+        attachment_error.set(None);
+        if let Some(input) = photo_input_ref.get_untracked() {
+            let input: web_sys::HtmlElement = input.unchecked_into();
+            input.click();
+        }
+    };
+
+    let choose_photo_state = state.clone();
+    let on_photos_chosen = move |ev| {
+        let input = event_target::<web_sys::HtmlInputElement>(&ev);
+        let files = input.files();
+        input.set_value("");
+
+        if !selected_backend_kind(&choose_photo_state)
+            .map(protocol::BackendKind::supports_image_input)
+            .unwrap_or(false)
+        {
+            attachment_error.set(Some(
+                "The selected agent backend does not support photo input.".to_owned(),
+            ));
+            return;
+        }
+
+        let Some(files) = files else {
+            return;
+        };
+        let files = (0..files.length())
+            .filter_map(|index| files.get(index))
+            .collect::<Vec<_>>();
+        if files.is_empty() {
+            return;
+        }
+
+        loading_photos.set(true);
+        attachment_error.set(None);
+        spawn_local(async move {
+            let mut added = Vec::new();
+            let mut errors = Vec::new();
+            for file in files {
+                match read_image_file(file).await {
+                    Ok(image) => added.push(image),
+                    Err(error) => errors.push(error),
+                }
+            }
+            if !added.is_empty() {
+                composer.images.update(|images| images.extend(added));
+            }
+            if !errors.is_empty() {
+                attachment_error.set(Some(errors.join(" ")));
+            }
+            loading_photos.set(false);
+        });
     };
 
     let queue_state = state.clone();
@@ -617,7 +776,81 @@ pub fn ChatInput() -> impl IntoView {
                     </div>
                 }.into_any()
             }}
+            <input
+                class="chat-photo-input"
+                type="file"
+                accept="image/*"
+                multiple=true
+                aria-label="Choose photos"
+                data-mobile-test="chat-photo-input"
+                node_ref=photo_input_ref
+                on:change=on_photos_chosen
+            />
+            <Show when=move || !composer.images.get().is_empty()>
+                <div
+                    class="chat-photo-tray"
+                    aria-label="Attached photos"
+                    data-mobile-test="chat-photo-tray"
+                >
+                    {move || {
+                        composer
+                            .images
+                            .get()
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, image)| {
+                                let src = format!(
+                                    "data:{};base64,{}",
+                                    image.media_type, image.data
+                                );
+                                let alt = image.name.clone();
+                                view! {
+                                    <div class="chat-photo-preview">
+                                        <img src=src alt=alt />
+                                        <button
+                                            type="button"
+                                            class="chat-photo-remove"
+                                            aria-label=format!("Remove {}", image.name)
+                                            on:click=move |_| {
+                                                composer.images.update(|images| {
+                                                    if index < images.len() {
+                                                        images.remove(index);
+                                                    }
+                                                });
+                                                attachment_error.set(None);
+                                            }
+                                        >
+                                            "×"
+                                        </button>
+                                    </div>
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    }}
+                </div>
+            </Show>
+            <Show when=move || attachment_error.get().is_some()>
+                <div
+                    class="chat-photo-error"
+                    role="alert"
+                    data-mobile-test="chat-photo-error"
+                >
+                    {move || attachment_error.get().unwrap_or_default()}
+                </div>
+            </Show>
             <div class="chat-input-row">
+                <button
+                    type="button"
+                    class="chat-photo-button"
+                    aria-label="Add photos"
+                    data-mobile-test="chat-add-photo"
+                    disabled=move || loading_photos.get() || submitting.get()
+                    on:click=on_add_photo
+                >
+                    <span aria-hidden="true">
+                        {move || if loading_photos.get() { "…" } else { "+" }}
+                    </span>
+                </button>
                 <textarea
                     class="chat-input-field"
                     placeholder="Message..."
@@ -645,7 +878,7 @@ pub fn ChatInput() -> impl IntoView {
                         type="button"
                         class="send-button chat-send-split-primary"
                         aria-label={move || {
-                            if is_running.get() && !has_text.get() { "Cancel current turn" }
+                            if is_running.get() && !has_input.get() { "Cancel current turn" }
                             else if is_steer.get() { "Queue message" }
                             else { "Send message" }
                         }}
@@ -654,7 +887,7 @@ pub fn ChatInput() -> impl IntoView {
                             let do_interrupt = interrupt_for_menu.clone();
                             let do_send = send_for_menu.clone();
                             move |_| {
-                                if is_running.get_untracked() && !has_text.get_untracked() {
+                                if is_running.get_untracked() && !has_input.get_untracked() {
                                     do_interrupt();
                                 } else {
                                     do_send();
@@ -664,15 +897,15 @@ pub fn ChatInput() -> impl IntoView {
                         disabled=move || {
                             // Cancel (thinking+empty): always enabled — stopping a
                             // turn must never be blocked by an unsettled send.
-                            if is_running.get() && !has_text.get() { false }
-                            // The composer now keeps its text across the in-flight
-                            // window, so "has text" no longer implies "not already
-                            // sending". Say so explicitly.
-                            else { !has_text.get() || submitting.get() }
+                            if is_running.get() && !has_input.get() { false }
+                            // The composer keeps its draft across the in-flight
+                            // window, so having input no longer implies this is
+                            // a fresh send. Say so explicitly.
+                            else { !has_input.get() || submitting.get() || loading_photos.get() }
                         }
                     >
                         {move || {
-                            if is_running.get() && !has_text.get() { "Cancel" }
+                            if is_running.get() && !has_input.get() { "Cancel" }
                             else if is_steer.get() { "Queue" }
                             else { "Send" }
                         }}
@@ -949,6 +1182,45 @@ mod wasm_tests {
             !composer.is_busy(),
             "settling must release the in-flight latch, or the composer stays wedged"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn admission_moves_photos_into_the_recovery_record() {
+        let state = AppState::new();
+        let host = LocalHostId("host-1".to_owned());
+        let composer = Composer::new();
+        composer.images.set(vec![PendingImage {
+            name: "photo.jpg".to_owned(),
+            media_type: "image/jpeg".to_owned(),
+            data: "cGhvdG8=".to_owned(),
+        }]);
+        let images = composer.image_payload();
+
+        settle_submission(
+            &state,
+            composer,
+            OutboundSubmission {
+                local_host_id: host,
+                target: SubmissionTarget::NewChat,
+                text: String::new(),
+                images,
+            },
+            Ok(accepted(2)),
+        );
+
+        assert!(
+            composer.images.get_untracked().is_empty(),
+            "admitted photos must leave the composer"
+        );
+        let held = state
+            .pending_submissions
+            .get_untracked()
+            .get(&LocalSubmissionId(2))
+            .cloned()
+            .expect("an admitted photo must have a recovery record");
+        assert_eq!(held.images.len(), 1);
+        assert_eq!(held.images[0].media_type, "image/jpeg");
+        assert_eq!(held.images[0].data, "cGhvdG8=");
     }
 
     /// A rejected submission never left the composer, so there is nothing to
@@ -1248,6 +1520,22 @@ mod wasm_tests {
         assert!(
             c.has_attribute("disabled"),
             "caret must be disabled with no menu items"
+        );
+
+        let picker: web_sys::HtmlInputElement = container
+            .query_selector("[data-mobile-test='chat-photo-input']")
+            .unwrap()
+            .expect("the composer must include a phone photo picker")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(picker.accept(), "image/*");
+        assert!(picker.multiple(), "the picker should allow multiple photos");
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-add-photo']")
+                .unwrap()
+                .is_some(),
+            "the photo picker needs a visible touch target"
         );
     }
 

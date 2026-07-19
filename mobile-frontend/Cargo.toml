@@ -72,6 +72,10 @@ web-sys = { version = "0.3", features = [
     "IdbVersionChangeEvent",
     "DomException",
     "DomStringList",
+    "Blob",
+    "File",
+    "FileList",
+    "HtmlInputElement",
 ] }
 log = "0.4"
 console_log = "1"
