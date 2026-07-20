@@ -9,10 +9,10 @@ use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use protocol::{
     AgentInput, BackendConfigField, BackendConfigFieldType, BackendConfigPersistenceMode,
     BackendConfigSchema, BackendConfigValues, BackendKind, BackendSetupDiagnosticCode, ChatEvent,
-    ChatMessage, MessageSender, MessageTokenUsage, ModelInfo, OperationCancelledData, SelectOption,
-    SendMessageToolResponse, SessionId, SessionSettingField, SessionSettingFieldType,
-    SessionSettingValue, SessionSettingsSchema, SessionSettingsValues, StreamEndData,
-    StreamStartData, StreamTextDeltaData, TokenUsage, TokenUsageUnavailableReason,
+    ChatMessage, ContextBreakdown, MessageSender, MessageTokenUsage, ModelInfo,
+    OperationCancelledData, SelectOption, SendMessageToolResponse, SessionId, SessionSettingField,
+    SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SessionSettingsValues,
+    StreamEndData, StreamStartData, StreamTextDeltaData, TokenUsage, TokenUsageUnavailableReason,
     ToolExecutionCompletedData, ToolExecutionResult, ToolProgressData, ToolProgressUpdate,
     ToolRequest, ToolRequestType, ToolUseData,
 };
@@ -67,9 +67,18 @@ load_hermes_dotenv()
 from tui_gateway import server as _tyde_gateway_server
 
 _tyde_original_emit = _tyde_gateway_server._emit
+_tyde_original_get_usage = _tyde_gateway_server._get_usage
 _tyde_tool_start_args = {}
 _tyde_message_condition = threading.Condition()
 _tyde_open_messages = set()
+
+def _tyde_get_usage(agent):
+    usage = dict(_tyde_original_get_usage(agent))
+    if agent is not None:
+        usage["cached_prompt_tokens"] = int(getattr(agent, "session_cache_read_tokens", 0) or 0)
+        usage["cache_creation_input_tokens"] = int(getattr(agent, "session_cache_write_tokens", 0) or 0)
+        usage["reasoning_tokens"] = int(getattr(agent, "session_reasoning_tokens", 0) or 0)
+    return usage
 
 def _tyde_emit(event_type, session_id, payload=None):
     if event_type == "message.start":
@@ -99,6 +108,7 @@ def _tyde_on_tool_start(session_id, tool_call_id, name, args):
     _tyde_original_tool_start(session_id, tool_call_id, name, args)
 
 _tyde_gateway_server._emit = _tyde_emit
+_tyde_gateway_server._get_usage = _tyde_get_usage
 _tyde_gateway_server._on_tool_start = _tyde_on_tool_start
 from tui_gateway.entry import main
 
@@ -283,7 +293,7 @@ struct HermesEventMapper {
     pending_tools: HashMap<String, String>,
     turn_tools: HashMap<String, String>,
     pending_approval_tool_id: Option<String>,
-    last_cumulative_usage: Option<TokenUsage>,
+    cumulative_usage: Option<TokenUsage>,
     awaiting_interrupted_complete: bool,
     session_info_emitted: bool,
     approval_counter: u64,
@@ -1129,62 +1139,97 @@ impl HermesSessionActor {
     }
 
     async fn enrich_message_complete_payload(&mut self, payload: Option<Value>) -> Option<Value> {
-        let has_turn_usage = payload
-            .as_ref()
-            .and_then(|payload| payload.get("usage"))
-            .and_then(token_usage_from_value)
-            .is_some();
-        let usage_result = tokio::time::timeout(
+        let mut payload = payload?;
+        let mut turn_usage = payload.get("usage").and_then(token_usage_from_value);
+        if turn_usage.is_none() {
+            let usage_result = tokio::time::timeout(
+                HERMES_USAGE_TIMEOUT,
+                self.gateway.request(
+                    "session.usage",
+                    json!({ "session_id": self.live_session_id }),
+                ),
+            )
+            .await;
+            turn_usage = match usage_result {
+                Ok(Ok(value)) => token_usage_from_value(&value),
+                Ok(Err(err)) => {
+                    self.emit(ChatEvent::MessageAdded(warning_message(format!(
+                        "Hermes session.usage failed: {err}"
+                    ))));
+                    None
+                }
+                Err(_) => {
+                    self.emit(ChatEvent::MessageAdded(warning_message(
+                        "Hermes session.usage timed out",
+                    )));
+                    None
+                }
+            };
+            if turn_usage.is_none() {
+                self.emit(ChatEvent::MessageAdded(warning_message(
+                    "Hermes session.usage did not report token counts",
+                )));
+            }
+        }
+
+        let context_result = tokio::time::timeout(
             HERMES_USAGE_TIMEOUT,
             self.gateway.request(
-                "session.usage",
+                "session.context_breakdown",
                 json!({ "session_id": self.live_session_id }),
             ),
         )
         .await;
-        let usage = match usage_result {
-            Ok(Ok(value)) => value,
+        let context_breakdown = match context_result {
+            Ok(Ok(value)) => match context_breakdown_from_hermes(&value) {
+                Some(context_breakdown) => Some(context_breakdown),
+                None => {
+                    self.emit(ChatEvent::MessageAdded(warning_message(
+                        "Hermes session.context_breakdown did not report context usage",
+                    )));
+                    None
+                }
+            },
             Ok(Err(err)) => {
                 self.emit(ChatEvent::MessageAdded(warning_message(format!(
-                    "Hermes session.usage failed: {err}"
+                    "Hermes session.context_breakdown failed: {err}"
                 ))));
-                return payload;
+                None
             }
             Err(_) => {
                 self.emit(ChatEvent::MessageAdded(warning_message(
-                    "Hermes session.usage timed out",
+                    "Hermes session.context_breakdown timed out",
                 )));
-                return payload;
+                None
             }
         };
 
-        let Some(cumulative) = token_usage_from_value(&usage) else {
-            self.emit(ChatEvent::MessageAdded(warning_message(
-                "Hermes session.usage did not report token counts",
-            )));
-            return payload;
-        };
-        let turn_usage = token_usage_delta(self.mapper.last_cumulative_usage.as_ref(), &cumulative);
-        self.mapper.last_cumulative_usage = Some(cumulative.clone());
-
-        match payload {
-            Some(mut payload) => {
-                if let Some(object) = payload.as_object_mut() {
-                    if !has_turn_usage {
-                        object.insert(
-                            "usage".to_string(),
-                            token_usage_to_gateway_value(&turn_usage),
-                        );
-                    }
-                    object.insert(
-                        "cumulative_usage".to_string(),
-                        token_usage_to_gateway_value(&cumulative),
-                    );
-                }
-                Some(payload)
+        if let Some(object) = payload.as_object_mut() {
+            if let Some(turn_usage) = turn_usage {
+                // Hermes constructs a fresh agent for each prompt, so both the
+                // message payload and session.usage expose this turn's counters.
+                // Tyde owns the task-wide cumulative scope across those turns.
+                let cumulative =
+                    token_usage_sum(self.mapper.cumulative_usage.as_ref(), &turn_usage);
+                self.mapper.cumulative_usage = Some(cumulative.clone());
+                object.insert(
+                    "usage".to_string(),
+                    token_usage_to_gateway_value(&turn_usage),
+                );
+                object.insert(
+                    "cumulative_usage".to_string(),
+                    token_usage_to_gateway_value(&cumulative),
+                );
             }
-            None => None,
+            if let Some(context_breakdown) = context_breakdown {
+                object.insert(
+                    "context_breakdown".to_string(),
+                    serde_json::to_value(context_breakdown)
+                        .expect("Hermes context breakdown must serialize"),
+                );
+            }
         }
+        Some(payload)
     }
 
     fn emit(&self, event: ChatEvent) {
@@ -1208,10 +1253,13 @@ fn is_internal_hermes_stderr(line: &str) -> bool {
     let Some(check) = line.strip_prefix("check_fn ") else {
         return false;
     };
-    check.ends_with(" returned False; dependent tools will be unavailable this turn")
-        && check
-            .strip_suffix(" returned False; dependent tools will be unavailable this turn")
-            .is_some_and(|name| !name.trim().is_empty() && !name.chars().any(char::is_whitespace))
+    [
+        " returned False; dependent tools will be unavailable this turn",
+        " raised; dependent tools will be unavailable this turn",
+    ]
+    .into_iter()
+    .find_map(|suffix| check.strip_suffix(suffix))
+    .is_some_and(|name| !name.trim().is_empty() && !name.chars().any(char::is_whitespace))
 }
 
 impl HermesGatewayHandle {
@@ -1997,7 +2045,7 @@ impl HermesEventMapper {
     fn fail_active_turn(&mut self, message: impl Into<String>) -> Vec<ChatEvent> {
         let mut events = Vec::new();
         if self.current_message_id.is_some() {
-            events.extend(self.finish_stream_events(None, None, None));
+            events.extend(self.finish_stream_events(None, None, None, None));
         }
         events.extend(self.complete_pending_tools_as_cancelled(
             "Hermes protocol error closed the active turn before the tool completed",
@@ -2048,7 +2096,7 @@ impl HermesEventMapper {
     fn map_message_start(&mut self) -> Result<Vec<ChatEvent>, String> {
         let mut events = Vec::new();
         if self.current_message_id.is_some() {
-            events.extend(self.finish_stream_events(None, None, None));
+            events.extend(self.finish_stream_events(None, None, None, None));
             events.push(ChatEvent::MessageAdded(error_message(
                 "Hermes emitted message.start before completing the previous message".to_string(),
             )));
@@ -2152,6 +2200,9 @@ impl HermesEventMapper {
         let cumulative_usage = payload
             .get("cumulative_usage")
             .and_then(token_usage_from_value);
+        let context_breakdown = payload
+            .get("context_breakdown")
+            .and_then(|value| serde_json::from_value::<ContextBreakdown>(value.clone()).ok());
         let stream_final_text = final_text
             .as_ref()
             .filter(|text| !text.trim().is_empty())
@@ -2174,6 +2225,7 @@ impl HermesEventMapper {
                     stream_final_text,
                     usage,
                     cumulative_usage,
+                    context_breakdown,
                 ));
                 events.extend(self.cancel_events("Operation cancelled"));
             }
@@ -2182,6 +2234,7 @@ impl HermesEventMapper {
                     stream_final_text.clone(),
                     usage,
                     cumulative_usage,
+                    context_breakdown,
                 ));
                 if let Some(error_text) =
                     optional_string(&payload, &["error"]).or_else(|| stream_final_text.clone())
@@ -2199,6 +2252,7 @@ impl HermesEventMapper {
                     stream_final_text,
                     usage,
                     cumulative_usage,
+                    context_breakdown,
                 ));
                 if !has_visible_text {
                     if has_reasoning {
@@ -2218,6 +2272,7 @@ impl HermesEventMapper {
                     stream_final_text,
                     usage,
                     cumulative_usage,
+                    context_breakdown,
                 ));
                 events.push(ChatEvent::MessageAdded(error_message(format!(
                     "Hermes message.complete returned unknown status '{other}'"
@@ -2391,6 +2446,7 @@ impl HermesEventMapper {
         final_text: Option<String>,
         usage: Option<TokenUsage>,
         cumulative_usage: Option<TokenUsage>,
+        context_breakdown: Option<ContextBreakdown>,
     ) -> Vec<ChatEvent> {
         let content = final_text.unwrap_or_else(|| self.current_text.clone());
         let message_id = self.current_message_id.take().map(protocol::ChatMessageId);
@@ -2424,7 +2480,7 @@ impl HermesEventMapper {
                 tool_calls: self.tool_uses_for_message(),
                 model_info: self.model.clone().map(|model| ModelInfo { model }),
                 token_usage,
-                context_breakdown: None,
+                context_breakdown,
                 images: None,
             },
         })]
@@ -2433,7 +2489,7 @@ impl HermesEventMapper {
     fn cancel_events(&mut self, message: &str) -> Vec<ChatEvent> {
         let mut events = Vec::new();
         if self.current_message_id.is_some() {
-            events.extend(self.finish_stream_events(None, None, None));
+            events.extend(self.finish_stream_events(None, None, None, None));
         }
         events.extend(
             self.complete_pending_tools_as_cancelled("Tool execution was cancelled by user"),
@@ -3971,28 +4027,73 @@ fn token_usage_to_gateway_value(usage: &TokenUsage) -> Value {
     })
 }
 
-fn token_usage_delta(previous: Option<&TokenUsage>, current: &TokenUsage) -> TokenUsage {
-    let Some(previous) = previous else {
-        return current.clone();
-    };
+fn token_usage_sum(previous: Option<&TokenUsage>, current: &TokenUsage) -> TokenUsage {
+    let previous = previous.cloned().unwrap_or_default();
     TokenUsage {
-        input_tokens: current.input_tokens.saturating_sub(previous.input_tokens),
-        output_tokens: current.output_tokens.saturating_sub(previous.output_tokens),
-        total_tokens: current.total_tokens.saturating_sub(previous.total_tokens),
-        cached_prompt_tokens: optional_token_delta(
+        input_tokens: previous.input_tokens.saturating_add(current.input_tokens),
+        output_tokens: previous.output_tokens.saturating_add(current.output_tokens),
+        total_tokens: previous.total_tokens.saturating_add(current.total_tokens),
+        cached_prompt_tokens: optional_token_sum(
             previous.cached_prompt_tokens,
             current.cached_prompt_tokens,
         ),
-        cache_creation_input_tokens: optional_token_delta(
+        cache_creation_input_tokens: optional_token_sum(
             previous.cache_creation_input_tokens,
             current.cache_creation_input_tokens,
         ),
-        reasoning_tokens: optional_token_delta(previous.reasoning_tokens, current.reasoning_tokens),
+        reasoning_tokens: optional_token_sum(previous.reasoning_tokens, current.reasoning_tokens),
     }
 }
 
-fn optional_token_delta(previous: Option<u64>, current: Option<u64>) -> Option<u64> {
-    current.map(|current| current.saturating_sub(previous.unwrap_or(0)))
+fn optional_token_sum(previous: Option<u64>, current: Option<u64>) -> Option<u64> {
+    match (previous, current) {
+        (Some(previous), Some(current)) => Some(previous.saturating_add(current)),
+        (Some(previous), None) => Some(previous),
+        (None, Some(current)) => Some(current),
+        (None, None) => None,
+    }
+}
+
+fn context_breakdown_from_hermes(value: &Value) -> Option<ContextBreakdown> {
+    let input_tokens = value.get("context_used").and_then(Value::as_u64)?;
+    let context_window = value
+        .get("context_max")
+        .and_then(Value::as_u64)
+        .filter(|window| *window > 0)?;
+    if input_tokens == 0 {
+        return None;
+    }
+
+    let category_tokens = |ids: &[&str]| {
+        value
+            .get("categories")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|category| {
+                category
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| ids.contains(&id))
+            })
+            .filter_map(|category| category.get("tokens").and_then(Value::as_u64))
+            .fold(0_u64, u64::saturating_add)
+    };
+    let bytes = |tokens: u64| tokens.saturating_mul(4);
+
+    Some(ContextBreakdown {
+        system_prompt_bytes: bytes(category_tokens(&["system_prompt"])),
+        tool_io_bytes: bytes(category_tokens(&[
+            "tool_definitions",
+            "mcp",
+            "subagent_definitions",
+        ])),
+        conversation_history_bytes: bytes(category_tokens(&["conversation"])),
+        reasoning_bytes: 0,
+        context_injection_bytes: bytes(category_tokens(&["rules", "skills", "memory"])),
+        input_tokens,
+        context_window,
+    })
 }
 
 fn user_message(content: &str) -> ChatMessage {
@@ -4461,11 +4562,13 @@ for line in sys.stdin:
         emit("reasoning.delta", sid, {"text":"think"})
         emit("message.delta", sid, {"text":"hel"})
         emit("message.delta", sid, {"text":"lo"})
-        emit("message.complete", sid, {"text":"hello","status":"complete"})
+        emit("message.complete", sid, {"text":"hello","status":"complete","usage":{"input":1,"output":2,"total":3,"cached_prompt_tokens":10,"cache_creation_input_tokens":4,"reasoning_tokens":1}})
     elif method == "session.interrupt":
         print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"status":"interrupted"}}), flush=True)
     elif method == "session.usage":
         print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"input":1,"output":2,"total":3}}), flush=True)
+    elif method == "session.context_breakdown":
+        print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"context_used":12000,"context_max":200000,"categories":[{"id":"system_prompt","tokens":1000},{"id":"tool_definitions","tokens":2000},{"id":"conversation","tokens":5000}]}}), flush=True)
     elif method == "session.history":
         print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"count":0,"messages":[]}}), flush=True)
     elif method == "session.list":
@@ -4504,15 +4607,24 @@ for line in sys.stdin:
                 ChatEvent::StreamEnd(end) => {
                     assert_eq!(end.message.content, "hello");
                     assert!(end.message.reasoning.is_none());
+                    let context = end
+                        .message
+                        .context_breakdown
+                        .as_ref()
+                        .expect("context breakdown");
+                    assert_eq!(context.input_tokens, 12_000);
+                    assert_eq!(context.context_window, 200_000);
+                    let usage = end.message.token_usage.as_ref().expect("usage");
                     assert_eq!(
-                        end.message
-                            .token_usage
-                            .expect("usage")
+                        usage.turn.known_usage().expect("turn usage").total_tokens,
+                        3
+                    );
+                    assert_eq!(
+                        usage
                             .turn
                             .known_usage()
-                            .expect("turn usage")
-                            .total_tokens,
-                        3
+                            .and_then(|usage| usage.cached_prompt_tokens),
+                        Some(10)
                     );
                     saw_end = true;
                 }
@@ -4524,6 +4636,45 @@ for line in sys.stdin:
         assert!(
             observed.iter().all(|event| !event.contains("think")),
             "raw Hermes reasoning leaked into events: {observed:#?}"
+        );
+
+        assert!(
+            backend
+                .send(AgentInput::SendMessage(payload("again")))
+                .await
+        );
+        let second_end = timeout(deadline, async {
+            loop {
+                if let Some(ChatEvent::StreamEnd(end)) = events.recv().await {
+                    break end;
+                }
+            }
+        })
+        .await
+        .expect("second turn timeout");
+        let second_usage = second_end.message.token_usage.expect("second usage");
+        assert_eq!(
+            second_usage
+                .turn
+                .known_usage()
+                .expect("second turn usage")
+                .total_tokens,
+            3
+        );
+        assert_eq!(
+            second_usage
+                .cumulative
+                .known_usage()
+                .expect("second cumulative usage")
+                .total_tokens,
+            6
+        );
+        assert_eq!(
+            second_usage
+                .cumulative
+                .known_usage()
+                .and_then(|usage| usage.cached_prompt_tokens),
+            Some(20)
         );
         backend.shutdown().await;
     }
@@ -5301,6 +5452,14 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn hermes_gateway_preserves_native_cache_usage() {
+        assert!(HERMES_MCP_GATEWAY_ENTRY.contains("session_cache_read_tokens"));
+        assert!(HERMES_MCP_GATEWAY_ENTRY.contains("session_cache_write_tokens"));
+        assert!(HERMES_MCP_GATEWAY_ENTRY.contains("session_reasoning_tokens"));
+        assert!(HERMES_MCP_GATEWAY_ENTRY.contains("_tyde_gateway_server._get_usage"));
+    }
+
+    #[test]
     fn hermes_tyde_agent_tools_use_shared_typed_contracts() {
         let mut mapper = HermesEventMapper::default();
         let request = mapper.map_event(
@@ -5390,6 +5549,9 @@ for line in sys.stdin:
     fn hermes_internal_tool_eligibility_diagnostic_is_not_user_facing() {
         assert!(is_internal_hermes_stderr(
             "check_fn check_close_terminal_requirements returned False; dependent tools will be unavailable this turn"
+        ));
+        assert!(is_internal_hermes_stderr(
+            "check_fn _check_file_reqs raised; dependent tools will be unavailable this turn"
         ));
         assert!(!is_internal_hermes_stderr(
             "gateway failed to initialize terminal tools"
@@ -5556,7 +5718,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn hermes_token_usage_delta_subtracts_cumulative_counts() {
+    fn hermes_token_usage_sum_accumulates_per_turn_counts() {
         let previous = token_usage_from_value(&json!({
             "input": 10,
             "output": 5,
@@ -5576,14 +5738,40 @@ for line in sys.stdin:
         }))
         .expect("current usage");
 
-        let delta = token_usage_delta(Some(&previous), &current);
+        let cumulative = token_usage_sum(Some(&previous), &current);
 
-        assert_eq!(delta.input_tokens, 8);
-        assert_eq!(delta.output_tokens, 8);
-        assert_eq!(delta.total_tokens, 16);
-        assert_eq!(delta.cached_prompt_tokens, Some(5));
-        assert_eq!(delta.cache_creation_input_tokens, Some(5));
-        assert_eq!(delta.reasoning_tokens, Some(5));
+        assert_eq!(cumulative.input_tokens, 28);
+        assert_eq!(cumulative.output_tokens, 18);
+        assert_eq!(cumulative.total_tokens, 46);
+        assert_eq!(cumulative.cached_prompt_tokens, Some(9));
+        assert_eq!(cumulative.cache_creation_input_tokens, Some(11));
+        assert_eq!(cumulative.reasoning_tokens, Some(13));
+    }
+
+    #[test]
+    fn hermes_context_breakdown_maps_native_categories() {
+        let breakdown = context_breakdown_from_hermes(&json!({
+            "context_used": 12_000,
+            "context_max": 200_000,
+            "categories": [
+                { "id": "system_prompt", "tokens": 1_000 },
+                { "id": "tool_definitions", "tokens": 2_000 },
+                { "id": "mcp", "tokens": 300 },
+                { "id": "subagent_definitions", "tokens": 200 },
+                { "id": "conversation", "tokens": 5_000 },
+                { "id": "rules", "tokens": 400 },
+                { "id": "skills", "tokens": 500 },
+                { "id": "memory", "tokens": 600 }
+            ]
+        }))
+        .expect("native context breakdown");
+
+        assert_eq!(breakdown.input_tokens, 12_000);
+        assert_eq!(breakdown.context_window, 200_000);
+        assert_eq!(breakdown.system_prompt_bytes, 4_000);
+        assert_eq!(breakdown.tool_io_bytes, 10_000);
+        assert_eq!(breakdown.conversation_history_bytes, 20_000);
+        assert_eq!(breakdown.context_injection_bytes, 6_000);
     }
 
     #[test]
