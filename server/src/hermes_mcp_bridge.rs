@@ -15,6 +15,12 @@ use rmcp::transport::{
 use rmcp::{ErrorData as McpError, ServerHandler};
 use serde::{Deserialize, Serialize};
 
+const DOWNSTREAM_STARTUP_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(250)
+} else {
+    Duration::from_secs(8)
+};
+
 pub const DESCRIPTOR_ENV: &str = "TYDE_HERMES_MCP_DESCRIPTOR";
 pub const MANAGED_SERVER_NAME: &str = "tyde";
 pub const DESCRIPTOR_FILE_NAME: &str = "tyde-mcp-servers.json";
@@ -196,41 +202,18 @@ async fn build_bridge(
     let mut tool_owners = HashMap::new();
     let mut startup_errors = Vec::new();
 
-    for server in descriptor.servers {
-        eprintln!(
-            "Tyde Hermes MCP bridge connecting configured server '{}'",
-            server.name
-        );
-        let connected = connect(&server).await;
-        let client = match connected {
-            Ok(client) => client,
+    let startup_results =
+        futures_util::future::join_all(descriptor.servers.into_iter().map(start_downstream)).await;
+    for (server_name, result) in startup_results {
+        let (client, server_tools) = match result {
+            Ok(connected) => connected,
             Err(error) => {
                 startup_errors.push(format!(
-                    "failed to connect configured MCP server '{}': {error}",
-                    server.name
+                    "failed to start configured MCP server '{server_name}': {error}"
                 ));
                 continue;
             }
         };
-        eprintln!(
-            "Tyde Hermes MCP bridge connected configured server '{}'",
-            server.name
-        );
-        let server_tools = match client.peer().list_all_tools().await {
-            Ok(tools) => tools,
-            Err(error) => {
-                startup_errors.push(format!(
-                    "failed to list tools from MCP server '{}': {error}",
-                    server.name
-                ));
-                continue;
-            }
-        };
-        eprintln!(
-            "Tyde Hermes MCP bridge listed {} tools from configured server '{}'",
-            server_tools.len(),
-            server.name
-        );
         let owner = downstreams.len();
         for tool in server_tools {
             let name = tool.name.to_string();
@@ -245,7 +228,7 @@ async fn build_bridge(
             tools.push(tool);
         }
         downstreams.push(Downstream {
-            name: server.name,
+            name: server_name,
             peer: client.peer().clone(),
         });
         clients.push(client);
@@ -270,6 +253,40 @@ async fn build_bridge(
         },
         clients,
     )
+}
+
+async fn start_downstream(
+    server: BridgeServerConfig,
+) -> (
+    String,
+    Result<(RunningService<RoleClient, ()>, Vec<Tool>), String>,
+) {
+    let name = server.name.clone();
+    eprintln!("Tyde Hermes MCP bridge connecting configured server '{name}'");
+    let result = tokio::time::timeout(DOWNSTREAM_STARTUP_TIMEOUT, async {
+        let mut client = connect(&server).await.map_err(|error| error.to_string())?;
+        eprintln!("Tyde Hermes MCP bridge connected configured server '{name}'");
+        let tools = match client.peer().list_all_tools().await {
+            Ok(tools) => tools,
+            Err(error) => {
+                let _ = client.close_with_timeout(Duration::from_secs(1)).await;
+                return Err(format!("failed to list tools: {error}"));
+            }
+        };
+        eprintln!(
+            "Tyde Hermes MCP bridge listed {} tools from configured server '{name}'",
+            tools.len()
+        );
+        Ok((client, tools))
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(format!(
+            "timed out after {}ms",
+            DOWNSTREAM_STARTUP_TIMEOUT.as_millis()
+        ))
+    });
+    (name, result)
 }
 
 fn empty_bridge(error: Option<String>) -> HermesMcpBridge {
@@ -520,6 +537,46 @@ mod tests {
         for downstream in &mut downstreams {
             let _ = downstream.close_with_timeout(Duration::from_secs(1)).await;
         }
+        working_task.abort();
+    }
+
+    #[tokio::test]
+    async fn stalled_downstream_does_not_block_working_tools() {
+        let (working_url, working_task) = start_http_server(TestMcpServer {
+            tool_name: "working_tool",
+            response: "working response",
+        })
+        .await;
+        let stalled_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalled MCP server");
+        let stalled_url = format!(
+            "http://{}/mcp",
+            stalled_listener.local_addr().expect("stalled MCP address")
+        );
+        let stalled_task = tokio::spawn(async move {
+            while let Ok((socket, _)) = stalled_listener.accept().await {
+                tokio::spawn(async move {
+                    let _socket = socket;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+
+        let (bridge, mut downstreams) = build_bridge(Some(BridgeDescriptor {
+            servers: vec![
+                http_server("working", working_url),
+                http_server("stalled", stalled_url),
+            ],
+        }))
+        .await;
+        assert!(bridge.startup_error.is_none());
+        assert_eq!(bridge.tools.len(), 1);
+        assert_eq!(bridge.tools[0].name, "working_tool");
+        for downstream in &mut downstreams {
+            let _ = downstream.close_with_timeout(Duration::from_secs(1)).await;
+        }
+        stalled_task.abort();
         working_task.abort();
     }
 

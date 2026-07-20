@@ -134,9 +134,10 @@ if not isinstance(servers, dict):
     config["mcp_servers"] = servers
 existing = servers.get(name)
 if existing != managed:
-    if isinstance(existing, dict) and existing.get("args") == ["hermes-mcp-bridge"]:
-        pass
-    elif existing is not None:
+    if existing is not None and not (
+        isinstance(existing, dict)
+        and existing.get("args") == ["hermes-mcp-bridge"]
+    ):
         raise RuntimeError(f"Hermes MCP server name '{name}' is already user-managed")
     servers[name] = managed
     save_config(config)
@@ -4330,7 +4331,11 @@ mod tests {
             serde_json::to_vec(&json!({
                 "model": { "default": "native-model" },
                 "mcp_servers": {
-                    "native": { "command": "native-command", "args": [] }
+                    "native": { "command": "native-command", "args": [] },
+                    "tyde": {
+                        "command": "/obsolete/tyde-server",
+                        "args": ["hermes-mcp-bridge"]
+                    }
                 }
             }))
             .expect("serialize fake config"),
