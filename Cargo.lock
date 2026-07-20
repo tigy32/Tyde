@@ -6916,7 +6916,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-shell"
-version = "0.8.19-beta.34"
+version = "0.8.19-beta.35"
 dependencies = [
  "core-foundation-sys",
  "devtools-protocol",
@@ -7581,7 +7581,7 @@ dependencies = [
 
 [[package]]
 name = "tyde-server"
-version = "0.8.19-beta.34"
+version = "0.8.19-beta.35"
 dependencies = [
  "rlimit",
  "server",
