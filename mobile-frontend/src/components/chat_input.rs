@@ -129,18 +129,17 @@ impl Composer {
 }
 
 fn selected_backend_kind(state: &AppState) -> Option<protocol::BackendKind> {
-    if let Some(active) = state.active_agent.get_untracked() {
-        if let Some(kind) = state.agents.with_untracked(|agents| {
+    if let Some(active) = state.active_agent.get_untracked()
+        && let Some(kind) = state.agents.with_untracked(|agents| {
             agents
                 .iter()
                 .find(|agent| {
-                    agent.local_host_id == active.local_host_id
-                        && agent.agent_id == active.agent_id
+                    agent.local_host_id == active.local_host_id && agent.agent_id == active.agent_id
                 })
                 .map(|agent| agent.backend_kind)
-        }) {
-            return Some(kind);
-        }
+        })
+    {
+        return Some(kind);
     }
 
     state
@@ -165,13 +164,11 @@ async fn read_image_file(file: web_sys::File) -> Result<PendingImage, String> {
         return Err(format!("{name} is not an image file"));
     }
 
-    let buffer = JsFuture::from(file.array_buffer())
-        .await
-        .map_err(|error| {
-            error
-                .as_string()
-                .unwrap_or_else(|| format!("Failed to read {name}"))
-        })?;
+    let buffer = JsFuture::from(file.array_buffer()).await.map_err(|error| {
+        error
+            .as_string()
+            .unwrap_or_else(|| format!("Failed to read {name}"))
+    })?;
     let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
     Ok(PendingImage {
         name,
@@ -422,12 +419,9 @@ pub fn ChatInput() -> impl IntoView {
                         // A new chat has no agent yet, and the client must not
                         // guess which `NewAgent` is its own — so this record is
                         // host-scoped, not attached to any agent.
-                        let outcome = crate::actions::spawn_new_chat(
-                            &state,
-                            text.clone(),
-                            images.clone(),
-                        )
-                        .await;
+                        let outcome =
+                            crate::actions::spawn_new_chat(&state, text.clone(), images.clone())
+                                .await;
                         (SubmissionTarget::NewChat, outcome)
                     }
                 };
@@ -590,12 +584,8 @@ pub fn ChatInput() -> impl IntoView {
             let state = state.clone();
             composer.begin();
             spawn_local(async move {
-                let outcome = crate::actions::spawn_side_question(
-                    &state,
-                    text.clone(),
-                    images.clone(),
-                )
-                .await;
+                let outcome =
+                    crate::actions::spawn_side_question(&state, text.clone(), images.clone()).await;
                 settle_submission(
                     &state,
                     composer,
@@ -627,13 +617,14 @@ pub fn ChatInput() -> impl IntoView {
     let is_running = Memo::new(move |_| active_agent_is_running_tracked(&running_state));
     let has_input_state = state.clone();
     let has_input = Memo::new(move |_| {
-        has_input_state.chat_input.with(|text| !text.trim().is_empty())
+        has_input_state
+            .chat_input
+            .with(|text| !text.trim().is_empty())
             || composer.images.with(|images| !images.is_empty())
     });
     let btw_state = state.clone();
-    let can_btw = Memo::new(move |_| {
-        has_input.get() && active_agent_has_session_id_tracked(&btw_state)
-    });
+    let can_btw =
+        Memo::new(move |_| has_input.get() && active_agent_has_session_id_tracked(&btw_state));
     // Steer = thinking + draft text or photos.
     let is_steer = Memo::new(move |_| is_running.get() && has_input.get());
     // Menu holds items only for: Fork + send (input+session) or Steer+Cancel (thinking+input).

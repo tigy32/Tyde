@@ -102,11 +102,9 @@ pub fn seed_state(state: &AppState) {
             },
         );
     });
-    state
-        .heartbeat_round_trip_ms_by_host
-        .update(|round_trips| {
-            round_trips.insert(host.clone(), 47);
-        });
+    state.heartbeat_round_trip_ms_by_host.update(|round_trips| {
+        round_trips.insert(host.clone(), 47);
+    });
     state.agents.set(vec![AgentInfo {
         local_host_id: host.clone(),
         agent_id: agent_id.clone(),

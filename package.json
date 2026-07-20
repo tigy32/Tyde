@@ -7,7 +7,10 @@
     "mobile:ui:serve": "cd mobile-frontend && NO_COLOR=true trunk serve --features ui-fixtures --address 127.0.0.1 --port 4173",
     "mobile:ui:test": "playwright test --config playwright.mobile.config.mjs",
     "mobile:ui:screenshots": "playwright test --config playwright.mobile.config.mjs --grep @visual",
-    "mobile:ui:report": "playwright show-report test-results/mobile-playwright-report"
+    "mobile:ui:report": "playwright show-report test-results/mobile-playwright-report",
+    "mobile:live:login": "node mobile-frontend/e2e/live/bootstrap.mjs",
+    "mobile:live:test": "playwright test --config playwright.mobile.live.config.mjs",
+    "mobile:live:show": "TYDE_LIVE_HEADED=1 playwright test --config playwright.mobile.live.config.mjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.61.1",
