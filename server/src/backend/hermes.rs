@@ -373,8 +373,12 @@ impl Backend for HermesBackend {
         reject_unverified_capabilities(&config, &initial_input)?;
         let resolved_settings = resolve_session_settings(&config);
         let expects_mcp_tools = !config.startup_mcp_servers.is_empty();
-        let (gateway, mut gateway_events_rx) =
-            HermesGatewayHandle::spawn(&workspace_roots, &config.startup_mcp_servers).await?;
+        let (gateway, mut gateway_events_rx) = HermesGatewayHandle::spawn(
+            &workspace_roots,
+            &config.startup_mcp_servers,
+            &config.resolved_spawn_config.tool_policy,
+        )
+        .await?;
         let create_params = build_session_create_params(
             &workspace_roots,
             &config.resolved_spawn_config,
@@ -423,8 +427,12 @@ impl Backend for HermesBackend {
         session_id: SessionId,
     ) -> Result<(Self, EventStream), String> {
         reject_unverified_resume_capabilities(&config)?;
-        let (gateway, gateway_events_rx) =
-            HermesGatewayHandle::spawn(&workspace_roots, &config.startup_mcp_servers).await?;
+        let (gateway, gateway_events_rx) = HermesGatewayHandle::spawn(
+            &workspace_roots,
+            &config.startup_mcp_servers,
+            &config.resolved_spawn_config.tool_policy,
+        )
+        .await?;
         let resume = gateway
             .request(
                 "session.resume",
@@ -486,7 +494,8 @@ impl Backend for HermesBackend {
     }
 
     async fn list_sessions() -> Result<Vec<BackendSession>, String> {
-        let (gateway, _gateway_events_rx) = HermesGatewayHandle::spawn(&[], &[]).await?;
+        let (gateway, _gateway_events_rx) =
+            HermesGatewayHandle::spawn(&[], &[], &protocol::ToolPolicy::Unrestricted).await?;
         let result = gateway
             .request("session.list", json!({ "limit": 200 }))
             .await;
@@ -536,7 +545,9 @@ impl Backend for HermesBackend {
 pub(crate) async fn probe_session_settings_schema(
     workspace_roots: &[String],
 ) -> Result<SessionSettingsSchema, String> {
-    let (gateway, _events) = HermesGatewayHandle::spawn(workspace_roots, &[]).await?;
+    let (gateway, _events) =
+        HermesGatewayHandle::spawn(workspace_roots, &[], &protocol::ToolPolicy::Unrestricted)
+            .await?;
     let options = gateway.request("model.options", json!({})).await;
     gateway.shutdown().await;
     session_settings_schema_from_model_options(&options?)
@@ -545,7 +556,9 @@ pub(crate) async fn probe_session_settings_schema(
 pub(crate) async fn probe_backend_config_snapshot(
     workspace_roots: &[String],
 ) -> Result<BackendConfigValues, String> {
-    let (gateway, _events) = HermesGatewayHandle::spawn(workspace_roots, &[]).await?;
+    let (gateway, _events) =
+        HermesGatewayHandle::spawn(workspace_roots, &[], &protocol::ToolPolicy::Unrestricted)
+            .await?;
     let options = gateway.request("model.options", json!({})).await;
     gateway.shutdown().await;
     hermes_backend_config_snapshot_from_model_options(&options?)
@@ -886,9 +899,13 @@ impl HermesSessionActor {
                 true
             }
             HermesGatewayEvent::Stderr(line) => {
-                self.emit(ChatEvent::MessageAdded(warning_message(format!(
-                    "Hermes stderr: {line}"
-                ))));
+                if is_internal_hermes_stderr(&line) {
+                    tracing::debug!(message = %line, "Hermes internal diagnostic");
+                } else {
+                    self.emit(ChatEvent::MessageAdded(warning_message(format!(
+                        "Hermes stderr: {line}"
+                    ))));
+                }
                 true
             }
             HermesGatewayEvent::Closed(exit_code) => {
@@ -977,13 +994,26 @@ impl HermesSessionActor {
     }
 }
 
+fn is_internal_hermes_stderr(line: &str) -> bool {
+    let Some(check) = line.strip_prefix("check_fn ") else {
+        return false;
+    };
+    check.ends_with(" returned False; dependent tools will be unavailable this turn")
+        && check
+            .strip_suffix(" returned False; dependent tools will be unavailable this turn")
+            .is_some_and(|name| !name.trim().is_empty() && !name.chars().any(char::is_whitespace))
+}
+
 impl HermesGatewayHandle {
     async fn spawn(
         workspace_roots: &[String],
         startup_mcp_servers: &[StartupMcpServer],
+        tool_policy: &protocol::ToolPolicy,
     ) -> Result<(Self, mpsc::UnboundedReceiver<HermesGatewayEvent>), String> {
         let mut target = resolve_gateway_spawn_target(workspace_roots).await?;
-        let mcp_runtime = prepare_hermes_mcp_runtime(&mut target, startup_mcp_servers).await?;
+        let mcp_runtime =
+            prepare_hermes_mcp_runtime(&mut target, startup_mcp_servers, tool_policy).await?;
+        let expects_mcp_tools = !startup_mcp_servers.is_empty();
         let mcp_ready_path = mcp_runtime
             .as_ref()
             .map(|runtime| runtime.ready_path.clone());
@@ -1039,7 +1069,10 @@ impl HermesGatewayHandle {
                         handle.shutdown().await;
                         return Err(error);
                     }
-                    if let Err(error) = wait_for_hermes_mcp_tools(&handle, startup_timeout).await {
+                    if expects_mcp_tools
+                        && let Err(error) =
+                            wait_for_hermes_mcp_tools(&handle, startup_timeout).await
+                    {
                         handle.shutdown().await;
                         return Err(error);
                     }
@@ -1425,8 +1458,15 @@ fn spawn_child_waiter(
 async fn prepare_hermes_mcp_runtime(
     target: &mut HermesSpawnTarget,
     startup_mcp_servers: &[StartupMcpServer],
+    tool_policy: &protocol::ToolPolicy,
 ) -> Result<Option<HermesMcpRuntime>, String> {
-    let Some(descriptor) = hermes_mcp_bridge_descriptor(startup_mcp_servers)? else {
+    let isolate_without_tools = matches!(
+        tool_policy,
+        protocol::ToolPolicy::AllowList { tools } if tools.is_empty()
+    );
+    let Some(descriptor) =
+        hermes_mcp_bridge_descriptor(startup_mcp_servers, isolate_without_tools)?
+    else {
         return Ok(None);
     };
     if target.remote_host.is_some() {
@@ -1436,7 +1476,9 @@ async fn prepare_hermes_mcp_runtime(
     let bridge_program = resolve_hermes_bridge_executable()?;
     let selected = register_hermes_mcp_bridge(target, &bridge_program).await?;
     let selected_toolsets = if let Some(mut selected) = selected {
-        if !selected.iter().any(|name| name == MANAGED_SERVER_NAME) {
+        if isolate_without_tools {
+            selected = vec![MANAGED_SERVER_NAME.to_string()];
+        } else if !selected.iter().any(|name| name == MANAGED_SERVER_NAME) {
             selected.push(MANAGED_SERVER_NAME.to_string());
         }
         let selected = selected.join(",");
@@ -1714,6 +1756,7 @@ impl HermesEventMapper {
         let result = match event_type {
             "gateway.ready" => Ok(Vec::new()),
             "session.info" => self.map_session_info(payload),
+            "session.title" => Ok(Vec::new()),
             "status.update" => self.map_status_update(payload),
             "message.start" => self.map_message_start(),
             "message.delta" => self.map_message_delta(payload),
@@ -2245,16 +2288,21 @@ fn reject_unverified_capabilities(
 }
 
 fn reject_unverified_resume_capabilities(config: &BackendSpawnConfig) -> Result<(), String> {
-    if config.resolved_spawn_config.tool_policy != protocol::ToolPolicy::Unrestricted {
-        return Err("Hermes custom tool policies are not enabled because the native gateway policy mapping has not been verified".to_string());
+    match &config.resolved_spawn_config.tool_policy {
+        protocol::ToolPolicy::Unrestricted => {}
+        protocol::ToolPolicy::AllowList { tools } if tools.is_empty() => {}
+        _ => {
+            return Err("Hermes custom tool policies are not enabled because the native gateway policy mapping has not been verified".to_string());
+        }
     }
     Ok(())
 }
 
 fn hermes_mcp_bridge_descriptor(
     startup_mcp_servers: &[StartupMcpServer],
+    force_empty_bridge: bool,
 ) -> Result<Option<BridgeDescriptor>, String> {
-    if startup_mcp_servers.is_empty() {
+    if startup_mcp_servers.is_empty() && !force_empty_bridge {
         return Ok(None);
     }
 
@@ -4298,6 +4346,48 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
+    async fn hermes_empty_allow_list_uses_only_empty_bridge() {
+        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
+        let dir = TempDir::new().expect("tempdir");
+        let (fake, observed_path, _) = write_fake_managed_mcp_gateway(&dir);
+        let _python_guard = TestHermesPythonGuard::set(&fake);
+        let bridge = dir.path().join("tyde-server");
+        fs::write(&bridge, "bridge placeholder").expect("write bridge placeholder");
+        let _bridge_guard = TestHermesBridgeExecutableGuard::set(&bridge.to_string_lossy());
+        let mut config = BackendSpawnConfig::default();
+        config.resolved_spawn_config.tool_policy =
+            protocol::ToolPolicy::AllowList { tools: Vec::new() };
+
+        let (backend, mut events) = HermesBackend::spawn(
+            vec![dir.path().to_string_lossy().to_string()],
+            config,
+            payload("name this task"),
+        )
+        .await
+        .expect("spawn tool-free fake Hermes backend");
+
+        timeout(Duration::from_secs(2), async {
+            while let Some(event) = events.recv().await {
+                if matches!(event, ChatEvent::StreamEnd(_)) {
+                    return;
+                }
+            }
+            panic!("Hermes event stream closed before the tool-free turn completed");
+        })
+        .await
+        .expect("tool-free Hermes turn should finish");
+
+        let observed: Value = serde_json::from_slice(
+            &fs::read(&observed_path).expect("read observed process config"),
+        )
+        .expect("parse observed process config");
+        assert_eq!(observed["toolsets"], MANAGED_SERVER_NAME);
+        assert_eq!(observed["descriptor"]["servers"], json!([]));
+
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn hermes_probe_session_settings_schema_uses_model_options() {
         let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
         let dir = TempDir::new().expect("tempdir");
@@ -4900,6 +4990,32 @@ for line in sys.stdin:
                 .map_event("tool.generating", Some(json!({ "name": "probe" })))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn hermes_native_title_does_not_override_tyde_naming() {
+        let mut mapper = HermesEventMapper::default();
+        assert!(
+            mapper
+                .map_event(
+                    "session.title",
+                    Some(json!({ "session_id": "stored", "title": "Hermes title" })),
+                )
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn hermes_internal_tool_eligibility_diagnostic_is_not_user_facing() {
+        assert!(is_internal_hermes_stderr(
+            "check_fn check_close_terminal_requirements returned False; dependent tools will be unavailable this turn"
+        ));
+        assert!(!is_internal_hermes_stderr(
+            "gateway failed to initialize terminal tools"
+        ));
+        assert!(!is_internal_hermes_stderr(
+            "check_fn returned False; dependent tools will be unavailable this turn"
+        ));
     }
 
     #[test]
