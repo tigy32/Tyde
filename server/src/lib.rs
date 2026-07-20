@@ -8,6 +8,7 @@ pub(crate) mod config_mcp;
 pub(crate) mod connection;
 pub(crate) mod debug_mcp;
 pub(crate) mod error;
+pub mod hermes_mcp_bridge;
 pub(crate) mod host;
 pub(crate) mod mobile_access;
 pub mod paths;

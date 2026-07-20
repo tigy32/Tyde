@@ -5231,6 +5231,155 @@ async fn real_hermes_openrouter_emits_visible_content() {
 }
 
 #[tokio::test]
+#[ignore = "real Hermes MCP test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
+async fn real_hermes_openrouter_calls_tyde_mcp_bridge() {
+    if !real_ai_tests_enabled() {
+        eprintln!("SKIPPED: real Hermes MCP test requires {RUN_REAL_AI_TESTS_ENV}=1");
+        return;
+    }
+    let hermes_python = std::env::var("HERMES_PYTHON")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_HERMES_TEST_PYTHON.to_string());
+    if !Path::new(&hermes_python).exists() {
+        eprintln!("SKIPPED: HERMES_PYTHON target not found: {hermes_python}");
+        return;
+    }
+    let _hermes_python_guard = EnvVarGuard::set("HERMES_PYTHON", hermes_python);
+    let provider = std::env::var("TYDE_HERMES_TEST_PROVIDER")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_HERMES_TEST_PROVIDER.to_string());
+    let model = std::env::var("TYDE_HERMES_TEST_MODEL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_HERMES_TEST_MODEL.to_string());
+    eprintln!("RUNNING Hermes MCP live test with provider={provider} model={model}");
+
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let mcp_script = workspace.path().join("probe_mcp.py");
+    std::fs::write(
+        &mcp_script,
+        r#"import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    request_id = request.get("id")
+    if request_id is None:
+        continue
+    if method == "initialize":
+        result = {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "tyde-live-probe", "version": "1"}
+        }
+    elif method == "tools/list":
+        result = {"tools": [{
+            "name": "tyde_live_probe",
+            "description": "Return the exact Tyde bridge verification phrase",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}
+        }]}
+    elif method == "tools/call":
+        result = {"content": [{"type": "text", "text": "TYDE_BRIDGE_OK"}], "isError": False}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+"#,
+    )
+    .expect("write live MCP probe");
+
+    let mut settings = SessionSettingsValues::default();
+    settings.0.insert(
+        "model".to_string(),
+        SessionSettingValue::String(format!("{model} --provider {provider}")),
+    );
+    settings.0.insert(
+        "reasoning_effort".to_string(),
+        SessionSettingValue::String("none".to_string()),
+    );
+    let (backend, mut events) = <server::backend::hermes::HermesBackend as Backend>::spawn(
+        vec![workspace.path().to_string_lossy().to_string()],
+        server::backend::BackendSpawnConfig {
+            execution_mode: Default::default(),
+            cost_hint: cost_hint_for(BackendKind::Hermes),
+            custom_agent_id: None,
+            startup_mcp_servers: vec![server::backend::StartupMcpServer {
+                name: "tyde_live_test".to_string(),
+                transport: server::backend::StartupMcpTransport::Stdio {
+                    command: "python3".to_string(),
+                    args: vec![mcp_script.to_string_lossy().to_string()],
+                    env: HashMap::new(),
+                },
+            }],
+            session_settings: Some(settings),
+            backend_config: Default::default(),
+            resolved_spawn_config: Default::default(),
+        },
+        protocol::SendMessagePayload {
+            message: "Call mcp_tyde_tyde_live_probe. Then reply with exactly the text returned by the tool."
+                .to_owned(),
+            images: None,
+            origin: None,
+            tool_response: None,
+        },
+    )
+    .await
+    .expect("spawn Hermes backend with Tyde MCP bridge");
+
+    let mut final_text = String::new();
+    let mut diagnostics = Vec::new();
+    let mut saw_bridge_tool_request = false;
+    let mut saw_bridge_tool_completion = false;
+    tokio::time::timeout(REAL_BACKEND_TIMEOUT, async {
+        while let Some(event) = events.recv().await {
+            match event {
+                ChatEvent::StreamEnd(end) => {
+                    final_text = end.message.content;
+                }
+                ChatEvent::TypingStatusChanged(false) if !final_text.is_empty() => break,
+                ChatEvent::MessageAdded(ChatMessage {
+                    sender: MessageSender::Error,
+                    content,
+                    ..
+                }) => panic!("Hermes MCP live test emitted error: {content}"),
+                ChatEvent::MessageAdded(ChatMessage {
+                    sender: MessageSender::Warning,
+                    content,
+                    ..
+                }) => diagnostics.push(content),
+                ChatEvent::ToolRequest(request)
+                    if request.tool_name == "mcp_tyde_tyde_live_probe" =>
+                {
+                    saw_bridge_tool_request = true;
+                }
+                ChatEvent::ToolExecutionCompleted(completed)
+                    if completed.tool_name == "mcp_tyde_tyde_live_probe" =>
+                {
+                    saw_bridge_tool_completion = true;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("Hermes MCP live response timed out");
+    backend.shutdown().await;
+    assert_eq!(
+        final_text.trim(),
+        "TYDE_BRIDGE_OK",
+        "Hermes diagnostics: {diagnostics:#?}"
+    );
+    assert!(
+        saw_bridge_tool_request,
+        "Hermes did not expose the MCP tool request"
+    );
+    assert!(
+        saw_bridge_tool_completion,
+        "Hermes did not expose the MCP tool completion"
+    );
+}
+
+#[tokio::test]
 #[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
 async fn resumable_real_backends_remember_secret() {
     let backends = [

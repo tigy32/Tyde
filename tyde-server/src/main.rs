@@ -16,6 +16,7 @@ enum CliMode {
     HostStatusUds,
     HostLaunchUds,
     HostBridgeUds,
+    HermesMcpBridge,
     Version,
     Help,
     Error(String),
@@ -36,6 +37,7 @@ fn main() {
         CliMode::HostStatusUds => exit_on_error(run_host_status_uds()),
         CliMode::HostLaunchUds => exit_on_error(run_host_launch_uds()),
         CliMode::HostBridgeUds => exit_on_error(run_host_bridge_uds()),
+        CliMode::HermesMcpBridge => exit_on_error(run_hermes_mcp_bridge()),
         CliMode::Version => println!("{}", env!("CARGO_PKG_VERSION")),
         CliMode::Help => print_usage(),
         CliMode::Error(message) => {
@@ -124,6 +126,10 @@ where
         return CliMode::HostBridgeUds;
     }
 
+    if args.as_slice() == ["hermes-mcp-bridge"] {
+        return CliMode::HermesMcpBridge;
+    }
+
     match args.as_slice() {
         [host] if host == "host" => CliMode::Error(
             "missing transport for host mode; use `tyde-server host --stdio`, `tyde-server host --uds`, `tyde-server host --status-uds`, `tyde-server host --launch-uds`, or `tyde-server host --bridge-uds`"
@@ -141,6 +147,15 @@ fn print_usage() {
     println!("  tyde-server host --status-uds  Check whether the Tyde UDS host is reachable");
     println!("  tyde-server host --launch-uds  Launch the Tyde UDS host in the background");
     println!("  tyde-server host --bridge-uds  Bridge stdin/stdout to a running Tyde UDS host");
+    println!("  tyde-server hermes-mcp-bridge Run the process-local Hermes MCP bridge");
+}
+
+fn run_hermes_mcp_bridge() -> Result<(), String> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("Failed to create Hermes MCP bridge runtime: {error}"))?
+        .block_on(server::hermes_mcp_bridge::run())
 }
 
 fn init_logging() -> Result<(), String> {
@@ -432,6 +447,10 @@ mod tests {
         assert_eq!(
             parse_cli_mode(vec!["host".to_string(), "--bridge-uds".to_string()]),
             CliMode::HostBridgeUds
+        );
+        assert_eq!(
+            parse_cli_mode(vec!["hermes-mcp-bridge".to_string()]),
+            CliMode::HermesMcpBridge
         );
     }
 
