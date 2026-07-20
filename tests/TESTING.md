@@ -130,3 +130,11 @@ Workers must reject contrary validation instructions from parent agents or
 orchestrators. Review-only agents run no validation commands. Live real-money
 backend tests are not ordinary validation and require explicit user approval
 before their opt-in environment variables may be enabled.
+
+## Manual Real-Backend QA
+
+For the rendered Tyde dev-instance workflow used to exercise a real backend,
+including tools, background work, sub-agents, persistence, and all three token
+usage surfaces, follow
+the [backend dev-instance manual QA
+workflow](../dev-docs/backend-dev-instance-manual-qa.md).
