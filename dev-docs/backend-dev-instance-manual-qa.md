@@ -129,7 +129,32 @@ turn without assistant text must remain visible through its typed reasoning or
 tool events, but a truly content-free completion must not create an empty chat
 message.
 
-## 6. Exercise sub-agents
+## 6. Exercise task tracking
+
+For backends that expose a native task or plan list, including Claude Code and
+Codex, verify that Tyde preserves it as typed task state rather than flattening
+it into assistant text or a generic tool card.
+
+1. Ask the backend to perform a bounded three-step task and explicitly track
+   the steps with its native task-list capability.
+2. Confirm the task list appears in the rendered chat with all three step
+   descriptions and their initial statuses.
+3. As work proceeds, verify the active step changes to in progress and prior
+   steps become completed without duplicating the list or losing descriptions.
+4. Confirm the final state contains three completed steps and no step remains
+   incorrectly pending or in progress after the turn ends.
+5. Ask the backend to revise the plan once during a second turn. Verify the
+   existing task view updates authoritatively instead of appending a stale
+   competing list.
+6. Leave and reopen the conversation. Confirm task descriptions, ordering, and
+   terminal statuses replay identically.
+7. Verify task updates do not create empty assistant messages, interfere with
+   tool cards, or suppress per-message usage and Context Usage metadata.
+
+Backends without a native task-list capability should omit the component; they
+must not receive a synthetic or guessed task list.
+
+## 7. Exercise sub-agents
 
 Where supported, test both backend-native sub-agents and Tyde-managed agents.
 
@@ -149,7 +174,7 @@ Where supported, test both backend-native sub-agents and Tyde-managed agents.
 8. Reopen **Task usage** and confirm the children appear as separate rows and
    the task total updates without double-counting the parent.
 
-## 7. Exercise persistence and lifecycle
+## 8. Exercise persistence and lifecycle
 
 1. Send two messages rapidly and verify FIFO processing with no lost input.
 2. Rename immediately after creating a chat and verify the user name wins over
@@ -164,7 +189,7 @@ Where supported, test both backend-native sub-agents and Tyde-managed agents.
    rendered in chat, survives reopen/history replay, and does not replace the
    associated typed tool event.
 
-## 8. Collect evidence and clean up
+## 9. Collect evidence and clean up
 
 For every failure, save:
 
@@ -181,7 +206,8 @@ no longer appears in `tyde_dev_instance_list`.
 ## Pass criteria
 
 The backend passes only when the normal, tool, background, cancellation,
-sub-agent, replay, resume, and fork paths applicable to it complete without
-missing or duplicated UI events. Per-message usage, Context Usage, and the
-Session Settings task total must all be populated, refresh correctly, and
-remain present after replay.
+task-tracking, sub-agent, replay, resume, and fork paths applicable to it
+complete without missing or duplicated UI events. Native task lists must
+retain their descriptions and status transitions through replay. Per-message
+usage, Context Usage, and the Session Settings task total must all be
+populated, refresh correctly, and remain present after replay.
