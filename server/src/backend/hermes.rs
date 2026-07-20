@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs, io};
 
@@ -22,6 +23,10 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::agent::customization::ResolvedSpawnConfig;
+use crate::backend::agent_control_progress::{
+    PendingToolNormalizationFailure, await_progress_data_for_tool, normalize_tyde_chat_event,
+    spawn_progress_data_for_tool_result,
+};
 use crate::backend::{
     Backend, BackendSession, BackendSpawnConfig, BackendStartupError, EventStream,
     StartupMcpServer, StartupMcpTransport, backend_config_text, backend_fork_unsupported_message,
@@ -33,6 +38,7 @@ use crate::hermes_mcp_bridge::{
     MANAGED_SERVER_NAME, READY_FILE_NAME,
 };
 use crate::process_env;
+use crate::sub_agent::{SubAgentEmitter, SubAgentHandle};
 
 const HERMES_AGENT_NAME: &str = "hermes";
 const HERMES_PYTHON_MODULE: &str = "tui_gateway.entry";
@@ -53,13 +59,51 @@ const HERMES_MANAGED_MCP_TOOLSET: &str = "mcp-tyde";
 const HERMES_MCP_GATEWAY_ENTRY: &str = r#"
 import os
 import sys
+import threading
 
 from hermes_cli.env_loader import load_hermes_dotenv
 
 load_hermes_dotenv()
+from tui_gateway import server as _tyde_gateway_server
+
+_tyde_original_emit = _tyde_gateway_server._emit
+_tyde_tool_start_args = {}
+_tyde_message_condition = threading.Condition()
+_tyde_open_messages = set()
+
+def _tyde_emit(event_type, session_id, payload=None):
+    if event_type == "message.start":
+        with _tyde_message_condition:
+            while session_id in _tyde_open_messages:
+                _tyde_message_condition.wait()
+            _tyde_open_messages.add(session_id)
+    if event_type == "tool.start" and isinstance(payload, dict):
+        tool_id = str(payload.get("tool_id") or payload.get("tool_call_id") or "")
+        args = _tyde_tool_start_args.pop((session_id, tool_id), None)
+        if isinstance(args, dict):
+            payload = dict(payload)
+            payload["args"] = args
+    try:
+        _tyde_original_emit(event_type, session_id, payload)
+    finally:
+        if event_type in ("message.complete", "error"):
+            with _tyde_message_condition:
+                _tyde_open_messages.discard(session_id)
+                _tyde_message_condition.notify_all()
+
+_tyde_original_tool_start = _tyde_gateway_server._on_tool_start
+
+def _tyde_on_tool_start(session_id, tool_call_id, name, args):
+    if isinstance(args, dict):
+        _tyde_tool_start_args[(session_id, str(tool_call_id))] = args
+    _tyde_original_tool_start(session_id, tool_call_id, name, args)
+
+_tyde_gateway_server._emit = _tyde_emit
+_tyde_gateway_server._on_tool_start = _tyde_on_tool_start
 from tui_gateway.entry import main
 
-os.environ["HERMES_TUI_TOOLSETS"] = sys.argv[1]
+if len(sys.argv) > 1:
+    os.environ["HERMES_TUI_TOOLSETS"] = sys.argv[1]
 main()
 "#;
 const HERMES_BRIDGE_REGISTRATION: &str = r#"
@@ -111,6 +155,7 @@ pub struct HermesBackend {
 
 enum HermesBackendCommand {
     Input(AgentInput),
+    SetSubagentEmitter(Arc<dyn SubAgentEmitter>, oneshot::Sender<()>),
     Interrupt(oneshot::Sender<bool>),
     Shutdown,
 }
@@ -217,6 +262,15 @@ struct HermesSessionActor {
     events_tx: mpsc::UnboundedSender<ChatEvent>,
     command_rx: mpsc::UnboundedReceiver<HermesBackendCommand>,
     gateway_events_rx: mpsc::UnboundedReceiver<HermesGatewayEvent>,
+    subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
+    native_subagents: HashMap<String, HermesNativeSubagent>,
+}
+
+struct HermesNativeSubagent {
+    handle: SubAgentHandle,
+    agent_name: String,
+    parent_tool_call_id: String,
+    tool_calls: u64,
 }
 
 #[derive(Default)]
@@ -233,6 +287,14 @@ struct HermesEventMapper {
     awaiting_interrupted_complete: bool,
     session_info_emitted: bool,
     approval_counter: u64,
+    normalization_failures: HashMap<String, PendingToolNormalizationFailure>,
+    delegation_tools: VecDeque<HermesDelegationTool>,
+}
+
+#[derive(Clone)]
+struct HermesDelegationTool {
+    tool_call_id: String,
+    goals: Vec<String>,
 }
 
 pub(crate) fn resolve_session_settings(config: &BackendSpawnConfig) -> SessionSettingsValues {
@@ -409,6 +471,8 @@ impl Backend for HermesBackend {
             events_tx,
             command_rx,
             gateway_events_rx,
+            subagent_emitter: None,
+            native_subagents: HashMap::new(),
         };
         tokio::spawn(actor.run(Some(initial_input), None, startup_gateway_events));
 
@@ -466,6 +530,8 @@ impl Backend for HermesBackend {
             events_tx,
             command_rx,
             gateway_events_rx,
+            subagent_emitter: None,
+            native_subagents: HashMap::new(),
         };
         tokio::spawn(actor.run(
             None,
@@ -539,6 +605,19 @@ impl Backend for HermesBackend {
 
     async fn shutdown(self) {
         let _ = self.command_tx.send(HermesBackendCommand::Shutdown);
+    }
+}
+
+impl HermesBackend {
+    pub(crate) async fn set_subagent_emitter(&self, emitter: Arc<dyn SubAgentEmitter>) {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .command_tx
+            .send(HermesBackendCommand::SetSubagentEmitter(emitter, reply_tx))
+            .is_ok()
+        {
+            let _ = reply_rx.await;
+        }
     }
 }
 
@@ -629,6 +708,10 @@ impl HermesSessionActor {
                     let Some(command) = maybe_command else { break; };
                     match command {
                         HermesBackendCommand::Input(input) => self.handle_input(input).await,
+                        HermesBackendCommand::SetSubagentEmitter(emitter, reply) => {
+                            self.subagent_emitter = Some(emitter);
+                            let _ = reply.send(());
+                        }
                         HermesBackendCommand::Interrupt(reply) => {
                             let ok = self.handle_interrupt().await;
                             let _ = reply.send(ok);
@@ -885,6 +968,17 @@ impl HermesSessionActor {
                 if !event_targets_session(session_id.as_deref(), &self.live_session_id) {
                     return true;
                 }
+                tracing::debug!(
+                    event_type,
+                    stream_open = self.mapper.current_message_id.is_some(),
+                    pending_tools = self.mapper.pending_tools.len(),
+                    "mapping Hermes gateway event"
+                );
+                if event_type.starts_with("subagent.") {
+                    self.handle_native_subagent_event(&event_type, payload)
+                        .await;
+                    return true;
+                }
                 if event_type == "message.complete" {
                     payload = self.enrich_message_complete_payload(payload).await;
                 }
@@ -915,6 +1009,122 @@ impl HermesSessionActor {
                 });
                 false
             }
+        }
+    }
+
+    async fn handle_native_subagent_event(&mut self, event_type: &str, payload: Option<Value>) {
+        let Some(payload) = payload else {
+            self.emit_error(format!("Hermes {event_type} omitted its payload"));
+            return;
+        };
+        let subagent_id = optional_string_any(&payload, &["subagent_id", "child_session_id"])
+            .unwrap_or_else(|| {
+                let task_index = payload
+                    .get("task_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                format!("hermes-subagent-{task_index}")
+            });
+        let description = optional_string_any(&payload, &["goal", "text"]).unwrap_or_default();
+
+        if !self.native_subagents.contains_key(&subagent_id) {
+            let Some(emitter) = self.subagent_emitter.as_ref().cloned() else {
+                self.emit_error(format!(
+                    "Hermes {event_type} arrived before the native sub-agent emitter was installed"
+                ));
+                return;
+            };
+            let parent_tool_call_id = self
+                .mapper
+                .delegation_tools
+                .iter()
+                .rev()
+                .find(|tool| {
+                    !description.is_empty() && tool.goals.iter().any(|goal| goal == &description)
+                })
+                .or_else(|| self.mapper.delegation_tools.back())
+                .map(|tool| tool.tool_call_id.clone())
+                .unwrap_or_else(|| subagent_id.clone());
+            let task_index = payload
+                .get("task_index")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let agent_name = optional_string(&payload, &["name"])
+                .unwrap_or_else(|| format!("Hermes Agent {}", task_index + 1));
+            let session_id_hint = optional_string(&payload, &["child_session_id"]).map(SessionId);
+            let handle = match emitter
+                .on_subagent_spawned(
+                    subagent_id.clone(),
+                    agent_name.clone(),
+                    description.clone(),
+                    "hermes_native".to_string(),
+                    session_id_hint,
+                )
+                .await
+            {
+                Ok(handle) => handle,
+                Err(error) => {
+                    self.emit_error(format!(
+                        "Hermes native child registration failed for {subagent_id}: {error}"
+                    ));
+                    return;
+                }
+            };
+            self.native_subagents.insert(
+                subagent_id.clone(),
+                HermesNativeSubagent {
+                    handle,
+                    agent_name,
+                    parent_tool_call_id,
+                    tool_calls: 0,
+                },
+            );
+        }
+
+        let mut child_event = None;
+        let mut parent_progress = None;
+        if let Some(child) = self.native_subagents.get_mut(&subagent_id) {
+            if event_type == "subagent.tool" {
+                child.tool_calls = child.tool_calls.saturating_add(1);
+            }
+            let completed = event_type == "subagent.complete";
+            parent_progress = Some(hermes_subagent_progress(
+                &child.handle,
+                &child.agent_name,
+                &child.parent_tool_call_id,
+                child.tool_calls,
+                completed,
+            ));
+            if completed {
+                let content = optional_string_any(&payload, &["summary", "text"])
+                    .unwrap_or_else(|| "Hermes child completed.".to_string());
+                child_event = Some(ChatEvent::MessageAdded(ChatMessage {
+                    message_id: None,
+                    timestamp: unix_now_ms(),
+                    sender: MessageSender::Assistant {
+                        agent: HERMES_AGENT_NAME.to_string(),
+                    },
+                    content,
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    model_info: optional_string(&payload, &["model"])
+                        .map(|model| ModelInfo { model }),
+                    token_usage: None,
+                    context_breakdown: None,
+                    images: None,
+                }));
+            }
+        }
+        if let Some(progress) = parent_progress {
+            self.emit(ChatEvent::ToolProgress(progress));
+        }
+        if let Some(event) = child_event
+            && let Some(child) = self.native_subagents.get(&subagent_id)
+        {
+            let _ = child.handle.event_tx.send(event);
+        }
+        if event_type == "subagent.complete" {
+            self.native_subagents.remove(&subagent_id);
         }
     }
 
@@ -1769,18 +1979,17 @@ impl HermesEventMapper {
             "tool.complete" => self.map_tool_complete(payload),
             "approval.request" => self.map_approval_request(payload),
             "error" => self.map_error(payload),
-            event if event.starts_with("subagent.") => {
-                Ok(vec![ChatEvent::MessageAdded(warning_message(format!(
-                    "Hermes delegation event '{event}' is not mapped to Tyde SubAgentProgress yet"
-                )))])
-            }
+            event if event.starts_with("subagent.") => Ok(Vec::new()),
             other => Ok(vec![ChatEvent::MessageAdded(warning_message(format!(
                 "Hermes event '{other}' is not supported by the Tyde Hermes backend"
             )))]),
         };
 
         match result {
-            Ok(events) => events,
+            Ok(events) => events
+                .into_iter()
+                .map(|event| normalize_tyde_chat_event(event, &mut self.normalization_failures).0)
+                .collect(),
             Err(err) => self.fail_active_turn(err),
         }
     }
@@ -2041,11 +2250,32 @@ impl HermesEventMapper {
             .insert(tool_call_id.clone(), tool_name.clone());
         self.turn_tools
             .insert(tool_call_id.clone(), tool_name.clone());
-        Ok(vec![ChatEvent::ToolRequest(ToolRequest {
-            tool_call_id,
-            tool_name,
-            tool_type: ToolRequestType::Other { args: payload },
-        })])
+        let arguments = payload.get("args").cloned().unwrap_or(payload);
+        let tool_type =
+            hermes_native_tool_request_type(&tool_name, &arguments).unwrap_or_else(|| {
+                ToolRequestType::Other {
+                    args: arguments.clone(),
+                }
+            });
+        if is_hermes_delegate_tool(&tool_name) {
+            if self.delegation_tools.len() >= 256 {
+                self.delegation_tools.pop_front();
+            }
+            self.delegation_tools.push_back(HermesDelegationTool {
+                tool_call_id: tool_call_id.clone(),
+                goals: hermes_delegation_goals(&arguments),
+            });
+        }
+        let mut events = vec![ChatEvent::ToolRequest(ToolRequest {
+            tool_call_id: tool_call_id.clone(),
+            tool_name: tool_name.clone(),
+            tool_type,
+        })];
+        if let Some(progress) = await_progress_data_for_tool(&tool_call_id, &tool_name, &arguments)
+        {
+            events.push(ChatEvent::ToolProgress(progress));
+        }
+        Ok(events)
     }
 
     fn map_tool_progress(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
@@ -2093,16 +2323,26 @@ impl HermesEventMapper {
             .cloned()
             .or_else(|| payload.get("summary").cloned())
             .unwrap_or(Value::Null);
-        Ok(vec![ChatEvent::ToolExecutionCompleted(
+        let completion_tool_call_id = tool_call_id.clone();
+        let mut events = vec![ChatEvent::ToolExecutionCompleted(
             ToolExecutionCompletedData {
                 tool_call_id,
-                tool_name,
-                tool_result: ToolExecutionResult::Other { result },
+                tool_name: tool_name.clone(),
+                tool_result: ToolExecutionResult::Other {
+                    result: result.clone(),
+                },
                 success,
                 error,
                 normalization_failure: None,
             },
-        )])
+        )];
+        if success
+            && let Some(progress) =
+                spawn_progress_data_for_tool_result(&completion_tool_call_id, &tool_name, &result)
+        {
+            events.push(ChatEvent::ToolProgress(progress));
+        }
+        Ok(events)
     }
 
     fn map_approval_request(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
@@ -2266,6 +2506,70 @@ impl HermesEventMapper {
         self.pending_tools.clear();
         self.turn_tools.clear();
         self.pending_approval_tool_id = None;
+    }
+}
+
+fn is_hermes_delegate_tool(tool_name: &str) -> bool {
+    tool_name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect::<String>()
+        .ends_with("delegatetask")
+}
+
+fn hermes_delegation_goals(arguments: &Value) -> Vec<String> {
+    arguments
+        .get("goals")
+        .and_then(Value::as_array)
+        .map(|goals| {
+            goals
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|goal| !goal.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .or_else(|| {
+            arguments
+                .get("goal")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|goal| !goal.is_empty())
+                .map(|goal| vec![goal.to_owned()])
+        })
+        .unwrap_or_default()
+}
+
+fn hermes_native_tool_request_type(tool_name: &str, arguments: &Value) -> Option<ToolRequestType> {
+    if !is_hermes_delegate_tool(tool_name) {
+        return None;
+    }
+    let goals = hermes_delegation_goals(arguments);
+    Some(ToolRequestType::AgentSpawn {
+        prompt: (!goals.is_empty()).then(|| goals.join("\n\n")),
+        name: None,
+    })
+}
+
+fn hermes_subagent_progress(
+    handle: &SubAgentHandle,
+    agent_name: &str,
+    parent_tool_call_id: &str,
+    tool_calls: u64,
+    completed: bool,
+) -> ToolProgressData {
+    ToolProgressData {
+        tool_call_id: parent_tool_call_id.to_string(),
+        tool_name: "delegate_task".to_string(),
+        update: ToolProgressUpdate::SubAgent(protocol::SubAgentProgress {
+            agent_id: handle.agent_id.clone(),
+            agent_name: agent_name.to_string(),
+            last_tool_name: None,
+            tool_calls,
+            completed,
+        }),
     }
 }
 
@@ -2781,9 +3085,9 @@ fn hermes_python_spawn_target(
     workspace_roots: &[String],
 ) -> Result<HermesSpawnTarget, String> {
     Ok(HermesSpawnTarget {
-        display_program: format!("{program} -m {HERMES_PYTHON_MODULE}"),
+        display_program: format!("{program} with Tyde Hermes gateway adapter"),
         program,
-        args: vec!["-m".to_string(), HERMES_PYTHON_MODULE.to_string()],
+        args: vec!["-c".to_string(), HERMES_MCP_GATEWAY_ENTRY.to_string()],
         env: HashMap::new(),
         cwd: Some(session_cwd(workspace_roots)?),
         remote_host: None,
@@ -2797,12 +3101,12 @@ async fn resolve_hermes_cli_gateway_spawn_target(
         return match probe_hermes_cli_gateway(&candidate).await {
             Ok(probe) => {
                 let display_program = format!(
-                    "{} via {} -m {}",
-                    probe.executable, probe.gateway_python, HERMES_PYTHON_MODULE
+                    "{} via {} with Tyde Hermes gateway adapter",
+                    probe.executable, probe.gateway_python
                 );
                 Ok(HermesSpawnTarget {
                     program: probe.gateway_python,
-                    args: vec!["-m".to_string(), HERMES_PYTHON_MODULE.to_string()],
+                    args: vec!["-c".to_string(), HERMES_MCP_GATEWAY_ENTRY.to_string()],
                     env: HashMap::new(),
                     cwd: Some(session_cwd(workspace_roots)?),
                     remote_host: None,
@@ -2818,12 +3122,12 @@ async fn resolve_hermes_cli_gateway_spawn_target(
         match probe_hermes_cli_gateway(&candidate).await {
             Ok(probe) => {
                 let display_program = format!(
-                    "{} via {} -m {}",
-                    probe.executable, probe.gateway_python, HERMES_PYTHON_MODULE
+                    "{} via {} with Tyde Hermes gateway adapter",
+                    probe.executable, probe.gateway_python
                 );
                 return Ok(HermesSpawnTarget {
                     program: probe.gateway_python,
-                    args: vec!["-m".to_string(), HERMES_PYTHON_MODULE.to_string()],
+                    args: vec!["-c".to_string(), HERMES_MCP_GATEWAY_ENTRY.to_string()],
                     env: HashMap::new(),
                     cwd: Some(session_cwd(workspace_roots)?),
                     remote_host: None,
@@ -4052,10 +4356,8 @@ for line in sys.stdin:
             .expect("resolve Hermes spawn target");
 
         assert_eq!(target.program, python);
-        assert_eq!(
-            target.args,
-            vec!["-m".to_string(), HERMES_PYTHON_MODULE.to_string()]
-        );
+        assert_eq!(target.args[0], "-c");
+        assert_eq!(target.args[1], HERMES_MCP_GATEWAY_ENTRY);
         assert!(
             target.display_program.contains(&hermes),
             "display should mention resolved Hermes executable: {}",
@@ -4990,6 +5292,85 @@ for line in sys.stdin:
                 .map_event("tool.generating", Some(json!({ "name": "probe" })))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn hermes_gateway_preserves_authoritative_tool_arguments() {
+        assert!(HERMES_MCP_GATEWAY_ENTRY.contains("payload[\"args\"] = args"));
+        assert!(HERMES_MCP_GATEWAY_ENTRY.contains("_tyde_gateway_server._on_tool_start"));
+    }
+
+    #[test]
+    fn hermes_tyde_agent_tools_use_shared_typed_contracts() {
+        let mut mapper = HermesEventMapper::default();
+        let request = mapper.map_event(
+            "tool.start",
+            Some(json!({
+                "tool_id": "spawn-1",
+                "name": "mcp_tyde_tyde_spawn_agent",
+                "args": {
+                    "name": "Hermes Child",
+                    "prompt": "Review this change"
+                }
+            })),
+        );
+        assert!(request.iter().any(|event| matches!(
+            event,
+            ChatEvent::ToolRequest(ToolRequest {
+                tool_type: ToolRequestType::AgentSpawn {
+                    prompt: Some(prompt),
+                    name: Some(name),
+                },
+                ..
+            }) if prompt == "Review this change" && name == "Hermes Child"
+        )));
+
+        let completion = mapper.map_event(
+            "tool.complete",
+            Some(json!({
+                "tool_id": "spawn-1",
+                "name": "mcp_tyde_tyde_spawn_agent",
+                "args": {
+                    "name": "Hermes Child",
+                    "prompt": "Review this change"
+                },
+                "result": {
+                    "result": "{\"agent_id\":\"agent-1\",\"name\":\"Hermes Child\",\"status\":\"thinking\"}"
+                }
+            })),
+        );
+        assert!(completion.iter().any(|event| matches!(
+            event,
+            ChatEvent::ToolProgress(ToolProgressData {
+                update: ToolProgressUpdate::AgentControl(progress),
+                ..
+            }) if progress.agents.iter().any(|agent| agent.agent_id.0 == "agent-1")
+        )));
+    }
+
+    #[test]
+    fn hermes_native_delegation_is_a_typed_agent_spawn() {
+        let mut mapper = HermesEventMapper::default();
+        let events = mapper.map_event(
+            "tool.start",
+            Some(json!({
+                "tool_id": "delegate-1",
+                "name": "delegate_task",
+                "args": { "goals": ["Inspect the protocol"] }
+            })),
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ChatEvent::ToolRequest(ToolRequest {
+                tool_type: ToolRequestType::AgentSpawn {
+                    prompt: Some(prompt),
+                    ..
+                },
+                ..
+            }) if prompt == "Inspect the protocol"
+        )));
+        assert_eq!(mapper.delegation_tools.len(), 1);
+        assert_eq!(mapper.delegation_tools[0].tool_call_id, "delegate-1");
     }
 
     #[test]

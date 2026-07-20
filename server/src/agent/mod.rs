@@ -1657,7 +1657,12 @@ async fn spawn_backend(
             Ok((Box::new(b), events, session_id))
         }
         BackendKind::Hermes => {
-            let (b, events) = HermesBackend::spawn(workspace_roots, config, initial_input).await?;
+            let (b, events) =
+                HermesBackend::spawn(workspace_roots.clone(), config, initial_input).await?;
+            b.set_subagent_emitter(Arc::new(
+                sub_agent_context.emitter(agent_id.clone(), workspace_roots),
+            ))
+            .await;
             let session_id = Backend::session_id(&b);
             Ok((Box::new(b), events, session_id))
         }
@@ -1716,7 +1721,12 @@ async fn resume_backend(
             (Box::new(b), events)
         }
         BackendKind::Hermes => {
-            let (b, events) = HermesBackend::resume(workspace_roots, config, session_id).await?;
+            let (b, events) =
+                HermesBackend::resume(workspace_roots.clone(), config, session_id).await?;
+            b.set_subagent_emitter(Arc::new(
+                sub_agent_context.emitter(agent_id.clone(), workspace_roots),
+            ))
+            .await;
             (Box::new(b), events)
         }
     };

@@ -433,6 +433,7 @@ fn is_tyde_agent_control_tool_name(tool_name: &str, bare_normalized_name: &str) 
     let normalized = normalize_tool_name(tool_name);
     normalized == bare_normalized_name
         || normalized.ends_with(&format!("tydeagentcontrol{bare_normalized_name}"))
+        || normalized.ends_with(&format!("mcptyde{bare_normalized_name}"))
 }
 
 fn normalize_tool_name(tool_name: &str) -> String {
@@ -637,6 +638,12 @@ mod tests {
         ));
         assert!(is_tyde_agent_control_await_tool_name(
             "mcp__tyde-agent-await__tyde_await_agents"
+        ));
+        assert!(is_tyde_agent_control_spawn_tool_name(
+            "mcp_tyde_tyde_spawn_agent"
+        ));
+        assert!(is_tyde_agent_control_await_tool_name(
+            "mcp_tyde_tyde_await_agents"
         ));
 
         assert!(!is_tyde_agent_control_spawn_tool_name("spawn_agent"));
