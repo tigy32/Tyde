@@ -2498,6 +2498,7 @@ impl ClaudeInner {
             reasoning,
             tool_calls,
             context_breakdown,
+            images: Vec::new(),
         });
     }
 

@@ -5087,6 +5087,10 @@ fn interrupted_tool_completion(completion: &ToolExecutionCompletedData) -> bool 
         | ToolExecutionResult::GetTypeDocs { .. }
         | ToolExecutionResult::TydeSendAgentMessage
         | ToolExecutionResult::TydeAwaitAgents { .. }
+        | ToolExecutionResult::GenerateImage { .. }
+        | ToolExecutionResult::WebSearch
+        | ToolExecutionResult::ViewImage
+        | ToolExecutionResult::Sleep
         | ToolExecutionResult::Other { .. } => false,
     }
 }

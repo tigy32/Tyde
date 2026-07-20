@@ -220,8 +220,25 @@ pub fn ChatMessageView(
                         <div class="chat-card-images">
                             {imgs.into_iter().map(|img| {
                                 let src = format!("data:{};base64,{}", img.media_type, img.data);
+                                let href = matches!(
+                                    img.media_type.as_str(),
+                                    "image/png"
+                                        | "image/jpeg"
+                                        | "image/jpg"
+                                        | "image/gif"
+                                        | "image/webp"
+                                )
+                                .then(|| src.clone());
                                 view! {
-                                    <img class="chat-card-image" src=src alt="Attached image" loading="lazy" />
+                                    <a
+                                        class="chat-card-image-link"
+                                        href=href
+                                        target="_blank"
+                                        rel="noopener"
+                                        aria-label="Open image full size"
+                                    >
+                                        <img class="chat-card-image" src=src alt="Chat image" loading="lazy" />
+                                    </a>
                                 }
                             }).collect::<Vec<_>>()}
                         </div>
@@ -536,6 +553,33 @@ mod wasm_tests {
             .query_selector(".token-stat-output")
             .unwrap()
             .map(|el| el.text_content().unwrap_or_default())
+    }
+
+    #[wasm_bindgen_test]
+    async fn assistant_generated_image_renders_as_full_size_link() {
+        let mut entry = assistant_msg(None);
+        entry.message.content.clear();
+        entry.message.images = Some(vec![protocol::ImageData {
+            media_type: "image/png".to_owned(),
+            data: "iVBORw0KGgo=".to_owned(),
+        }]);
+        let container = mount_message(entry);
+        next_tick().await;
+
+        let link = container
+            .query_selector(".chat-card-image-link")
+            .unwrap()
+            .expect("generated image has a full-size link");
+        assert_eq!(link.get_attribute("target").as_deref(), Some("_blank"));
+        let image = container
+            .query_selector(".chat-card-image")
+            .unwrap()
+            .expect("generated image renders inline");
+        assert!(
+            image
+                .get_attribute("src")
+                .is_some_and(|src| src.starts_with("data:image/png;base64,"))
+        );
     }
 
     fn badge_title(container: &HtmlElement) -> Option<String> {

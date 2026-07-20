@@ -226,6 +226,57 @@ pub fn ToolCardView(owner_agent_ref: AgentRef, entry: ToolRequestEntry) -> impl 
             }
             .into_any();
         }
+
+        if let ToolRequestType::GenerateImage { prompt } = &entry.request.tool_type {
+            let prompt = prompt
+                .clone()
+                .unwrap_or_else(|| "Generating image".to_owned());
+            let detail = match entry.result.as_ref().map(|result| &result.tool_result) {
+                None => "Generating image".to_owned(),
+                Some(ToolExecutionResult::GenerateImage { image_count, .. }) => format!(
+                    "{image_count} image{} generated",
+                    if *image_count == 1 { "" } else { "s" }
+                ),
+                Some(other) => {
+                    log::error!("generate_image completed with an untyped result: {other:?}");
+                    "Image result could not be read".to_owned()
+                }
+            };
+            return view! {
+                <div
+                    class=format!("tool-card {status_class} generate-image")
+                    data-mobile-test="tool-card-generate-image"
+                >
+                    <div class="tool-card-header">
+                        <span class="tool-name">{tool_name}</span>
+                    </div>
+                    <div class="tool-image-generation-prompt">{prompt}</div>
+                    <div class="tool-image-generation-status">{detail}</div>
+                </div>
+            }
+            .into_any();
+        }
+
+        let native_detail = match &entry.request.tool_type {
+            ToolRequestType::WebSearch { query } => Some(("Search", query.clone())),
+            ToolRequestType::ViewImage { path } => Some(("View image", path.clone())),
+            ToolRequestType::Sleep { duration_ms } => Some(("Wait", format!("{} ms", duration_ms))),
+            _ => None,
+        };
+        if let Some((label, detail)) = native_detail {
+            return view! {
+                <div
+                    class=format!("tool-card {status_class} native-tool")
+                    data-mobile-test="tool-card-native"
+                >
+                    <div class="tool-card-header">
+                        <span class="tool-name">{label}</span>
+                    </div>
+                    <div class="tool-native-detail">{detail}</div>
+                </div>
+            }
+            .into_any();
+        }
     }
 
     let is_completed = entry.result.is_some();

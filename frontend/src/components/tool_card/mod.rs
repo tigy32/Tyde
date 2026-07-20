@@ -674,6 +674,24 @@ fn render_body(
             }
             .into_any(),
         },
+        ToolRequestType::GenerateImage { prompt } => view! {
+            <div class="tool-image-generation-prompt">
+                {prompt.clone().unwrap_or_else(|| "Generating image".to_owned())}
+            </div>
+        }
+        .into_any(),
+        ToolRequestType::WebSearch { query } => view! {
+            <div class="tool-native-detail">{query.clone()}</div>
+        }
+        .into_any(),
+        ToolRequestType::ViewImage { path } => view! {
+            <div class="tool-native-detail">{path.clone()}</div>
+        }
+        .into_any(),
+        ToolRequestType::Sleep { duration_ms } => view! {
+            <div class="tool-native-detail">{format!("Waiting {} ms", duration_ms)}</div>
+        }
+        .into_any(),
         ToolRequestType::Other { .. } => {
             other::render(req, result, malformed_payload, mode).into_any()
         }
@@ -1341,6 +1359,15 @@ fn tool_icon_and_detail(name: &str, tool_type: &ToolRequestType) -> (&'static st
             "\u{1f916}",
             name.clone().or_else(|| Some("Spawning agent".to_owned())),
         ),
+        ToolRequestType::GenerateImage { prompt } => (
+            "\u{1f5bc}",
+            prompt
+                .clone()
+                .or_else(|| Some("Generating image".to_owned())),
+        ),
+        ToolRequestType::WebSearch { query } => ("\u{1f50d}", Some(query.clone())),
+        ToolRequestType::ViewImage { path } => ("\u{1f5bc}", Some(short_path(path))),
+        ToolRequestType::Sleep { duration_ms } => ("\u{23f1}", Some(format!("{} ms", duration_ms))),
         // The recipient's live name needs app state, so the shell resolves it
         // (see `recipient_detail`). The request alone carries only a uuid, which
         // would be a worse header than none.
@@ -1451,6 +1478,15 @@ pub(crate) fn completion_header_summary(
             }
             parts.join(" \u{b7} ")
         }
+        ToolExecutionResult::GenerateImage { image_count, .. } => {
+            format!(
+                "{image_count} image{}",
+                if *image_count == 1 { "" } else { "s" }
+            )
+        }
+        ToolExecutionResult::WebSearch => "search complete".to_owned(),
+        ToolExecutionResult::ViewImage => "image viewed".to_owned(),
+        ToolExecutionResult::Sleep => "wait complete".to_owned(),
         ToolExecutionResult::Other { .. } => String::new(),
     }
 }

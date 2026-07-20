@@ -2167,6 +2167,7 @@ impl KiroInner {
                 } else {
                     Some(context_breakdown)
                 },
+                images: Vec::new(),
             },
         );
         self.flush_tool_events_after_stream_end(&tool_calls_for_events)

@@ -1162,11 +1162,17 @@ async fn fake_codex_provider_items_keep_identity_live_late_and_same_host_reconne
     }
 
     let child = child.expect("fake Codex flow must advertise backend-native child");
-    assert_eq!(parent_followup.stream_starts, vec!["parent-followup"]);
+    assert_eq!(
+        parent_followup.stream_starts,
+        vec!["parent-followup", "spawn-child"]
+    );
     assert!(parent_followup.stream_deltas.is_empty());
     assert_eq!(
         parent_followup.stream_ends,
-        vec![("parent-followup".to_owned(), "Starting child".to_owned())]
+        vec![
+            ("parent-followup".to_owned(), "Starting child".to_owned()),
+            ("spawn-child".to_owned(), String::new()),
+        ]
     );
     assert_eq!(parent_followup.errors, 0);
     assert_eq!(parent_followup.identity_errors, 0);

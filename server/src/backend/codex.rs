@@ -17,10 +17,10 @@ use protocol::{
     AgentControlAgentRef, AgentControlProgress, AgentControlProgressKind, BackendAccessMode,
     CapacityBucket, CapacityBucketId, CapacityCoverage, CapacityMeasure, CapacityPlanLabel,
     CapacityReport, CapacityReset, CapacityScope, CapacitySource, CapacityUnavailableReason,
-    CapacityWindow, ChatMessageId, CodexLimitSlot, ModelRequestId, ModelRequestTokenUsage,
-    ModelTurnId, ServerGeneratedChatMessageIdOrigin, ServerGeneratedChatMessageIdentity,
-    TokenUsage, TokenUsageUnavailableReason, ToolExecutionNormalizationFailure, ToolProgressData,
-    ToolProgressUpdate, ValueProvenance,
+    CapacityWindow, ChatMessageId, CodexLimitSlot, ImageData, ModelRequestId,
+    ModelRequestTokenUsage, ModelTurnId, ServerGeneratedChatMessageIdOrigin,
+    ServerGeneratedChatMessageIdentity, TokenUsage, TokenUsageUnavailableReason,
+    ToolExecutionNormalizationFailure, ToolProgressData, ToolProgressUpdate, ValueProvenance,
 };
 
 use crate::agent_control_mcp::AGENT_CONTROL_AWAIT_MCP_SERVER_NAME;
@@ -58,6 +58,7 @@ const CODEX_READ_ONLY_SANDBOX: &str = "workspace-write";
 const CODEX_INFERENCE_SANDBOX: &str = "read-only";
 const CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS: bool = true;
 const CODEX_REASONING_SUMMARY_LEVEL: &str = "detailed";
+const CODEX_MAX_GENERATED_IMAGE_BYTES: usize = 25 * 1024 * 1024;
 
 #[cfg(any(test, feature = "test-support"))]
 static CODEX_TEST_APP_SERVER_BINARY: std::sync::OnceLock<
@@ -653,6 +654,7 @@ impl CodexSession {
                 generated_identity_epoch,
                 next_generated_identity_ordinal: 1,
                 pending_tool_call_ids: HashSet::new(),
+                tool_container_images: Vec::new(),
                 cancelled_tool_call_ids: HashSet::new(),
                 close_active_stream_when_tools_idle: false,
                 pending_message_metadata: None,
@@ -1217,6 +1219,7 @@ struct ActiveStreamState {
     reasoning: String,
     reasoning_only: bool,
     stream_published: bool,
+    images: Vec<ImageData>,
 }
 
 impl ActiveStreamState {
@@ -1225,6 +1228,7 @@ impl ActiveStreamState {
             && !self.stream_published
             && self.text.is_empty()
             && self.reasoning.is_empty()
+            && self.images.is_empty()
     }
 }
 
@@ -1233,6 +1237,7 @@ struct InterruptedPublishedStream {
     content: String,
     reasoning: Option<String>,
     tool_call_ids: Vec<String>,
+    images: Vec<ImageData>,
 }
 
 #[derive(Clone)]
@@ -1298,8 +1303,10 @@ struct CodexSubAgentStream {
     current_text: String,
     current_reasoning: String,
     current_tool_call_ids: Vec<String>,
+    current_images: Vec<ImageData>,
     tool_container: Option<ChatMessageId>,
     pending_tool_call_ids: HashSet<String>,
+    tool_container_images: Vec<protocol::ImageData>,
     completed_agent_messages: HashMap<ChatMessageId, CompletedCodexAgentMessage>,
     retired_unpublished_message_ids: HashSet<ChatMessageId>,
     quarantined_turn_id: Option<String>,
@@ -1317,6 +1324,7 @@ impl CodexSubAgentStream {
             && !self.current_stream_published
             && self.current_text.is_empty()
             && self.current_reasoning.is_empty()
+            && self.current_images.is_empty()
     }
 
     fn retire_replaceable_provider_reservation(&mut self) -> bool {
@@ -1334,6 +1342,7 @@ impl CodexSubAgentStream {
         self.current_text.clear();
         self.current_reasoning.clear();
         self.current_tool_call_ids.clear();
+        self.current_images.clear();
         true
     }
 }
@@ -1404,6 +1413,7 @@ struct CodexState {
     generated_identity_epoch: u64,
     next_generated_identity_ordinal: u64,
     pending_tool_call_ids: HashSet<String>,
+    tool_container_images: Vec<protocol::ImageData>,
     cancelled_tool_call_ids: HashSet<String>,
     close_active_stream_when_tools_idle: bool,
     pending_message_metadata: Option<PendingCodexMessageMetadata>,
@@ -1564,6 +1574,7 @@ impl CodexInner {
             .active_turn_id
             .clone()
             .unwrap_or_else(|| message_id.0.clone());
+        let images = std::mem::take(&mut state.tool_container_images);
         state.active_stream = Some(ActiveStreamState {
             turn_id,
             message_id: message_id.clone(),
@@ -1572,6 +1583,7 @@ impl CodexInner {
             reasoning: String::new(),
             reasoning_only: false,
             stream_published: false,
+            images,
         });
         CodexAgentMessageOpen::Open
     }
@@ -1634,6 +1646,7 @@ impl CodexInner {
             .active_turn_id
             .clone()
             .unwrap_or_else(|| message_id.0.clone());
+        let images = std::mem::take(&mut state.tool_container_images);
         state.active_stream = Some(ActiveStreamState {
             turn_id,
             message_id: message_id.clone(),
@@ -1642,6 +1655,7 @@ impl CodexInner {
             reasoning: String::new(),
             reasoning_only: true,
             stream_published: false,
+            images,
         });
         CodexAgentMessageOpen::Open
     }
@@ -1841,9 +1855,21 @@ impl CodexInner {
 
     async fn record_tool_container(&self, container: Option<ChatMessageId>) {
         let Some(container) = container else {
+            if std::env::var_os("TYDE_CODEX_TRACE_TOOL_STATE").is_some() {
+                eprintln!("[codex-tool-state] no new tool container");
+            }
             return;
         };
         let mut state = self.state.lock().await;
+        if std::env::var_os("TYDE_CODEX_TRACE_TOOL_STATE").is_some() {
+            eprintln!(
+                "[codex-tool-state] record container={} active_stream={} existing_container={} pending={}",
+                container.0,
+                state.active_stream.is_some(),
+                state.tool_container.is_some(),
+                state.pending_tool_call_ids.len()
+            );
+        }
         if state.active_stream.is_some() || state.tool_container.is_some() {
             drop(state);
             self.emitter.discard_open_stream_with_identity_violation(
@@ -1855,24 +1881,70 @@ impl CodexInner {
     }
 
     async fn close_tool_container_if_open(&self) {
-        let container = self.state.lock().await.tool_container.take();
-        if let Some(container) = container {
-            self.emitter.close_tool_container(container);
+        let pending = {
+            let mut state = self.state.lock().await;
+            state
+                .tool_container
+                .take()
+                .map(|container| (container, std::mem::take(&mut state.tool_container_images)))
+        };
+        if let Some((container, images)) = pending {
+            self.emitter
+                .close_tool_container_with_images(container, images);
         }
     }
 
     async fn mark_tool_completed(&self, tool_call_id: &str) {
+        self.mark_tool_completed_with_images(tool_call_id, Vec::new())
+            .await;
+    }
+
+    async fn mark_tool_completed_with_images(
+        &self,
+        tool_call_id: &str,
+        images: Vec<protocol::ImageData>,
+    ) {
         let container = {
             let mut state = self.state.lock().await;
+            state.tool_container_images.extend(images);
             state.pending_tool_call_ids.remove(tool_call_id);
-            state
-                .pending_tool_call_ids
-                .is_empty()
-                .then(|| state.tool_container.take())
-                .flatten()
+            if std::env::var_os("TYDE_CODEX_TRACE_TOOL_STATE").is_some() {
+                eprintln!(
+                    "[codex-tool-state] complete tool={} pending={} container={} active_stream={} images={}",
+                    tool_call_id,
+                    state.pending_tool_call_ids.len(),
+                    state.tool_container.is_some(),
+                    state.active_stream.is_some(),
+                    state.tool_container_images.len()
+                );
+            }
+            if state.pending_tool_call_ids.is_empty() {
+                if let Some(container) = state.tool_container.take() {
+                    Some((container, std::mem::take(&mut state.tool_container_images)))
+                } else if state.active_stream.is_some() {
+                    let images = std::mem::take(&mut state.tool_container_images);
+                    state
+                        .active_stream
+                        .as_mut()
+                        .expect("active Codex stream disappeared")
+                        .images
+                        .extend(images);
+                    None
+                } else {
+                    // Codex may start and finish an intervening reasoning item
+                    // while an image tool is still running. Retain the image
+                    // until the next provider message claims it rather than
+                    // dropping output that arrived after its tool container
+                    // closed.
+                    None
+                }
+            } else {
+                None
+            }
         };
-        if let Some(container) = container {
-            self.emitter.close_tool_container(container);
+        if let Some((container, images)) = container {
+            self.emitter
+                .close_tool_container_with_images(container, images);
         }
     }
 
@@ -2239,6 +2311,33 @@ impl CodexInner {
                             },
                         );
                     }
+                    "imageGeneration" => {
+                        let Ok(image) = parse_codex_generated_image(item) else {
+                            continue;
+                        };
+                        total_bytes = total_bytes.saturating_add(image.data.len() as u64);
+                        self.emitter.assistant_message(
+                            crate::backend::turn_emitter::AssistantMessagePayload {
+                                agent: AgentName(CODEX_AGENT_NAME),
+                                message_id: item
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .filter(|message_id| !message_id.trim().is_empty()),
+                                content: String::new(),
+                                reasoning: None,
+                                tool_calls: Vec::new(),
+                                model_info: Some(json!({ "model": model })),
+                                request_usage: None,
+                                turn_usage: None,
+                                cumulative_usage: None,
+                                context_breakdown: None,
+                                images: vec![
+                                    serde_json::to_value(image)
+                                        .expect("serialize resumed Codex generated image"),
+                                ],
+                            },
+                        );
+                    }
                     _ => {}
                 }
             }
@@ -2505,6 +2604,7 @@ impl CodexInner {
                     state.active_stream = None;
                     state.retired_unpublished_message_ids.clear();
                     state.pending_tool_call_ids.clear();
+                    state.tool_container_images.clear();
                     state.close_active_stream_when_tools_idle = false;
                     state.pending_message_metadata = None;
                     let pending_user_input = state.pending_user_input_bytes;
@@ -2959,7 +3059,9 @@ impl CodexInner {
                         stream.current_text.clear();
                         stream.current_reasoning.clear();
                         stream.current_tool_call_ids.clear();
+                        stream.current_images.clear();
                         stream.pending_tool_call_ids.clear();
+                        stream.tool_container_images.clear();
                         stream.retired_unpublished_message_ids.clear();
                         stream.quarantined_turn_id = None;
                         stream.quarantined = false;
@@ -3065,6 +3167,7 @@ impl CodexInner {
                         stream.current_text.clear();
                         stream.current_reasoning.clear();
                         stream.current_tool_call_ids.clear();
+                        stream.current_images.clear();
                         stream.current_text.push_str(&delta);
                         stream.current_stream_published =
                             contains_non_whitespace(&stream.current_text);
@@ -3223,6 +3326,7 @@ impl CodexInner {
                             stream.current_text.clear();
                             stream.current_reasoning = delta.clone();
                             stream.current_tool_call_ids.clear();
+                            stream.current_images.clear();
                             stream.current_stream_published =
                                 contains_non_whitespace(&stream.current_reasoning);
                             let published = stream.current_stream_published;
@@ -3329,6 +3433,7 @@ impl CodexInner {
                                 stream.current_text.clear();
                                 stream.current_reasoning.clear();
                                 stream.current_tool_call_ids.clear();
+                                stream.current_images.clear();
                             }
                             violation
                         }
@@ -3387,6 +3492,7 @@ impl CodexInner {
                             stream.current_text.clear();
                             stream.current_reasoning.clear();
                             stream.current_tool_call_ids.clear();
+                            stream.current_images.clear();
                             None
                         }
                     };
@@ -3405,6 +3511,10 @@ impl CodexInner {
                     item_type,
                     "commandExecution"
                         | "fileChange"
+                        | "imageGeneration"
+                        | "webSearch"
+                        | "imageView"
+                        | "sleep"
                         | "collabToolCall"
                         | "collabAgentToolCall"
                         | "mcpToolCall"
@@ -3521,9 +3631,9 @@ impl CodexInner {
                     return;
                 };
                 if let Some(tool_call_id) = codex_error_tool_call_id(params)
-                    && emitter.fail_pending_tool(tool_call_id, &message)
+                    && emitter.fail_pending_tool(&tool_call_id, &message)
                 {
-                    self.complete_subagent_tool_calls(stream_key, &[tool_call_id.to_string()])
+                    self.complete_subagent_tool_calls(stream_key, &[tool_call_id])
                         .await;
                     return;
                 }
@@ -3590,13 +3700,16 @@ impl CodexInner {
             let Some(stream) = state.subagent_streams.get_mut(stream_key) else {
                 return;
             };
-            stream
-                .tool_container
-                .take()
-                .map(|container| (Arc::clone(&stream.emitter), container))
+            stream.tool_container.take().map(|container| {
+                (
+                    Arc::clone(&stream.emitter),
+                    container,
+                    std::mem::take(&mut stream.tool_container_images),
+                )
+            })
         };
-        if let Some((emitter, container)) = container {
-            emitter.close_tool_container(container);
+        if let Some((emitter, container, images)) = container {
+            emitter.close_tool_container_with_images(container, images);
         }
     }
 
@@ -3632,25 +3745,43 @@ impl CodexInner {
     }
 
     async fn complete_subagent_tool_calls(&self, stream_key: &str, tool_call_ids: &[String]) {
+        self.complete_subagent_tool_calls_with_images(stream_key, tool_call_ids, Vec::new())
+            .await;
+    }
+
+    async fn complete_subagent_tool_calls_with_images(
+        &self,
+        stream_key: &str,
+        tool_call_ids: &[String],
+        images: Vec<protocol::ImageData>,
+    ) {
         let container = {
             let mut state = self.state.lock().await;
             let Some(stream) = state.subagent_streams.get_mut(stream_key) else {
                 return;
             };
+            stream.tool_container_images.extend(images);
             for tool_call_id in tool_call_ids {
                 stream.pending_tool_call_ids.remove(tool_call_id);
             }
             if stream.pending_tool_call_ids.is_empty() {
-                stream
-                    .tool_container
-                    .take()
-                    .map(|container| (Arc::clone(&stream.emitter), container))
+                if let Some(container) = stream.tool_container.take() {
+                    Some((
+                        Arc::clone(&stream.emitter),
+                        container,
+                        std::mem::take(&mut stream.tool_container_images),
+                    ))
+                } else {
+                    let images = std::mem::take(&mut stream.tool_container_images);
+                    stream.current_images.extend(images);
+                    None
+                }
             } else {
                 None
             }
         };
-        if let Some((emitter, container)) = container {
-            emitter.close_tool_container(container);
+        if let Some((emitter, container, images)) = container {
+            emitter.close_tool_container_with_images(container, images);
         }
     }
 
@@ -3679,8 +3810,10 @@ impl CodexInner {
             stream.current_text.clear();
             stream.current_reasoning.clear();
             stream.current_tool_call_ids.clear();
+            stream.current_images.clear();
             stream.tool_container = None;
             stream.pending_tool_call_ids.clear();
+            stream.tool_container_images.clear();
             (Arc::clone(&stream.emitter), stream_published)
         };
         tracing::warn!(
@@ -3708,10 +3841,62 @@ impl CodexInner {
         let item_id = item
             .get("id")
             .and_then(Value::as_str)
-            .unwrap_or("tool-call")
-            .to_string();
+            .map(|item_id| codex_scoped_tool_call_id(params, item_id))
+            .unwrap_or_else(|| codex_scoped_tool_call_id(params, "tool-call"));
 
         match item_type {
+            "imageGeneration" => {
+                let prompt = item
+                    .get("revisedPrompt")
+                    .and_then(Value::as_str)
+                    .filter(|prompt| !prompt.trim().is_empty())
+                    .map(str::to_owned);
+                let container = emitter.tool_request_in_container(
+                    &item_id,
+                    "generate_image",
+                    serde_json::to_value(protocol::ToolRequestType::GenerateImage { prompt })
+                        .expect("serialize Codex image generation request"),
+                );
+                (container, vec![item_id])
+            }
+            "webSearch" => {
+                let query = item
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let container = emitter.tool_request_in_container(
+                    &item_id,
+                    "web_search",
+                    serde_json::to_value(protocol::ToolRequestType::WebSearch { query })
+                        .expect("serialize Codex web search request"),
+                );
+                (container, vec![item_id])
+            }
+            "imageView" => {
+                let path = item
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let container = emitter.tool_request_in_container(
+                    &item_id,
+                    "view_image",
+                    serde_json::to_value(protocol::ToolRequestType::ViewImage { path })
+                        .expect("serialize Codex image view request"),
+                );
+                (container, vec![item_id])
+            }
+            "sleep" => {
+                let duration_ms = item.get("durationMs").and_then(Value::as_u64).unwrap_or(0);
+                let container = emitter.tool_request_in_container(
+                    &item_id,
+                    "sleep",
+                    serde_json::to_value(protocol::ToolRequestType::Sleep { duration_ms })
+                        .expect("serialize Codex sleep request"),
+                );
+                (container, vec![item_id])
+            }
             "commandExecution" => {
                 let command = item
                     .get("command")
@@ -3784,8 +3969,8 @@ impl CodexInner {
         let item_id = item
             .get("id")
             .and_then(Value::as_str)
-            .unwrap_or("item")
-            .to_string();
+            .map(|item_id| codex_scoped_tool_call_id(params, item_id))
+            .unwrap_or_else(|| codex_scoped_tool_call_id(params, "item"));
 
         match item_type {
             "agentMessage" => {
@@ -3818,6 +4003,7 @@ impl CodexInner {
                     content,
                     final_reasoning,
                     tool_call_ids,
+                    images,
                 )) = self
                     .complete_subagent_message(
                         stream_key,
@@ -3855,6 +4041,7 @@ impl CodexInner {
                         reasoning: final_reasoning,
                         tool_calls,
                         context_breakdown: None,
+                        images,
                     },
                 );
             }
@@ -3871,6 +4058,14 @@ impl CodexInner {
                         .filter(|reasoning| contains_non_whitespace(reasoning)),
                 )
                 .await;
+            }
+            "imageGeneration" => {
+                self.complete_subagent_image_generation(stream_key, &item_id, item)
+                    .await;
+            }
+            "webSearch" | "imageView" | "sleep" => {
+                self.complete_subagent_native_tool(stream_key, &item_id, item_type)
+                    .await;
             }
             "commandExecution" => {
                 let Some(emitter) = self.codex_subagent_emitter(stream_key).await else {
@@ -4018,6 +4213,77 @@ impl CodexInner {
         }
     }
 
+    async fn complete_subagent_image_generation(
+        &self,
+        stream_key: &str,
+        item_id: &str,
+        item: &Value,
+    ) {
+        let Some(emitter) = self.codex_subagent_emitter(stream_key).await else {
+            return;
+        };
+        let revised_prompt = codex_image_generation_prompt(item);
+        let image = parse_codex_generated_image(item);
+        let (success, tool_result, error, images) = match image {
+            Ok(image) => (
+                true,
+                serde_json::to_value(protocol::ToolExecutionResult::GenerateImage {
+                    revised_prompt,
+                    image_count: 1,
+                })
+                .expect("serialize Codex image generation result"),
+                None,
+                vec![image],
+            ),
+            Err(error) => (
+                false,
+                json!({
+                    "kind": "Error",
+                    "short_message": "Image generation failed",
+                    "detailed_message": error,
+                }),
+                Some(error),
+                Vec::new(),
+            ),
+        };
+        let container = emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id: item_id,
+            tool_name: "generate_image",
+            tool_result,
+            success,
+            error: error.as_deref(),
+        });
+        self.record_subagent_tool_container(stream_key, container)
+            .await;
+        self.complete_subagent_tool_calls_with_images(stream_key, &[item_id.to_owned()], images)
+            .await;
+    }
+
+    async fn complete_subagent_native_tool(
+        &self,
+        stream_key: &str,
+        item_id: &str,
+        item_type: &str,
+    ) {
+        let Some((tool_name, tool_result)) = codex_native_tool_completion(item_type) else {
+            return;
+        };
+        let Some(emitter) = self.codex_subagent_emitter(stream_key).await else {
+            return;
+        };
+        let container = emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id: item_id,
+            tool_name,
+            tool_result,
+            success: true,
+            error: None,
+        });
+        self.record_subagent_tool_container(stream_key, container)
+            .await;
+        self.complete_subagent_tool_calls(stream_key, &[item_id.to_owned()])
+            .await;
+    }
+
     async fn complete_subagent_message(
         &self,
         stream_key: &str,
@@ -4034,6 +4300,7 @@ impl CodexInner {
         String,
         Option<String>,
         Vec<String>,
+        Vec<ImageData>,
     )> {
         self.close_subagent_tool_container_if_open(stream_key).await;
         let result = {
@@ -4090,7 +4357,7 @@ impl CodexInner {
                     &content,
                     reasoning.as_deref(),
                     stream.current_tool_call_ids.len(),
-                    0,
+                    stream.current_images.len(),
                 );
                 let resolved_completion = CompletedCodexAgentMessage {
                     reported_text,
@@ -4108,6 +4375,7 @@ impl CodexInner {
                 stream.current_text.clear();
                 stream.current_reasoning.clear();
                 let tool_call_ids = std::mem::take(&mut stream.current_tool_call_ids);
+                let images = std::mem::take(&mut stream.current_images);
                 stream
                     .completed_agent_messages
                     .insert(message_id.clone(), resolved_completion);
@@ -4141,6 +4409,7 @@ impl CodexInner {
                     content,
                     reasoning,
                     tool_call_ids,
+                    images,
                 )))
             }
         };
@@ -4257,11 +4526,16 @@ impl CodexInner {
                         stream.current_stream_published = false;
                         stream.current_text.clear();
                         stream.current_reasoning.clear();
-                        stream.current_tool_call_ids.clear();
+                        let tool_call_ids = std::mem::take(&mut stream.current_tool_call_ids);
+                        let images = std::mem::take(&mut stream.current_images);
                         stream
                             .completed_agent_messages
                             .insert(message_id.clone(), completion);
-                        if reasoning.is_none() && !stream_published {
+                        if reasoning.is_none()
+                            && tool_call_ids.is_empty()
+                            && images.is_empty()
+                            && !stream_published
+                        {
                             tracing::debug!(
                                 provider_item_id = message_id.0.as_str(),
                                 item_type = "reasoning",
@@ -4290,6 +4564,8 @@ impl CodexInner {
                             reasoning,
                             token_usage,
                             unavailable_reason,
+                            tool_call_ids,
+                            images,
                         ))
                     }
                 }
@@ -4303,6 +4579,8 @@ impl CodexInner {
             reasoning,
             token_usage,
             unavailable_reason,
+            tool_call_ids,
+            images,
         ) = match result {
             Ok(result) => result,
             Err(violation) => {
@@ -4333,8 +4611,9 @@ impl CodexInner {
                 cumulative_usage: None,
                 token_usage_unavailable_reason: unavailable_reason,
                 reasoning,
-                tool_calls: Vec::new(),
+                tool_calls: emitter.tool_call_declarations(&tool_call_ids),
                 context_breakdown: None,
+                images,
             },
         );
     }
@@ -4510,6 +4789,7 @@ impl CodexInner {
                             content,
                             reasoning,
                             tool_call_ids: std::mem::take(&mut stream.current_tool_call_ids),
+                            images: std::mem::take(&mut stream.current_images),
                         });
                     } else {
                         let durable_idless_reasoning = stream.current_reasoning_only
@@ -4546,6 +4826,7 @@ impl CodexInner {
                     stream.current_text.clear();
                     stream.current_reasoning.clear();
                     stream.current_tool_call_ids.clear();
+                    stream.current_images.clear();
                     if open_item && !(turn_status == "interrupted" && !open_item_published) {
                         stream.quarantined = true;
                         stream.quarantined_turn_id = extract_turn_id(params);
@@ -4580,6 +4861,7 @@ impl CodexInner {
                     reasoning: stream.reasoning,
                     tool_calls,
                     context_breakdown: None,
+                    images: stream.images,
                 },
             );
             emitter.operation_cancelled("Operation cancelled");
@@ -4600,6 +4882,7 @@ impl CodexInner {
                     reasoning: Some(reasoning),
                     tool_calls: Vec::new(),
                     context_breakdown: None,
+                    images: Vec::new(),
                 },
             );
             emitter.operation_cancelled("Codex child turn ended before reasoning item completion");
@@ -4685,9 +4968,9 @@ impl CodexInner {
             .unwrap_or("Codex error")
             .to_string();
         if let Some(tool_call_id) = codex_error_tool_call_id(params)
-            && self.emitter.fail_pending_tool(tool_call_id, &message)
+            && self.emitter.fail_pending_tool(&tool_call_id, &message)
         {
-            self.mark_tool_completed(tool_call_id).await;
+            self.mark_tool_completed(&tool_call_id).await;
             return;
         }
         let terminal = {
@@ -4748,7 +5031,8 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or("approval")
                     .to_string();
-                let tool_call_id = format!("approval-{item_id}");
+                let tool_call_id =
+                    format!("approval-{}", codex_scoped_tool_call_id(params, &item_id));
                 let question = params
                     .get("reason")
                     .and_then(Value::as_str)
@@ -4792,7 +5076,10 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or("file-approval")
                     .to_string();
-                let tool_call_id = format!("file-approval-{item_id}");
+                let tool_call_id = format!(
+                    "file-approval-{}",
+                    codex_scoped_tool_call_id(params, &item_id)
+                );
                 let question = params
                     .get("reason")
                     .and_then(Value::as_str)
@@ -4830,7 +5117,10 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or("exec-approval")
                     .to_string();
-                let tool_call_id = format!("exec-approval-{call_id}");
+                let tool_call_id = format!(
+                    "exec-approval-{}",
+                    codex_scoped_tool_call_id(params, &call_id)
+                );
                 let command_text = params
                     .get("command")
                     .and_then(Value::as_array)
@@ -4886,7 +5176,10 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or("patch-approval")
                     .to_string();
-                let tool_call_id = format!("patch-approval-{call_id}");
+                let tool_call_id = format!(
+                    "patch-approval-{}",
+                    codex_scoped_tool_call_id(params, &call_id)
+                );
                 let question = params
                     .get("reason")
                     .and_then(Value::as_str)
@@ -4924,7 +5217,10 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or("request-user-input")
                     .to_string();
-                let tool_call_id = format!("request-user-input-{item_id}");
+                let tool_call_id = format!(
+                    "request-user-input-{}",
+                    codex_scoped_tool_call_id(params, &item_id)
+                );
                 let questions = params
                     .get("questions")
                     .and_then(Value::as_array)
@@ -4974,16 +5270,17 @@ impl CodexInner {
                 let call_id = params
                     .get("callId")
                     .and_then(Value::as_str)
-                    .unwrap_or("dynamic-tool-call");
+                    .map(|call_id| codex_scoped_tool_call_id(params, call_id))
+                    .unwrap_or_else(|| codex_scoped_tool_call_id(params, "dynamic-tool-call"));
                 let tool_name = params
                     .get("tool")
                     .and_then(Value::as_str)
                     .unwrap_or("dynamic_tool");
 
-                self.track_tool_requests(std::iter::once(call_id.to_string()))
+                self.track_tool_requests(std::iter::once(call_id.clone()))
                     .await;
                 self.emit_tool_request(
-                    call_id,
+                    &call_id,
                     tool_name,
                     json!({
                         "kind": "Other",
@@ -5006,7 +5303,7 @@ impl CodexInner {
                 });
                 let _ = self.rpc.respond(id, response_payload).await;
                 self.emit_tool_execution_completed(
-                    call_id,
+                    &call_id,
                     tool_name,
                     false,
                     json!({
@@ -5122,8 +5419,72 @@ impl CodexInner {
                     }
                 }
             }
+            "imageGeneration" => {
+                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("tool-call"));
+                self.track_tool_requests(std::iter::once(item_id.clone()))
+                    .await;
+                let prompt = item
+                    .get("revisedPrompt")
+                    .and_then(Value::as_str)
+                    .filter(|prompt| !prompt.trim().is_empty())
+                    .map(str::to_owned);
+                self.emit_tool_request(
+                    &item_id,
+                    "generate_image",
+                    serde_json::to_value(protocol::ToolRequestType::GenerateImage { prompt })
+                        .expect("serialize Codex image generation request"),
+                )
+                .await;
+            }
+            "webSearch" => {
+                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("tool-call"));
+                self.track_tool_requests(std::iter::once(item_id.clone()))
+                    .await;
+                let query = item
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                self.emit_tool_request(
+                    &item_id,
+                    "web_search",
+                    serde_json::to_value(protocol::ToolRequestType::WebSearch { query })
+                        .expect("serialize Codex web search request"),
+                )
+                .await;
+            }
+            "imageView" => {
+                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("tool-call"));
+                self.track_tool_requests(std::iter::once(item_id.clone()))
+                    .await;
+                let path = item
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                self.emit_tool_request(
+                    &item_id,
+                    "view_image",
+                    serde_json::to_value(protocol::ToolRequestType::ViewImage { path })
+                        .expect("serialize Codex image view request"),
+                )
+                .await;
+            }
+            "sleep" => {
+                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("tool-call"));
+                self.track_tool_requests(std::iter::once(item_id.clone()))
+                    .await;
+                let duration_ms = item.get("durationMs").and_then(Value::as_u64).unwrap_or(0);
+                self.emit_tool_request(
+                    &item_id,
+                    "sleep",
+                    serde_json::to_value(protocol::ToolRequestType::Sleep { duration_ms })
+                        .expect("serialize Codex sleep request"),
+                )
+                .await;
+            }
             "commandExecution" => {
-                let item_id = item_id.unwrap_or("tool-call").to_string();
+                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("tool-call"));
                 let command = item
                     .get("command")
                     .and_then(Value::as_str)
@@ -5148,7 +5509,7 @@ impl CodexInner {
                 .await;
             }
             "fileChange" => {
-                let item_id = item_id.unwrap_or("tool-call").to_string();
+                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("tool-call"));
                 let file_changes = parse_codex_file_changes(item);
                 if file_changes.is_empty() {
                     return;
@@ -5180,7 +5541,7 @@ impl CodexInner {
                 }
             }
             "collabToolCall" | "collabAgentToolCall" => {
-                let item_id = item_id.unwrap_or("tool-call").to_string();
+                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("tool-call"));
                 let tool_name = item
                     .get("tool")
                     .and_then(Value::as_str)
@@ -5192,14 +5553,14 @@ impl CodexInner {
                 self.record_tool_container(container).await;
                 self.emit_agent_control_await_progress_if_needed(&item_id, &tool_name, item)
                     .await;
-                self.record_codex_subagent_spawn_metadata_if_needed(item)
+                self.record_codex_subagent_spawn_metadata_if_needed(Some(params), item)
                     .await;
             }
             "subAgentActivity" | "sub_agent_activity" => {
                 self.register_codex_subagent_activity_if_needed(item).await;
             }
             "mcpToolCall" | "dynamicToolCall" => {
-                let item_id = item_id.unwrap_or("tool-call").to_string();
+                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("tool-call"));
                 let tool_name = item
                     .get("tool")
                     .and_then(Value::as_str)
@@ -5294,6 +5655,7 @@ impl CodexInner {
                             Some(Ok((stream, false)))
                         }
                     } else {
+                        let images = std::mem::take(&mut state.tool_container_images);
                         Some(Ok((
                             ActiveStreamState {
                                 turn_id: state
@@ -5306,6 +5668,7 @@ impl CodexInner {
                                 reasoning: String::new(),
                                 reasoning_only: false,
                                 stream_published: false,
+                                images,
                             },
                             true,
                         )))
@@ -5341,7 +5704,9 @@ impl CodexInner {
                     Some(stream.reasoning)
                 }
                 .filter(|reasoning| contains_non_whitespace(reasoning));
-                let renderable = codex_message_is_renderable(&content, reasoning.as_deref(), 0, 0);
+                let images = stream.images;
+                let renderable =
+                    codex_message_is_renderable(&content, reasoning.as_deref(), 0, images.len());
                 let resolved_completion = CompletedCodexAgentMessage {
                     reported_text,
                     reported_reasoning,
@@ -5422,6 +5787,7 @@ impl CodexInner {
                         reasoning,
                         tool_calls: Vec::new(),
                         context_breakdown: None,
+                        images,
                     },
                 );
             }
@@ -5510,6 +5876,7 @@ impl CodexInner {
                                 .expect("generated reasoning identity")
                                 .message_id()
                         });
+                        let images = std::mem::take(&mut state.tool_container_images);
                         Some(Ok((
                             ActiveStreamState {
                                 turn_id: state
@@ -5522,6 +5889,7 @@ impl CodexInner {
                                 reasoning: String::new(),
                                 reasoning_only: true,
                                 stream_published: false,
+                                images,
                             },
                             true,
                         )))
@@ -5548,6 +5916,7 @@ impl CodexInner {
                 let reasoning = completion_reasoning.or_else(|| {
                     contains_non_whitespace(&stream.reasoning).then_some(stream.reasoning.clone())
                 });
+                let images = stream.images;
                 let completion = CompletedCodexAgentMessage {
                     reported_text: String::new(),
                     reported_reasoning,
@@ -5580,7 +5949,7 @@ impl CodexInner {
                         .insert(stream.message_id.clone(), completion);
                     model
                 };
-                if reasoning.is_none() && !stream.stream_published {
+                if reasoning.is_none() && images.is_empty() && !stream.stream_published {
                     tracing::debug!(
                         provider_item_id = stream.message_id.0.as_str(),
                         item_type = "reasoning",
@@ -5616,11 +5985,20 @@ impl CodexInner {
                         reasoning,
                         tool_calls: Vec::new(),
                         context_breakdown: None,
+                        images,
                     },
                 );
             }
+            "imageGeneration" => {
+                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("item"));
+                self.complete_image_generation(&item_id, item).await;
+            }
+            "webSearch" | "imageView" | "sleep" => {
+                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("item"));
+                self.complete_native_tool(&item_id, item_type).await;
+            }
             "commandExecution" => {
-                let item_id = item_id.unwrap_or("item").to_string();
+                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("item"));
                 self.add_active_turn_tool_bytes(estimate_command_execution_tool_bytes(item))
                     .await;
                 let exit_code = item.get("exitCode").and_then(Value::as_i64).unwrap_or(-1) as i32;
@@ -5649,7 +6027,7 @@ impl CodexInner {
                 .await;
             }
             "fileChange" => {
-                let item_id = item_id.unwrap_or("item").to_string();
+                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("item"));
                 self.add_active_turn_tool_bytes(estimate_file_change_tool_bytes(item))
                     .await;
                 let success = item.get("status").and_then(Value::as_str) == Some("completed");
@@ -5713,7 +6091,7 @@ impl CodexInner {
                 .await;
             }
             "mcpToolCall" | "dynamicToolCall" => {
-                let item_id = item_id.unwrap_or("item").to_string();
+                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("item"));
                 self.add_active_turn_tool_bytes(estimate_generic_tool_bytes(item))
                     .await;
                 let tool_name = item
@@ -5746,7 +6124,7 @@ impl CodexInner {
                     receiver_count = codex_native_wait_thread_ids(item).len(),
                     "Codex native collaboration completion"
                 );
-                let item_id = item_id.unwrap_or("item").to_string();
+                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("item"));
                 self.add_active_turn_tool_bytes(estimate_generic_tool_bytes(item))
                     .await;
                 let tool_name = item
@@ -5769,14 +6147,18 @@ impl CodexInner {
                     },
                 )
                 .await;
-                self.record_codex_subagent_spawn_metadata_if_needed(item)
+                self.record_codex_subagent_spawn_metadata_if_needed(Some(params), item)
                     .await;
             }
             _ => {}
         }
     }
 
-    async fn record_codex_subagent_spawn_metadata_if_needed(&self, item: &Value) {
+    async fn record_codex_subagent_spawn_metadata_if_needed(
+        &self,
+        params: Option<&Value>,
+        item: &Value,
+    ) {
         let spawns = parse_codex_subagent_collabs(item);
         if spawns.is_empty() {
             return;
@@ -5787,7 +6169,10 @@ impl CodexInner {
             .is_some_and(|tool| tool.eq_ignore_ascii_case("spawnAgent"))
             && item.get("status").and_then(Value::as_str) == Some("completed")
             && item.get("receiverThreadIds").is_some();
-        for spawn in spawns {
+        for mut spawn in spawns {
+            if let Some(params) = params {
+                spawn.item_id = codex_scoped_tool_call_id(params, &spawn.item_id);
+            }
             let receiver_thread_id = spawn.receiver_thread_id.clone();
             let fallback_agent_path = spawn.name.clone();
             let conflict = {
@@ -6062,6 +6447,7 @@ impl CodexInner {
                         current_tool_call_ids: Vec::new(),
                         tool_container: None,
                         pending_tool_call_ids: HashSet::new(),
+                        tool_container_images: Vec::new(),
                         completed_agent_messages: HashMap::new(),
                         retired_unpublished_message_ids: HashSet::new(),
                         quarantined_turn_id: None,
@@ -6070,6 +6456,7 @@ impl CodexInner {
                         next_generated_identity_ordinal: 1,
                         pending_message_metadata: None,
                         token_usage_by_turn: HashMap::new(),
+                        current_images: Vec::new(),
                     },
                 );
                 false
@@ -6278,6 +6665,7 @@ impl CodexInner {
                             content,
                             reasoning,
                             tool_call_ids: Vec::new(),
+                            images: stream.images,
                         });
                         state.quarantined_turn_id = Some(turn_id.clone());
                     } else {
@@ -6361,6 +6749,7 @@ impl CodexInner {
                     .extend(interrupted_tool_call_ids);
             }
             state.pending_tool_call_ids.clear();
+            state.tool_container_images.clear();
             state.close_active_stream_when_tools_idle = false;
             state.pending_user_input_bytes = 0;
             (
@@ -6393,6 +6782,7 @@ impl CodexInner {
                     reasoning: stream.reasoning,
                     tool_calls: Vec::new(),
                     context_breakdown: None,
+                    images: stream.images,
                 },
             );
             self.emitter.operation_cancelled("Operation cancelled");
@@ -6417,6 +6807,7 @@ impl CodexInner {
                     reasoning: Some(reasoning),
                     tool_calls: Vec::new(),
                     context_breakdown: None,
+                    images: Vec::new(),
                 },
             );
             self.emitter
@@ -6506,6 +6897,54 @@ impl CodexInner {
         };
         self.record_tool_container(container).await;
         self.mark_tool_completed(tool_call_id).await;
+    }
+
+    async fn complete_image_generation(&self, tool_call_id: &str, item: &Value) {
+        if self.suppress_cancelled_tool_completion(tool_call_id).await {
+            return;
+        }
+        let revised_prompt = codex_image_generation_prompt(item);
+        let image = parse_codex_generated_image(item);
+        let (success, tool_result, error, images) = match image {
+            Ok(image) => (
+                true,
+                serde_json::to_value(protocol::ToolExecutionResult::GenerateImage {
+                    revised_prompt,
+                    image_count: 1,
+                })
+                .expect("serialize Codex image generation result"),
+                None,
+                vec![image],
+            ),
+            Err(error) => (
+                false,
+                json!({
+                    "kind": "Error",
+                    "short_message": "Image generation failed",
+                    "detailed_message": error,
+                }),
+                Some(error),
+                Vec::new(),
+            ),
+        };
+        let container = self.emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id,
+            tool_name: "generate_image",
+            tool_result,
+            success,
+            error: error.as_deref(),
+        });
+        self.record_tool_container(container).await;
+        self.mark_tool_completed_with_images(tool_call_id, images)
+            .await;
+    }
+
+    async fn complete_native_tool(&self, tool_call_id: &str, item_type: &str) {
+        let Some((tool_name, tool_result)) = codex_native_tool_completion(item_type) else {
+            return;
+        };
+        self.emit_tool_execution_completed(tool_call_id, tool_name, true, tool_result, None)
+            .await;
     }
 
     async fn emit_agent_control_await_progress_if_needed(
@@ -6656,7 +7095,25 @@ fn extract_notification_thread_id(params: &Value) -> Option<String> {
         .map(|id| id.to_string())
 }
 
-fn codex_error_tool_call_id(params: &Value) -> Option<&str> {
+fn codex_scoped_tool_call_id(params: &Value, provider_item_id: &str) -> String {
+    let Some(thread_id) = extract_notification_thread_id(params) else {
+        return provider_item_id.to_owned();
+    };
+    let Some(turn_id) = extract_turn_id(params) else {
+        return provider_item_id.to_owned();
+    };
+    let scoped = format!("codex:{thread_id}:{turn_id}:{provider_item_id}");
+    tracing::debug!(
+        provider_tool_call_id = provider_item_id,
+        canonical_tool_call_id = scoped,
+        thread_id,
+        turn_id,
+        "Scoped Codex tool identity"
+    );
+    scoped
+}
+
+fn codex_error_tool_call_id(params: &Value) -> Option<String> {
     [
         "/toolCallId",
         "/tool_call_id",
@@ -6668,6 +7125,7 @@ fn codex_error_tool_call_id(params: &Value) -> Option<&str> {
     .find_map(|pointer| params.pointer(pointer).and_then(Value::as_str))
     .map(str::trim)
     .filter(|tool_call_id| !tool_call_id.is_empty())
+    .map(|tool_call_id| codex_scoped_tool_call_id(params, tool_call_id))
 }
 
 fn is_thread_scoped_codex_notification(method: &str) -> bool {
@@ -7338,6 +7796,89 @@ fn codex_message_is_renderable(
         || reasoning.is_some_and(contains_non_whitespace)
         || declared_tool_count > 0
         || image_count > 0
+}
+
+fn codex_image_generation_prompt(item: &Value) -> Option<String> {
+    item.get("revisedPrompt")
+        .and_then(Value::as_str)
+        .filter(|prompt| !prompt.trim().is_empty())
+        .map(str::to_owned)
+}
+
+fn codex_native_tool_completion(item_type: &str) -> Option<(&'static str, Value)> {
+    match item_type {
+        "webSearch" => Some((
+            "web_search",
+            serde_json::to_value(protocol::ToolExecutionResult::WebSearch)
+                .expect("serialize Codex web search completion"),
+        )),
+        "imageView" => Some((
+            "view_image",
+            serde_json::to_value(protocol::ToolExecutionResult::ViewImage)
+                .expect("serialize Codex image view completion"),
+        )),
+        "sleep" => Some((
+            "sleep",
+            serde_json::to_value(protocol::ToolExecutionResult::Sleep)
+                .expect("serialize Codex sleep completion"),
+        )),
+        _ => None,
+    }
+}
+
+fn parse_codex_generated_image(item: &Value) -> Result<ImageData, String> {
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if status != "completed" {
+        return Err(format!(
+            "Codex image generation ended with status '{}'",
+            if status.is_empty() { "unknown" } else { status }
+        ));
+    }
+    let encoded = item
+        .get("result")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|result| !result.is_empty())
+        .ok_or_else(|| "Codex image generation completed without image data".to_owned())?;
+    let encoded_limit = CODEX_MAX_GENERATED_IMAGE_BYTES.saturating_mul(4) / 3 + 4;
+    if encoded.len() > encoded_limit {
+        return Err(format!(
+            "Codex generated image exceeds the {} MiB limit",
+            CODEX_MAX_GENERATED_IMAGE_BYTES / (1024 * 1024)
+        ));
+    }
+    let bytes = BASE64_STANDARD
+        .decode(encoded)
+        .map_err(|error| format!("Codex generated image is not valid base64: {error}"))?;
+    if bytes.len() > CODEX_MAX_GENERATED_IMAGE_BYTES {
+        return Err(format!(
+            "Codex generated image exceeds the {} MiB limit",
+            CODEX_MAX_GENERATED_IMAGE_BYTES / (1024 * 1024)
+        ));
+    }
+    let media_type = detect_generated_image_media_type(&bytes)
+        .ok_or_else(|| "Codex generated image has an unsupported file format".to_owned())?;
+    Ok(ImageData {
+        media_type: media_type.to_owned(),
+        data: BASE64_STANDARD.encode(bytes),
+    })
+}
+
+fn detect_generated_image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
 }
 
 fn map_plan_status(status: &str) -> protocol::TaskStatus {
@@ -12460,6 +13001,7 @@ for line in sys.stdin:
                 reasoning: String::new(),
                 reasoning_only: false,
                 stream_published: true,
+                images: Vec::new(),
             }),
             tool_container: None,
             notification_sequence: 0,
@@ -12469,6 +13011,7 @@ for line in sys.stdin:
             generated_identity_epoch: codex_generated_identity_epoch("thread-test"),
             next_generated_identity_ordinal: 1,
             pending_tool_call_ids: HashSet::new(),
+            tool_container_images: Vec::new(),
             cancelled_tool_call_ids: HashSet::new(),
             close_active_stream_when_tools_idle: false,
             pending_message_metadata: None,
@@ -12583,6 +13126,7 @@ for line in sys.stdin:
                 current_tool_call_ids: Vec::new(),
                 tool_container: None,
                 pending_tool_call_ids: HashSet::new(),
+                tool_container_images: Vec::new(),
                 completed_agent_messages: HashMap::new(),
                 retired_unpublished_message_ids: HashSet::new(),
                 quarantined_turn_id: None,
@@ -12591,6 +13135,7 @@ for line in sys.stdin:
                 next_generated_identity_ordinal: 1,
                 pending_message_metadata: None,
                 token_usage_by_turn: HashMap::new(),
+                current_images: Vec::new(),
             },
         );
     }
@@ -14825,6 +15370,110 @@ Do not describe the tool, and do not skip the tool call."#;
 
             session.shutdown().await;
             let _ = std::fs::remove_dir_all(&workspace);
+        });
+    }
+
+    #[test]
+    #[ignore = "Live Codex test. Use --ignored and TYDE_RUN_REAL_AI_TESTS=1."]
+    fn live_codex_generates_inline_image() {
+        if !live_codex_tests_enabled() {
+            skip_live_codex_test();
+            return;
+        }
+        if !std::process::Command::new("codex")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            eprintln!("Skipping live Codex image test (`codex` CLI is not available).");
+            return;
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let workspace = tempfile::tempdir().expect("live image workspace");
+            let (session, mut event_rx) = CodexSession::spawn(
+                &[workspace.path().to_string_lossy().to_string()],
+                None,
+                &[],
+                None,
+                BackendAccessMode::Unrestricted,
+            )
+            .await
+            .expect("spawn live Codex image session");
+            let model = live_test_select_model(&session)
+                .await
+                .expect("Luna is required for the live Codex image test");
+            session
+                .command_handle()
+                .update_runtime_settings(json!({
+                    "model": model,
+                    "reasoning_effort": "low"
+                }))
+                .await
+                .expect("provider must acknowledge Luna image test settings");
+            session
+                .command_handle()
+                .execute(SessionCommand::SendMessage {
+                    message: "Use image generation exactly once to create a simple 256px blue square prototype on a white background. Then reply exactly IMAGE_DONE."
+                        .to_owned(),
+                    images: None,
+                })
+                .await
+                .expect("send live image prompt");
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+            let mut saw_request = false;
+            let mut saw_completion = false;
+            let mut image: Option<ImageData> = None;
+            while tokio::time::Instant::now() < deadline {
+                let Ok(Some(event)) =
+                    tokio::time::timeout(Duration::from_secs(3), event_rx.recv()).await
+                else {
+                    continue;
+                };
+                live_test_log(&format!("image event: {}", summarize_live_event(&event)));
+                assert_ne!(
+                    event.get("kind").and_then(Value::as_str),
+                    Some("Error"),
+                    "Codex emitted an error during live image generation: {event}"
+                );
+                match event.get("kind").and_then(Value::as_str) {
+                    Some("ToolRequest") => {
+                        saw_request |= event
+                            .pointer("/data/tool_type/kind")
+                            .and_then(Value::as_str)
+                            == Some("GenerateImage");
+                    }
+                    Some("ToolExecutionCompleted") => {
+                        saw_completion |= event
+                            .pointer("/data/tool_result/kind")
+                            .and_then(Value::as_str)
+                            == Some("GenerateImage");
+                    }
+                    Some("StreamEnd") => {
+                        if let Some(value) = event.pointer("/data/message/images/0") {
+                            image = serde_json::from_value(value.clone()).ok();
+                        }
+                    }
+                    _ => {}
+                }
+                if saw_request && saw_completion && image.is_some() {
+                    break;
+                }
+            }
+            assert!(saw_request, "live Codex did not emit typed image request");
+            assert!(
+                saw_completion,
+                "live Codex did not emit typed image completion"
+            );
+            let image = image.expect("live Codex image was not attached to StreamEnd");
+            assert!(image.media_type.starts_with("image/"));
+            assert!(image.data.len() > 100);
+            session.shutdown().await;
         });
     }
 
@@ -17647,7 +18296,9 @@ Do not describe the tool, and do not skip the tool call."#;
                 vec![
                     "StreamStart",
                     "StreamEnd",
+                    "StreamStart",
                     "ToolRequest",
+                    "StreamEnd",
                     "TypingStatusChanged",
                     "StreamStart",
                     "StreamDelta",
@@ -17668,7 +18319,7 @@ Do not describe the tool, and do not skip the tool call."#;
                 completions[0]
                     .pointer("/data/tool_call_id")
                     .and_then(Value::as_str),
-                Some("background-command")
+                Some("codex:thread-test:background-turn:background-command")
             );
             assert_eq!(
                 completions[0]
@@ -18049,6 +18700,558 @@ Do not describe the tool, and do not skip the tool call."#;
         assert!(codex_message_is_renderable("", Some("reasoning"), 0, 0));
         assert!(codex_message_is_renderable("", None, 1, 0));
         assert!(codex_message_is_renderable("", None, 0, 1));
+    }
+
+    #[test]
+    fn codex_generated_image_requires_valid_bounded_image_bytes() {
+        let image = parse_codex_generated_image(&json!({
+            "status": "completed",
+            "result": "iVBORw0KGgo="
+        }))
+        .expect("PNG signature should be accepted");
+        assert_eq!(image.media_type, "image/png");
+        assert_eq!(image.data, "iVBORw0KGgo=");
+
+        assert!(
+            parse_codex_generated_image(&json!({
+                "status": "completed",
+                "result": "not base64"
+            }))
+            .unwrap_err()
+            .contains("base64")
+        );
+        assert!(
+            parse_codex_generated_image(&json!({
+                "status": "failed",
+                "result": "iVBORw0KGgo="
+            }))
+            .unwrap_err()
+            .contains("failed")
+        );
+    }
+
+    #[test]
+    fn codex_image_generation_completes_typed_tool_with_inline_image() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut rx) = test_codex_inner();
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({ "threadId": "thread-test", "turn": { "id": "image-turn" } }),
+                )
+                .await;
+            drain_events(&mut rx);
+            inner
+                .handle_notification(
+                    "item/started",
+                    &json!({
+                        "threadId": "thread-test",
+                        "item": {
+                            "type": "imageGeneration",
+                            "id": "image-call",
+                            "status": "inProgress",
+                            "revisedPrompt": "A blue prototype"
+                        }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "item": {
+                            "type": "imageGeneration",
+                            "id": "image-call",
+                            "status": "completed",
+                            "revisedPrompt": "A blue prototype",
+                            "result": "iVBORw0KGgo="
+                        }
+                    }),
+                )
+                .await;
+
+            let events = drain_events(&mut rx);
+            assert_eq!(
+                event_kinds(&events),
+                vec![
+                    "StreamStart",
+                    "ToolRequest",
+                    "ToolExecutionCompleted",
+                    "StreamEnd"
+                ]
+            );
+            let request = events
+                .iter()
+                .find(|event| event.get("kind").and_then(Value::as_str) == Some("ToolRequest"))
+                .expect("typed image request");
+            assert_eq!(
+                request
+                    .pointer("/data/tool_type/kind")
+                    .and_then(Value::as_str),
+                Some("GenerateImage")
+            );
+            let completion = events
+                .iter()
+                .find(|event| {
+                    event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
+                })
+                .expect("typed image completion");
+            assert_eq!(
+                completion
+                    .pointer("/data/tool_result/kind")
+                    .and_then(Value::as_str),
+                Some("GenerateImage")
+            );
+            let end = events
+                .iter()
+                .find(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"))
+                .expect("image tool container completes");
+            assert_eq!(
+                end.pointer("/data/message/images/0/media_type")
+                    .and_then(Value::as_str),
+                Some("image/png")
+            );
+            assert_eq!(
+                end.pointer("/data/message/images/0/data")
+                    .and_then(Value::as_str),
+                Some("iVBORw0KGgo=")
+            );
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn codex_image_attached_to_reasoning_stream_reaches_stream_end() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut rx) = test_codex_inner();
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({ "threadId": "thread-test", "turn": { "id": "image-turn" } }),
+                )
+                .await;
+            drain_events(&mut rx);
+            inner
+                .handle_notification(
+                    "item/reasoning/delta",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turnId": "image-turn",
+                        "itemId": "image-reasoning",
+                        "delta": "Creating the prototype"
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/started",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turnId": "image-turn",
+                        "item": {
+                            "type": "imageGeneration",
+                            "id": "image-call",
+                            "status": "inProgress",
+                            "revisedPrompt": "A blue prototype"
+                        }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turnId": "image-turn",
+                        "item": {
+                            "type": "imageGeneration",
+                            "id": "image-call",
+                            "status": "completed",
+                            "revisedPrompt": "A blue prototype",
+                            "result": "iVBORw0KGgo="
+                        }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turnId": "image-turn",
+                        "item": {
+                            "type": "reasoning",
+                            "id": "image-reasoning",
+                            "summary": ["Creating the prototype"]
+                        }
+                    }),
+                )
+                .await;
+
+            let events = drain_events(&mut rx);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.get("kind").and_then(Value::as_str) == Some("ToolRequest"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.get("kind").and_then(Value::as_str)
+                        == Some("ToolExecutionCompleted"))
+                    .count(),
+                1
+            );
+            let end = events
+                .iter()
+                .find(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"))
+                .expect("reasoning stream completes");
+            assert_eq!(
+                end.pointer("/data/message/images/0/media_type")
+                    .and_then(Value::as_str),
+                Some("image/png")
+            );
+            assert_codex_protocol_valid(&events);
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn codex_image_survives_intervening_reasoning_item() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut rx) = test_codex_inner();
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({ "threadId": "thread-test", "turn": { "id": "image-turn" } }),
+                )
+                .await;
+            drain_events(&mut rx);
+            inner
+                .handle_notification(
+                    "item/started",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turnId": "image-turn",
+                        "item": {
+                            "type": "imageGeneration",
+                            "id": "image-call",
+                            "status": "inProgress",
+                            "revisedPrompt": "A blue prototype"
+                        }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/started",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turnId": "image-turn",
+                        "item": { "type": "reasoning", "id": "image-reasoning" }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turnId": "image-turn",
+                        "item": {
+                            "type": "reasoning",
+                            "id": "image-reasoning",
+                            "summary": ["Waiting for image output"]
+                        }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turnId": "image-turn",
+                        "item": {
+                            "type": "imageGeneration",
+                            "id": "image-call",
+                            "status": "completed",
+                            "revisedPrompt": "A blue prototype",
+                            "result": "iVBORw0KGgo="
+                        }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/started",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turnId": "image-turn",
+                        "item": { "type": "agentMessage", "id": "final-message" }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turnId": "image-turn",
+                        "item": {
+                            "type": "agentMessage",
+                            "id": "final-message",
+                            "text": "IMAGE_DONE"
+                        }
+                    }),
+                )
+                .await;
+
+            let events = drain_events(&mut rx);
+            let end = events
+                .iter()
+                .find(|event| {
+                    event.get("kind").and_then(Value::as_str) == Some("StreamEnd")
+                        && event
+                            .pointer("/data/message/message_id")
+                            .and_then(Value::as_str)
+                            == Some("final-message")
+                })
+                .expect("final response must claim the late image output");
+            assert_eq!(
+                end.pointer("/data/message/images/0/media_type")
+                    .and_then(Value::as_str),
+                Some("image/png")
+            );
+            assert_codex_protocol_valid(&events);
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn codex_native_tools_complete_as_visible_typed_tools() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut rx) = test_codex_inner();
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({ "threadId": "thread-test", "turn": { "id": "native-turn" } }),
+                )
+                .await;
+            drain_events(&mut rx);
+
+            for (item_type, item_fields, expected_kind) in [
+                ("webSearch", json!({ "query": "Bedrock news" }), "WebSearch"),
+                (
+                    "imageView",
+                    json!({ "path": "/tmp/chart.png" }),
+                    "ViewImage",
+                ),
+                ("sleep", json!({ "durationMs": 250 }), "Sleep"),
+            ] {
+                let item_id = format!("{item_type}-call");
+                let mut item = item_fields.as_object().cloned().expect("object fields");
+                item.insert("type".to_owned(), json!(item_type));
+                item.insert("id".to_owned(), json!(item_id));
+                item.insert("status".to_owned(), json!("inProgress"));
+                let started = json!({
+                    "threadId": "thread-test",
+                    "turnId": "native-turn",
+                    "item": item
+                });
+                inner.handle_notification("item/started", &started).await;
+
+                let mut completed = started;
+                completed["item"]["status"] = json!("completed");
+                inner
+                    .handle_notification("item/completed", &completed)
+                    .await;
+
+                let events = drain_events(&mut rx);
+                assert_eq!(
+                    event_kinds(&events),
+                    vec![
+                        "StreamStart",
+                        "ToolRequest",
+                        "ToolExecutionCompleted",
+                        "StreamEnd"
+                    ]
+                );
+                assert_eq!(
+                    events[1]
+                        .pointer("/data/tool_type/kind")
+                        .and_then(Value::as_str),
+                    Some(expected_kind)
+                );
+                assert_eq!(
+                    events[2]
+                        .pointer("/data/tool_result/kind")
+                        .and_then(Value::as_str),
+                    Some(expected_kind)
+                );
+                assert_codex_protocol_valid(&events);
+            }
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn codex_reused_provider_call_ids_remain_distinct_across_turns() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut rx) = test_codex_inner();
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-one" } }),
+                )
+                .await;
+            drain_events(&mut rx);
+            for (method, status) in [
+                ("item/started", "inProgress"),
+                ("item/completed", "completed"),
+            ] {
+                inner
+                    .handle_notification(
+                        method,
+                        &json!({
+                            "threadId": "thread-test",
+                            "turnId": "turn-one",
+                            "item": {
+                                "type": "mcpToolCall",
+                                "id": "call_1",
+                                "tool": "InternalSearch",
+                                "status": status
+                            }
+                        }),
+                    )
+                    .await;
+            }
+            let first = drain_events(&mut rx);
+            let first_id = first
+                .iter()
+                .find(|event| event.get("kind").and_then(Value::as_str) == Some("ToolRequest"))
+                .and_then(|event| event.pointer("/data/tool_call_id"))
+                .and_then(Value::as_str)
+                .expect("first tool request")
+                .to_owned();
+
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-two" } }),
+                )
+                .await;
+            drain_events(&mut rx);
+            inner
+                .handle_notification(
+                    "item/started",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turnId": "turn-two",
+                        "item": {
+                            "type": "collabAgentToolCall",
+                            "id": "call_1",
+                            "tool": "spawnAgent",
+                            "senderThreadId": "thread-test",
+                            "receiverThreadId": "child-thread",
+                            "receiverAgentName": "Pierce",
+                            "prompt": "Search Bedrock news",
+                            "status": "inProgress"
+                        }
+                    }),
+                )
+                .await;
+            let second = drain_events(&mut rx);
+            let second_id = second
+                .iter()
+                .find(|event| event.get("kind").and_then(Value::as_str) == Some("ToolRequest"))
+                .and_then(|event| event.pointer("/data/tool_call_id"))
+                .and_then(Value::as_str)
+                .expect("second tool request")
+                .to_owned();
+            assert_ne!(first_id, second_id);
+            assert_eq!(first_id, "codex:thread-test:turn-one:call_1");
+            assert_eq!(second_id, "codex:thread-test:turn-two:call_1");
+
+            inner.emitter.tool_progress(&ToolProgressData {
+                tool_call_id: second_id,
+                tool_name: "spawnAgent".to_owned(),
+                update: ToolProgressUpdate::Other {
+                    payload: json!({ "status": "running" }),
+                },
+            });
+            let progress = drain_events(&mut rx);
+            assert_eq!(event_kinds(&progress), vec!["ToolProgress"]);
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn resumed_codex_history_preserves_generated_images() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut rx) = test_codex_inner();
+            inner
+                .emit_resumed_thread_history(
+                    &[json!({
+                        "items": [{
+                            "type": "imageGeneration",
+                            "id": "historic-image",
+                            "status": "completed",
+                            "result": "iVBORw0KGgo="
+                        }]
+                    })],
+                    "gpt-5.6",
+                )
+                .await;
+            let events = drain_events(&mut rx);
+            assert_eq!(event_kinds(&events), vec!["MessageAdded"]);
+            assert_eq!(
+                events[0]
+                    .pointer("/data/images/0/media_type")
+                    .and_then(Value::as_str),
+                Some("image/png")
+            );
+            assert_eq!(
+                events[0]
+                    .pointer("/data/model_info/model")
+                    .and_then(Value::as_str),
+                Some("gpt-5.6")
+            );
+            inner.rpc.shutdown().await;
+        });
     }
 
     #[test]
@@ -19204,11 +20407,11 @@ Do not describe the tool, and do not skip the tool call."#;
     fn codex_error_tool_call_id_accepts_provider_aliases() {
         assert_eq!(
             codex_error_tool_call_id(&json!({ "toolCallId": "call-1" })),
-            Some("call-1")
+            Some("call-1".to_owned())
         );
         assert_eq!(
             codex_error_tool_call_id(&json!({ "item": { "id": "call-2" } })),
-            Some("call-2")
+            Some("call-2".to_owned())
         );
         assert_eq!(codex_error_tool_call_id(&json!({ "call_id": " " })), None);
     }
@@ -19541,16 +20744,19 @@ Do not describe the tool, and do not skip the tool call."#;
                 state.subagent_emitter = Some(emitter.clone() as Arc<dyn SubAgentEmitter>);
             }
             inner
-                .record_codex_subagent_spawn_metadata_if_needed(&json!({
-                    "type": "collabAgentToolCall",
-                    "id": "spawn-array",
-                    "senderThreadId": "thread-parent",
-                    "receiverThreadIds": ["thread-child"],
-                    "agentsStates": {"thread-child": {"status": "pendingInit"}},
-                    "prompt": "inspect",
-                    "status": "completed",
-                    "tool": "spawnAgent"
-                }))
+                .record_codex_subagent_spawn_metadata_if_needed(
+                    None,
+                    &json!({
+                        "type": "collabAgentToolCall",
+                        "id": "spawn-array",
+                        "senderThreadId": "thread-parent",
+                        "receiverThreadIds": ["thread-child"],
+                        "agentsStates": {"thread-child": {"status": "pendingInit"}},
+                        "prompt": "inspect",
+                        "status": "completed",
+                        "tool": "spawnAgent"
+                    }),
+                )
                 .await;
             assert_eq!(emitter.spawn_count().await, 1);
             assert!(

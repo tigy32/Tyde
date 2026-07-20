@@ -102,6 +102,7 @@ pub struct StreamEndPayload<'a> {
     pub reasoning: Option<String>,
     pub tool_calls: Vec<Value>,
     pub context_breakdown: Option<Value>,
+    pub images: Vec<protocol::ImageData>,
 }
 
 pub struct ToolCompletedPayload<'a> {
@@ -267,7 +268,7 @@ impl TurnEmitter {
     pub fn tool_request(&self, tool_call_id: &str, tool_name: &str, tool_type: Value) {
         let _ = self
             .lock()
-            .tool_request(tool_call_id, tool_name, tool_type, None);
+            .tool_request(tool_call_id, tool_name, tool_type, None, false);
     }
 
     pub fn tool_request_in_container(
@@ -277,7 +278,7 @@ impl TurnEmitter {
         tool_type: Value,
     ) -> Option<ChatMessageId> {
         self.lock()
-            .tool_request(tool_call_id, tool_name, tool_type, None)
+            .tool_request(tool_call_id, tool_name, tool_type, None, true)
     }
 
     pub fn tool_request_with_normalization_failure(
@@ -292,6 +293,7 @@ impl TurnEmitter {
             tool_name,
             tool_type,
             Some(normalization_failure),
+            false,
         );
     }
 
@@ -307,11 +309,21 @@ impl TurnEmitter {
             tool_name,
             tool_type,
             Some(normalization_failure),
+            true,
         )
     }
 
     pub fn close_tool_container(&self, message_id: ChatMessageId) {
         self.lock().close_tool_container(message_id);
+    }
+
+    pub fn close_tool_container_with_images(
+        &self,
+        message_id: ChatMessageId,
+        images: Vec<protocol::ImageData>,
+    ) {
+        self.lock()
+            .close_tool_container_with_images(message_id, images);
     }
 
     pub fn tool_call_declarations(&self, tool_call_ids: &[String]) -> Vec<Value> {
@@ -770,6 +782,7 @@ impl TurnEmitterState {
         tool_name: &str,
         provider_tool_type: Value,
         normalization_failure: Option<ToolExecutionNormalizationFailure>,
+        own_container: bool,
     ) -> Option<ChatMessageId> {
         let mut normalization_failure =
             normalization_failure.map(|kind| PendingToolNormalizationFailure {
@@ -809,7 +822,7 @@ impl TurnEmitterState {
             );
             return None;
         }
-        let opened_container = if !self.assistant_turn_open {
+        let opened_container = if own_container || !self.assistant_turn_open {
             self.ensure_assistant_turn_open(tool_call_id)
         } else {
             None
@@ -941,6 +954,7 @@ impl TurnEmitterState {
                         },
                     }),
                     None,
+                    true,
                 );
             }
             Some(_) => {}
@@ -956,6 +970,7 @@ impl TurnEmitterState {
                         },
                     }),
                     None,
+                    true,
                 );
             }
         }
@@ -1100,7 +1115,7 @@ impl TurnEmitterState {
     }
 
     fn ensure_assistant_turn_open(&mut self, message_id: &str) -> Option<ChatMessageId> {
-        if !self.assistant_turn_open {
+        if !self.stream_open {
             return self.open_synthetic_stream(message_id);
         }
         None
@@ -1120,6 +1135,14 @@ impl TurnEmitterState {
     }
 
     fn close_tool_container(&mut self, message_id: ChatMessageId) {
+        self.close_tool_container_with_images(message_id, Vec::new());
+    }
+
+    fn close_tool_container_with_images(
+        &mut self,
+        message_id: ChatMessageId,
+        images: Vec<protocol::ImageData>,
+    ) {
         if self.synthetic_tool_container_id.as_ref() != Some(&message_id)
             || !self.stream_open
             || self.current_stream_message_id.as_ref() != Some(&message_id)
@@ -1144,6 +1167,7 @@ impl TurnEmitterState {
             message_id,
             StreamEndPayload {
                 tool_calls,
+                images,
                 ..StreamEndPayload::default()
             },
         );
@@ -1355,7 +1379,7 @@ fn build_stream_end_value(
                 "model_info": model_info,
                 "token_usage": usage_value,
                 "context_breakdown": context_breakdown_value,
-                "images": [],
+                "images": payload.images,
             }
         },
     })
@@ -1964,6 +1988,7 @@ mod tests {
             reasoning: None,
             tool_calls: Vec::new(),
             context_breakdown: None,
+            images: Vec::new(),
         });
         drop(emitter);
         let events = recv_events(&mut rx);
@@ -2577,6 +2602,62 @@ mod tests {
                 .pointer("/data/message/tool_calls/0/id")
                 .and_then(Value::as_str),
             Some("tool-a")
+        );
+    }
+
+    #[test]
+    fn later_tool_in_same_turn_opens_its_own_message_container() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new_for_agent(tx, AgentName("codex"));
+        let first_message_id = ChatMessageId("msg-first".to_owned());
+        emitter.stream_start_with_id(first_message_id.clone(), AgentName("codex"), Some("model"));
+        emitter.stream_end_with_id(
+            first_message_id,
+            StreamEndPayload {
+                content: "I will run the tool.".to_owned(),
+                ..StreamEndPayload::default()
+            },
+        );
+
+        let container = match emitter.tool_request_in_container(
+            "tool-later",
+            "run_command",
+            run_command_request(),
+        ) {
+            Some(container) => container,
+            None => panic!(
+                "tool container missing; stream_open={} events={}",
+                emitter.has_open_stream(),
+                serde_json::to_string(&recv_events(&mut rx)).expect("serialize diagnostics")
+            ),
+        };
+        emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id: "tool-later",
+            tool_name: "run_command",
+            tool_result: json!({
+                "kind": "RunCommand",
+                "exit_code": 0,
+                "stdout": "done",
+                "stderr": "",
+            }),
+            success: true,
+            error: None,
+        });
+        emitter.close_tool_container(container);
+        drop(emitter);
+
+        let events = recv_events(&mut rx);
+        assert_protocol_valid(&events);
+        assert_eq!(
+            event_kinds(&events),
+            vec![
+                "StreamStart",
+                "StreamEnd",
+                "StreamStart",
+                "ToolRequest",
+                "ToolExecutionCompleted",
+                "StreamEnd",
+            ]
         );
     }
 

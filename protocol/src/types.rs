@@ -6775,6 +6775,19 @@ pub enum ToolRequestType {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
+    GenerateImage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+    },
+    WebSearch {
+        query: String,
+    },
+    ViewImage {
+        path: String,
+    },
+    Sleep {
+        duration_ms: u64,
+    },
     /// `tyde_send_agent_message`: a follow-up message delivered to a direct
     /// child agent. The message is human-authored prose, so it is carried as
     /// canonical typed data rather than an opaque args blob — the UI renders it
@@ -7007,6 +7020,14 @@ pub enum ToolExecutionResult {
         ready: Vec<TydeAgentWaitStatus>,
         still_thinking: Vec<TydeAgentWaitStatus>,
     },
+    GenerateImage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revised_prompt: Option<String>,
+        image_count: u64,
+    },
+    WebSearch,
+    ViewImage,
+    Sleep,
     Other {
         result: Value,
     },

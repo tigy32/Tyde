@@ -1308,6 +1308,27 @@ input, textarea, select {
     margin-bottom: 0;
 }
 
+.chat-message-images {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.chat-message-image-link {
+    display: block;
+    min-width: 0;
+}
+
+.chat-message-image {
+    display: block;
+    width: 100%;
+    max-height: 320px;
+    border: 1px solid var(--border-primary);
+    border-radius: 8px;
+    object-fit: contain;
+}
+
 :is(.message-content, .tool-md) pre {
     background: var(--bg-surface-3);
     padding: var(--space-3);

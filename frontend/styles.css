@@ -2778,6 +2778,11 @@ kbd {
     margin-top: var(--space-2);
 }
 
+.chat-card-image-link {
+    display: block;
+    line-height: 0;
+}
+
 .chat-card-image {
     max-width: 200px;
     max-height: 200px;
