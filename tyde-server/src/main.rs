@@ -233,8 +233,7 @@ fn run_host_uds() -> Result<(), String> {
             .map_err(|err| format!("failed to create tokio runtime for host UDS mode: {err}"))?;
 
         runtime.block_on(async move {
-            let (listener, host) =
-                bind_host_socket_before_start(&socket_path, spawn_host).await?;
+            let (listener, host) = bind_host_socket_before_start(&socket_path, spawn_host).await?;
             server::serve_uds(listener, server::ServerConfig::current(), host)
                 .await
                 .map_err(|err| {

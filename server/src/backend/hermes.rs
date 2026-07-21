@@ -116,9 +116,21 @@ if len(sys.argv) > 1:
     os.environ["HERMES_TUI_TOOLSETS"] = sys.argv[1]
 main()
 "#;
+/// Printed by the registration script (and matched by Tyde) when the Hermes
+/// install is missing the optional `mcp` Python package. Without it Hermes sets
+/// `_MCP_AVAILABLE = False` and silently skips MCP discovery, so it never spawns
+/// the bridge and Tyde would otherwise wait out the full startup timeout with an
+/// opaque error. Detecting it here turns that 15s hang into an actionable fix.
+const HERMES_MCP_MISSING_MARKER: &str = "__TYDE_HERMES_MCP_MISSING__";
+
 const HERMES_BRIDGE_REGISTRATION: &str = r#"
+import importlib.util
 import json
 import sys
+
+if importlib.util.find_spec("mcp") is None:
+    print("__TYDE_HERMES_MCP_MISSING__")
+    raise SystemExit(0)
 
 from hermes_cli.config import read_raw_config, save_config
 
@@ -1838,6 +1850,16 @@ async fn register_hermes_mcp_bridge(
             target.display_program
         )
     })?;
+    if String::from_utf8_lossy(&output.stdout).contains(HERMES_MCP_MISSING_MARKER)
+        || String::from_utf8_lossy(&output.stderr).contains(HERMES_MCP_MISSING_MARKER)
+    {
+        return Err(format!(
+            "Hermes is installed without its MCP integration (the `mcp` Python package is \
+             missing), so it cannot expose the managed Tyde tools. Install it with \
+             `{} -m pip install -e '.[mcp]'` from the Hermes agent directory, then relaunch.",
+            target.display_program
+        ));
+    }
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if stderr.is_empty() {
@@ -4967,6 +4989,56 @@ for line in sys.stdin:
         );
 
         backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn register_reports_missing_hermes_mcp_extra() {
+        // When Hermes is installed without the optional `mcp` package, the
+        // registration script prints the marker and exits 0 instead of spawning
+        // the bridge. Tyde must turn that into an actionable error at launch
+        // rather than waiting out the startup timeout with an opaque message.
+        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
+        let dir = TempDir::new().expect("tempdir");
+        let launcher = dir.path().join("fake_python_mcp_missing.sh");
+        fs::write(
+            &launcher,
+            format!("#!/bin/sh\necho {HERMES_MCP_MISSING_MARKER}\nexit 0\n"),
+        )
+        .expect("write fake python");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&launcher)
+                .expect("launcher metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&launcher, perms).expect("chmod launcher");
+        }
+
+        let target = HermesSpawnTarget {
+            program: launcher.to_string_lossy().to_string(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            remote_host: None,
+            display_program: "hermes".to_string(),
+        };
+
+        let error = register_hermes_mcp_bridge(&target, "/opt/tyde/tyde-server")
+            .await
+            .expect_err("registration must fail when the Hermes mcp extra is absent");
+        assert!(
+            error.contains("mcp"),
+            "error should name the missing package: {error}"
+        );
+        assert!(
+            error.contains("pip install") && error.contains(".[mcp]"),
+            "error should give the install command: {error}"
+        );
+        assert!(
+            error.contains("hermes"),
+            "error should reference the Hermes interpreter: {error}"
+        );
     }
 
     #[tokio::test]

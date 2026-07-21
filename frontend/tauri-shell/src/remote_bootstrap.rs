@@ -276,18 +276,9 @@ async fn ensure_target_installed(
         RemoteHostLifecycleStep::DownloadAsset,
         Some(target_version.clone()),
     );
-    if let Err(err) = install_release_on_remote(
-        ssh_destination,
-        &target_version,
-        &asset_name,
-    )
-    .await
+    if let Err(err) = install_release_on_remote(ssh_destination, &target_version, &asset_name).await
     {
-        return lifecycle_error(
-            app,
-            host_id,
-            remote_install_error(&target_version, err),
-        );
+        return lifecycle_error(app, host_id, remote_install_error(&target_version, err));
     }
     emit_running(
         app,
