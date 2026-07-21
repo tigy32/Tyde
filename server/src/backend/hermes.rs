@@ -56,6 +56,11 @@ const HERMES_TOOLSETS_ENV: &str = "HERMES_TUI_TOOLSETS";
 const HERMES_TOOL_PROGRESS_ENV: &str = "HERMES_TUI_TOOL_PROGRESS";
 const HERMES_MANAGED_DIR_ENV: &str = "HERMES_MANAGED_DIR";
 const HERMES_MANAGED_MCP_TOOLSET: &str = "mcp-tyde";
+/// Hermes's Tool Search bridge tool. When deferral is active the
+/// model-visible tool list carries this (plus tool_describe/tool_call)
+/// instead of the deferred MCP tools; its presence marks a session that
+/// reaches MCP tools through the bridge.
+const HERMES_TOOL_SEARCH_BRIDGE_TOOL: &str = "tool_search";
 const HERMES_MCP_GATEWAY_ENTRY: &str = r#"
 import os
 import sys
@@ -1476,37 +1481,126 @@ async fn wait_for_hermes_mcp_tools(
     timeout: Duration,
 ) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut last_result = None;
+    let mut last_toolsets: Option<String> = None;
+    let mut last_shown = None;
+    let mut tools_list_unsupported = false;
     loop {
         if tokio::time::Instant::now() >= deadline {
             return Err(format!(
-                "Hermes did not register the managed Tyde MCP toolset{}",
-                last_result
+                "Hermes did not register the managed Tyde MCP toolset{}{}",
+                last_toolsets
+                    .map(|summary| format!("; last tools.list toolsets: {summary}"))
+                    .unwrap_or_default(),
+                last_shown
                     .map(|value: Value| format!("; last tools.show result: {value}"))
                     .unwrap_or_default()
             ));
         }
-        if let Ok(result) = gateway.request("tools.show", json!({})).await {
-            let registered = result
-                .get("sections")
-                .and_then(Value::as_array)
-                .is_some_and(|sections| {
-                    sections.iter().any(|section| {
-                        section.get("name").and_then(Value::as_str)
-                            == Some(HERMES_MANAGED_MCP_TOOLSET)
-                            && section
-                                .get("tools")
-                                .and_then(Value::as_array)
-                                .is_some_and(|tools| !tools.is_empty())
-                    })
-                });
-            if registered {
-                return Ok(());
+        // The toolset registry (tools.list) is authoritative: it reports the
+        // managed toolset even when Hermes's Tool Search feature defers MCP
+        // tools behind tool_search/tool_describe/tool_call and hides them
+        // from the model-visible tools.show sections. Both probes are bounded
+        // by the gate deadline so a slow RPC cannot stretch one poll past it.
+        if !tools_list_unsupported {
+            match tokio::time::timeout_at(deadline, gateway.request("tools.list", json!({}))).await
+            {
+                Ok(Ok(result)) => {
+                    let toolsets = result.get("toolsets").and_then(Value::as_array);
+                    if toolsets
+                        .is_some_and(|toolsets| toolsets.iter().any(managed_mcp_toolset_entry))
+                    {
+                        return Ok(());
+                    }
+                    last_toolsets = Some(summarize_hermes_toolsets(toolsets));
+                }
+                Ok(Err(error)) => {
+                    if is_unsupported_gateway_method(&error) {
+                        tools_list_unsupported = true;
+                    } else {
+                        last_toolsets = Some(format!("request failed: {error}"));
+                    }
+                }
+                Err(_) => continue,
             }
-            last_result = Some(result);
+        }
+        // Fallback for gateways without tools.list: the model-visible
+        // sections still name the toolset when deferral is inactive.
+        match tokio::time::timeout_at(deadline, gateway.request("tools.show", json!({}))).await {
+            Ok(Ok(result)) => {
+                let registered = result
+                    .get("sections")
+                    .and_then(Value::as_array)
+                    .is_some_and(|sections| {
+                        sections.iter().any(|section| {
+                            section.get("name").and_then(Value::as_str)
+                                == Some(HERMES_MANAGED_MCP_TOOLSET)
+                                && section
+                                    .get("tools")
+                                    .and_then(Value::as_array)
+                                    .is_some_and(|tools| !tools.is_empty())
+                        })
+                    });
+                if registered {
+                    return Ok(());
+                }
+                last_shown = Some(result);
+            }
+            Ok(Err(_)) => {}
+            Err(_) => continue,
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+/// A tools.list entry for the managed Tyde MCP toolset. The gateway displays
+/// the toolset under its registered server alias (`tyde`,
+/// `MANAGED_SERVER_NAME`) and only falls back to the canonical `mcp-tyde`
+/// name when that alias is shadowed. The entry must carry at least one
+/// resolved tool and must not be explicitly disabled (a missing `enabled`
+/// field counts as enabled, for older gateways that omit it).
+fn managed_mcp_toolset_entry(toolset: &Value) -> bool {
+    if !matches!(
+        toolset.get("name").and_then(Value::as_str),
+        Some(MANAGED_SERVER_NAME | HERMES_MANAGED_MCP_TOOLSET)
+    ) {
+        return false;
+    }
+    if toolset.get("enabled").and_then(Value::as_bool) == Some(false) {
+        return false;
+    }
+    toolset
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+}
+
+/// Compact rendering of a tools.list response for the readiness-timeout
+/// error: one `name(enabled, tool count)` per toolset, instead of dumping
+/// every resolved tool name of every toolset into the error card.
+fn summarize_hermes_toolsets(toolsets: Option<&Vec<Value>>) -> String {
+    let Some(toolsets) = toolsets else {
+        return "missing toolsets array".to_string();
+    };
+    let entries: Vec<String> = toolsets
+        .iter()
+        .map(|toolset| {
+            format!(
+                "{}(enabled={}, tools={})",
+                toolset.get("name").and_then(Value::as_str).unwrap_or("?"),
+                toolset
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .map(|enabled| enabled.to_string())
+                    .unwrap_or_else(|| "?".to_string()),
+                toolset
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0),
+            )
+        })
+        .collect();
+    format!("[{}]", entries.join(", "))
 }
 
 async fn run_gateway_actor(
@@ -3143,9 +3237,7 @@ async fn wait_for_hermes_session_mcp_tools(
                 && payload
                     .get("tools")
                     .and_then(Value::as_object)
-                    .and_then(|tools| tools.get(HERMES_MANAGED_MCP_TOOLSET))
-                    .and_then(Value::as_array)
-                    .is_some_and(|tools| !tools.is_empty())
+                    .is_some_and(session_tools_include_managed_mcp)
         );
         let terminal = match &event {
             HermesGatewayEvent::ProtocolError(error) => Some(format!(
@@ -3167,6 +3259,30 @@ async fn wait_for_hermes_session_mcp_tools(
             return Ok(buffered);
         }
     }
+}
+
+/// The session has the managed MCP tools either directly (a non-empty
+/// mcp-tyde bucket in the model-visible tool map) or via Hermes's Tool
+/// Search deferral, where the model-visible list carries the tool_search
+/// bridge instead of the deferred MCP tools themselves. Registration of the
+/// managed toolset is verified against the gateway's toolset registry before
+/// the session is created (`wait_for_hermes_mcp_tools`), so the bridge's
+/// presence is sufficient proof of attachment here.
+fn session_tools_include_managed_mcp(tools: &serde_json::Map<String, Value>) -> bool {
+    if tools
+        .get(HERMES_MANAGED_MCP_TOOLSET)
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+    {
+        return true;
+    }
+    tools.values().any(|bucket| {
+        bucket.as_array().is_some_and(|names| {
+            names
+                .iter()
+                .any(|name| name.as_str() == Some(HERMES_TOOL_SEARCH_BRIDGE_TOOL))
+        })
+    })
 }
 
 fn parse_session_list(value: &Value) -> Result<Vec<BackendSession>, String> {
@@ -4557,6 +4673,24 @@ mod tests {
     fn write_fake_managed_mcp_gateway(
         dir: &TempDir,
     ) -> (String, std::path::PathBuf, std::path::PathBuf) {
+        write_fake_managed_mcp_gateway_with_deferral(dir, false)
+    }
+
+    /// Like `write_fake_managed_mcp_gateway`, but simulates a Hermes with
+    /// Tool Search deferral active: tools.show never names the managed
+    /// toolset (the model-visible list carries only the tool_search bridge),
+    /// and the managed toolset is visible solely through the tools.list
+    /// registry view.
+    fn write_fake_deferred_mcp_gateway(
+        dir: &TempDir,
+    ) -> (String, std::path::PathBuf, std::path::PathBuf) {
+        write_fake_managed_mcp_gateway_with_deferral(dir, true)
+    }
+
+    fn write_fake_managed_mcp_gateway_with_deferral(
+        dir: &TempDir,
+        deferred: bool,
+    ) -> (String, std::path::PathBuf, std::path::PathBuf) {
         let observed = dir.path().join("observed.json");
         let config = dir.path().join("config.json");
         fs::write(
@@ -4578,12 +4712,14 @@ mod tests {
             serde_json::to_string(&observed.to_string_lossy()).expect("serialize observed path");
         let config_json =
             serde_json::to_string(&config.to_string_lossy()).expect("serialize config path");
+        let deferred_py = if deferred { "True" } else { "False" };
         let script = format!(
             r#"
 import json, os, sys
 
 observed_path = {observed_json}
 config_path = {config_json}
+DEFERRED = {deferred_py}
 if len(sys.argv) == 5 and sys.argv[1:2] == ["-c"]:
     name = sys.argv[-2]
     command = sys.argv[-1]
@@ -4625,12 +4761,27 @@ for line in sys.stdin:
     elif method == "session.usage":
         result = {{"input":0,"output":0,"total":0}}
     elif method == "tools.show":
-        result = {{"sections":[{{"name":"mcp-tyde","tools":[{{"name":"mcp_tyde_probe"}}]}}],"total":1}}
+        if DEFERRED:
+            result = {{"sections":[{{"name":"unknown","tools":[{{"name":"tool_search"}},{{"name":"tool_describe"}},{{"name":"tool_call"}}]}}],"total":3}}
+        else:
+            result = {{"sections":[{{"name":"mcp-tyde","tools":[{{"name":"mcp_tyde_probe"}}]}}],"total":1}}
+    elif method == "tools.list":
+        if DEFERRED:
+            result = {{"toolsets":[
+                {{"name":"file","tool_count":1,"enabled":True,"tools":["read_file"]}},
+                {{"name":"tyde","tool_count":1,"enabled":True,"tools":["mcp_tyde_probe"]}},
+            ]}}
+        else:
+            result = {{"toolsets":[]}}
     else:
         result = {{}}
     print(json.dumps({{"jsonrpc":"2.0","id":request_id,"result":result}}), flush=True)
     if method == "session.create":
-        print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"session.info","session_id":"live-mcp","payload":{{"tools":{{"mcp-tyde":["mcp_tyde_probe"]}}}}}}}}), flush=True)
+        if DEFERRED:
+            tools_payload = {{"other":["tool_search","tool_describe","tool_call"]}}
+        else:
+            tools_payload = {{"mcp-tyde":["mcp_tyde_probe"]}}
+        print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"session.info","session_id":"live-mcp","payload":{{"tools":tools_payload}}}}}}), flush=True)
     if method == "prompt.submit":
         session_id = params["session_id"]
         print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"message.start","session_id":session_id}}}}), flush=True)
@@ -5032,6 +5183,55 @@ for line in sys.stdin:
             persisted["mcp_servers"]["tyde"]["command"],
             bridge.to_string_lossy().as_ref()
         );
+
+        backend.shutdown().await;
+    }
+
+    /// A modern Hermes with Tool Search deferral active hides MCP tools from
+    /// the model-visible tools.show sections (they sit behind the tool_search
+    /// bridge) and reports the managed toolset only via the tools.list
+    /// registry view. Both startup gates must still pass — this pinned the
+    /// live "Hermes did not register the managed Tyde MCP toolset" failure.
+    #[tokio::test]
+    async fn hermes_mcp_gates_accept_tool_search_deferred_toolset() {
+        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
+        let dir = TempDir::new().expect("tempdir");
+        let (fake, _observed_path, _config_path) = write_fake_deferred_mcp_gateway(&dir);
+        let _python_guard = TestHermesPythonGuard::set(&fake);
+        let bridge = dir.path().join("tyde-server");
+        fs::write(&bridge, "bridge placeholder").expect("write bridge placeholder");
+        let _bridge_guard = TestHermesBridgeExecutableGuard::set(&bridge.to_string_lossy());
+
+        let startup_mcp_servers = vec![StartupMcpServer {
+            name: "local".to_string(),
+            transport: StartupMcpTransport::Stdio {
+                command: "node".to_string(),
+                args: vec!["server.js".to_string()],
+                env: HashMap::new(),
+            },
+        }];
+        let config = BackendSpawnConfig {
+            startup_mcp_servers,
+            ..BackendSpawnConfig::default()
+        };
+        let (backend, mut events) = HermesBackend::spawn(
+            vec![dir.path().to_string_lossy().to_string()],
+            config,
+            payload("verify deferred MCP startup"),
+        )
+        .await
+        .expect("spawn must succeed when the managed toolset is deferred behind tool_search");
+
+        timeout(Duration::from_secs(2), async {
+            while let Some(event) = events.recv().await {
+                if matches!(event, ChatEvent::StreamEnd(_)) {
+                    return;
+                }
+            }
+            panic!("Hermes event stream closed before the deferred MCP test turn completed");
+        })
+        .await
+        .expect("deferred MCP test turn should finish");
 
         backend.shutdown().await;
     }
@@ -5847,6 +6047,31 @@ for line in sys.stdin:
         assert!(!is_unsupported_gateway_method(
             "Hermes JSON-RPC error -32000: internal error"
         ));
+    }
+
+    #[test]
+    fn managed_toolset_entry_matches_alias_and_respects_enabled() {
+        assert!(
+            managed_mcp_toolset_entry(&json!({
+                "name": "tyde", "enabled": true, "tools": ["mcp_tyde_probe"]
+            })),
+            "the gateway displays the managed toolset under its server alias"
+        );
+        assert!(
+            managed_mcp_toolset_entry(&json!({
+                "name": "mcp-tyde", "tools": ["mcp_tyde_probe"]
+            })),
+            "canonical name with a missing enabled field counts as enabled"
+        );
+        assert!(!managed_mcp_toolset_entry(&json!({
+            "name": "tyde", "enabled": false, "tools": ["mcp_tyde_probe"]
+        })));
+        assert!(!managed_mcp_toolset_entry(&json!({
+            "name": "tyde", "enabled": true, "tools": []
+        })));
+        assert!(!managed_mcp_toolset_entry(&json!({
+            "name": "file", "enabled": true, "tools": ["read_file"]
+        })));
     }
 
     #[test]
