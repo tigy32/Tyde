@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -128,6 +128,33 @@ impl ClaudeCommandHandle {
         &self,
         payload: protocol::SendMessagePayload,
     ) -> Result<(), String> {
+        match ClaudeInner::send_message(
+            Arc::clone(&self.inner),
+            payload.message,
+            protocol_images_to_attachments(payload.images),
+            payload.tool_response,
+        )
+        .await?
+        {
+            ClaudeSendAdmission::Handled => Ok(()),
+            // Busy sends flow through `send_message_with_outcome`, which
+            // hands the message back for requeueing. This legacy path has no
+            // way to return it, so a busy result here is an invariant breach
+            // and must be visible rather than silently dropped.
+            ClaudeSendAdmission::Busy => {
+                self.inner
+                    .emit_error("Claude is busy with another turn; the message was not delivered.");
+                Err("Claude backend was busy on a path that cannot requeue".to_string())
+            }
+        }
+    }
+
+    /// Like `send_message_payload`, but reports a busy backend by handing the
+    /// payload back to the caller instead of failing.
+    async fn send_message_with_outcome(
+        &self,
+        payload: protocol::SendMessagePayload,
+    ) -> Result<ClaudeSendAdmission, String> {
         ClaudeInner::send_message(
             Arc::clone(&self.inner),
             payload.message,
@@ -280,7 +307,6 @@ impl ClaudeSession {
                 cumulative_usage_complete: true,
                 conversation_bytes_total: 0,
                 active_turn: None,
-                queued_turns: VecDeque::new(),
                 closing: false,
                 restart_process_after_turn: false,
                 subagent_emitter: None,
@@ -322,9 +348,13 @@ struct ActiveTurn {
     quiesced_waiters: Vec<oneshot::Sender<()>>,
 }
 
-struct QueuedTurnMessage {
-    message: String,
-    images: Vec<ImageAttachment>,
+/// How the Claude backend disposed of a send: either it fully handled the
+/// input (turn started, tool response answered, or a visible error emitted),
+/// or it was busy with an already-active turn and did not consume the
+/// message — the caller must requeue it.
+enum ClaudeSendAdmission {
+    Handled,
+    Busy,
 }
 
 #[derive(Clone)]
@@ -414,17 +444,8 @@ struct ClaudeState {
     cumulative_usage_complete: bool,
     conversation_bytes_total: u64,
     active_turn: Option<ActiveTurn>,
-    /// Messages accepted while a turn was already active. The agent actor
-    /// normally queues busy-time sends itself, so entries land here only in
-    /// the narrow race where the actor observed idle before this backend
-    /// cleared its turn. `finalize_turn` drains the front entry into a fresh
-    /// turn as soon as the active turn clears; entries that cannot run
-    /// (shutdown, session resume) are surfaced as an error/warning card, never
-    /// silently dropped.
-    queued_turns: VecDeque<QueuedTurnMessage>,
-    /// Set by `shutdown`. Blocks new sends and queue drains so a queued
-    /// message cannot start a turn (or respawn the CLI process) after the
-    /// backend has been told to close.
+    /// Set by `shutdown`. Blocks new turns (including CLI-initiated ones) and
+    /// process respawn after the backend has been told to close.
     closing: bool,
     restart_process_after_turn: bool,
     subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
@@ -463,7 +484,6 @@ impl Default for ClaudeState {
             cumulative_usage_complete: true,
             conversation_bytes_total: 0,
             active_turn: None,
-            queued_turns: VecDeque::new(),
             closing: false,
             restart_process_after_turn: false,
             subagent_emitter: None,
@@ -1021,7 +1041,17 @@ impl ClaudeInner {
     async fn execute_arc(this: Arc<Self>, command: SessionCommand) -> Result<(), String> {
         match command {
             SessionCommand::SendMessage { message, images } => {
-                Self::send_message(this, message, images, None).await
+                match Self::send_message(this.clone(), message, images, None).await? {
+                    ClaudeSendAdmission::Handled => Ok(()),
+                    // See `send_message_payload`: this command path cannot
+                    // hand the message back for requeueing.
+                    ClaudeSendAdmission::Busy => {
+                        this.emit_error(
+                            "Claude is busy with another turn; the message was not delivered.",
+                        );
+                        Err("Claude backend was busy on a path that cannot requeue".to_string())
+                    }
+                }
             }
             SessionCommand::CancelConversation => {
                 this.cancel_active_turn().await;
@@ -1111,50 +1141,121 @@ impl ClaudeInner {
         message: String,
         images: Option<Vec<ImageAttachment>>,
         tool_response: Option<SendMessageToolResponse>,
-    ) -> Result<(), String> {
+    ) -> Result<ClaudeSendAdmission, String> {
         if let Some(tool_response) = tool_response {
             if this
                 .answer_pending_tool_response(tool_response, message.clone())
                 .await?
             {
-                return Ok(());
+                return Ok(ClaudeSendAdmission::Handled);
             }
             this.emit_error("No matching pending tool request is waiting for that response.");
-            return Ok(());
+            return Ok(ClaudeSendAdmission::Handled);
         }
 
         if this
             .answer_pending_ask_user_question(message.clone(), images.clone())
             .await?
         {
-            return Ok(());
+            return Ok(ClaudeSendAdmission::Handled);
         }
-        this.emit_user_message_added(&message, images.as_deref());
-        this.start_turn(message, images).await;
-        Ok(())
+        Ok(this.start_turn(message, images).await)
     }
 
-    async fn start_turn(self: Arc<Self>, message: String, images: Option<Vec<ImageAttachment>>) {
+    /// Start a user turn, or report that the backend is busy with a turn it
+    /// already has in flight (e.g. one it opened on its own initiative after a
+    /// sub-agent wakeup). On `Busy` nothing is emitted or consumed — the
+    /// caller retains the message and requeues it above the backend.
+    async fn start_turn(
+        self: Arc<Self>,
+        message: String,
+        images: Option<Vec<ImageAttachment>>,
+    ) -> ClaudeSendAdmission {
         let images = images.unwrap_or_default();
-        {
+        let input_bytes = estimate_turn_input_bytes(&message, &images);
+        let (turn_id, conversation_history_bytes, model_hint, ephemeral, outcome_rx) = {
             let mut state = self.state.lock().await;
             if state.closing {
                 drop(state);
                 self.emit_error("Claude backend is shutting down; the message was not sent.");
-                return;
+                return ClaudeSendAdmission::Handled;
             }
-            state
-                .queued_turns
-                .push_back(QueuedTurnMessage { message, images });
             if state.active_turn.is_some() {
-                tracing::info!(
-                    queued = state.queued_turns.len(),
-                    "queued message behind active Claude turn"
-                );
-                return;
+                return ClaudeSendAdmission::Busy;
             }
-        }
-        self.start_next_queued_turn().await;
+
+            let turn_id = CLAUDE_TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let (outcome_tx, outcome_rx) = oneshot::channel();
+            state.active_turn = Some(ActiveTurn {
+                id: turn_id,
+                outcome_tx: Some(outcome_tx),
+                interrupt_requested: false,
+                pending_ask_user_question: None,
+                pending_exit_plan_mode: None,
+                quiesced_waiters: Vec::new(),
+            });
+            state.conversation_bytes_total =
+                state.conversation_bytes_total.saturating_add(input_bytes);
+
+            (
+                turn_id,
+                state.conversation_bytes_total,
+                state.model.clone(),
+                state.ephemeral,
+                outcome_rx,
+            )
+        };
+
+        // The user bubble is emitted only once the turn is admitted, so a
+        // busy hand-back (which redispatches later) can never duplicate it and
+        // the chat never shows a message that was not delivered.
+        self.emit_user_message_added(&message, (!images.is_empty()).then_some(images.as_slice()));
+        let message_id = format!("claude-msg-{turn_id}");
+        self.emit_typing_status(true);
+        self.emit_stream_start(&message_id, model_hint.clone());
+
+        tokio::spawn(async move {
+            match self
+                .write_turn_to_persistent_process(turn_id, &message, &images)
+                .await
+            {
+                Ok(()) => {}
+                Err(TurnStartError::Cancelled) => {
+                    self.complete_active_turn_with_outcome(
+                        turn_id,
+                        TurnOutcome::Cancelled {
+                            summary: ClaudeStdoutSummary::default(),
+                        },
+                    )
+                    .await;
+                }
+                Err(TurnStartError::Failed(error)) => {
+                    self.complete_active_turn_with_outcome(
+                        turn_id,
+                        TurnOutcome::Failed {
+                            summary: ClaudeStdoutSummary::default(),
+                            error,
+                        },
+                    )
+                    .await;
+                }
+            }
+
+            let outcome = outcome_rx.await.unwrap_or_else(|_| TurnOutcome::Failed {
+                summary: ClaudeStdoutSummary::default(),
+                error: "Claude turn ended before returning a result".to_string(),
+            });
+
+            self.finalize_turn(
+                turn_id,
+                outcome,
+                ephemeral,
+                conversation_history_bytes,
+                model_hint,
+            )
+            .await;
+        });
+        ClaudeSendAdmission::Handled
     }
 
     #[cfg(test)]
@@ -1320,7 +1421,6 @@ impl ClaudeInner {
                 if self.take_restart_process_after_turn().await {
                     self.shutdown_process().await;
                 }
-                self.start_next_queued_turn().await;
                 return;
             }
             TurnOutcome::Failed { summary, error } => {
@@ -1349,113 +1449,6 @@ impl ClaudeInner {
         if self.take_restart_process_after_turn().await {
             self.shutdown_process().await;
         }
-        self.start_next_queued_turn().await;
-    }
-
-    /// Claim the turn slot and dispatch the oldest queued message in one
-    /// atomic step: the pop, the `ActiveTurn` reservation, and the closing
-    /// check all happen under a single state lock, so racing sends can
-    /// neither reorder the queue among themselves nor double-start. A
-    /// CLI-initiated turn that wins the slot first delays queued entries by
-    /// one turn (its finalize drains them) rather than dropping them. The
-    /// user bubble for a queued message was already emitted when it was
-    /// accepted. Returns an erased boxed future: this sits on the
-    /// start_turn/finalize_turn → start_next_queued_turn loop, so an
-    /// `async fn` here would make those opaque future types reference
-    /// themselves.
-    fn start_next_queued_turn(
-        self: &Arc<Self>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
-        let this = Arc::clone(self);
-        Box::pin(async move {
-            let launch = {
-                let mut state = this.state.lock().await;
-                if state.closing || state.active_turn.is_some() {
-                    None
-                } else if let Some(queued) = state.queued_turns.pop_front() {
-                    let input_bytes = estimate_turn_input_bytes(&queued.message, &queued.images);
-                    let turn_id = CLAUDE_TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
-                    let (outcome_tx, outcome_rx) = oneshot::channel();
-                    state.active_turn = Some(ActiveTurn {
-                        id: turn_id,
-                        outcome_tx: Some(outcome_tx),
-                        interrupt_requested: false,
-                        pending_ask_user_question: None,
-                        pending_exit_plan_mode: None,
-                        quiesced_waiters: Vec::new(),
-                    });
-                    state.conversation_bytes_total =
-                        state.conversation_bytes_total.saturating_add(input_bytes);
-                    Some((
-                        turn_id,
-                        state.conversation_bytes_total,
-                        state.model.clone(),
-                        state.ephemeral,
-                        outcome_rx,
-                        queued,
-                    ))
-                } else {
-                    None
-                }
-            };
-            let Some((
-                turn_id,
-                conversation_history_bytes,
-                model_hint,
-                ephemeral,
-                outcome_rx,
-                queued,
-            )) = launch
-            else {
-                return;
-            };
-
-            let message_id = format!("claude-msg-{turn_id}");
-            this.emit_typing_status(true);
-            this.emit_stream_start(&message_id, model_hint.clone());
-
-            tokio::spawn(async move {
-                match this
-                    .write_turn_to_persistent_process(turn_id, &queued.message, &queued.images)
-                    .await
-                {
-                    Ok(()) => {}
-                    Err(TurnStartError::Cancelled) => {
-                        this.complete_active_turn_with_outcome(
-                            turn_id,
-                            TurnOutcome::Cancelled {
-                                summary: ClaudeStdoutSummary::default(),
-                            },
-                        )
-                        .await;
-                    }
-                    Err(TurnStartError::Failed(error)) => {
-                        this.complete_active_turn_with_outcome(
-                            turn_id,
-                            TurnOutcome::Failed {
-                                summary: ClaudeStdoutSummary::default(),
-                                error,
-                            },
-                        )
-                        .await;
-                    }
-                }
-
-                let outcome = outcome_rx.await.unwrap_or_else(|_| TurnOutcome::Failed {
-                    summary: ClaudeStdoutSummary::default(),
-                    error: "Claude turn ended before returning a result".to_string(),
-                });
-
-                this.finalize_turn(
-                    turn_id,
-                    outcome,
-                    ephemeral,
-                    conversation_history_bytes,
-                    model_hint,
-                )
-                .await;
-            });
-        })
     }
 
     /// Open a turn for output the Claude CLI produced on its own initiative,
@@ -2371,7 +2364,7 @@ impl ClaudeInner {
     async fn resume_session(&self, session_id: String) -> Result<(), String> {
         let normalized = normalize_nonempty(&session_id).ok_or("Invalid session id")?;
         self.shutdown_process().await;
-        let (workspace_root, ssh_host, dropped_queued) = {
+        let (workspace_root, ssh_host) = {
             let mut state = self.state.lock().await;
             state.session_id = Some(normalized.clone());
             state.fork_from_session_id = None;
@@ -2379,19 +2372,8 @@ impl ClaudeInner {
             state.cumulative_usage = None;
             state.cumulative_usage_complete = true;
             state.conversation_bytes_total = 0;
-            let dropped_queued = std::mem::take(&mut state.queued_turns);
-            (
-                state.workspace_root.clone(),
-                state.ssh_host.clone(),
-                dropped_queued,
-            )
+            (state.workspace_root.clone(), state.ssh_host.clone())
         };
-        if !dropped_queued.is_empty() {
-            self.emitter.warning_message(&format!(
-                "Resuming a different Claude session; {} queued message(s) for the previous conversation were discarded.",
-                dropped_queued.len()
-            ));
-        }
 
         self.emitter.session_started(&normalized);
         self.emitter.conversation_cleared();
@@ -2467,9 +2449,8 @@ impl ClaudeInner {
     async fn delete_session(&self, session_id: String) -> Result<(), String> {
         let normalized = normalize_nonempty(&session_id).ok_or("Invalid session id")?;
         self.shutdown_process().await;
-        let (workspace_root, ssh_host, dropped_queued) = {
+        let (workspace_root, ssh_host) = {
             let mut state = self.state.lock().await;
-            let mut dropped_queued = VecDeque::new();
             if state.session_id.as_deref() == Some(normalized.as_str()) {
                 state.session_id = None;
                 state.fork_from_session_id = None;
@@ -2477,20 +2458,9 @@ impl ClaudeInner {
                 state.cumulative_usage = None;
                 state.cumulative_usage_complete = true;
                 state.conversation_bytes_total = 0;
-                dropped_queued = std::mem::take(&mut state.queued_turns);
             }
-            (
-                state.workspace_root.clone(),
-                state.ssh_host.clone(),
-                dropped_queued,
-            )
+            (state.workspace_root.clone(), state.ssh_host.clone())
         };
-        if !dropped_queued.is_empty() {
-            self.emitter.warning_message(&format!(
-                "Deleted the active Claude session; {} queued message(s) for it were discarded.",
-                dropped_queued.len()
-            ));
-        }
 
         if let Some(host) = &ssh_host {
             delete_claude_session_remote(host, &workspace_root, &normalized).await?;
@@ -2555,17 +2525,7 @@ impl ClaudeInner {
     }
 
     async fn shutdown(&self) {
-        let dropped_queued = {
-            let mut state = self.state.lock().await;
-            state.closing = true;
-            std::mem::take(&mut state.queued_turns)
-        };
-        if !dropped_queued.is_empty() {
-            self.emit_error(&format!(
-                "Claude backend is shutting down; {} queued message(s) were not sent.",
-                dropped_queued.len()
-            ));
-        }
+        self.state.lock().await.closing = true;
         self.cancel_active_turn().await;
         self.shutdown_process().await;
     }
@@ -8598,6 +8558,11 @@ pub struct ClaudeBackend {
     interrupt_tx: mpsc::UnboundedSender<ClaudeInterrupt>,
     session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
     subagent_emitter_tx: watch::Sender<Option<Arc<dyn SubAgentEmitter>>>,
+    /// Direct handle to the live session, populated once the spawn task has
+    /// created it. `send_with_outcome` uses it to run turn admission
+    /// synchronously so a busy backend can hand the message back instead of
+    /// dropping it in the input-pump task.
+    command_handle: Arc<StdMutex<Option<ClaudeCommandHandle>>>,
 }
 
 struct ClaudeInterrupt {
@@ -8668,6 +8633,9 @@ impl ClaudeBackend {
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
         let (startup_cancel_tx, mut startup_cancel_rx) = oneshot::channel();
         let mut startup_cancel_guard = ClaudeDetachedStartupCancelGuard(Some(startup_cancel_tx));
+        let command_handle: Arc<StdMutex<Option<ClaudeCommandHandle>>> =
+            Arc::new(StdMutex::new(None));
+        let command_handle_task = Arc::clone(&command_handle);
 
         tokio::spawn(async move {
             let steering_content = claude_steering_content(&config);
@@ -8708,6 +8676,9 @@ impl ClaudeBackend {
             };
 
             let handle = session.command_handle();
+            *command_handle_task
+                .lock()
+                .expect("Claude command handle slot poisoned") = Some(handle.clone());
             let resolved_settings = resolve_session_settings(&config);
             let model_override = match resolved_settings.0.get("model") {
                 Some(SessionSettingValue::String(value)) => Some(value.clone()),
@@ -8874,6 +8845,7 @@ impl ClaudeBackend {
                 interrupt_tx,
                 session_id,
                 subagent_emitter_tx,
+                command_handle,
             },
             EventStream::new(events_rx),
         ))
@@ -9591,6 +9563,7 @@ impl Backend for ClaudeBackend {
         let mut startup_guard = ClaudeResumeStartupGuard::new(session.clone());
 
         let handle = session.command_handle();
+        let backend_command_handle = handle.clone();
         let maybe_emitter = subagent_emitter_rx.borrow().clone();
         if let Some(emitter) = maybe_emitter {
             session.set_subagent_emitter(emitter).await;
@@ -9736,6 +9709,7 @@ impl Backend for ClaudeBackend {
                 interrupt_tx,
                 session_id: backend_session_id,
                 subagent_emitter_tx,
+                command_handle: Arc::new(StdMutex::new(Some(backend_command_handle))),
             },
             EventStream::new_with_resume_replay_barrier(events_rx, resume_replay_complete_rx),
         ))
@@ -9772,6 +9746,66 @@ impl Backend for ClaudeBackend {
 
     async fn send(&self, input: AgentInput) -> bool {
         self.input_tx.send(input).is_ok()
+    }
+
+    async fn send_with_outcome(&self, input: AgentInput) -> crate::backend::SendOutcome {
+        use crate::backend::SendOutcome;
+        let handle = self
+            .command_handle
+            .lock()
+            .expect("Claude command handle slot poisoned")
+            .clone();
+        let (payload, handle) = match (input, handle) {
+            (AgentInput::SendMessage(payload), Some(handle)) => (payload, handle),
+            (input, _) => {
+                // Not a message (or the session is still starting): the pump
+                // path is fine — such inputs can't collide with turn
+                // admission.
+                return if self.input_tx.send(input).is_ok() {
+                    SendOutcome::Accepted
+                } else {
+                    SendOutcome::Closed
+                };
+            }
+        };
+        let retained = payload.clone();
+        match handle.send_message_with_outcome(payload).await {
+            Ok(ClaudeSendAdmission::Handled) => SendOutcome::Accepted,
+            Ok(ClaudeSendAdmission::Busy) => SendOutcome::Busy(AgentInput::SendMessage(retained)),
+            Err(err) => {
+                tracing::error!("Failed to send Claude message: {err}");
+                SendOutcome::Closed
+            }
+        }
+    }
+
+    async fn update_session_settings(
+        &mut self,
+        payload: protocol::SetSessionSettingsPayload,
+    ) -> Result<(), String> {
+        // Routed through the same direct handle as `send_with_outcome` so a
+        // settings update can never be overtaken by a later message that
+        // bypassed the input pump.
+        let handle = self
+            .command_handle
+            .lock()
+            .expect("Claude command handle slot poisoned")
+            .clone();
+        match handle {
+            Some(handle) => {
+                handle
+                    .execute(SessionCommand::UpdateSettings {
+                        settings: session_settings_to_json(&payload.values),
+                        persist: false,
+                    })
+                    .await
+            }
+            None => self
+                .send(AgentInput::UpdateSessionSettings(payload))
+                .await
+                .then_some(())
+                .ok_or_else(|| "backend terminated before applying session settings".to_owned()),
+        }
     }
 
     async fn interrupt(&self) -> bool {
@@ -9856,7 +9890,6 @@ mod tests {
                 cumulative_usage_complete: true,
                 conversation_bytes_total: 0,
                 active_turn: None,
-                queued_turns: VecDeque::new(),
                 closing: false,
                 restart_process_after_turn: false,
                 subagent_emitter: None,
@@ -13047,7 +13080,7 @@ for raw_line in sys.stdin:
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn fake_claude_busy_send_queues_and_dispatches_after_turn_ends() {
+    async fn fake_claude_busy_send_hands_message_back_and_redispatch_delivers() {
         let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let fake = workspace.path().join("fake-claude-busy-queue.py");
@@ -13216,35 +13249,45 @@ for raw_line in sys.stdin:
             Some("working")
         );
 
-        // Send twice while the first turn is mid-stream: both messages must be
-        // accepted and queued in order, not rejected with "still processing".
-        handle
-            .execute(SessionCommand::SendMessage {
-                message: "queued follow up one".to_string(),
-                images: None,
-            })
+        // Send while the first turn is mid-stream: admission must hand the
+        // message back as Busy without consuming it — no user bubble, no
+        // error card, nothing written to the CLI.
+        let busy_payload = protocol::SendMessagePayload {
+            message: "queued follow up".to_string(),
+            images: None,
+            origin: None,
+            tool_response: None,
+        };
+        let outcome = handle
+            .send_message_with_outcome(busy_payload.clone())
             .await
-            .expect("send first busy-time message");
-        handle
-            .execute(SessionCommand::SendMessage {
-                message: "queued follow up two".to_string(),
-                images: None,
-            })
-            .await
-            .expect("send second busy-time message");
-        {
-            let state = session.inner.state.lock().await;
-            assert_eq!(
-                state.queued_turns.len(),
-                2,
-                "busy-time sends must be queued behind the active turn"
+            .expect("busy admission must not error");
+        assert!(
+            matches!(outcome, ClaudeSendAdmission::Busy),
+            "a send during an active turn must be handed back as Busy"
+        );
+        while let Ok(event) = rx.try_recv() {
+            assert_ne!(
+                event_kind(&event),
+                Some("Error"),
+                "a busy hand-back must not emit an error card: {event}"
             );
-            assert_eq!(state.queued_turns[0].message, "queued follow up one");
-            assert_eq!(state.queued_turns[1].message, "queued follow up two");
+            assert!(
+                !event.to_string().contains("queued follow up"),
+                "a busy hand-back must not surface the message in any event: {event}"
+            );
+        }
+        {
+            let log_contents =
+                std::fs::read_to_string(&log).expect("read fake Claude busy-handback log");
+            assert!(
+                !log_contents.contains("queued follow up"),
+                "a busy hand-back must not reach the Claude CLI: {log_contents}"
+            );
         }
 
-        // End the first turn; the queued messages must then run as their own
-        // turns, in order, and no Error event may appear in the sequence.
+        // End the first turn, then redispatch the retained payload exactly as
+        // the agent actor does after requeueing it.
         timeout(
             Duration::from_secs(2),
             handle.execute(SessionCommand::CancelConversation),
@@ -13253,13 +13296,26 @@ for raw_line in sys.stdin:
         .expect("fake interrupt should quiesce")
         .expect("fake interrupt command should succeed");
 
-        let mut queued_stream_ends = 0;
+        let outcome = handle
+            .send_message_with_outcome(busy_payload)
+            .await
+            .expect("redispatch must not error");
+        assert!(
+            matches!(outcome, ClaudeSendAdmission::Handled),
+            "the redispatched message must start a turn once the backend is idle"
+        );
+
+        let mut saw_user_bubble = false;
+        let mut saw_stream_end = false;
         timeout(Duration::from_secs(10), async {
-            while queued_stream_ends < 2 {
+            while !(saw_user_bubble && saw_stream_end) {
                 let event = rx.recv().await.expect("backend event");
                 match event_kind(&event) {
                     Some("Error") => {
-                        panic!("queued busy-time sends must not produce an Error event: {event}");
+                        panic!("the redispatched message must not produce an Error event: {event}");
+                    }
+                    Some("MessageAdded") if event.to_string().contains("queued follow up") => {
+                        saw_user_bubble = true;
                     }
                     Some("StreamEnd")
                         if event
@@ -13269,21 +13325,14 @@ for raw_line in sys.stdin:
                             .and_then(Value::as_str)
                             .is_some_and(|content| content.contains("queued follow-up ok")) =>
                     {
-                        queued_stream_ends += 1;
+                        saw_stream_end = true;
                     }
                     _ => {}
                 }
             }
         })
         .await
-        .expect("queued messages should dispatch as turns after the active turn ends");
-        {
-            let state = session.inner.state.lock().await;
-            assert!(
-                state.queued_turns.is_empty(),
-                "queue must drain once the queued turns dispatch"
-            );
-        }
+        .expect("the redispatched message should run as its own turn with a user bubble");
 
         session.shutdown().await;
         // SAFETY: guarded by FAKE_CLAUDE_ENV_LOCK; restore the process-global
@@ -13293,16 +13342,11 @@ for raw_line in sys.stdin:
             std::env::remove_var("TYDE_FAKE_CLAUDE_LOG");
         }
 
-        let log_contents = std::fs::read_to_string(&log).expect("read fake Claude busy-queue log");
-        let first_index = log_contents
-            .find("queued follow up one")
-            .expect("first queued message must reach the Claude CLI");
-        let second_index = log_contents
-            .find("queued follow up two")
-            .expect("second queued message must reach the Claude CLI");
+        let log_contents =
+            std::fs::read_to_string(&log).expect("read fake Claude busy-handback log");
         assert!(
-            first_index < second_index,
-            "queued messages must dispatch in FIFO order: {log_contents}"
+            log_contents.contains("queued follow up"),
+            "the redispatched message must reach the Claude CLI: {log_contents}"
         );
     }
 
@@ -16180,7 +16224,6 @@ for raw_line in sys.stdin:
                     cumulative_usage_complete: true,
                     conversation_bytes_total: 0,
                     active_turn: None,
-                    queued_turns: VecDeque::new(),
                     closing: false,
                     restart_process_after_turn: false,
                     subagent_emitter: None,

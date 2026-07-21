@@ -288,12 +288,27 @@ impl From<&str> for BackendStartupError {
     }
 }
 
+/// Outcome of handing an input to a backend via `Backend::send_with_outcome`.
+#[derive(Debug)]
+pub enum SendOutcome {
+    /// The backend accepted the input.
+    Accepted,
+    /// The backend already has an active turn (e.g. it resumed on its own
+    /// initiative after a sub-agent wakeup) and cannot start a user turn
+    /// right now. The input is handed back so the caller can queue it and
+    /// retry once the backend goes idle; a backend must never report Busy
+    /// after consuming the input.
+    Busy(AgentInput),
+    /// The backend has terminated and can't accept input.
+    Closed,
+}
+
 /// A coding agent backend session handle.
 ///
 /// Created via `Backend::spawn()` which returns `(Self, EventStream)`.
 /// The handle is used to send input; the EventStream is used to read output.
 /// Backends are not object-safe — the agent actor knows the concrete type.
-pub trait Backend: Send + 'static {
+pub trait Backend: Send + Sync + 'static {
     fn session_settings_schema() -> SessionSettingsSchema
     where
         Self: Sized;
@@ -352,6 +367,33 @@ pub trait Backend: Send + 'static {
     /// Send an input event to the backend.
     /// Returns false if the backend has terminated and can't accept input.
     fn send(&self, input: AgentInput) -> impl std::future::Future<Output = bool> + Send;
+
+    /// Send an input event and report whether the backend accepted it, is
+    /// busy with a turn it started on its own (handing the input back for
+    /// the caller to queue), or has terminated.
+    ///
+    /// The default forwards to `send`: backends that can only start turns in
+    /// response to caller input are never busy at send time, because the
+    /// caller serializes sends against the idle/typing lifecycle. Backends
+    /// that can open turns on their own initiative (or otherwise reject a
+    /// send while working) must override this instead of dropping the input.
+    ///
+    /// Contract: message sends must be serialized by a single caller (the
+    /// agent actor). Admission checks in overrides may be check-then-forward,
+    /// which is only race-free while `Accepted` results cannot be issued
+    /// concurrently for the same backend.
+    fn send_with_outcome(
+        &self,
+        input: AgentInput,
+    ) -> impl std::future::Future<Output = SendOutcome> + Send {
+        async move {
+            if self.send(input).await {
+                SendOutcome::Accepted
+            } else {
+                SendOutcome::Closed
+            }
+        }
+    }
 
     fn update_session_settings(
         &mut self,

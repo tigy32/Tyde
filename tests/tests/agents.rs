@@ -941,6 +941,7 @@ const MOCK_NATIVE_CHILD_AND_DROP_SENTINEL: &str = "__mock_spawn_native_child_and
 const MOCK_LIVE_NATIVE_CHILD_SENTINEL: &str = "__mock_spawn_live_native_child__";
 const MOCK_ERROR_WITHOUT_IDLE_SENTINEL: &str = "__mock_error_without_idle__";
 const MOCK_MID_TURN_ERROR_SENTINEL: &str = "__mock_mid_turn_error__";
+const MOCK_BUSY_SELF_TURN_SENTINEL: &str = "__mock_busy_self_turn__";
 const MOCK_TOOL_FAILURE_WITHOUT_IDLE_SENTINEL: &str = "__mock_tool_failure_without_idle__";
 const MOCK_AGENT_CONTROL_AWAIT_SENTINEL: &str = "__mock_agent_control_await__";
 const MOCK_AGENT_CONTROL_SEND_MESSAGE_SENTINEL: &str = "__mock_agent_control_send_message__";
@@ -3256,6 +3257,76 @@ async fn agent_mid_turn_error_is_diagnostic_and_keeps_stream_identity() {
         &mut fixture.client,
         &agent_stream,
         "mock backend response to: after mid-turn error",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn agent_requeues_message_when_backend_is_busy_with_self_started_turn() {
+    let mut fixture = Fixture::new().await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("busy-self-turn-agent".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "hello".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn_agent failed");
+
+    let env = expect_next_event(&mut fixture.client, "NewAgent").await;
+    assert_eq!(env.kind, FrameKind::NewAgent);
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse NewAgent");
+    let agent_stream = new_agent.instance_stream.clone();
+
+    let env = expect_next_event(&mut fixture.client, "AgentStart").await;
+    assert_eq!(env.kind, FrameKind::AgentStart);
+    assert_eq!(env.stream, agent_stream);
+
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &agent_stream,
+        "mock backend response to: hello",
+    )
+    .await;
+
+    // The backend hands this send back as Busy while it runs a turn "it
+    // started on its own"; the actor must requeue the message rather than
+    // drop it or surface an error.
+    let message = format!("{MOCK_BUSY_SELF_TURN_SENTINEL} follow up");
+    fixture
+        .client
+        .send_message(&agent_stream, message.clone())
+        .await
+        .expect("send busy-time message failed");
+
+    // The self-started turn runs first…
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &agent_stream,
+        "mock backend response to: self-initiated wakeup",
+    )
+    .await;
+
+    // …then the requeued message is delivered as its own turn, with no
+    // error cards in between (expect_turn_on_stream is strict about the
+    // event sequence).
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &agent_stream,
+        &format!("mock backend response to: {message}"),
     )
     .await;
 }

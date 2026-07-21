@@ -52,6 +52,11 @@ pub(crate) const MOCK_DUPLICATE_IDLE_SENTINEL: &str = "__mock_duplicate_idle__";
 /// task exits, which drives the agent actor into `enter_terminal_failure`.
 pub(crate) const MOCK_DIE_AFTER_BUSY_SENTINEL: &str = "__mock_die_after_busy__";
 pub(crate) const MOCK_ERROR_WITHOUT_IDLE_SENTINEL: &str = "__mock_error_without_idle__";
+/// Makes the FIRST send of a message containing this sentinel return
+/// `SendOutcome::Busy` (handing the message back) while the mock runs a turn
+/// "it started on its own"; subsequent sends are accepted normally. Simulates
+/// a backend that resumed on its own initiative at the moment of a send.
+pub(crate) const MOCK_BUSY_SELF_TURN_SENTINEL: &str = "__mock_busy_self_turn__";
 /// Emits a diagnostic Error card in the middle of an otherwise normal
 /// streaming turn (typing stays on and the stream closes properly afterward).
 /// Exercises the agent rule that a mid-turn error must not end the turn.
@@ -150,11 +155,13 @@ pub struct MockBackend {
     command_tx: mpsc::UnboundedSender<MockCommand>,
     session_id: SessionId,
     subagent_emitter_tx: watch::Sender<Option<Arc<dyn SubAgentEmitter>>>,
+    busy_self_turn_fired: Arc<std::sync::atomic::AtomicBool>,
 }
 
 enum MockCommand {
     Input(AgentInput),
     Interrupt,
+    EmitBusySelfTurn,
 }
 
 struct MockLoopConfig {
@@ -254,6 +261,7 @@ impl Backend for MockBackend {
                 command_tx,
                 session_id,
                 subagent_emitter_tx,
+                busy_self_turn_fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
             EventStream::new(events_rx),
         ))
@@ -320,6 +328,7 @@ impl Backend for MockBackend {
                     command_tx,
                     session_id,
                     subagent_emitter_tx,
+                    busy_self_turn_fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 },
                 EventStream::new_with_resume_replay_barrier(events_rx, resume_replay_complete_rx),
             ));
@@ -350,6 +359,7 @@ impl Backend for MockBackend {
                 command_tx,
                 session_id,
                 subagent_emitter_tx,
+                busy_self_turn_fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
             EventStream::new_with_resume_replay_barrier(events_rx, resume_replay_complete_rx),
         ))
@@ -429,6 +439,7 @@ impl Backend for MockBackend {
                 command_tx,
                 session_id,
                 subagent_emitter_tx,
+                busy_self_turn_fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
             EventStream::new(events_rx),
         ))
@@ -461,6 +472,24 @@ impl Backend for MockBackend {
 
     async fn send(&self, input: AgentInput) -> bool {
         self.command_tx.send(MockCommand::Input(input)).is_ok()
+    }
+
+    async fn send_with_outcome(&self, input: AgentInput) -> crate::backend::SendOutcome {
+        use crate::backend::SendOutcome;
+        if let AgentInput::SendMessage(payload) = &input
+            && payload.message.contains(MOCK_BUSY_SELF_TURN_SENTINEL)
+            && !self
+                .busy_self_turn_fired
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let _ = self.command_tx.send(MockCommand::EmitBusySelfTurn);
+            return SendOutcome::Busy(input);
+        }
+        if self.send(input).await {
+            SendOutcome::Accepted
+        } else {
+            SendOutcome::Closed
+        }
     }
 
     async fn interrupt(&self) -> bool {
@@ -682,6 +711,18 @@ fn start_mock_command_loop(
                     panic!(
                         "queued-message inputs must be handled by the agent actor before reaching the backend"
                     );
+                }
+                MockCommand::EmitBusySelfTurn => {
+                    if !emit_turn(
+                        &events_tx,
+                        &session_id_for_task,
+                        "self-initiated wakeup",
+                        false,
+                    )
+                    .await
+                    {
+                        return;
+                    }
                 }
                 MockCommand::Interrupt => {
                     if holding_until_interrupt {

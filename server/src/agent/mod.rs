@@ -32,7 +32,7 @@ use crate::backend::mock::MockBackend;
 use crate::backend::tycode::TycodeBackend;
 use crate::backend::{
     Backend, BackendEvent, BackendExecutionMode, BackendSession, BackendSpawnConfig,
-    BackendStartupError, EventStream, apply_session_settings_update,
+    BackendStartupError, EventStream, SendOutcome, apply_session_settings_update,
     resolve_backend_session_settings, validate_runtime_session_settings_update,
     validate_session_settings_values,
 };
@@ -1555,10 +1555,10 @@ fn activity_summary_attempted_tool_labels(
 
 /// Type-erased backend handle for agent input and acknowledged settings edits.
 trait BackendSender: Send + 'static {
-    fn send<'a>(
+    fn send_with_outcome<'a>(
         &'a self,
         input: AgentInput,
-    ) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+    ) -> Pin<Box<dyn std::future::Future<Output = SendOutcome> + Send + 'a>>;
     fn update_session_settings<'a>(
         &'a mut self,
         payload: protocol::SetSessionSettingsPayload,
@@ -1568,11 +1568,11 @@ trait BackendSender: Send + 'static {
 }
 
 impl<B: Backend> BackendSender for B {
-    fn send<'a>(
+    fn send_with_outcome<'a>(
         &'a self,
         input: AgentInput,
-    ) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
-        Box::pin(Backend::send(self, input))
+    ) -> Pin<Box<dyn std::future::Future<Output = SendOutcome> + Send + 'a>> {
+        Box::pin(Backend::send_with_outcome(self, input))
     }
 
     fn update_session_settings<'a>(
@@ -2875,77 +2875,100 @@ pub(crate) fn spawn_agent_actor(
                         .await;
                         in_turn = true;
                         idle_transition_armed = false;
-                        let sent = backend
+                        let outcome = backend
                             .as_ref()
                             .expect("backend must exist while actor is running")
-                            .send(AgentInput::SendMessage(queued_message_to_send_payload(
-                                queued.clone(),
-                            )))
+                            .send_with_outcome(AgentInput::SendMessage(
+                                queued_message_to_send_payload(queued.clone()),
+                            ))
                             .await;
-                        if !sent {
-                            if let Some(review_id) = review_origin.as_ref() {
-                                tracing::warn!(
-                                    review_id = %review_id,
+                        match outcome {
+                            SendOutcome::Busy(_) => {
+                                // The backend opened a turn on its own initiative
+                                // before this dispatch landed. Keep the message at
+                                // the front of the queue; the self-started turn's
+                                // idle marker re-triggers this drain.
+                                tracing::info!(
                                     agent_id = %current_start.agent_id,
                                     queued_message_id = %queued.id,
-                                    "failed to send dequeued review-origin bundle to backend"
+                                    "backend busy with a self-started turn; requeued message at front"
                                 );
+                                queue.push_front(queued);
+                                update_queued_messages_snapshot(
+                                    &canonical_stream,
+                                    &mut event_log,
+                                    &mut subscribers,
+                                    &queue,
+                                )
+                                .await;
                             }
-                            let payload = AgentErrorPayload {
-                                agent_id: current_start.agent_id.clone(),
-                                code: AgentErrorCode::Internal,
-                                message: "agent backend closed".to_owned(),
-                                fatal: true,
-                            };
-                            enter_terminal_failure(
-                                TerminalFailureContext {
-                                    accepting_input: &accepting_input_task,
-                                    status_handle: &status_handle,
-                                    canonical_stream: &canonical_stream,
-                                    event_log: &mut event_log,
-                                    replay_state: &mut replay_state,
-                                    subscribers: &mut subscribers,
-                                    queue: &mut queue,
-                                },
-                                &payload,
-                            )
-                            .await;
-                            park_terminal_agent(
-                                &session_store,
-                                current_session_id.as_ref(),
-                                &mut pending_alias,
-                                &mut current_start,
-                                &start_tx,
-                                &mut event_log,
-                                &mut latest_output,
-                                &mut subscribers,
-                                &mut pending_inputs,
-                                &mut rx,
-                            )
-                            .await;
-                            return;
-                        }
-                        if let Some(review_id) = review_origin.as_ref() {
-                            tracing::info!(
-                                review_id = %review_id,
-                                agent_id = %current_start.agent_id,
-                                queued_message_id = %queued.id,
-                                "sent dequeued review-origin bundle to backend"
-                            );
-                        }
-                        if let Some(MessageOrigin::Review { review_id }) = queued.origin {
-                            tracing::debug!(
-                                review_id = %review_id,
-                                agent_id = %current_start.agent_id,
-                                queued_message_id = %queued.id,
-                                "dequeued review-origin bundle sent; notifying consumed"
-                            );
-                            notify_review_bundle_consumed(
-                                &review_registry,
-                                review_id,
-                                &current_start.agent_id,
-                            )
-                            .await;
+                            SendOutcome::Closed => {
+                                if let Some(review_id) = review_origin.as_ref() {
+                                    tracing::warn!(
+                                        review_id = %review_id,
+                                        agent_id = %current_start.agent_id,
+                                        queued_message_id = %queued.id,
+                                        "failed to send dequeued review-origin bundle to backend"
+                                    );
+                                }
+                                let payload = AgentErrorPayload {
+                                    agent_id: current_start.agent_id.clone(),
+                                    code: AgentErrorCode::Internal,
+                                    message: "agent backend closed".to_owned(),
+                                    fatal: true,
+                                };
+                                enter_terminal_failure(
+                                    TerminalFailureContext {
+                                        accepting_input: &accepting_input_task,
+                                        status_handle: &status_handle,
+                                        canonical_stream: &canonical_stream,
+                                        event_log: &mut event_log,
+                                        replay_state: &mut replay_state,
+                                        subscribers: &mut subscribers,
+                                        queue: &mut queue,
+                                    },
+                                    &payload,
+                                )
+                                .await;
+                                park_terminal_agent(
+                                    &session_store,
+                                    current_session_id.as_ref(),
+                                    &mut pending_alias,
+                                    &mut current_start,
+                                    &start_tx,
+                                    &mut event_log,
+                                    &mut latest_output,
+                                    &mut subscribers,
+                                    &mut pending_inputs,
+                                    &mut rx,
+                                )
+                                .await;
+                                return;
+                            }
+                            SendOutcome::Accepted => {
+                                if let Some(review_id) = review_origin.as_ref() {
+                                    tracing::info!(
+                                        review_id = %review_id,
+                                        agent_id = %current_start.agent_id,
+                                        queued_message_id = %queued.id,
+                                        "sent dequeued review-origin bundle to backend"
+                                    );
+                                }
+                                if let Some(MessageOrigin::Review { review_id }) = queued.origin {
+                                    tracing::debug!(
+                                        review_id = %review_id,
+                                        agent_id = %current_start.agent_id,
+                                        queued_message_id = %queued.id,
+                                        "dequeued review-origin bundle sent; notifying consumed"
+                                    );
+                                    notify_review_bundle_consumed(
+                                        &review_registry,
+                                        review_id,
+                                        &current_start.agent_id,
+                                    )
+                                    .await;
+                                }
+                            }
                         }
                     }
                 }
@@ -3212,12 +3235,49 @@ pub(crate) fn spawn_agent_actor(
                                                 "sending review-origin bundle to backend"
                                             );
                                         }
-                                        let sent = backend
+                                        let backend_ref = backend
                                             .as_ref()
-                                            .expect("backend must exist while actor is running")
-                                            .send(AgentInput::SendMessage(msg))
+                                            .expect("backend must exist while actor is running");
+                                        let outcome = backend_ref
+                                            .send_with_outcome(AgentInput::SendMessage(msg))
                                             .await;
-                                        if !sent {
+                                        if let SendOutcome::Busy(input) = outcome {
+                                            match input {
+                                                AgentInput::SendMessage(payload)
+                                                    if payload.tool_response.is_none() =>
+                                                {
+                                                    tracing::info!(
+                                                        agent_id = %current_start.agent_id,
+                                                        "backend busy with a self-started turn; queued message at front"
+                                                    );
+                                                    queue.push_front(
+                                                        queued_entry_from_send_payload(payload),
+                                                    );
+                                                    update_queued_messages_snapshot(
+                                                        &canonical_stream,
+                                                        &mut event_log,
+                                                        &mut subscribers,
+                                                        &queue,
+                                                    )
+                                                    .await;
+                                                }
+                                                _ => {
+                                                    // Tool responses answer the
+                                                    // backend's active turn, so a
+                                                    // busy hand-back for one is a
+                                                    // backend contract violation.
+                                                    tracing::error!(
+                                                        agent_id = %current_start.agent_id,
+                                                        "backend handed back a non-requeueable input as Busy"
+                                                    );
+                                                }
+                                            }
+                                            // The requeued (or rejected) input was
+                                            // not delivered: skip the post-send
+                                            // bookkeeping below so e.g. a review
+                                            // bundle is not marked consumed.
+                                            continue;
+                                        } else if matches!(outcome, SendOutcome::Closed) {
                                             if let Some(review_id) = review_origin.as_ref() {
                                                 tracing::warn!(
                                                     review_id = %review_id,
@@ -3444,78 +3504,98 @@ pub(crate) fn spawn_agent_actor(
                                     .await;
                                     in_turn = true;
                                     idle_transition_armed = false;
-                                    let sent = backend
+                                    let outcome = backend
                                         .as_ref()
                                         .expect("backend must exist while actor is running")
-                                        .send(AgentInput::SendMessage(
+                                        .send_with_outcome(AgentInput::SendMessage(
                                             queued_message_to_send_payload(queued.clone()),
                                         ))
                                         .await;
-                                    if !sent {
-                                        if let Some(review_id) = review_origin.as_ref() {
-                                            tracing::warn!(
-                                                review_id = %review_id,
+                                    match outcome {
+                                        SendOutcome::Busy(_) => {
+                                            tracing::info!(
                                                 agent_id = %current_start.agent_id,
                                                 queued_message_id = %queued.id,
-                                                "failed to send immediate review-origin bundle to backend"
+                                                "backend busy with a self-started turn; send-now message requeued at front"
                                             );
+                                            queue.push_front(queued);
+                                            update_queued_messages_snapshot(
+                                                &canonical_stream,
+                                                &mut event_log,
+                                                &mut subscribers,
+                                                &queue,
+                                            )
+                                            .await;
                                         }
-                                        let payload = AgentErrorPayload {
-                                            agent_id: current_start.agent_id.clone(),
-                                            code: AgentErrorCode::Internal,
-                                            message: "agent backend closed".to_owned(),
-                                            fatal: true,
-                                        };
-                                        enter_terminal_failure(
-                                            TerminalFailureContext {
-                                                accepting_input: &accepting_input_task,
-                                                status_handle: &status_handle,
-                                                canonical_stream: &canonical_stream,
-                                                event_log: &mut event_log,
-                                                replay_state: &mut replay_state,
-                                                subscribers: &mut subscribers,
-                                                queue: &mut queue,
-                                            },
-                                            &payload,
-                                        )
-                                        .await;
-                                        park_terminal_agent(
-                                            &session_store,
-                                            current_session_id.as_ref(),
-                                            &mut pending_alias,
-                                            &mut current_start,
-                                            &start_tx,
-                                            &mut event_log,
-                                            &mut latest_output,
-                                            &mut subscribers,
-                                            &mut pending_inputs,
-                                            &mut rx,
-                                        )
-                                        .await;
-                                        return;
-                                    }
-                                    if let Some(review_id) = review_origin.as_ref() {
-                                        tracing::info!(
-                                            review_id = %review_id,
-                                            agent_id = %current_start.agent_id,
-                                            queued_message_id = %queued.id,
-                                            "sent immediate review-origin bundle to backend"
-                                        );
-                                    }
-                                    if let Some(MessageOrigin::Review { review_id }) = queued.origin
-                                    {
-                                        tracing::debug!(
-                                            review_id = %review_id,
-                                            agent_id = %current_start.agent_id,
-                                            queued_message_id = %queued.id,
-                                            "immediate review-origin bundle sent; notifying consumed"
-                                        );
-                                        notify_review_bundle_consumed(
-                                            &review_registry,
-                                            review_id,
-                                            &current_start.agent_id,
-                                        )
-                                        .await;
+                                        SendOutcome::Closed => {
+                                            if let Some(review_id) = review_origin.as_ref() {
+                                                tracing::warn!(
+                                                    review_id = %review_id,
+                                                    agent_id = %current_start.agent_id,
+                                                    queued_message_id = %queued.id,
+                                                    "failed to send immediate review-origin bundle to backend"
+                                                );
+                                            }
+                                            let payload = AgentErrorPayload {
+                                                agent_id: current_start.agent_id.clone(),
+                                                code: AgentErrorCode::Internal,
+                                                message: "agent backend closed".to_owned(),
+                                                fatal: true,
+                                            };
+                                            enter_terminal_failure(
+                                                TerminalFailureContext {
+                                                    accepting_input: &accepting_input_task,
+                                                    status_handle: &status_handle,
+                                                    canonical_stream: &canonical_stream,
+                                                    event_log: &mut event_log,
+                                                    replay_state: &mut replay_state,
+                                                    subscribers: &mut subscribers,
+                                                    queue: &mut queue,
+                                                },
+                                                &payload,
+                                            )
+                                            .await;
+                                            park_terminal_agent(
+                                                &session_store,
+                                                current_session_id.as_ref(),
+                                                &mut pending_alias,
+                                                &mut current_start,
+                                                &start_tx,
+                                                &mut event_log,
+                                                &mut latest_output,
+                                                &mut subscribers,
+                                                &mut pending_inputs,
+                                                &mut rx,
+                                            )
+                                            .await;
+                                            return;
+                                        }
+                                        SendOutcome::Accepted => {
+                                            if let Some(review_id) = review_origin.as_ref() {
+                                                tracing::info!(
+                                                    review_id = %review_id,
+                                                    agent_id = %current_start.agent_id,
+                                                    queued_message_id = %queued.id,
+                                                    "sent immediate review-origin bundle to backend"
+                                                );
+                                            }
+                                            if let Some(MessageOrigin::Review { review_id }) =
+                                                queued.origin
+                                            {
+                                                tracing::debug!(
+                                                    review_id = %review_id,
+                                                    agent_id = %current_start.agent_id,
+                                                    queued_message_id = %queued.id,
+                                                    "immediate review-origin bundle sent; notifying consumed"
+                                                );
+                                                notify_review_bundle_consumed(
+                                                    &review_registry,
+                                                    review_id,
+                                                    &current_start.agent_id,
+                                                )
+                                                .await;
+                                            }
+                                        }
                                     }
                                 }
                                 AgentInput::UpdateSessionSettings(update) => {
@@ -3681,34 +3761,49 @@ pub(crate) fn spawn_agent_actor(
                                     s.activity_counter = s.activity_counter.saturating_add(1);
                                 })
                                 .await;
-                            if !backend
+                            let outcome = backend
                                 .as_ref()
                                 .expect("backend must exist while actor is running")
-                                .send(AgentInput::SendMessage(SendMessagePayload {
+                                .send_with_outcome(AgentInput::SendMessage(SendMessagePayload {
                                     message: summary_prompt,
                                     images: None,
                                     origin: None,
                                     tool_response: None,
                                 }))
-                                .await
-                            {
+                                .await;
+                            if !matches!(outcome, SendOutcome::Accepted) {
+                                // A compaction prompt is not a user message: on a
+                                // busy hand-back it is abandoned with an error
+                                // reply (mirroring the pre-send busy rejection),
+                                // never queued as conversation input.
+                                let backend_busy = matches!(outcome, SendOutcome::Busy(_));
+                                let error = if backend_busy {
+                                    "agent is busy".to_owned()
+                                } else {
+                                    "agent backend closed".to_owned()
+                                };
                                 let compaction = active_compaction
                                     .take()
                                     .expect("active compaction disappeared after backend send failed");
                                 compaction_blocked = false;
-                                in_turn = false;
+                                // Busy means the backend has a live self-started
+                                // turn: stay in_turn (its typing events arm the
+                                // idle transition) instead of declaring idle
+                                // against a backend known to be working.
+                                if !backend_busy {
+                                    in_turn = false;
+                                }
                                 idle_transition_armed = false;
+                                let last_error = error.clone();
                                 status_handle
-                                    .update(|s| {
-                                        s.is_thinking = false;
-                                        s.turn_completed = true;
-                                        s.last_error = Some("agent backend closed".to_owned());
+                                    .update(move |s| {
+                                        s.is_thinking = backend_busy;
+                                        s.turn_completed = !backend_busy;
+                                        s.last_error = Some(last_error);
                                         s.activity_counter = s.activity_counter.saturating_add(1);
                                     })
                                     .await;
-                                let _ = compaction
-                                    .reply
-                                    .send(Err("agent backend closed".to_owned()));
+                                let _ = compaction.reply.send(Err(error));
                             }
                         }
                         AgentCommand::ReleaseCompaction { reply } => {
@@ -4992,6 +5087,17 @@ fn queued_message_to_send_payload(entry: QueuedMessageEntry) -> SendMessagePaylo
     }
 }
 
+/// Rebuild a queue entry from a payload the backend handed back with
+/// `SendOutcome::Busy`, so it can be requeued at the front.
+fn queued_entry_from_send_payload(payload: SendMessagePayload) -> QueuedMessageEntry {
+    QueuedMessageEntry {
+        id: QueuedMessageId(Uuid::new_v4().to_string()),
+        message: payload.message,
+        images: payload.images.unwrap_or_default(),
+        origin: payload.origin,
+    }
+}
+
 async fn notify_review_bundle_consumed(
     review_registry: &ReviewRegistryHandle,
     review_id: protocol::ReviewId,
@@ -5273,14 +5379,39 @@ async fn send_initial_follow_up_or_park(
 ) -> bool {
     *context.in_turn = true;
     *context.idle_transition_armed = false;
-    if context
+    match context
         .backend
         .as_ref()
         .expect("backend must exist after successful startup")
-        .send(AgentInput::SendMessage(input))
+        .send_with_outcome(AgentInput::SendMessage(input))
         .await
     {
-        return true;
+        SendOutcome::Accepted => return true,
+        SendOutcome::Busy(input) => {
+            if let AgentInput::SendMessage(payload) = input {
+                tracing::info!(
+                    agent_id = %context.current_start.agent_id,
+                    "backend busy with a self-started turn; initial follow-up queued at front"
+                );
+                context
+                    .queue
+                    .push_front(queued_entry_from_send_payload(payload));
+                update_queued_messages_snapshot(
+                    context.canonical_stream,
+                    context.event_log,
+                    context.subscribers,
+                    context.queue,
+                )
+                .await;
+            } else {
+                tracing::error!(
+                    agent_id = %context.current_start.agent_id,
+                    "backend handed back a non-message input as Busy"
+                );
+            }
+            return true;
+        }
+        SendOutcome::Closed => {}
     }
 
     let payload = AgentErrorPayload {

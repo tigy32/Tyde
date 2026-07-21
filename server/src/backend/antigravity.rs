@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -66,28 +66,14 @@ struct AntigravityState {
     session_settings: SessionSettingsValues,
     access_mode: BackendAccessMode,
     active_turn: Option<ActiveTurn>,
-    /// Messages accepted while a turn was already active. The agent actor
-    /// normally queues busy-time sends itself, so entries land here only in
-    /// the narrow race where the actor observed idle before this backend
-    /// cleared its turn. `run_prepared_turn` drains the front entry into a
-    /// fresh turn once the active turn clears; entries that cannot run
-    /// (shutdown, preparation failure) are surfaced as an error card, never
-    /// silently dropped.
-    queued_sends: VecDeque<QueuedSend>,
-    /// Set by `shutdown`. Blocks new sends and queue drains so a queued
-    /// message cannot start a turn (or spawn a fresh agy process) after the
-    /// backend has been told to close.
+    /// Set by `shutdown`. Blocks new turns so a racing send cannot spawn a
+    /// fresh agy process after the backend has been told to close.
     closing: bool,
 }
 
 struct ActiveTurn {
     id: u64,
     cancel_tx: Option<oneshot::Sender<()>>,
-}
-
-struct QueuedSend {
-    message: String,
-    session_capture: Option<SessionCapture>,
 }
 
 struct PreparedTurn {
@@ -219,28 +205,33 @@ impl Backend for AntigravityBackend {
         self.input_tx.send(input).is_ok()
     }
 
+    async fn send_with_outcome(&self, input: AgentInput) -> crate::backend::SendOutcome {
+        use crate::backend::SendOutcome;
+        // Antigravity only starts turns in response to caller input, so a
+        // busy admission here means the caller dispatched against a stale
+        // idle view (e.g. an actor/backend desync); hand the message back for
+        // requeueing instead of letting the actor task reject and drop it.
+        if let AgentInput::SendMessage(payload) = &input
+            && payload.tool_response.is_none()
+        {
+            let state = self.inner.state.lock().await;
+            if state.active_turn.is_some() {
+                return SendOutcome::Busy(input);
+            }
+        }
+        if self.input_tx.send(input).is_ok() {
+            SendOutcome::Accepted
+        } else {
+            SendOutcome::Closed
+        }
+    }
+
     async fn interrupt(&self) -> bool {
         self.interrupt_tx.send(()).is_ok()
     }
 
     async fn shutdown(self) {
-        let dropped_queued = {
-            let mut state = self.inner.state.lock().await;
-            state.closing = true;
-            std::mem::take(&mut state.queued_sends)
-        };
-        if !dropped_queued.is_empty() {
-            self.inner.emit_error(&format!(
-                "Antigravity backend is shutting down; {} queued message(s) were not sent.",
-                dropped_queued.len()
-            ));
-        }
-        for mut queued in dropped_queued {
-            fail_session_capture(
-                &mut queued.session_capture,
-                "Antigravity backend is shutting down; the queued message was not sent.",
-            );
-        }
+        self.inner.state.lock().await.closing = true;
         let _ = self.interrupt_tx.send(());
     }
 }
@@ -272,7 +263,6 @@ impl AntigravityBackend {
                 session_settings: resolved_settings,
                 access_mode: config.resolved_spawn_config.access_mode,
                 active_turn: None,
-                queued_sends: VecDeque::new(),
                 closing: false,
             }),
         });
@@ -355,7 +345,6 @@ impl AntigravityBackend {
                 session_settings: resolved_settings,
                 access_mode: config.resolved_spawn_config.access_mode,
                 active_turn: None,
-                queued_sends: VecDeque::new(),
                 closing: false,
             }),
         });
@@ -437,8 +426,7 @@ impl AntigravityInner {
         }
 
         let prepared = match self.prepare_turn(payload.message, session_capture).await {
-            Ok(Some(turn)) => turn,
-            Ok(None) => return,
+            Ok(turn) => turn,
             Err(err) => {
                 self.emit_error(&err);
                 return;
@@ -462,13 +450,11 @@ impl AntigravityInner {
         }
     }
 
-    /// Returns `Ok(None)` when the message was queued behind an active turn;
-    /// `run_prepared_turn` drains the queue once that turn clears.
     async fn prepare_turn(
         &self,
         message: String,
         mut session_capture: Option<SessionCapture>,
-    ) -> Result<Option<PreparedTurn>, String> {
+    ) -> Result<PreparedTurn, String> {
         let mut state = self.state.lock().await;
         if state.closing {
             let err = "Antigravity backend is shutting down; the message was not sent.".to_string();
@@ -476,18 +462,15 @@ impl AntigravityInner {
             return Err(err);
         }
         if state.active_turn.is_some() {
-            state.queued_sends.push_back(QueuedSend {
-                message,
-                session_capture,
-            });
-            tracing::info!(
-                queued = state.queued_sends.len(),
-                "queued message behind active Antigravity turn"
-            );
-            return Ok(None);
+            // Busy sends are handed back by `send_with_outcome` before input
+            // reaches this actor, so this branch is an invariant breach, not
+            // an expected path — fail visibly rather than dropping silently.
+            let err = "Antigravity is still processing the previous turn.".to_string();
+            fail_session_capture(&mut session_capture, &err);
+            return Err(err);
         }
 
-        Self::prepare_turn_locked(&mut state, message, session_capture).map(Some)
+        Self::prepare_turn_locked(&mut state, message, session_capture)
     }
 
     /// Build a turn while holding the state lock, reserving `active_turn`
@@ -595,52 +578,6 @@ impl AntigravityInner {
         }
 
         self.emit_typing_status(false);
-        self.start_next_queued_send().await;
-    }
-
-    /// Dispatch the oldest message that arrived while a turn was active. The
-    /// pop, turn preparation, and `active_turn` reservation happen under one
-    /// state lock, so a racing send can neither reorder the queue nor
-    /// double-start; a queued entry whose preparation fails is surfaced as an
-    /// error and the drain continues with the next entry instead of stranding
-    /// it. The user bubble for a queued message was already emitted when it
-    /// was accepted. Returns an erased boxed future: this sits on the
-    /// run_prepared_turn → start_next_queued_send loop, so an `async fn` here
-    /// would make run_prepared_turn's opaque future type reference itself.
-    fn start_next_queued_send(
-        self: &Arc<Self>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
-        let this = Arc::clone(self);
-        Box::pin(async move {
-            // One lock over the whole drain: a failing entry's error is
-            // emitted (sync send) without releasing the lock, so a fresh send
-            // cannot slip in between a failed entry and the next queued one.
-            let launch = {
-                let mut state = this.state.lock().await;
-                loop {
-                    if state.closing || state.active_turn.is_some() {
-                        break None;
-                    }
-                    let Some(queued) = state.queued_sends.pop_front() else {
-                        break None;
-                    };
-                    match Self::prepare_turn_locked(
-                        &mut state,
-                        queued.message,
-                        queued.session_capture,
-                    ) {
-                        Ok(prepared) => break Some(prepared),
-                        Err(err) => this.emit_error(&err),
-                    }
-                }
-            };
-            if let Some(prepared) = launch {
-                let turn = Arc::clone(&this);
-                tokio::spawn(async move {
-                    turn.run_prepared_turn(prepared).await;
-                });
-            }
-        })
     }
 
     async fn run_turn(self: &Arc<Self>, prepared: &mut PreparedTurn) -> TurnOutcome {
@@ -2294,14 +2231,15 @@ mod tests {
                 session_settings: SessionSettingsValues::default(),
                 access_mode: BackendAccessMode::Unrestricted,
                 active_turn: None,
-                queued_sends: VecDeque::new(),
                 closing: false,
             }),
         })
     }
 
     #[tokio::test]
-    async fn busy_send_queues_instead_of_dropping() {
+    async fn busy_send_hands_the_message_back() {
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let (interrupt_tx, _interrupt_rx) = mpsc::unbounded_channel();
         let inner = test_antigravity_inner("/tmp".to_string());
         {
             let mut state = inner.state.lock().await;
@@ -2310,75 +2248,40 @@ mod tests {
                 cancel_tx: None,
             });
         }
+        let backend = AntigravityBackend {
+            input_tx,
+            interrupt_tx,
+            session_id: SessionId("busy-handback-test".to_owned()),
+            inner: Arc::clone(&inner),
+        };
 
-        let prepared = inner
-            .prepare_turn("queued while busy".to_string(), None)
-            .await
-            .expect("busy-time send must not error");
+        let payload = protocol::SendMessagePayload {
+            message: "sent while busy".to_owned(),
+            images: None,
+            origin: None,
+            tool_response: None,
+        };
+        let outcome = Backend::send_with_outcome(&backend, AgentInput::SendMessage(payload)).await;
+        let crate::backend::SendOutcome::Busy(AgentInput::SendMessage(returned)) = outcome else {
+            panic!("busy backend must hand the message back, got {outcome:?}");
+        };
+        assert_eq!(returned.message, "sent while busy");
         assert!(
-            prepared.is_none(),
-            "busy-time send must be queued, not prepared into a turn"
+            input_rx.try_recv().is_err(),
+            "a busy send must not reach the backend actor task"
         );
 
-        let state = inner.state.lock().await;
-        assert_eq!(state.queued_sends.len(), 1);
-        assert_eq!(state.queued_sends[0].message, "queued while busy");
-    }
-
-    #[tokio::test]
-    async fn queue_drain_continues_past_preparation_failures() {
-        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let mut bad_settings = SessionSettingsValues::default();
-        bad_settings.0.insert(
-            "model".to_owned(),
-            SessionSettingValue::String("not-a-real-agy-model".to_owned()),
+        // Once the turn clears, the same payload is accepted and forwarded.
+        inner.state.lock().await.active_turn = None;
+        let outcome = Backend::send_with_outcome(&backend, AgentInput::SendMessage(returned)).await;
+        assert!(
+            matches!(outcome, crate::backend::SendOutcome::Accepted),
+            "idle backend must accept the redispatched message, got {outcome:?}"
         );
-        let inner = Arc::new(AntigravityInner {
-            events_tx,
-            state: Mutex::new(AntigravityState {
-                session_id: None,
-                conversations_dir: std::env::temp_dir(),
-                primary_root: "/tmp".to_string(),
-                extra_roots: Vec::new(),
-                startup_mcp_servers: Vec::new(),
-                combined_instructions: None,
-                session_settings: bad_settings,
-                access_mode: BackendAccessMode::Unrestricted,
-                active_turn: None,
-                queued_sends: VecDeque::new(),
-                closing: false,
-            }),
-        });
-        {
-            let mut state = inner.state.lock().await;
-            state.queued_sends.push_back(QueuedSend {
-                message: "first queued".to_owned(),
-                session_capture: None,
-            });
-            state.queued_sends.push_back(QueuedSend {
-                message: "second queued".to_owned(),
-                session_capture: None,
-            });
-        }
-
-        inner.start_next_queued_send().await;
-
-        {
-            let state = inner.state.lock().await;
-            assert!(
-                state.queued_sends.is_empty(),
-                "a failing entry must not strand the rest of the queue"
-            );
-        }
-        let mut errors = 0;
-        while let Ok(event) = events_rx.try_recv() {
-            if let ChatEvent::MessageAdded(message) = &event
-                && matches!(message.sender, MessageSender::Error)
-            {
-                errors += 1;
-            }
-        }
-        assert_eq!(errors, 2, "each failed queued entry must surface an error");
+        assert!(
+            input_rx.try_recv().is_ok(),
+            "an accepted send must reach the backend actor task"
+        );
     }
 
     #[test]
@@ -2396,7 +2299,6 @@ mod tests {
                 session_settings: SessionSettingsValues::default(),
                 access_mode: BackendAccessMode::Unrestricted,
                 active_turn: None,
-                queued_sends: VecDeque::new(),
                 closing: false,
             }),
         };
