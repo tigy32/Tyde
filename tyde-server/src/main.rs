@@ -200,6 +200,21 @@ fn run_host_stdio() -> Result<(), String> {
     })
 }
 
+#[cfg(unix)]
+async fn bind_host_socket_before_start<T>(
+    socket_path: &std::path::Path,
+    start: impl FnOnce() -> Result<T, String>,
+) -> Result<(server::BoundUdsListener, T), String> {
+    let listener = server::bind_uds(socket_path).await.map_err(|err| {
+        format!(
+            "host UDS listener failed at {}: {err}",
+            socket_path.display()
+        )
+    })?;
+    let host = start()?;
+    Ok((listener, host))
+}
+
 fn run_host_uds() -> Result<(), String> {
     #[cfg(not(unix))]
     {
@@ -218,8 +233,9 @@ fn run_host_uds() -> Result<(), String> {
             .map_err(|err| format!("failed to create tokio runtime for host UDS mode: {err}"))?;
 
         runtime.block_on(async move {
-            let host = spawn_host()?;
-            server::listen_uds(&socket_path, server::ServerConfig::current(), host)
+            let (listener, host) =
+                bind_host_socket_before_start(&socket_path, spawn_host).await?;
+            server::serve_uds(listener, server::ServerConfig::current(), host)
                 .await
                 .map_err(|err| {
                     format!(
@@ -433,6 +449,36 @@ impl AsyncWrite for StdioTransport {
 #[cfg(test)]
 mod tests {
     use super::{CliMode, parse_cli_mode};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn socket_contention_exits_before_host_start() {
+        use super::bind_host_socket_before_start;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "tyde-server-uds-test-{}-{nonce}.sock",
+            std::process::id()
+        ));
+        let owner = server::bind_uds(&path).await.expect("first socket owner");
+        let started = std::cell::Cell::new(false);
+
+        let result = bind_host_socket_before_start(&path, || {
+            started.set(true);
+            Ok(())
+        })
+        .await;
+
+        assert!(result.is_err(), "the second server must fail to bind");
+        assert!(
+            !started.get(),
+            "a server that does not own the socket must not construct its host"
+        );
+        drop(owner);
+    }
 
     #[test]
     fn parses_host_modes() {

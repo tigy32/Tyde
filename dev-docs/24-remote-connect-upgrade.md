@@ -64,12 +64,17 @@ already installed.
 
 Install flow:
 
-1. Emit `ResolveRelease` and resolve `v<target>` from GitHub.
-2. Emit `DownloadAsset`, select the platform asset, and download it.
-3. Extract `tyde-server`.
-4. Emit `InstallBinary` and upload it to
+1. Emit `ResolveRelease` and derive the exact `v<target>` GitHub release URL.
+2. Emit `DownloadAsset`, then instruct the remote host over SSH to download the
+   platform asset directly from GitHub with `curl` or `wget`.
+3. On the remote host, extract `tyde-server`, verify that its reported version
+   exactly matches `<target>`, and atomically install it at
    `~/.tyde/bin/<target>/tyde-server`.
+4. Emit `InstallBinary` after the remote install command completes.
 5. Re-probe the snapshot and fail if `installed_target` is still false.
+
+The desktop never downloads the release archive or streams the server binary
+through SSH. The managed remote requires `curl` or `wget` plus `unzip`.
 
 If GitHub is unavailable during install, the error must name the target version
 and propagate visibly. There is no fallback to `current`, an older cached

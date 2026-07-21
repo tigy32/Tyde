@@ -1,6 +1,4 @@
 use std::collections::HashMap;
-use std::io::{Cursor, Read};
-use std::process::Stdio;
 
 use host_config::{
     ConfiguredHost, HostLifecycleEvent, HostTransportConfig, RemoteArchitecture,
@@ -8,16 +6,12 @@ use host_config::{
     RemoteHostLifecycleStep, RemoteOperatingSystem, RemotePlatform, RemoteTydeRunningState,
     TydeReleaseVersion,
 };
-use reqwest::header::USER_AGENT;
-use serde::Deserialize;
 use tauri::{AppHandle, Emitter};
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::bridge::HOST_LIFECYCLE_EVENT;
 
-const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/tigy32/Tyde/releases";
-const GITHUB_USER_AGENT: &str = "Tyde remote lifecycle";
+const GITHUB_RELEASE_DOWNLOADS: &str = "https://github.com/tigy32/Tyde/releases/download";
 
 pub(crate) fn current_app_release_version() -> Result<TydeReleaseVersion, String> {
     let tag = option_env!("TYDE_RELEASE_TAG").ok_or_else(|| {
@@ -266,21 +260,8 @@ async fn ensure_target_installed(
         RemoteHostLifecycleStep::ResolveRelease,
         Some(target_version.clone()),
     );
-    let release = match resolve_release(target_version.clone()).await {
-        Ok(release) => release,
-        Err(err) => {
-            return lifecycle_error(app, host_id, github_install_error(&target_version, err));
-        }
-    };
-
-    emit_running(
-        app,
-        host_id,
-        RemoteHostLifecycleStep::DownloadAsset,
-        Some(target_version.clone()),
-    );
-    let asset = match select_release_asset(&release, snapshot.platform) {
-        Ok(asset) => asset,
+    let asset_name = match release_asset_name(snapshot.platform) {
+        Ok(asset_name) => asset_name,
         Err(err) => {
             return lifecycle_error(
                 app,
@@ -289,36 +270,31 @@ async fn ensure_target_installed(
             );
         }
     };
-    let archive = match download_asset(&asset.download_url).await {
-        Ok(archive) => archive,
-        Err(err) => {
-            return lifecycle_error(app, host_id, github_install_error(&target_version, err));
-        }
-    };
-    let binary = match extract_tyde_binary(&archive, asset.kind) {
-        Ok(binary) => binary,
-        Err(err) => {
-            return lifecycle_error(
-                app,
-                host_id,
-                format!("failed to extract Tyde {target_version} server binary: {err}"),
-            );
-        }
-    };
-
+    emit_running(
+        app,
+        host_id,
+        RemoteHostLifecycleStep::DownloadAsset,
+        Some(target_version.clone()),
+    );
+    if let Err(err) = install_release_on_remote(
+        ssh_destination,
+        &target_version,
+        &asset_name,
+    )
+    .await
+    {
+        return lifecycle_error(
+            app,
+            host_id,
+            remote_install_error(&target_version, err),
+        );
+    }
     emit_running(
         app,
         host_id,
         RemoteHostLifecycleStep::InstallBinary,
         Some(target_version.clone()),
     );
-    if let Err(err) = install_binary(ssh_destination, &target_version, &binary).await {
-        return lifecycle_error(
-            app,
-            host_id,
-            format!("failed to install Tyde {target_version} on the remote host: {err}"),
-        );
-    }
 
     let snapshot =
         match probe_snapshot(ssh_destination, snapshot.platform, target_version.clone()).await {
@@ -350,8 +326,8 @@ fn missing_target_binary_message(target_version: &TydeReleaseVersion) -> String 
     )
 }
 
-fn github_install_error(target_version: &TydeReleaseVersion, error: String) -> String {
-    format!("installing Tyde {target_version} requires GitHub, which is unavailable: {error}")
+fn remote_install_error(target_version: &TydeReleaseVersion, error: String) -> String {
+    format!("failed to download and install Tyde {target_version} on the remote host: {error}")
 }
 
 fn lifecycle_error<T>(app: &AppHandle, host_id: &str, message: String) -> Result<T, String> {
@@ -396,167 +372,21 @@ async fn launch_and_verify(
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct GitHubRelease {
-    tag_name: String,
-    assets: Vec<GitHubAsset>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GitHubAsset {
-    name: String,
-    browser_download_url: String,
-}
-
-#[derive(Debug, Clone)]
-struct ReleaseInfo {
-    version: TydeReleaseVersion,
-    assets: Vec<ReleaseAssetInfo>,
-}
-
-#[derive(Debug, Clone)]
-struct ReleaseAssetInfo {
-    name: String,
-    download_url: String,
-}
-
-async fn resolve_release(expected: TydeReleaseVersion) -> Result<ReleaseInfo, String> {
-    let url = format!("{GITHUB_RELEASES_API}/tags/{}", expected.github_tag());
-
-    let release = reqwest::Client::new()
-        .get(url)
-        .header(USER_AGENT, GITHUB_USER_AGENT)
-        .send()
-        .await
-        .map_err(|err| format!("failed to resolve Tyde release from GitHub: {err}"))?
-        .error_for_status()
-        .map_err(|err| format!("GitHub release lookup failed: {err}"))?
-        .json::<GitHubRelease>()
-        .await
-        .map_err(|err| format!("failed to parse GitHub release response: {err}"))?;
-
-    let version = release
-        .tag_name
-        .parse::<TydeReleaseVersion>()
-        .map_err(|err| {
-            format!(
-                "GitHub release tag {:?} is not a valid Tyde release version: {err}",
-                release.tag_name
-            )
-        })?;
-    if version != expected {
-        return Err(format!(
-            "GitHub release tag {} resolved to {}, expected {}",
-            expected.github_tag(),
-            version.github_tag(),
-            expected.github_tag()
-        ));
-    }
-
-    Ok(ReleaseInfo {
-        version,
-        assets: release
-            .assets
-            .into_iter()
-            .map(|asset| ReleaseAssetInfo {
-                name: asset.name,
-                download_url: asset.browser_download_url,
-            })
-            .collect(),
-    })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReleaseAssetKind {
-    Zip,
-}
-
-#[derive(Debug, Clone)]
-struct SelectedReleaseAsset {
-    download_url: String,
-    kind: ReleaseAssetKind,
-}
-
-fn select_release_asset(
-    release: &ReleaseInfo,
-    platform: RemotePlatform,
-) -> Result<SelectedReleaseAsset, String> {
-    let (asset_name, kind) = release_asset_name(platform)?;
-    let asset = release
-        .assets
-        .iter()
-        .find(|asset| asset.name == asset_name)
-        .ok_or_else(|| {
-            format!(
-                "Tyde release v{} does not contain required asset {}",
-                release.version, asset_name
-            )
-        })?;
-    Ok(SelectedReleaseAsset {
-        download_url: asset.download_url.clone(),
-        kind,
-    })
-}
-
-fn release_asset_name(platform: RemotePlatform) -> Result<(String, ReleaseAssetKind), String> {
+fn release_asset_name(platform: RemotePlatform) -> Result<String, String> {
     match (platform.os, platform.arch) {
-        (RemoteOperatingSystem::Linux, RemoteArchitecture::X86_64) => Ok((
-            "tyde-server-x86_64-unknown-linux-musl.zip".to_string(),
-            ReleaseAssetKind::Zip,
-        )),
-        (RemoteOperatingSystem::Linux, RemoteArchitecture::Aarch64) => Ok((
-            "tyde-server-aarch64-unknown-linux-musl.zip".to_string(),
-            ReleaseAssetKind::Zip,
-        )),
-        (RemoteOperatingSystem::Macos, RemoteArchitecture::X86_64) => Ok((
-            "tyde-server-x86_64-apple-darwin.zip".to_string(),
-            ReleaseAssetKind::Zip,
-        )),
-        (RemoteOperatingSystem::Macos, RemoteArchitecture::Aarch64) => Ok((
-            "tyde-server-aarch64-apple-darwin.zip".to_string(),
-            ReleaseAssetKind::Zip,
-        )),
-    }
-}
-
-async fn download_asset(url: &str) -> Result<Vec<u8>, String> {
-    let bytes = reqwest::Client::new()
-        .get(url)
-        .header(USER_AGENT, GITHUB_USER_AGENT)
-        .send()
-        .await
-        .map_err(|err| format!("failed to download Tyde release asset: {err}"))?
-        .error_for_status()
-        .map_err(|err| format!("Tyde release asset download failed: {err}"))?
-        .bytes()
-        .await
-        .map_err(|err| format!("failed to read Tyde release asset bytes: {err}"))?;
-    Ok(bytes.to_vec())
-}
-
-fn extract_tyde_binary(archive: &[u8], kind: ReleaseAssetKind) -> Result<Vec<u8>, String> {
-    match kind {
-        ReleaseAssetKind::Zip => extract_tyde_from_zip(archive),
-    }
-}
-
-fn extract_tyde_from_zip(archive: &[u8]) -> Result<Vec<u8>, String> {
-    let cursor = Cursor::new(archive);
-    let mut archive = zip::ZipArchive::new(cursor)
-        .map_err(|err| format!("failed to read Tyde zip asset: {err}"))?;
-    for index in 0..archive.len() {
-        let mut file = archive
-            .by_index(index)
-            .map_err(|err| format!("failed to read Tyde zip entry {index}: {err}"))?;
-        let name = file.name().to_string();
-        if name == "tyde-server" || name.ends_with("/tyde-server") {
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)
-                .map_err(|err| format!("failed to extract tyde-server from zip: {err}"))?;
-            return Ok(bytes);
+        (RemoteOperatingSystem::Linux, RemoteArchitecture::X86_64) => {
+            Ok("tyde-server-x86_64-unknown-linux-musl.zip".to_string())
+        }
+        (RemoteOperatingSystem::Linux, RemoteArchitecture::Aarch64) => {
+            Ok("tyde-server-aarch64-unknown-linux-musl.zip".to_string())
+        }
+        (RemoteOperatingSystem::Macos, RemoteArchitecture::X86_64) => {
+            Ok("tyde-server-x86_64-apple-darwin.zip".to_string())
+        }
+        (RemoteOperatingSystem::Macos, RemoteArchitecture::Aarch64) => {
+            Ok("tyde-server-aarch64-apple-darwin.zip".to_string())
         }
     }
-    Err("Tyde zip asset did not contain a tyde-server binary".to_string())
 }
 
 async fn probe_platform(ssh_destination: &str) -> Result<RemotePlatform, String> {
@@ -712,78 +542,62 @@ fn parse_optional_release_version_path_result(
     }
 }
 
-/// Number of times to retry the binary upload before giving up. Streaming a
-/// large binary into `ssh ... 'cat > file'` over stdin can intermittently
-/// truncate, so each attempt verifies size + sha256 on the remote and we retry
-/// the whole upload on any mismatch.
-const INSTALL_UPLOAD_ATTEMPTS: usize = 3;
-
-async fn install_binary(
+async fn install_release_on_remote(
     ssh_destination: &str,
     version: &TydeReleaseVersion,
-    binary: &[u8],
+    asset_name: &str,
 ) -> Result<(), String> {
     let version_sh = shell_quote(version.as_str());
-    let expected_len = binary.len();
-    let expected_sha = sha256_hex(binary);
-    // The remote script writes stdin to a temp file, then refuses to install it
-    // unless both the byte count and (when a sha256 tool is available) the
-    // digest match what we sent. `cat` happily returns success on a truncated
-    // stream, so without this check a partial transfer silently installs a
-    // corrupt binary. The EXIT trap removes the temp file on any failure.
+    let url = format!(
+        "{GITHUB_RELEASE_DOWNLOADS}/{}/{}",
+        version.github_tag(),
+        asset_name
+    );
+    let url_sh = shell_quote(&url);
     let command = format!(
         r#"set -eu
 version={version_sh}
-expected_len={expected_len}
-expected_sha={expected_sha}
+download_url={url_sh}
 install_dir="$HOME/.tyde/bin/$version"
 mkdir -p "$install_dir" "$HOME/.tyde/logs" "$HOME/.tyde/run"
-tmp="$install_dir/tyde-server.tmp.$$"
-trap 'rm -f "$tmp"' EXIT
-cat > "$tmp"
-actual_len=$(wc -c < "$tmp" | tr -d ' ')
-if [ "$actual_len" != "$expected_len" ]; then
-  echo "tyde-server upload truncated: expected $expected_len bytes, received $actual_len" >&2
-  exit 1
-fi
-if command -v sha256sum >/dev/null 2>&1; then
-  actual_sha=$(sha256sum "$tmp" | awk '{{print $1}}')
-elif command -v shasum >/dev/null 2>&1; then
-  actual_sha=$(shasum -a 256 "$tmp" | awk '{{print $1}}')
+archive="$install_dir/tyde-server.zip.tmp.$$"
+binary="$install_dir/tyde-server.tmp.$$"
+trap 'rm -f "$archive" "$binary"' EXIT
+if command -v curl >/dev/null 2>&1; then
+  curl --fail --location --silent --show-error "$download_url" --output "$archive"
+elif command -v wget >/dev/null 2>&1; then
+  wget -q "$download_url" -O "$archive"
 else
-  actual_sha=""
-fi
-if [ -n "$actual_sha" ] && [ "$actual_sha" != "$expected_sha" ]; then
-  echo "tyde-server upload corrupted: sha256 mismatch (expected $expected_sha, received $actual_sha)" >&2
+  echo "remote Tyde install requires curl or wget" >&2
   exit 1
 fi
-chmod 755 "$tmp"
-mv "$tmp" "$install_dir/tyde-server"
+if ! command -v unzip >/dev/null 2>&1; then
+  echo "remote Tyde install requires unzip" >&2
+  exit 1
+fi
+entry=$(unzip -Z1 "$archive" | awk '$0 == "tyde-server" || $0 ~ /\/tyde-server$/ {{ print; exit }}')
+if [ -z "$entry" ]; then
+  echo "Tyde release archive did not contain tyde-server" >&2
+  exit 1
+fi
+unzip -p "$archive" "$entry" > "$binary"
+if [ ! -s "$binary" ]; then
+  echo "downloaded Tyde server binary is empty" >&2
+  exit 1
+fi
+chmod 755 "$binary"
+actual_version=$("$binary" --version)
+if [ "$actual_version" != "$version" ]; then
+  echo "downloaded Tyde server reports version $actual_version, expected $version" >&2
+  exit 1
+fi
+mv "$binary" "$install_dir/tyde-server"
 trap - EXIT
+rm -f "$archive"
 ln -sfn "$version" "$HOME/.tyde/bin/current"
 "#
     );
-
-    let mut last_err = String::new();
-    for attempt in 1..=INSTALL_UPLOAD_ATTEMPTS {
-        match ssh_with_stdin(ssh_destination, &command, binary).await {
-            Ok(()) => return Ok(()),
-            Err(err) => last_err = format!("attempt {attempt}/{INSTALL_UPLOAD_ATTEMPTS}: {err}"),
-        }
-    }
-    Err(format!(
-        "failed to upload a complete tyde-server binary after {INSTALL_UPLOAD_ATTEMPTS} attempts ({last_err})"
-    ))
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
+    ssh_capture(ssh_destination, &command).await.map(|_| ())
 }
 
 async fn stop_managed_server(ssh_destination: &str) -> Result<(), String> {
@@ -824,6 +638,25 @@ pid_file="$HOME/.tyde/run/tyde-host.pid"
 version_file="$HOME/.tyde/run/tyde-host-version"
 log_file="$HOME/.tyde/logs/tyde-host-$version.log"
 mkdir -p "$HOME/.tyde/logs" "$HOME/.tyde/run"
+launch_lock="$HOME/.tyde/run/tyde-host-launch.lock"
+i=0
+while ! mkdir "$launch_lock" 2>/dev/null; do
+  if [ -f "$launch_lock/pid" ]; then
+    lock_pid=$(cat "$launch_lock/pid" 2>/dev/null || true)
+    if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
+      rm -rf "$launch_lock"
+      continue
+    fi
+  fi
+  if [ "$i" -ge 100 ]; then
+    echo "timed out waiting for another managed Tyde launch" >&2
+    exit 1
+  fi
+  i=$((i + 1))
+  sleep 0.1
+done
+printf '%s\n' "$$" > "$launch_lock/pid"
+trap 'rm -rf "$launch_lock"' EXIT
 if [ ! -x "$bin" ]; then
   echo "managed tyde-server binary is not executable: $bin" >&2
   exit 1
@@ -834,21 +667,16 @@ tail_launch_log() {{
     tail -n 80 "$log_file" >&2 || true
   fi
 }}
-# Remove any stale socket left by a previous server. Otherwise the readiness
-# check below ([ -S "$socket" ]) can pass against the old socket and report a
-# successful launch even when the new process crashed immediately, masking the
-# real failure as a later "NotRunning" observation. Safe here: this path is
-# only reached when no managed server is running (NotRunning, or after the old
-# one was stopped).
-rm -f "$socket"
 nohup "$bin" host --uds >> "$log_file" 2>&1 < /dev/null &
 pid=$!
-printf '%s\n' "$pid" > "$pid_file"
-printf '%s\n' "$version" > "$version_file"
 i=0
 while [ "$i" -lt 50 ]; do
   if kill -0 "$pid" 2>/dev/null && [ -S "$socket" ]; then
+    printf '%s\n' "$pid" > "$pid_file"
+    printf '%s\n' "$version" > "$version_file"
     ln -sfn "$version" "$HOME/.tyde/bin/current"
+    rm -rf "$launch_lock"
+    trap - EXIT
     exit 0
   fi
   if ! kill -0 "$pid" 2>/dev/null; then
@@ -884,49 +712,6 @@ async fn ssh_capture(ssh_destination: &str, remote_command: &str) -> Result<Stri
     }
     String::from_utf8(output.stdout)
         .map_err(|err| format!("ssh command output from {ssh_destination} was not UTF-8: {err}"))
-}
-
-async fn ssh_with_stdin(
-    ssh_destination: &str,
-    remote_command: &str,
-    stdin_bytes: &[u8],
-) -> Result<(), String> {
-    let mut child = Command::new("ssh")
-        .arg("-T")
-        .arg(ssh_destination)
-        .arg(remote_command)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("failed to start ssh command for {ssh_destination}: {err}"))?;
-
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| format!("ssh command for {ssh_destination} has no stdin"))?;
-    stdin
-        .write_all(stdin_bytes)
-        .await
-        .map_err(|err| format!("failed to write tyde-server binary to ssh stdin: {err}"))?;
-    stdin
-        .shutdown()
-        .await
-        .map_err(|err| format!("failed to close ssh stdin for tyde-server upload: {err}"))?;
-    drop(stdin);
-
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|err| format!("failed waiting for ssh command for {ssh_destination}: {err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "ssh upload command failed for {ssh_destination} with status {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(())
 }
 
 fn emit_running(
@@ -1122,17 +907,11 @@ mod tests {
         };
         assert_eq!(
             release_asset_name(linux_x64).unwrap(),
-            (
-                "tyde-server-x86_64-unknown-linux-musl.zip".to_string(),
-                ReleaseAssetKind::Zip
-            )
+            "tyde-server-x86_64-unknown-linux-musl.zip"
         );
         assert_eq!(
             release_asset_name(mac_arm).unwrap(),
-            (
-                "tyde-server-aarch64-apple-darwin.zip".to_string(),
-                ReleaseAssetKind::Zip
-            )
+            "tyde-server-aarch64-apple-darwin.zip"
         );
     }
 
