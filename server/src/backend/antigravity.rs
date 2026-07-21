@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -48,6 +48,7 @@ pub struct AntigravityBackend {
     input_tx: mpsc::UnboundedSender<AgentInput>,
     interrupt_tx: mpsc::UnboundedSender<()>,
     session_id: SessionId,
+    inner: Arc<AntigravityInner>,
 }
 
 struct AntigravityInner {
@@ -65,11 +66,28 @@ struct AntigravityState {
     session_settings: SessionSettingsValues,
     access_mode: BackendAccessMode,
     active_turn: Option<ActiveTurn>,
+    /// Messages accepted while a turn was already active. The agent actor
+    /// normally queues busy-time sends itself, so entries land here only in
+    /// the narrow race where the actor observed idle before this backend
+    /// cleared its turn. `run_prepared_turn` drains the front entry into a
+    /// fresh turn once the active turn clears; entries that cannot run
+    /// (shutdown, preparation failure) are surfaced as an error card, never
+    /// silently dropped.
+    queued_sends: VecDeque<QueuedSend>,
+    /// Set by `shutdown`. Blocks new sends and queue drains so a queued
+    /// message cannot start a turn (or spawn a fresh agy process) after the
+    /// backend has been told to close.
+    closing: bool,
 }
 
 struct ActiveTurn {
     id: u64,
     cancel_tx: Option<oneshot::Sender<()>>,
+}
+
+struct QueuedSend {
+    message: String,
+    session_capture: Option<SessionCapture>,
 }
 
 struct PreparedTurn {
@@ -206,6 +224,23 @@ impl Backend for AntigravityBackend {
     }
 
     async fn shutdown(self) {
+        let dropped_queued = {
+            let mut state = self.inner.state.lock().await;
+            state.closing = true;
+            std::mem::take(&mut state.queued_sends)
+        };
+        if !dropped_queued.is_empty() {
+            self.inner.emit_error(&format!(
+                "Antigravity backend is shutting down; {} queued message(s) were not sent.",
+                dropped_queued.len()
+            ));
+        }
+        for mut queued in dropped_queued {
+            fail_session_capture(
+                &mut queued.session_capture,
+                "Antigravity backend is shutting down; the queued message was not sent.",
+            );
+        }
         let _ = self.interrupt_tx.send(());
     }
 }
@@ -237,6 +272,8 @@ impl AntigravityBackend {
                 session_settings: resolved_settings,
                 access_mode: config.resolved_spawn_config.access_mode,
                 active_turn: None,
+                queued_sends: VecDeque::new(),
+                closing: false,
             }),
         });
 
@@ -279,6 +316,7 @@ impl AntigravityBackend {
                 input_tx,
                 interrupt_tx,
                 session_id,
+                inner,
             },
             EventStream::new(events_rx),
         ))
@@ -317,11 +355,14 @@ impl AntigravityBackend {
                 session_settings: resolved_settings,
                 access_mode: config.resolved_spawn_config.access_mode,
                 active_turn: None,
+                queued_sends: VecDeque::new(),
+                closing: false,
             }),
         });
 
+        let inner_task = Arc::clone(&inner);
         tokio::spawn(async move {
-            run_antigravity_actor(inner, input_rx, interrupt_rx, None, None).await;
+            run_antigravity_actor(inner_task, input_rx, interrupt_rx, None, None).await;
         });
 
         Ok((
@@ -329,6 +370,7 @@ impl AntigravityBackend {
                 input_tx,
                 interrupt_tx,
                 session_id,
+                inner,
             },
             EventStream::new(events_rx),
         ))
@@ -395,7 +437,8 @@ impl AntigravityInner {
         }
 
         let prepared = match self.prepare_turn(payload.message, session_capture).await {
-            Ok(turn) => turn,
+            Ok(Some(turn)) => turn,
+            Ok(None) => return,
             Err(err) => {
                 self.emit_error(&err);
                 return;
@@ -419,18 +462,41 @@ impl AntigravityInner {
         }
     }
 
+    /// Returns `Ok(None)` when the message was queued behind an active turn;
+    /// `run_prepared_turn` drains the queue once that turn clears.
     async fn prepare_turn(
         &self,
         message: String,
         mut session_capture: Option<SessionCapture>,
-    ) -> Result<PreparedTurn, String> {
+    ) -> Result<Option<PreparedTurn>, String> {
         let mut state = self.state.lock().await;
-        if state.active_turn.is_some() {
-            let err = "Antigravity is still processing the previous turn.".to_string();
+        if state.closing {
+            let err = "Antigravity backend is shutting down; the message was not sent.".to_string();
             fail_session_capture(&mut session_capture, &err);
             return Err(err);
         }
+        if state.active_turn.is_some() {
+            state.queued_sends.push_back(QueuedSend {
+                message,
+                session_capture,
+            });
+            tracing::info!(
+                queued = state.queued_sends.len(),
+                "queued message behind active Antigravity turn"
+            );
+            return Ok(None);
+        }
 
+        Self::prepare_turn_locked(&mut state, message, session_capture).map(Some)
+    }
+
+    /// Build a turn while holding the state lock, reserving `active_turn`
+    /// before the lock is released so no other send can double-start.
+    fn prepare_turn_locked(
+        state: &mut AntigravityState,
+        message: String,
+        mut session_capture: Option<SessionCapture>,
+    ) -> Result<PreparedTurn, String> {
         let model = match selected_model(&state.session_settings) {
             Ok(model) => model,
             Err(err) => {
@@ -529,6 +595,52 @@ impl AntigravityInner {
         }
 
         self.emit_typing_status(false);
+        self.start_next_queued_send().await;
+    }
+
+    /// Dispatch the oldest message that arrived while a turn was active. The
+    /// pop, turn preparation, and `active_turn` reservation happen under one
+    /// state lock, so a racing send can neither reorder the queue nor
+    /// double-start; a queued entry whose preparation fails is surfaced as an
+    /// error and the drain continues with the next entry instead of stranding
+    /// it. The user bubble for a queued message was already emitted when it
+    /// was accepted. Returns an erased boxed future: this sits on the
+    /// run_prepared_turn → start_next_queued_send loop, so an `async fn` here
+    /// would make run_prepared_turn's opaque future type reference itself.
+    fn start_next_queued_send(
+        self: &Arc<Self>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+        let this = Arc::clone(self);
+        Box::pin(async move {
+            // One lock over the whole drain: a failing entry's error is
+            // emitted (sync send) without releasing the lock, so a fresh send
+            // cannot slip in between a failed entry and the next queued one.
+            let launch = {
+                let mut state = this.state.lock().await;
+                loop {
+                    if state.closing || state.active_turn.is_some() {
+                        break None;
+                    }
+                    let Some(queued) = state.queued_sends.pop_front() else {
+                        break None;
+                    };
+                    match Self::prepare_turn_locked(
+                        &mut state,
+                        queued.message,
+                        queued.session_capture,
+                    ) {
+                        Ok(prepared) => break Some(prepared),
+                        Err(err) => this.emit_error(&err),
+                    }
+                }
+            };
+            if let Some(prepared) = launch {
+                let turn = Arc::clone(&this);
+                tokio::spawn(async move {
+                    turn.run_prepared_turn(prepared).await;
+                });
+            }
+        })
     }
 
     async fn run_turn(self: &Arc<Self>, prepared: &mut PreparedTurn) -> TurnOutcome {
@@ -2182,8 +2294,91 @@ mod tests {
                 session_settings: SessionSettingsValues::default(),
                 access_mode: BackendAccessMode::Unrestricted,
                 active_turn: None,
+                queued_sends: VecDeque::new(),
+                closing: false,
             }),
         })
+    }
+
+    #[tokio::test]
+    async fn busy_send_queues_instead_of_dropping() {
+        let inner = test_antigravity_inner("/tmp".to_string());
+        {
+            let mut state = inner.state.lock().await;
+            state.active_turn = Some(ActiveTurn {
+                id: 3,
+                cancel_tx: None,
+            });
+        }
+
+        let prepared = inner
+            .prepare_turn("queued while busy".to_string(), None)
+            .await
+            .expect("busy-time send must not error");
+        assert!(
+            prepared.is_none(),
+            "busy-time send must be queued, not prepared into a turn"
+        );
+
+        let state = inner.state.lock().await;
+        assert_eq!(state.queued_sends.len(), 1);
+        assert_eq!(state.queued_sends[0].message, "queued while busy");
+    }
+
+    #[tokio::test]
+    async fn queue_drain_continues_past_preparation_failures() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let mut bad_settings = SessionSettingsValues::default();
+        bad_settings.0.insert(
+            "model".to_owned(),
+            SessionSettingValue::String("not-a-real-agy-model".to_owned()),
+        );
+        let inner = Arc::new(AntigravityInner {
+            events_tx,
+            state: Mutex::new(AntigravityState {
+                session_id: None,
+                conversations_dir: std::env::temp_dir(),
+                primary_root: "/tmp".to_string(),
+                extra_roots: Vec::new(),
+                startup_mcp_servers: Vec::new(),
+                combined_instructions: None,
+                session_settings: bad_settings,
+                access_mode: BackendAccessMode::Unrestricted,
+                active_turn: None,
+                queued_sends: VecDeque::new(),
+                closing: false,
+            }),
+        });
+        {
+            let mut state = inner.state.lock().await;
+            state.queued_sends.push_back(QueuedSend {
+                message: "first queued".to_owned(),
+                session_capture: None,
+            });
+            state.queued_sends.push_back(QueuedSend {
+                message: "second queued".to_owned(),
+                session_capture: None,
+            });
+        }
+
+        inner.start_next_queued_send().await;
+
+        {
+            let state = inner.state.lock().await;
+            assert!(
+                state.queued_sends.is_empty(),
+                "a failing entry must not strand the rest of the queue"
+            );
+        }
+        let mut errors = 0;
+        while let Ok(event) = events_rx.try_recv() {
+            if let ChatEvent::MessageAdded(message) = &event
+                && matches!(message.sender, MessageSender::Error)
+            {
+                errors += 1;
+            }
+        }
+        assert_eq!(errors, 2, "each failed queued entry must surface an error");
     }
 
     #[test]
@@ -2201,6 +2396,8 @@ mod tests {
                 session_settings: SessionSettingsValues::default(),
                 access_mode: BackendAccessMode::Unrestricted,
                 active_turn: None,
+                queued_sends: VecDeque::new(),
+                closing: false,
             }),
         };
 

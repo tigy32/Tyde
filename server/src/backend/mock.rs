@@ -52,6 +52,10 @@ pub(crate) const MOCK_DUPLICATE_IDLE_SENTINEL: &str = "__mock_duplicate_idle__";
 /// task exits, which drives the agent actor into `enter_terminal_failure`.
 pub(crate) const MOCK_DIE_AFTER_BUSY_SENTINEL: &str = "__mock_die_after_busy__";
 pub(crate) const MOCK_ERROR_WITHOUT_IDLE_SENTINEL: &str = "__mock_error_without_idle__";
+/// Emits a diagnostic Error card in the middle of an otherwise normal
+/// streaming turn (typing stays on and the stream closes properly afterward).
+/// Exercises the agent rule that a mid-turn error must not end the turn.
+pub(crate) const MOCK_MID_TURN_ERROR_SENTINEL: &str = "__mock_mid_turn_error__";
 pub(crate) const MOCK_TOOL_FAILURE_WITHOUT_IDLE_SENTINEL: &str =
     "__mock_tool_failure_without_idle__";
 const MOCK_EXIT_PLAN_MODE_SENTINEL: &str = "__mock_exit_plan_mode__";
@@ -1032,6 +1036,10 @@ async fn emit_turn(
         .is_err()
     {
         return false;
+    }
+
+    if user_message.contains(MOCK_MID_TURN_ERROR_SENTINEL) {
+        emit_mock_error(events_tx, "mock mid-turn diagnostic error");
     }
 
     let delayed_usage = user_message.contains(MOCK_LATE_USAGE_SENTINEL);

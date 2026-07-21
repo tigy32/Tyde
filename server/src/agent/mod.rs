@@ -2246,6 +2246,17 @@ pub(crate) fn spawn_agent_actor(
         let mut backend = Some(backend);
         let mut in_turn = starts_with_initial_turn;
         let mut idle_transition_armed = false;
+        // Last typing value the backend itself emitted. While this is true the
+        // backend has an open turn, so a generic Error card is a mid-turn
+        // diagnostic, not a terminal signal — ending the turn on it desyncs
+        // this actor from the still-streaming backend, and every later event
+        // of that turn is then dropped as a stream identity violation. The
+        // error-ends-turn heuristic below only fires once the backend has gone
+        // quiet (never emitted typing(true), or already emitted typing(false))
+        // without a proper idle marker. Interrupted tool completions are not
+        // gated on this: they are a narrow, deliberately terminal marker even
+        // while typing is on.
+        let mut backend_typing = false;
         let mut pending_tool_response_ids: HashSet<String> = HashSet::new();
         let mut lifecycle = ActorLifecycle::Running;
         let mut close_reply: Option<oneshot::Sender<()>> = None;
@@ -2565,8 +2576,16 @@ pub(crate) fn spawn_agent_actor(
                                 }
                             }
                             if matches!(message.sender, MessageSender::Error) {
-                                let error_ends_turn =
-                                    in_turn && pending_tool_response_ids.is_empty();
+                                let diagnostic_mid_turn = in_turn && backend_typing;
+                                let error_ends_turn = in_turn
+                                    && pending_tool_response_ids.is_empty()
+                                    && !backend_typing;
+                                if diagnostic_mid_turn {
+                                    tracing::info!(
+                                        agent_id = %current_start.agent_id,
+                                        "backend error event during open turn treated as diagnostic"
+                                    );
+                                }
                                 if error_ends_turn {
                                     tracing::warn!(
                                         agent_id = %current_start.agent_id,
@@ -2579,7 +2598,12 @@ pub(crate) fn spawn_agent_actor(
                                 }
                                 let msg = message.content.clone();
                                 status_handle.update(|s| {
-                                    s.turn_completed = true;
+                                    // A mid-turn diagnostic leaves the turn
+                                    // running; reporting it as completed would
+                                    // contradict is_thinking.
+                                    if !diagnostic_mid_turn {
+                                        s.turn_completed = true;
+                                    }
                                     if error_ends_turn {
                                         s.is_thinking = false;
                                     }
@@ -2628,6 +2652,7 @@ pub(crate) fn spawn_agent_actor(
                         }
                         ChatEvent::TypingStatusChanged(typing) => {
                             let typing = *typing;
+                            backend_typing = typing;
                             let mut completed_by_idle = false;
                             if typing {
                                 in_turn = true;
@@ -2704,6 +2729,11 @@ pub(crate) fn spawn_agent_actor(
                                 synthesize_idle_after_error = true;
                                 in_turn = false;
                                 idle_transition_armed = false;
+                                // This terminal marker stands in for the idle
+                                // event the backend never sent; treat the
+                                // backend as no longer typing so a later
+                                // error-without-idle can still end its turn.
+                                backend_typing = false;
                             }
                             status_handle.update(|s| {
                                 if completed_pending_response && pending_tool_response_ids.is_empty() {

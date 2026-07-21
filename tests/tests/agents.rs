@@ -940,6 +940,7 @@ const MOCK_NATIVE_CHILD_SENTINEL: &str = "__mock_spawn_native_child__";
 const MOCK_NATIVE_CHILD_AND_DROP_SENTINEL: &str = "__mock_spawn_native_child_and_drop__";
 const MOCK_LIVE_NATIVE_CHILD_SENTINEL: &str = "__mock_spawn_live_native_child__";
 const MOCK_ERROR_WITHOUT_IDLE_SENTINEL: &str = "__mock_error_without_idle__";
+const MOCK_MID_TURN_ERROR_SENTINEL: &str = "__mock_mid_turn_error__";
 const MOCK_TOOL_FAILURE_WITHOUT_IDLE_SENTINEL: &str = "__mock_tool_failure_without_idle__";
 const MOCK_AGENT_CONTROL_AWAIT_SENTINEL: &str = "__mock_agent_control_await__";
 const MOCK_AGENT_CONTROL_SEND_MESSAGE_SENTINEL: &str = "__mock_agent_control_send_message__";
@@ -3147,6 +3148,114 @@ async fn agent_recovers_after_backend_tool_failure_without_idle() {
         &mut fixture.client,
         &agent_stream,
         "mock backend response to: after backend tool failure",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn agent_mid_turn_error_is_diagnostic_and_keeps_stream_identity() {
+    let mut fixture = Fixture::new().await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("mid-turn-error-agent".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "hello".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn_agent failed");
+
+    let env = expect_next_event(&mut fixture.client, "NewAgent").await;
+    assert_eq!(env.kind, FrameKind::NewAgent);
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse NewAgent");
+    let agent_stream = new_agent.instance_stream.clone();
+
+    let env = expect_next_event(&mut fixture.client, "AgentStart").await;
+    assert_eq!(env.kind, FrameKind::AgentStart);
+    assert_eq!(env.stream, agent_stream);
+
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &agent_stream,
+        "mock backend response to: hello",
+    )
+    .await;
+
+    fixture
+        .client
+        .send_message(&agent_stream, MOCK_MID_TURN_ERROR_SENTINEL.to_owned())
+        .await
+        .expect("send mid-turn error sentinel failed");
+
+    // The turn starts normally.
+    let env = expect_chat_event_on_stream(
+        &mut fixture.client,
+        &agent_stream,
+        "TypingStatusChanged(true)",
+    )
+    .await;
+    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+    assert!(matches!(event, ChatEvent::TypingStatusChanged(true)));
+    let env = expect_chat_event_on_stream(&mut fixture.client, &agent_stream, "StreamStart").await;
+    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+    assert!(matches!(event, ChatEvent::StreamStart(..)));
+    let env = expect_chat_event_on_stream(&mut fixture.client, &agent_stream, "StreamDelta").await;
+    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+    assert!(matches!(event, ChatEvent::StreamDelta(..)));
+
+    // The diagnostic error surfaces mid-turn while the backend keeps typing.
+    expect_error_message_on_stream(
+        &mut fixture.client,
+        &agent_stream,
+        "mock mid-turn diagnostic error",
+    )
+    .await;
+
+    // The turn must still close with its own StreamEnd and then the backend
+    // idle marker. Without the backend-typing gate, the error ended the turn
+    // early: the agent synthesized idle, discarded the open stream, and the
+    // real StreamEnd surfaced as a "Stream identity violation" error card.
+    let env = expect_chat_event_on_stream(&mut fixture.client, &agent_stream, "StreamEnd").await;
+    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+    assert!(
+        matches!(event, ChatEvent::StreamEnd(..)),
+        "mid-turn error must not displace the turn's StreamEnd on {agent_stream}, got {event:?}"
+    );
+    let env = expect_chat_event_on_stream(
+        &mut fixture.client,
+        &agent_stream,
+        "TypingStatusChanged(false)",
+    )
+    .await;
+    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+    assert!(
+        matches!(event, ChatEvent::TypingStatusChanged(false)),
+        "turn must end via the backend idle marker on {agent_stream}, got {event:?}"
+    );
+
+    // Follow-up turns keep working.
+    fixture
+        .client
+        .send_message(&agent_stream, "after mid-turn error".to_owned())
+        .await
+        .expect("send follow-up failed");
+
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &agent_stream,
+        "mock backend response to: after mid-turn error",
     )
     .await;
 }

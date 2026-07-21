@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -280,6 +280,8 @@ impl ClaudeSession {
                 cumulative_usage_complete: true,
                 conversation_bytes_total: 0,
                 active_turn: None,
+                queued_turns: VecDeque::new(),
+                closing: false,
                 restart_process_after_turn: false,
                 subagent_emitter: None,
                 capacity_access: ClaudeCapacityAccess::Unknown,
@@ -318,6 +320,11 @@ struct ActiveTurn {
     pending_ask_user_question: Option<PendingAskUserQuestionControl>,
     pending_exit_plan_mode: Option<PendingExitPlanModeControl>,
     quiesced_waiters: Vec<oneshot::Sender<()>>,
+}
+
+struct QueuedTurnMessage {
+    message: String,
+    images: Vec<ImageAttachment>,
 }
 
 #[derive(Clone)]
@@ -407,6 +414,18 @@ struct ClaudeState {
     cumulative_usage_complete: bool,
     conversation_bytes_total: u64,
     active_turn: Option<ActiveTurn>,
+    /// Messages accepted while a turn was already active. The agent actor
+    /// normally queues busy-time sends itself, so entries land here only in
+    /// the narrow race where the actor observed idle before this backend
+    /// cleared its turn. `finalize_turn` drains the front entry into a fresh
+    /// turn as soon as the active turn clears; entries that cannot run
+    /// (shutdown, session resume) are surfaced as an error/warning card, never
+    /// silently dropped.
+    queued_turns: VecDeque<QueuedTurnMessage>,
+    /// Set by `shutdown`. Blocks new sends and queue drains so a queued
+    /// message cannot start a turn (or respawn the CLI process) after the
+    /// backend has been told to close.
+    closing: bool,
     restart_process_after_turn: bool,
     subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
     capacity_access: ClaudeCapacityAccess,
@@ -444,6 +463,8 @@ impl Default for ClaudeState {
             cumulative_usage_complete: true,
             conversation_bytes_total: 0,
             active_turn: None,
+            queued_turns: VecDeque::new(),
+            closing: false,
             restart_process_after_turn: false,
             subagent_emitter: None,
             capacity_access: ClaudeCapacityAccess::Unknown,
@@ -1115,81 +1136,25 @@ impl ClaudeInner {
 
     async fn start_turn(self: Arc<Self>, message: String, images: Option<Vec<ImageAttachment>>) {
         let images = images.unwrap_or_default();
-        let input_bytes = estimate_turn_input_bytes(&message, &images);
-        let (turn_id, conversation_history_bytes, model_hint, ephemeral, outcome_rx) = {
+        {
             let mut state = self.state.lock().await;
-            if state.active_turn.is_some() {
-                self.emit_error("Claude is still processing the previous turn.");
+            if state.closing {
+                drop(state);
+                self.emit_error("Claude backend is shutting down; the message was not sent.");
                 return;
             }
-
-            let turn_id = CLAUDE_TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let (outcome_tx, outcome_rx) = oneshot::channel();
-            state.active_turn = Some(ActiveTurn {
-                id: turn_id,
-                outcome_tx: Some(outcome_tx),
-                interrupt_requested: false,
-                pending_ask_user_question: None,
-                pending_exit_plan_mode: None,
-                quiesced_waiters: Vec::new(),
-            });
-            state.conversation_bytes_total =
-                state.conversation_bytes_total.saturating_add(input_bytes);
-
-            (
-                turn_id,
-                state.conversation_bytes_total,
-                state.model.clone(),
-                state.ephemeral,
-                outcome_rx,
-            )
-        };
-
-        let message_id = format!("claude-msg-{turn_id}");
-        self.emit_typing_status(true);
-        self.emit_stream_start(&message_id, model_hint.clone());
-
-        tokio::spawn(async move {
-            match self
-                .write_turn_to_persistent_process(turn_id, &message, &images)
-                .await
-            {
-                Ok(()) => {}
-                Err(TurnStartError::Cancelled) => {
-                    self.complete_active_turn_with_outcome(
-                        turn_id,
-                        TurnOutcome::Cancelled {
-                            summary: ClaudeStdoutSummary::default(),
-                        },
-                    )
-                    .await;
-                }
-                Err(TurnStartError::Failed(error)) => {
-                    self.complete_active_turn_with_outcome(
-                        turn_id,
-                        TurnOutcome::Failed {
-                            summary: ClaudeStdoutSummary::default(),
-                            error,
-                        },
-                    )
-                    .await;
-                }
+            state
+                .queued_turns
+                .push_back(QueuedTurnMessage { message, images });
+            if state.active_turn.is_some() {
+                tracing::info!(
+                    queued = state.queued_turns.len(),
+                    "queued message behind active Claude turn"
+                );
+                return;
             }
-
-            let outcome = outcome_rx.await.unwrap_or_else(|_| TurnOutcome::Failed {
-                summary: ClaudeStdoutSummary::default(),
-                error: "Claude turn ended before returning a result".to_string(),
-            });
-
-            self.finalize_turn(
-                turn_id,
-                outcome,
-                ephemeral,
-                conversation_history_bytes,
-                model_hint,
-            )
-            .await;
-        });
+        }
+        self.start_next_queued_turn().await;
     }
 
     #[cfg(test)]
@@ -1355,6 +1320,7 @@ impl ClaudeInner {
                 if self.take_restart_process_after_turn().await {
                     self.shutdown_process().await;
                 }
+                self.start_next_queued_turn().await;
                 return;
             }
             TurnOutcome::Failed { summary, error } => {
@@ -1383,6 +1349,113 @@ impl ClaudeInner {
         if self.take_restart_process_after_turn().await {
             self.shutdown_process().await;
         }
+        self.start_next_queued_turn().await;
+    }
+
+    /// Claim the turn slot and dispatch the oldest queued message in one
+    /// atomic step: the pop, the `ActiveTurn` reservation, and the closing
+    /// check all happen under a single state lock, so racing sends can
+    /// neither reorder the queue among themselves nor double-start. A
+    /// CLI-initiated turn that wins the slot first delays queued entries by
+    /// one turn (its finalize drains them) rather than dropping them. The
+    /// user bubble for a queued message was already emitted when it was
+    /// accepted. Returns an erased boxed future: this sits on the
+    /// start_turn/finalize_turn → start_next_queued_turn loop, so an
+    /// `async fn` here would make those opaque future types reference
+    /// themselves.
+    fn start_next_queued_turn(
+        self: &Arc<Self>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+        let this = Arc::clone(self);
+        Box::pin(async move {
+            let launch = {
+                let mut state = this.state.lock().await;
+                if state.closing || state.active_turn.is_some() {
+                    None
+                } else if let Some(queued) = state.queued_turns.pop_front() {
+                    let input_bytes = estimate_turn_input_bytes(&queued.message, &queued.images);
+                    let turn_id = CLAUDE_TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
+                    let (outcome_tx, outcome_rx) = oneshot::channel();
+                    state.active_turn = Some(ActiveTurn {
+                        id: turn_id,
+                        outcome_tx: Some(outcome_tx),
+                        interrupt_requested: false,
+                        pending_ask_user_question: None,
+                        pending_exit_plan_mode: None,
+                        quiesced_waiters: Vec::new(),
+                    });
+                    state.conversation_bytes_total =
+                        state.conversation_bytes_total.saturating_add(input_bytes);
+                    Some((
+                        turn_id,
+                        state.conversation_bytes_total,
+                        state.model.clone(),
+                        state.ephemeral,
+                        outcome_rx,
+                        queued,
+                    ))
+                } else {
+                    None
+                }
+            };
+            let Some((
+                turn_id,
+                conversation_history_bytes,
+                model_hint,
+                ephemeral,
+                outcome_rx,
+                queued,
+            )) = launch
+            else {
+                return;
+            };
+
+            let message_id = format!("claude-msg-{turn_id}");
+            this.emit_typing_status(true);
+            this.emit_stream_start(&message_id, model_hint.clone());
+
+            tokio::spawn(async move {
+                match this
+                    .write_turn_to_persistent_process(turn_id, &queued.message, &queued.images)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(TurnStartError::Cancelled) => {
+                        this.complete_active_turn_with_outcome(
+                            turn_id,
+                            TurnOutcome::Cancelled {
+                                summary: ClaudeStdoutSummary::default(),
+                            },
+                        )
+                        .await;
+                    }
+                    Err(TurnStartError::Failed(error)) => {
+                        this.complete_active_turn_with_outcome(
+                            turn_id,
+                            TurnOutcome::Failed {
+                                summary: ClaudeStdoutSummary::default(),
+                                error,
+                            },
+                        )
+                        .await;
+                    }
+                }
+
+                let outcome = outcome_rx.await.unwrap_or_else(|_| TurnOutcome::Failed {
+                    summary: ClaudeStdoutSummary::default(),
+                    error: "Claude turn ended before returning a result".to_string(),
+                });
+
+                this.finalize_turn(
+                    turn_id,
+                    outcome,
+                    ephemeral,
+                    conversation_history_bytes,
+                    model_hint,
+                )
+                .await;
+            });
+        })
     }
 
     /// Open a turn for output the Claude CLI produced on its own initiative,
@@ -1395,7 +1468,7 @@ impl ClaudeInner {
     async fn begin_cli_initiated_turn(self: &Arc<Self>) -> Option<u64> {
         let (turn_id, ephemeral, conversation_history_bytes, model_hint, outcome_rx) = {
             let mut state = self.state.lock().await;
-            if state.active_turn.is_some() {
+            if state.closing || state.active_turn.is_some() {
                 return None;
             }
             let turn_id = CLAUDE_TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1804,6 +1877,11 @@ impl ClaudeInner {
 
         let config = {
             let state = self.state.lock().await;
+            // A turn reserved just before shutdown must not respawn the CLI
+            // process after `shutdown_process` has killed it.
+            if state.closing {
+                return Err("Claude backend is shutting down".to_string());
+            }
             ClaudeProcessSpawnConfig {
                 workspace_root: state.workspace_root.clone(),
                 ssh_host: state.ssh_host.clone(),
@@ -2293,7 +2371,7 @@ impl ClaudeInner {
     async fn resume_session(&self, session_id: String) -> Result<(), String> {
         let normalized = normalize_nonempty(&session_id).ok_or("Invalid session id")?;
         self.shutdown_process().await;
-        let (workspace_root, ssh_host) = {
+        let (workspace_root, ssh_host, dropped_queued) = {
             let mut state = self.state.lock().await;
             state.session_id = Some(normalized.clone());
             state.fork_from_session_id = None;
@@ -2301,8 +2379,19 @@ impl ClaudeInner {
             state.cumulative_usage = None;
             state.cumulative_usage_complete = true;
             state.conversation_bytes_total = 0;
-            (state.workspace_root.clone(), state.ssh_host.clone())
+            let dropped_queued = std::mem::take(&mut state.queued_turns);
+            (
+                state.workspace_root.clone(),
+                state.ssh_host.clone(),
+                dropped_queued,
+            )
         };
+        if !dropped_queued.is_empty() {
+            self.emitter.warning_message(&format!(
+                "Resuming a different Claude session; {} queued message(s) for the previous conversation were discarded.",
+                dropped_queued.len()
+            ));
+        }
 
         self.emitter.session_started(&normalized);
         self.emitter.conversation_cleared();
@@ -2378,8 +2467,9 @@ impl ClaudeInner {
     async fn delete_session(&self, session_id: String) -> Result<(), String> {
         let normalized = normalize_nonempty(&session_id).ok_or("Invalid session id")?;
         self.shutdown_process().await;
-        let (workspace_root, ssh_host) = {
+        let (workspace_root, ssh_host, dropped_queued) = {
             let mut state = self.state.lock().await;
+            let mut dropped_queued = VecDeque::new();
             if state.session_id.as_deref() == Some(normalized.as_str()) {
                 state.session_id = None;
                 state.fork_from_session_id = None;
@@ -2387,9 +2477,20 @@ impl ClaudeInner {
                 state.cumulative_usage = None;
                 state.cumulative_usage_complete = true;
                 state.conversation_bytes_total = 0;
+                dropped_queued = std::mem::take(&mut state.queued_turns);
             }
-            (state.workspace_root.clone(), state.ssh_host.clone())
+            (
+                state.workspace_root.clone(),
+                state.ssh_host.clone(),
+                dropped_queued,
+            )
         };
+        if !dropped_queued.is_empty() {
+            self.emitter.warning_message(&format!(
+                "Deleted the active Claude session; {} queued message(s) for it were discarded.",
+                dropped_queued.len()
+            ));
+        }
 
         if let Some(host) = &ssh_host {
             delete_claude_session_remote(host, &workspace_root, &normalized).await?;
@@ -2454,6 +2555,17 @@ impl ClaudeInner {
     }
 
     async fn shutdown(&self) {
+        let dropped_queued = {
+            let mut state = self.state.lock().await;
+            state.closing = true;
+            std::mem::take(&mut state.queued_turns)
+        };
+        if !dropped_queued.is_empty() {
+            self.emit_error(&format!(
+                "Claude backend is shutting down; {} queued message(s) were not sent.",
+                dropped_queued.len()
+            ));
+        }
         self.cancel_active_turn().await;
         self.shutdown_process().await;
     }
@@ -9744,6 +9856,8 @@ mod tests {
                 cumulative_usage_complete: true,
                 conversation_bytes_total: 0,
                 active_turn: None,
+                queued_turns: VecDeque::new(),
+                closing: false,
                 restart_process_after_turn: false,
                 subagent_emitter: None,
                 capacity_access: ClaudeCapacityAccess::Unknown,
@@ -12933,6 +13047,266 @@ for raw_line in sys.stdin:
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn fake_claude_busy_send_queues_and_dispatches_after_turn_ends() {
+        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let fake = workspace.path().join("fake-claude-busy-queue.py");
+        let log = workspace.path().join("fake-claude-busy-queue.log");
+        std::fs::write(
+            &fake,
+            r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+session_id = "fake-busy-queue-session"
+if "--session-id" in args:
+    session_id = args[args.index("--session-id") + 1]
+elif "--resume" in args:
+    session_id = args[args.index("--resume") + 1]
+log_path = os.environ["TYDE_FAKE_CLAUDE_LOG"]
+
+def log(message):
+    with open(log_path, "a", encoding="utf-8") as handle:
+        handle.write(message + "\n")
+
+def emit(value):
+    print(json.dumps(value), flush=True)
+
+log("START " + " ".join(args))
+turn = 0
+for raw_line in sys.stdin:
+    line = raw_line.strip()
+    if not line:
+        continue
+    log("IN " + line)
+    value = json.loads(line)
+    if value.get("type") == "control_request":
+        request = value.get("request", {})
+        request_id = value.get("request_id") or request.get("request_id")
+        subtype = request.get("subtype")
+        emit({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": request_id,
+                "response": {} if subtype == "initialize" else None,
+            },
+        })
+        if subtype == "interrupt":
+            emit({
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "result": None,
+                "session_id": session_id,
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            })
+        continue
+
+    if value.get("type") != "user":
+        continue
+    turn += 1
+    if turn == 1:
+        emit({
+            "type": "system",
+            "subtype": "init",
+            "session_id": session_id,
+            "model": "fake-model",
+        })
+        emit({
+            "type": "stream_event",
+            "session_id": session_id,
+            "event": {
+                "type": "message_start",
+                "message": {"id": "fake-msg-1", "model": "fake-model", "usage": {"input_tokens": 1}},
+            },
+        })
+        emit({
+            "type": "stream_event",
+            "session_id": session_id,
+            "event": {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": "working"},
+            },
+        })
+        continue
+
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {
+            "type": "message_start",
+            "message": {"id": "fake-msg-2", "model": "fake-model", "usage": {"input_tokens": 2}},
+        },
+    })
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "queued follow-up ok"},
+        },
+    })
+    emit({"type": "stream_event", "session_id": session_id, "event": {"type": "content_block_stop", "index": 0}})
+    emit({"type": "stream_event", "session_id": session_id, "event": {"type": "message_stop"}})
+    emit({
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "queued follow-up ok",
+        "session_id": session_id,
+        "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+    })
+"#,
+        )
+        .expect("write fake Claude busy-queue script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&fake)
+                .expect("stat fake Claude busy-queue script")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&fake, permissions)
+                .expect("chmod fake Claude busy-queue script");
+        }
+
+        // SAFETY: this test holds FAKE_CLAUDE_ENV_LOCK for the entire period
+        // where the process-global environment points at the fake binary.
+        unsafe {
+            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
+            std::env::set_var("TYDE_FAKE_CLAUDE_LOG", &log);
+        }
+
+        let (session, mut rx) = ClaudeSession::spawn(
+            &[workspace.path().to_string_lossy().to_string()],
+            None,
+            &[],
+            None,
+            None,
+            ToolPolicy::Unrestricted,
+            BackendAccessMode::Unrestricted,
+        )
+        .await
+        .expect("spawn fake Claude session");
+        session
+            .inner
+            .ensure_process_ready()
+            .await
+            .expect("initialize persistent fake Claude process");
+        let handle = session.command_handle();
+        handle
+            .execute(SessionCommand::SendMessage {
+                message: "first turn".to_string(),
+                images: None,
+            })
+            .await
+            .expect("send first fake turn");
+
+        let first_delta = recv_until_kind(&mut rx, "StreamDelta").await;
+        assert_eq!(
+            first_delta
+                .get("data")
+                .and_then(|data| data.get("text"))
+                .and_then(Value::as_str),
+            Some("working")
+        );
+
+        // Send twice while the first turn is mid-stream: both messages must be
+        // accepted and queued in order, not rejected with "still processing".
+        handle
+            .execute(SessionCommand::SendMessage {
+                message: "queued follow up one".to_string(),
+                images: None,
+            })
+            .await
+            .expect("send first busy-time message");
+        handle
+            .execute(SessionCommand::SendMessage {
+                message: "queued follow up two".to_string(),
+                images: None,
+            })
+            .await
+            .expect("send second busy-time message");
+        {
+            let state = session.inner.state.lock().await;
+            assert_eq!(
+                state.queued_turns.len(),
+                2,
+                "busy-time sends must be queued behind the active turn"
+            );
+            assert_eq!(state.queued_turns[0].message, "queued follow up one");
+            assert_eq!(state.queued_turns[1].message, "queued follow up two");
+        }
+
+        // End the first turn; the queued messages must then run as their own
+        // turns, in order, and no Error event may appear in the sequence.
+        timeout(
+            Duration::from_secs(2),
+            handle.execute(SessionCommand::CancelConversation),
+        )
+        .await
+        .expect("fake interrupt should quiesce")
+        .expect("fake interrupt command should succeed");
+
+        let mut queued_stream_ends = 0;
+        timeout(Duration::from_secs(10), async {
+            while queued_stream_ends < 2 {
+                let event = rx.recv().await.expect("backend event");
+                match event_kind(&event) {
+                    Some("Error") => {
+                        panic!("queued busy-time sends must not produce an Error event: {event}");
+                    }
+                    Some("StreamEnd")
+                        if event
+                            .get("data")
+                            .and_then(|data| data.get("message"))
+                            .and_then(|message| message.get("content"))
+                            .and_then(Value::as_str)
+                            .is_some_and(|content| content.contains("queued follow-up ok")) =>
+                    {
+                        queued_stream_ends += 1;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("queued messages should dispatch as turns after the active turn ends");
+        {
+            let state = session.inner.state.lock().await;
+            assert!(
+                state.queued_turns.is_empty(),
+                "queue must drain once the queued turns dispatch"
+            );
+        }
+
+        session.shutdown().await;
+        // SAFETY: guarded by FAKE_CLAUDE_ENV_LOCK; restore the process-global
+        // environment before allowing other tests to run through this section.
+        unsafe {
+            std::env::remove_var(TYDE_CLAUDE_BIN_ENV);
+            std::env::remove_var("TYDE_FAKE_CLAUDE_LOG");
+        }
+
+        let log_contents = std::fs::read_to_string(&log).expect("read fake Claude busy-queue log");
+        let first_index = log_contents
+            .find("queued follow up one")
+            .expect("first queued message must reach the Claude CLI");
+        let second_index = log_contents
+            .find("queued follow up two")
+            .expect("second queued message must reach the Claude CLI");
+        assert!(
+            first_index < second_index,
+            "queued messages must dispatch in FIFO order: {log_contents}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn fake_claude_exit_while_ask_user_question_pending_fails_tool() {
         let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
         let workspace = tempfile::tempdir().expect("workspace tempdir");
@@ -15806,6 +16180,8 @@ for raw_line in sys.stdin:
                     cumulative_usage_complete: true,
                     conversation_bytes_total: 0,
                     active_turn: None,
+                    queued_turns: VecDeque::new(),
+                    closing: false,
                     restart_process_after_turn: false,
                     subagent_emitter: None,
                     capacity_access: ClaudeCapacityAccess::Unknown,
