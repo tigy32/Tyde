@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocol::{
     BackendKind, CustomAgentId, LaunchProfileId, ProjectId, SessionId, SessionListScope,
-    SessionSettingsValues, SessionSummary,
+    SessionSettingsValues, SessionSummary, TaskList,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -60,6 +60,11 @@ struct StoreFile {
     records: HashMap<String, SessionRecord>,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct TaskStateFile {
+    records: HashMap<String, TaskList>,
+}
+
 #[derive(Debug)]
 pub struct SessionStore {
     path: PathBuf,
@@ -101,6 +106,37 @@ impl SessionStore {
         Self::read_from_disk(&self.path)
             .ok()
             .and_then(|records| records.get(&id.0).cloned())
+    }
+
+    pub fn get_task_list(&self, id: &SessionId) -> Option<TaskList> {
+        self.read_task_state()
+            .ok()
+            .and_then(|state| state.records.get(&id.0).cloned())
+    }
+
+    pub fn set_task_list(&self, id: &SessionId, task_list: TaskList) -> Result<(), String> {
+        let mut state = self.read_task_state()?;
+        state.records.insert(id.0.clone(), task_list);
+        let value = serde_json::to_value(state)
+            .map_err(|err| format!("Failed to serialize task state: {err}"))?;
+        write_json_value_atomically(&self.task_state_path(), &value)
+    }
+
+    fn task_state_path(&self) -> PathBuf {
+        self.path.with_extension("task-lists.json")
+    }
+
+    fn read_task_state(&self) -> Result<TaskStateFile, String> {
+        let path = self.task_state_path();
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => serde_json::from_str(&contents)
+                .map_err(|err| format!("Failed to parse task state {}: {err}", path.display())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(TaskStateFile::default()),
+            Err(err) => Err(format!(
+                "Failed to read task state {}: {err}",
+                path.display()
+            )),
+        }
     }
 
     pub fn upsert_backend_session(
@@ -834,6 +870,39 @@ mod tests {
             !session_record_is_resumable_with(&backend_native, |_| true),
             "backend-native Antigravity child records must stay non-resumable even when a native db exists"
         );
+    }
+
+    #[test]
+    fn session_store_round_trips_task_list() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sessions.json");
+        let id = SessionId("task-session".to_string());
+        let record = test_record(BackendKind::Codex, id.clone(), true);
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&StoreFile {
+                records: HashMap::from([(id.0.clone(), record)]),
+            })
+            .expect("serialize store"),
+        )
+        .expect("write store");
+        let store = SessionStore::load(path).expect("load store");
+        store
+            .set_task_list(
+                &id,
+                TaskList {
+                    title: String::new(),
+                    tasks: vec![protocol::Task {
+                        id: 1,
+                        description: "Alpha check".to_string(),
+                        status: protocol::TaskStatus::Completed,
+                    }],
+                },
+            )
+            .expect("persist task list");
+
+        let task_list = store.get_task_list(&id).expect("stored task list");
+        assert_eq!(task_list.tasks[0].description, "Alpha check");
     }
 
     fn test_record(backend_kind: BackendKind, id: SessionId, resumable: bool) -> SessionRecord {

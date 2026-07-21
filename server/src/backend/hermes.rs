@@ -300,6 +300,8 @@ struct HermesEventMapper {
     approval_counter: u64,
     normalization_failures: HashMap<String, PendingToolNormalizationFailure>,
     delegation_tools: VecDeque<HermesDelegationTool>,
+    task_ids: HashMap<String, u64>,
+    next_task_id: u64,
 }
 
 #[derive(Clone)]
@@ -2393,6 +2395,18 @@ impl HermesEventMapper {
             },
         )];
         if success
+            && is_hermes_todo_tool(&tool_name)
+            && let Some(tasks) =
+                hermes_task_list_from_value(&result, &mut self.task_ids, &mut self.next_task_id)
+        {
+            tracing::info!(
+                tool_call_id = %completion_tool_call_id,
+                task_count = tasks.tasks.len(),
+                "mapped Hermes todo result to typed task state"
+            );
+            events.push(ChatEvent::TaskUpdate(tasks));
+        }
+        if success
             && let Some(progress) =
                 spawn_progress_data_for_tool_result(&completion_tool_call_id, &tool_name, &result)
         {
@@ -2573,6 +2587,59 @@ fn is_hermes_delegate_tool(tool_name: &str) -> bool {
         .map(|ch| ch.to_ascii_lowercase())
         .collect::<String>()
         .ends_with("delegatetask")
+}
+
+fn is_hermes_todo_tool(tool_name: &str) -> bool {
+    tool_name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect::<String>()
+        == "todo"
+}
+
+fn hermes_task_list_from_value(
+    value: &Value,
+    task_ids: &mut HashMap<String, u64>,
+    next_task_id: &mut u64,
+) -> Option<protocol::TaskList> {
+    let todos = value.get("todos")?.as_array()?;
+    let mut tasks = Vec::with_capacity(todos.len());
+    for todo in todos {
+        let provider_id = todo.get("id")?.as_str()?.trim();
+        let description = todo.get("content")?.as_str()?.trim();
+        let status = todo.get("status")?.as_str().and_then(hermes_task_status)?;
+        if provider_id.is_empty() || description.is_empty() {
+            return None;
+        }
+        let id = if let Some(id) = task_ids.get(provider_id).copied() {
+            id
+        } else {
+            let id = *next_task_id;
+            *next_task_id = next_task_id.saturating_add(1);
+            task_ids.insert(provider_id.to_string(), id);
+            id
+        };
+        tasks.push(protocol::Task {
+            id,
+            description: description.to_string(),
+            status,
+        });
+    }
+    Some(protocol::TaskList {
+        title: String::new(),
+        tasks,
+    })
+}
+
+fn hermes_task_status(value: &str) -> Option<protocol::TaskStatus> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "pending" => Some(protocol::TaskStatus::Pending),
+        "in_progress" | "inprogress" | "active" => Some(protocol::TaskStatus::InProgress),
+        "completed" | "complete" | "done" => Some(protocol::TaskStatus::Completed),
+        "failed" | "cancelled" | "canceled" => Some(protocol::TaskStatus::Failed),
+        _ => None,
+    }
 }
 
 fn hermes_delegation_goals(arguments: &Value) -> Vec<String> {
@@ -3067,38 +3134,137 @@ fn hermes_history_to_chat_events(value: &Value) -> Result<Vec<ChatEvent>, String
         .and_then(Value::as_array)
         .ok_or_else(|| "Hermes session.history response missing messages array".to_string())?;
     let mut events = Vec::new();
+    let mut task_ids = HashMap::new();
+    let mut next_task_id = 0;
     for message in messages {
         let role = required_string(message, &["role"], "session.history message")?;
-        let text = optional_string(message, &["text"])
-            .or_else(|| optional_string(message, &["content"]))
-            .ok_or_else(|| "Hermes session.history message missing text".to_string())?;
+        let text = message
+            .get("text")
+            .or_else(|| message.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let tool_calls = hermes_history_tool_calls(message)?;
         let sender = match role.as_str() {
             "user" => MessageSender::User,
             "assistant" => MessageSender::Assistant {
                 agent: HERMES_AGENT_NAME.to_string(),
             },
             "system" => MessageSender::System,
-            "tool" => MessageSender::System,
+            "tool" => {
+                let Some(tool_call_id) = optional_string_any(message, &["tool_call_id", "tool_id"])
+                else {
+                    let tool_name = optional_string_any(message, &["tool_name", "name"])
+                        .unwrap_or_else(|| "tool".to_string());
+                    let context = optional_string_any(message, &["context"]);
+                    let content = context
+                        .filter(|context| !context.trim().is_empty())
+                        .map(|context| format!("Hermes tool {tool_name}: {context}"))
+                        .unwrap_or_else(|| format!("Hermes tool: {tool_name}"));
+                    events.push(ChatEvent::MessageAdded(system_message(content)));
+                    continue;
+                };
+                let tool_name = optional_string_any(message, &["tool_name", "name"])
+                    .unwrap_or_else(|| "tool".to_string());
+                let result =
+                    serde_json::from_str(&text).unwrap_or_else(|_| Value::String(text.clone()));
+                events.push(ChatEvent::ToolExecutionCompleted(
+                    ToolExecutionCompletedData {
+                        tool_call_id,
+                        tool_name: tool_name.clone(),
+                        tool_result: ToolExecutionResult::Other {
+                            result: result.clone(),
+                        },
+                        success: true,
+                        error: None,
+                        normalization_failure: None,
+                    },
+                ));
+                if is_hermes_todo_tool(&tool_name)
+                    && let Some(tasks) =
+                        hermes_task_list_from_value(&result, &mut task_ids, &mut next_task_id)
+                {
+                    events.push(ChatEvent::TaskUpdate(tasks));
+                }
+                continue;
+            }
             other => {
                 return Err(format!(
                     "Hermes session.history message has unsupported role '{other}'"
                 ));
             }
         };
+        if text.trim().is_empty() && tool_calls.is_empty() {
+            continue;
+        }
         events.push(ChatEvent::MessageAdded(ChatMessage {
             message_id: None,
             timestamp: unix_now_ms(),
             sender,
             content: text,
             reasoning: None,
-            tool_calls: Vec::new(),
+            tool_calls: tool_calls.clone(),
             model_info: None,
             token_usage: None,
             context_breakdown: None,
             images: None,
         }));
+        for tool_call in tool_calls {
+            events.push(ChatEvent::ToolRequest(ToolRequest {
+                tool_call_id: tool_call.id,
+                tool_name: tool_call.name,
+                tool_type: ToolRequestType::Other {
+                    args: tool_call.arguments,
+                },
+            }));
+        }
     }
     Ok(events)
+}
+
+fn hermes_history_tool_calls(message: &Value) -> Result<Vec<ToolUseData>, String> {
+    let Some(raw) = message.get("tool_calls").filter(|value| !value.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let parsed = if let Some(text) = raw.as_str() {
+        serde_json::from_str::<Value>(text)
+            .map_err(|err| format!("Hermes session.history tool_calls is invalid JSON: {err}"))?
+    } else {
+        raw.clone()
+    };
+    let calls = parsed
+        .as_array()
+        .ok_or_else(|| "Hermes session.history tool_calls must be an array".to_string())?;
+    calls
+        .iter()
+        .map(|call| {
+            let id = required_string_any(
+                call,
+                &["id", "call_id", "tool_call_id"],
+                "session.history tool call",
+            )?;
+            let function = call.get("function").unwrap_or(call);
+            let name = required_string_any(
+                function,
+                &["name", "tool_name"],
+                "session.history tool call",
+            )?;
+            let arguments = match function.get("arguments") {
+                Some(Value::String(arguments)) => {
+                    serde_json::from_str(arguments).map_err(|err| {
+                        format!("Hermes session.history tool arguments is invalid JSON: {err}")
+                    })?
+                }
+                Some(arguments) => arguments.clone(),
+                None => Value::Null,
+            };
+            Ok(ToolUseData {
+                id,
+                name,
+                arguments,
+            })
+        })
+        .collect()
 }
 
 async fn resolve_gateway_spawn_target(
@@ -5967,5 +6133,81 @@ for line in sys.stdin:
             "bad prompt status should clear typing after the error; observed: {observed:#?}"
         );
         backend.shutdown().await;
+    }
+
+    #[test]
+    fn todo_results_build_stable_typed_task_lists() {
+        use protocol::TaskStatus;
+
+        let mut ids = HashMap::new();
+        let mut next_id = 0;
+        let first = hermes_task_list_from_value(
+            &json!({"todos": [
+                {"id": "alpha", "content": "Alpha check", "status": "in_progress"},
+                {"id": "beta", "content": "Beta check", "status": "pending"}
+            ]}),
+            &mut ids,
+            &mut next_id,
+        )
+        .expect("first task list");
+        let second = hermes_task_list_from_value(
+            &json!({"todos": [
+                {"id": "alpha", "content": "Alpha check", "status": "completed"},
+                {"id": "beta", "content": "Beta check", "status": "in_progress"}
+            ]}),
+            &mut ids,
+            &mut next_id,
+        )
+        .expect("second task list");
+
+        assert_eq!(first.tasks[0].id, second.tasks[0].id);
+        assert_eq!(first.tasks[1].id, second.tasks[1].id);
+        assert!(matches!(second.tasks[0].status, TaskStatus::Completed));
+        assert!(matches!(second.tasks[1].status, TaskStatus::InProgress));
+    }
+
+    #[test]
+    fn history_replays_tool_only_messages_and_todo_state() {
+        let events = hermes_history_to_chat_events(&json!({"messages": [
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-1",
+                    "function": {
+                        "name": "todo",
+                        "arguments": "{\"todos\":[{\"id\":\"alpha\",\"content\":\"Alpha check\",\"status\":\"in_progress\"}]}"
+                    }
+                }]
+            },
+            {
+                "role": "tool",
+                "content": "{\"todos\":[{\"id\":\"alpha\",\"content\":\"Alpha check\",\"status\":\"completed\"}]}",
+                "tool_call_id": "call-1",
+                "tool_name": "todo"
+            },
+            {
+                "role": "tool",
+                "name": "todo",
+                "context": "Update task list"
+            }
+        ]}))
+        .expect("history mapping");
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::ToolRequest(_)))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::ToolExecutionCompleted(_)))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ChatEvent::TaskUpdate(tasks)
+                if matches!(tasks.tasks[0].status, protocol::TaskStatus::Completed)
+        )));
     }
 }

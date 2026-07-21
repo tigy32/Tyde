@@ -1,6 +1,8 @@
 use leptos::prelude::*;
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 use wasm_bindgen::JsCast;
 
 use crate::components::tool_card::StreamingToolCardListView;
@@ -131,12 +133,15 @@ fn throttled_string_signal(
     };
     let throttled: ArcRwSignal<String> = ArcRwSignal::new(initial);
     let render_pending = Rc::new(Cell::new(false));
+    let timer_id = Arc::new(AtomicI32::new(-1));
     let timer_cb = {
         let pending = render_pending.clone();
+        let timer_id = timer_id.clone();
         let dest = throttled.clone();
         let src = source.clone();
         Rc::new(wasm_bindgen::closure::Closure::<dyn FnMut()>::new(
             move || {
+                timer_id.store(-1, Ordering::Relaxed);
                 pending.set(false);
                 dest.set(src.with_untracked(|text| transform(text)));
             },
@@ -145,6 +150,7 @@ fn throttled_string_signal(
 
     let source_for_effect = source.clone();
     let timer_cb_for_effect = timer_cb.clone();
+    let timer_id_for_effect = timer_id.clone();
     Effect::new(move |_| {
         if let Some(enabled) = enabled.as_ref()
             && !enabled.get()
@@ -157,10 +163,22 @@ fn throttled_string_signal(
         }
         render_pending.set(true);
         if let Some(window) = web_sys::window() {
-            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+            match window.set_timeout_with_callback_and_timeout_and_arguments_0(
                 timer_cb_for_effect.as_ref().as_ref().unchecked_ref(),
                 STREAMING_RENDER_INTERVAL_MS,
-            );
+            ) {
+                Ok(id) => timer_id_for_effect.store(id, Ordering::Relaxed),
+                Err(_) => render_pending.set(false),
+            }
+        }
+    });
+
+    on_cleanup(move || {
+        let id = timer_id.swap(-1, Ordering::Relaxed);
+        if id >= 0
+            && let Some(window) = web_sys::window()
+        {
+            window.clear_timeout_with_handle(id);
         }
     });
 
@@ -272,5 +290,34 @@ mod wasm_tests {
                 .contains("inspect the eventual assistant item"),
             "same preview updates without replacing its disclosure"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn unmount_cancels_pending_stream_render_callback() {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document.create_element("div").unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        let container = container.dyn_into::<web_sys::HtmlElement>().unwrap();
+        let text = ArcRwSignal::new(String::new());
+        let text_for_mount = text.clone();
+        let handle = mount_to(container.clone(), move || {
+            view! {
+                <ChatStreamingView
+                    agent_ref=Signal::derive(|| None)
+                    streaming=StreamingState {
+                        agent_name: "codex".to_owned(),
+                        model: Some("gpt-test".to_owned()),
+                        text: text_for_mount.clone(),
+                        reasoning: ArcRwSignal::new(String::new()),
+                        tool_requests: ArcRwSignal::new(Vec::new()),
+                    }
+                />
+            }
+        });
+
+        text.set("schedule a throttled render".to_owned());
+        drop(handle);
+        container.remove();
+        next_tick().await;
     }
 }

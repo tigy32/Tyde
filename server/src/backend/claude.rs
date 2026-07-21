@@ -1,6 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -288,6 +289,7 @@ impl ClaudeSession {
             }),
             runtime: Mutex::new(None),
             turn_event_gate: Mutex::new(()),
+            task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
         });
 
         Ok((Self { inner }, event_rx))
@@ -461,6 +463,7 @@ struct ClaudeInner {
     state: Mutex<ClaudeState>,
     runtime: Mutex<Option<ClaudeProcessRuntime>>,
     turn_event_gate: Mutex<()>,
+    task_tracker: StdMutex<ClaudeTaskTracker>,
 }
 
 struct ClaudeProcessRuntime {
@@ -2406,9 +2409,12 @@ impl ClaudeInner {
     }
 
     fn emit_tool_request(&self, tool_call: &ClaudeToolCall) {
-        if claude_is_todo_write_tool_name(&tool_call.name)
-            && let Some(tasks) = claude_task_update_from_todo_write(&tool_call.arguments)
-        {
+        let task_update = self
+            .task_tracker
+            .lock()
+            .expect("Claude task tracker mutex poisoned")
+            .observe_request(tool_call);
+        if let Some(tasks) = task_update {
             self.emitter.task_update(&tasks);
         }
         self.emitter.tool_request(
@@ -2426,6 +2432,14 @@ impl ClaudeInner {
         tool_result: Value,
         error: Option<String>,
     ) {
+        let task_update = if success {
+            self.task_tracker
+                .lock()
+                .expect("Claude task tracker mutex poisoned")
+                .observe_completion(tool_call_id, tool_name, &tool_result)
+        } else {
+            None
+        };
         let completed = ToolCompletedPayload {
             tool_call_id,
             tool_name,
@@ -2434,6 +2448,9 @@ impl ClaudeInner {
             error: error.as_deref(),
         };
         self.emitter.tool_completed(completed);
+        if let Some(tasks) = task_update {
+            self.emitter.task_update(&tasks);
+        }
     }
 
     async fn shutdown(&self) {
@@ -3217,7 +3234,7 @@ async fn read_claude_stdout_persistent(
         }
 
         if value.get("type").and_then(Value::as_str) == Some("result") {
-            flush_pending_tool_uses(&mut turn_state.summary, &mut turn_state.segment);
+            flush_pending_tool_uses_with_fallback(&mut turn_state.summary, &mut turn_state.segment);
             let summary = std::mem::take(&mut turn_state.summary);
             turn_state.segment = SegmentState::default();
             turn_state.active_turn_id = None;
@@ -3245,7 +3262,7 @@ async fn read_claude_stdout_persistent(
     };
     if let Some(turn_id) = active_turn_id {
         if turn_state.active_turn_id.is_some() {
-            flush_pending_tool_uses(&mut turn_state.summary, &mut turn_state.segment);
+            flush_pending_tool_uses_with_fallback(&mut turn_state.summary, &mut turn_state.segment);
         }
         let summary = std::mem::take(&mut turn_state.summary);
         let interrupted = inner.active_turn_interrupted(turn_id).await;
@@ -4115,6 +4132,7 @@ async fn ensure_subagent_stream(
         state: Mutex::new(ClaudeState::default()),
         runtime: Mutex::new(None),
         turn_event_gate: Mutex::new(()),
+        task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
     });
     let sa_message_id = format!("subagent-{}", tool_use_id);
 
@@ -4664,7 +4682,7 @@ async fn detect_subagent_completions(value: &Value, streams: &mut HashMap<String
 
 /// Flush and close out a sub-agent stream, emitting its final progress stats.
 fn finalize_subagent_stream(mut stream: SubAgentStream) {
-    flush_pending_tool_uses(&mut stream.summary, &mut stream.segment);
+    flush_pending_tool_uses_with_fallback(&mut stream.summary, &mut stream.segment);
     if phase_has_pending_output(&stream.summary, &stream.segment) {
         close_current_subagent_phase(&mut stream.summary, &mut stream.segment, &stream.inner);
     } else if let Some(turn_usage) = subagent_terminal_usage(&stream.summary) {
@@ -5069,8 +5087,11 @@ fn consume_assistant_message(
         .as_ref()
         .zip(segment.current_claude_message_id.as_ref())
         .is_some_and(|(next, current)| next == current);
+    let has_new_tool_call = next_tool_calls
+        .iter()
+        .any(|tool_call| !summary.seen_tool_ids.contains(&tool_call.id));
 
-    if has_payload && !is_duplicate {
+    if has_payload && (!is_duplicate || (segment.awaiting_stream_start && has_new_tool_call)) {
         maybe_emit_next_stream_start(
             summary,
             segment,
@@ -5103,6 +5124,9 @@ fn consume_assistant_message(
     }
 
     for tool_call in next_tool_calls {
+        segment
+            .pending_tool_uses
+            .retain(|_, pending| pending.id != tool_call.id);
         if summary.register_tool_call(tool_call) {
             segment.has_content = true;
         }
@@ -5440,18 +5464,41 @@ fn flush_pending_tool_uses(summary: &mut ClaudeStdoutSummary, segment: &mut Segm
         .copied()
         .collect::<Vec<_>>();
     for index in indexes {
-        maybe_emit_pending_tool_use(summary, segment, index);
-        if let Some(pending) = segment.pending_tool_uses.remove(&index) {
-            if pending.request_emitted {
-                continue;
-            }
-            let fallback = ClaudeToolCall {
+        finish_pending_tool_use(summary, segment, index);
+    }
+}
+
+fn flush_pending_tool_uses_with_fallback(
+    summary: &mut ClaudeStdoutSummary,
+    segment: &mut SegmentState,
+) {
+    flush_pending_tool_uses(summary, segment);
+    let pending = std::mem::take(&mut segment.pending_tool_uses);
+    for (_, pending) in pending {
+        register_tool_call_for_phase(
+            summary,
+            segment,
+            ClaudeToolCall {
                 id: pending.id,
                 name: pending.name,
                 arguments: pending.arguments,
-            };
-            register_tool_call_for_phase(summary, segment, fallback);
-        }
+            },
+        );
+    }
+}
+
+fn finish_pending_tool_use(
+    summary: &mut ClaudeStdoutSummary,
+    segment: &mut SegmentState,
+    index: u64,
+) {
+    maybe_emit_pending_tool_use(summary, segment, index);
+    if segment
+        .pending_tool_uses
+        .get(&index)
+        .is_some_and(|pending| pending.request_emitted)
+    {
+        segment.pending_tool_uses.remove(&index);
     }
 }
 
@@ -5467,6 +5514,25 @@ fn consume_stream_event(
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or_default();
+
+    if segment.awaiting_stream_start
+        && matches!(event_type, "content_block_start" | "content_block_delta")
+    {
+        tracing::info!(
+            event_type,
+            provider_message_id = ?segment.current_claude_message_id,
+            "Claude content block started a response phase without message_start"
+        );
+        let model = summary.model.clone();
+        maybe_emit_next_stream_start(
+            summary,
+            segment,
+            inner,
+            base_message_id,
+            current_message_id,
+            model,
+        );
+    }
 
     match event_type {
         "message_start" => {
@@ -5639,8 +5705,7 @@ fn consume_stream_event(
             let Some(index) = content_block_index(event) else {
                 return;
             };
-            maybe_emit_pending_tool_use(summary, segment, index);
-            segment.pending_tool_uses.remove(&index);
+            finish_pending_tool_use(summary, segment, index);
         }
         "message_stop" => {
             flush_pending_tool_uses(summary, segment);
@@ -6250,6 +6315,208 @@ fn claude_is_read_tool_name(tool_name: &str) -> bool {
 
 fn claude_is_todo_write_tool_name(tool_name: &str) -> bool {
     normalize_tool_name(tool_name) == "todowrite"
+}
+
+fn claude_is_task_create_tool_name(tool_name: &str) -> bool {
+    normalize_tool_name(tool_name) == "taskcreate"
+}
+
+fn claude_is_task_update_tool_name(tool_name: &str) -> bool {
+    normalize_tool_name(tool_name) == "taskupdate"
+}
+
+#[derive(Default)]
+struct ClaudeTaskTracker {
+    tasks: BTreeMap<u64, protocol::Task>,
+    provider_ids: HashMap<u64, u64>,
+    pending: HashMap<String, ClaudePendingTaskCall>,
+    next_local_id: u64,
+}
+
+enum ClaudePendingTaskCall {
+    Create { local_id: Option<u64> },
+    Update { provider_id: u64, arguments: Value },
+}
+
+impl ClaudeTaskTracker {
+    fn observe_request(&mut self, tool_call: &ClaudeToolCall) -> Option<protocol::TaskList> {
+        if claude_is_todo_write_tool_name(&tool_call.name) {
+            let tasks = claude_task_update_from_todo_write(&tool_call.arguments)?;
+            self.tasks = tasks
+                .tasks
+                .iter()
+                .cloned()
+                .map(|task| (task.id, task))
+                .collect();
+            self.provider_ids.clear();
+            self.pending.clear();
+            self.next_local_id = self
+                .tasks
+                .keys()
+                .next_back()
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(1);
+            return Some(tasks);
+        }
+
+        if claude_is_task_create_tool_name(&tool_call.name) {
+            let local_id = task_description(&tool_call.arguments).map(|description| {
+                let local_id = self.next_local_id.max(1);
+                self.next_local_id = local_id.saturating_add(1);
+                self.tasks.insert(
+                    local_id,
+                    protocol::Task {
+                        id: local_id,
+                        description,
+                        status: protocol::TaskStatus::Pending,
+                    },
+                );
+                local_id
+            });
+            self.pending.insert(
+                tool_call.id.clone(),
+                ClaudePendingTaskCall::Create { local_id },
+            );
+            return local_id.map(|_| self.snapshot());
+        }
+
+        if claude_is_task_update_tool_name(&tool_call.name) {
+            let provider_id = task_id_from_value(&tool_call.arguments)?;
+            self.pending.insert(
+                tool_call.id.clone(),
+                ClaudePendingTaskCall::Update {
+                    provider_id,
+                    arguments: tool_call.arguments.clone(),
+                },
+            );
+        }
+        None
+    }
+
+    fn observe_completion(
+        &mut self,
+        tool_call_id: &str,
+        tool_name: &str,
+        result: &Value,
+    ) -> Option<protocol::TaskList> {
+        let pending = self.pending.remove(tool_call_id)?;
+        match pending {
+            ClaudePendingTaskCall::Create { local_id }
+                if claude_is_task_create_tool_name(tool_name) =>
+            {
+                let local_id = match local_id {
+                    Some(local_id) => local_id,
+                    None => {
+                        let description = task_description_from_result(result)?;
+                        let local_id = self.next_local_id.max(1);
+                        self.next_local_id = local_id.saturating_add(1);
+                        self.tasks.insert(
+                            local_id,
+                            protocol::Task {
+                                id: local_id,
+                                description,
+                                status: protocol::TaskStatus::Pending,
+                            },
+                        );
+                        local_id
+                    }
+                };
+                if let Some(provider_id) = task_id_from_value(result) {
+                    self.provider_ids.insert(provider_id, local_id);
+                }
+            }
+            ClaudePendingTaskCall::Update {
+                provider_id,
+                arguments,
+            } if claude_is_task_update_tool_name(tool_name) => {
+                let local_id = self
+                    .provider_ids
+                    .get(&provider_id)
+                    .copied()
+                    .or_else(|| self.tasks.contains_key(&provider_id).then_some(provider_id))?;
+                let task = self.tasks.get_mut(&local_id)?;
+                if let Some(description) = task_description(&arguments) {
+                    task.description = description;
+                }
+                if let Some(status) = arguments
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .and_then(task_status)
+                {
+                    task.status = status;
+                }
+            }
+            _ => return None,
+        }
+        Some(self.snapshot())
+    }
+
+    fn snapshot(&self) -> protocol::TaskList {
+        protocol::TaskList {
+            title: String::new(),
+            tasks: self.tasks.values().cloned().collect(),
+        }
+    }
+}
+
+fn task_description(value: &Value) -> Option<String> {
+    ["subject", "description", "content", "activeForm"]
+        .iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn task_description_from_result(value: &Value) -> Option<String> {
+    if let Some(description) = task_description(value) {
+        return Some(description);
+    }
+    let text = value.as_str()?.trim();
+    text.split_once(':')
+        .map(|(_, description)| description.trim())
+        .filter(|description| !description.is_empty())
+        .map(str::to_string)
+}
+
+fn task_id_from_value(value: &Value) -> Option<u64> {
+    for key in ["taskId", "task_id", "id"] {
+        if let Some(id) = value.get(key).and_then(value_as_u64) {
+            return Some(id);
+        }
+    }
+    if let Some(text) = value.as_str() {
+        if let Some(after_hash) = text.split('#').nth(1) {
+            let digits = after_hash
+                .chars()
+                .take_while(|character| character.is_ascii_digit())
+                .collect::<String>();
+            if let Ok(id) = digits.parse() {
+                return Some(id);
+            }
+        }
+        return text.trim().parse().ok();
+    }
+    value
+        .as_object()
+        .and_then(|object| object.values().find_map(task_id_from_value))
+}
+
+fn value_as_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+}
+
+fn task_status(value: &str) -> Option<protocol::TaskStatus> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "pending" => Some(protocol::TaskStatus::Pending),
+        "in_progress" | "inprogress" | "active" => Some(protocol::TaskStatus::InProgress),
+        "completed" | "complete" | "done" => Some(protocol::TaskStatus::Completed),
+        "failed" | "cancelled" | "canceled" | "deleted" => Some(protocol::TaskStatus::Failed),
+        _ => None,
+    }
 }
 
 fn claude_is_ask_user_question_tool_name(tool_name: &str) -> bool {
@@ -9486,6 +9753,7 @@ mod tests {
             }),
             runtime: Mutex::new(None),
             turn_event_gate: Mutex::new(()),
+            task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
         };
         (inner, event_rx)
     }
@@ -14162,6 +14430,123 @@ for raw_line in sys.stdin:
     }
 
     #[tokio::test]
+    async fn content_block_stop_keeps_tool_use_when_arguments_are_missing() {
+        let (inner, mut rx) = make_test_inner();
+        let mut summary = ClaudeStdoutSummary::default();
+        let mut segment = SegmentState::default();
+        inner.emit_stream_start("claude-msg", Some("claude-test".to_string()));
+        assert_eq!(
+            event_kind(&rx.recv().await.expect("stream start")),
+            Some("StreamStart")
+        );
+        segment.pending_tool_uses.insert(
+            4,
+            PendingClaudeToolUse {
+                id: "toolu_task".to_string(),
+                name: "TaskCreate".to_string(),
+                arguments: json!({}),
+                partial_json: String::new(),
+                request_emitted: false,
+            },
+        );
+
+        finish_pending_tool_use(&mut summary, &mut segment, 4);
+        assert!(summary.tool_calls.is_empty());
+        assert!(segment.pending_tool_uses.contains_key(&4));
+        let mut current_id = "claude-msg".to_string();
+        consume_assistant_message(
+            &json!({
+                "message": {
+                    "id": "provider-message",
+                    "model": "claude-test",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_task",
+                        "name": "TaskCreate",
+                        "input": {"subject": "Recovered task"}
+                    }]
+                }
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            "claude-msg",
+            &mut current_id,
+        );
+        assert_eq!(summary.tool_calls.len(), 1);
+        assert_eq!(summary.tool_calls[0].id, "toolu_task");
+        assert_eq!(summary.tool_calls[0].name, "TaskCreate");
+        assert_eq!(
+            summary.tool_calls[0].arguments,
+            json!({"subject": "Recovered task"})
+        );
+        assert!(segment.pending_tool_uses.is_empty());
+        close_current_phase(&mut summary, &mut segment, &inner);
+        assert_eq!(
+            event_kind(&rx.recv().await.expect("stream end")),
+            Some("StreamEnd")
+        );
+        assert_eq!(
+            event_kind(&rx.recv().await.expect("task update")),
+            Some("TaskUpdate")
+        );
+        assert_eq!(
+            event_kind(&rx.recv().await.expect("tool request")),
+            Some("ToolRequest")
+        );
+    }
+
+    #[tokio::test]
+    async fn content_block_opens_phase_when_message_start_is_omitted() {
+        let (inner, mut rx) = make_test_inner();
+        let mut summary = ClaudeStdoutSummary {
+            model: Some("claude-test".to_string()),
+            ..ClaudeStdoutSummary::default()
+        };
+        let mut segment = SegmentState {
+            awaiting_stream_start: true,
+            ..SegmentState::default()
+        };
+        let base_id = "claude-msg".to_string();
+        let mut current_id = base_id.clone();
+
+        consume_stream_event(
+            &json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "toolu_task",
+                    "name": "TaskCreate",
+                    "input": {"subject": "Next task"}
+                }
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+        consume_stream_event(
+            &json!({"type": "message_stop"}),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+
+        let mut kinds = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            kinds.push(event_kind(&event).unwrap_or_default().to_string());
+        }
+        assert_eq!(kinds.first().map(String::as_str), Some("StreamStart"));
+        assert!(kinds.iter().any(|kind| kind == "StreamEnd"));
+        assert!(kinds.iter().any(|kind| kind == "ToolRequest"));
+        assert!(!kinds.iter().any(|kind| kind == "Error"));
+    }
+
+    #[tokio::test]
     async fn unresolved_streamed_tool_request_is_auto_closed_before_next_stream_start() {
         let (inner, mut rx) = make_test_inner();
         let mut summary = ClaudeStdoutSummary::default();
@@ -15430,6 +15815,7 @@ for raw_line in sys.stdin:
                 }),
                 runtime: Mutex::new(None),
                 turn_event_gate: Mutex::new(()),
+                task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
             }),
             event_rx,
         )
@@ -17125,6 +17511,155 @@ for raw_line in sys.stdin:
     }
 
     #[test]
+    fn current_task_tools_build_a_typed_task_list() {
+        use protocol::TaskStatus;
+
+        let mut tracker = ClaudeTaskTracker::default();
+        let create = ClaudeToolCall {
+            id: "create-1".to_string(),
+            name: "TaskCreate".to_string(),
+            arguments: json!({"subject": "Alpha check", "description": "Calculate 1+1"}),
+        };
+        let created = tracker.observe_request(&create).expect("create snapshot");
+        assert_eq!(created.tasks[0].description, "Alpha check");
+        assert!(matches!(created.tasks[0].status, TaskStatus::Pending));
+        tracker
+            .observe_completion(
+                "create-1",
+                "TaskCreate",
+                &json!("Task #7 created successfully: Alpha check"),
+            )
+            .expect("create completion snapshot");
+
+        let update = ClaudeToolCall {
+            id: "update-1".to_string(),
+            name: "TaskUpdate".to_string(),
+            arguments: json!({"taskId": "7", "status": "in_progress"}),
+        };
+        assert!(tracker.observe_request(&update).is_none());
+        let active = tracker
+            .observe_completion("update-1", "TaskUpdate", &json!("Updated task #7 status"))
+            .expect("update snapshot");
+        assert!(matches!(active.tasks[0].status, TaskStatus::InProgress));
+
+        let missing_arguments = ClaudeToolCall {
+            id: "create-2".to_string(),
+            name: "TaskCreate".to_string(),
+            arguments: json!({}),
+        };
+        assert!(tracker.observe_request(&missing_arguments).is_none());
+        let recovered = tracker
+            .observe_completion(
+                "create-2",
+                "TaskCreate",
+                &json!("Task #8 created successfully: Beta check"),
+            )
+            .expect("completion reconstructs missing request arguments");
+        assert_eq!(recovered.tasks[1].description, "Beta check");
+    }
+
+    #[tokio::test]
+    async fn repeated_tools_in_one_claude_response_remain_visible() {
+        let (inner, mut rx) = make_test_inner();
+        let mut summary = ClaudeStdoutSummary::default();
+        let mut segment = SegmentState::default();
+        let base_id = "claude-response".to_owned();
+        let mut current_id = base_id.clone();
+        inner.emit_stream_start(&base_id, Some("claude-test".to_owned()));
+
+        for (index, subject) in ["Alpha check", "Beta check", "Gamma check"]
+            .into_iter()
+            .enumerate()
+        {
+            let tool_call_id = format!("tool-{index}");
+            let assistant = json!({
+                "type": "assistant",
+                "message": {
+                    "id": "same-provider-message",
+                    "model": "claude-test",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": tool_call_id.clone(),
+                        "name": "TaskCreate",
+                        "input": {"subject": subject, "description": subject}
+                    }]
+                }
+            });
+            consume_claude_stream_value(
+                &assistant,
+                &mut summary,
+                &mut segment,
+                &inner,
+                &base_id,
+                &mut current_id,
+            );
+            close_current_phase(&mut summary, &mut segment, &inner);
+            consume_claude_stream_value(
+                &assistant,
+                &mut summary,
+                &mut segment,
+                &inner,
+                &base_id,
+                &mut current_id,
+            );
+            consume_claude_stream_value(
+                &json!({
+                    "type": "user",
+                    "message": {
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": tool_call_id,
+                            "content": format!("Task #{} created successfully: {subject}", index + 1)
+                        }]
+                    }
+                }),
+                &mut summary,
+                &mut segment,
+                &inner,
+                &base_id,
+                &mut current_id,
+            );
+        }
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event_kind(event) == Some("ToolRequest"))
+                .count(),
+            3
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event_kind(event) == Some("ToolExecutionCompleted")
+                        && event.pointer("/data/success").and_then(Value::as_bool) == Some(true)
+                })
+                .count(),
+            3
+        );
+        assert!(events.iter().all(|event| {
+            event.pointer("/data/error").and_then(Value::as_str) != Some("Tool result missing")
+        }));
+        let final_tasks = events
+            .iter()
+            .rev()
+            .find(|event| event_kind(event) == Some("TaskUpdate"))
+            .expect("typed task update");
+        assert_eq!(
+            final_tasks
+                .pointer("/data/tasks")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(3)
+        );
+    }
+
+    #[test]
     fn extract_spawn_description_prefers_prompt_over_description() {
         let input = json!({
             "description": "Spawn test sub-agent",
@@ -17157,6 +17692,7 @@ for raw_line in sys.stdin:
                     state: Mutex::new(ClaudeState::default()),
                     runtime: Mutex::new(None),
                     turn_event_gate: Mutex::new(()),
+                    task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
                 }),
                 parent_tool_use_id: "toolu_spawn".to_string(),
                 parent_tool_name: "Task".to_string(),

@@ -2283,6 +2283,11 @@ pub(crate) fn spawn_agent_actor(
                 "failed to persist agent session startup state"
             );
         }
+        let mut persisted_resume_task_list = if is_resume {
+            session_store.lock().await.get_task_list(&actor_session_id)
+        } else {
+            None
+        };
         let _ = startup_tx.send(Ok(actor_session_id.clone()));
         accepting_input_task.store(!resume_replay_gate_pending, Ordering::SeqCst);
         status_handle
@@ -2967,6 +2972,23 @@ pub(crate) fn spawn_agent_actor(
                                         }
                                     }
                                 }
+                            }
+                            if result.is_ok()
+                                && let Some(task_list) = persisted_resume_task_list.take()
+                            {
+                                let mut event = ChatEvent::TaskUpdate(task_list);
+                                ingest_gated_replay_event(
+                                    &mut event,
+                                    &canonical_stream,
+                                    &current_start.agent_id,
+                                    &mut event_log,
+                                    &mut subscribers,
+                                    &mut replay_state,
+                                    &mut activity_stats,
+                                    &mut active_stream_text,
+                                    &mut activity_event_seq,
+                                )
+                                .await;
                             }
                             resume_replay_gate_pending = false;
                             match result {
@@ -6514,12 +6536,21 @@ async fn apply_runtime_session_updates(
             }),
             ChatEvent::TaskUpdate(tasks) => {
                 let title = tasks.title.trim();
-                store.update(session_id, |record| {
-                    record.updated_at_ms = now_ms();
-                    if !title.is_empty() && record.alias.is_none() {
-                        record.alias = Some(title.to_string());
-                    }
-                })
+                tracing::info!(
+                    session_id = %session_id,
+                    task_count = tasks.tasks.len(),
+                    "persisting typed task state"
+                );
+                store
+                    .set_task_list(session_id, tasks.clone())
+                    .and_then(|()| {
+                        store.update(session_id, |record| {
+                            record.updated_at_ms = now_ms();
+                            if !title.is_empty() && record.alias.is_none() {
+                                record.alias = Some(title.to_string());
+                            }
+                        })
+                    })
             }
             _ => store.update(session_id, |record| {
                 record.updated_at_ms = now_ms();

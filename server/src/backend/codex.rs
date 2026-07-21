@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -25,7 +25,8 @@ use protocol::{
 
 use crate::agent_control_mcp::AGENT_CONTROL_AWAIT_MCP_SERVER_NAME;
 use crate::backend::agent_control_progress::{
-    PendingToolNormalizationFailure, normalize_tyde_chat_event,
+    PendingToolNormalizationFailure, is_tyde_agent_control_await_tool_name,
+    is_tyde_agent_control_spawn_tool_name, normalize_tyde_chat_event,
 };
 use crate::backend::turn_emitter::{
     AgentName, MessageMetadataUpdatePayload, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
@@ -654,6 +655,7 @@ impl CodexSession {
                 generated_identity_epoch,
                 next_generated_identity_ordinal: 1,
                 pending_tool_call_ids: HashSet::new(),
+                tool_call_identities: CodexToolCallIdentities::default(),
                 tool_container_images: Vec::new(),
                 cancelled_tool_call_ids: HashSet::new(),
                 close_active_stream_when_tools_idle: false,
@@ -1413,6 +1415,7 @@ struct CodexState {
     generated_identity_epoch: u64,
     next_generated_identity_ordinal: u64,
     pending_tool_call_ids: HashSet<String>,
+    tool_call_identities: CodexToolCallIdentities,
     tool_container_images: Vec<protocol::ImageData>,
     cancelled_tool_call_ids: HashSet<String>,
     close_active_stream_when_tools_idle: bool,
@@ -1435,6 +1438,129 @@ struct CodexState {
     completed_subagent_streams: HashMap<String, CompletedCodexSubAgentStream>,
 }
 
+#[derive(Default)]
+struct CodexToolCallIdentities {
+    occurrence_counts: HashMap<(String, String, String), u64>,
+    pending: HashMap<(String, String), VecDeque<CodexToolCallOccurrence>>,
+    completed: HashMap<(String, String, String), String>,
+}
+
+struct CodexToolCallOccurrence {
+    canonical_id: String,
+    turn_id: String,
+    tool_name: String,
+}
+
+impl CodexToolCallIdentities {
+    fn started(
+        &mut self,
+        thread_id: &str,
+        turn_id: &str,
+        provider_item_id: &str,
+        tool_name: &str,
+        base_canonical_id: &str,
+    ) -> String {
+        let key = (thread_id.to_owned(), provider_item_id.to_owned());
+        let queue = self.pending.entry(key).or_default();
+        if let Some(existing) = queue.back()
+            && existing.turn_id == turn_id
+            && existing.tool_name == tool_name
+        {
+            return existing.canonical_id.clone();
+        }
+        let occurrence = self
+            .occurrence_counts
+            .entry((
+                thread_id.to_owned(),
+                turn_id.to_owned(),
+                provider_item_id.to_owned(),
+            ))
+            .or_default();
+        *occurrence = occurrence.saturating_add(1);
+        let canonical_id = if *occurrence == 1 {
+            base_canonical_id.to_owned()
+        } else {
+            format!("{base_canonical_id}:occurrence-{occurrence}")
+        };
+        queue.push_back(CodexToolCallOccurrence {
+            canonical_id: canonical_id.clone(),
+            turn_id: turn_id.to_owned(),
+            tool_name: tool_name.to_owned(),
+        });
+        canonical_id
+    }
+
+    fn completed(
+        &mut self,
+        thread_id: &str,
+        turn_id: &str,
+        provider_item_id: &str,
+        tool_name: &str,
+        base_canonical_id: &str,
+    ) -> String {
+        let key = (thread_id.to_owned(), provider_item_id.to_owned());
+        if let Some(queue) = self.pending.get_mut(&key) {
+            let position = queue
+                .iter()
+                .position(|occurrence| {
+                    occurrence.turn_id == turn_id && occurrence.tool_name == tool_name
+                })
+                .or_else(|| {
+                    queue
+                        .iter()
+                        .position(|occurrence| occurrence.tool_name == tool_name)
+                });
+            if let Some(position) = position {
+                let occurrence = queue
+                    .remove(position)
+                    .expect("pending Codex tool occurrence disappeared");
+                if queue.is_empty() {
+                    self.pending.remove(&key);
+                }
+                self.completed.insert(
+                    (
+                        thread_id.to_owned(),
+                        provider_item_id.to_owned(),
+                        tool_name.to_owned(),
+                    ),
+                    occurrence.canonical_id.clone(),
+                );
+                return occurrence.canonical_id;
+            }
+        }
+        if let Some(canonical_id) = self.completed.get(&(
+            thread_id.to_owned(),
+            provider_item_id.to_owned(),
+            tool_name.to_owned(),
+        )) {
+            return canonical_id.clone();
+        }
+        let canonical_id = self.started(
+            thread_id,
+            turn_id,
+            provider_item_id,
+            tool_name,
+            base_canonical_id,
+        );
+        if let Some(queue) = self.pending.get_mut(&key)
+            && let Some(occurrence) = queue.pop_back()
+        {
+            if queue.is_empty() {
+                self.pending.remove(&key);
+            }
+            self.completed.insert(
+                (
+                    thread_id.to_owned(),
+                    provider_item_id.to_owned(),
+                    tool_name.to_owned(),
+                ),
+                occurrence.canonical_id.clone(),
+            );
+        }
+        canonical_id
+    }
+}
+
 struct CodexInner {
     rpc: CodexRpc,
     emitter: Arc<TurnEmitter>,
@@ -1443,6 +1569,50 @@ struct CodexInner {
 }
 
 impl CodexInner {
+    async fn tool_call_started_id(
+        &self,
+        params: &Value,
+        provider_item_id: &str,
+        tool_name: &str,
+    ) -> String {
+        let mut state = self.state.lock().await;
+        let thread_id =
+            extract_notification_thread_id(params).unwrap_or_else(|| state.thread_id.clone());
+        let turn_id = extract_turn_id(params)
+            .or_else(|| state.active_turn_id.clone())
+            .unwrap_or_else(|| "turn".to_owned());
+        let base_canonical_id = codex_scoped_tool_call_id(params, provider_item_id);
+        state.tool_call_identities.started(
+            &thread_id,
+            &turn_id,
+            provider_item_id,
+            tool_name,
+            &base_canonical_id,
+        )
+    }
+
+    async fn tool_call_completed_id(
+        &self,
+        params: &Value,
+        provider_item_id: &str,
+        tool_name: &str,
+    ) -> String {
+        let mut state = self.state.lock().await;
+        let thread_id =
+            extract_notification_thread_id(params).unwrap_or_else(|| state.thread_id.clone());
+        let turn_id = extract_turn_id(params)
+            .or_else(|| state.active_turn_id.clone())
+            .unwrap_or_else(|| "turn".to_owned());
+        let base_canonical_id = codex_scoped_tool_call_id(params, provider_item_id);
+        state.tool_call_identities.completed(
+            &thread_id,
+            &turn_id,
+            provider_item_id,
+            tool_name,
+            &base_canonical_id,
+        )
+    }
+
     fn spawn_capacity_refresh(self: &Arc<Self>, emitter: Arc<dyn SubAgentEmitter>) {
         let inner = Arc::clone(self);
         tokio::spawn(async move {
@@ -2819,6 +2989,9 @@ impl CodexInner {
         let item_status = item
             .and_then(|item| item.get("status"))
             .and_then(Value::as_str);
+        let tool_name = item
+            .and_then(|item| item.get("tool"))
+            .and_then(Value::as_str);
         let (sequence, active_turn_id, active_item_id, tool_container_id, pending_tool_count) = {
             let mut state = self.state.lock().await;
             state.notification_sequence = state.notification_sequence.saturating_add(1);
@@ -2847,6 +3020,25 @@ impl CodexInner {
             pending_tool_count,
             "Codex notification structure"
         );
+        if tool_name.is_some_and(|tool_name| {
+            is_tyde_agent_control_spawn_tool_name(tool_name)
+                || is_tyde_agent_control_await_tool_name(tool_name)
+        }) {
+            tracing::info!(
+                codex_notification_sequence = sequence,
+                codex_method = method,
+                thread_id = ?extract_notification_thread_id(params),
+                turn_id = ?extract_turn_id(params),
+                ?item_id,
+                ?item_type,
+                ?item_status,
+                ?tool_name,
+                ?active_turn_id,
+                ?tool_container_id,
+                pending_tool_count,
+                "Observed Codex Tyde agent-control notification"
+            );
+        }
     }
 
     async fn trace_terminal_emission(&self, terminal: &'static str, message_id: Option<&str>) {
@@ -3558,8 +3750,9 @@ impl CodexInner {
                         Some(model),
                     );
                 }
-                let (container, tool_call_ids) =
-                    self.handle_subagent_item_started(params, emitter.as_ref());
+                let (container, tool_call_ids) = self
+                    .handle_subagent_item_started(params, emitter.as_ref())
+                    .await;
                 if container.is_some() || !tool_call_ids.is_empty() {
                     let violation_emitter = {
                         let mut state = self.state.lock().await;
@@ -3829,7 +4022,7 @@ impl CodexInner {
         }
     }
 
-    fn handle_subagent_item_started(
+    async fn handle_subagent_item_started(
         &self,
         params: &Value,
         emitter: &TurnEmitter,
@@ -3838,11 +4031,28 @@ impl CodexInner {
             return (None, Vec::new());
         };
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
-        let item_id = item
-            .get("id")
-            .and_then(Value::as_str)
-            .map(|item_id| codex_scoped_tool_call_id(params, item_id))
-            .unwrap_or_else(|| codex_scoped_tool_call_id(params, "tool-call"));
+        let tool_name = match item_type {
+            "imageGeneration" => "generate_image",
+            "webSearch" => "web_search",
+            "imageView" => "view_image",
+            "sleep" => "sleep",
+            "commandExecution" => "run_command",
+            "fileChange" => "file_change",
+            "collabToolCall" | "collabAgentToolCall" | "mcpToolCall" | "dynamicToolCall" => item
+                .get("tool")
+                .and_then(Value::as_str)
+                .unwrap_or(item_type),
+            _ => return (None, Vec::new()),
+        };
+        let item_id = self
+            .tool_call_started_id(
+                params,
+                item.get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool-call"),
+                tool_name,
+            )
+            .await;
 
         match item_type {
             "imageGeneration" => {
@@ -3966,11 +4176,7 @@ impl CodexInner {
             return;
         };
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
-        let item_id = item
-            .get("id")
-            .and_then(Value::as_str)
-            .map(|item_id| codex_scoped_tool_call_id(params, item_id))
-            .unwrap_or_else(|| codex_scoped_tool_call_id(params, "item"));
+        let provider_item_id = item.get("id").and_then(Value::as_str).unwrap_or("item");
 
         match item_type {
             "agentMessage" => {
@@ -4060,14 +4266,26 @@ impl CodexInner {
                 .await;
             }
             "imageGeneration" => {
+                let item_id = self
+                    .tool_call_completed_id(params, provider_item_id, "generate_image")
+                    .await;
                 self.complete_subagent_image_generation(stream_key, &item_id, item)
                     .await;
             }
             "webSearch" | "imageView" | "sleep" => {
+                let tool_name = codex_native_tool_completion(item_type)
+                    .map(|(tool_name, _)| tool_name)
+                    .unwrap_or(item_type);
+                let item_id = self
+                    .tool_call_completed_id(params, provider_item_id, tool_name)
+                    .await;
                 self.complete_subagent_native_tool(stream_key, &item_id, item_type)
                     .await;
             }
             "commandExecution" => {
+                let item_id = self
+                    .tool_call_completed_id(params, provider_item_id, "run_command")
+                    .await;
                 let Some(emitter) = self.codex_subagent_emitter(stream_key).await else {
                     return;
                 };
@@ -4101,6 +4319,9 @@ impl CodexInner {
                     .await;
             }
             "fileChange" => {
+                let item_id = self
+                    .tool_call_completed_id(params, provider_item_id, "file_change")
+                    .await;
                 let Some(emitter) = self.codex_subagent_emitter(stream_key).await else {
                     return;
                 };
@@ -4158,6 +4379,9 @@ impl CodexInner {
                     .get("tool")
                     .and_then(Value::as_str)
                     .unwrap_or(item_type);
+                let item_id = self
+                    .tool_call_completed_id(params, provider_item_id, tool_name)
+                    .await;
                 let success = item.get("status").and_then(Value::as_str) == Some("completed")
                     || item.get("success").and_then(Value::as_bool) == Some(true);
                 let error_message = if success {
@@ -4188,6 +4412,9 @@ impl CodexInner {
                     .get("tool")
                     .and_then(Value::as_str)
                     .unwrap_or("collab_tool");
+                let item_id = self
+                    .tool_call_completed_id(params, provider_item_id, tool_name)
+                    .await;
                 let success = codex_item_success(item);
                 let error_message = if success {
                     None
@@ -5420,7 +5647,9 @@ impl CodexInner {
                 }
             }
             "imageGeneration" => {
-                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("tool-call"));
+                let item_id = self
+                    .tool_call_started_id(params, item_id.unwrap_or("tool-call"), "generate_image")
+                    .await;
                 self.track_tool_requests(std::iter::once(item_id.clone()))
                     .await;
                 let prompt = item
@@ -5437,7 +5666,9 @@ impl CodexInner {
                 .await;
             }
             "webSearch" => {
-                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("tool-call"));
+                let item_id = self
+                    .tool_call_started_id(params, item_id.unwrap_or("tool-call"), "web_search")
+                    .await;
                 self.track_tool_requests(std::iter::once(item_id.clone()))
                     .await;
                 let query = item
@@ -5454,7 +5685,9 @@ impl CodexInner {
                 .await;
             }
             "imageView" => {
-                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("tool-call"));
+                let item_id = self
+                    .tool_call_started_id(params, item_id.unwrap_or("tool-call"), "view_image")
+                    .await;
                 self.track_tool_requests(std::iter::once(item_id.clone()))
                     .await;
                 let path = item
@@ -5471,7 +5704,9 @@ impl CodexInner {
                 .await;
             }
             "sleep" => {
-                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("tool-call"));
+                let item_id = self
+                    .tool_call_started_id(params, item_id.unwrap_or("tool-call"), "sleep")
+                    .await;
                 self.track_tool_requests(std::iter::once(item_id.clone()))
                     .await;
                 let duration_ms = item.get("durationMs").and_then(Value::as_u64).unwrap_or(0);
@@ -5484,7 +5719,9 @@ impl CodexInner {
                 .await;
             }
             "commandExecution" => {
-                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("tool-call"));
+                let item_id = self
+                    .tool_call_started_id(params, item_id.unwrap_or("tool-call"), "run_command")
+                    .await;
                 let command = item
                     .get("command")
                     .and_then(Value::as_str)
@@ -5509,7 +5746,9 @@ impl CodexInner {
                 .await;
             }
             "fileChange" => {
-                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("tool-call"));
+                let item_id = self
+                    .tool_call_started_id(params, item_id.unwrap_or("tool-call"), "file_change")
+                    .await;
                 let file_changes = parse_codex_file_changes(item);
                 if file_changes.is_empty() {
                     return;
@@ -5541,34 +5780,62 @@ impl CodexInner {
                 }
             }
             "collabToolCall" | "collabAgentToolCall" => {
-                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("tool-call"));
                 let tool_name = item
                     .get("tool")
                     .and_then(Value::as_str)
                     .unwrap_or("collab_tool")
                     .to_string();
+                let item_id = self
+                    .tool_call_started_id(params, item_id.unwrap_or("tool-call"), &tool_name)
+                    .await;
                 self.track_tool_requests(std::iter::once(item_id.clone()))
                     .await;
                 let container = emit_codex_tool_request(&self.emitter, &item_id, &tool_name, item);
+                if is_tyde_agent_control_spawn_tool_name(&tool_name)
+                    || is_tyde_agent_control_await_tool_name(&tool_name)
+                {
+                    tracing::info!(
+                        tool_call_id = item_id,
+                        tool_name,
+                        container_id = ?container,
+                        "Emitted Codex Tyde agent-control request"
+                    );
+                }
                 self.record_tool_container(container).await;
                 self.emit_agent_control_await_progress_if_needed(&item_id, &tool_name, item)
                     .await;
-                self.record_codex_subagent_spawn_metadata_if_needed(Some(params), item)
-                    .await;
+                self.record_codex_subagent_spawn_metadata_if_needed(
+                    Some(&item_id),
+                    Some(params),
+                    item,
+                )
+                .await;
             }
             "subAgentActivity" | "sub_agent_activity" => {
                 self.register_codex_subagent_activity_if_needed(item).await;
             }
             "mcpToolCall" | "dynamicToolCall" => {
-                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("tool-call"));
                 let tool_name = item
                     .get("tool")
                     .and_then(Value::as_str)
                     .unwrap_or(item_type)
                     .to_string();
+                let item_id = self
+                    .tool_call_started_id(params, item_id.unwrap_or("tool-call"), &tool_name)
+                    .await;
                 self.track_tool_requests(std::iter::once(item_id.clone()))
                     .await;
                 let container = emit_codex_tool_request(&self.emitter, &item_id, &tool_name, item);
+                if is_tyde_agent_control_spawn_tool_name(&tool_name)
+                    || is_tyde_agent_control_await_tool_name(&tool_name)
+                {
+                    tracing::info!(
+                        tool_call_id = item_id,
+                        tool_name,
+                        container_id = ?container,
+                        "Emitted Codex Tyde agent-control request"
+                    );
+                }
                 self.record_tool_container(container).await;
                 self.emit_agent_control_await_progress_if_needed(&item_id, &tool_name, item)
                     .await;
@@ -5990,15 +6257,24 @@ impl CodexInner {
                 );
             }
             "imageGeneration" => {
-                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("item"));
+                let item_id = self
+                    .tool_call_completed_id(params, item_id.unwrap_or("item"), "generate_image")
+                    .await;
                 self.complete_image_generation(&item_id, item).await;
             }
             "webSearch" | "imageView" | "sleep" => {
-                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("item"));
+                let tool_name = codex_native_tool_completion(item_type)
+                    .map(|(tool_name, _)| tool_name)
+                    .unwrap_or(item_type);
+                let item_id = self
+                    .tool_call_completed_id(params, item_id.unwrap_or("item"), tool_name)
+                    .await;
                 self.complete_native_tool(&item_id, item_type).await;
             }
             "commandExecution" => {
-                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("item"));
+                let item_id = self
+                    .tool_call_completed_id(params, item_id.unwrap_or("item"), "run_command")
+                    .await;
                 self.add_active_turn_tool_bytes(estimate_command_execution_tool_bytes(item))
                     .await;
                 let exit_code = item.get("exitCode").and_then(Value::as_i64).unwrap_or(-1) as i32;
@@ -6027,7 +6303,9 @@ impl CodexInner {
                 .await;
             }
             "fileChange" => {
-                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("item"));
+                let item_id = self
+                    .tool_call_completed_id(params, item_id.unwrap_or("item"), "file_change")
+                    .await;
                 self.add_active_turn_tool_bytes(estimate_file_change_tool_bytes(item))
                     .await;
                 let success = item.get("status").and_then(Value::as_str) == Some("completed");
@@ -6091,13 +6369,15 @@ impl CodexInner {
                 .await;
             }
             "mcpToolCall" | "dynamicToolCall" => {
-                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("item"));
                 self.add_active_turn_tool_bytes(estimate_generic_tool_bytes(item))
                     .await;
                 let tool_name = item
                     .get("tool")
                     .and_then(Value::as_str)
                     .unwrap_or(item_type);
+                let item_id = self
+                    .tool_call_completed_id(params, item_id.unwrap_or("item"), tool_name)
+                    .await;
                 let success = item.get("status").and_then(Value::as_str) == Some("completed")
                     || item.get("success").and_then(Value::as_bool) == Some(true);
                 self.emit_tool_execution_completed(
@@ -6124,13 +6404,15 @@ impl CodexInner {
                     receiver_count = codex_native_wait_thread_ids(item).len(),
                     "Codex native collaboration completion"
                 );
-                let item_id = codex_scoped_tool_call_id(params, item_id.unwrap_or("item"));
                 self.add_active_turn_tool_bytes(estimate_generic_tool_bytes(item))
                     .await;
                 let tool_name = item
                     .get("tool")
                     .and_then(Value::as_str)
                     .unwrap_or("collab_tool");
+                let item_id = self
+                    .tool_call_completed_id(params, item_id.unwrap_or("item"), tool_name)
+                    .await;
                 let success = codex_item_success(item);
                 self.emit_tool_execution_completed(
                     &item_id,
@@ -6147,8 +6429,12 @@ impl CodexInner {
                     },
                 )
                 .await;
-                self.record_codex_subagent_spawn_metadata_if_needed(Some(params), item)
-                    .await;
+                self.record_codex_subagent_spawn_metadata_if_needed(
+                    Some(&item_id),
+                    Some(params),
+                    item,
+                )
+                .await;
             }
             _ => {}
         }
@@ -6156,6 +6442,7 @@ impl CodexInner {
 
     async fn record_codex_subagent_spawn_metadata_if_needed(
         &self,
+        canonical_item_id: Option<&str>,
         params: Option<&Value>,
         item: &Value,
     ) {
@@ -6170,7 +6457,9 @@ impl CodexInner {
             && item.get("status").and_then(Value::as_str) == Some("completed")
             && item.get("receiverThreadIds").is_some();
         for mut spawn in spawns {
-            if let Some(params) = params {
+            if let Some(canonical_item_id) = canonical_item_id {
+                spawn.item_id = canonical_item_id.to_owned();
+            } else if let Some(params) = params {
                 spawn.item_id = codex_scoped_tool_call_id(params, &spawn.item_id);
             }
             let receiver_thread_id = spawn.receiver_thread_id.clone();
@@ -13011,6 +13300,7 @@ for line in sys.stdin:
             generated_identity_epoch: codex_generated_identity_epoch("thread-test"),
             next_generated_identity_ordinal: 1,
             pending_tool_call_ids: HashSet::new(),
+            tool_call_identities: CodexToolCallIdentities::default(),
             tool_container_images: Vec::new(),
             cancelled_tool_call_ids: HashSet::new(),
             close_active_stream_when_tools_idle: false,
@@ -19119,7 +19409,7 @@ Do not describe the tool, and do not skip the tool call."#;
     }
 
     #[test]
-    fn codex_reused_provider_call_ids_remain_distinct_across_turns() {
+    fn codex_reused_provider_call_ids_remain_distinct_within_one_turn() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -19165,17 +19455,10 @@ Do not describe the tool, and do not skip the tool call."#;
 
             inner
                 .handle_notification(
-                    "turn/started",
-                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-two" } }),
-                )
-                .await;
-            drain_events(&mut rx);
-            inner
-                .handle_notification(
                     "item/started",
                     &json!({
                         "threadId": "thread-test",
-                        "turnId": "turn-two",
+                        "turnId": "turn-one",
                         "item": {
                             "type": "collabAgentToolCall",
                             "id": "call_1",
@@ -19199,7 +19482,7 @@ Do not describe the tool, and do not skip the tool call."#;
                 .to_owned();
             assert_ne!(first_id, second_id);
             assert_eq!(first_id, "codex:thread-test:turn-one:call_1");
-            assert_eq!(second_id, "codex:thread-test:turn-two:call_1");
+            assert_eq!(second_id, "codex:thread-test:turn-one:call_1:occurrence-2");
 
             inner.emitter.tool_progress(&ToolProgressData {
                 tool_call_id: second_id,
@@ -20745,6 +21028,7 @@ Do not describe the tool, and do not skip the tool call."#;
             }
             inner
                 .record_codex_subagent_spawn_metadata_if_needed(
+                    None,
                     None,
                     &json!({
                         "type": "collabAgentToolCall",
