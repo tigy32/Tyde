@@ -6667,6 +6667,40 @@ kbd {
     flex-shrink: 1;
 }
 
+/* Transient highlight of the go-to-definition target line, so a jump whose
+   target is already on screen still gives visible feedback. */
+.file-line-goto-flash {
+    animation: file-line-goto-flash 1.6s ease-out;
+}
+
+@keyframes file-line-goto-flash {
+    0%,
+    30% {
+        background: color-mix(in srgb, var(--accent-primary, #007acc) 30%, transparent);
+    }
+    100% {
+        background: transparent;
+    }
+}
+
+.file-view-deleted-banner {
+    padding: 6px 12px;
+    background: color-mix(in srgb, var(--error) 12%, transparent);
+    color: var(--error);
+    border-bottom: 1px solid var(--border);
+    font-size: 0.846rem;
+    flex-shrink: 0;
+}
+
+.file-view-code-intel-notice {
+    padding: 6px 12px;
+    background: color-mix(in srgb, var(--accent-primary, #007acc) 12%, transparent);
+    color: var(--text-secondary);
+    border-bottom: 1px solid var(--border);
+    font-size: 0.846rem;
+    flex-shrink: 0;
+}
+
 .file-view-close {
     width: 24px;
     height: 24px;
@@ -7307,6 +7341,36 @@ kbd {
 .code-intel-hover-popover pre {
     font-family: var(--font-mono, ui-monospace, monospace);
     font-size: 11px;
+}
+
+.code-intel-hover-diagnostic {
+    padding: 2px 0 6px;
+}
+
+.code-intel-hover-diagnostic + .code-intel-hover-diagnostic,
+.code-intel-hover-diagnostic + .code-intel-hover-markdown {
+    border-top: 1px solid var(--border, #30363d);
+    padding-top: 6px;
+}
+
+.code-intel-hover-diagnostic-severity {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--text-tertiary, #8b949e);
+}
+
+.code-intel-hover-diagnostic--error .code-intel-hover-diagnostic-severity {
+    color: var(--error, #f48771);
+}
+
+.code-intel-hover-diagnostic--warning .code-intel-hover-diagnostic-severity {
+    color: var(--warning, #e8c56a);
+}
+
+.code-intel-hover-diagnostic-message {
+    white-space: pre-wrap;
 }
 
 /* ===== Transient Notices (kept for backward compat but now rendered as cards) ===== */

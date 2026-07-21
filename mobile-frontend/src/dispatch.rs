@@ -3088,6 +3088,7 @@ mod wasm_tests {
                     version: protocol::ProjectFileVersion(1),
                     contents: Some("fn main() {}".to_owned()),
                     is_binary: false,
+                    missing: false,
                 },
             ),
         );

@@ -4864,6 +4864,13 @@ pub struct ProjectFileContentsPayload {
     pub version: ProjectFileVersion,
     pub contents: Option<String>,
     pub is_binary: bool,
+    /// The file did not exist on disk when this read ran. Server-owned
+    /// existence signal for open viewers: a watcher-driven refresh of a
+    /// deleted file reports `missing: true` (with `contents: None`) instead of
+    /// a pathless command error, so the client can label the exact viewer
+    /// "deleted on disk" without inferring deletion from directory listings.
+    #[serde(default)]
+    pub missing: bool,
 }
 
 // ── Project global search ─────────────────────────────────────────────────
@@ -5041,6 +5048,15 @@ pub struct CodeIntelProviderStatus {
     pub total_work: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Files-with-diagnostics aggregate for this provider's workspace: total
+    /// error diagnostics across *all* files the server has published for
+    /// (open or not). The server owns this because the client drops
+    /// diagnostics for closed files.
+    #[serde(default)]
+    pub error_count: u32,
+    /// Same aggregate for warnings.
+    #[serde(default)]
+    pub warning_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5070,6 +5086,15 @@ pub struct CodeIntelOverviewSummary {
     pub failed: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Project-wide diagnostics aggregate: error diagnostics summed over every
+    /// provider (which each count across all their workspace files, open or
+    /// not). Server-owned so the footer can show real error visibility even
+    /// though the client drops closed-file diagnostics.
+    #[serde(default)]
+    pub error_count: u32,
+    /// Same aggregate for warnings.
+    #[serde(default)]
+    pub warning_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5247,6 +5272,14 @@ pub struct CodeIntelNavigateResultPayload {
     pub version: ProjectFileVersion,
     /// Empty means "no definition found here" (a valid answer, not an error).
     pub targets: Vec<CodeIntelLocation>,
+    /// Definition targets the language server returned that resolve *outside
+    /// this provider's workspace root* (standard library, dependencies, or —
+    /// in a multi-root project — another root; providers are per-root and do
+    /// not classify against sibling roots). They are dropped from `targets`
+    /// (not navigable), but the count lets a client explain an
+    /// otherwise-silent no-op jump.
+    #[serde(default)]
+    pub external_targets: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -8026,6 +8059,7 @@ mod search_serde_tests {
             version: ProjectFileVersion(7),
             contents: Some("fn main() {}".to_owned()),
             is_binary: false,
+            missing: false,
         };
         let json = serde_json::to_value(&payload).expect("serialize");
         assert_eq!(json["version"], serde_json::json!(7));
@@ -8185,6 +8219,8 @@ mod code_intel_serde_tests {
                         work_done: Some(40),
                         total_work: Some(100),
                         message: Some("indexing".to_owned()),
+                        error_count: 3,
+                        warning_count: 1,
                     }],
                 },
                 CodeIntelRootOverview {
@@ -8200,6 +8236,8 @@ mod code_intel_serde_tests {
                 unavailable: 0,
                 failed: 0,
                 message: Some("Indexing code intelligence".to_owned()),
+                error_count: 3,
+                warning_count: 1,
             },
         };
         assert_eq!(round_trip(&payload), payload);
@@ -8220,6 +8258,8 @@ mod code_intel_serde_tests {
                 unavailable: 0,
                 failed: 0,
                 message: Some("No language server running — open a file to index".to_owned()),
+                error_count: 0,
+                warning_count: 0,
             },
         };
 
@@ -8338,6 +8378,7 @@ mod code_intel_serde_tests {
             path: sample_path(),
             version: ProjectFileVersion(2),
             targets: vec![sample_location()],
+            external_targets: 1,
         };
         assert_eq!(round_trip(&navigate), navigate);
         let hover = CodeIntelHoverResultPayload {

@@ -417,6 +417,7 @@ mod wasm_tests {
                     version: ProjectFileVersion(1),
                     contents: Some("the needle".to_owned()),
                     is_binary: false,
+                    missing: false,
                 },
             );
         });

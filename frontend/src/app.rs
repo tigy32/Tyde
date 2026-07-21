@@ -74,6 +74,24 @@ impl DocumentEventListenerHandle {
     }
 }
 
+/// A window listener registered in the **capture** phase (removal must pass the
+/// same `capture` flag, hence a distinct handle type).
+struct CaptureEventListenerHandle {
+    window: web_sys::Window,
+    event: &'static str,
+    callback: wasm_bindgen::closure::Closure<dyn Fn(web_sys::Event)>,
+}
+
+impl CaptureEventListenerHandle {
+    fn remove(self) {
+        let _ = self.window.remove_event_listener_with_callback_and_bool(
+            self.event,
+            self.callback.as_ref().unchecked_ref(),
+            true,
+        );
+    }
+}
+
 thread_local! {
     static APP_LISTENERS_ACTIVE: Cell<bool> = const { Cell::new(false) };
     static APP_LISTENER_TOKEN: Cell<u64> = const { Cell::new(0) };
@@ -85,6 +103,7 @@ thread_local! {
     static VISIBILITY_LISTENER_HANDLE: RefCell<Option<DocumentEventListenerHandle>> = const { RefCell::new(None) };
     static CLICK_LISTENER_HANDLE: RefCell<Option<EventListenerHandle>> = const { RefCell::new(None) };
     static FILE_DROP_LISTENER_HANDLES: RefCell<Vec<EventListenerHandle>> = const { RefCell::new(Vec::new()) };
+    static HOVER_DISMISS_LISTENER_HANDLES: RefCell<Vec<CaptureEventListenerHandle>> = const { RefCell::new(Vec::new()) };
 }
 
 fn set_app_listeners_active(active: bool) {
@@ -149,6 +168,11 @@ pub(crate) fn clear_app_listeners() {
         }
     });
     FILE_DROP_LISTENER_HANDLES.with(|handles| {
+        for handle in handles.borrow_mut().drain(..) {
+            handle.remove();
+        }
+    });
+    HOVER_DISMISS_LISTENER_HANDLES.with(|handles| {
         for handle in handles.borrow_mut().drain(..) {
             handle.remove();
         }
@@ -435,6 +459,41 @@ fn install_click_listener(state: AppState) {
             event: "click",
             callback,
         });
+    });
+}
+
+/// Dismiss the code-intel hover popover on **any** press anywhere in the app
+/// (left click or context menu). Registered in the capture phase so a
+/// component that stops propagation — tab strips, context menus — can never
+/// strand an open popover floating over unrelated content. Public within the
+/// crate so wasm tests can install it against a fixture state.
+pub(crate) fn install_hover_dismiss_listeners(state: AppState) {
+    HOVER_DISMISS_LISTENER_HANDLES.with(|handles| {
+        for handle in handles.borrow_mut().drain(..) {
+            handle.remove();
+        }
+    });
+
+    let window = web_sys::window().unwrap();
+    let mut handles = Vec::new();
+    for event in ["mousedown", "contextmenu"] {
+        let state = state.clone();
+        let callback = Closure::<dyn Fn(web_sys::Event)>::new(move |_ev: web_sys::Event| {
+            crate::actions::dismiss_hover(&state);
+        });
+        let _ = window.add_event_listener_with_callback_and_bool(
+            event,
+            callback.as_ref().unchecked_ref(),
+            true,
+        );
+        handles.push(CaptureEventListenerHandle {
+            window: window.clone(),
+            event,
+            callback,
+        });
+    }
+    HOVER_DISMISS_LISTENER_HANDLES.with(|slot| {
+        *slot.borrow_mut() = handles;
     });
 }
 
@@ -812,6 +871,10 @@ pub fn App() -> impl IntoView {
     });
     Effect::new(move |_| {
         install_file_drop_navigation_guard();
+    });
+    let state_for_hover_dismiss = state.clone();
+    Effect::new(move |_| {
+        install_hover_dismiss_listeners(state_for_hover_dismiss.clone());
     });
 
     let state_for_feedback = state.clone();

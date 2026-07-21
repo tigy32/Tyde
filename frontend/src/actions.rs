@@ -857,13 +857,9 @@ pub fn request_hover(
 /// hover id **even when no popover is currently visible**, so a request that is
 /// still in flight (debounce fired, result not yet back) is dropped on arrival.
 pub fn dismiss_hover(state: &AppState) {
-    // Mint a fresh id as the active hover so any in-flight result (which carries
-    // an older id) is dropped by `apply_code_intel_hover_result`.
-    let superseded = next_code_intel_id(state);
-    state.code_intel_active_hover.set(superseded);
-    if state.code_intel_hover.with_untracked(|h| h.is_some()) {
-        state.code_intel_hover.set(None);
-    }
+    // Mints a fresh id as the active hover so any in-flight result (which
+    // carries an older id) is dropped by `apply_code_intel_hover_result`.
+    state.dismiss_code_intel_hover();
 }
 
 /// Start a streamed find-references query (Shift+F12 / M5). Mints a fresh
@@ -1432,6 +1428,7 @@ mod native_tests {
                         version: ProjectFileVersion(1),
                         contents: Some("fn main() {}".to_owned()),
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });

@@ -2042,6 +2042,7 @@ mod wasm_tests {
                     version: ProjectFileVersion(1),
                     contents: Some(file_contents),
                     is_binary: false,
+                    missing: false,
                 },
             );
         });
@@ -2202,6 +2203,7 @@ mod wasm_tests {
                     version: ProjectFileVersion(1),
                     contents: Some(file_contents),
                     is_binary: false,
+                    missing: false,
                 },
             );
         });

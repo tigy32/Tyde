@@ -506,7 +506,37 @@ struct RaActor {
     /// Last non-forced progress report emission. `$/progress` reports can arrive
     /// much faster than the UI can render, so they are coalesced here.
     last_progress_status_at: Option<StdInstant>,
+    /// Last-published raw LSP diagnostics per absolute file path, kept for
+    /// *every* workspace file the server publishes for — subscribed or not.
+    /// Two consumers: (1) a subscribe replays this cache so a close→reopen (or
+    /// a first open of a file whose errors were published while it was closed)
+    /// paints diagnostics immediately — rust-analyzer does not re-publish on a
+    /// plain `didOpen` of unchanged content and the client drops frames for
+    /// closed files; (2) the project-level error/warning aggregate is summed
+    /// from it. Raw JSON (not converted) because conversion to byte ranges
+    /// needs the file text, which is only known once the file is opened. An
+    /// empty publish clears the entry (the file is clean again).
+    published_diagnostics: HashMap<PathBuf, Vec<Value>>,
+    /// When the provider entered `Unavailable` (binary not found). Discovery is
+    /// retried on the next subscribe/warm once [`DISCOVERY_RETRY_BACKOFF`] has
+    /// elapsed — without this the failure is sticky for the server's lifetime,
+    /// so installing the language server never takes effect until an app
+    /// restart.
+    unavailable_since: Option<StdInstant>,
+    /// The workspace root's path prefixes: the configured path first, then
+    /// (when different) its canonical form. Language servers may report URIs
+    /// in either form (macOS: `/tmp` vs `/private/tmp`), while every
+    /// `SubscribedFile.absolute` and cache key uses the configured form —
+    /// [`Self::normalize_workspace_path`] folds incoming paths onto that one
+    /// key form. Canonicalization is IO, so it runs once at actor creation,
+    /// mirroring the watcher's `WatcherRootPaths`.
+    root_prefixes: Vec<PathBuf>,
 }
+
+/// Minimum wait between `Unavailable` discovery retries. Long enough that a
+/// burst of subscribes doesn't hammer discovery probes, short enough that
+/// "install the binary, reopen the file" just works.
+const DISCOVERY_RETRY_BACKOFF: Duration = Duration::from_secs(10);
 
 impl RaActor {
     fn new(
@@ -516,6 +546,17 @@ impl RaActor {
         self_tx: mpsc::UnboundedSender<RaCommand>,
         provider_status_tx: Option<mpsc::UnboundedSender<CodeIntelProviderStatus>>,
     ) -> Self {
+        let raw_root = PathBuf::from(&root.0);
+        let mut root_prefixes = vec![raw_root.clone()];
+        match std::fs::canonicalize(&root.0) {
+            Ok(canonical) if canonical != raw_root => root_prefixes.push(canonical),
+            Ok(_) => {}
+            Err(error) => tracing::debug!(
+                %error,
+                root = %root.0,
+                "code-intel root canonicalization failed; matching the configured path only"
+            ),
+        }
         Self {
             config,
             self_tx,
@@ -539,7 +580,26 @@ impl RaActor {
             last_provider_status: None,
             last_file_statuses: HashMap::new(),
             last_progress_status_at: None,
+            published_diagnostics: HashMap::new(),
+            unavailable_since: None,
+            root_prefixes,
         }
+    }
+
+    /// Fold an absolute path reported by the language server onto the
+    /// configured-root key form used by `SubscribedFile.absolute` and
+    /// `published_diagnostics`. Returns `None` when the path is outside this
+    /// provider's workspace root (under neither the configured nor the
+    /// canonical prefix) — such paths are not workspace files and must not
+    /// enter the cache or the footer totals.
+    fn normalize_workspace_path(&self, absolute: &Path) -> Option<PathBuf> {
+        let configured = &self.root_prefixes[0];
+        for prefix in &self.root_prefixes {
+            if let Ok(relative) = absolute.strip_prefix(prefix) {
+                return Some(configured.join(relative));
+            }
+        }
+        None
     }
 
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<RaCommand>) {
@@ -630,9 +690,17 @@ impl RaActor {
                         Err(failure) => self.emit_start_failure(failure, true),
                     },
                     Phase::Unavailable | Phase::Failed => {
-                        // Re-emit the terminal status so the new file's chip is
-                        // honest (no provider will come up for it).
-                        self.emit_status_for(&path);
+                        // `Unavailable` means the binary was missing at the
+                        // last probe — the user may have installed it since, so
+                        // retry discovery (backed off) instead of staying
+                        // sticky until an app restart.
+                        if self.phase == Phase::Unavailable && self.discovery_retry_due() {
+                            self.retry_unavailable_start().await;
+                        } else {
+                            // Re-emit the terminal status so the new file's
+                            // chip is honest (no provider will come up for it).
+                            self.emit_status_for(&path);
+                        }
                     }
                     Phase::Starting | Phase::Indexing | Phase::Ready => {
                         self.emit_status_for(&path);
@@ -640,6 +708,13 @@ impl RaActor {
                             self.reopen_file(&path).await;
                         } else {
                             self.open_file(path.clone()).await;
+                            // Replay the last-published diagnostics for this
+                            // file from the server-side cache. Only when the
+                            // version is unchanged: after a `didChange` the
+                            // server re-publishes against the new text itself,
+                            // and cached ranges would resolve against stale
+                            // offsets.
+                            self.replay_published_diagnostics(&path);
                         }
                         self.ensure_file_models();
                     }
@@ -653,6 +728,11 @@ impl RaActor {
                         Err(failure) => self.emit_start_failure(failure, true),
                     },
                     Phase::Starting | Phase::Indexing | Phase::Ready => {}
+                    // A project switch re-warms its roots: the natural moment
+                    // to re-probe a previously missing binary.
+                    Phase::Unavailable if self.discovery_retry_due() => {
+                        self.retry_unavailable_start().await;
+                    }
                     Phase::Unavailable | Phase::Failed => {}
                 }
             }
@@ -660,8 +740,20 @@ impl RaActor {
                 // M1: keep the process alive after the last unsubscribe
                 // (idle-shutdown policy is deferred, spec §9). Just stop
                 // tracking the file so stale diagnostics aren't forwarded.
-                self.files.remove(&path);
-                self.opened.remove(&path);
+                let removed = self.files.remove(&path);
+                // Tell the language server the document is closed. Without the
+                // `didClose`, the next subscribe's `didOpen` is a duplicate
+                // open of a still-open document, which rust-analyzer rejects —
+                // so a close→reopen never received diagnostics again.
+                if self.opened.remove(&path)
+                    && let Some(client) = self.client.as_ref()
+                    && let Some(uri) = removed.as_ref().and_then(|file| file_uri(&file.absolute))
+                {
+                    let _ = client.notify(
+                        "textDocument/didClose",
+                        json!({ "textDocument": { "uri": uri } }),
+                    );
+                }
                 self.last_file_statuses.remove(&path);
                 // Cancel any in-flight whole-file resolution (dropping the
                 // handle drops its `_cancel_tx`, which the driver awaits).
@@ -676,7 +768,13 @@ impl RaActor {
                 // driven by the watcher and re-using the file's stored output
                 // stream (no new subscribe).
                 let Some(file) = self.files.get_mut(&path) else {
-                    // Not subscribed here (or unsubscribed in between): ignore.
+                    // Not subscribed here (closed viewer or never opened). The
+                    // language server still needs to hear about the disk
+                    // change: it has no watcher of its own in this setup, so a
+                    // closed-file edit would otherwise freeze diagnostics
+                    // crate-wide (a re-created util.rs never clears main.rs's
+                    // "file not found for module").
+                    self.untracked_file_changed(&path);
                     return;
                 };
                 // Monotonic: only advance, never regress. An equal version
@@ -812,6 +910,11 @@ impl RaActor {
         self.active_progress.clear();
         self.last_progress_status_at = None;
         self.resolutions.clear();
+        // The cache holds the dead server's world view; the replacement
+        // re-analyzes and republishes from scratch. Keeping it would replay
+        // (and count in the footer) diagnostics no live server stands behind.
+        self.published_diagnostics.clear();
+        self.emit_provider_status_if_totals_changed();
         match self.start().await {
             Ok(()) => {
                 let paths: Vec<ProjectPath> = self.files.keys().cloned().collect();
@@ -936,6 +1039,7 @@ impl RaActor {
                 path: payload.path.clone(),
                 version: payload.version,
                 targets: Vec::new(),
+                external_targets: 0,
             };
             emit(output, FrameKind::CodeIntelNavigateResult, &result);
         };
@@ -969,7 +1073,7 @@ impl RaActor {
                 "textDocument": { "uri": uri },
                 "position": { "line": line, "character": character },
             });
-            let targets = match request_while_active_id(
+            let (targets, external_targets) = match request_while_active_id(
                 &requester,
                 "textDocument/definition",
                 params,
@@ -979,11 +1083,11 @@ impl RaActor {
             .await
             {
                 ActiveIdRequestOutcome::Response(Ok(value)) => {
-                    let targets = locations_to_byte_targets(&root, value).await;
+                    let converted = locations_to_byte_targets(&root, value).await;
                     if active.load(Ordering::SeqCst) != payload.navigate_id {
                         return;
                     }
-                    targets
+                    converted
                 }
                 ActiveIdRequestOutcome::Response(Err(error)) => {
                     tracing::debug!(%error, "code-intel: textDocument/definition failed");
@@ -998,7 +1102,7 @@ impl RaActor {
                             },
                         );
                     }
-                    Vec::new()
+                    (Vec::new(), 0)
                 }
                 ActiveIdRequestOutcome::Superseded => return,
             };
@@ -1017,6 +1121,7 @@ impl RaActor {
                     path: payload.path,
                     version: payload.version,
                     targets: Vec::new(),
+                    external_targets: 0,
                 };
                 emit(&output, FrameKind::CodeIntelNavigateResult, &result);
                 return;
@@ -1026,6 +1131,7 @@ impl RaActor {
                 path: payload.path,
                 version: payload.version,
                 targets,
+                external_targets,
             };
             emit(&output, FrameKind::CodeIntelNavigateResult, &result);
         });
@@ -1324,15 +1430,103 @@ impl RaActor {
         });
         if let Some(client) = self.client.as_ref() {
             let _ = client.notify("textDocument/didOpen", params);
+            // The file may have changed on disk while it was closed (closed
+            // files get no `didChange`), leaving flycheck's last results — the
+            // compiler-diagnostics source — stale crate-wide. A save
+            // notification makes rust-analyzer re-check; when nothing actually
+            // changed, the re-check is a cheap fingerprint no-op.
+            let _ = client.notify(
+                "textDocument/didSave",
+                json!({ "textDocument": { "uri": uri } }),
+            );
         }
         self.opened.insert(path);
+    }
+
+    /// Replay the last-published diagnostics for a (re-)subscribed file from
+    /// the server-side cache. Rust-analyzer does not re-publish on a plain
+    /// `didOpen` of unchanged content and the client drops diagnostics frames
+    /// for closed files, so without the replay a close→reopen — or a first
+    /// open of a file whose errors were published while it was closed — showed
+    /// no diagnostics until the next crate-wide recheck.
+    fn replay_published_diagnostics(&self, path: &ProjectPath) {
+        let Some(file) = self.files.get(path) else {
+            return;
+        };
+        let Some(raw) = self.published_diagnostics.get(&file.absolute) else {
+            return;
+        };
+        if !self.opened.contains(path) {
+            // `didOpen` never went out (the subscribe's read failed), so
+            // `file.text` is not the text the client renders — there is no
+            // index to resolve the cached positions against. A successfully
+            // opened but legitimately empty file passes: its text is
+            // authoritative even when empty.
+            return;
+        }
+        let index = LineIndex::new(&file.text);
+        let diagnostics = raw
+            .iter()
+            .filter_map(|item| convert_diagnostic(&index, item))
+            .collect::<Vec<_>>();
+        if diagnostics.is_empty() {
+            return;
+        }
+        let payload = CodeIntelDiagnosticsPayload {
+            path: path.clone(),
+            version: file.version,
+            diagnostics,
+        };
+        emit(&file.output, FrameKind::CodeIntelDiagnostics, &payload);
+    }
+
+    /// The file vanished from disk while subscribed (deletion observed via a
+    /// version bump whose re-read got `NotFound`). Close the document with the
+    /// language server — otherwise the last `didOpen`/`didChange` text lives on
+    /// as an overlay and the server keeps analyzing a file that no longer
+    /// exists (`mod util;` never reports "file not found") — drop its cached
+    /// diagnostics, and push an empty diagnostics set so the client clears any
+    /// stale squiggles. The subscription itself stays: if the file is
+    /// re-created, the next version bump re-opens it.
+    async fn close_deleted_file(&mut self, path: &ProjectPath) {
+        self.resolutions.remove(path);
+        let Some(file) = self.files.get_mut(path) else {
+            return;
+        };
+        file.model_version = None;
+        file.text = String::new();
+        let absolute = file.absolute.clone();
+        let output = file.output.clone();
+        let version = file.version;
+        self.published_diagnostics.remove(&absolute);
+        if self.opened.remove(path)
+            && let Some(client) = self.client.as_ref()
+            && let Some(uri) = file_uri(&absolute)
+        {
+            let _ = client.notify(
+                "textDocument/didClose",
+                json!({ "textDocument": { "uri": uri } }),
+            );
+        }
+        emit(
+            &output,
+            FrameKind::CodeIntelDiagnostics,
+            &CodeIntelDiagnosticsPayload {
+                path: path.clone(),
+                version,
+                diagnostics: Vec::new(),
+            },
+        );
+        // Dropping the cached diagnostics may have changed the footer totals.
+        self.emit_provider_status_if_totals_changed();
     }
 
     /// Re-read a file that changed under us (a re-subscribe at a new version)
     /// and notify rust-analyzer with a full-document `didChange`, then clear its
     /// `model_version` so the whole-file model push restarts against the new
     /// contents (M3 supersession). Falls back to a first `didOpen` if the file
-    /// somehow isn't open yet.
+    /// somehow isn't open yet. A `NotFound` on the re-read is a deletion, not a
+    /// transient failure — see [`Self::close_deleted_file`].
     async fn reopen_file(&mut self, path: &ProjectPath) {
         if !self.opened.contains(path) {
             self.open_file(path.clone()).await;
@@ -1341,6 +1535,10 @@ impl RaActor {
         let absolute = absolute_path(path);
         let text = match tokio::fs::read_to_string(&absolute).await {
             Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.close_deleted_file(path).await;
+                return;
+            }
             Err(error) => {
                 tracing::warn!(%error, ?absolute, "code-intel: failed to re-read file for didChange");
                 return;
@@ -1362,8 +1560,72 @@ impl RaActor {
             "textDocument": { "uri": uri, "version": version },
             "contentChanges": [{ "text": text }],
         });
+        // The cached publish describes the *previous* text: a resubscribe
+        // arriving before the server re-publishes must not replay old ranges
+        // onto the new content. The `didSave` below refills it.
+        self.published_diagnostics.remove(&absolute);
         if let Some(client) = self.client.as_ref() {
             let _ = client.notify("textDocument/didChange", params);
+            // The watcher only reports content already on disk, so the change
+            // is by definition a save — and rust-analyzer's flycheck (cargo
+            // check), the source of compiler diagnostics, re-runs only on
+            // `didSave`. Without it, diagnostics freeze at the last check.
+            let _ = client.notify(
+                "textDocument/didSave",
+                json!({ "textDocument": { "uri": uri } }),
+            );
+        }
+    }
+
+    /// A watched disk change for a file this provider has no subscription for.
+    /// The language server holds no overlay for it, but its VFS and last
+    /// flycheck results still describe the old disk content. Sync the change
+    /// via `workspace/didChangeWatchedFiles`, drop our cached publish for it
+    /// (it describes the old content), and kick a re-check through `didSave`
+    /// on one open document — flycheck's only trigger. Non-matching extensions
+    /// are ignored (the change belongs to another provider's language).
+    fn untracked_file_changed(&mut self, path: &ProjectPath) {
+        let extension_matches = Path::new(&path.relative_path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| {
+                let ext = ext.to_ascii_lowercase();
+                self.config.extensions.contains(&ext.as_str())
+            });
+        if !extension_matches {
+            return;
+        }
+        if self.client.is_none() {
+            return;
+        }
+        let absolute = absolute_path(path);
+        let Some(uri) = file_uri(&absolute) else {
+            return;
+        };
+        // LSP FileChangeType: 1 = Created, 2 = Changed, 3 = Deleted. Created
+        // and Changed both make the server (re)load from disk, so Changed
+        // covers new files too; only deletion needs distinguishing.
+        let change_type = if absolute.exists() { 2 } else { 3 };
+        let kick_uri = self
+            .opened
+            .iter()
+            .next()
+            .and_then(|open_path| file_uri(&absolute_path(open_path)));
+        if let Some(client) = self.client.as_ref() {
+            let _ = client.notify(
+                "workspace/didChangeWatchedFiles",
+                json!({ "changes": [{ "uri": uri, "type": change_type }] }),
+            );
+            if let Some(open_uri) = kick_uri {
+                let _ = client.notify(
+                    "textDocument/didSave",
+                    json!({ "textDocument": { "uri": open_uri } }),
+                );
+            }
+        }
+        if change_type == 3 {
+            self.published_diagnostics.remove(&absolute);
+            self.emit_provider_status_if_totals_changed();
         }
     }
 
@@ -1463,7 +1725,28 @@ impl RaActor {
             tracing::debug!(%uri, "code-intel: ignoring publishDiagnostics with unparseable URI");
             return;
         };
-        let Some((path, version, output, text)) = self.files.iter().find_map(|(path, file)| {
+        // Malformed traffic: `diagnostics` is required by the LSP spec. Do not
+        // reinterpret its absence as "the file is clean" — that would clear
+        // cached diagnostics on garbage input.
+        let Some(raw) = params.get("diagnostics").and_then(Value::as_array).cloned() else {
+            tracing::warn!(
+                %uri,
+                "code-intel: ignoring publishDiagnostics without a diagnostics array"
+            );
+            return;
+        };
+        // Fold the reported path onto the configured-root key form (macOS
+        // servers may report the canonical `/private/tmp/...` for a configured
+        // `/tmp/...` root); reject paths outside this provider's root so
+        // dependency files can't enter the cache or the footer totals.
+        let Some(incoming) = self.normalize_workspace_path(&incoming) else {
+            tracing::debug!(
+                %uri,
+                "code-intel: ignoring publishDiagnostics outside the workspace root"
+            );
+            return;
+        };
+        let subscribed = self.files.iter().find_map(|(path, file)| {
             (file.absolute == incoming).then(|| {
                 (
                     path.clone(),
@@ -1472,29 +1755,53 @@ impl RaActor {
                     file.text.clone(),
                 )
             })
-        }) else {
-            // Diagnostics for an unsubscribed workspace file: ignore in M1.
+        });
+        // The `didOpen`/`didChange` we send carry `ProjectFileVersion` as the
+        // LSP document version, so a versioned publish correlates directly.
+        // A publish for an older version arriving after the watcher already
+        // advanced the file describes text we no longer render: stamping it
+        // with the current version would paint stale ranges and poison the
+        // replay cache — drop it; the re-analysis of the newer didChange
+        // publishes again.
+        if let Some((path, version, _, _)) = &subscribed
+            && let Some(published) = params.get("version").and_then(Value::as_u64)
+            && published != version.0
+        {
+            tracing::info!(
+                path = %path.relative_path,
+                current = version.0,
+                published,
+                "code-intel: dropping publishDiagnostics for a superseded file version"
+            );
             return;
-        };
+        }
+        // Cache the last-published raw set per absolute path — for *every*
+        // workspace file, subscribed or not — so a later subscribe can replay
+        // it (see `published_diagnostics`). An empty publish means the file is
+        // clean again: drop the entry rather than storing an empty replay.
+        if raw.is_empty() {
+            self.published_diagnostics.remove(&incoming);
+        } else {
+            self.published_diagnostics
+                .insert(incoming.clone(), raw.clone());
+        }
+        // Project-level error/warning visibility (footer counts): the totals
+        // just moved with this publish, so push a provider-status update.
+        self.emit_provider_status_if_totals_changed();
+        if let Some((path, version, output, text)) = subscribed {
+            let index = LineIndex::new(&text);
+            let diagnostics = raw
+                .iter()
+                .filter_map(|item| convert_diagnostic(&index, item))
+                .collect::<Vec<_>>();
 
-        let index = LineIndex::new(&text);
-        let diagnostics = params
-            .get("diagnostics")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| convert_diagnostic(&index, item))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        let payload = CodeIntelDiagnosticsPayload {
-            path,
-            version,
-            diagnostics,
-        };
-        emit(&output, FrameKind::CodeIntelDiagnostics, &payload);
+            let payload = CodeIntelDiagnosticsPayload {
+                path,
+                version,
+                diagnostics,
+            };
+            emit(&output, FrameKind::CodeIntelDiagnostics, &payload);
+        }
 
         // Diagnostics arriving while no progress is in flight means the initial
         // analysis settled — promote to Ready. M1-acceptable heuristic: this and
@@ -1637,9 +1944,39 @@ impl RaActor {
         }
     }
 
+    /// Whether an `Unavailable` provider should re-probe discovery (the
+    /// backoff since it went unavailable has elapsed).
+    fn discovery_retry_due(&self) -> bool {
+        self.unavailable_since
+            .is_some_and(|since| since.elapsed() >= DISCOVERY_RETRY_BACKOFF)
+    }
+
+    /// Re-run the cold-start path for an `Unavailable` provider (the binary
+    /// may have been installed since) and, on success, re-open every
+    /// still-subscribed file — the same sequence a first subscribe drives.
+    async fn retry_unavailable_start(&mut self) {
+        match self.start().await {
+            Ok(()) => {
+                let paths: Vec<ProjectPath> = self.files.keys().cloned().collect();
+                for path in paths {
+                    self.open_file(path).await;
+                }
+                self.ensure_file_models();
+            }
+            Err(failure) => self.emit_start_failure(failure, true),
+        }
+    }
+
     fn set_phase(&mut self, phase: Phase, message: Option<String>) {
         self.phase = phase;
         self.message = message;
+        // Each (re-)entry into Unavailable restarts the retry backoff; any
+        // other phase clears it (the binary was found).
+        self.unavailable_since = if phase == Phase::Unavailable {
+            Some(StdInstant::now())
+        } else {
+            None
+        };
         self.emit_status_all(None, None, true);
         // Becoming Ready is the trigger to push whole-file models for any
         // opened files that haven't been pushed at their current version, and to
@@ -1680,10 +2017,49 @@ impl RaActor {
         false
     }
 
+    /// Total (errors, warnings) across the last-published diagnostics of every
+    /// workspace file (open or not). Severity mirrors [`convert_diagnostic`]:
+    /// 1 ⇒ error, 3/4 ⇒ neither, anything else (2 or unannotated) ⇒ warning.
+    fn diagnostic_totals(&self) -> (u32, u32) {
+        let mut errors = 0u32;
+        let mut warnings = 0u32;
+        for raw in self.published_diagnostics.values() {
+            for item in raw {
+                match item.get("severity").and_then(Value::as_u64) {
+                    Some(1) => errors += 1,
+                    Some(3) | Some(4) => {}
+                    _ => warnings += 1,
+                }
+            }
+        }
+        (errors, warnings)
+    }
+
+    /// Push a provider-status update when the diagnostic totals moved (the
+    /// footer's error/warning counts), without waiting for a phase change.
+    fn emit_provider_status_if_totals_changed(&mut self) {
+        let totals_changed = match self.last_provider_status.as_ref() {
+            Some(last) => (last.error_count, last.warning_count) != self.diagnostic_totals(),
+            None => self.diagnostic_totals() != (0, 0),
+        };
+        if totals_changed {
+            // Totals-only update: carry the last reported progress forward.
+            // Diagnostics routinely arrive mid-index, and a `None`/`None`
+            // emission here would wipe "Indexing 30/100" from the footer.
+            let (work_done, total_work) = self
+                .last_provider_status
+                .as_ref()
+                .map(|status| (status.work_done, status.total_work))
+                .unwrap_or((None, None));
+            self.emit_provider_status(work_done, total_work);
+        }
+    }
+
     fn emit_provider_status(&mut self, work_done: Option<u32>, total_work: Option<u32>) {
         let Some(tx) = &self.provider_status_tx else {
             return;
         };
+        let (error_count, warning_count) = self.diagnostic_totals();
         let status = CodeIntelProviderStatus {
             provider: self.config.provider_id.clone(),
             language: self.config.language.clone(),
@@ -1692,6 +2068,8 @@ impl RaActor {
             work_done,
             total_work,
             message: self.message.clone(),
+            error_count,
+            warning_count,
         };
         if self.last_provider_status.as_ref() == Some(&status) {
             return;
@@ -2347,7 +2725,9 @@ async fn resolve_definition(
         "position": { "line": line, "character": character },
     });
     match requester.request("textDocument/definition", params).await {
-        Ok(value) => locations_to_byte_targets(root, value).await,
+        // The push model only carries navigable (in-project) targets; the
+        // external count is meaningful for the on-demand navigate path only.
+        Ok(value) => locations_to_byte_targets(root, value).await.0,
         Err(error) => {
             tracing::debug!(%error, "code-intel: push definition resolve failed");
             Vec::new()
@@ -2773,16 +3153,39 @@ fn convert_diagnostic(index: &LineIndex, diagnostic: &Value) -> Option<CodeIntel
 ///
 /// Targets outside the project root (stdlib, cargo-registry deps) are skipped
 /// in M2: a `ProjectPath` is rooted at the project, and the frontend can only
-/// open in-project files. Cross-crate-out-of-root navigation is deferred.
-async fn locations_to_byte_targets(root: &ProjectRootPath, value: Value) -> Vec<CodeIntelLocation> {
+/// open in-project files. Cross-crate-out-of-root navigation is deferred, but
+/// the number of skipped external targets is **counted** and reported, so a
+/// jump whose only definitions live in a dependency can be explained to the
+/// user instead of silently doing nothing.
+async fn locations_to_byte_targets(
+    root: &ProjectRootPath,
+    value: Value,
+) -> (Vec<CodeIntelLocation>, u32) {
     let raw = parse_lsp_locations(&value);
+    // Servers may report targets under the root's canonical form (macOS:
+    // `/private/tmp/...` for a configured `/tmp/...` root); resolve it once so
+    // in-root targets are not misclassified as external.
+    let canonical_root = tokio::fs::canonicalize(&root.0)
+        .await
+        .ok()
+        .filter(|canonical| *canonical != Path::new(&root.0));
     let mut out = Vec::new();
+    let mut external = 0u32;
     for (uri, (start_line, start_char, end_line, end_char)) in raw {
         let Some(absolute) = uri_to_path(&uri) else {
             continue;
         };
-        let Some(relative_path) = relative_to_root(root, &absolute) else {
-            // Outside the project root: not navigable in M2.
+        let relative = relative_to_root(root, &absolute).or_else(|| {
+            let canonical = canonical_root.as_ref()?;
+            absolute
+                .strip_prefix(canonical)
+                .ok()
+                .map(|relative| relative.to_string_lossy().into_owned())
+        });
+        let Some(relative_path) = relative else {
+            // Outside this provider's workspace root: not navigable in M2,
+            // but counted.
+            external += 1;
             continue;
         };
         let text = match tokio::fs::read_to_string(&absolute).await {
@@ -2802,7 +3205,7 @@ async fn locations_to_byte_targets(root: &ProjectRootPath, value: Value) -> Vec<
             range,
         });
     }
-    out
+    (out, external)
 }
 
 /// Flatten an LSP definition result into `(uri, (start_line, start_char,
@@ -3260,6 +3663,387 @@ mod tests {
         let payload = delivered.expect("diagnostics delivered on the re-subscribe stream");
         assert_eq!(payload.diagnostics.len(), 1);
         assert_eq!(payload.path, path);
+    }
+
+    fn drain_diagnostics_frames(
+        rx: &mut mpsc::UnboundedReceiver<protocol::Envelope>,
+    ) -> Vec<CodeIntelDiagnosticsPayload> {
+        let mut payloads = Vec::new();
+        while let Ok(envelope) = rx.try_recv() {
+            if envelope.kind == FrameKind::CodeIntelDiagnostics {
+                payloads
+                    .push(serde_json::from_value(envelope.payload).expect("diagnostics payload"));
+            }
+        }
+        payloads
+    }
+
+    fn captured_methods(captured: &CapturedRequests) -> Vec<String> {
+        captured
+            .lock()
+            .expect("captured mutex poisoned")
+            .iter()
+            .map(|(method, _)| method.clone())
+            .collect()
+    }
+
+    async fn wait_for_captured_method(captured: &CapturedRequests, method: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if captured_methods(captured).iter().any(|m| m == method) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "language server never received {method}; got {:?}",
+            captured_methods(captured)
+        );
+    }
+
+    /// A3: closing a tab (unsubscribe) must `didClose` the document — otherwise
+    /// the next subscribe's `didOpen` is a duplicate open the language server
+    /// rejects — and the re-subscribe must replay the cached last-published
+    /// diagnostics immediately (the server does not re-publish on a `didOpen`
+    /// of unchanged content).
+    #[tokio::test]
+    async fn unsubscribe_didcloses_and_resubscribe_replays_cached_diagnostics() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = ProjectRootPath(dir.path().to_string_lossy().into_owned());
+        let path = ProjectPath {
+            root: root.clone(),
+            relative_path: "main.rs".to_owned(),
+        };
+        let text = "fn main() { let _x: i32 = \"no\"; }";
+        std::fs::write(dir.path().join("main.rs"), text).expect("write main.rs");
+
+        let (c2s_w, c2s_r) = tokio::io::duplex(64 * 1024);
+        let (s2c_w, s2c_r) = tokio::io::duplex(64 * 1024);
+        let captured = std::sync::Arc::new(StdMutex::new(Vec::new()));
+        tokio::spawn(recording_lsp(
+            c2s_r,
+            s2c_w,
+            HashMap::new(),
+            captured.clone(),
+        ));
+        let (client, _events) = LspClient::from_io(c2s_w, s2c_r, None);
+
+        let mut actor = test_actor(root.clone(), CodeIntelResourceMode::Full);
+        actor.phase = Phase::Ready;
+        actor.client = Some(client);
+        let absolute = absolute_path(&path);
+        let (old_tx, _old_rx) = mpsc::unbounded_channel();
+        actor.files.insert(
+            path.clone(),
+            SubscribedFile {
+                version: ProjectFileVersion(1),
+                version_cell: Arc::new(AtomicU64::new(1)),
+                output: Stream::new(StreamPath("/project/p".to_owned()), old_tx),
+                text: text.to_owned(),
+                absolute: absolute.clone(),
+                model_version: None,
+            },
+        );
+        actor.opened.insert(path.clone());
+
+        // The server publishes an error while the file is open (fills the cache).
+        let uri = file_uri(&absolute).unwrap();
+        actor.on_publish_diagnostics(json!({
+            "uri": uri,
+            "diagnostics": [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
+                "severity": 1,
+                "message": "mismatched types",
+            }],
+        }));
+
+        // Tab closed.
+        actor
+            .handle_command(RaCommand::Unsubscribe { path: path.clone() })
+            .await;
+        assert!(actor.files.is_empty());
+        assert!(actor.opened.is_empty());
+        wait_for_captured_method(&captured, "textDocument/didClose").await;
+
+        // Tab reopened at the same version, on a fresh output stream.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        actor
+            .handle_command(RaCommand::Subscribe {
+                path: path.clone(),
+                version: ProjectFileVersion(1),
+                output: Stream::new(StreamPath("/project/p".to_owned()), tx),
+            })
+            .await;
+        wait_for_captured_method(&captured, "textDocument/didOpen").await;
+
+        let replayed = drain_diagnostics_frames(&mut rx);
+        assert_eq!(
+            replayed.len(),
+            1,
+            "re-subscribe must replay the cached diagnostics"
+        );
+        assert_eq!(replayed[0].path, path);
+        assert_eq!(replayed[0].version, ProjectFileVersion(1));
+        assert_eq!(replayed[0].diagnostics.len(), 1);
+        assert_eq!(replayed[0].diagnostics[0].message, "mismatched types");
+    }
+
+    /// A5: diagnostics published for a file that was never subscribed (e.g. a
+    /// crate-wide check flagged it while its tab was closed) must be cached and
+    /// replayed when the file is first opened.
+    #[tokio::test]
+    async fn subscribe_replays_diagnostics_published_while_file_was_closed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = ProjectRootPath(dir.path().to_string_lossy().into_owned());
+        let path = ProjectPath {
+            root: root.clone(),
+            relative_path: "lib.rs".to_owned(),
+        };
+        let text = "pub fn broken() -> i32 { \"no\" }";
+        std::fs::write(dir.path().join("lib.rs"), text).expect("write lib.rs");
+
+        // No client: `didOpen` is skipped but the subscribe path (read text,
+        // track file, replay cache) still runs.
+        let mut actor = test_actor(root.clone(), CodeIntelResourceMode::Full);
+        actor.phase = Phase::Ready;
+
+        let uri = file_uri(&absolute_path(&path)).unwrap();
+        actor.on_publish_diagnostics(json!({
+            "uri": uri,
+            "diagnostics": [{
+                "range": {"start": {"line": 0, "character": 25}, "end": {"line": 0, "character": 29}},
+                "severity": 1,
+                "message": "expected `i32`, found `&str`",
+            }],
+        }));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        actor
+            .handle_command(RaCommand::Subscribe {
+                path: path.clone(),
+                version: ProjectFileVersion(0),
+                output: Stream::new(StreamPath("/project/p".to_owned()), tx),
+            })
+            .await;
+
+        let replayed = drain_diagnostics_frames(&mut rx);
+        assert_eq!(
+            replayed.len(),
+            1,
+            "first open of a flagged file must paint its known diagnostics"
+        );
+        assert_eq!(replayed[0].diagnostics.len(), 1);
+        assert_eq!(
+            replayed[0].diagnostics[0].message,
+            "expected `i32`, found `&str`"
+        );
+    }
+
+    /// A6: a file deleted from disk while subscribed must be `didClose`d (so
+    /// the language server drops its overlay and re-analyzes the workspace
+    /// without it) and its stale squiggles cleared, and a later re-creation
+    /// must re-open it.
+    #[tokio::test]
+    async fn deleted_file_closes_document_and_clears_diagnostics() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = ProjectRootPath(dir.path().to_string_lossy().into_owned());
+        let path = ProjectPath {
+            root: root.clone(),
+            relative_path: "util.rs".to_owned(),
+        };
+        let text = "pub fn util() {}";
+        std::fs::write(dir.path().join("util.rs"), text).expect("write util.rs");
+
+        let (c2s_w, c2s_r) = tokio::io::duplex(64 * 1024);
+        let (s2c_w, s2c_r) = tokio::io::duplex(64 * 1024);
+        let captured = std::sync::Arc::new(StdMutex::new(Vec::new()));
+        tokio::spawn(recording_lsp(
+            c2s_r,
+            s2c_w,
+            HashMap::new(),
+            captured.clone(),
+        ));
+        let (client, _events) = LspClient::from_io(c2s_w, s2c_r, None);
+
+        let mut actor = test_actor(root.clone(), CodeIntelResourceMode::Full);
+        actor.phase = Phase::Ready;
+        actor.client = Some(client);
+        let absolute = absolute_path(&path);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        actor.files.insert(
+            path.clone(),
+            SubscribedFile {
+                version: ProjectFileVersion(1),
+                version_cell: Arc::new(AtomicU64::new(1)),
+                output: Stream::new(StreamPath("/project/p".to_owned()), tx),
+                text: text.to_owned(),
+                absolute: absolute.clone(),
+                model_version: None,
+            },
+        );
+        actor.opened.insert(path.clone());
+        let uri = file_uri(&absolute).unwrap();
+        actor.on_publish_diagnostics(json!({
+            "uri": uri,
+            "diagnostics": [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}},
+                "severity": 2,
+                "message": "unused function",
+            }],
+        }));
+        drain_diagnostics_frames(&mut rx);
+
+        // The file is deleted; the watcher-driven version bump arrives.
+        std::fs::remove_file(dir.path().join("util.rs")).expect("delete util.rs");
+        actor
+            .handle_command(RaCommand::FileVersionChanged {
+                path: path.clone(),
+                version: ProjectFileVersion(2),
+            })
+            .await;
+
+        wait_for_captured_method(&captured, "textDocument/didClose").await;
+        assert!(
+            !actor.opened.contains(&path),
+            "a deleted file must not stay marked open"
+        );
+        assert!(
+            actor.published_diagnostics.is_empty(),
+            "cached diagnostics for a deleted file must be dropped"
+        );
+        let cleared = drain_diagnostics_frames(&mut rx);
+        assert_eq!(cleared.len(), 1, "stale squiggles must be cleared");
+        assert!(cleared[0].diagnostics.is_empty());
+        assert_eq!(cleared[0].version, ProjectFileVersion(2));
+
+        // Re-creating the file re-opens it with the fresh contents.
+        std::fs::write(dir.path().join("util.rs"), "pub fn util2() {}").expect("re-create");
+        actor
+            .handle_command(RaCommand::FileVersionChanged {
+                path: path.clone(),
+                version: ProjectFileVersion(3),
+            })
+            .await;
+        wait_for_captured_method(&captured, "textDocument/didOpen").await;
+        assert!(actor.opened.contains(&path));
+        assert_eq!(actor.files.get(&path).unwrap().text, "pub fn util2() {}");
+    }
+
+    /// B2: every publish re-derives the provider's project-wide error/warning
+    /// totals (across all workspace files, subscribed or not) and pushes them
+    /// as a provider-status update for the footer.
+    #[test]
+    fn publish_diagnostics_updates_provider_error_and_warning_totals() {
+        let (status_tx, mut status_rx) = mpsc::unbounded_channel();
+        let mut actor = test_actor_with_status_tx(
+            ProjectRootPath("/repo".to_owned()),
+            CodeIntelResourceMode::Full,
+            status_tx,
+        );
+        actor.phase = Phase::Ready;
+
+        let error = json!({
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+            "severity": 1,
+            "message": "boom",
+        });
+        let warning = json!({
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+            "severity": 2,
+            "message": "meh",
+        });
+
+        // Neither file is subscribed: totals still count them.
+        actor.on_publish_diagnostics(json!({
+            "uri": "file:///repo/a.rs",
+            "diagnostics": [error.clone(), warning.clone()],
+        }));
+        actor.on_publish_diagnostics(json!({
+            "uri": "file:///repo/b.rs",
+            "diagnostics": [error],
+        }));
+        let mut last = None;
+        while let Ok(status) = status_rx.try_recv() {
+            last = Some(status);
+        }
+        let status = last.expect("totals change pushes a provider status");
+        assert_eq!(status.error_count, 2);
+        assert_eq!(status.warning_count, 1);
+
+        // A clean publish for one file subtracts its share.
+        actor.on_publish_diagnostics(json!({
+            "uri": "file:///repo/a.rs",
+            "diagnostics": [],
+        }));
+        let mut last = None;
+        while let Ok(status) = status_rx.try_recv() {
+            last = Some(status);
+        }
+        let status = last.expect("clearing a file updates the totals");
+        assert_eq!(status.error_count, 1);
+        assert_eq!(status.warning_count, 0);
+    }
+
+    static DISCOVERY_PROBE_COUNT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn discover_counting_absent(
+        _: &Path,
+        _configured_path: Option<&protocol::HostExecutablePath>,
+    ) -> ServerDiscovery {
+        DISCOVERY_PROBE_COUNT.fetch_add(1, Ordering::SeqCst);
+        ServerDiscovery::absent_install("rust-analyzer", "test: install me")
+    }
+
+    /// B4: a missing language server must not be sticky for the server's
+    /// lifetime. A subscribe while `Unavailable` re-probes discovery once the
+    /// backoff elapsed — and not before (probes are not free).
+    #[tokio::test]
+    async fn unavailable_provider_reprobes_discovery_after_backoff() {
+        let mut config = test_config();
+        config.discover = discover_counting_absent;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut actor = RaActor::new(
+            config,
+            ProjectRootPath("/repo".to_owned()),
+            CodeIntelResourceMode::Full,
+            tx,
+            None,
+        );
+        let path = ProjectPath {
+            root: actor.root.clone(),
+            relative_path: "main.rs".to_owned(),
+        };
+        let subscribe = |version| RaCommand::Subscribe {
+            path: path.clone(),
+            version: ProjectFileVersion(version),
+            output: dead_stream(),
+        };
+
+        DISCOVERY_PROBE_COUNT.store(0, Ordering::SeqCst);
+        actor.handle_command(subscribe(1)).await;
+        assert_eq!(actor.phase, Phase::Unavailable);
+        assert_eq!(DISCOVERY_PROBE_COUNT.load(Ordering::SeqCst), 1);
+        assert!(
+            actor.unavailable_since.is_some(),
+            "entering Unavailable must arm the retry backoff"
+        );
+
+        // Within the backoff: no re-probe.
+        actor.handle_command(subscribe(1)).await;
+        assert_eq!(DISCOVERY_PROBE_COUNT.load(Ordering::SeqCst), 1);
+
+        // Backoff elapsed: the next subscribe re-probes (and, still absent,
+        // re-arms the backoff).
+        actor.unavailable_since = Some(StdInstant::now() - DISCOVERY_RETRY_BACKOFF);
+        actor.handle_command(subscribe(1)).await;
+        assert_eq!(DISCOVERY_PROBE_COUNT.load(Ordering::SeqCst), 2);
+        assert_eq!(actor.phase, Phase::Unavailable);
+
+        // Warm (project switch) is the other retry entry point.
+        actor.unavailable_since = Some(StdInstant::now() - DISCOVERY_RETRY_BACKOFF);
+        actor.handle_command(RaCommand::Warm).await;
+        assert_eq!(DISCOVERY_PROBE_COUNT.load(Ordering::SeqCst), 3);
     }
 
     #[test]

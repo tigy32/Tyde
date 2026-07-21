@@ -199,12 +199,16 @@ impl CodeIntelService {
     }
 
     /// A per-file version bump arrived from the project-stream actor (§M4).
-    /// Only files this root has actually subscribed are re-resolved — other
-    /// files in the project (and files belonging to other roots) are ignored.
-    /// The provider enforces monotonicity, so a stale/duplicate version is a
-    /// no-op there.
+    /// Files belonging to other roots are ignored; within this root the change
+    /// is forwarded to the file's language provider whether or not anyone has
+    /// the file open. Subscribed files re-resolve fully (didChange + model
+    /// re-push); for unopened files the provider forwards a watched-file
+    /// change instead — a closed-file edit still invalidates the language
+    /// server's crate-wide view (module tree, flycheck results), and dropping
+    /// it here froze diagnostics until the next open-file edit. The provider
+    /// enforces monotonicity, so a stale/duplicate version is a no-op there.
     fn handle_version_change(&mut self, change: FileVersionChange) {
-        if !self.subscriptions.contains(&change.path) {
+        if change.path.root != self.root {
             return;
         }
         if let Some(provider) = self.provider_for_path(&change.path) {
@@ -353,6 +357,7 @@ impl CodeIntelService {
                             path: payload.path,
                             version: payload.version,
                             targets: Vec::new(),
+                            external_targets: 0,
                         };
                         emit(&output, FrameKind::CodeIntelNavigateResult, &result);
                     }

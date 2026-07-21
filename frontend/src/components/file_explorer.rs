@@ -302,10 +302,12 @@ fn headline_dot_class(headline: CodeIntelOverviewHeadline) -> &'static str {
 
 /// Renders the server-authored overview headline into a collapsed aggregate
 /// label + dot class. The headline is authoritative (including `NotStarted`);
-/// the counts are only used to enrich the indexing progress text.
+/// the state counts only enrich the indexing progress text. The server-owned
+/// error/warning totals are appended (e.g. "Ready · 2 errors") so the footer
+/// never claims a clean bill of health while the project has compile errors.
 fn aggregate_label(summary: &CodeIntelOverviewSummary) -> (String, &'static str) {
     let class = headline_dot_class(summary.headline);
-    let label = match summary.headline {
+    let mut label = match summary.headline {
         CodeIntelOverviewHeadline::NotStarted => "Not started".to_owned(),
         CodeIntelOverviewHeadline::Starting => "Starting".to_owned(),
         CodeIntelOverviewHeadline::Indexing => {
@@ -320,6 +322,22 @@ fn aggregate_label(summary: &CodeIntelOverviewSummary) -> (String, &'static str)
         CodeIntelOverviewHeadline::Unavailable => "Unavailable".to_owned(),
         CodeIntelOverviewHeadline::Failed => "Failed".to_owned(),
     };
+    if summary.error_count > 0 {
+        let noun = if summary.error_count == 1 {
+            "error"
+        } else {
+            "errors"
+        };
+        label = format!("{label} · {} {noun}", summary.error_count);
+    }
+    if summary.warning_count > 0 {
+        let noun = if summary.warning_count == 1 {
+            "warning"
+        } else {
+            "warnings"
+        };
+        label = format!("{label} · {} {noun}", summary.warning_count);
+    }
     (label, class)
 }
 
@@ -763,6 +781,8 @@ mod wasm_tests {
             work_done: progress.map(|(d, _)| d),
             total_work: progress.map(|(_, t)| t),
             message: None,
+            error_count: 0,
+            warning_count: 0,
         }
     }
 
@@ -786,6 +806,8 @@ mod wasm_tests {
             unavailable: counts[3],
             failed: counts[4],
             message: message.map(|m| m.to_owned()),
+            error_count: 0,
+            warning_count: 0,
         }
     }
 
@@ -902,6 +924,7 @@ mod wasm_tests {
                             version: protocol::ProjectFileVersion(1),
                             contents: Some("contents".to_owned()),
                             is_binary: false,
+                            missing: false,
                         },
                     );
                 });
@@ -1186,6 +1209,36 @@ mod wasm_tests {
                 .length(),
             0,
             "collapsed footer must not render per-root detail"
+        );
+    }
+
+    /// B2: the footer surfaces the server-owned project-wide error/warning
+    /// totals next to the state, so "Ready" with compile errors reads as
+    /// "Ready · 2 errors · 1 warning" instead of a clean bill of health.
+    #[wasm_bindgen_test]
+    async fn footer_shows_project_error_and_warning_counts() {
+        let container = make_container();
+        let mut with_counts = summary(CodeIntelOverviewHeadline::Ready, [1, 0, 0, 0, 0], None);
+        with_counts.error_count = 2;
+        with_counts.warning_count = 1;
+        let overview = CodeIntelOverviewPayload {
+            roots: vec![root(
+                "/repo",
+                vec![provider(
+                    "rust-analyzer",
+                    "rust",
+                    CodeIntelState::Ready,
+                    None,
+                )],
+            )],
+            summary: with_counts,
+        };
+        let _mounted = mount_footer(container.clone(), Some(overview));
+        next_tick().await;
+
+        assert_eq!(
+            label_text(&container),
+            "Code Intel: Ready · 2 errors · 1 warning"
         );
     }
 

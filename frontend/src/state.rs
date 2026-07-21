@@ -1558,6 +1558,11 @@ pub struct OpenFile {
     pub version: ProjectFileVersion,
     pub contents: Option<String>,
     pub is_binary: bool,
+    /// Server-reported: the file no longer exists on disk (a refresh read
+    /// answered `missing`). `contents` keeps the last-seen text so the viewer
+    /// can label it "deleted" instead of going blank; cleared by the next
+    /// contents frame after the file is re-created.
+    pub missing: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1726,6 +1731,47 @@ impl CodeIntelFileState {
         self.resolved_definition_at(version, offset)
             .map(|(range, _)| range)
     }
+
+    /// The diagnostics whose range contains `offset`, at the rendered version.
+    /// Used to merge diagnostic messages into the hover popover: the squiggle
+    /// itself carries no readable message, so hovering the flagged span is the
+    /// one place the user can read what is wrong. Zero-width ranges (some
+    /// servers anchor a diagnostic to a single position) match their anchor
+    /// offset. Order: most severe first, so the error reads before its hints.
+    pub fn diagnostics_at(
+        &self,
+        version: ProjectFileVersion,
+        offset: u32,
+    ) -> Vec<CodeIntelDiagnostic> {
+        if self.rendered_version != Some(version) {
+            return Vec::new();
+        }
+        let Some(data) = self.applied() else {
+            return Vec::new();
+        };
+        let mut hits: Vec<CodeIntelDiagnostic> = data
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                let range = diagnostic.range;
+                (range.start <= offset && offset < range.end)
+                    || (range.start == range.end && offset == range.start)
+            })
+            .cloned()
+            .collect();
+        hits.sort_by_key(|diagnostic| severity_sort_rank(diagnostic.severity));
+        hits
+    }
+}
+
+/// Ascending sort rank: most severe first.
+fn severity_sort_rank(severity: protocol::CodeIntelSeverity) -> u8 {
+    match severity {
+        protocol::CodeIntelSeverity::Error => 0,
+        protocol::CodeIntelSeverity::Warning => 1,
+        protocol::CodeIntelSeverity::Information => 2,
+        protocol::CodeIntelSeverity::Hint => 3,
+    }
 }
 
 /// Context for the most recent on-demand go-to-definition request (M2), stored
@@ -1767,6 +1813,16 @@ pub struct HoverPopover {
     pub anchor_bottom: f64,
     /// Rendered markdown, or `None` until the result arrives.
     pub contents: Option<String>,
+}
+
+/// A transient, per-tab code-intelligence notice (e.g. "definition is outside
+/// the project"). Rendered as a small banner by the owning file view, which
+/// also owns the auto-clear timeout. Distinct from `CodeIntelData.error`:
+/// notices are informational one-shots, never a provider failure state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CodeIntelNotice {
+    pub tab: TabId,
+    pub message: String,
 }
 
 /// Cache key for `diff_contents`. Carries the explicit owning `(host_id,
@@ -2428,6 +2484,9 @@ pub struct AppState {
     /// The current hover popover, or `None` when nothing is hovered. The
     /// `HoverPopover` component renders from this signal (no `window.*`).
     pub code_intel_hover: RwSignal<Option<HoverPopover>>,
+    /// Transient per-tab code-intel notice (see [`CodeIntelNotice`]); at most
+    /// one at a time — a newer notice replaces the last.
+    pub code_intel_notice: RwSignal<Option<CodeIntelNotice>>,
     /// True while the go-to-definition modifier is held. Mirrors the existing
     /// Cmd/Ctrl-click convention and is cleared on blur/visibility changes.
     pub cmd_held: RwSignal<bool>,
@@ -2821,6 +2880,7 @@ impl AppState {
             code_intel_navigate_ctx: RwSignal::new(None),
             code_intel_active_hover: RwSignal::new(0),
             code_intel_hover: RwSignal::new(None),
+            code_intel_notice: RwSignal::new(None),
             cmd_held: RwSignal::new(false),
             code_intel_focus: RwSignal::new(None),
             host_settings_by_host: RwSignal::new(HashMap::new()),
@@ -4744,6 +4804,25 @@ impl AppState {
         }
     }
 
+    /// Dismiss the hover popover and supersede any in-flight hover request so
+    /// its late result is dropped (mirrors `actions::dismiss_hover`, which
+    /// delegates here; the logic lives on state so tab-activation paths can
+    /// dismiss without depending on the actions layer).
+    pub fn dismiss_code_intel_hover(&self) {
+        let mut id = 0;
+        self.code_intel_request_seq.update(|seq| {
+            *seq = seq.wrapping_add(1).max(1);
+            id = *seq;
+        });
+        self.code_intel_active_hover.set(id);
+        if self
+            .code_intel_hover
+            .with_untracked(|hover| hover.is_some())
+        {
+            self.code_intel_hover.set(None);
+        }
+    }
+
     fn drop_code_intel(&self, file: &FileResourceKey) {
         let key = CodeIntelKey {
             host_id: file.host_id.clone(),
@@ -4802,6 +4881,13 @@ impl AppState {
         self.center_zone.update(|center_zone| {
             revealed = center_zone.reveal_tab(id);
         });
+        // A hover popover is pinned to viewport coordinates captured over the
+        // previously visible content; it has no meaning over another tab. Any
+        // tab activation (mouse, keyboard, or programmatic) dismisses it and
+        // supersedes an in-flight hover request.
+        if revealed {
+            self.dismiss_code_intel_hover();
+        }
         revealed
     }
 
@@ -5084,6 +5170,62 @@ mod code_intel_tests {
             message: "boom".to_owned(),
             source: None,
         }
+    }
+
+    #[test]
+    fn diagnostics_at_returns_hits_under_offset_most_severe_first() {
+        let mut s = CodeIntelFileState::default();
+        s.set_rendered_version(ProjectFileVersion(1));
+        s.merge_versioned(ProjectFileVersion(1), |d| {
+            d.diagnostics = vec![
+                CodeIntelDiagnostic {
+                    range: ByteRange { start: 4, end: 10 },
+                    severity: protocol::CodeIntelSeverity::Hint,
+                    message: "consider removing".to_owned(),
+                    source: None,
+                },
+                CodeIntelDiagnostic {
+                    range: ByteRange { start: 4, end: 10 },
+                    severity: protocol::CodeIntelSeverity::Error,
+                    message: "mismatched types".to_owned(),
+                    source: Some("rustc".to_owned()),
+                },
+                CodeIntelDiagnostic {
+                    range: ByteRange { start: 20, end: 24 },
+                    severity: protocol::CodeIntelSeverity::Warning,
+                    message: "elsewhere".to_owned(),
+                    source: None,
+                },
+            ];
+        });
+
+        let hits = s.diagnostics_at(ProjectFileVersion(1), 5);
+        assert_eq!(hits.len(), 2, "only diagnostics containing the offset");
+        assert_eq!(hits[0].message, "mismatched types", "most severe first");
+        assert_eq!(hits[1].message, "consider removing");
+
+        assert!(s.diagnostics_at(ProjectFileVersion(1), 15).is_empty());
+        // End is exclusive.
+        assert!(s.diagnostics_at(ProjectFileVersion(1), 10).is_empty());
+        // A mismatched version never paints another version's diagnostics.
+        assert!(s.diagnostics_at(ProjectFileVersion(2), 5).is_empty());
+    }
+
+    #[test]
+    fn diagnostics_at_matches_zero_width_ranges_at_their_anchor() {
+        let mut s = CodeIntelFileState::default();
+        s.set_rendered_version(ProjectFileVersion(1));
+        s.merge_versioned(ProjectFileVersion(1), |d| {
+            d.diagnostics = vec![CodeIntelDiagnostic {
+                range: ByteRange { start: 7, end: 7 },
+                severity: protocol::CodeIntelSeverity::Error,
+                message: "expected `;`".to_owned(),
+                source: None,
+            }];
+        });
+        assert_eq!(s.diagnostics_at(ProjectFileVersion(1), 7).len(), 1);
+        assert!(s.diagnostics_at(ProjectFileVersion(1), 6).is_empty());
+        assert!(s.diagnostics_at(ProjectFileVersion(1), 8).is_empty());
     }
 
     fn occurrence(start: u32, end: u32, definition: Vec<CodeIntelLocation>) -> CodeIntelOccurrence {
@@ -5603,6 +5745,7 @@ mod tests {
                         version: ProjectFileVersion(1),
                         contents: None,
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });
@@ -5747,6 +5890,7 @@ mod tests {
                         version: ProjectFileVersion(1),
                         contents: None,
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });
@@ -5791,6 +5935,7 @@ mod tests {
                         version: ProjectFileVersion(1),
                         contents: None,
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });
@@ -6991,6 +7136,7 @@ mod tests {
                         version: ProjectFileVersion(1),
                         contents: None,
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });
@@ -7067,6 +7213,7 @@ mod tests {
                     version: ProjectFileVersion(1),
                     contents: Some("one\ntwo\nthree".to_string()),
                     is_binary: false,
+                    missing: false,
                 },
             );
         });
@@ -7455,6 +7602,7 @@ mod tests {
                         version: ProjectFileVersion(1),
                         contents: Some("a".to_string()),
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });

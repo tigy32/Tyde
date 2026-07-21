@@ -212,6 +212,7 @@ mod mock {
                 path: payload.path,
                 version: payload.version,
                 targets: Vec::new(),
+                external_targets: 0,
             };
             emit(&output, FrameKind::CodeIntelNavigateResult, &result);
         }

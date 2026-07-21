@@ -356,6 +356,7 @@ mod wasm_tests {
                     version: ProjectFileVersion(1),
                     contents: Some(contents.to_owned()),
                     is_binary: false,
+                    missing: false,
                 },
             );
         });
@@ -679,6 +680,7 @@ mod wasm_tests {
                             range: ByteRange { start: 7, end: 13 },
                         },
                     ],
+                    external_targets: 0,
                 },
             );
         });

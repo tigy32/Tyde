@@ -464,6 +464,11 @@ async fn run_project_subscription(
     // so this is the one fan-out point for "a watched file's version changed."
     let mut file_version_listeners = Vec::<mpsc::UnboundedSender<FileVersionChange>>::new();
     let mut pending_file_version_changes = HashMap::<ProjectPath, ProjectFileVersion>::new();
+    // Watcher-event → ProjectPath resolver, matching canonicalized roots too
+    // (macOS FSEvents reports symlink-resolved paths). Re-synced per event so a
+    // root add/remove picked up by a refresh is reflected without re-canonicalizing
+    // on every event.
+    let mut watcher_roots = WatcherRootPaths::new(project.root_paths());
     let mut pending_update = PendingProjectUpdate::default();
     let mut debounce_active = false;
     let mut debounce_sleep = Box::pin(sleep(Duration::from_secs(60 * 60 * 24 * 365)));
@@ -673,7 +678,8 @@ async fn run_project_subscription(
                         // the new version, superseding any stale in-flight
                         // resolution. The counter stays single and authoritative;
                         // there is no second counter and no double-bump.
-                        let changes = bump_watched_paths(&project, &event, &mut file_versions);
+                        watcher_roots.sync(project.root_paths());
+                        let changes = bump_watched_paths(&watcher_roots, &event, &mut file_versions);
                         merge_file_version_changes(&mut pending_file_version_changes, changes);
                         let refresh = classify_watch_event(&event);
                         if !refresh.is_empty() || !pending_file_version_changes.is_empty() {
@@ -1013,6 +1019,8 @@ fn summarize_code_intel_overview(roots: &[CodeIntelRootOverview]) -> CodeIntelOv
     let mut starting = 0;
     let mut unavailable = 0;
     let mut failed = 0;
+    let mut error_count = 0;
+    let mut warning_count = 0;
     for provider in roots.iter().flat_map(|root| root.providers.iter()) {
         match provider.state {
             CodeIntelState::Ready => ready += 1,
@@ -1022,6 +1030,8 @@ fn summarize_code_intel_overview(roots: &[CodeIntelRootOverview]) -> CodeIntelOv
             CodeIntelState::Failed => failed += 1,
             CodeIntelState::Unsupported => {}
         }
+        error_count += provider.error_count;
+        warning_count += provider.warning_count;
     }
 
     let provider_count = ready + indexing + starting + unavailable + failed;
@@ -1038,13 +1048,29 @@ fn summarize_code_intel_overview(roots: &[CodeIntelRootOverview]) -> CodeIntelOv
     } else {
         CodeIntelOverviewHeadline::Ready
     };
+    // For terminal headlines, prefer the provider's own message — for a
+    // missing binary it carries the actionable install hint ("pyright not
+    // installed — run `npm install -g pyright`") that the generic label lacks.
+    let provider_message_for = |target: CodeIntelState| {
+        roots
+            .iter()
+            .flat_map(|root| root.providers.iter())
+            .find(|provider| provider.state == target)
+            .and_then(|provider| provider.message.clone())
+    };
     let message = match headline {
         CodeIntelOverviewHeadline::NotStarted => Some(
             "No language server running — select the project or launch an agent to index"
                 .to_owned(),
         ),
-        CodeIntelOverviewHeadline::Failed => Some("Code intelligence failed".to_owned()),
-        CodeIntelOverviewHeadline::Unavailable => Some("Language server unavailable".to_owned()),
+        CodeIntelOverviewHeadline::Failed => Some(
+            provider_message_for(CodeIntelState::Failed)
+                .unwrap_or_else(|| "Code intelligence failed".to_owned()),
+        ),
+        CodeIntelOverviewHeadline::Unavailable => Some(
+            provider_message_for(CodeIntelState::Unavailable)
+                .unwrap_or_else(|| "Language server unavailable".to_owned()),
+        ),
         CodeIntelOverviewHeadline::Indexing => Some("Indexing code intelligence".to_owned()),
         CodeIntelOverviewHeadline::Starting => Some("Starting language server".to_owned()),
         CodeIntelOverviewHeadline::Ready => Some("Code intelligence ready".to_owned()),
@@ -1058,6 +1084,8 @@ fn summarize_code_intel_overview(roots: &[CodeIntelRootOverview]) -> CodeIntelOv
         unavailable,
         failed,
         message,
+        error_count,
+        warning_count,
     }
 }
 
@@ -1120,6 +1148,91 @@ fn bump_file_version(
     *slot
 }
 
+/// Resolves absolute filesystem-watcher event paths back to `ProjectPath`s.
+///
+/// Watcher backends do not necessarily report events under the path a root was
+/// registered with: macOS FSEvents resolves symlinks first, so a root
+/// configured as `/tmp/project` produces events under `/private/tmp/project`.
+/// Matching only the configured root string silently drops every per-file
+/// version bump for a root behind a symlink — code-intel `didChange` sync and
+/// open-viewer reloads go dead while the path-agnostic file-tree refresh keeps
+/// working (verified QA regression). So each root is matched by its configured
+/// path *and* its canonicalized path. Canonicalization is IO, so it happens
+/// once per root here — never on the per-event path.
+struct WatcherRootPaths {
+    roots: Vec<ProjectRootPath>,
+    /// Per root, the path prefixes an event path is matched against: the
+    /// configured path first, then (when different) its canonical form.
+    prefixes: Vec<(ProjectRootPath, Vec<PathBuf>)>,
+}
+
+impl WatcherRootPaths {
+    fn new(roots: Vec<ProjectRootPath>) -> Self {
+        let prefixes = roots
+            .iter()
+            .map(|root| {
+                let raw = PathBuf::from(&root.0);
+                let mut candidates = vec![raw.clone()];
+                match fs::canonicalize(&root.0) {
+                    Ok(canonical) if canonical != raw => candidates.push(canonical),
+                    Ok(_) => {}
+                    Err(error) => tracing::debug!(
+                        %error,
+                        root = %root.0,
+                        "watcher root canonicalization failed; matching the configured path only"
+                    ),
+                }
+                (root.clone(), candidates)
+            })
+            .collect();
+        Self { roots, prefixes }
+    }
+
+    /// Rebuild only when the project's root list changed. The comparison runs
+    /// per watcher event (cheap: a few string compares); the canonicalization
+    /// IO only reruns on an actual root change.
+    fn sync(&mut self, roots: Vec<ProjectRootPath>) {
+        if self.roots != roots {
+            *self = Self::new(roots);
+        }
+    }
+
+    fn project_path_for(&self, absolute: &Path) -> Option<ProjectPath> {
+        if !absolute.is_absolute() {
+            return None;
+        }
+        // Most-specific (longest) matching root wins: with nested roots
+        // `/repo` and `/repo/sub`, an event under `/repo/sub` must be
+        // attributed to the nested root — that is the root whose code-intel
+        // service holds the subscription. First-match order would silently
+        // route the bump to the outer root.
+        let mut best: Option<(usize, Option<ProjectPath>)> = None;
+        for (root, candidates) in &self.prefixes {
+            for prefix in candidates {
+                let Ok(relative) = absolute.strip_prefix(prefix) else {
+                    continue;
+                };
+                let specificity = prefix.components().count();
+                if best
+                    .as_ref()
+                    .is_some_and(|(existing, _)| *existing >= specificity)
+                {
+                    continue;
+                }
+                let relative_path = relative.to_string_lossy().replace('\\', "/");
+                // An empty relative path means the event is for this root
+                // directory itself, not a file inside it.
+                let mapped = (!relative_path.is_empty()).then(|| ProjectPath {
+                    root: root.clone(),
+                    relative_path,
+                });
+                best = Some((specificity, mapped));
+            }
+        }
+        best.and_then(|(_, mapped)| mapped)
+    }
+}
+
 /// Map every changed path in a watch event back to a `ProjectPath` and bump its
 /// version through the single bump point. Paths inside `.git` are ignored — git
 /// bookkeeping is not a source file change. Returns one [`FileVersionChange`]
@@ -1128,7 +1241,7 @@ fn bump_file_version(
 /// changes, and duplicate paths inside one notify event are coalesced so a
 /// single filesystem change advances the counter once.
 fn bump_watched_paths(
-    project: &Project,
+    watcher_roots: &WatcherRootPaths,
     event: &Event,
     versions: &mut HashMap<ProjectPath, ProjectFileVersion>,
 ) -> Vec<FileVersionChange> {
@@ -1141,10 +1254,7 @@ fn bump_watched_paths(
         if is_inside_git(path) {
             continue;
         }
-        let Some(absolute) = path.to_str() else {
-            continue;
-        };
-        if let Some(project_path) = project_path_from_absolute(project, absolute) {
+        if let Some(project_path) = watcher_roots.project_path_for(path) {
             if !seen.insert(project_path.clone()) {
                 continue;
             }
@@ -1703,23 +1813,44 @@ pub(crate) fn read_file(
     let path = normalize_read_path(project, payload.path)?;
     validate_project_path(project, &path)?;
     let absolute = absolute_project_path(&path)?;
-    let bytes = fs::read(&absolute)
-        .map_err(|err| format!("Failed to read file '{}': {err}", absolute.display()))?;
     // `version` is a placeholder here; the project-stream actor overwrites it
     // with the centralized counter's next value (the single bump point) before
     // the payload leaves the actor. See `ProjectStreamCommand::ReadFile`.
+    let bytes = match fs::read(&absolute) {
+        Ok(bytes) => bytes,
+        // Deletion is an answer, not a failure: report it as a typed payload
+        // (a command error carries no path, so the client could not attribute
+        // it to the right viewer).
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ProjectFileContentsPayload {
+                path,
+                version: ProjectFileVersion(0),
+                contents: None,
+                is_binary: false,
+                missing: true,
+            });
+        }
+        Err(err) => {
+            return Err(format!(
+                "Failed to read file '{}': {err}",
+                absolute.display()
+            ));
+        }
+    };
     match String::from_utf8(bytes) {
         Ok(contents) => Ok(ProjectFileContentsPayload {
             path,
             version: ProjectFileVersion(0),
             contents: Some(contents),
             is_binary: false,
+            missing: false,
         }),
         Err(_) => Ok(ProjectFileContentsPayload {
             path,
             version: ProjectFileVersion(0),
             contents: None,
             is_binary: true,
+            missing: false,
         }),
     }
 }
@@ -2865,6 +2996,10 @@ mod tests {
         }
     }
 
+    fn watcher_roots_for(project: &Project) -> WatcherRootPaths {
+        WatcherRootPaths::new(project.root_paths())
+    }
+
     fn provider_status(
         provider: &str,
         language: &str,
@@ -2878,6 +3013,8 @@ mod tests {
             work_done: None,
             total_work: None,
             message: None,
+            error_count: 0,
+            warning_count: 0,
         }
     }
 
@@ -2956,6 +3093,50 @@ mod tests {
             overview.summary.message.as_deref(),
             Some("No language server running — select the project or launch an agent to index")
         );
+    }
+
+    /// B2: the overview summary aggregates each provider's server-owned
+    /// error/warning totals, so the footer can show project-level counts even
+    /// though the client drops closed-file diagnostics.
+    #[test]
+    fn overview_summary_sums_provider_diagnostic_counts() {
+        let project = test_project_with_roots(&["/repo-a", "/repo-b"]);
+        let mut overview = initial_code_intel_overview(project.root_paths());
+
+        let mut status_a = provider_status("rust-analyzer", "rust", CodeIntelState::Ready);
+        status_a.error_count = 2;
+        status_a.warning_count = 1;
+        assert!(update_code_intel_provider_status(
+            &mut overview,
+            &project,
+            ProjectRootPath("/repo-a".to_owned()),
+            status_a,
+        ));
+        let mut status_b = provider_status("pyright", "python", CodeIntelState::Ready);
+        status_b.error_count = 1;
+        status_b.warning_count = 4;
+        assert!(update_code_intel_provider_status(
+            &mut overview,
+            &project,
+            ProjectRootPath("/repo-b".to_owned()),
+            status_b,
+        ));
+
+        assert_eq!(overview.summary.error_count, 3);
+        assert_eq!(overview.summary.warning_count, 5);
+
+        // Counts going back to zero clear from the summary too.
+        let mut cleared = provider_status("rust-analyzer", "rust", CodeIntelState::Ready);
+        cleared.error_count = 0;
+        cleared.warning_count = 0;
+        assert!(update_code_intel_provider_status(
+            &mut overview,
+            &project,
+            ProjectRootPath("/repo-a".to_owned()),
+            cleared,
+        ));
+        assert_eq!(overview.summary.error_count, 1);
+        assert_eq!(overview.summary.warning_count, 4);
     }
 
     #[test]
@@ -3891,12 +4072,20 @@ new mode 100755\n";
         let mut versions = HashMap::new();
         let file = PathBuf::from("/repo/src/main.rs");
 
-        let first = bump_watched_paths(&project, &watch_event(vec![file.clone()]), &mut versions);
+        let first = bump_watched_paths(
+            &watcher_roots_for(&project),
+            &watch_event(vec![file.clone()]),
+            &mut versions,
+        );
         assert_eq!(first.len(), 1, "exactly one change per changed file");
         assert_eq!(first[0].path.relative_path, "src/main.rs");
         assert_eq!(first[0].version, ProjectFileVersion(1));
 
-        let second = bump_watched_paths(&project, &watch_event(vec![file.clone()]), &mut versions);
+        let second = bump_watched_paths(
+            &watcher_roots_for(&project),
+            &watch_event(vec![file.clone()]),
+            &mut versions,
+        );
         assert_eq!(second[0].version, ProjectFileVersion(2), "monotonic");
 
         // Only one counter entry for the file: no parallel/double counter.
@@ -3934,7 +4123,7 @@ new mode 100755\n";
 
         // The watcher is what advances the counter.
         let changes = bump_watched_paths(
-            &project,
+            &watcher_roots_for(&project),
             &watch_event(vec!["/repo/lib.rs".into()]),
             &mut versions,
         );
@@ -3959,7 +4148,7 @@ new mode 100755\n";
         let project = test_project("/repo");
         let mut versions = HashMap::new();
         let changes = bump_watched_paths(
-            &project,
+            &watcher_roots_for(&project),
             &watch_event(vec!["/repo/.git/index".into()]),
             &mut versions,
         );
@@ -3974,7 +4163,7 @@ new mode 100755\n";
         let file = PathBuf::from("/repo/src/main.rs");
 
         let access = bump_watched_paths(
-            &project,
+            &watcher_roots_for(&project),
             &watch_event_kind(
                 EventKind::Access(notify::event::AccessKind::Read),
                 vec![file.clone()],
@@ -3984,7 +4173,7 @@ new mode 100755\n";
         assert!(access.is_empty());
 
         let metadata = bump_watched_paths(
-            &project,
+            &watcher_roots_for(&project),
             &watch_event_kind(
                 EventKind::Modify(notify::event::ModifyKind::Metadata(
                     notify::event::MetadataKind::WriteTime,
@@ -4008,7 +4197,7 @@ new mode 100755\n";
             vec![PathBuf::from("/repo/.git/index")],
         );
 
-        let changes = bump_watched_paths(&project, &event, &mut versions);
+        let changes = bump_watched_paths(&watcher_roots_for(&project), &event, &mut versions);
         let refresh = classify_watch_event(&event);
 
         assert!(changes.is_empty());
@@ -4029,7 +4218,7 @@ new mode 100755\n";
             ],
         );
 
-        let changes = bump_watched_paths(&project, &event, &mut versions);
+        let changes = bump_watched_paths(&watcher_roots_for(&project), &event, &mut versions);
         let refresh = classify_watch_event(&event);
 
         assert!(changes.is_empty());
@@ -4049,7 +4238,7 @@ new mode 100755\n";
             vec![PathBuf::from("/repo/src/main.rs")],
         );
 
-        let changes = bump_watched_paths(&project, &event, &mut versions);
+        let changes = bump_watched_paths(&watcher_roots_for(&project), &event, &mut versions);
         let refresh = classify_watch_event(&event);
 
         assert!(changes.is_empty());
@@ -4065,7 +4254,7 @@ new mode 100755\n";
         let file = PathBuf::from("/repo/src/main.rs");
 
         let create = bump_watched_paths(
-            &project,
+            &watcher_roots_for(&project),
             &watch_event_kind(
                 EventKind::Create(notify::event::CreateKind::File),
                 vec![file.clone(), file.clone()],
@@ -4076,7 +4265,7 @@ new mode 100755\n";
         assert_eq!(create[0].version, ProjectFileVersion(1));
 
         let modify = bump_watched_paths(
-            &project,
+            &watcher_roots_for(&project),
             &watch_event_kind(
                 EventKind::Modify(notify::event::ModifyKind::Data(
                     notify::event::DataChange::Content,
@@ -4088,7 +4277,7 @@ new mode 100755\n";
         assert_eq!(modify[0].version, ProjectFileVersion(2));
 
         let remove = bump_watched_paths(
-            &project,
+            &watcher_roots_for(&project),
             &watch_event_kind(
                 EventKind::Remove(notify::event::RemoveKind::File),
                 vec![file],
@@ -4096,6 +4285,78 @@ new mode 100755\n";
             &mut versions,
         );
         assert_eq!(remove[0].version, ProjectFileVersion(3));
+    }
+
+    /// macOS FSEvents reports symlink-resolved paths: a root configured as
+    /// `/tmp/proj` yields watcher events under `/private/tmp/proj`. Those
+    /// canonical event paths must still map back to the configured root — with
+    /// raw-prefix matching only, no watched change under a symlinked root ever
+    /// bumped a file version, so the code-intel `didChange` sync and the
+    /// open-viewer reload path were silently dead while the (path-agnostic)
+    /// file-tree refresh kept working. Verified live QA regression 2026-07-20.
+    #[cfg(unix)]
+    #[test]
+    fn canonicalized_watcher_paths_map_back_to_symlinked_roots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_root = dir.path().join("real-root");
+        fs::create_dir(&real_root).expect("create real root");
+        let link_root = dir.path().join("link-root");
+        std::os::unix::fs::symlink(&real_root, &link_root).expect("symlink root");
+
+        let link_root_str = link_root.to_str().unwrap().to_owned();
+        let project = test_project(&link_root_str);
+        let watcher_roots = watcher_roots_for(&project);
+        let mut versions = HashMap::new();
+
+        // The event arrives under the canonical (symlink-resolved) path, the
+        // way FSEvents reports it.
+        let canonical_file = fs::canonicalize(&link_root)
+            .expect("canonicalize symlinked root")
+            .join("src/main.rs");
+        let changes = bump_watched_paths(
+            &watcher_roots,
+            &watch_event(vec![canonical_file]),
+            &mut versions,
+        );
+
+        assert_eq!(
+            changes.len(),
+            1,
+            "canonical event path must map to the root"
+        );
+        assert_eq!(changes[0].path.root, ProjectRootPath(link_root_str));
+        assert_eq!(changes[0].path.relative_path, "src/main.rs");
+        assert_eq!(changes[0].version, ProjectFileVersion(1));
+    }
+
+    /// A root add/remove must rebuild the watcher-path resolver; an unchanged
+    /// root list must not (the canonicalization IO stays off the per-event
+    /// path).
+    #[test]
+    fn watcher_root_resolver_syncs_only_on_root_change() {
+        let mut resolver = watcher_roots_for(&test_project("/repo"));
+        let file = Path::new("/repo/src/main.rs");
+        assert_eq!(
+            resolver.project_path_for(file).map(|p| p.relative_path),
+            Some("src/main.rs".to_owned())
+        );
+
+        // Same roots: no-op.
+        resolver.sync(vec![ProjectRootPath("/repo".to_owned())]);
+        assert_eq!(
+            resolver.project_path_for(file).map(|p| p.relative_path),
+            Some("src/main.rs".to_owned())
+        );
+
+        // Changed roots: the old root stops matching, the new one starts.
+        resolver.sync(vec![ProjectRootPath("/other".to_owned())]);
+        assert_eq!(resolver.project_path_for(file), None);
+        assert_eq!(
+            resolver
+                .project_path_for(Path::new("/other/lib.rs"))
+                .map(|p| p.relative_path),
+            Some("lib.rs".to_owned())
+        );
     }
 
     #[test]
@@ -4106,7 +4367,7 @@ new mode 100755\n";
         let file = PathBuf::from("/repo/src/main.rs");
 
         let first = bump_watched_paths(
-            &project,
+            &watcher_roots_for(&project),
             &watch_event_kind(
                 EventKind::Modify(notify::event::ModifyKind::Data(
                     notify::event::DataChange::Content,
@@ -4118,7 +4379,7 @@ new mode 100755\n";
         merge_file_version_changes(&mut pending, first);
 
         let second = bump_watched_paths(
-            &project,
+            &watcher_roots_for(&project),
             &watch_event_kind(
                 EventKind::Modify(notify::event::ModifyKind::Data(
                     notify::event::DataChange::Content,

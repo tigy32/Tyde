@@ -545,6 +545,22 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         }
                     });
                 }
+                // A failed `ProjectReadFile` (e.g. the file was deleted on disk
+                // between a watcher-driven version bump and the refresh read)
+                // must release the in-flight refresh markers for this host.
+                // `CommandErrorPayload` carries no path, so this clears every
+                // `RefreshInPlace` marker (never a user-driven `Open` intent —
+                // those own tab placement): a marker left behind would block
+                // every future watcher-driven reload of its file, including the
+                // reload after the file is re-created.
+                if matches!(payload.request_kind, FrameKind::ProjectReadFile) {
+                    state.pending_file_opens.update(|pending| {
+                        pending.retain(|key, intent| {
+                            !(key.host_id == host_id
+                                && matches!(intent, crate::state::PendingFileOpen::RefreshInPlace))
+                        });
+                    });
+                }
                 // Surface workflow command failures inline in the Workflows
                 // panel instead of only logging them. `CommandErrorPayload`
                 // carries no `workflow_id`, so this is a panel-level banner; it
@@ -1611,13 +1627,27 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     };
                     let version = payload.version;
                     state.open_files.update(|files| {
+                        // A `missing` read carries no contents; keep the
+                        // last-seen text so the viewer shows "deleted on
+                        // disk" over the final version instead of a blank
+                        // pane. Any non-missing frame (the file was
+                        // re-created) replaces contents and clears the flag.
+                        let prior_contents = payload
+                            .missing
+                            .then(|| files.get(&key).and_then(|open| open.contents.clone()))
+                            .flatten();
                         files.insert(
                             key.clone(),
                             OpenFile {
                                 path: payload.path,
                                 version,
-                                contents: payload.contents,
+                                contents: if payload.missing {
+                                    prior_contents
+                                } else {
+                                    payload.contents
+                                },
                                 is_binary: payload.is_binary,
+                                missing: payload.missing,
                             },
                         );
                     });
@@ -2793,7 +2823,21 @@ pub(crate) fn apply_code_intel_navigate_result(
 
     let mut targets = payload.targets;
     if targets.is_empty() {
-        log::debug!("code_intel_navigate_result: no definition at this position");
+        // B5: when the only definitions live outside this workspace root
+        // (stdlib, dependencies, or a sibling root — providers are per-root),
+        // say so instead of a silent no-op jump.
+        if payload.external_targets > 0 {
+            state
+                .code_intel_notice
+                .set(Some(crate::state::CodeIntelNotice {
+                    tab: ctx.tab,
+                    message: "Definition is outside this workspace root (dependency, standard \
+                              library, or another root)"
+                        .to_owned(),
+                }));
+        } else {
+            log::debug!("code_intel_navigate_result: no definition at this position");
+        }
         return;
     }
     if targets.len() == 1 {
@@ -2882,6 +2926,17 @@ fn apply_code_intel_hover_result(
         (true, Some(text)) if !text.trim().is_empty() => Some(text),
         _ => None,
     };
+    // Whether diagnostics sit under the hovered offset. An empty hover result
+    // must not dismiss a popover that is showing (or about to show) a
+    // diagnostic message — an unresolved identifier typically has *no* LSP
+    // hover, and its error text is exactly what the user is trying to read.
+    let diagnostics_present = state.code_intel.with_untracked(|map| {
+        map.get(&code_intel_key).is_some_and(|file| {
+            !file
+                .diagnostics_at(payload.version, context.offset)
+                .is_empty()
+        })
+    });
     state.code_intel_hover.update(|hover| {
         // Only fill the popover we seeded for this exact hover id.
         let matches = hover
@@ -2902,7 +2957,13 @@ fn apply_code_intel_hover_result(
                     popover.contents = Some(text);
                 }
             }
-            None => *hover = None, // nothing to show: dismiss
+            None => {
+                // Nothing to show from hover. Keep the popover only when it is
+                // carrying diagnostics; otherwise dismiss.
+                if !diagnostics_present {
+                    *hover = None;
+                }
+            }
         }
     });
 }
@@ -5587,6 +5648,7 @@ mod tests {
                     version: ProjectFileVersion(1),
                     contents: Some("fn main() {}".to_owned()),
                     is_binary: false,
+                    missing: false,
                 },
             );
         });
@@ -6718,6 +6780,7 @@ mod tests {
                         version: protocol::ProjectFileVersion(1),
                         contents: Some("fn main() {}".to_owned()),
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });
@@ -7729,6 +7792,7 @@ mod wasm_tests {
                 version,
                 contents: Some("fn main() {}".to_owned()),
                 is_binary: false,
+                missing: false,
             },
         )
         .expect("synthetic ProjectFileContents")
@@ -7965,6 +8029,7 @@ mod wasm_tests {
                     version: ProjectFileVersion(1),
                     contents: Some("fn main() {}".to_owned()),
                     is_binary: false,
+                    missing: false,
                 },
             );
         });
@@ -8047,6 +8112,7 @@ mod wasm_tests {
                     version: ProjectFileVersion(1),
                     contents: Some("fn main() {}".to_owned()),
                     is_binary: false,
+                    missing: false,
                 },
             );
         });
@@ -8146,6 +8212,7 @@ mod wasm_tests {
                     version: ProjectFileVersion(1),
                     contents: Some("fn main() {}".to_owned()),
                     is_binary: false,
+                    missing: false,
                 },
             );
         });

@@ -709,6 +709,14 @@ fn FileViewLoaded(
         }
     });
 
+    // Transient highlight of the goto target line (B6): without it a
+    // go-to-definition whose target is already on screen gives zero feedback,
+    // so the user can't tell the jump worked. Set when a goto lands, cleared
+    // by a timeout; the row render appends a flash class while it matches.
+    let flash_line: RwSignal<Option<u32>> = RwSignal::new(None);
+    let flash_timer: TimeoutClosureSlot = StoredValue::new_local(None);
+    on_cleanup(move || clear_timeout_timer(flash_timer));
+
     // Apply / re-snap the scroll. Subscribes to `pending_line`, `line_height`,
     // `geometry_measured`, and the element ref: it aligns first with the
     // estimate, then re-snaps once the real line height is measured and
@@ -732,6 +740,20 @@ fn FileViewLoaded(
         let element: web_sys::Element = el.clone().unchecked_into();
         state_for_goto_scroll
             .save_tab_scroll_state(tab_id, tab_scroll_state_from_element(&element));
+        // Flash the target line so an on-screen (no-scroll) jump is visible.
+        flash_line.set(Some(line));
+        clear_timeout_timer(flash_timer);
+        if let Some(window) = web_sys::window() {
+            let cb = Closure::<dyn FnMut()>::new(move || {
+                flash_line.set(None);
+            });
+            if let Ok(id) = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                cb.as_ref().unchecked_ref(),
+                GOTO_FLASH_MS,
+            ) {
+                flash_timer.update_value(|slot| *slot = Some((id, cb)));
+            }
+        }
         if measured {
             // Real geometry applied — consume the request so it fires once.
             pending_line.set(None);
@@ -1012,6 +1034,51 @@ fn FileViewLoaded(
     let find_for_render = find_state.clone();
     let menu_key = key.clone();
 
+    // Transient code-intel notice for this tab (e.g. "definition is outside
+    // the project"). The banner clears itself after a few seconds.
+    let notice_signal = state.code_intel_notice;
+    let notice_timer: TimeoutClosureSlot = StoredValue::new_local(None);
+    on_cleanup(move || clear_timeout_timer(notice_timer));
+    Effect::new(move |_| {
+        let is_mine =
+            notice_signal.with(|notice| notice.as_ref().is_some_and(|notice| notice.tab == tab_id));
+        if !is_mine {
+            return;
+        }
+        clear_timeout_timer(notice_timer);
+        if let Some(window) = web_sys::window() {
+            let cb = Closure::<dyn FnMut()>::new(move || {
+                notice_signal.update(|notice| {
+                    if notice.as_ref().is_some_and(|notice| notice.tab == tab_id) {
+                        *notice = None;
+                    }
+                });
+            });
+            if let Ok(id) = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                cb.as_ref().unchecked_ref(),
+                CODE_INTEL_NOTICE_MS,
+            ) {
+                notice_timer.update_value(|slot| *slot = Some((id, cb)));
+            }
+        }
+    });
+
+    // Whether this file has been deleted on disk while its viewer is open.
+    // Server-owned signal: a watcher-driven refresh read of a missing file
+    // answers `ProjectFileContents { missing: true }` (see `read_file`), which
+    // dispatch records on the `OpenFile`. The directory listing is *not*
+    // consulted — it is depth-limited and lazily expanded, so absence from it
+    // proves nothing for files below the loaded depth.
+    let deleted_key = key.clone();
+    let open_files = state.open_files;
+    let deleted_on_disk: Memo<bool> = Memo::new(move |_| {
+        open_files.with(|files| {
+            files
+                .get(&deleted_key)
+                .is_some_and(|open_file| open_file.missing)
+        })
+    });
+
     view! {
                             <div class="file-view-header">
                                 <span class="file-view-path">{path_display}</span>
@@ -1045,6 +1112,33 @@ fn FileViewLoaded(
                                 }
                                 <button class="file-view-close" on:click=on_close title="Close">"×"</button>
                             </div>
+                            {move || {
+                                deleted_on_disk.get().then(|| view! {
+                                    <div
+                                        class="file-view-deleted-banner"
+                                        data-test="file-view-deleted-banner"
+                                    >
+                                        "This file was deleted on disk. The content below is the last version seen."
+                                    </div>
+                                })
+                            }}
+                            {move || {
+                                notice_signal
+                                    .with(|notice| {
+                                        notice
+                                            .as_ref()
+                                            .filter(|notice| notice.tab == tab_id)
+                                            .map(|notice| notice.message.clone())
+                                    })
+                                    .map(|message| view! {
+                                        <div
+                                            class="file-view-code-intel-notice"
+                                            data-test="file-view-code-intel-notice"
+                                        >
+                                            {message}
+                                        </div>
+                                    })
+                            }}
                             {move || {
                                 if find_bar_open.get() {
                                     Some(view! { <FindBar /> })
@@ -1091,7 +1185,7 @@ fn FileViewLoaded(
                                         view! {
                                             <div
                                                 class=move || file_line_class_with_diagnostics(
-                                                    i, &find_for_class, decorations,
+                                                    i, &find_for_class, decorations, flash_line,
                                                 )
                                                 data-find-idx=i
                                             >
@@ -1266,11 +1360,24 @@ fn file_line_class_with_diagnostics(
     line_idx: usize,
     find: &FindState,
     decorations: Memo<HashMap<usize, LineDecorations>>,
+    flash_line: RwSignal<Option<u32>>,
 ) -> String {
     let base = file_line_class(line_idx, find);
     let gutter = decorations.with(|map| map.get(&line_idx).and_then(|d| d.gutter));
-    format!("{base}{}", gutter_class(gutter))
+    // Transient goto-target flash (1-based in the signal).
+    let flash = if flash_line.get() == Some(line_idx as u32 + 1) {
+        " file-line-goto-flash"
+    } else {
+        ""
+    };
+    format!("{base}{}{flash}", gutter_class(gutter))
 }
+
+/// How long the goto-target line stays highlighted after a jump.
+const GOTO_FLASH_MS: i32 = 1600;
+
+/// How long a transient code-intel notice banner stays visible.
+const CODE_INTEL_NOTICE_MS: i32 = 4000;
 
 /// Per-line diagnostic decorations: a gutter dot severity and the squiggle
 /// spans/link spans (byte ranges relative to the line start).
@@ -1743,6 +1850,25 @@ fn hover_target_at_point(lines: &FileLines, client_x: f64, client_y: f64) -> Opt
     })
 }
 
+/// Whether any diagnostic covers `offset` at the rendered `version` — the
+/// other hover-worthy target besides identifiers.
+fn has_diagnostics_at(
+    state: &AppState,
+    key: &FileResourceKey,
+    version: protocol::ProjectFileVersion,
+    offset: u32,
+) -> bool {
+    let code_intel_key = crate::state::CodeIntelKey {
+        host_id: key.host_id.clone(),
+        project_id: key.project_id.clone(),
+        path: key.path.clone(),
+    };
+    state.code_intel.with_untracked(|map| {
+        map.get(&code_intel_key)
+            .is_some_and(|file| !file.diagnostics_at(version, offset).is_empty())
+    })
+}
+
 /// Whether the byte at `offset` in the file begins an identifier-ish char
 /// (alphanumeric or `_`). Used to gate hover requests so we don't pop a hover
 /// over whitespace / punctuation.
@@ -1865,7 +1991,12 @@ fn maybe_request_hover(
         crate::actions::dismiss_hover(state);
         return;
     };
-    if !is_identifier_byte(lines, target.line_idx, target.line_byte) {
+    // Identifier chars get a hover; so does any byte covered by a diagnostic
+    // (a flagged string literal or operator has a message worth reading even
+    // though it isn't identifier-shaped). Everything else dismisses.
+    if !is_identifier_byte(lines, target.line_idx, target.line_byte)
+        && !has_diagnostics_at(state, &key, version, target.offset)
+    {
         crate::actions::dismiss_hover(state);
         return;
     }
@@ -2278,6 +2409,7 @@ mod wasm_tests {
                         version: ProjectFileVersion(1),
                         contents: Some(content.to_owned()),
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });
@@ -2384,6 +2516,7 @@ mod wasm_tests {
                         version: ProjectFileVersion(1),
                         contents: Some("old contents".to_owned()),
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });
@@ -2413,6 +2546,7 @@ mod wasm_tests {
                     version: ProjectFileVersion(2),
                     contents: Some("new contents".to_owned()),
                     is_binary: false,
+                    missing: false,
                 },
             );
         });
@@ -2476,6 +2610,7 @@ mod wasm_tests {
                         version: ProjectFileVersion(1),
                         contents: Some(initial.clone()),
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });
@@ -2541,6 +2676,7 @@ mod wasm_tests {
                     version: ProjectFileVersion(2),
                     contents: Some(updated),
                     is_binary: false,
+                    missing: false,
                 },
             );
         });
@@ -2725,6 +2861,7 @@ mod wasm_tests {
                         version: ProjectFileVersion(1),
                         contents: Some("project alpha".to_owned()),
                         is_binary: false,
+                        missing: false,
                     },
                 );
                 files.insert(
@@ -2734,6 +2871,7 @@ mod wasm_tests {
                         version: ProjectFileVersion(1),
                         contents: Some("project bravo".to_owned()),
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });
@@ -2808,6 +2946,7 @@ mod wasm_tests {
                     version: ProjectFileVersion(2),
                     contents: Some("project alpha updated".to_owned()),
                     is_binary: false,
+                    missing: false,
                 },
             );
         });
@@ -2882,6 +3021,7 @@ mod wasm_tests {
                         version: ProjectFileVersion(1),
                         contents: Some("fn main() {}".to_owned()),
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });
@@ -2970,6 +3110,7 @@ mod wasm_tests {
                         version: ProjectFileVersion(1),
                         contents: Some(content.to_owned()),
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });
@@ -3048,6 +3189,7 @@ mod wasm_tests {
                         version: ProjectFileVersion(1),
                         contents: Some("fn first() {}".to_owned()),
                         is_binary: false,
+                        missing: false,
                     },
                 );
                 files.insert(
@@ -3057,6 +3199,7 @@ mod wasm_tests {
                         version: ProjectFileVersion(1),
                         contents: Some("fn second() {}".to_owned()),
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });
@@ -3121,6 +3264,7 @@ mod wasm_tests {
                         version: ProjectFileVersion(1),
                         contents: Some(content.to_owned()),
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });
@@ -3232,6 +3376,7 @@ mod wasm_tests {
                         version: ProjectFileVersion(1),
                         contents: Some(content.to_owned()),
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });
@@ -3379,6 +3524,7 @@ mod wasm_tests {
                         version: ProjectFileVersion(1),
                         contents: Some(content.to_owned()),
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });
@@ -3468,6 +3614,7 @@ mod wasm_tests {
                         version: ProjectFileVersion(1),
                         contents: Some(content.to_owned()),
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });
@@ -3550,6 +3697,7 @@ mod wasm_tests {
                         version: ProjectFileVersion(1),
                         contents: Some(content.to_owned()),
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });
@@ -3657,6 +3805,7 @@ mod wasm_tests {
                         version: ProjectFileVersion(1),
                         contents: Some(content.to_owned()),
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });
@@ -3809,6 +3958,7 @@ mod wasm_tests {
                         version: ProjectFileVersion(1),
                         contents: Some(content.to_owned()),
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });
@@ -3962,6 +4112,7 @@ mod wasm_tests {
                         version: ProjectFileVersion(1),
                         contents: Some(content.to_owned()),
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });
@@ -4113,6 +4264,7 @@ mod wasm_tests {
                         version: ProjectFileVersion(1),
                         contents: Some(content.to_owned()),
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });
@@ -4234,6 +4386,7 @@ mod wasm_tests {
                         version: ProjectFileVersion(1),
                         contents: Some(content.to_owned()),
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });
@@ -4293,6 +4446,101 @@ mod wasm_tests {
         );
     }
 
+    /// A6: when the server reports an open file's refresh read as `missing`
+    /// (the file was deleted on disk), the viewer says so — otherwise the tab
+    /// silently shows stale content forever.
+    ///
+    /// Assertion basis (was: remove the file from the directory listing): the
+    /// listing is depth-limited and lazily expanded, so absence from it is not
+    /// evidence of deletion — a deep, never-listed file would have shown a
+    /// false banner. The banner is now driven by the server's typed
+    /// `ProjectFileContents { missing: true }` answer, recorded on the
+    /// `OpenFile`. Same behavioral contract, stricter trigger: banner appears
+    /// exactly when the server reports the file gone, and last-seen content
+    /// stays visible beneath it.
+    #[wasm_bindgen_test]
+    async fn deleted_file_shows_banner_when_server_reports_missing() {
+        ensure_styles_loaded();
+        install_send_stub();
+
+        let path = ProjectPath {
+            root: ProjectRootPath("test-root".to_owned()),
+            relative_path: "main.rs".to_owned(),
+        };
+        let container = make_container();
+        let mount_path = path.clone();
+        let captured: Rc<RefCell<Option<AppState>>> = Rc::new(RefCell::new(None));
+        let cap = captured.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let file_path = mount_path.clone();
+            let resource_key = file_key(file_path.clone());
+            state.open_files.update(|files| {
+                files.insert(
+                    resource_key.clone(),
+                    OpenFile {
+                        path: file_path.clone(),
+                        version: ProjectFileVersion(1),
+                        contents: Some("fn main() {}".to_owned()),
+                        is_binary: false,
+                        missing: false,
+                    },
+                );
+            });
+            let tab_id = state
+                .open_tab_at(
+                    OpenTarget::Focused,
+                    crate::state::TabContent::File {
+                        key: resource_key.clone(),
+                    },
+                    "main.rs".to_owned(),
+                    true,
+                )
+                .expect("fixture tab");
+            *cap.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! { <FileView tab_id=tab_id key=resource_key /> }
+        });
+        next_tick().await;
+        let state = captured.borrow().clone().unwrap();
+
+        assert!(
+            container
+                .query_selector("[data-test=\"file-view-deleted-banner\"]")
+                .unwrap()
+                .is_none(),
+            "no banner while the server has not reported the file missing"
+        );
+
+        // The watcher-driven refresh read answers `missing: true`; dispatch
+        // records it on the OpenFile, keeping the last-seen contents.
+        let missing_key = file_key(path.clone());
+        state.open_files.update(|files| {
+            if let Some(open_file) = files.get_mut(&missing_key) {
+                open_file.missing = true;
+                open_file.version = ProjectFileVersion(2);
+            }
+        });
+        next_tick().await;
+
+        let banner = container
+            .query_selector("[data-test=\"file-view-deleted-banner\"]")
+            .unwrap()
+            .expect("deletion must surface a banner in the open viewer");
+        let text = banner.text_content().unwrap_or_default();
+        assert!(
+            text.contains("deleted on disk"),
+            "the banner must say the file was deleted; got {text:?}"
+        );
+        assert!(
+            container
+                .query_selector(".file-line-code")
+                .unwrap()
+                .is_some(),
+            "the last-seen content stays visible under the banner"
+        );
+    }
+
     /// A `code_intel_navigate_result` correlated to the active navigate id
     /// triggers navigation: the target's byte offset is stashed in
     /// `pending_goto_offset` (consumed by the file view's scroll-snap) and the
@@ -4332,6 +4580,7 @@ mod wasm_tests {
                             version: ProjectFileVersion(1),
                             contents: Some("fn main() {}".to_owned()),
                             is_binary: false,
+                            missing: false,
                         },
                     );
                 });
@@ -4387,6 +4636,7 @@ mod wasm_tests {
                 path: target.clone(),
                 range: ByteRange { start: 42, end: 48 },
             }],
+            external_targets: 0,
         };
         crate::dispatch::apply_code_intel_navigate_result(&state, payload);
 
@@ -4409,6 +4659,7 @@ mod wasm_tests {
                 path: target.clone(),
                 range: ByteRange { start: 5, end: 9 },
             }],
+            external_targets: 0,
         };
         crate::dispatch::apply_code_intel_navigate_result(&state, stale);
         assert_eq!(
@@ -4439,6 +4690,7 @@ mod wasm_tests {
                 path: target,
                 range: ByteRange { start: 5, end: 9 },
             }],
+            external_targets: 0,
         };
         crate::dispatch::apply_code_intel_navigate_result(&state, after_switch);
         assert_eq!(
@@ -4499,6 +4751,7 @@ mod wasm_tests {
                     version: ProjectFileVersion(1),
                     contents: Some("fn main() {}".to_owned()),
                     is_binary: false,
+                    missing: false,
                 },
             );
         });
@@ -4586,6 +4839,7 @@ mod wasm_tests {
                     path: stale_target.clone(),
                     range: ByteRange { start: 5, end: 9 },
                 }],
+                external_targets: 0,
             },
         );
 
@@ -4731,6 +4985,7 @@ mod wasm_tests {
                         version: ProjectFileVersion(1),
                         contents: Some(content.to_owned()),
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });
@@ -4833,6 +5088,7 @@ mod wasm_tests {
                         version: ProjectFileVersion(1),
                         contents: Some(content.to_owned()),
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });
@@ -4943,6 +5199,7 @@ mod wasm_tests {
                         version: ProjectFileVersion(1),
                         contents: Some(content.to_owned()),
                         is_binary: false,
+                        missing: false,
                     },
                 );
             });
