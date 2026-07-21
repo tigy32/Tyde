@@ -123,6 +123,11 @@ main()
 /// opaque error. Detecting it here turns that 15s hang into an actionable fix.
 const HERMES_MCP_MISSING_MARKER: &str = "__TYDE_HERMES_MCP_MISSING__";
 
+/// How many trailing Hermes stderr lines to retain per turn so a message-less
+/// gateway exit can still report the underlying cause (e.g. an API-failure
+/// panel printed just before the process died).
+const HERMES_STDERR_TAIL: usize = 30;
+
 const HERMES_BRIDGE_REGISTRATION: &str = r#"
 import importlib.util
 import json
@@ -287,6 +292,12 @@ struct HermesSessionActor {
     gateway_events_rx: mpsc::UnboundedReceiver<HermesGatewayEvent>,
     subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
     native_subagents: HashMap<String, HermesNativeSubagent>,
+    /// Bounded tail of the most recent Hermes stderr lines for the current turn.
+    /// Stderr is normally diagnostic-only (logged at debug), but if a turn dies
+    /// without a protocol-level message (e.g. the gateway exits mid-call after
+    /// exhausting API retries) this tail is attached to the failure so the real
+    /// cause is never silenced.
+    recent_stderr: VecDeque<String>,
 }
 
 struct HermesNativeSubagent {
@@ -498,6 +509,7 @@ impl Backend for HermesBackend {
             gateway_events_rx,
             subagent_emitter: None,
             native_subagents: HashMap::new(),
+            recent_stderr: VecDeque::new(),
         };
         tokio::spawn(actor.run(Some(initial_input), None, startup_gateway_events));
 
@@ -557,6 +569,7 @@ impl Backend for HermesBackend {
             gateway_events_rx,
             subagent_emitter: None,
             native_subagents: HashMap::new(),
+            recent_stderr: VecDeque::new(),
         };
         tokio::spawn(actor.run(
             None,
@@ -786,6 +799,9 @@ impl HermesSessionActor {
             return;
         }
 
+        // Scope the stderr tail to this turn so a later failure never reports
+        // stale output from an earlier one.
+        self.recent_stderr.clear();
         self.emit(ChatEvent::MessageAdded(user_message(&payload.message)));
         self.emit(ChatEvent::TypingStatusChanged(true));
         match self
@@ -1018,20 +1034,31 @@ impl HermesSessionActor {
                 true
             }
             HermesGatewayEvent::Stderr(line) => {
-                if is_internal_hermes_stderr(&line) {
-                    tracing::debug!(message = %line, "Hermes internal diagnostic");
-                } else {
-                    self.emit(ChatEvent::MessageAdded(warning_message(format!(
-                        "Hermes stderr: {line}"
-                    ))));
+                // Hermes stderr is diagnostic decoration — retry panels ("API
+                // call failed (attempt 1/3)", provider/endpoint/elapsed banners),
+                // capability notes, and the like — not a user-facing error
+                // channel. Surfacing one chat warning per line fragments a single
+                // failure across many cards and cries wolf on transient retries
+                // that ultimately succeed. Genuine turn failures arrive as
+                // protocol "error"/"failed" events (see map_error) and gateway
+                // death via Closed, each of which surfaces one coherent message.
+                // Keep the raw stderr in the host log for debugging, and retain a
+                // bounded tail so a message-less failure (gateway exit) can still
+                // report the real cause.
+                tracing::debug!(message = %line, "Hermes stderr");
+                if self.recent_stderr.len() == HERMES_STDERR_TAIL {
+                    self.recent_stderr.pop_front();
                 }
+                self.recent_stderr.push_back(line);
                 true
             }
             HermesGatewayEvent::Closed(exit_code) => {
-                self.emit_turn_failure(match exit_code {
+                let base = match exit_code {
                     Some(code) => format!("Hermes gateway exited with code {code}"),
                     None => "Hermes gateway exited".to_string(),
-                });
+                };
+                let message = format_failure_with_stderr_tail(base, &self.recent_stderr);
+                self.emit_turn_failure(message);
                 false
             }
         }
@@ -1206,9 +1233,17 @@ impl HermesSessionActor {
                 }
             },
             Ok(Err(err)) => {
-                self.emit(ChatEvent::MessageAdded(warning_message(format!(
-                    "Hermes session.context_breakdown failed: {err}"
-                ))));
+                // Leaner/older Hermes gateways don't implement this optional
+                // method and answer JSON-RPC -32601. That's a capability gap, not
+                // a failure the user needs to see on every otherwise-working
+                // turn — keep it in the log and only warn on genuine breakage.
+                if is_unsupported_gateway_method(&err) {
+                    tracing::debug!(error = %err, "Hermes gateway lacks session.context_breakdown");
+                } else {
+                    self.emit(ChatEvent::MessageAdded(warning_message(format!(
+                        "Hermes session.context_breakdown failed: {err}"
+                    ))));
+                }
                 None
             }
             Err(_) => {
@@ -1264,17 +1299,27 @@ impl HermesSessionActor {
     }
 }
 
-fn is_internal_hermes_stderr(line: &str) -> bool {
-    let Some(check) = line.strip_prefix("check_fn ") else {
-        return false;
-    };
-    [
-        " returned False; dependent tools will be unavailable this turn",
-        " raised; dependent tools will be unavailable this turn",
-    ]
-    .into_iter()
-    .find_map(|suffix| check.strip_suffix(suffix))
-    .is_some_and(|name| !name.trim().is_empty() && !name.chars().any(char::is_whitespace))
+/// Append the buffered stderr tail to a failure message that would otherwise
+/// carry no detail, so a gateway that died mid-call after exhausting API retries
+/// still reports why. No-op when there is nothing buffered.
+fn format_failure_with_stderr_tail(base: String, recent_stderr: &VecDeque<String>) -> String {
+    if recent_stderr.is_empty() {
+        return base;
+    }
+    let tail = recent_stderr
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{base}\n\nRecent Hermes output:\n{tail}")
+}
+
+/// True when a gateway request failed because this Hermes build doesn't
+/// implement the method (JSON-RPC -32601). Tyde calls a few optional methods
+/// (e.g. `session.context_breakdown`) that leaner/older gateways lack; those
+/// belong in the log, not in a user-facing warning on every working turn.
+fn is_unsupported_gateway_method(error: &str) -> bool {
+    error.contains("-32601") || error.contains("unknown method")
 }
 
 impl HermesGatewayHandle {
@@ -5789,19 +5834,39 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn hermes_internal_tool_eligibility_diagnostic_is_not_user_facing() {
-        assert!(is_internal_hermes_stderr(
-            "check_fn check_close_terminal_requirements returned False; dependent tools will be unavailable this turn"
+    fn unsupported_gateway_method_is_recognized() {
+        assert!(is_unsupported_gateway_method(
+            "Hermes JSON-RPC error -32601: unknown method: session.context_breakdown"
         ));
-        assert!(is_internal_hermes_stderr(
-            "check_fn _check_file_reqs raised; dependent tools will be unavailable this turn"
+        assert!(is_unsupported_gateway_method(
+            "unknown method: session.title"
         ));
-        assert!(!is_internal_hermes_stderr(
-            "gateway failed to initialize terminal tools"
+        assert!(!is_unsupported_gateway_method(
+            "Hermes session.context_breakdown timed out"
         ));
-        assert!(!is_internal_hermes_stderr(
-            "check_fn returned False; dependent tools will be unavailable this turn"
+        assert!(!is_unsupported_gateway_method(
+            "Hermes JSON-RPC error -32000: internal error"
         ));
+    }
+
+    #[test]
+    fn failure_message_absorbs_buffered_stderr_tail() {
+        let empty = VecDeque::new();
+        assert_eq!(
+            format_failure_with_stderr_tail("Hermes gateway exited".to_string(), &empty),
+            "Hermes gateway exited",
+            "no buffered stderr should leave the message untouched"
+        );
+
+        let mut tail = VecDeque::new();
+        tail.push_back("API call failed (attempt 3/3): AssertionError".to_string());
+        tail.push_back("Error: model rejected the request".to_string());
+        let message = format_failure_with_stderr_tail("Hermes gateway exited".to_string(), &tail);
+        assert!(message.starts_with("Hermes gateway exited"));
+        assert!(
+            message.contains("AssertionError") && message.contains("model rejected the request"),
+            "the failure must carry the buffered stderr so the cause is not silenced: {message}"
+        );
     }
 
     #[test]
