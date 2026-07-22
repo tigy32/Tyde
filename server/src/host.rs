@@ -6953,8 +6953,12 @@ impl HostHandle {
                     crate::backend::tycode::persist_native_settings(settings.clone())
                         .await
                         .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+                    // A Tycode save can create or delete settings profiles,
+                    // which changes the session schema's `profile` Select —
+                    // re-publish it alongside the settings snapshot.
                     self.refresh_backend_config_snapshots_after_native_save()
                         .await;
+                    self.refresh_session_schemas_with_fanout(true).await;
                 }
                 BackendKind::Hermes => {
                     let workspace_root = hermes_probe_workspace_root()
