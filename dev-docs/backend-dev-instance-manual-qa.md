@@ -102,6 +102,15 @@ test plan.
    exposes it, and record the evidence.
 7. Prepare unique marker strings for every prompt, command, file, and child.
    Reusing a marker can hide duplicated or misrouted events.
+8. Prove that the QA environment uses disposable project, session, review, and
+   frontend stores, not merely a disposable filesystem workspace. Record the
+   store locations and confirm they contain no production records. A dev
+   instance that silently reuses the operator's normal stores cannot certify a
+   backend.
+9. Confirm the available driver can capture screenshots, rendered DOM,
+   console/backend events, and a separately controlled second client. Treat a
+   missing required observation channel as `BLOCKED`, not as permission to
+   infer the result from final DOM or protocol state.
 
 ## 2. Start a clean Tyde dev instance
 
@@ -112,7 +121,10 @@ test plan.
 4. Check the initial console and rendered UI for startup errors.
 5. Confirm no prior agents, chats, tool cards, or in-flight rows from another
    run are present in the disposable store.
-6. If code changes during the test, stop the instance and start a new one.
+6. Confirm the project rail, selected-project label, footer, and error banner
+   all refer to the disposable project. A stale deleted workbench, missing
+   project root, or global error inherited from another store fails setup.
+7. If code changes during the test, stop the instance and start a new one.
    Dev instances intentionally do not hot-reload.
 
 Use `tyde_debug_evaluate` for DOM inspection and ordinary browser input for
@@ -165,6 +177,11 @@ For every transition:
    changes success to failure, duplicates completion, or alters final output.
 7. Repeat the active-to-completed transition on a subsequent turn. Startup-only
    correctness does not certify reused-session behavior.
+8. For every root and child spawn, sample once immediately after Tyde registers
+   the agent but before its first backend stream event. Repeat with foreground
+   and background children. The card must remain Initializing or Thinking; an
+   idle/completed default during this registration-to-stream gap is a failure,
+   even when a later event corrects it.
 
 Use a ledger like this for every agent:
 
@@ -254,6 +271,11 @@ failure.
    turns.
 7. While a child is still active, confirm partial usage does not falsely mark
    the child completed; after completion, confirm the final total refreshes.
+8. After child completion, reconcile the child's row with its rendered message
+   usage and any authoritative completion usage. Positive usage must not remain
+   permanently `partial` or `unreported` when the backend supplied the missing
+   values, and a known-unsplittable total must be explained rather than shown
+   as an unexplained zero or tiny output count.
 
 These surfaces answer different questions and need not show the same number:
 
@@ -291,6 +313,10 @@ and after replay.
    a new identity. If the agent turn itself has authoritatively ended, the
    agent may be idle while the separate background row remains running; the two
    surfaces must clearly communicate that distinction.
+   The launch acknowledgement must not be rendered as process `Done` or
+   `exit 0`. After the in-flight row disappears, the original card must retain
+   the real final stdout, stderr, exit status, and terminal state through
+   replay and restart.
 6. **Non-zero exit:** run a harmless command that exits non-zero. Confirm the
    typed result includes its exit code and failure treatment without turning
    into an unrelated top-level protocol error.
@@ -324,6 +350,10 @@ truly content-free completion must not create an empty chat message.
 5. Cancel during pre-output thinking, text streaming, a foreground tool, and a
    native child run. Each must show cancelling then one terminal cancelled
    state, stop backend work, and reject late contradictory success.
+   Every surface must describe cancellation as cancellation, not permission
+   denial, rejected tool input, command failure, or successful completion.
+   Backend control prompts or synthetic rejection instructions must never be
+   exposed as user-facing stdout, stderr, or assistant text.
 6. Force one safe backend error and one tool error. Confirm each is attributed
    to the correct agent and turn, preserves prior history, and leaves controls
    recoverable.
@@ -365,7 +395,9 @@ unique name, prompt marker, command marker, and final-answer marker.
    output. The parent must immediately show a typed spawn card with child name
    and prompt.
 2. Before child output starts, confirm its agent card is Initializing or
-   Thinking, never completed.
+   Thinking, never completed. Poll or capture the exact interval after the
+   spawn acknowledgement and before the first child stream event; checking
+   only after streaming begins misses the highest-risk lifecycle gap.
 3. Open the child. Confirm its initial prompt, backend, model, parent relation,
    and active state are visible.
 4. Keep the child running across at least two assistant/tool phases. Inspect it
@@ -376,6 +408,13 @@ unique name, prompt marker, command marker, and final-answer marker.
    must agree.
 6. Wait five seconds after completion and confirm no late event reopens the
    child or changes its result.
+7. Spawn two same-type children with different requested names or backend
+   descriptions. Confirm those labels propagate to cards, open-agent actions,
+   progress rows, and replay so the children remain distinguishable.
+8. Expand and collapse every native spawn, await, and progress card. Confirm
+   neither state exposes raw thread/agent/task identifiers, temporary output
+   paths, serialized backend control payloads, synthetic prompts, or text that
+   instructs the model not to reveal internal metadata.
 
 ### Child-owned work
 
@@ -391,6 +430,9 @@ unique name, prompt marker, command marker, and final-answer marker.
    duplicate of the child's answer.
 6. Leave and reopen the child. Confirm its status, cards, tasks, final message,
    and ordering replay identically.
+7. Compare the parent's final progress summary with the child's rendered tool
+   history. Child tool counts and completed-work summaries must match for zero,
+   one, and multiple tool calls.
 
 ### Background child outliving its parent turn
 
@@ -405,6 +447,10 @@ unique name, prompt marker, command marker, and final-answer marker.
    targets the same child.
 5. After the child completes, confirm parent progress, child status, final
    answer, and in-flight surfaces transition exactly once.
+6. Confirm a background-completion notification does not create an unsolicited
+   second assistant turn in the parent or duplicate the child's final answer.
+   Any parent notification must remain typed status/progress with its own clear
+   identity and must not add answer usage as a new parent response.
 
 ### Native child usage
 
@@ -460,6 +506,9 @@ unique name, prompt marker, command marker, and final-answer marker.
    active status and open work instead of showing completion until a new event
    arrives.
 3. Reload again after completion. Confirm no active state is resurrected.
+   Also confirm the selected project and conversation restore consistently:
+   project rail, editor, chat, footer, and agent panel must not disagree or
+   require clicking an agent merely to repair bootstrap state.
 4. Exercise **Resume** on completed, cancelled, and failed sessions where
    supported. Confirm history loads without blocking unrelated commands and
    the first new turn follows the lifecycle oracle.
@@ -490,6 +539,9 @@ unique name, prompt marker, command marker, and final-answer marker.
 
 1. Change every exposed per-session setting before the first turn and verify
    the response metadata reflects the selected value.
+   Capture the bootstrap interval as well: a chosen model, effort, access mode,
+   or profile must not temporarily render as `Auto` or another default while
+   the backend initializes and then silently correct itself later.
 2. Change settings between turns where allowed. Confirm the new value applies
    only at the documented boundary and old messages retain their metadata.
 3. Attempt a setting change while busy. Confirm it is queued, rejected, or
@@ -524,6 +576,9 @@ unique name, prompt marker, command marker, and final-answer marker.
    labels, correct disabled states, and no accidental double activation.
 4. Confirm status is communicated by text/icon as well as color and that live
    updates are understandable without relying on animation alone.
+   Inspect the accessibility tree or element attributes: each status icon must
+   expose a meaningful accessible name such as Initializing, Thinking,
+   Cancelled, Failed, or Completed rather than an unlabeled glyph and CSS class.
 5. During split output and concurrent children, watch for frozen input,
    excessive layout shifts, runaway scrolling, duplicate renders, or sustained
    high CPU/memory. Record measurements when suspicious.
@@ -539,6 +594,8 @@ Keep an evidence index for every numbered case, not only failures:
 - exact prompt and unique markers;
 - before, held-active, transition, and terminal screenshots;
 - relevant rendered DOM text from `tyde_debug_evaluate`;
+- both collapsed and expanded card evidence when details can contain different
+  content, including an accessibility-tree or attribute capture for statuses;
 - agent, child, tool, task, session, and instance identities where visible;
 - console/log excerpt or explicit note that none appeared;
 - backend, provider, model, settings, commit, and `instance_id`;
