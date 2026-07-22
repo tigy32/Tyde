@@ -5908,7 +5908,7 @@ enum StreamIdentityRecovery {
     /// so processing may continue. `finalize_abandoned` closes the still-open
     /// stream the backend walked away from before the event is applied.
     Resync {
-        finalize_abandoned: Option<ChatEvent>,
+        finalize_abandoned: Option<Box<ChatEvent>>,
     },
     /// No unambiguous interpretation exists; drop the event after reporting.
     Unrecoverable,
@@ -5941,7 +5941,7 @@ fn recover_stream_identity_violation(
                 return StreamIdentityRecovery::Unrecoverable;
             };
             StreamIdentityRecovery::Resync {
-                finalize_abandoned: Some(synthesized_end_for_abandoned_stream(active)),
+                finalize_abandoned: Some(Box::new(synthesized_end_for_abandoned_stream(active))),
             }
         }
         _ => StreamIdentityRecovery::Unrecoverable,
@@ -7226,7 +7226,7 @@ mod tests {
         else {
             panic!("foreign start over an active stream must resync with a finalize");
         };
-        let ChatEvent::StreamEnd(finalize_end) = &finalize else {
+        let ChatEvent::StreamEnd(finalize_end) = &*finalize else {
             panic!("finalize event must be a StreamEnd");
         };
         assert_eq!(

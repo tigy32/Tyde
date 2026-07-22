@@ -4748,10 +4748,8 @@ impl TycodeStreamState {
                     delta.message_id.clone_from(&self.message_id);
                 }
             }
-            ChatEvent::StreamEnd(end) => {
-                if self.open && end.message.message_id.is_none() {
-                    end.message.message_id = self.message_id.clone().map(ChatMessageId);
-                }
+            ChatEvent::StreamEnd(end) if self.open && end.message.message_id.is_none() => {
+                end.message.message_id = self.message_id.clone().map(ChatMessageId);
             }
             _ => {}
         }
