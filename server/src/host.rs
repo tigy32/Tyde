@@ -17119,10 +17119,23 @@ fn new_instance_stream(agent_id: &AgentId) -> StreamPath {
 }
 
 fn default_compaction_summary_prompt() -> String {
-    "Summarize the durable context a future replacement Tyde agent should remember. \
-Focus on user preferences, project facts, decisions, constraints, open threads, and \
-useful debugging or implementation learnings. Omit transient chatter and output only \
-the summary."
+    r#"You are writing a handoff note for the Tyde agent that will replace you after this session is compacted. It will see only this note — not the conversation. Capture the durable context it needs to continue seamlessly, and nothing else.
+
+If there is genuinely nothing durable to carry forward, output exactly `No durable context.` and stop.
+
+Otherwise use these sections; omit any that are empty rather than padding them:
+
+- **Objective & acceptance criteria** — what we are ultimately trying to achieve and what "done" looks like.
+- **Current state & next step** — what is in progress now and the single most important next action.
+- **Open threads** — unfinished work, unanswered questions, and known blockers.
+- **Decisions, rationale & rejected alternatives** — what was decided or ruled out and why, so the replacement neither relitigates nor violates them.
+- **Key paths, artifacts & how to verify** — the specific files, commands, endpoints, and checks needed to continue and to confirm work is correct.
+- **Project & environment facts** — durable, non-obvious facts about the code, tools, and setup.
+- **User preferences** — how this user wants work done.
+- **Learnings & dead-ends** — insights worth keeping, and failed attempts **only** where knowing they failed constrains future work.
+- **Uncertainty & open disagreements** — what is unverified or unresolved.
+
+Rules: Record only what remains true and useful for future work; drop transient chatter, resolved dead-ends, and step-by-step narration. Preserve specifics — exact names, paths, commands, values, and error signatures — over vague description. Mark anything unverified as an assumption; never invent facts, decisions, or outcomes you cannot support from this session, and say plainly when something important is unknown. **Never include secrets, tokens, keys, or credentials.** Be concise: prefer the shortest form a replacement could act on without re-deriving it. Output only the note (or the `No durable context.` sentinel)."#
         .to_owned()
 }
 
@@ -17443,6 +17456,29 @@ mod tests {
 
     static STARTUP_FAILURE_FANOUT_RACE_TEST_LOCK: tokio::sync::Mutex<()> =
         tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn default_compaction_prompt_matches_approved_handoff_note() {
+        let expected = r#"You are writing a handoff note for the Tyde agent that will replace you after this session is compacted. It will see only this note — not the conversation. Capture the durable context it needs to continue seamlessly, and nothing else.
+
+If there is genuinely nothing durable to carry forward, output exactly `No durable context.` and stop.
+
+Otherwise use these sections; omit any that are empty rather than padding them:
+
+- **Objective & acceptance criteria** — what we are ultimately trying to achieve and what "done" looks like.
+- **Current state & next step** — what is in progress now and the single most important next action.
+- **Open threads** — unfinished work, unanswered questions, and known blockers.
+- **Decisions, rationale & rejected alternatives** — what was decided or ruled out and why, so the replacement neither relitigates nor violates them.
+- **Key paths, artifacts & how to verify** — the specific files, commands, endpoints, and checks needed to continue and to confirm work is correct.
+- **Project & environment facts** — durable, non-obvious facts about the code, tools, and setup.
+- **User preferences** — how this user wants work done.
+- **Learnings & dead-ends** — insights worth keeping, and failed attempts **only** where knowing they failed constrains future work.
+- **Uncertainty & open disagreements** — what is unverified or unresolved.
+
+Rules: Record only what remains true and useful for future work; drop transient chatter, resolved dead-ends, and step-by-step narration. Preserve specifics — exact names, paths, commands, values, and error signatures — over vague description. Mark anything unverified as an assumption; never invent facts, decisions, or outcomes you cannot support from this session, and say plainly when something important is unknown. **Never include secrets, tokens, keys, or credentials.** Be concise: prefer the shortest form a replacement could act on without re-deriving it. Output only the note (or the `No durable context.` sentinel)."#;
+
+        assert_eq!(default_compaction_summary_prompt(), expected);
+    }
 
     #[test]
     fn hermes_profile_launch_entries_synthesize_ready_and_unavailable() {
