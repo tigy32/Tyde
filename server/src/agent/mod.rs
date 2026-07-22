@@ -1951,6 +1951,7 @@ pub(crate) fn spawn_agent_actor(
         let mut event_log: Vec<Envelope> = Vec::new();
         let mut latest_output = AgentControlLatestOutput::default();
         let mut replay_state = AgentReplayState::default();
+        let mut last_stream_identity_violation: Option<StreamIdentityViolation> = None;
         let mut subscribers: Vec<Stream> = Vec::new();
         let mut active_stream_text = String::new();
         let mut activity_stats = AgentActivityStatsTracker::for_backend(backend_kind);
@@ -2549,16 +2550,44 @@ pub(crate) fn spawn_agent_actor(
                     if let Err(violation) =
                         validate_chat_event_stream_identity(&replay_state, &event)
                     {
-                        let error = stream_identity_violation_event(violation);
-                        append_chat_event(
-                            &canonical_stream,
-                            &mut event_log,
-                            &mut subscribers,
-                            &mut replay_state,
-                            &error,
-                        )
-                        .await;
-                        continue;
+                        if last_stream_identity_violation != Some(violation) {
+                            last_stream_identity_violation = Some(violation);
+                            let error = stream_identity_violation_event(violation);
+                            append_chat_event(
+                                &canonical_stream,
+                                &mut event_log,
+                                &mut subscribers,
+                                &mut replay_state,
+                                &error,
+                            )
+                            .await;
+                        }
+                        match recover_stream_identity_violation(
+                            &replay_state,
+                            &mut event,
+                            violation,
+                        ) {
+                            StreamIdentityRecovery::Resync { finalize_abandoned } => {
+                                if let Some(finalize) = finalize_abandoned {
+                                    append_chat_event(
+                                        &canonical_stream,
+                                        &mut event_log,
+                                        &mut subscribers,
+                                        &mut replay_state,
+                                        &finalize,
+                                    )
+                                    .await;
+                                }
+                                if validate_chat_event_stream_identity(&replay_state, &event)
+                                    .is_err()
+                                {
+                                    continue;
+                                }
+                            }
+                            StreamIdentityRecovery::Unrecoverable => continue,
+                        }
+                    } else {
+                        last_stream_identity_violation = None;
                     }
                     if resume_replay_gate_pending {
                         ingest_gated_replay_event(
@@ -4118,6 +4147,7 @@ pub(crate) fn spawn_relay_agent_actor(
         let mut event_log: Vec<Envelope> = Vec::new();
         let mut latest_output = AgentControlLatestOutput::default();
         let mut replay_state = AgentReplayState::default();
+        let mut last_stream_identity_violation: Option<StreamIdentityViolation> = None;
         let mut subscribers: Vec<Stream> = Vec::new();
         let mut active_stream_text = String::new();
         let mut activity_stats = AgentActivityStatsTracker::default();
@@ -4202,16 +4232,44 @@ pub(crate) fn spawn_relay_agent_actor(
                     if let Err(violation) =
                         validate_chat_event_stream_identity(&replay_state, &event)
                     {
-                        let error = stream_identity_violation_event(violation);
-                        append_chat_event(
-                            &canonical_stream,
-                            &mut event_log,
-                            &mut subscribers,
-                            &mut replay_state,
-                            &error,
-                        )
-                        .await;
-                        continue;
+                        if last_stream_identity_violation != Some(violation) {
+                            last_stream_identity_violation = Some(violation);
+                            let error = stream_identity_violation_event(violation);
+                            append_chat_event(
+                                &canonical_stream,
+                                &mut event_log,
+                                &mut subscribers,
+                                &mut replay_state,
+                                &error,
+                            )
+                            .await;
+                        }
+                        match recover_stream_identity_violation(
+                            &replay_state,
+                            &mut event,
+                            violation,
+                        ) {
+                            StreamIdentityRecovery::Resync { finalize_abandoned } => {
+                                if let Some(finalize) = finalize_abandoned {
+                                    append_chat_event(
+                                        &canonical_stream,
+                                        &mut event_log,
+                                        &mut subscribers,
+                                        &mut replay_state,
+                                        &finalize,
+                                    )
+                                    .await;
+                                }
+                                if validate_chat_event_stream_identity(&replay_state, &event)
+                                    .is_err()
+                                {
+                                    continue;
+                                }
+                            }
+                            StreamIdentityRecovery::Unrecoverable => continue,
+                        }
+                    } else {
+                        last_stream_identity_violation = None;
                     }
 
                     match &event {
@@ -5830,6 +5888,56 @@ fn validate_chat_event_stream_identity(
     Ok(())
 }
 
+/// How the ingest loop should proceed after a stream identity violation.
+enum StreamIdentityRecovery {
+    /// The event has been rewritten (or the abandoned stream can be closed)
+    /// so processing may continue. `finalize_abandoned` closes the still-open
+    /// stream the backend walked away from before the event is applied.
+    Resync { finalize_abandoned: Option<ChatEvent> },
+    /// No unambiguous interpretation exists; drop the event after reporting.
+    Unrecoverable,
+}
+
+/// A violation must cost one diagnostic, not the rest of the session. The two
+/// resyncable shapes are the ones with exactly one faithful interpretation:
+/// an id-less `StreamEnd` while a single stream is active can only be ending
+/// that stream, and a fresh `StreamStart` while another stream is active can
+/// only mean the backend abandoned the previous stream without ending it.
+/// Everything else (duplicates, mismatched ends, orphan deltas) stays
+/// report-and-drop because guessing would fabricate transcript state.
+fn recover_stream_identity_violation(
+    replay_state: &AgentReplayState,
+    event: &mut ChatEvent,
+    violation: StreamIdentityViolation,
+) -> StreamIdentityRecovery {
+    match (violation, event) {
+        (StreamIdentityViolation::MissingMessageId, ChatEvent::StreamEnd(end)) => {
+            let Some(active) = replay_state.active_stream.as_ref() else {
+                return StreamIdentityRecovery::Unrecoverable;
+            };
+            end.message.message_id = Some(active.message_id.clone());
+            StreamIdentityRecovery::Resync {
+                finalize_abandoned: None,
+            }
+        }
+        (StreamIdentityViolation::ForeignActiveMessageId, ChatEvent::StreamStart(_)) => {
+            let Some(active) = replay_state.active_stream.as_ref() else {
+                return StreamIdentityRecovery::Unrecoverable;
+            };
+            StreamIdentityRecovery::Resync {
+                finalize_abandoned: Some(synthesized_end_for_abandoned_stream(active)),
+            }
+        }
+        _ => StreamIdentityRecovery::Unrecoverable,
+    }
+}
+
+fn synthesized_end_for_abandoned_stream(active: &ReplayActiveStream) -> ChatEvent {
+    ChatEvent::StreamEnd(StreamEndData {
+        message: cancelled_stream_message(active),
+    })
+}
+
 fn required_replay_stream_message_id(
     message_id: Result<ChatMessageId, StreamIdentityViolation>,
 ) -> Result<ChatMessageId, StreamIdentityViolation> {
@@ -6976,6 +7084,177 @@ mod tests {
     use crate::stream::Stream;
 
     static AGENT_STARTUP_ACTOR_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+    fn recovery_stream_start(message_id: &str) -> ChatEvent {
+        ChatEvent::StreamStart(StreamStartData {
+            message_id: Some(message_id.to_owned()),
+            agent: "tycode".to_owned(),
+            model: Some("qwen-plus".to_owned()),
+        })
+    }
+
+    fn recovery_stream_delta(message_id: &str, text: &str) -> ChatEvent {
+        ChatEvent::StreamDelta(StreamTextDeltaData {
+            message_id: Some(message_id.to_owned()),
+            text: text.to_owned(),
+        })
+    }
+
+    fn recovery_id_less_stream_end(content: &str) -> ChatEvent {
+        ChatEvent::StreamEnd(StreamEndData {
+            message: ChatMessage {
+                message_id: None,
+                timestamp: 1,
+                sender: MessageSender::Assistant {
+                    agent: "tycode".to_owned(),
+                },
+                content: content.to_owned(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            },
+        })
+    }
+
+    fn record_recovery_event(
+        event_log: &mut Vec<super::Envelope>,
+        replay_state: &mut AgentReplayState,
+        event: &ChatEvent,
+    ) {
+        super::record_chat_event_for_replay("/agent/recovery-test", event_log, replay_state, event)
+            .expect("recovery test event must validate");
+    }
+
+    /// An id-less `StreamEnd` while its stream is active is the tycode 0.10.0
+    /// wire shape; recovery must adopt the active id so the completion (and
+    /// its metadata) lands instead of poisoning every later turn.
+    #[test]
+    fn stream_identity_missing_end_id_recovers_without_poisoning_session() {
+        let mut event_log = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+        record_recovery_event(&mut event_log, &mut replay_state, &recovery_stream_start("m1"));
+        record_recovery_event(
+            &mut event_log,
+            &mut replay_state,
+            &recovery_stream_delta("m1", "pong"),
+        );
+
+        let mut end = recovery_id_less_stream_end("pong");
+        let violation = super::validate_chat_event_stream_identity(&replay_state, &end)
+            .expect_err("id-less StreamEnd must be flagged");
+        assert_eq!(violation, protocol::StreamIdentityViolation::MissingMessageId);
+
+        let recovery =
+            super::recover_stream_identity_violation(&replay_state, &mut end, violation);
+        assert!(matches!(
+            recovery,
+            super::StreamIdentityRecovery::Resync {
+                finalize_abandoned: None
+            }
+        ));
+        let ChatEvent::StreamEnd(recovered) = &end else {
+            unreachable!()
+        };
+        assert_eq!(
+            recovered.message.message_id,
+            Some(ChatMessageId("m1".to_owned()))
+        );
+        record_recovery_event(&mut event_log, &mut replay_state, &end);
+        assert!(replay_state.active_stream.is_none());
+
+        // The next turn must open cleanly: no cascade.
+        super::validate_chat_event_stream_identity(&replay_state, &recovery_stream_start("m2"))
+            .expect("next turn must not inherit a stuck stream");
+    }
+
+    /// A fresh `StreamStart` while another stream is active means the backend
+    /// abandoned the previous stream; recovery finalizes the abandoned stream
+    /// with its accumulated content before accepting the new one.
+    #[test]
+    fn stream_identity_foreign_start_recovery_finalizes_abandoned_stream() {
+        let mut event_log = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+        record_recovery_event(&mut event_log, &mut replay_state, &recovery_stream_start("m1"));
+        record_recovery_event(
+            &mut event_log,
+            &mut replay_state,
+            &recovery_stream_delta("m1", "partial answer"),
+        );
+
+        let mut start = recovery_stream_start("m2");
+        let violation = super::validate_chat_event_stream_identity(&replay_state, &start)
+            .expect_err("start over an active stream must be flagged");
+        assert_eq!(
+            violation,
+            protocol::StreamIdentityViolation::ForeignActiveMessageId
+        );
+
+        let recovery =
+            super::recover_stream_identity_violation(&replay_state, &mut start, violation);
+        let super::StreamIdentityRecovery::Resync {
+            finalize_abandoned: Some(finalize),
+        } = recovery
+        else {
+            panic!("foreign start over an active stream must resync with a finalize");
+        };
+        let ChatEvent::StreamEnd(finalize_end) = &finalize else {
+            panic!("finalize event must be a StreamEnd");
+        };
+        assert_eq!(
+            finalize_end.message.message_id,
+            Some(ChatMessageId("m1".to_owned()))
+        );
+        assert_eq!(finalize_end.message.content, "partial answer");
+
+        record_recovery_event(&mut event_log, &mut replay_state, &finalize);
+        record_recovery_event(&mut event_log, &mut replay_state, &start);
+        assert_eq!(
+            replay_state
+                .active_stream
+                .as_ref()
+                .map(|active| active.message_id.0.as_str()),
+            Some("m2")
+        );
+        assert!(
+            replay_state
+                .terminal_stream_message_ids
+                .contains(&ChatMessageId("m1".to_owned()))
+        );
+    }
+
+    /// Shapes without one faithful interpretation stay report-and-drop:
+    /// recovery must not fabricate transcript state.
+    #[test]
+    fn stream_identity_ambiguous_shapes_stay_unrecoverable() {
+        let mut event_log = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+
+        // An id-less end with no active stream has nothing to adopt.
+        let mut orphan_end = recovery_id_less_stream_end("orphan");
+        let violation =
+            super::validate_chat_event_stream_identity(&replay_state, &orphan_end).unwrap_err();
+        assert!(matches!(
+            super::recover_stream_identity_violation(&replay_state, &mut orphan_end, violation),
+            super::StreamIdentityRecovery::Unrecoverable
+        ));
+
+        // A delta for a foreign id must not be grafted onto the active stream.
+        record_recovery_event(&mut event_log, &mut replay_state, &recovery_stream_start("m1"));
+        let mut foreign_delta = recovery_stream_delta("m9", "stray");
+        let violation = super::validate_chat_event_stream_identity(&replay_state, &foreign_delta)
+            .unwrap_err();
+        assert!(matches!(
+            super::recover_stream_identity_violation(
+                &replay_state,
+                &mut foreign_delta,
+                violation
+            ),
+            super::StreamIdentityRecovery::Unrecoverable
+        ));
+    }
 
     fn startup_actor_fixture(
         agent_id: &str,
