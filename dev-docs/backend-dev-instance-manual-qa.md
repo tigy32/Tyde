@@ -163,16 +163,58 @@ Where supported, test both backend-native sub-agents and Tyde-managed agents.
    and prompt.
 3. Open the child and verify its initial prompt, tool activity, final response,
    backend, and model are visible.
-4. Ask the parent to spawn a Tyde-managed agent, then await it through the Tyde
+
+### Native sub-agent work renders in the child's chat
+
+For backends whose native sub-agents can themselves use tools, drive a child
+through the same tool and background paths tested in section 5 and confirm the
+work renders inside the **sub-agent's own chat**, not the parent's.
+
+1. Give the native sub-agent a bounded prompt that makes it both run a
+   foreground command (such as `printf`) and start a bounded background command
+   (such as a short `sleep`), then finish with a one-line textual summary.
+2. Open the child conversation. Confirm the foreground tool card appears as a
+   typed tool card with its command, output, exit status, and terminal state —
+   not flattened into assistant text or a generic card.
+3. Confirm the background command card remains visible and transitions to its
+   final state without acquiring a new identity, exactly as required in
+   section 5, but inside the child's chat.
+4. If the native sub-agent exposes a task list, confirm its task state renders
+   in the child's chat under the section 6 rules (typed steps, status
+   transitions, no duplicated list, no empty assistant messages).
+5. Confirm the sub-agent's **final message** appears once in the child's chat,
+   finishes normally, shows the child's backend and model, and is not left as an
+   empty assistant placeholder. The same final text must not be duplicated into
+   the parent's chat; the parent shows only the typed spawn/await result.
+6. Leave and reopen the child conversation and confirm its tool cards,
+   background transition, task state, and final message replay identically.
+
+### Sub-agent usage reaches the Session Settings tracker
+
+1. After the native sub-agent completes, expand the parent's bottom
+   **Session Settings (<backend>)** row and open the **Task usage** popover.
+2. Confirm the native sub-agent appears as its own row, distinct from the root
+   agent, with the expected backend and model, and the header reports the
+   correct agent count.
+3. Confirm the sub-agent row shows positive input and output totals sourced from
+   the child's own turns, not zeroes or a copy of the parent's figures.
+4. Confirm the task total grows to include the sub-agent's usage and is not
+   double-counted against the parent. Compare with the authoritative cumulative
+   scopes rather than summing every message.
+
+### Tyde-managed agents and mixed turns
+
+1. Ask the parent to spawn a Tyde-managed agent, then await it through the Tyde
    agent tools.
-5. Verify spawn and await cards name every affected agent and that every
+2. Verify spawn and await cards name every affected agent and that every
    **Open agent** action opens the correct child.
-6. In one turn, mix a native sub-agent with a Tyde-managed agent. Verify neither
+3. In one turn, mix a native sub-agent with a Tyde-managed agent. Verify neither
    is rendered as a generic command and neither tool stream disappears.
-7. Confirm the parent finishes once, late child completion remains attached to
+4. Confirm the parent finishes once, late child completion remains attached to
    the correct request, and no foreign/duplicate identity error appears.
-8. Reopen **Task usage** and confirm the children appear as separate rows and
-   the task total updates without double-counting the parent.
+5. Reopen **Task usage** and confirm both the native and Tyde-managed children
+   appear as separate rows and the task total updates without double-counting
+   the parent.
 
 ## 8. Exercise persistence and lifecycle
 
@@ -208,6 +250,9 @@ no longer appears in `tyde_dev_instance_list`.
 The backend passes only when the normal, tool, background, cancellation,
 task-tracking, sub-agent, replay, resume, and fork paths applicable to it
 complete without missing or duplicated UI events. Native task lists must
-retain their descriptions and status transitions through replay. Per-message
-usage, Context Usage, and the Session Settings task total must all be
-populated, refresh correctly, and remain present after replay.
+retain their descriptions and status transitions through replay. Native
+sub-agent tool, background, task, and final-message events must render inside
+the child's own chat and replay identically. Per-message usage, Context Usage,
+and the Session Settings task total must all be populated, refresh correctly,
+attribute native sub-agent usage to its own row without double-counting, and
+remain present after replay.

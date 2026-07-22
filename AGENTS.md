@@ -4,6 +4,29 @@ Guidance for AI coding agents working in the Tyde2 repository. The conventions
 in this file apply to every agent (Claude, Codex, Gemini, etc.) that touches
 this codebase.
 
+## Branch hygiene: never develop on `main`
+
+`main` is always kept clean. **Do not do active development directly against
+`main`.** All work happens on a throwaway Tyde workbench and only finished,
+committed work lands on `main`. The workflow for every change is:
+
+1. **Create a fresh Tyde workbench** for the change.
+2. **Do all the work in that workbench** — make your changes there until
+   everything is completed and committed on the workbench. `main` stays
+   untouched while you iterate.
+3. **Land the commits on `main`** by cherry-picking or rebasing them onto
+   `main`. If there are conflicts, do **not** resolve them on `main` and do not
+   leave `main` in a half-merged state: rebase the workbench from `main`,
+   resolve the conflicts in the workbench, and retry the land. Conflict
+   resolution never blocks or dirties `main`.
+4. **Run `./dev.sh check`** to confirm `main` is clean once the commits have
+   landed.
+5. **Delete your workbench.**
+
+The single exception is a change small and self-contained enough that the user
+explicitly tells you to skip the workbench; then edit and commit on `main`
+directly as instructed.
+
 ## How to commit
 
 ### 1. Commit message rules
