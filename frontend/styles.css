@@ -3862,12 +3862,108 @@ kbd {
     border-color: var(--accent-hover);
 }
 
-.queued-messages {
+/* ── In-flight tray ──────────────────────────────────────────────────
+   The single live surface for a chat's background work (child agents,
+   sub-agents, workflows) plus its queued messages. One bordered object
+   with a collapsed one-line header; renders nothing when idle. Row
+   internals reuse the .tool-live-agent-* styles below. */
+
+.inflight-tray {
+    margin: 0 var(--space-3) var(--space-2);
+    border: 1px solid var(--border-secondary);
+    border-radius: 6px;
+    background: var(--surface-1);
+    overflow: hidden;
+}
+
+.inflight-tray-header {
+    display: flex;
+    width: 100%;
+    align-items: center;
+    gap: var(--space-2);
+    padding: 5px 10px;
+    background: var(--surface-2);
+    color: var(--text-secondary);
+    border: none;
+    font-size: 0.846rem;
+    text-align: left;
+    cursor: pointer;
+}
+
+.inflight-tray-header:hover {
+    color: var(--text-primary);
+}
+
+.inflight-tray-chevron {
+    flex-shrink: 0;
+    font-size: 0.615rem;
+    transition: transform 0.15s;
+}
+
+.inflight-tray-chevron.expanded {
+    transform: rotate(90deg);
+}
+
+.inflight-tray-summary {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.inflight-tray-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    max-height: 260px;
+    overflow-y: auto;
+    padding: var(--space-2) 10px;
+    border-top: 1px solid var(--border-secondary);
+}
+
+.inflight-tray-row-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+
+.inflight-tray-dismiss {
+    flex-shrink: 0;
+    padding: 0 5px;
+    background: transparent;
+    color: var(--text-tertiary, var(--text-secondary));
+    border: none;
+    font-size: 0.846rem;
+    cursor: pointer;
+}
+
+.inflight-tray-dismiss:hover {
+    color: var(--error);
+}
+
+.inflight-tray-queue {
     display: flex;
     flex-direction: column;
     gap: 4px;
-    position: relative;
-    z-index: 1;
+    margin-top: var(--space-1);
+}
+
+.inflight-tray-clear {
+    align-self: flex-end;
+    height: 22px;
+    padding: 0 7px;
+    background: var(--surface-3);
+    color: var(--text-secondary);
+    border: 1px solid var(--border-secondary);
+    border-radius: 3px;
+    font-size: 0.769rem;
+    cursor: pointer;
+}
+
+.inflight-tray-clear:hover {
+    color: var(--text-primary);
+    border-color: var(--border-primary);
 }
 
 .queued-message-item {
@@ -11889,19 +11985,24 @@ pre.tool-error-pre {
     margin-bottom: var(--space-2);
 }
 
+/* Agent-control receipt: the spawned/awaited agents as named open-agent
+   links plus a pointer to the In-flight tray. Live per-agent rows render
+   in the tray, never here. */
 .tool-live-agent-control {
     display: flex;
-    flex-direction: column;
-    gap: var(--space-1);
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--space-1) var(--space-2);
     margin-bottom: var(--space-2);
 }
 
-.tool-live-agent-control-title {
+.tool-live-agent-receipt-link {
+    font-size: 0.846rem;
+}
+
+.tool-live-agent-receipt-hint {
     font-size: 0.769rem;
-    font-weight: 600;
     color: var(--text-tertiary, var(--text-secondary));
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
 }
 
 .tool-live-agent-row {

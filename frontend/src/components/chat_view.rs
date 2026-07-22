@@ -12,6 +12,7 @@ use wasm_bindgen::closure::Closure;
 use crate::components::chat_input::ChatInput;
 use crate::components::chat_message::ChatMessageView;
 use crate::components::chat_streaming::ChatStreamingView;
+use crate::components::inflight_tray::InflightTray;
 use crate::components::orchestration_view::OrchestrationView;
 use crate::components::settings_panel::persist_tool_output_mode;
 use crate::components::task_list::TaskListView;
@@ -1020,6 +1021,13 @@ pub fn ChatView(
                     </Show>
                 </div>
             </Show>
+            // The In-flight tray sits between the transcript and the
+            // composer: the single live surface for this chat's background
+            // work (child agents, sub-agents, workflows) and its queued
+            // messages. It renders nothing when the agent has nothing in
+            // flight, and is deliberately independent of the tool-output
+            // mode — live operational state is not transcript history.
+            <InflightTray agent_ref=agent_ref />
             <Show
                 when=move || owns_composer.get()
                 fallback=move || view! {

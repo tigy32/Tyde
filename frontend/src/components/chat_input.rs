@@ -12,8 +12,8 @@ use crate::send::send_frame;
 use crate::state::{ActiveAgentRef, AppState, ConnectionStatus, PendingTeamMember};
 
 use protocol::{
-    AgentOrigin, BackendKind, BackendSetupStatus, CancelQueuedMessagePayload, FrameKind, ImageData,
-    InterruptPayload, QueuedMessageId, SendMessagePayload, SendQueuedMessageNowPayload, StreamPath,
+    AgentOrigin, BackendKind, BackendSetupStatus, FrameKind, ImageData, InterruptPayload,
+    SendMessagePayload, StreamPath,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,116 +21,6 @@ struct PendingImage {
     name: String,
     media_type: String,
     data: String,
-}
-
-#[component]
-fn QueuedMessageRow(
-    id: QueuedMessageId,
-    agent_ref: Signal<Option<ActiveAgentRef>>,
-) -> impl IntoView {
-    let state = expect_context::<AppState>();
-
-    let id_for_lookup = id.clone();
-    let id_for_send = id.clone();
-    let id_for_cancel = id.clone();
-    let state_preview = state.clone();
-    let state_send = state.clone();
-    let state_cancel = state.clone();
-
-    let preview = move || {
-        let Some(active) = agent_ref.get() else {
-            return String::new();
-        };
-        let queue = state_preview.agent_message_queue.get();
-        let Some(entries) = queue.get(&active.agent_id) else {
-            return String::new();
-        };
-        let Some(entry) = entries.iter().find(|entry| entry.id == id_for_lookup) else {
-            return String::new();
-        };
-        let chars: Vec<char> = entry.message.chars().collect();
-        if chars.len() > 80 {
-            chars[..80].iter().collect::<String>() + "…"
-        } else {
-            entry.message.clone()
-        }
-    };
-
-    let on_send_now = move |_| {
-        let Some(active) = agent_ref.get_untracked() else {
-            return;
-        };
-        let agents = state_send.agents.get_untracked();
-        let Some(agent) = agents
-            .iter()
-            .find(|agent| agent.host_id == active.host_id && agent.agent_id == active.agent_id)
-        else {
-            return;
-        };
-        let host_id = agent.host_id.clone();
-        let stream = agent.instance_stream.clone();
-        let id = id_for_send.clone();
-        spawn_local(async move {
-            if let Err(error) = send_frame(
-                &host_id,
-                stream,
-                FrameKind::SendQueuedMessageNow,
-                &SendQueuedMessageNowPayload { id },
-            )
-            .await
-            {
-                log::error!("failed to send send_queued_message_now: {error}");
-            }
-        });
-    };
-
-    let on_cancel = move |_| {
-        let Some(active) = agent_ref.get_untracked() else {
-            return;
-        };
-        let agents = state_cancel.agents.get_untracked();
-        let Some(agent) = agents
-            .iter()
-            .find(|agent| agent.host_id == active.host_id && agent.agent_id == active.agent_id)
-        else {
-            return;
-        };
-        let host_id = agent.host_id.clone();
-        let stream = agent.instance_stream.clone();
-        let id = id_for_cancel.clone();
-        spawn_local(async move {
-            if let Err(error) = send_frame(
-                &host_id,
-                stream,
-                FrameKind::CancelQueuedMessage,
-                &CancelQueuedMessagePayload { id },
-            )
-            .await
-            {
-                log::error!("failed to send cancel_queued_message: {error}");
-            }
-        });
-    };
-
-    view! {
-        <div class="queued-message-item">
-            <span class="queued-message-preview">{preview}</span>
-            <button
-                class="queued-message-btn queued-message-send-now"
-                title="Send this message now"
-                on:click=on_send_now
-            >
-                "↑ Send Now"
-            </button>
-            <button
-                class="queued-message-btn queued-message-cancel"
-                title="Cancel this queued message"
-                on:click=on_cancel
-            >
-                "× Cancel"
-            </button>
-        </div>
-    }
 }
 
 fn target_instance_stream(
@@ -1160,19 +1050,6 @@ pub fn ChatInput(
     });
     let notice_state = state.clone();
 
-    let queue_state = state.clone();
-    let queue_ids = Memo::new(move |_| -> Vec<QueuedMessageId> {
-        let Some(active) = agent_ref.get() else {
-            return Vec::new();
-        };
-        queue_state.agent_message_queue.with(|queue| {
-            queue
-                .get(&active.agent_id)
-                .map(|entries| entries.iter().map(|e| e.id.clone()).collect())
-                .unwrap_or_default()
-        })
-    });
-
     view! {
         <div
             class="chat-input-area"
@@ -1241,18 +1118,10 @@ pub fn ChatInput(
                 </div>
             </Show>
 
-            <Show when=move || !queue_ids.get().is_empty()>
-                <div class="queued-messages">
-                    <For
-                        each=move || queue_ids.get()
-                        key=|id| id.0.clone()
-                        let:id
-                    >
-                        <QueuedMessageRow id=id agent_ref=agent_ref />
-                    </For>
-                </div>
-            </Show>
-
+            // Queued messages render in the In-flight tray (above this
+            // composer, alongside the running background work they are
+            // queued behind) — not here. The composer owns only draft
+            // state: attachments, drop overlay, input errors.
             <Show when=move || is_readonly.get()>
                 <div class="chat-readonly-notice">"Read-only: native sub-agent"</div>
             </Show>
