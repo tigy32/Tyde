@@ -419,6 +419,60 @@ enum SupervisorCompactionTaskEvent {
     },
 }
 
+#[cfg(test)]
+struct SupervisorVerdictPostSampleTestGate {
+    agent_id: AgentId,
+    entered: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+static SUPERVISOR_VERDICT_POST_SAMPLE_TEST_GATE: StdMutex<
+    Option<SupervisorVerdictPostSampleTestGate>,
+> = StdMutex::new(None);
+
+#[cfg(test)]
+fn install_supervisor_verdict_post_sample_test_gate(
+    agent_id: AgentId,
+) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let replaced = SUPERVISOR_VERDICT_POST_SAMPLE_TEST_GATE
+        .lock()
+        .expect("supervisor verdict test gate mutex poisoned")
+        .replace(SupervisorVerdictPostSampleTestGate {
+            agent_id,
+            entered: entered_tx,
+            release: release_rx,
+        });
+    assert!(
+        replaced.is_none(),
+        "supervisor verdict test gate already installed"
+    );
+    (entered_rx, release_tx)
+}
+
+#[cfg(test)]
+async fn wait_for_supervisor_verdict_post_sample_test_gate(agent_id: &AgentId) {
+    let gate = {
+        let mut slot = SUPERVISOR_VERDICT_POST_SAMPLE_TEST_GATE
+            .lock()
+            .expect("supervisor verdict test gate mutex poisoned");
+        if slot.as_ref().is_some_and(|gate| &gate.agent_id == agent_id) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(());
+        let _ = gate.release.await;
+    }
+}
+
+#[cfg(not(test))]
+async fn wait_for_supervisor_verdict_post_sample_test_gate(_agent_id: &AgentId) {}
+
 #[derive(Clone)]
 struct ActivitySummaryObservation {
     agent_id: AgentId,
@@ -12998,14 +13052,15 @@ fn spawn_agent_supervisor_task(host: HostHandle) {
             mpsc::unbounded_channel::<SupervisorCompactionTaskEvent>();
         let semaphore = Arc::new(Semaphore::new(1));
         let mut entries = HashMap::<AgentId, SupervisorSchedulerEntry>::new();
-        let mut settings = *settings_rx.borrow();
+        let mut last_seen_settings = *settings_rx.borrow();
 
-        if settings.settings.enabled {
+        if last_seen_settings.settings.enabled {
             observe_supervised_agents(&host, &mut entries).await;
         }
 
         loop {
-            let next_deadline = supervisor_next_deadline(&entries, settings);
+            let current_settings = *settings_rx.borrow();
+            let next_deadline = supervisor_next_deadline(&entries, current_settings);
             let sleep_until = next_deadline.unwrap_or_else(|| {
                 Instant::now()
                     .checked_add(Duration::from_secs(86_400))
@@ -13019,7 +13074,8 @@ fn spawn_agent_supervisor_task(host: HostHandle) {
                     if changed.is_err() {
                         break;
                     }
-                    if settings.settings.enabled {
+                    let supervisor_enabled = settings_rx.borrow().settings.enabled;
+                    if supervisor_enabled {
                         observe_supervised_agents(&host, &mut entries).await;
                     }
                 }
@@ -13027,21 +13083,23 @@ fn spawn_agent_supervisor_task(host: HostHandle) {
                     if changed.is_err() {
                         break;
                     }
-                    let previous = settings;
-                    settings = *settings_rx.borrow();
+                    let previous = last_seen_settings;
+                    let current = *settings_rx.borrow();
+                    last_seen_settings = current;
                     apply_supervisor_settings_change(
                         &host,
                         &mut entries,
                         previous,
-                        settings,
+                        current,
                     )
                     .await;
                 }
                 Some(result) = verdict_rx.recv() => {
+                    let current = *settings_rx.borrow();
                     accept_supervision_verdict_result(
                         &host,
                         &mut entries,
-                        settings,
+                        current,
                         result,
                     )
                     .await;
@@ -13094,10 +13152,10 @@ fn spawn_agent_supervisor_task(host: HostHandle) {
                     }
                 }
                 _ = &mut deadline_sleep, if next_deadline.is_some() => {
-                    process_supervisor_deadlines(
+                    process_supervisor_deadlines_from_signal(
                         &host,
                         &mut entries,
-                        settings,
+                        &settings_rx,
                         &verdict_tx,
                         &compaction_tx,
                         &semaphore,
@@ -13131,6 +13189,26 @@ fn spawn_agent_supervisor_task(host: HostHandle) {
     {
         tracing::error!(error = %err, "failed to spawn agent supervisor worker thread");
     }
+}
+
+async fn process_supervisor_deadlines_from_signal(
+    host: &HostHandle,
+    entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
+    settings_rx: &watch::Receiver<SupervisorSettingsSignal>,
+    verdict_tx: &mpsc::UnboundedSender<SupervisorVerdictTaskResult>,
+    compaction_tx: &mpsc::UnboundedSender<SupervisorCompactionTaskEvent>,
+    semaphore: &Arc<Semaphore>,
+) {
+    let settings = *settings_rx.borrow();
+    process_supervisor_deadlines(
+        host,
+        entries,
+        settings,
+        verdict_tx,
+        compaction_tx,
+        semaphore,
+    )
+    .await;
 }
 
 fn supervisor_phase_idle_since(phase: &SupervisorPhase) -> Option<Instant> {
@@ -13170,8 +13248,17 @@ fn mark_supervisor_kick_pending(status: &mut crate::agent::registry::AgentStatus
     status.turn_completed = false;
 }
 
-fn requeue_inflight_supervision_for_settings_change(entry: &mut SupervisorSchedulerEntry) {
-    if let SupervisorPhase::VerdictInFlight { idle_since, .. } = &entry.phase {
+fn requeue_inflight_supervision_for_settings_change(
+    entry: &mut SupervisorSchedulerEntry,
+    current_settings_epoch: u64,
+) {
+    if let SupervisorPhase::VerdictInFlight {
+        idle_since,
+        settings_epoch,
+        ..
+    } = &entry.phase
+        && *settings_epoch != current_settings_epoch
+    {
         entry.phase = SupervisorPhase::Debouncing {
             idle_since: *idle_since,
         };
@@ -13196,7 +13283,7 @@ async fn apply_supervisor_settings_change(
     } else {
         observe_supervised_agents(host, entries).await;
         for entry in entries.values_mut() {
-            requeue_inflight_supervision_for_settings_change(entry);
+            requeue_inflight_supervision_for_settings_change(entry, current.epoch);
         }
     }
 }
@@ -13551,6 +13638,7 @@ async fn accept_supervision_verdict_result(
     result: SupervisorVerdictTaskResult,
 ) {
     let live_settings = host.supervisor_settings_signal().await;
+    wait_for_supervisor_verdict_post_sample_test_gate(&result.agent_id).await;
     let Some(entry) = entries.get(&result.agent_id) else {
         return;
     };
@@ -13630,6 +13718,27 @@ async fn accept_supervision_verdict_result(
         );
         entries.get_mut(&result.agent_id).expect("entry exists").phase =
             SupervisorPhase::Dormant { idle_since };
+        return;
+    }
+
+    let final_settings = host.supervisor_settings_signal().await;
+    if !final_settings.settings.enabled {
+        entries.remove(&result.agent_id);
+        tracing::debug!(
+            agent_id = %result.agent_id,
+            "dropping supervision verdict after the supervisor was disabled"
+        );
+        return;
+    }
+    if final_settings.epoch != result.settings_epoch {
+        entries.get_mut(&result.agent_id).expect("entry exists").phase =
+            SupervisorPhase::Debouncing { idle_since };
+        tracing::debug!(
+            agent_id = %result.agent_id,
+            result_settings_epoch = result.settings_epoch,
+            live_settings_epoch = final_settings.epoch,
+            "dropping supervision verdict superseded during final live checks"
+        );
         return;
     }
 
@@ -23008,7 +23117,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
     }
 
     #[tokio::test]
-    async fn stale_verdict_rearms_from_authoritative_settings_epoch() {
+    async fn settings_commit_during_verdict_await_rearms_without_kick() {
         let fixture = compact_fixture().await;
         let (agent_id, session_id) =
             spawn_idle_user_agent(&fixture.host, "stale verdict settings race").await;
@@ -23049,45 +23158,69 @@ Rules: Record only what remains true and useful for future work; drop transient 
             },
         )]);
 
+        let (entered, release) =
+            install_supervisor_verdict_post_sample_test_gate(agent_id.clone());
+        let host = fixture.host.clone();
+        let result_agent_id = agent_id.clone();
+        let result_baseline = baseline.clone();
+        let acceptance = tokio::spawn(async move {
+            accept_supervision_verdict_result(
+                &host,
+                &mut entries,
+                cached_settings,
+                SupervisorVerdictTaskResult {
+                    agent_id: result_agent_id,
+                    activity_counter,
+                    settings_epoch: cached_settings.epoch,
+                    baseline: result_baseline,
+                    result: Ok(crate::agent::supervisor::SupervisionVerdict::Continue {
+                        message: "stale kick must not be sent".to_owned(),
+                    }),
+                },
+            )
+            .await;
+            entries
+        });
+        entered
+            .await
+            .expect("verdict handler sampled the original settings epoch");
         fixture
             .host
             .set_setting(SetSettingPayload {
                 setting: HostSettingValue::SupervisorRetryAttempts { count: 2 },
             })
             .await
-            .expect("commit newer supervisor settings");
+            .expect("commit settings during post-sample await window");
         assert_ne!(
             fixture.host.supervisor_settings_signal().await.epoch,
             cached_settings.epoch
         );
-        accept_supervision_verdict_result(
-            &fixture.host,
-            &mut entries,
-            cached_settings,
-            SupervisorVerdictTaskResult {
-                agent_id: agent_id.clone(),
-                activity_counter,
-                settings_epoch: cached_settings.epoch,
-                baseline: baseline.clone(),
-                result: Ok(crate::agent::supervisor::SupervisionVerdict::Done),
-            },
-        )
-        .await;
+        release.send(()).expect("release verdict handler");
+        let mut entries = acceptance.await.expect("verdict acceptance task");
 
         assert!(matches!(
             entries.get(&agent_id).map(|entry| &entry.phase),
             Some(SupervisorPhase::Debouncing { idle_since: preserved })
                 if *preserved == idle_since
         ));
+        let live_settings = fixture.host.supervisor_settings_signal().await;
+        let context_after_stale_result = observation
+            .handle
+            .read_supervision_context()
+            .await
+            .expect("supervision context after stale result");
+        assert_eq!(
+            context_after_stale_result.kicks_since_user_message,
+            baseline.kicks_since_user_message
+        );
         requeue_inflight_supervision_for_settings_change(
             entries.get_mut(&agent_id).expect("scheduler entry"),
+            live_settings.epoch,
         );
         assert!(matches!(
             entries.get(&agent_id).map(|entry| &entry.phase),
             Some(SupervisorPhase::Debouncing { .. })
         ));
-
-        let live_settings = fixture.host.supervisor_settings_signal().await;
         entries.get_mut(&agent_id).expect("scheduler entry").phase =
             SupervisorPhase::VerdictInFlight {
                 idle_since,
@@ -23131,6 +23264,84 @@ Rules: Record only what remains true and useful for future work; drop transient 
         assert!(matches!(
             entries.get(&agent_id).map(|entry| &entry.phase),
             Some(SupervisorPhase::DoneAuthorized { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn deadline_launch_reads_live_epoch_without_rearm_churn() {
+        let fixture = compact_fixture().await;
+        let (agent_id, _) = spawn_idle_user_agent(&fixture.host, "live deadline epoch").await;
+        fixture
+            .host
+            .set_setting(SetSettingPayload {
+                setting: HostSettingValue::SupervisorEnabled { enabled: true },
+            })
+            .await
+            .expect("enable supervisor");
+        let settings_rx = fixture.host.supervisor_settings_receiver().await;
+        let stale_settings = *settings_rx.borrow();
+        fixture
+            .host
+            .set_setting(SetSettingPayload {
+                setting: HostSettingValue::SupervisorRetryAttempts { count: 2 },
+            })
+            .await
+            .expect("commit settings before deadline decision");
+        let live_settings = fixture.host.supervisor_settings_signal().await;
+        assert_ne!(live_settings.epoch, stale_settings.epoch);
+
+        let observation = fixture
+            .host
+            .activity_summary_observation(&agent_id)
+            .await
+            .expect("agent observation");
+        let idle_since = Instant::now()
+            .checked_sub(SUPERVISION_DEBOUNCE)
+            .expect("past-due debounce instant");
+        let mut entries = HashMap::from([(
+            agent_id.clone(),
+            SupervisorSchedulerEntry {
+                last_activity_counter: observation.status.activity_counter,
+                phase: SupervisorPhase::Debouncing { idle_since },
+            },
+        )]);
+        let (verdict_tx, _verdict_rx) = mpsc::unbounded_channel();
+        let (compaction_tx, _compaction_rx) = mpsc::unbounded_channel();
+        let semaphore = Arc::new(Semaphore::new(0));
+        semaphore.close();
+
+        process_supervisor_deadlines_from_signal(
+            &fixture.host,
+            &mut entries,
+            &settings_rx,
+            &verdict_tx,
+            &compaction_tx,
+            &semaphore,
+        )
+        .await;
+
+        assert!(matches!(
+            entries.get(&agent_id).map(|entry| &entry.phase),
+            Some(SupervisorPhase::VerdictInFlight {
+                settings_epoch,
+                idle_since: preserved,
+                ..
+            }) if *settings_epoch == live_settings.epoch && *preserved == idle_since
+        ));
+
+        apply_supervisor_settings_change(
+            &fixture.host,
+            &mut entries,
+            stale_settings,
+            live_settings,
+        )
+        .await;
+        assert!(matches!(
+            entries.get(&agent_id).map(|entry| &entry.phase),
+            Some(SupervisorPhase::VerdictInFlight {
+                settings_epoch,
+                ..
+            }) if *settings_epoch == live_settings.epoch
         ));
     }
 
@@ -23397,11 +23608,28 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 baseline: baseline.clone(),
             },
         };
-        requeue_inflight_supervision_for_settings_change(&mut inflight);
+        requeue_inflight_supervision_for_settings_change(&mut inflight, 2);
         assert!(matches!(
             inflight.phase,
             SupervisorPhase::Debouncing { idle_since: preserved }
                 if preserved == idle_since
+        ));
+
+        let mut current_inflight = SupervisorSchedulerEntry {
+            last_activity_counter: 4,
+            phase: SupervisorPhase::VerdictInFlight {
+                idle_since,
+                settings_epoch: 2,
+                baseline: baseline.clone(),
+            },
+        };
+        requeue_inflight_supervision_for_settings_change(&mut current_inflight, 2);
+        assert!(matches!(
+            current_inflight.phase,
+            SupervisorPhase::VerdictInFlight {
+                settings_epoch: 2,
+                ..
+            }
         ));
 
         let mut done = SupervisorSchedulerEntry {
@@ -23412,14 +23640,14 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 last_gate_evaluation_epoch: None,
             },
         };
-        requeue_inflight_supervision_for_settings_change(&mut done);
+        requeue_inflight_supervision_for_settings_change(&mut done, 2);
         assert!(matches!(done.phase, SupervisorPhase::DoneAuthorized { .. }));
 
         let mut awaiting = SupervisorSchedulerEntry {
             last_activity_counter: 4,
             phase: SupervisorPhase::AwaitingUser { idle_since },
         };
-        requeue_inflight_supervision_for_settings_change(&mut awaiting);
+        requeue_inflight_supervision_for_settings_change(&mut awaiting, 2);
         assert!(matches!(awaiting.phase, SupervisorPhase::AwaitingUser { .. }));
     }
 }
