@@ -4411,13 +4411,50 @@ fn clear_session_history_loading_for_host(state: &AppState, host_id: &str) {
     });
 }
 
+/// Extracts the agent id from an `/agent/<agent_id>/<instance_id>` stream
+/// path, mirroring the server's stream grammar (router.rs `parse_agent_id`)
+/// without its UUID requirement.
+fn agent_id_from_stream(stream: &StreamPath) -> Option<AgentId> {
+    let segments: Vec<&str> = stream.0.split('/').collect();
+    let [empty, kind, agent_id, _instance] = segments.as_slice() else {
+        return None;
+    };
+    if !empty.is_empty() || *kind != "agent" || agent_id.is_empty() {
+        return None;
+    }
+    Some(AgentId((*agent_id).to_owned()))
+}
+
 fn apply_session_history(
     state: &AppState,
     host_id: &str,
-    _stream: &StreamPath,
+    stream: &StreamPath,
     payload: SessionHistoryPayload,
 ) {
     let agent_id = payload.agent_id.clone();
+    // The server stamps the payload agent and the delivering stream from the
+    // same agent-scoped handle and rejects a FetchSessionHistory whose stream
+    // and payload agent disagree (router.rs). Mirror that guard here: this is
+    // the only path that prepends replayed rows into a transcript, and it is
+    // keyed by a payload field — applying a frame whose stream does not vouch
+    // for that agent renders one agent's history inside another agent's chat.
+    match agent_id_from_stream(stream) {
+        Some(stream_agent) if stream_agent == agent_id => {}
+        stream_agent => {
+            report_dispatch_error(
+                state,
+                host_id,
+                stream,
+                FrameKind::SessionHistory,
+                format!(
+                    "session_history payload names agent {} but its stream resolves to {:?}; dropping replay",
+                    agent_id.0,
+                    stream_agent.map(|agent| agent.0),
+                ),
+            );
+            return;
+        }
+    }
 
     let mut replay = HistoryReplay::default();
     for event in payload.events {
@@ -6696,6 +6733,18 @@ mod tests {
         });
     }
 
+    /// Correction (2026-07-22): this test previously delivered the payload on
+    /// `/agent/different-stream-owner/inst` and asserted the rows still landed
+    /// under `payload-agent`, pinning that the client trusts the payload field
+    /// over the delivering stream. Live QA showed the failure that trust
+    /// enables: one agent's replayed history rendered prefixed inside another
+    /// agent's chat. The server stamps both identities from the same
+    /// agent-scoped handle and rejects mismatched requests (router.rs), so a
+    /// mismatched frame is inconsistent by definition and must be dropped —
+    /// covered by `session_history_on_mismatched_stream_is_rejected` below.
+    /// The contract this test was reaching for — rows are keyed by the
+    /// payload's owner and applied in server order — is preserved on a
+    /// consistent frame.
     #[test]
     fn session_history_uses_payload_owner_and_server_order() {
         let owner = leptos::reactive::owner::Owner::new();
@@ -6720,7 +6769,7 @@ mod tests {
             apply_session_history(
                 &state,
                 "history-host",
-                &StreamPath("/agent/different-stream-owner/inst".to_owned()),
+                &StreamPath("/agent/payload-agent/inst".to_owned()),
                 SessionHistoryPayload {
                     agent_id: payload_agent.clone(),
                     events: vec![
@@ -6748,6 +6797,77 @@ mod tests {
                     .map(|id| id.0)
                     .collect::<Vec<_>>(),
                 vec!["first".to_owned(), "second".to_owned()]
+            );
+        });
+    }
+
+    /// A `SessionHistory` frame whose delivering stream names a different
+    /// agent than its payload must not touch any transcript. This is the
+    /// client-side mirror of the server router's stream/agent pairing guard;
+    /// without it, replayed rows prepend under the payload's key and one
+    /// agent's history renders inside another agent's chat (observed live).
+    #[test]
+    fn session_history_on_mismatched_stream_is_rejected() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let payload_agent = AgentId("agent-b".to_owned());
+            let message = |id: &str, content: &str| protocol::ChatMessage {
+                message_id: Some(protocol::ChatMessageId(id.to_owned())),
+                timestamp: 0,
+                sender: protocol::MessageSender::Assistant {
+                    agent: "History Agent".to_owned(),
+                },
+                content: content.to_owned(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            };
+            state.push_chat_entry(
+                payload_agent.clone(),
+                ChatMessageEntry {
+                    message: message("live", "live row"),
+                    tool_requests: Vec::new(),
+                },
+            );
+
+            apply_session_history(
+                &state,
+                "history-host",
+                &StreamPath("/agent/agent-a/inst".to_owned()),
+                SessionHistoryPayload {
+                    agent_id: payload_agent.clone(),
+                    events: vec![ChatEvent::MessageAdded(message("older", "foreign history"))],
+                    has_more_before: true,
+                    oldest_seq: Some(1),
+                },
+            );
+
+            let rows = state
+                .chat_rows
+                .with_untracked(|map| map.get(&payload_agent).cloned())
+                .expect("live rows must survive");
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.entry.get_untracked().message.content)
+                    .collect::<Vec<_>>(),
+                vec!["live row".to_owned()],
+                "a mismatched frame must not prepend foreign history"
+            );
+            assert!(
+                state
+                    .chat_rows
+                    .with_untracked(|map| !map.contains_key(&AgentId("agent-a".to_owned()))),
+                "a mismatched frame must not create rows for the stream's agent either"
+            );
+            assert!(
+                state
+                    .session_history
+                    .with_untracked(|map| !map.contains_key(&payload_agent)),
+                "a rejected frame must not update pagination state"
             );
         });
     }
