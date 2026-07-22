@@ -3953,19 +3953,34 @@ pub(crate) fn spawn_agent_actor(
                                 }))
                                 .await;
                             if !matches!(outcome, SendOutcome::Accepted) {
-                                let error = match outcome {
-                                    SendOutcome::Busy(_) => {
-                                        "agent backend rejected the compaction summary because it is busy"
-                                    }
-                                    SendOutcome::Closed => {
-                                        "agent backend closed before compaction could start"
-                                    }
-                                    SendOutcome::Accepted => unreachable!(),
+                                let backend_busy = matches!(outcome, SendOutcome::Busy(_));
+                                let error = if backend_busy {
+                                    "agent backend rejected the compaction summary because it is busy"
+                                        .to_owned()
+                                } else {
+                                    "agent backend closed before compaction could start".to_owned()
                                 };
-                                finish_active_compaction_with_error(
-                                    &mut active_compaction,
-                                    error.to_owned(),
-                                );
+                                let compaction = active_compaction
+                                    .take()
+                                    .expect("active compaction disappeared after backend send failed");
+                                compaction_blocked = false;
+                                // Busy means the backend has a live self-started
+                                // turn, so its typing events remain responsible
+                                // for the next idle transition.
+                                if !backend_busy {
+                                    in_turn = false;
+                                }
+                                idle_transition_armed = false;
+                                let last_error = error.clone();
+                                status_handle
+                                    .update(move |s| {
+                                        s.is_thinking = backend_busy;
+                                        s.turn_completed = !backend_busy;
+                                        s.last_error = Some(last_error);
+                                        s.activity_counter = s.activity_counter.saturating_add(1);
+                                    })
+                                    .await;
+                                let _ = compaction.reply.send(Err(error));
                             }
                         }
                         AgentCommand::Compact {
