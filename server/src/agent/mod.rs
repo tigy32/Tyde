@@ -5907,7 +5907,9 @@ enum StreamIdentityRecovery {
     /// The event has been rewritten (or the abandoned stream can be closed)
     /// so processing may continue. `finalize_abandoned` closes the still-open
     /// stream the backend walked away from before the event is applied.
-    Resync { finalize_abandoned: Option<ChatEvent> },
+    Resync {
+        finalize_abandoned: Option<ChatEvent>,
+    },
     /// No unambiguous interpretation exists; drop the event after reporting.
     Unrecoverable,
 }
@@ -7149,7 +7151,11 @@ mod tests {
     fn stream_identity_missing_end_id_recovers_without_poisoning_session() {
         let mut event_log = Vec::new();
         let mut replay_state = AgentReplayState::default();
-        record_recovery_event(&mut event_log, &mut replay_state, &recovery_stream_start("m1"));
+        record_recovery_event(
+            &mut event_log,
+            &mut replay_state,
+            &recovery_stream_start("m1"),
+        );
         record_recovery_event(
             &mut event_log,
             &mut replay_state,
@@ -7159,10 +7165,12 @@ mod tests {
         let mut end = recovery_id_less_stream_end("pong");
         let violation = super::validate_chat_event_stream_identity(&replay_state, &end)
             .expect_err("id-less StreamEnd must be flagged");
-        assert_eq!(violation, protocol::StreamIdentityViolation::MissingMessageId);
+        assert_eq!(
+            violation,
+            protocol::StreamIdentityViolation::MissingMessageId
+        );
 
-        let recovery =
-            super::recover_stream_identity_violation(&replay_state, &mut end, violation);
+        let recovery = super::recover_stream_identity_violation(&replay_state, &mut end, violation);
         assert!(matches!(
             recovery,
             super::StreamIdentityRecovery::Resync {
@@ -7191,7 +7199,11 @@ mod tests {
     fn stream_identity_foreign_start_recovery_finalizes_abandoned_stream() {
         let mut event_log = Vec::new();
         let mut replay_state = AgentReplayState::default();
-        record_recovery_event(&mut event_log, &mut replay_state, &recovery_stream_start("m1"));
+        record_recovery_event(
+            &mut event_log,
+            &mut replay_state,
+            &recovery_stream_start("m1"),
+        );
         record_recovery_event(
             &mut event_log,
             &mut replay_state,
@@ -7256,16 +7268,16 @@ mod tests {
         ));
 
         // A delta for a foreign id must not be grafted onto the active stream.
-        record_recovery_event(&mut event_log, &mut replay_state, &recovery_stream_start("m1"));
+        record_recovery_event(
+            &mut event_log,
+            &mut replay_state,
+            &recovery_stream_start("m1"),
+        );
         let mut foreign_delta = recovery_stream_delta("m9", "stray");
-        let violation = super::validate_chat_event_stream_identity(&replay_state, &foreign_delta)
-            .unwrap_err();
+        let violation =
+            super::validate_chat_event_stream_identity(&replay_state, &foreign_delta).unwrap_err();
         assert!(matches!(
-            super::recover_stream_identity_violation(
-                &replay_state,
-                &mut foreign_delta,
-                violation
-            ),
+            super::recover_stream_identity_violation(&replay_state, &mut foreign_delta, violation),
             super::StreamIdentityRecovery::Unrecoverable
         ));
     }
