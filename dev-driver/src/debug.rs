@@ -574,7 +574,11 @@ fn seed_dev_project_store(
     project_dir: &Path,
     instance_id: &str,
 ) -> Result<(), String> {
-    let project_id = ProjectId(format!("dev-{instance_id}"));
+    let project_id = ProjectId(
+        Uuid::parse_str(instance_id)
+            .map_err(|err| format!("invalid dev instance id '{instance_id}': {err}"))?
+            .to_string(),
+    );
     let name = project_dir
         .file_name()
         .and_then(|name| name.to_str())
@@ -1346,8 +1350,12 @@ mod tests {
     fn dev_instance_seeds_only_requested_project() {
         let store = tempfile::tempdir().expect("store dir");
         let project = tempfile::tempdir().expect("project dir");
-        seed_dev_project_store(store.path(), project.path(), "instance")
-            .expect("seed project store");
+        seed_dev_project_store(
+            store.path(),
+            project.path(),
+            "12345678123456781234567812345678",
+        )
+        .expect("seed project store");
         let contents: Value = serde_json::from_slice(
             &std::fs::read(store.path().join("projects.json")).expect("read project store"),
         )
@@ -1355,11 +1363,11 @@ mod tests {
         let records = contents["records"].as_object().expect("records object");
         assert_eq!(records.len(), 1);
         assert_eq!(
-            records["dev-instance"]["source"]["kind"],
+            records["12345678-1234-5678-1234-567812345678"]["source"]["kind"],
             Value::String("standalone".to_owned())
         );
         assert_eq!(
-            records["dev-instance"]["source"]["roots"][0],
+            records["12345678-1234-5678-1234-567812345678"]["source"]["roots"][0],
             Value::String(project.path().display().to_string())
         );
     }

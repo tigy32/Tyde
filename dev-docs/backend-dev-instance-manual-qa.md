@@ -514,12 +514,17 @@ unique name, prompt marker, command marker, and final-answer marker.
    session identity, backend, model, project, terminal state, and last unique
    marker before clicking Resume. Do not send a prompt as part of the resume
    action. Confirm exactly one resumed conversation opens, its prior history
-   appears exactly once and in order, no turn starts merely because it was
-   resumed, and unrelated commands remain responsive while history loads.
+   appears exactly once and in order, and the parent agent card settles at Idle
+   without a turn starting merely because it was resumed. A persistent
+   Initializing or Thinking card before any prompt is a failure. Confirm
+   unrelated commands remain responsive while history loads.
 5. Use every resumed session rather than treating successful history rendering
    as proof of a working resume. Send a unique context-dependent prompt that
-   requires information from before the resume, observe its active lifecycle,
-   and confirm exactly one correct terminal response. Then send a second unique
+   requires information from before the resume. From acceptance until the real
+   terminal event, assert the parent agent card continuously shows an active
+   state such as Initializing or Thinking; the chat composer showing Thinking
+   does not count, and any Idle/completed card while the backend is still
+   running is a failure. Confirm exactly one correct terminal response. Then send a second unique
    prompt in the same resumed conversation and exercise one supported tool.
    Confirm both turns use the original backend/provider session, retain the
    selected model and settings, append to the same History entry, and do not

@@ -271,6 +271,7 @@ struct AgentReplayState {
     terminal_stream_message_ids: HashSet<ChatMessageId>,
     recorded_message_senders: HashMap<ChatMessageId, MessageSender>,
     typing: bool,
+    resume_history_settled_idle: bool,
     /// Position in the event_log of the single retained `ToolProgress`
     /// envelope per tool_call_id. Progress snapshots are coalesced
     /// latest-wins (replace in place, preserving seq) so long-running
@@ -2364,9 +2365,7 @@ pub(crate) fn spawn_agent_actor(
         accepting_input_task.store(!resume_replay_gate_pending, Ordering::SeqCst);
         status_handle
             .update(|s| {
-                s.started = true;
-                s.last_error = None;
-                s.activity_counter = s.activity_counter.saturating_add(1);
+                record_agent_started(s, is_resume);
             })
             .await;
         append_event(
@@ -2464,7 +2463,6 @@ pub(crate) fn spawn_agent_actor(
             abort_resume_replay_barrier_task(&mut resume_replay_barrier_task);
             return;
         }
-
         loop {
             latest_output
                 .observe_event_log(&event_log)
@@ -3035,6 +3033,7 @@ pub(crate) fn spawn_agent_actor(
                                 return;
                             }
                             SendOutcome::Accepted => {
+                                mark_agent_turn_active(&status_handle).await;
                                 if let Some(review_id) = review_origin.as_ref() {
                                     tracing::info!(
                                         review_id = %review_id,
@@ -3136,6 +3135,16 @@ pub(crate) fn spawn_agent_actor(
                             match result {
                                 Ok(()) => {
                                     accepting_input_task.store(true, Ordering::SeqCst);
+                                    if initial_follow_up.is_none() {
+                                        publish_resumed_agent_idle(
+                                            &status_handle,
+                                            &canonical_stream,
+                                            &mut event_log,
+                                            &mut subscribers,
+                                            &mut replay_state,
+                                        )
+                                        .await;
+                                    }
                                     flush_pending_agent_attaches(
                                         &event_log,
                                         Some(&replay_state),
@@ -3411,6 +3420,9 @@ pub(crate) fn spawn_agent_actor(
                                             )
                                             .await;
                                             return;
+                                        }
+                                        if !is_tool_response {
+                                            mark_agent_turn_active(&status_handle).await;
                                         }
                                         if let Some(clear_pending_response) = plan_response {
                                             status_handle
@@ -5580,7 +5592,10 @@ async fn send_initial_follow_up_or_park(
         .send_with_outcome(AgentInput::SendMessage(input))
         .await
     {
-        SendOutcome::Accepted => return true,
+        SendOutcome::Accepted => {
+            mark_agent_turn_active(context.status_handle).await;
+            return true;
+        }
         SendOutcome::Busy(input) => {
             if let AgentInput::SendMessage(payload) = input {
                 tracing::info!(
@@ -5641,6 +5656,52 @@ async fn send_initial_follow_up_or_park(
     )
     .await;
     false
+}
+
+async fn mark_agent_turn_active(status_handle: &registry::AgentStatusHandle) {
+    status_handle
+        .update(|status| {
+            status.is_thinking = true;
+            status.turn_completed = false;
+            status.last_error = None;
+            status.activity_counter = status.activity_counter.saturating_add(1);
+        })
+        .await;
+}
+
+fn record_agent_started(status: &mut registry::AgentStatus, is_resume: bool) {
+    status.started = true;
+    if is_resume {
+        status.is_thinking = false;
+        status.turn_completed = true;
+    }
+    status.last_error = None;
+    status.activity_counter = status.activity_counter.saturating_add(1);
+}
+
+async fn publish_resumed_agent_idle(
+    status_handle: &registry::AgentStatusHandle,
+    canonical_stream: &str,
+    event_log: &mut Vec<Envelope>,
+    subscribers: &mut Vec<Stream>,
+    replay_state: &mut AgentReplayState,
+) {
+    status_handle
+        .update(|status| {
+            status.is_thinking = false;
+            status.turn_completed = true;
+            status.activity_counter = status.activity_counter.saturating_add(1);
+        })
+        .await;
+    append_chat_event(
+        canonical_stream,
+        event_log,
+        subscribers,
+        replay_state,
+        &ChatEvent::TypingStatusChanged(false),
+    )
+    .await;
+    replay_state.resume_history_settled_idle = true;
 }
 
 /// Ingest a backend event that arrived while the resume-replay gate is still
@@ -5902,6 +5963,9 @@ fn record_chat_event_for_replay(
         }
         ChatEvent::TypingStatusChanged(typing) => {
             replay_state.typing = *typing;
+            if *typing {
+                replay_state.resume_history_settled_idle = false;
+            }
             if !typing {
                 replay_state.completed_stream = None;
             }
@@ -6698,6 +6762,11 @@ fn attach_subscriber_with_latest_output(
                 .into_iter()
                 .map(AgentBootstrapEvent::ChatEvent),
         );
+        if replay_state.resume_history_settled_idle {
+            events.push(AgentBootstrapEvent::ChatEvent(
+                ChatEvent::TypingStatusChanged(false),
+            ));
+        }
     }
 
     let bootstrap_event_count = events.len();
@@ -7297,10 +7366,10 @@ mod tests {
 
     use protocol::{
         AgentActivityStats, AgentActivityStatsPayload, AgentBootstrapEvent, AgentBootstrapPayload,
-        AgentControlLatestOutput, AgentControlOutput, AgentId, AgentInput, AgentStartPayload,
-        BackendKind, ChatEvent, ChatMessage, ChatMessageId, FrameKind, MessageMetadataUpdateData,
-        MessageSender, MessageTokenUsage, ModelInfo, ModelRequestId, ModelRequestTokenUsage,
-        ModelTurnId, ReasoningData, ServerGeneratedChatMessageIdOrigin,
+        AgentControlLatestOutput, AgentControlOutput, AgentControlStatus, AgentId, AgentInput,
+        AgentStartPayload, BackendKind, ChatEvent, ChatMessage, ChatMessageId, FrameKind,
+        MessageMetadataUpdateData, MessageSender, MessageTokenUsage, ModelInfo, ModelRequestId,
+        ModelRequestTokenUsage, ModelTurnId, ReasoningData, ServerGeneratedChatMessageIdOrigin,
         ServerGeneratedChatMessageIdentity, SessionId, StreamEndData, StreamPath, StreamStartData,
         StreamTextDeltaData, TaskList, TaskTokenUsageScope, TaskTokenUsageUnavailableReason,
         TokenUsage, TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData,
@@ -7318,11 +7387,12 @@ mod tests {
         agent_usage_snapshot_from_log, append_chat_event, append_event, apply_generated_agent_name,
         attach_subscriber, attach_subscriber_with_latest_output,
         collect_agent_activity_summary_events, collect_agent_name_events, current_latest_output,
-        generate_mock_name, ingest_gated_replay_event, known_turn_usage, output_events_since,
-        project_legacy_native_collaboration_event, replay_envelope,
-        resolve_backend_session_settings, sanitize_generated_agent_name,
-        session_history_entries_from_log, session_history_window, spawn_agent_actor,
-        spawn_relay_agent_actor, terminal_input_rejected_payload, upsert_activity_stats_snapshot,
+        generate_mock_name, ingest_gated_replay_event, known_turn_usage, mark_agent_turn_active,
+        output_events_since, project_legacy_native_collaboration_event, publish_resumed_agent_idle,
+        record_agent_started, replay_envelope, resolve_backend_session_settings,
+        sanitize_generated_agent_name, session_history_entries_from_log, session_history_window,
+        spawn_agent_actor, spawn_relay_agent_actor, terminal_input_rejected_payload,
+        upsert_activity_stats_snapshot,
     };
     use crate::agent::customization::ResolvedSpawnConfig;
     use crate::agent::registry::AgentStatusHandle;
@@ -9383,6 +9453,92 @@ mod tests {
             sanitize_generated_agent_name("  \"fix login flow\" ").unwrap(),
             "Fix Login Flow"
         );
+    }
+
+    #[tokio::test]
+    async fn resumed_agent_start_is_idle_before_follow_up() {
+        let (status_handle, _status_rx) = AgentStatusHandle::new();
+        status_handle
+            .update(|status| record_agent_started(status, true))
+            .await;
+
+        let status = status_handle.snapshot().await;
+        assert!(status.started);
+        assert!(!status.is_thinking);
+        assert!(status.turn_completed);
+        assert!(!status.is_active());
+        assert_eq!(status.status(), AgentControlStatus::Idle);
+    }
+
+    #[tokio::test]
+    async fn resumed_history_bootstrap_ends_with_authoritative_idle() {
+        let canonical_stream = "/agent/resumed-agent";
+        let (status_handle, _status_rx) = AgentStatusHandle::new();
+        let mut event_log = Vec::new();
+        let mut subscribers = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::MessageAdded(ChatMessage {
+                message_id: Some(ChatMessageId("prior-user-message".to_owned())),
+                timestamp: 1,
+                sender: MessageSender::User,
+                content: "prior request".to_owned(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            }),
+        )
+        .await;
+        publish_resumed_agent_idle(
+            &status_handle,
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+        )
+        .await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        attach_subscriber(
+            &event_log,
+            Some(&replay_state),
+            &mut subscribers,
+            replay_stream(tx),
+        );
+        let events = recv_agent_bootstrap_events(&mut rx, "resumed bootstrap").await;
+        assert!(matches!(
+            events.as_slice(),
+            [
+                AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(_)),
+                AgentBootstrapEvent::ChatEvent(ChatEvent::TypingStatusChanged(false)),
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn accepted_turn_marks_completed_agent_active() {
+        let (status_handle, _status_rx) = AgentStatusHandle::new();
+        status_handle
+            .update(|status| {
+                status.started = true;
+                status.turn_completed = true;
+            })
+            .await;
+
+        mark_agent_turn_active(&status_handle).await;
+
+        let status = status_handle.snapshot().await;
+        assert!(status.is_thinking);
+        assert!(!status.turn_completed);
+        assert!(status.is_active());
+        assert_eq!(status.status(), AgentControlStatus::Thinking);
     }
 
     #[tokio::test]
