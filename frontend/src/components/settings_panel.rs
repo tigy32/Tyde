@@ -623,6 +623,7 @@ enum SettingsTab {
     Hosts,
     Appearance,
     General,
+    Supervisor,
     Backends,
     CustomAgents,
     McpServers,
@@ -638,6 +639,7 @@ impl SettingsTab {
             Self::Hosts => "Hosts",
             Self::Appearance => "Appearance",
             Self::General => "General",
+            Self::Supervisor => "Supervisor",
             Self::Backends => "Backends",
             Self::CustomAgents => "Custom Agents",
             Self::McpServers => "MCP Servers",
@@ -696,6 +698,22 @@ impl SettingsTab {
                 "Code intelligence",
                 "rust-analyzer binary path",
                 "custom toolchain",
+            ],
+            Self::Supervisor => &[
+                "Supervisor",
+                "Agent supervisor",
+                "Enable agent supervisor",
+                "Auto-compact on success",
+                "Verdict model tier",
+                "Low",
+                "High",
+                "Backend default",
+                "Kick limit",
+                "Retry attempts",
+                "Idle",
+                "Continue",
+                "Task list",
+                "Compaction",
             ],
             Self::Backends => &[
                 "Backends",
@@ -789,10 +807,11 @@ impl SettingsTab {
     }
 }
 
-const ALL_TABS: [SettingsTab; 10] = [
+const ALL_TABS: [SettingsTab; 11] = [
     SettingsTab::Hosts,
     SettingsTab::Appearance,
     SettingsTab::General,
+    SettingsTab::Supervisor,
     SettingsTab::Backends,
     SettingsTab::CustomAgents,
     SettingsTab::McpServers,
@@ -805,10 +824,11 @@ const ALL_TABS: [SettingsTab; 10] = [
 /// Tabs listed under the "Settings" sidebar group. `SettingsTab::Backends` is
 /// deliberately absent: it renders as the stable "Overview" entry of the
 /// dedicated Backends group.
-const SETTINGS_GROUP_TABS: [SettingsTab; 9] = [
+const SETTINGS_GROUP_TABS: [SettingsTab; 10] = [
     SettingsTab::Hosts,
     SettingsTab::Appearance,
     SettingsTab::General,
+    SettingsTab::Supervisor,
     SettingsTab::CustomAgents,
     SettingsTab::McpServers,
     SettingsTab::Steering,
@@ -1003,6 +1023,7 @@ pub fn SettingsPanel() -> impl IntoView {
                                     SettingsTab::Hosts => view! { <HostsTab /> }.into_any(),
                                     SettingsTab::Appearance => view! { <AppearanceTab /> }.into_any(),
                                     SettingsTab::General => view! { <GeneralTab /> }.into_any(),
+                                    SettingsTab::Supervisor => view! { <SupervisorTab /> }.into_any(),
                                     SettingsTab::Backends => view! { <BackendsTab active_page /> }.into_any(),
                                     SettingsTab::CustomAgents => view! { <CustomAgentsTab /> }.into_any(),
                                     SettingsTab::McpServers => view! { <McpServersTab /> }.into_any(),
@@ -1988,6 +2009,247 @@ fn BackgroundAgentFeaturesSection() -> impl IntoView {
                     <span class="settings-toggle-slider"></span>
                 </label>
             </div>
+        </div>
+    }
+}
+
+/// Agent supervisor settings. When an agent goes idle, a hidden background
+/// model call reviews the last user request, the task list, and the agent's
+/// final message, then either accepts the turn as done or sends a follow-up
+/// message that kicks the agent back to work. Every knob is host-scoped and
+/// committed as a typed `Supervisor*` host setting; the feature costs money
+/// per idle transition, so it defaults off.
+#[component]
+fn SupervisorTab() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let state_for_enabled_checked = state.clone();
+    let state_for_enabled_disabled = state.clone();
+    let state_for_compact_checked = state.clone();
+    let state_for_compact_disabled = state.clone();
+    let state_for_kicks_value = state.clone();
+    let state_for_kicks_disabled = state.clone();
+    let state_for_retries_value = state.clone();
+    let state_for_retries_disabled = state.clone();
+
+    let enabled_checked = move || {
+        state_for_enabled_checked
+            .selected_host_settings()
+            .is_some_and(|settings| settings.supervisor.enabled)
+    };
+    let enabled_disabled = move || {
+        state_for_enabled_disabled
+            .selected_host_settings()
+            .is_none()
+    };
+    let enabled_on_toggle = {
+        let state = state.clone();
+        move |ev: web_sys::Event| {
+            let target = ev.target().unwrap();
+            let input: web_sys::HtmlInputElement = target.unchecked_into();
+            send_host_setting(
+                &state,
+                HostSettingValue::SupervisorEnabled {
+                    enabled: input.checked(),
+                },
+            );
+        }
+    };
+
+    let compact_checked = move || {
+        state_for_compact_checked
+            .selected_host_settings()
+            .is_some_and(|settings| settings.supervisor.auto_compact_on_success)
+    };
+    let compact_disabled = move || {
+        state_for_compact_disabled
+            .selected_host_settings()
+            .is_none()
+    };
+    let compact_on_toggle = {
+        let state = state.clone();
+        move |ev: web_sys::Event| {
+            let target = ev.target().unwrap();
+            let input: web_sys::HtmlInputElement = target.unchecked_into();
+            send_host_setting(
+                &state,
+                HostSettingValue::SupervisorAutoCompactOnSuccess {
+                    enabled: input.checked(),
+                },
+            );
+        }
+    };
+
+    let kicks_value = move || {
+        state_for_kicks_value
+            .selected_host_settings()
+            .map(|settings| settings.supervisor.max_kicks_per_task.to_string())
+            .unwrap_or_default()
+    };
+    let kicks_disabled = move || state_for_kicks_disabled.selected_host_settings().is_none();
+    let kicks_on_change = {
+        let state = state.clone();
+        move |ev: web_sys::Event| {
+            let target = ev.target().unwrap();
+            let input: web_sys::HtmlInputElement = target.unchecked_into();
+            if let Ok(count) = input.value().trim().parse::<u8>()
+                && count >= 1
+            {
+                send_host_setting(
+                    &state,
+                    HostSettingValue::SupervisorMaxKicksPerTask { count },
+                );
+            }
+        }
+    };
+
+    let state_for_tier_value = state.clone();
+    let state_for_tier_disabled = state.clone();
+    let tier_value = move || {
+        let tier = state_for_tier_value
+            .selected_host_settings()
+            .map(|settings| settings.supervisor.cost_tier)
+            .unwrap_or_default();
+        match tier {
+            protocol::SupervisorCostTier::Low => "low",
+            protocol::SupervisorCostTier::Default => "default",
+            protocol::SupervisorCostTier::High => "high",
+        }
+        .to_owned()
+    };
+    let tier_disabled = move || state_for_tier_disabled.selected_host_settings().is_none();
+    let tier_on_change = {
+        let state = state.clone();
+        move |ev: web_sys::Event| {
+            let target = ev.target().unwrap();
+            let select: web_sys::HtmlSelectElement = target.unchecked_into();
+            let tier = match select.value().as_str() {
+                "low" => protocol::SupervisorCostTier::Low,
+                "default" => protocol::SupervisorCostTier::Default,
+                "high" => protocol::SupervisorCostTier::High,
+                other => {
+                    log::warn!("unknown supervisor cost tier option: {other:?}");
+                    return;
+                }
+            };
+            send_host_setting(&state, HostSettingValue::SupervisorCostTier { tier });
+        }
+    };
+
+    let retries_value = move || {
+        state_for_retries_value
+            .selected_host_settings()
+            .map(|settings| settings.supervisor.retry_attempts.to_string())
+            .unwrap_or_default()
+    };
+    let retries_disabled = move || {
+        state_for_retries_disabled
+            .selected_host_settings()
+            .is_none()
+    };
+    let retries_on_change = {
+        let state = state.clone();
+        move |ev: web_sys::Event| {
+            let target = ev.target().unwrap();
+            let input: web_sys::HtmlInputElement = target.unchecked_into();
+            if let Ok(count) = input.value().trim().parse::<u8>() {
+                send_host_setting(&state, HostSettingValue::SupervisorRetryAttempts { count });
+            }
+        }
+    };
+
+    view! {
+        <h2 class="settings-panel-title">"Supervisor"</h2>
+
+        <div class="settings-field">
+            <div class="settings-toggle-row">
+                <div>
+                    <label class="settings-label">"Enable agent supervisor"</label>
+                    <p class="settings-description">
+                        "When an agent goes idle, a background model call checks whether it actually finished the last request. If the agent stopped on an error or quit mid-task, the supervisor sends it a follow-up message to keep it working. This runs an extra model call per idle transition and costs money. Off by default."
+                    </p>
+                </div>
+                <label class="settings-toggle">
+                    <input
+                        type="checkbox"
+                        prop:checked=enabled_checked
+                        disabled=enabled_disabled
+                        on:change=enabled_on_toggle
+                    />
+                    <span class="settings-toggle-slider"></span>
+                </label>
+            </div>
+        </div>
+
+        <div class="settings-field">
+            <div class="settings-toggle-row">
+                <div>
+                    <label class="settings-label">"Auto-compact on success"</label>
+                    <p class="settings-description">
+                        "When the supervisor confirms a task is finished, automatically compact the agent: its session is summarized and rotated into a fresh agent with a small warm context, so reusing it later does not pay to resume a huge cold session."
+                    </p>
+                </div>
+                <label class="settings-toggle">
+                    <input
+                        type="checkbox"
+                        prop:checked=compact_checked
+                        disabled=compact_disabled
+                        on:change=compact_on_toggle
+                    />
+                    <span class="settings-toggle-slider"></span>
+                </label>
+            </div>
+        </div>
+
+        <div class="settings-field">
+            <label class="settings-label">"Verdict model tier"</label>
+            <p class="settings-description">
+                "Which model tier judges whether a task is finished. Low uses the cheap tier (like agent naming); Backend default uses the backend's normal model; High uses the most capable configuration. Raise this if the supervisor's verdicts are unreliable."
+            </p>
+            <select
+                class="settings-select"
+                prop:value=tier_value
+                disabled=tier_disabled
+                aria-label="Supervisor verdict model tier"
+                on:change=tier_on_change
+            >
+                <option value="low">"Low (cheap)"</option>
+                <option value="default">"Backend default"</option>
+                <option value="high">"High (most capable)"</option>
+            </select>
+        </div>
+
+        <div class="settings-field">
+            <label class="settings-label">"Kick limit"</label>
+            <p class="settings-description">
+                "Maximum consecutive supervisor follow-ups without a new message from you. Prevents the supervisor and the agent from looping forever on a task that cannot finish."
+            </p>
+            <input
+                class="settings-input settings-supervisor-number-input"
+                type="number"
+                min="1"
+                max="20"
+                prop:value=kicks_value
+                disabled=kicks_disabled
+                aria-label="Supervisor kick limit"
+                on:change=kicks_on_change
+            />
+        </div>
+
+        <div class="settings-field">
+            <label class="settings-label">"Retry attempts"</label>
+            <p class="settings-description">
+                "Extra attempts when a supervision call fails or returns an unparseable verdict. Each retry is a fresh model call."
+            </p>
+            <input
+                class="settings-input settings-supervisor-number-input"
+                type="number"
+                min="0"
+                max="5"
+                prop:value=retries_value
+                disabled=retries_disabled
+                aria-label="Supervisor retry attempts"
+                on:change=retries_on_change
+            />
         </div>
     }
 }
@@ -7486,6 +7748,7 @@ mod wasm_tests {
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: Default::default(),
+                    supervisor: Default::default(),
                     code_intel: Default::default(),
                     backend_config: std::collections::HashMap::new(),
                     launch_profiles: Vec::new(),
@@ -7779,7 +8042,17 @@ mod wasm_tests {
     /// `Event::new` does not carry the `key` property our handler
     /// reads — building the event in JS sidesteps both limitations.
     fn dispatch_event_from_js(input: &web_sys::HtmlInputElement, kind: &str, key: Option<&str>) {
-        let id = format!("__tyde_dispatch_target_{kind}");
+        // The id must be unique per dispatch, and cleared after use. A fixed
+        // id resolves `getElementById` to the FIRST tagged element in the
+        // document, so a second dispatch in the same test (or a panel leaked
+        // by an earlier panicked test — wasm panics skip destructors) would
+        // silently re-fire a previous target instead of `input`. Observed as
+        // one input's SetSetting frame recorded twice while the intended
+        // target never fired.
+        static DISPATCH_SEQ: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let seq = DISPATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = format!("__tyde_dispatch_target_{kind}_{seq}");
         input.set_id(&id);
         let key_part = key.map(|k| format!(", key: {k:?}")).unwrap_or_default();
         let code = format!(
@@ -7794,6 +8067,7 @@ mod wasm_tests {
                     ev = new Event({kind:?}, {{ bubbles: true, cancelable: true }});
                 }}
                 el.dispatchEvent(ev);
+                el.removeAttribute('id');
             }})();
             "#
         );
@@ -8733,6 +9007,7 @@ mod wasm_tests {
                         auto_generate_agent_names,
                         agent_activity_summaries,
                     },
+                    supervisor: protocol::SupervisorSettings::default(),
                     code_intel,
                     backend_config: std::collections::HashMap::new(),
                     launch_profiles: Vec::new(),
@@ -8813,6 +9088,153 @@ mod wasm_tests {
             frame.get("enabled").and_then(|v| v.as_bool()),
             Some(true),
             "the committed frame must carry enabled=true: {frame:?}"
+        );
+    }
+
+    /// Toggling "Enable agent supervisor" on must commit a `SetSetting`
+    /// frame whose payload is `SupervisorEnabled { enabled: true }`. Like the
+    /// activity-summaries assertion, this is the load-bearing wire check for
+    /// a paid opt-in feature.
+    #[wasm_bindgen_test]
+    async fn supervisor_tab_enable_toggle_commits_setting() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_general_host_settings(&state, true, false, None);
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Supervisor");
+        next_tick().await;
+
+        let toggle = toggle_for_label(&container, "Enable agent supervisor");
+        assert!(
+            !toggle.checked(),
+            "the supervisor defaults off before the user opts in"
+        );
+        toggle.set_checked(true);
+        dispatch_change(&toggle);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let settings = recorded_set_setting_payloads(&calls);
+        let frame = settings
+            .iter()
+            .find(|s| s.get("kind").and_then(|k| k.as_str()) == Some("supervisor_enabled"))
+            .expect("toggling the supervisor must emit a SupervisorEnabled SetSetting");
+        assert_eq!(
+            frame.get("enabled").and_then(|v| v.as_bool()),
+            Some(true),
+            "the committed frame must carry enabled=true: {frame:?}"
+        );
+
+        let compact = toggle_for_label(&container, "Auto-compact on success");
+        compact.set_checked(true);
+        dispatch_change(&compact);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let settings = recorded_set_setting_payloads(&calls);
+        assert!(
+            settings.iter().any(|s| {
+                s.get("kind").and_then(|k| k.as_str()) == Some("supervisor_auto_compact_on_success")
+                    && s.get("enabled").and_then(|v| v.as_bool()) == Some(true)
+            }),
+            "toggling auto-compact must emit a SupervisorAutoCompactOnSuccess SetSetting: {settings:?}"
+        );
+    }
+
+    /// The Supervisor tab number inputs must reflect the host defaults and
+    /// commit typed count settings when edited.
+    #[wasm_bindgen_test]
+    async fn supervisor_tab_number_inputs_commit_counts() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_general_host_settings(&state, true, false, None);
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Supervisor");
+        next_tick().await;
+
+        let kicks: web_sys::HtmlInputElement = container
+            .query_selector("input[aria-label='Supervisor kick limit']")
+            .unwrap()
+            .expect("kick limit input renders")
+            .dyn_into()
+            .expect("kick limit is an input");
+        assert_eq!(
+            kicks.value(),
+            "3",
+            "kick limit shows the host default before edits"
+        );
+        kicks.set_value("5");
+        dispatch_change(&kicks);
+
+        let retries: web_sys::HtmlInputElement = container
+            .query_selector("input[aria-label='Supervisor retry attempts']")
+            .unwrap()
+            .expect("retry attempts input renders")
+            .dyn_into()
+            .expect("retry attempts is an input");
+        assert_eq!(
+            retries.value(),
+            "1",
+            "retry attempts shows the host default before edits"
+        );
+        retries.set_value("2");
+        dispatch_change(&retries);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let settings = recorded_set_setting_payloads(&calls);
+        assert!(
+            settings.iter().any(|s| {
+                s.get("kind").and_then(|k| k.as_str()) == Some("supervisor_max_kicks_per_task")
+                    && s.get("count").and_then(|v| v.as_u64()) == Some(5)
+            }),
+            "editing the kick limit must emit SupervisorMaxKicksPerTask count=5: {settings:?}"
+        );
+        assert!(
+            settings.iter().any(|s| {
+                s.get("kind").and_then(|k| k.as_str()) == Some("supervisor_retry_attempts")
+                    && s.get("count").and_then(|v| v.as_u64()) == Some(2)
+            }),
+            "editing retry attempts must emit SupervisorRetryAttempts count=2: {settings:?}"
+        );
+
+        let tier: web_sys::HtmlSelectElement = container
+            .query_selector("select[aria-label='Supervisor verdict model tier']")
+            .unwrap()
+            .expect("verdict tier select renders")
+            .dyn_into()
+            .expect("verdict tier is a select");
+        assert_eq!(
+            tier.value(),
+            "low",
+            "the verdict tier defaults to the cheap tier"
+        );
+        tier.set_value("high");
+        dispatch_event_from_js(&tier.clone().unchecked_into(), "change", None);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let settings = recorded_set_setting_payloads(&calls);
+        assert!(
+            settings.iter().any(|s| {
+                s.get("kind").and_then(|k| k.as_str()) == Some("supervisor_cost_tier")
+                    && s.get("tier").and_then(|v| v.as_str()) == Some("high")
+            }),
+            "picking High must emit SupervisorCostTier tier=high: {settings:?}"
         );
     }
 
@@ -8937,6 +9359,7 @@ mod wasm_tests {
             complexity_tiers_enabled: false,
             backend_tier_configs: std::collections::HashMap::new(),
             background_agent_features: Default::default(),
+            supervisor: Default::default(),
             code_intel: Default::default(),
             backend_config,
             launch_profiles: Vec::new(),
@@ -9780,6 +10203,7 @@ mod wasm_tests {
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: Default::default(),
+                    supervisor: Default::default(),
                     code_intel: Default::default(),
                     backend_config: std::collections::HashMap::new(),
                     launch_profiles: Vec::new(),
@@ -10277,6 +10701,7 @@ mod wasm_tests {
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: Default::default(),
+                    supervisor: Default::default(),
                     code_intel: Default::default(),
                     backend_config: std::collections::HashMap::new(),
                     launch_profiles: profiles,

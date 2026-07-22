@@ -1078,6 +1078,7 @@ fn expected_empty_settings() -> HostSettings {
         complexity_tiers_enabled: false,
         backend_tier_configs: std::collections::HashMap::new(),
         background_agent_features: Default::default(),
+        supervisor: Default::default(),
         code_intel: Default::default(),
         backend_config: std::collections::HashMap::new(),
         launch_profiles: Vec::new(),
@@ -1180,10 +1181,76 @@ fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
             complexity_tiers_enabled: false,
             backend_tier_configs: std::collections::HashMap::new(),
             background_agent_features: Default::default(),
+            supervisor: Default::default(),
             code_intel: Default::default(),
             backend_config: std::collections::HashMap::new(),
             launch_profiles: Vec::new(),
         }
+    );
+}
+
+#[test]
+fn supervisor_settings_default_apply_and_validate() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let path = dir.path().join("settings.json");
+    let store = HostSettingsStore::load(path).expect("load empty settings store");
+
+    let defaults = store.get().expect("read empty settings").supervisor;
+    assert!(!defaults.enabled, "supervisor must default off");
+    assert!(
+        !defaults.auto_compact_on_success,
+        "auto-compact must default off"
+    );
+    assert_eq!(defaults.max_kicks_per_task, 3);
+    assert_eq!(defaults.retry_attempts, 1);
+
+    let settings = store
+        .apply(HostSettingValue::SupervisorEnabled { enabled: true })
+        .expect("enable supervisor");
+    assert!(settings.supervisor.enabled);
+    let settings = store
+        .apply(HostSettingValue::SupervisorAutoCompactOnSuccess { enabled: true })
+        .expect("enable auto-compact");
+    assert!(settings.supervisor.auto_compact_on_success);
+    let settings = store
+        .apply(HostSettingValue::SupervisorMaxKicksPerTask { count: 5 })
+        .expect("set kick limit");
+    assert_eq!(settings.supervisor.max_kicks_per_task, 5);
+    let settings = store
+        .apply(HostSettingValue::SupervisorRetryAttempts { count: 0 })
+        .expect("retries can be disabled entirely");
+    assert_eq!(settings.supervisor.retry_attempts, 0);
+    assert_eq!(
+        settings.supervisor.cost_tier,
+        protocol::SupervisorCostTier::Low,
+        "the verdict tier defaults to the cheap tier"
+    );
+    let settings = store
+        .apply(HostSettingValue::SupervisorCostTier {
+            tier: protocol::SupervisorCostTier::High,
+        })
+        .expect("set verdict tier");
+    assert_eq!(
+        settings.supervisor.cost_tier,
+        protocol::SupervisorCostTier::High
+    );
+
+    store
+        .apply(HostSettingValue::SupervisorMaxKicksPerTask { count: 0 })
+        .expect_err("a zero kick limit must be rejected, not stored");
+
+    let persisted = store.get().expect("re-read persisted settings").supervisor;
+    assert!(persisted.enabled);
+    assert!(persisted.auto_compact_on_success);
+    assert_eq!(
+        persisted.max_kicks_per_task, 5,
+        "the rejected zero write must not clobber the stored kick limit"
+    );
+    assert_eq!(persisted.retry_attempts, 0);
+    assert_eq!(
+        persisted.cost_tier,
+        protocol::SupervisorCostTier::High,
+        "the verdict tier must survive the read-modify-write cycle"
     );
 }
 

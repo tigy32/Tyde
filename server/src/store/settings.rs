@@ -366,6 +366,27 @@ fn apply_setting(settings: &mut HostSettings, setting: HostSettingValue) -> Resu
                 settings.background_agent_features.agent_activity_summaries = enabled;
             }
         },
+        HostSettingValue::SupervisorEnabled { enabled } => {
+            settings.supervisor.enabled = enabled;
+        }
+        HostSettingValue::SupervisorAutoCompactOnSuccess { enabled } => {
+            settings.supervisor.auto_compact_on_success = enabled;
+        }
+        HostSettingValue::SupervisorMaxKicksPerTask { count } => {
+            if count == 0 {
+                return Err(
+                    "supervisor max kicks per task must be at least 1; disable the supervisor instead of setting it to 0"
+                        .to_owned(),
+                );
+            }
+            settings.supervisor.max_kicks_per_task = count;
+        }
+        HostSettingValue::SupervisorRetryAttempts { count } => {
+            settings.supervisor.retry_attempts = count;
+        }
+        HostSettingValue::SupervisorCostTier { tier } => {
+            settings.supervisor.cost_tier = tier;
+        }
         HostSettingValue::CodeIntelLanguageServerPath { provider, path } => match path {
             Some(path) => {
                 if path.0.trim().is_empty() {
@@ -474,6 +495,7 @@ fn empty_settings() -> HostSettings {
         complexity_tiers_enabled: false,
         backend_tier_configs: std::collections::HashMap::new(),
         background_agent_features: Default::default(),
+        supervisor: Default::default(),
         code_intel: Default::default(),
         backend_config: std::collections::HashMap::new(),
         launch_profiles: Vec::new(),
@@ -525,6 +547,7 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
         complexity_tiers_enabled: settings.complexity_tiers_enabled,
         backend_tier_configs: settings.backend_tier_configs,
         background_agent_features: settings.background_agent_features,
+        supervisor: settings.supervisor,
         code_intel,
         backend_config,
         launch_profiles,

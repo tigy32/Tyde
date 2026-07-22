@@ -1173,6 +1173,7 @@ mod wasm_tests {
             complexity_tiers_enabled: false,
             backend_tier_configs: Default::default(),
             background_agent_features: Default::default(),
+            supervisor: Default::default(),
             code_intel: Default::default(),
             backend_config: Default::default(),
             launch_profiles: Vec::new(),

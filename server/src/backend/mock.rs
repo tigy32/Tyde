@@ -52,6 +52,7 @@ pub(crate) const MOCK_DUPLICATE_IDLE_SENTINEL: &str = "__mock_duplicate_idle__";
 /// task exits, which drives the agent actor into `enter_terminal_failure`.
 pub(crate) const MOCK_DIE_AFTER_BUSY_SENTINEL: &str = "__mock_die_after_busy__";
 pub(crate) const MOCK_ERROR_WITHOUT_IDLE_SENTINEL: &str = "__mock_error_without_idle__";
+pub(crate) const MOCK_USER_BUBBLES_SENTINEL: &str = "__mock_user_bubbles__";
 /// Makes the FIRST send of a message containing this sentinel return
 /// `SendOutcome::Busy` (handing the message back) while the mock runs a turn
 /// "it started on its own"; subsequent sends are accepted normally. Simulates
@@ -518,6 +519,9 @@ fn start_mock_command_loop(
         let mut active_subagents = Vec::new();
         let mut pending_exit_plan_mode = None;
         let mut holding_until_interrupt = false;
+        let mut emit_user_bubbles = initial_message
+            .as_deref()
+            .is_some_and(|message| message.contains(MOCK_USER_BUBBLES_SENTINEL));
         if let Some(initial_message) = initial_message {
             if initial_message.contains(MOCK_DIE_AFTER_BUSY_SENTINEL) {
                 // Send TypingStatusChanged(true) so the actor sets in_turn=true,
@@ -528,6 +532,9 @@ fn start_mock_command_loop(
                 return;
             }
             record_prompt(&session_id_for_task, &initial_message);
+            if emit_user_bubbles {
+                emit_mock_user_bubble(&events_tx, &initial_message);
+            }
             if hold_initial_turn || initial_message.contains(MOCK_HOLD_UNTIL_INTERRUPT_SENTINEL) {
                 if !emit_held_turn(&events_tx, &session_id_for_task, &initial_message).await {
                     return;
@@ -633,6 +640,12 @@ fn start_mock_command_loop(
                         continue;
                     }
                     record_prompt(&session_id_for_task, &payload.message);
+                    if payload.message.contains(MOCK_USER_BUBBLES_SENTINEL) {
+                        emit_user_bubbles = true;
+                    }
+                    if emit_user_bubbles {
+                        emit_mock_user_bubble(&events_tx, &payload.message);
+                    }
                     if let Some((agent_id, message)) =
                         parse_mock_agent_control_send_message(&payload.message)
                     {
@@ -1684,6 +1697,26 @@ fn emit_mock_orchestration(events_tx: &mpsc::UnboundedSender<ChatEvent>) {
         },
     }));
     let _ = events_tx.send(ChatEvent::TypingStatusChanged(false));
+}
+
+/// Real backends echo every accepted user message into the transcript as a
+/// `MessageSender::User` bubble; the mock skips that by default because many
+/// tests pin exact frame sequences. Prompts containing
+/// [`MOCK_USER_BUBBLES_SENTINEL`] opt a session into the realistic behavior
+/// (needed by supervisor tests, whose context reader consumes user bubbles).
+fn emit_mock_user_bubble(events_tx: &mpsc::UnboundedSender<ChatEvent>, message: &str) {
+    let _ = events_tx.send(ChatEvent::MessageAdded(ChatMessage {
+        message_id: Some(protocol::ChatMessageId(Uuid::new_v4().to_string())),
+        timestamp: now_ms(),
+        sender: MessageSender::User,
+        content: message.to_owned(),
+        reasoning: None,
+        tool_calls: Vec::new(),
+        model_info: None,
+        token_usage: None,
+        context_breakdown: None,
+        images: None,
+    }));
 }
 
 fn emit_mock_error(events_tx: &mpsc::UnboundedSender<ChatEvent>, message: &str) {

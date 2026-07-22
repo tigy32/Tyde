@@ -34,40 +34,41 @@ use protocol::{
     HostSettingsPayload, ImageData, LOCAL_HOST_ID, LaunchProfile, LaunchProfileCatalog,
     LaunchProfileCatalogPayload, LaunchProfileEntry, LaunchProfileId, LaunchProfileKind,
     ListSessionsPayload, MAX_SESSION_LIST_PAGE_LIMIT, McpServerConfig, McpServerDeletePayload,
-    McpServerId, McpServerNotifyPayload, McpServerUpsertPayload, McpTransportConfig, MessageSender,
-    MobileDeviceRenamePayload, MobileDeviceRevokePayload, MobilePairingCancelPayload,
-    NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
-    ProjectDeleteRootPayload, ProjectDiscardFilePayload, ProjectGitCommitPayload,
-    ProjectGitCommitResultPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload,
-    ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
-    ProjectReorderPayload, ProjectRootPath, ProjectSearchCancelPayload,
-    ProjectSearchCompletePayload, ProjectSearchFileResult, ProjectSearchPayload,
-    ProjectSearchResultsPayload, ProjectSource, ProjectStageFilePayload, ProjectStageHunkPayload,
-    ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload, ReviewDiffSelection,
-    ReviewId, ReviewSubmitTarget, RunBackendSetupPayload, SendMessagePayload,
-    SessionHistoryPayload, SessionId, SessionListCursor, SessionListGeneration,
-    SessionListPageInfo, SessionListPageStatus, SessionListPayload, SessionListScope,
-    SessionSchemaEntry, SessionSchemasPayload, SessionSettingsSchema, SessionSummary,
-    SetAgentGroupsPayload, SetAgentPinsPayload, SetAgentTagsPayload, SetAgentsSmartViewsPayload,
-    SetAgentsViewPreferencesPayload, SetSettingPayload, Skill, SkillNotifyPayload,
-    SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
-    SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath,
-    TaskTokenUsageAggregate, TaskTokenUsageAmount, TaskTokenUsageEntry, TaskTokenUsagePayload,
-    TaskTokenUsageScope, TaskTokenUsageStatus, TaskTokenUsageUnavailableReason, TeamCreatePayload,
-    TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
-    TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftNotifyPayload,
-    TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamId, TeamMember,
-    TeamMemberBindingNotifyPayload, TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberId,
-    TeamMemberNotifyPayload, TeamMemberRole, TeamMemberShufflePayload,
-    TeamMemberShuffleSuggestionNotifyPayload, TeamMemberState, TeamMemberUpdatePayload,
-    TeamNotifyPayload, TeamRenamePayload, TeamSetManagerPayload, TerminalCreatePayload, TerminalId,
-    TerminalLaunchTarget, TerminalResizePayload, TerminalSendPayload, TriggerWorkflowPayload,
-    WorkbenchCreatePayload, WorkbenchRemovePayload, WorkbenchRoot, WorkflowCatalogLocation,
-    WorkflowDiagnostic, WorkflowDiagnosticSeverity, WorkflowInputControl, WorkflowInputSpec,
-    WorkflowNotifyPayload, WorkflowRunId, WorkflowRunNotifyPayload, WorkflowRunSnapshot,
-    WorkflowRunSnapshotStatus, WorkflowSaveMode, WorkflowSaveRequest, WorkflowSaveResponse,
-    WorkflowSaveTarget, WorkflowSource, WorkflowSourceScope, WorkflowStepRunId,
-    WorkflowStepRunSnapshot, WorkflowTargetDirectory, WorkflowTargetsResponse,
+    McpServerId, McpServerNotifyPayload, McpServerUpsertPayload, McpTransportConfig, MessageOrigin,
+    MessageSender, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
+    MobilePairingCancelPayload, NewAgentPayload, Project, ProjectAddRootPayload,
+    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
+    ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectGitCommitResultPayload, ProjectId,
+    ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
+    ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectRootPath,
+    ProjectSearchCancelPayload, ProjectSearchCompletePayload, ProjectSearchFileResult,
+    ProjectSearchPayload, ProjectSearchResultsPayload, ProjectSource, ProjectStageFilePayload,
+    ProjectStageHunkPayload, ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload,
+    ReviewDiffSelection, ReviewId, ReviewSubmitTarget, RunBackendSetupPayload,
+    SUPERVISOR_MESSAGE_PREFIX, SendMessagePayload, SessionHistoryPayload, SessionId,
+    SessionListCursor, SessionListGeneration, SessionListPageInfo, SessionListPageStatus,
+    SessionListPayload, SessionListScope, SessionSchemaEntry, SessionSchemasPayload,
+    SessionSettingsSchema, SessionSummary, SetAgentGroupsPayload, SetAgentPinsPayload,
+    SetAgentTagsPayload, SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload,
+    SetSettingPayload, Skill, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams,
+    SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringScope,
+    SteeringUpsertPayload, StreamPath, TaskTokenUsageAggregate, TaskTokenUsageAmount,
+    TaskTokenUsageEntry, TaskTokenUsagePayload, TaskTokenUsageScope, TaskTokenUsageStatus,
+    TaskTokenUsageUnavailableReason, TeamCreatePayload, TeamDeletePayload,
+    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
+    TeamDraftDiscardPayload, TeamDraftNotifyPayload, TeamDraftShufflePayload,
+    TeamDraftUpdatePayload, TeamId, TeamMember, TeamMemberBindingNotifyPayload,
+    TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberId, TeamMemberNotifyPayload,
+    TeamMemberRole, TeamMemberShufflePayload, TeamMemberShuffleSuggestionNotifyPayload,
+    TeamMemberState, TeamMemberUpdatePayload, TeamNotifyPayload, TeamRenamePayload,
+    TeamSetManagerPayload, TerminalCreatePayload, TerminalId, TerminalLaunchTarget,
+    TerminalResizePayload, TerminalSendPayload, TriggerWorkflowPayload, WorkbenchCreatePayload,
+    WorkbenchRemovePayload, WorkbenchRoot, WorkflowCatalogLocation, WorkflowDiagnostic,
+    WorkflowDiagnosticSeverity, WorkflowInputControl, WorkflowInputSpec, WorkflowNotifyPayload,
+    WorkflowRunId, WorkflowRunNotifyPayload, WorkflowRunSnapshot, WorkflowRunSnapshotStatus,
+    WorkflowSaveMode, WorkflowSaveRequest, WorkflowSaveResponse, WorkflowSaveTarget,
+    WorkflowSource, WorkflowSourceScope, WorkflowStepRunId, WorkflowStepRunSnapshot,
+    WorkflowTargetDirectory, WorkflowTargetsResponse,
 };
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -389,11 +390,34 @@ const ACTIVITY_SUMMARY_MAX_FREQUENCY: Duration = Duration::from_secs(60);
 const ACTIVITY_SUMMARY_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 const ACTIVITY_SUMMARY_GENERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const AGENT_NAME_GENERATION_TIMEOUT: Duration = Duration::from_secs(30);
+/// One supervision verdict reads more context than naming, so it gets a
+/// longer budget per attempt.
+const SUPERVISION_GENERATION_TIMEOUT: Duration = Duration::from_secs(60);
+/// Grace period between observing an idle transition and reading the
+/// supervision context, so queued-message drains and immediate user
+/// follow-ups win the race instead of being second-guessed.
+const SUPERVISION_DEBOUNCE: Duration = Duration::from_secs(3);
+/// How long the supervisor waits for an auto-compaction it requested to
+/// reach a terminal notify before giving up on observing it (the compaction
+/// itself keeps running server-side either way).
+const SUPERVISION_COMPACTION_OBSERVE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ActivitySummarySettingsSignal {
     enabled: bool,
     epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SupervisorSettingsSignal {
+    settings: protocol::SupervisorSettings,
+    epoch: u64,
+}
+
+#[derive(Default)]
+struct SupervisorSchedulerEntry {
+    was_active: bool,
+    in_flight: bool,
 }
 
 #[derive(Clone)]
@@ -519,6 +543,8 @@ pub(crate) struct HostState {
     closed_agent_usage_snapshots: HashMap<AgentId, AgentUsageSnapshot>,
     activity_summary_epoch: u64,
     activity_summary_settings_tx: watch::Sender<ActivitySummarySettingsSignal>,
+    supervisor_epoch: u64,
+    supervisor_settings_tx: watch::Sender<SupervisorSettingsSignal>,
     pub sub_agent_spawn_tx: HostSubAgentSpawnTx,
     pub capacity_tx: HostCapacityTx,
     pub use_mock_backend: bool,
@@ -7134,6 +7160,7 @@ impl HostHandle {
             .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
         fan_out_host_settings(&mut state, settings.clone()).await;
         apply_agent_activity_summary_setting(&mut state, &settings).await;
+        apply_agent_supervisor_setting(&mut state, &settings);
         state.mobile_access.settings_changed(settings);
         fan_out_launch_profile_catalog(&mut state).await;
         if refresh_session_schemas || refresh_backend_config_snapshots {
@@ -8418,6 +8445,14 @@ impl HostHandle {
             .await
             .activity_summary_settings_tx
             .subscribe()
+    }
+
+    async fn supervisor_settings_receiver(&self) -> watch::Receiver<SupervisorSettingsSignal> {
+        self.state.lock().await.supervisor_settings_tx.subscribe()
+    }
+
+    async fn supervisor_settings_signal(&self) -> SupervisorSettingsSignal {
+        *self.state.lock().await.supervisor_settings_tx.borrow()
     }
 
     async fn activity_summary_observations(&self) -> Vec<ActivitySummaryObservation> {
@@ -12378,6 +12413,11 @@ fn spawn_host_inner(
                 .agent_activity_summaries,
             epoch: 0,
         });
+    let (supervisor_settings_tx, _supervisor_settings_rx) =
+        watch::channel(SupervisorSettingsSignal {
+            settings: host_settings.supervisor,
+            epoch: 0,
+        });
     let mobile_pairings_store = MobilePairingsStore::load(paths.mobile_pairings)?;
     let custom_agent_store = CustomAgentStore::load(paths.custom_agent)?;
     let (role_preset_ids, personality_preset_ids) = team_preset_validation_refs();
@@ -12490,6 +12530,8 @@ fn spawn_host_inner(
             agent_activity_summaries: HashMap::new(),
             closed_agent_usage_snapshots: HashMap::new(),
             activity_summary_epoch: 0,
+            supervisor_epoch: 0,
+            supervisor_settings_tx,
             activity_summary_settings_tx,
             sub_agent_spawn_tx,
             capacity_tx: capacity_tx.clone(),
@@ -12659,6 +12701,7 @@ fn spawn_host_inner(
     spawn_host_team_status_task(host.clone());
     spawn_task_token_usage_task(host.clone());
     spawn_agent_activity_summary_task(host.clone());
+    spawn_agent_supervisor_task(host.clone());
 
     Ok(host)
 }
@@ -12898,6 +12941,395 @@ fn spawn_agent_activity_summary_task(host: HostHandle) {
         tracing::error!(
             error = %err,
             "failed to spawn agent activity summary worker thread"
+        );
+    }
+}
+
+/// Watches for active→idle agent transitions and runs one hidden supervision
+/// verdict per transition: the supervisor either accepts the turn as done
+/// (optionally auto-compacting the agent) or sends a follow-up message that
+/// kicks the agent back to work. Fully settings-gated; supervision failures
+/// never affect the supervised agent.
+fn spawn_agent_supervisor_task(host: HostHandle) {
+    let worker = async move {
+        let mut status_rx = host.subscribe_agent_status_changes().await;
+        let mut settings_rx = host.supervisor_settings_receiver().await;
+        let (done_tx, mut done_rx) = mpsc::unbounded_channel::<AgentId>();
+        let semaphore = Arc::new(Semaphore::new(1));
+        let mut entries = HashMap::<AgentId, SupervisorSchedulerEntry>::new();
+
+        loop {
+            tokio::select! {
+                changed = status_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let settings = *settings_rx.borrow();
+                    if settings.settings.enabled {
+                        observe_supervised_agents(
+                            &host,
+                            &mut entries,
+                            settings,
+                            &done_tx,
+                            &semaphore,
+                        )
+                        .await;
+                    }
+                }
+                changed = settings_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    if !settings_rx.borrow().settings.enabled {
+                        entries.clear();
+                    }
+                }
+                Some(agent_id) = done_rx.recv() => {
+                    if let Some(entry) = entries.get_mut(&agent_id) {
+                        entry.in_flight = false;
+                    }
+                }
+            }
+        }
+    };
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(worker);
+        return;
+    }
+
+    if let Err(err) = std::thread::Builder::new()
+        .name("tyde-agent-supervisor".to_string())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to build agent supervisor runtime");
+                    return;
+                }
+            };
+            runtime.block_on(worker);
+        })
+    {
+        tracing::error!(error = %err, "failed to spawn agent supervisor worker thread");
+    }
+}
+
+async fn observe_supervised_agents(
+    host: &HostHandle,
+    entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
+    settings: SupervisorSettingsSignal,
+    done_tx: &mpsc::UnboundedSender<AgentId>,
+    semaphore: &Arc<Semaphore>,
+) {
+    let observations = host.activity_summary_observations().await;
+    let live_agent_ids = observations
+        .iter()
+        .map(|observation| observation.agent_id.clone())
+        .collect::<HashSet<_>>();
+    entries.retain(|agent_id, _| live_agent_ids.contains(agent_id));
+
+    for observation in observations {
+        // Supervise only standalone user-driven agents. Orchestrated agents
+        // (teams, workflows, agent-control children, backend-native
+        // sub-agents) have their own coordinator watching them.
+        if !matches!(
+            observation.start.origin,
+            AgentOrigin::User | AgentOrigin::SideQuestion
+        ) || observation.start.parent_agent_id.is_some()
+        {
+            continue;
+        }
+
+        let entry = entries.entry(observation.agent_id.clone()).or_default();
+        let status = &observation.status;
+        if status.terminated {
+            entry.was_active = false;
+            continue;
+        }
+        if status.is_active() {
+            entry.was_active = true;
+            continue;
+        }
+        if !entry.was_active {
+            continue;
+        }
+        entry.was_active = false;
+        if entry.in_flight || status.is_plan_approval_pending() {
+            continue;
+        }
+        entry.in_flight = true;
+
+        let host = host.clone();
+        let agent_id = observation.agent_id.clone();
+        let done_tx = done_tx.clone();
+        let semaphore = Arc::clone(semaphore);
+        tokio::spawn(async move {
+            supervise_idle_agent(&host, &agent_id, settings, semaphore).await;
+            let _ = done_tx.send(agent_id);
+        });
+    }
+}
+
+async fn supervise_idle_agent(
+    host: &HostHandle,
+    agent_id: &AgentId,
+    settings: SupervisorSettingsSignal,
+    semaphore: Arc<Semaphore>,
+) {
+    tokio::time::sleep(SUPERVISION_DEBOUNCE).await;
+    let Ok(permit) = semaphore.acquire_owned().await else {
+        return;
+    };
+
+    // Re-observe after the debounce and the (possibly long) wait for the
+    // concurrency permit: the agent may have picked up new work.
+    let Some(observation) = host.activity_summary_observation(agent_id).await else {
+        return;
+    };
+    if observation.status.terminated
+        || observation.status.is_active()
+        || observation.status.is_plan_approval_pending()
+    {
+        return;
+    }
+    let Some(context) = observation.handle.read_supervision_context().await else {
+        return;
+    };
+    let Some(last_user_message) = context.last_user_message.clone() else {
+        return;
+    };
+    if context.cancelled_since_user_message {
+        tracing::debug!(
+            agent_id = %agent_id,
+            "skipping supervision: user cancelled work since their last message"
+        );
+        return;
+    }
+    let max_kicks = u32::from(settings.settings.max_kicks_per_task.max(1));
+    if context.kicks_since_user_message >= max_kicks {
+        tracing::info!(
+            agent_id = %agent_id,
+            kicks = context.kicks_since_user_message,
+            "supervision kick budget exhausted; leaving the agent idle"
+        );
+        return;
+    }
+
+    let session_id = observation.start.session_id.clone();
+    let (task_list, session_record) = match &session_id {
+        Some(session_id) => {
+            let session_store = { host.state.lock().await.session_store.clone() };
+            let store = session_store.lock().await;
+            (store.get_task_list(session_id), store.get(session_id))
+        }
+        None => (None, None),
+    };
+    // Already rotated (or mid-rotation): the idle transition after the
+    // compaction summary turn belongs to a dying agent.
+    if session_record
+        .as_ref()
+        .is_some_and(|record| record.compacted_to_session_id.is_some())
+    {
+        return;
+    }
+    let compacted_from_session = session_record
+        .as_ref()
+        .is_some_and(|record| record.compacted_from_session_id.is_some());
+    // A freshly compacted replacement agent idles right after digesting its
+    // bootstrap summary prompt. Supervising that turn would judge "done" and
+    // re-compact forever; wait for the first real user message instead.
+    if compacted_from_session && context.user_message_count <= 1 {
+        tracing::debug!(
+            agent_id = %agent_id,
+            "skipping supervision: post-compaction bootstrap turn"
+        );
+        return;
+    }
+
+    let use_mock_backend = host.use_mock_backend().await;
+    let capacity_tx = { host.state.lock().await.capacity_tx.clone() };
+    let backend_kind = observation.start.backend_kind;
+    let verdict = crate::agent::supervisor::run_supervision_with_retries(
+        u32::from(settings.settings.retry_attempts),
+        |_attempt| {
+            let request = crate::agent::supervisor::GenerateSupervisionVerdictRequest {
+                verdict_agent_id: AgentId(Uuid::new_v4().to_string()),
+                backend_kind,
+                last_user_message: last_user_message.clone(),
+                task_list: task_list.clone(),
+                last_assistant_message: context.last_assistant_message.clone(),
+                last_error: context.last_error_since_user_message.clone(),
+                kicks_so_far: context.kicks_since_user_message,
+                max_kicks,
+                cost_hint: settings.settings.cost_tier.as_cost_hint(),
+                use_mock_backend,
+                capacity_tx: capacity_tx.clone(),
+            };
+            async move {
+                match tokio::time::timeout(
+                    SUPERVISION_GENERATION_TIMEOUT,
+                    crate::agent::supervisor::generate_supervision_verdict(request),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(format!(
+                        "supervision verdict timed out after {}",
+                        generation_timeout_label(SUPERVISION_GENERATION_TIMEOUT)
+                    )),
+                }
+            }
+        },
+    )
+    .await;
+    let verdict = match verdict {
+        Ok(verdict) => verdict,
+        Err(error) => {
+            tracing::warn!(
+                agent_id = %agent_id,
+                error = %error,
+                "agent supervision produced no verdict; leaving the agent alone"
+            );
+            return;
+        }
+    };
+
+    // The verdict may be stale: settings can flip and the user can act while
+    // the model call runs. Re-validate everything cheap before acting.
+    let current_settings = host.supervisor_settings_signal().await;
+    if !current_settings.settings.enabled || current_settings.epoch != settings.epoch {
+        return;
+    }
+    let Some(observation) = host.activity_summary_observation(agent_id).await else {
+        return;
+    };
+    if observation.status.terminated
+        || observation.status.is_active()
+        || observation.status.is_plan_approval_pending()
+    {
+        return;
+    }
+    let Some(recheck) = observation.handle.read_supervision_context().await else {
+        return;
+    };
+    if recheck.last_user_message.as_deref() != Some(last_user_message.as_str())
+        || recheck.kicks_since_user_message != context.kicks_since_user_message
+        || recheck.cancelled_since_user_message
+    {
+        tracing::debug!(
+            agent_id = %agent_id,
+            "dropping stale supervision verdict: conversation moved on"
+        );
+        return;
+    }
+    drop(permit);
+
+    match verdict {
+        crate::agent::supervisor::SupervisionVerdict::Continue { message } => {
+            tracing::info!(
+                agent_id = %agent_id,
+                kick = context.kicks_since_user_message + 1,
+                max_kicks,
+                "supervisor kicking idle agent to continue"
+            );
+            if let Some(status_handle) = host.agent_status_handle(agent_id).await {
+                status_handle
+                    .update(|s| {
+                        s.turn_completed = false;
+                        s.activity_counter = s.activity_counter.saturating_add(1);
+                    })
+                    .await;
+            }
+            let sent = observation
+                .handle
+                .send_input(AgentInput::SendMessage(SendMessagePayload {
+                    message: format!("{SUPERVISOR_MESSAGE_PREFIX}{message}"),
+                    images: None,
+                    origin: Some(MessageOrigin::Supervisor),
+                    tool_response: None,
+                }))
+                .await;
+            if !sent {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    "supervisor kick could not be delivered: agent backend is closed"
+                );
+            }
+        }
+        crate::agent::supervisor::SupervisionVerdict::Done => {
+            tracing::info!(agent_id = %agent_id, "supervisor confirmed the task is done");
+            if current_settings.settings.auto_compact_on_success {
+                supervisor_auto_compact(host, agent_id).await;
+            }
+        }
+    }
+}
+
+async fn supervisor_auto_compact(host: &HostHandle, agent_id: &AgentId) {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let stream = Stream::new(
+        StreamPath(format!("/agent/{}/supervisor-compact", agent_id)),
+        tx,
+    );
+    if let Err(error) = host
+        .compact_agent_in_background(
+            agent_id.clone(),
+            AgentCompactPayload {
+                summary_prompt: None,
+                max_summary_bytes: None,
+            },
+            stream,
+        )
+        .await
+    {
+        tracing::warn!(
+            agent_id = %agent_id,
+            error = %error,
+            "supervisor auto-compaction could not start"
+        );
+        return;
+    }
+
+    let observe = async {
+        while let Some(envelope) = rx.recv().await {
+            if envelope.kind != FrameKind::AgentCompactNotify {
+                continue;
+            }
+            let Ok(payload) = envelope.parse_payload::<AgentCompactNotifyPayload>() else {
+                continue;
+            };
+            match payload.status {
+                AgentCompactStatus::Completed => {
+                    tracing::info!(
+                        agent_id = %agent_id,
+                        new_agent_id = ?payload.new_agent_id,
+                        "supervisor auto-compaction completed"
+                    );
+                    return;
+                }
+                AgentCompactStatus::Failed => {
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        message = ?payload.message,
+                        "supervisor auto-compaction failed"
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
+    };
+    if tokio::time::timeout(SUPERVISION_COMPACTION_OBSERVE_TIMEOUT, observe)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            agent_id = %agent_id,
+            "supervisor auto-compaction did not reach a terminal notify in time"
         );
     }
 }
@@ -15688,6 +16120,18 @@ async fn apply_agent_activity_summary_setting(
         )
         .await;
     }
+}
+
+fn apply_agent_supervisor_setting(state: &mut HostState, settings: &protocol::HostSettings) {
+    let current = *state.supervisor_settings_tx.borrow();
+    if current.settings == settings.supervisor {
+        return;
+    }
+    state.supervisor_epoch = state.supervisor_epoch.saturating_add(1);
+    let _ = state.supervisor_settings_tx.send(SupervisorSettingsSignal {
+        settings: settings.supervisor,
+        epoch: state.supervisor_epoch,
+    });
 }
 
 fn initial_agent_activity_summary_state(
@@ -18839,6 +19283,7 @@ mod tests {
             complexity_tiers_enabled: false,
             backend_tier_configs: HashMap::new(),
             background_agent_features: Default::default(),
+            supervisor: Default::default(),
             code_intel: Default::default(),
             backend_config: HashMap::new(),
             launch_profiles: Vec::new(),

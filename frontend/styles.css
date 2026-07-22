@@ -7966,6 +7966,10 @@ kbd {
     cursor: not-allowed;
 }
 
+.settings-supervisor-number-input {
+    width: 6rem;
+}
+
 .settings-mobile-broker-row {
     display: flex;
     align-items: center;

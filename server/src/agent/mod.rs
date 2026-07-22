@@ -44,6 +44,7 @@ use crate::sub_agent::HostSubAgentSpawnTx;
 
 pub(crate) mod customization;
 pub(crate) mod registry;
+pub(crate) mod supervisor;
 
 use self::registry::{
     AgentStartupFailure, InitialAgentAlias, InitialAgentAliasPersistence, ResolvedSpawnRequest,
@@ -202,6 +203,9 @@ enum AgentCommand {
         max_events: usize,
         max_bytes: usize,
         reply: oneshot::Sender<AgentActivityHistorySnapshot>,
+    },
+    ReadSupervisionContext {
+        reply: oneshot::Sender<supervisor::SupervisionContextSnapshot>,
     },
     ReadUsageSnapshot {
         reply: oneshot::Sender<AgentUsageSnapshot>,
@@ -1059,6 +1063,18 @@ impl AgentHandle {
                 max_bytes,
                 reply: reply_tx,
             })
+            .is_err()
+        {
+            return None;
+        }
+        reply_rx.await.ok()
+    }
+
+    pub async fn read_supervision_context(&self) -> Option<supervisor::SupervisionContextSnapshot> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(AgentCommand::ReadSupervisionContext { reply: reply_tx })
             .is_err()
         {
             return None;
@@ -2146,6 +2162,9 @@ pub(crate) fn spawn_agent_actor(
                                 active_stream_included: false,
                             });
                         }
+                        AgentCommand::ReadSupervisionContext { reply } => {
+                            let _ = reply.send(supervisor::SupervisionContextSnapshot::default());
+                        }
                         AgentCommand::ReadUsageSnapshot { reply } => {
                             let _ = reply.send(agent_usage_snapshot_from_tracker(
                                 &current_start,
@@ -2849,7 +2868,7 @@ pub(crate) fn spawn_agent_actor(
                             .expect("queue reported non-empty but pop_front returned None");
                         let review_origin = match queued.origin.as_ref() {
                             Some(MessageOrigin::Review { review_id }) => Some(review_id.clone()),
-                            Some(MessageOrigin::User) | None => None,
+                            Some(MessageOrigin::User) | Some(MessageOrigin::Supervisor) | None => None,
                         };
                         if let Some(review_id) = review_origin.as_ref() {
                             tracing::info!(
@@ -3167,13 +3186,13 @@ pub(crate) fn spawn_agent_actor(
                                         Some(MessageOrigin::Review { review_id }) => {
                                             Some(review_id.clone())
                                         }
-                                        Some(MessageOrigin::User) | None => None,
+                                        Some(MessageOrigin::User) | Some(MessageOrigin::Supervisor) | None => None,
                                     };
                                     let message_len = msg.message.len();
                                     let images_count = msg.images.as_ref().map_or(0, Vec::len);
                                     let review_origin_for_queue = match msg.origin.clone() {
                                         Some(MessageOrigin::Review { review_id }) => Some(review_id),
-                                        Some(MessageOrigin::User) | None => None,
+                                        Some(MessageOrigin::User) | Some(MessageOrigin::Supervisor) | None => None,
                                     };
                                     let is_tool_response = msg.tool_response.is_some();
                                     let plan_response = match msg.tool_response.as_ref() {
@@ -3478,7 +3497,7 @@ pub(crate) fn spawn_agent_actor(
                                         Some(MessageOrigin::Review { review_id }) => {
                                             Some(review_id.clone())
                                         }
-                                        Some(MessageOrigin::User) | None => None,
+                                        Some(MessageOrigin::User) | Some(MessageOrigin::Supervisor) | None => None,
                                     };
                                     if let Some(review_id) = review_origin.as_ref() {
                                         tracing::info!(
@@ -3883,6 +3902,10 @@ pub(crate) fn spawn_agent_actor(
                                 max_events,
                                 max_bytes,
                             ));
+                        }
+                        AgentCommand::ReadSupervisionContext { reply } => {
+                            let _ = reply
+                                .send(supervisor::supervision_context_snapshot(&event_log));
                         }
                         AgentCommand::ReadUsageSnapshot { reply } => {
                             let _ = reply.send(agent_usage_snapshot_from_tracker(
@@ -4415,6 +4438,10 @@ pub(crate) fn spawn_relay_agent_actor(
                                 max_bytes,
                             ));
                         }
+                        AgentCommand::ReadSupervisionContext { reply } => {
+                            let _ = reply
+                                .send(supervisor::supervision_context_snapshot(&event_log));
+                        }
                         AgentCommand::ReadUsageSnapshot { reply } => {
                             let _ = reply.send(agent_usage_snapshot_from_tracker(
                                 &current_start,
@@ -4705,6 +4732,9 @@ async fn park_terminal_agent(
                     event_log, None, after_seq, max_events, max_bytes,
                 ));
             }
+            AgentCommand::ReadSupervisionContext { reply } => {
+                let _ = reply.send(supervisor::supervision_context_snapshot(event_log));
+            }
             AgentCommand::ReadUsageSnapshot { reply } => {
                 let _ = reply.send(agent_usage_snapshot_from_log(current_start, event_log));
             }
@@ -4833,6 +4863,9 @@ async fn park_relay_terminal_agent(
                 let _ = reply.send(activity_history_snapshot(
                     event_log, None, after_seq, max_events, max_bytes,
                 ));
+            }
+            AgentCommand::ReadSupervisionContext { reply } => {
+                let _ = reply.send(supervisor::supervision_context_snapshot(event_log));
             }
             AgentCommand::ReadUsageSnapshot { reply } => {
                 let _ = reply.send(agent_usage_snapshot_from_log(current_start, event_log));
@@ -7520,6 +7553,11 @@ mod tests {
                     } => {
                         let _ = reply.send(activity_history_snapshot(
                             &event_log, None, after_seq, max_events, max_bytes,
+                        ));
+                    }
+                    AgentCommand::ReadSupervisionContext { reply } => {
+                        let _ = reply.send(crate::agent::supervisor::supervision_context_snapshot(
+                            &event_log,
                         ));
                     }
                     AgentCommand::ReadUsageSnapshot { reply } => {

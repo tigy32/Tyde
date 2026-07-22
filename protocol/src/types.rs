@@ -2218,6 +2218,8 @@ pub struct HostSettings {
     #[serde(default = "default_background_agent_features")]
     pub background_agent_features: BackgroundAgentFeaturesSettings,
     #[serde(default)]
+    pub supervisor: SupervisorSettings,
+    #[serde(default)]
     pub code_intel: CodeIntelSettings,
     /// Per-backend deep configuration (e.g. Hermes default model/provider).
     /// Host-level and persistent, distinct from lightweight per-session
@@ -2254,6 +2256,82 @@ pub struct BackgroundAgentFeaturesSettings {
     #[serde(default)]
     pub agent_activity_summaries: bool,
 }
+
+/// Agent supervisor: when an agent goes idle, a hidden one-shot model call
+/// reviews the last user request, the task list, and the agent's final
+/// message, then either accepts the turn as finished or sends a follow-up
+/// message to kick the agent back to work. Costs money per idle transition,
+/// so everything defaults off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupervisorSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    /// When the supervisor judges the task complete, automatically compact
+    /// (rotate-and-summarize) the agent so reusing it later starts from a
+    /// small warm context instead of resuming a huge cold session.
+    #[serde(default)]
+    pub auto_compact_on_success: bool,
+    /// Maximum consecutive supervisor kicks without an intervening real user
+    /// message. Prevents a supervisor/agent ping-pong loop.
+    #[serde(default = "default_supervisor_max_kicks_per_task")]
+    pub max_kicks_per_task: u8,
+    /// Extra attempts when a supervision call errors or returns output that
+    /// does not parse to a verdict. 1 means one retry after the first failure.
+    #[serde(default = "default_supervisor_retry_attempts")]
+    pub retry_attempts: u8,
+    /// Which model tier the supervision verdict runs on. `Low` is the cheap
+    /// tier (like agent naming); `Default` uses the backend's own default
+    /// model; `High` is the most capable configuration.
+    #[serde(default)]
+    pub cost_tier: SupervisorCostTier,
+}
+
+/// Model tier for supervision verdict calls, mapped to a [`SpawnCostHint`]
+/// at spawn time (`Default` maps to no hint).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorCostTier {
+    #[default]
+    Low,
+    Default,
+    High,
+}
+
+impl SupervisorCostTier {
+    pub fn as_cost_hint(self) -> Option<SpawnCostHint> {
+        match self {
+            Self::Low => Some(SpawnCostHint::Low),
+            Self::Default => None,
+            Self::High => Some(SpawnCostHint::High),
+        }
+    }
+}
+
+pub fn default_supervisor_max_kicks_per_task() -> u8 {
+    3
+}
+
+pub fn default_supervisor_retry_attempts() -> u8 {
+    1
+}
+
+impl Default for SupervisorSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_compact_on_success: false,
+            max_kicks_per_task: default_supervisor_max_kicks_per_task(),
+            retry_attempts: default_supervisor_retry_attempts(),
+            cost_tier: SupervisorCostTier::default(),
+        }
+    }
+}
+
+/// Prefix every supervisor-authored kick message carries. It keeps supervisor
+/// turns visibly labeled in the transcript and lets the server count
+/// consecutive supervisor kicks straight from the event log, with no
+/// per-agent bookkeeping that could survive or miss restarts.
+pub const SUPERVISOR_MESSAGE_PREFIX: &str = "[Tyde Supervisor] ";
 
 /// Per-backend mapping from spawn complexity tiers to session-settings
 /// overrides (e.g. `model`, `effort`). An empty map means "no override" —
@@ -2331,6 +2409,21 @@ pub enum HostSettingValue {
         feature: BackgroundAgentFeature,
         enabled: bool,
     },
+    SupervisorEnabled {
+        enabled: bool,
+    },
+    SupervisorAutoCompactOnSuccess {
+        enabled: bool,
+    },
+    SupervisorMaxKicksPerTask {
+        count: u8,
+    },
+    SupervisorRetryAttempts {
+        count: u8,
+    },
+    SupervisorCostTier {
+        tier: SupervisorCostTier,
+    },
     CodeIntelLanguageServerPath {
         provider: CodeIntelProviderId,
         path: Option<HostExecutablePath>,
@@ -2390,6 +2483,15 @@ impl HostSettingValue {
             Self::BackgroundAgentFeatureEnabled { .. } => {
                 HostSettingErrorTarget::BackgroundAgentFeatureEnabled
             }
+            Self::SupervisorEnabled { .. } => HostSettingErrorTarget::SupervisorEnabled,
+            Self::SupervisorAutoCompactOnSuccess { .. } => {
+                HostSettingErrorTarget::SupervisorAutoCompactOnSuccess
+            }
+            Self::SupervisorMaxKicksPerTask { .. } => {
+                HostSettingErrorTarget::SupervisorMaxKicksPerTask
+            }
+            Self::SupervisorRetryAttempts { .. } => HostSettingErrorTarget::SupervisorRetryAttempts,
+            Self::SupervisorCostTier { .. } => HostSettingErrorTarget::SupervisorCostTier,
             Self::CodeIntelLanguageServerPath { .. } => {
                 HostSettingErrorTarget::CodeIntelLanguageServerPath
             }
@@ -2422,6 +2524,11 @@ pub enum HostSettingErrorTarget {
     ComplexityTiersEnabled,
     BackendTiers,
     BackgroundAgentFeatureEnabled,
+    SupervisorEnabled,
+    SupervisorAutoCompactOnSuccess,
+    SupervisorMaxKicksPerTask,
+    SupervisorRetryAttempts,
+    SupervisorCostTier,
     CodeIntelLanguageServerPath,
     BackendConfig,
     BackendNativeSettings,
@@ -3285,7 +3392,12 @@ pub struct SendMessagePayload {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MessageOrigin {
     User,
-    Review { review_id: ReviewId },
+    Review {
+        review_id: ReviewId,
+    },
+    /// Sent by the hidden agent supervisor to kick a stalled agent back to
+    /// work after it went idle without finishing its task.
+    Supervisor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -7905,6 +8017,7 @@ mod search_serde_tests {
                 complexity_tiers_enabled: false,
                 backend_tier_configs: HashMap::new(),
                 background_agent_features: BackgroundAgentFeaturesSettings::default(),
+                supervisor: SupervisorSettings::default(),
                 code_intel: CodeIntelSettings::default(),
                 backend_config: HashMap::new(),
                 launch_profiles: Vec::new(),
