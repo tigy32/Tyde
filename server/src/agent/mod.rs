@@ -1300,15 +1300,29 @@ pub(crate) fn agent_name_generation_spawn_config() -> BackendSpawnConfig {
 
 async fn collect_agent_name_events(events: &mut EventStream) -> Result<String, String> {
     let mut streamed_text = String::new();
+    // Some backends run session-setup commands before the naming turn, and
+    // each command completion emits its own typing false (captured live on
+    // the Tycode wire: SetRootAgent produces typing true → RootAgentChanged →
+    // typing false before the prompt turn starts). Typing false only means
+    // "turn completed without a response" once the turn itself has produced a
+    // message or stream frame; earlier ones are setup noise. A backend that
+    // never produces either is bounded by await_agent_name_generation's
+    // timeout rather than misread here.
+    let mut turn_started = false;
     while let Some(event) = events.recv().await {
         match event {
             ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::Error) => {
                 return Err(message.content);
             }
+            ChatEvent::MessageAdded(_) | ChatEvent::StreamStart(_) => {
+                turn_started = true;
+            }
             ChatEvent::StreamDelta(delta) => {
+                turn_started = true;
                 streamed_text.push_str(&delta.text);
             }
             ChatEvent::StreamEnd(data) => {
+                turn_started = true;
                 let final_content = data.message.content;
                 let candidate = if final_content.trim().is_empty() {
                     std::mem::take(&mut streamed_text)
@@ -1320,7 +1334,7 @@ async fn collect_agent_name_events(events: &mut EventStream) -> Result<String, S
                 }
                 return sanitize_generated_agent_name(&candidate);
             }
-            ChatEvent::TypingStatusChanged(false) => {
+            ChatEvent::TypingStatusChanged(false) if turn_started => {
                 return Err(
                     "agent name generator turn completed before producing a final response"
                         .to_string(),
@@ -9039,6 +9053,35 @@ mod tests {
         assert_eq!(
             collect_agent_name_events(&mut events).await.unwrap(),
             "Fix Login Flow"
+        );
+    }
+
+    /// Pinned to the captured Tycode wire: SetRootAgent completes with its own
+    /// typing true → typing false cycle before the naming turn starts. That
+    /// setup cycle must not be read as "turn completed without a response" —
+    /// it previously aborted naming and discarded the generated name.
+    #[tokio::test]
+    async fn generated_name_ignores_setup_typing_cycle_before_turn() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(ChatEvent::TypingStatusChanged(true))
+            .expect("setup typing start");
+        tx.send(ChatEvent::TypingStatusChanged(false))
+            .expect("setup typing completion");
+        tx.send(ChatEvent::TypingStatusChanged(true))
+            .expect("turn typing start");
+        tx.send(ChatEvent::StreamDelta(StreamTextDeltaData {
+            message_id: Some("generated-name".to_owned()),
+            text: "Tyde Backend QA".to_owned(),
+        }))
+        .expect("assistant name delta");
+        tx.send(generated_name_stream_end("Tyde Backend QA", None))
+            .expect("assistant StreamEnd");
+        drop(tx);
+        let mut events = EventStream::new(rx);
+
+        assert_eq!(
+            collect_agent_name_events(&mut events).await.unwrap(),
+            "Tyde Backend QA"
         );
     }
 
