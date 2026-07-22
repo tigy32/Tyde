@@ -21,6 +21,7 @@ use protocol::{
     SetSettingPayload, Skill, SkillId, Steering, SteeringId, SteeringScope, ToolPolicy,
     SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX,
     SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN,
+    SUPERVISOR_RETRY_ATTEMPTS_MAX, SUPERVISOR_RETRY_ATTEMPTS_MIN,
 };
 
 use serde_json::{Map, Value};
@@ -707,7 +708,7 @@ impl SettingsTab {
                 "High",
                 "Backend default",
                 "Kick limit",
-                "Retry attempts",
+                "Extra delayed attempts",
                 "Idle",
                 "Continue",
                 "Task list",
@@ -2221,7 +2222,9 @@ fn SupervisorTab() -> impl IntoView {
         move |ev: web_sys::Event| {
             let target = ev.target().unwrap();
             let input: web_sys::HtmlInputElement = target.unchecked_into();
-            if let Ok(count) = input.value().trim().parse::<u8>() {
+            if let Ok(count) = input.value().trim().parse::<u8>()
+                && count <= SUPERVISOR_RETRY_ATTEMPTS_MAX
+            {
                 send_host_setting(&state, HostSettingValue::SupervisorRetryAttempts { count });
             }
         }
@@ -2347,18 +2350,18 @@ fn SupervisorTab() -> impl IntoView {
         </div>
 
         <div class="settings-field">
-            <label class="settings-label">"Retry attempts"</label>
+            <label class="settings-label">"Extra delayed attempts"</label>
             <p class="settings-description">
-                "Extra attempts when a supervision call fails or returns an unparseable verdict. Each retry is a fresh model call."
+                "Extra delayed attempts after a supervisor verdict call fails or returns an invalid verdict. Each attempt is a fresh paid model call with automatic backoff. 0 disables extra attempts; maximum 5. The default 1 means two total calls."
             </p>
             <input
                 class="settings-input settings-supervisor-number-input"
                 type="number"
-                min="0"
-                max="5"
+                min=SUPERVISOR_RETRY_ATTEMPTS_MIN
+                max=SUPERVISOR_RETRY_ATTEMPTS_MAX
                 prop:value=retries_value
                 disabled=retries_disabled
-                aria-label="Supervisor retry attempts"
+                aria-label="Supervisor extra delayed attempts"
                 on:change=retries_on_change
             />
         </div>
@@ -9243,7 +9246,7 @@ mod wasm_tests {
         dispatch_change(&kicks);
 
         let retries: web_sys::HtmlInputElement = container
-            .query_selector("input[aria-label='Supervisor retry attempts']")
+            .query_selector("input[aria-label='Supervisor extra delayed attempts']")
             .unwrap()
             .expect("retry attempts input renders")
             .dyn_into()
@@ -9254,6 +9257,8 @@ mod wasm_tests {
             "retry attempts shows the host default before edits"
         );
         retries.set_value("2");
+        dispatch_change(&retries);
+        retries.set_value("6");
         dispatch_change(&retries);
         for _ in 0..4 {
             next_tick().await;
@@ -9308,6 +9313,13 @@ mod wasm_tests {
                     && s.get("count").and_then(|v| v.as_u64()) == Some(2)
             }),
             "editing retry attempts must emit SupervisorRetryAttempts count=2: {settings:?}"
+        );
+        assert!(
+            settings.iter().all(|s| {
+                s.get("kind").and_then(|k| k.as_str()) != Some("supervisor_retry_attempts")
+                    || s.get("count").and_then(|v| v.as_u64()) != Some(6)
+            }),
+            "out-of-range delayed attempts must emit nothing: {settings:?}"
         );
 
         let tier: web_sys::HtmlSelectElement = container

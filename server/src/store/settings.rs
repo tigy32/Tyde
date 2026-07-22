@@ -7,6 +7,7 @@ use protocol::{
     HostSettingValue, HostSettings, LaunchProfileId,
     SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX,
     SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN,
+    SUPERVISOR_RETRY_ATTEMPTS_MAX, SUPERVISOR_RETRY_ATTEMPTS_MIN,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -390,6 +391,12 @@ fn apply_setting(settings: &mut HostSettings, setting: HostSettingValue) -> Resu
             settings.supervisor.max_kicks_per_task = count;
         }
         HostSettingValue::SupervisorRetryAttempts { count } => {
+            if count > SUPERVISOR_RETRY_ATTEMPTS_MAX {
+                return Err(format!(
+                    "supervisor retry attempts must be between {} and {}",
+                    SUPERVISOR_RETRY_ATTEMPTS_MIN, SUPERVISOR_RETRY_ATTEMPTS_MAX,
+                ));
+            }
             settings.supervisor.retry_attempts = count;
         }
         HostSettingValue::SupervisorCostTier { tier } => {
@@ -538,6 +545,13 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
             "supervisor auto-compact inactivity delay must be between {} and {} seconds",
             SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN,
             SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX,
+        ));
+    }
+
+    if settings.supervisor.retry_attempts > SUPERVISOR_RETRY_ATTEMPTS_MAX {
+        return Err(format!(
+            "supervisor retry attempts must be between {} and {}",
+            SUPERVISOR_RETRY_ATTEMPTS_MIN, SUPERVISOR_RETRY_ATTEMPTS_MAX,
         ));
     }
 

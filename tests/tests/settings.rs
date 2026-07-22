@@ -1219,6 +1219,13 @@ fn supervisor_settings_default_apply_and_validate() {
         .apply(HostSettingValue::SupervisorRetryAttempts { count: 0 })
         .expect("retries can be disabled entirely");
     assert_eq!(settings.supervisor.retry_attempts, 0);
+    let settings = store
+        .apply(HostSettingValue::SupervisorRetryAttempts { count: 5 })
+        .expect("five delayed attempts is the maximum");
+    assert_eq!(settings.supervisor.retry_attempts, 5);
+    store
+        .apply(HostSettingValue::SupervisorRetryAttempts { count: 6 })
+        .expect_err("six delayed attempts must be rejected");
     assert_eq!(
         settings.supervisor.cost_tier,
         protocol::SupervisorCostTier::Low,
@@ -1250,7 +1257,7 @@ fn supervisor_settings_default_apply_and_validate() {
         persisted.max_kicks_per_task, 5,
         "the rejected zero write must not clobber the stored kick limit"
     );
-    assert_eq!(persisted.retry_attempts, 0);
+    assert_eq!(persisted.retry_attempts, 5);
     assert_eq!(
         persisted.cost_tier,
         protocol::SupervisorCostTier::High,
@@ -1285,6 +1292,26 @@ fn invalid_persisted_supervisor_inactivity_delay_is_rejected() {
             "unexpected error for {seconds}: {error}"
         );
     }
+}
+
+#[test]
+fn invalid_persisted_supervisor_retry_attempts_is_rejected() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let path = dir.path().join("settings.json");
+    fs::write(
+        &path,
+        r#"{
+  "settings": {
+    "enabled_backends": [],
+    "default_backend": null,
+    "supervisor": { "retry_attempts": 6 }
+  }
+}"#,
+    )
+    .expect("write invalid supervisor settings store");
+    let error = HostSettingsStore::load(path)
+        .expect_err("invalid persisted retry attempts must fail load");
+    assert!(error.contains("retry attempts must be between 0 and 5"));
 }
 
 #[test]

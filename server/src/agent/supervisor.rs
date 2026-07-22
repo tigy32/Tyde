@@ -35,6 +35,29 @@ pub(crate) enum SupervisionVerdict {
     Continue { message: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SupervisionFailureKind {
+    BackendStart,
+    BackendStream,
+    Timeout,
+    InvalidVerdict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SupervisionFailure {
+    pub kind: SupervisionFailureKind,
+    pub message: String,
+}
+
+impl SupervisionFailure {
+    fn new(kind: SupervisionFailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
 /// Stateless projection of an agent's event log with everything the
 /// supervisor scheduler needs. Computed inside the agent actor so it is
 /// consistent with the live log; carries no scheduler state, so restarts of
@@ -153,7 +176,7 @@ pub(crate) struct GenerateSupervisionVerdictRequest {
 
 pub(crate) async fn generate_supervision_verdict(
     request: GenerateSupervisionVerdictRequest,
-) -> Result<SupervisionVerdict, String> {
+) -> Result<SupervisionVerdict, SupervisionFailure> {
     if request.use_mock_backend {
         return generate_mock_supervision_verdict(&request);
     }
@@ -161,7 +184,10 @@ pub(crate) async fn generate_supervision_verdict(
     let prompt = build_supervision_prompt(&request);
     let spawn_config = supervision_spawn_config(request.cost_hint);
     let isolated_workspace = tempfile::tempdir()
-        .map_err(|err| format!("failed to create isolated supervision workspace: {err}"))?;
+        .map_err(|err| SupervisionFailure::new(
+            SupervisionFailureKind::BackendStart,
+            format!("failed to create isolated supervision workspace: {err}"),
+        ))?;
     let workspace_roots = vec![isolated_workspace.path().to_string_lossy().into_owned()];
     let initial_input = SendMessagePayload {
         message: prompt,
@@ -186,9 +212,12 @@ pub(crate) async fn generate_supervision_verdict(
     {
         Ok(result) => result,
         Err(err) => {
-            return Err(format!(
-                "agent supervisor failed to start for backend {:?}: {}",
-                request.backend_kind, err
+            return Err(SupervisionFailure::new(
+                SupervisionFailureKind::BackendStart,
+                format!(
+                    "agent supervisor failed to start for backend {:?}: {}",
+                    request.backend_kind, err
+                ),
             ));
         }
     };
@@ -197,7 +226,8 @@ pub(crate) async fn generate_supervision_verdict(
     if let Err(err) = &result {
         tracing::warn!(
             backend_kind = ?request.backend_kind,
-            error = %err,
+            failure_kind = ?err.kind,
+            error = %err.message,
             "agent supervision call failed"
         );
     }
@@ -222,12 +252,15 @@ fn supervision_spawn_config(cost_hint: Option<SpawnCostHint>) -> BackendSpawnCon
 
 async fn collect_supervision_events(
     events: &mut EventStream,
-) -> Result<SupervisionVerdict, String> {
+) -> Result<SupervisionVerdict, SupervisionFailure> {
     let mut streamed_text = String::new();
     while let Some(event) = events.recv().await {
         match event {
             ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::Error) => {
-                return Err(message.content);
+                return Err(SupervisionFailure::new(
+                    SupervisionFailureKind::BackendStream,
+                    message.content,
+                ));
             }
             ChatEvent::StreamDelta(delta) => {
                 streamed_text.push_str(&delta.text);
@@ -242,18 +275,24 @@ async fn collect_supervision_events(
                 if candidate.trim().is_empty() {
                     continue;
                 }
-                return parse_supervision_verdict(&candidate);
+                return parse_supervision_verdict(&candidate).map_err(|message| {
+                    SupervisionFailure::new(SupervisionFailureKind::InvalidVerdict, message)
+                });
             }
             ChatEvent::TypingStatusChanged(false) => {
-                return Err(
-                    "agent supervisor turn completed before producing a verdict".to_string()
-                );
+                return Err(SupervisionFailure::new(
+                    SupervisionFailureKind::BackendStream,
+                    "agent supervisor turn completed before producing a verdict",
+                ));
             }
             _ => {}
         }
     }
 
-    Err("agent supervisor ended before producing a verdict".to_string())
+    Err(SupervisionFailure::new(
+        SupervisionFailureKind::BackendStream,
+        "agent supervisor ended before producing a verdict",
+    ))
 }
 
 pub(crate) const MOCK_SUPERVISOR_ERROR: &str = "__mock_supervisor_error__";
@@ -265,18 +304,23 @@ pub(crate) const MOCK_SUPERVISOR_CONTINUE: &str = "__mock_supervisor_continue__"
 
 fn generate_mock_supervision_verdict(
     request: &GenerateSupervisionVerdictRequest,
-) -> Result<SupervisionVerdict, String> {
+) -> Result<SupervisionVerdict, SupervisionFailure> {
     if request
         .last_user_message
         .contains(MOCK_SUPERVISOR_ERROR)
     {
-        return Err("mock supervision failure".to_owned());
+        return Err(SupervisionFailure::new(
+            SupervisionFailureKind::BackendStream,
+            "mock supervision failure",
+        ));
     }
     if request
         .last_user_message
         .contains(MOCK_SUPERVISOR_INVALID)
     {
-        return parse_supervision_verdict("this is not a verdict");
+        return parse_supervision_verdict("this is not a verdict").map_err(|message| {
+            SupervisionFailure::new(SupervisionFailureKind::InvalidVerdict, message)
+        });
     }
     if request
         .last_user_message
@@ -446,36 +490,6 @@ fn strip_verdict_marker(line: &str) -> Option<&str> {
         return None;
     }
     Some(&line[marker + "VERDICT:".len()..])
-}
-
-/// Runs one supervision call up to `1 + retry_attempts` times, retrying when
-/// the call errors or its output does not parse to a verdict. Each attempt is
-/// a fresh ephemeral backend spawn.
-pub(crate) async fn run_supervision_with_retries<F, Fut>(
-    retry_attempts: u32,
-    mut run_attempt: F,
-) -> Result<SupervisionVerdict, String>
-where
-    F: FnMut(u32) -> Fut,
-    Fut: std::future::Future<Output = Result<SupervisionVerdict, String>>,
-{
-    let attempts = retry_attempts.saturating_add(1);
-    let mut last_error = String::new();
-    for attempt in 0..attempts {
-        match run_attempt(attempt).await {
-            Ok(verdict) => return Ok(verdict),
-            Err(err) => {
-                tracing::warn!(
-                    attempt = attempt + 1,
-                    attempts,
-                    error = %err,
-                    "agent supervision attempt failed"
-                );
-                last_error = err;
-            }
-        }
-    }
-    Err(last_error)
 }
 
 #[cfg(test)]
@@ -772,36 +786,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn retries_stop_after_first_success() {
-        let mut calls = 0u32;
-        let result = run_supervision_with_retries(2, |attempt| {
-            calls += 1;
-            async move {
-                if attempt == 0 {
-                    Err("first attempt fails".to_owned())
-                } else {
-                    Ok(SupervisionVerdict::Done)
-                }
-            }
-        })
-        .await;
-        assert_eq!(result, Ok(SupervisionVerdict::Done));
-        assert_eq!(calls, 2);
-    }
-
-    #[tokio::test]
-    async fn retries_exhaust_to_last_error() {
-        let mut calls = 0u32;
-        let result = run_supervision_with_retries(1, |attempt| {
-            calls += 1;
-            async move { Err::<SupervisionVerdict, _>(format!("attempt {attempt} failed")) }
-        })
-        .await;
-        assert_eq!(result, Err("attempt 1 failed".to_owned()));
-        assert_eq!(calls, 2, "retry_attempts=1 means exactly two attempts");
-    }
-
     #[test]
     fn prompt_includes_task_list_and_kick_budget() {
         let request = GenerateSupervisionVerdictRequest {
@@ -866,6 +850,20 @@ mod tests {
         assert!(matches!(
             generate_mock_supervision_verdict(&request(MOCK_SUPERVISOR_CONTINUE)),
             Ok(SupervisionVerdict::Continue { .. })
+        ));
+        assert!(matches!(
+            generate_mock_supervision_verdict(&request(MOCK_SUPERVISOR_ERROR)),
+            Err(SupervisionFailure {
+                kind: SupervisionFailureKind::BackendStream,
+                ..
+            })
+        ));
+        assert!(matches!(
+            generate_mock_supervision_verdict(&request(MOCK_SUPERVISOR_INVALID)),
+            Err(SupervisionFailure {
+                kind: SupervisionFailureKind::InvalidVerdict,
+                ..
+            })
         ));
     }
 }

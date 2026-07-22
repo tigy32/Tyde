@@ -833,6 +833,29 @@ verdict call. A late `MessageMetadataUpdated` patch counts as activity, so one
 arriving after idle begins restarts the interval and can trigger a fresh
 verdict; patches within the debounce coalesce into that generation.
 
+Each verdict task makes one paid call. A failed start, stream, timeout, or
+invalid verdict enters scheduler-owned `RetryPending` rather than retrying
+immediately. `retry_attempts` is the number of additional delayed calls:
+default 1 means at most two total calls, valid values are `0..=5`, and the
+maximum is six total. Delays after successive failures are 30, 60, 120, 240,
+and 480 seconds; exhaustion becomes `Dormant`. Activity starts a new generation
+with a fresh budget. Disabling clears retry state, re-enabling observes idle
+agents with a fresh interval and budget, and restart persists none of it.
+Lowering the limit can exhaust a pending retry immediately; raising it
+preserves attempts and the existing due time. Auto-compaction settings do not
+reset classification retries. Failures are structured server logs and never
+messages in the supervised transcript.
+
+A failed Codex turn that emits a warning, authoritative idle status, and a
+nonfatal error remains eligible for supervision. Startup and disabled-to-
+enabled transitions observe already-idle eligible agents, so no active-to-idle
+edge must be replayed. There is deliberately no backend circuit breaker until
+failure scope can distinguish backend-wide outages from agent-specific parse,
+credential, or configuration errors. During a sustained outage affecting `N`
+unchanged idle agents, paid calls are therefore finite but `O(N)`: at most
+`2N` by default or `6N` at the configured maximum, serialized to one in flight
+per host.
+
 Automatic compaction requires all four live conditions: the supervisor and
 auto-compact setting are enabled; the accepted verdict for the unchanged
 generation is `Done`; the full inactivity delay has elapsed; and the latest
@@ -847,9 +870,11 @@ log reason. Manual compaction is unaffected.
 Delay, threshold, and auto-compact changes apply live to an already accepted
 `Done` classification and preserve the original `idle_since`; accepted
 `Done`/`AwaitingUser` classifications are not re-judged for those edits.
-Changing settings while a verdict is in flight rejects that old-epoch result
-and re-launches classification for the same idle generation. Disabling the
-supervisor clears runtime state; enabling it begins a fresh interval. A host or
+Changing verdict-relevant settings while a verdict is in flight rejects the
+old result but retains that started call in the generation's budget and uses
+the normal delayed retry policy. Auto-compaction-only edits do not invalidate
+classification. Disabling the supervisor clears runtime state; enabling it
+begins a fresh interval. A host or
 scheduler restart likewise observes already-idle agents with a fresh
 `idle_since` and persists none of the generation, phase, verdict, or deadline.
 

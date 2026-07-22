@@ -123,6 +123,7 @@ pub use types::{
     default_supervisor_auto_compact_inactivity_delay_seconds,
     SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX,
     SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN,
+    SUPERVISOR_RETRY_ATTEMPTS_MAX, SUPERVISOR_RETRY_ATTEMPTS_MIN,
     TYDE_VERSION, Task, TaskList, TaskStatus, TaskTokenUsageAggregate, TaskTokenUsageAmount,
     TaskTokenUsageEntry, TaskTokenUsagePayload, TaskTokenUsageScope, TaskTokenUsageStatus,
     TaskTokenUsageUnavailableReason, Team, TeamCompactNotifyPayload, TeamCompactPayload,

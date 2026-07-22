@@ -67,6 +67,8 @@ pub(crate) const MOCK_BUSY_SELF_TURN_SENTINEL: &str = "__mock_busy_self_turn__";
 /// streaming turn (typing stays on and the stream closes properly afterward).
 /// Exercises the agent rule that a mid-turn error must not end the turn.
 pub(crate) const MOCK_MID_TURN_ERROR_SENTINEL: &str = "__mock_mid_turn_error__";
+pub(crate) const MOCK_CODEX_INTERNAL_ERROR_TAIL_SENTINEL: &str =
+    "__mock_codex_internal_error_tail__";
 pub(crate) const MOCK_TOOL_FAILURE_WITHOUT_IDLE_SENTINEL: &str =
     "__mock_tool_failure_without_idle__";
 const MOCK_EXIT_PLAN_MODE_SENTINEL: &str = "__mock_exit_plan_mode__";
@@ -594,6 +596,8 @@ fn start_mock_command_loop(
                 });
             } else if initial_message.contains(MOCK_ERROR_WITHOUT_IDLE_SENTINEL) {
                 emit_mock_error(&events_tx, "mock backend emitted error without idle");
+            } else if initial_message.contains(MOCK_CODEX_INTERNAL_ERROR_TAIL_SENTINEL) {
+                emit_mock_codex_internal_error_tail(&events_tx);
             } else if initial_message.contains(MOCK_TOOL_FAILURE_WITHOUT_IDLE_SENTINEL) {
                 emit_mock_tool_failure_without_idle(&events_tx);
             } else if initial_message.contains(MOCK_ORCHESTRATION_SENTINEL) {
@@ -702,6 +706,8 @@ fn start_mock_command_loop(
                         return;
                     } else if payload.message.contains(MOCK_ERROR_WITHOUT_IDLE_SENTINEL) {
                         emit_mock_error(&events_tx, "mock backend emitted error without idle");
+                    } else if payload.message.contains(MOCK_CODEX_INTERNAL_ERROR_TAIL_SENTINEL) {
+                        emit_mock_codex_internal_error_tail(&events_tx);
                     } else if payload
                         .message
                         .contains(MOCK_TOOL_FAILURE_WITHOUT_IDLE_SENTINEL)
@@ -1762,6 +1768,47 @@ fn emit_mock_error(events_tx: &mpsc::UnboundedSender<ChatEvent>, message: &str) 
         context_breakdown: None,
         images: None,
     }));
+}
+
+fn emit_mock_codex_internal_error_tail(events_tx: &mpsc::UnboundedSender<ChatEvent>) {
+    const TOOL_CALL_ID: &str = "mock-codex-successful-tool";
+    let _ = events_tx.send(ChatEvent::TypingStatusChanged(true));
+    let _ = events_tx.send(ChatEvent::ToolRequest(ToolRequest {
+        tool_call_id: TOOL_CALL_ID.to_owned(),
+        tool_name: "Bash".to_owned(),
+        tool_type: ToolRequestType::RunCommand {
+            command: "printf done".to_owned(),
+            working_directory: "/tmp/test".to_owned(),
+        },
+    }));
+    let _ = events_tx.send(ChatEvent::ToolExecutionCompleted(
+        ToolExecutionCompletedData {
+            tool_call_id: TOOL_CALL_ID.to_owned(),
+            tool_name: "Bash".to_owned(),
+            tool_result: ToolExecutionResult::RunCommand {
+                exit_code: 0,
+                stdout: "done".to_owned(),
+                stderr: String::new(),
+            },
+            success: true,
+            error: None,
+            normalization_failure: None,
+        },
+    ));
+    let _ = events_tx.send(ChatEvent::MessageAdded(ChatMessage {
+        message_id: None,
+        timestamp: now_ms(),
+        sender: MessageSender::Warning,
+        content: "Codex warning: Internal server error".to_owned(),
+        reasoning: None,
+        tool_calls: Vec::new(),
+        model_info: None,
+        token_usage: None,
+        context_breakdown: None,
+        images: None,
+    }));
+    let _ = events_tx.send(ChatEvent::TypingStatusChanged(false));
+    emit_mock_error(events_tx, "Internal server error");
 }
 
 fn emit_mock_tool_failure_without_idle(events_tx: &mpsc::UnboundedSender<ChatEvent>) {

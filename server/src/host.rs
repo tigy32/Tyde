@@ -343,6 +343,13 @@ const SUPERVISION_GENERATION_TIMEOUT: Duration = Duration::from_secs(60);
 /// supervision context, so queued-message drains and immediate user
 /// follow-ups win the race instead of being second-guessed.
 const SUPERVISION_DEBOUNCE: Duration = Duration::from_secs(3);
+const SUPERVISION_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(120),
+    Duration::from_secs(240),
+    Duration::from_secs(480),
+];
 /// How long the supervisor waits for an auto-compaction it requested to
 /// reach a terminal notify before giving up on observing it (the compaction
 /// itself keeps running server-side either way).
@@ -372,6 +379,29 @@ struct SupervisionBaseline {
     session_id: Option<SessionId>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VerdictSettingsFingerprint {
+    max_kicks_per_task: u8,
+    retry_attempts: u8,
+    cost_tier: protocol::SupervisorCostTier,
+}
+
+impl From<protocol::SupervisorSettings> for VerdictSettingsFingerprint {
+    fn from(settings: protocol::SupervisorSettings) -> Self {
+        Self {
+            max_kicks_per_task: settings.max_kicks_per_task,
+            retry_attempts: settings.retry_attempts,
+            cost_tier: settings.cost_tier,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SupervisionRetryReason {
+    Failure(crate::agent::supervisor::SupervisionFailureKind),
+    SettingsChanged,
+}
+
 enum SupervisorPhase {
     Active,
     Debouncing {
@@ -379,8 +409,17 @@ enum SupervisorPhase {
     },
     VerdictInFlight {
         idle_since: Instant,
-        settings_epoch: u64,
         baseline: SupervisionBaseline,
+        attempts_started: u8,
+        verdict_settings: VerdictSettingsFingerprint,
+    },
+    RetryPending {
+        idle_since: Instant,
+        baseline: SupervisionBaseline,
+        attempts_started: u8,
+        due_at: Instant,
+        last_failure_kind: SupervisionRetryReason,
+        verdict_settings: VerdictSettingsFingerprint,
     },
     DoneAuthorized {
         idle_since: Instant,
@@ -402,9 +441,13 @@ enum SupervisorPhase {
 struct SupervisorVerdictTaskResult {
     agent_id: AgentId,
     activity_counter: u64,
-    settings_epoch: u64,
     baseline: SupervisionBaseline,
-    result: Result<crate::agent::supervisor::SupervisionVerdict, String>,
+    attempts_started: u8,
+    verdict_settings: VerdictSettingsFingerprint,
+    result: Result<
+        crate::agent::supervisor::SupervisionVerdict,
+        crate::agent::supervisor::SupervisionFailure,
+    >,
 }
 
 enum SupervisorCompactionTaskEvent {
@@ -13215,6 +13258,7 @@ fn supervisor_phase_idle_since(phase: &SupervisorPhase) -> Option<Instant> {
     match phase {
         SupervisorPhase::Debouncing { idle_since }
         | SupervisorPhase::VerdictInFlight { idle_since, .. }
+        | SupervisorPhase::RetryPending { idle_since, .. }
         | SupervisorPhase::DoneAuthorized { idle_since, .. }
         | SupervisorPhase::AwaitingUser { idle_since, .. }
         | SupervisorPhase::Dormant { idle_since }
@@ -13248,20 +13292,32 @@ fn mark_supervisor_kick_pending(status: &mut crate::agent::registry::AgentStatus
     status.turn_completed = false;
 }
 
-fn requeue_inflight_supervision_for_settings_change(
+fn apply_live_retry_settings(
+    agent_id: &AgentId,
     entry: &mut SupervisorSchedulerEntry,
-    current_settings_epoch: u64,
+    settings: protocol::SupervisorSettings,
 ) {
-    if let SupervisorPhase::VerdictInFlight {
-        idle_since,
-        settings_epoch,
-        ..
-    } = &entry.phase
-        && *settings_epoch != current_settings_epoch
+    let (idle_since, attempts_started) = match &entry.phase {
+        SupervisorPhase::RetryPending {
+            idle_since,
+            attempts_started,
+            ..
+        } => (*idle_since, *attempts_started),
+        _ => return,
+    };
+    if attempts_started >= settings.retry_attempts.saturating_add(1) {
+        entry.phase = SupervisorPhase::Dormant { idle_since };
+        tracing::info!(
+            agent_id = %agent_id,
+            attempts_started,
+            maximum_attempts = settings.retry_attempts.saturating_add(1),
+            "live retry limit exhausted pending supervision attempts"
+        );
+    } else if let SupervisorPhase::RetryPending {
+        verdict_settings, ..
+    } = &mut entry.phase
     {
-        entry.phase = SupervisorPhase::Debouncing {
-            idle_since: *idle_since,
-        };
+        *verdict_settings = VerdictSettingsFingerprint::from(settings);
     }
 }
 
@@ -13282,8 +13338,8 @@ async fn apply_supervisor_settings_change(
         observe_supervised_agents(host, entries).await;
     } else {
         observe_supervised_agents(host, entries).await;
-        for entry in entries.values_mut() {
-            requeue_inflight_supervision_for_settings_change(entry, current.epoch);
+        for (agent_id, entry) in entries.iter_mut() {
+            apply_live_retry_settings(agent_id, entry, current.settings);
         }
     }
 }
@@ -13326,6 +13382,21 @@ async fn observe_supervised_agents(
             ) {
                 continue;
             }
+            if let SupervisorPhase::RetryPending {
+                attempts_started, ..
+            }
+            | SupervisorPhase::VerdictInFlight {
+                attempts_started, ..
+            } = &entry.phase
+            {
+                tracing::info!(
+                    agent_id = %observation.agent_id,
+                    attempts_started,
+                    old_activity_counter = entry.last_activity_counter,
+                    new_activity_counter = status.activity_counter,
+                    "agent activity cancelled the pending supervision generation"
+                );
+            }
             entry.last_activity_counter = status.activity_counter;
             entry.phase = supervisor_phase_for_fresh_observation(status, now);
             continue;
@@ -13350,12 +13421,16 @@ fn supervisor_next_deadline(
     entries: &HashMap<AgentId, SupervisorSchedulerEntry>,
     settings: SupervisorSettingsSignal,
 ) -> Option<Instant> {
+    let verdict_in_flight = entries
+        .values()
+        .any(|entry| matches!(entry.phase, SupervisorPhase::VerdictInFlight { .. }));
     entries
         .values()
         .filter_map(|entry| match &entry.phase {
-            SupervisorPhase::Debouncing { idle_since } => {
+            SupervisorPhase::Debouncing { idle_since } if !verdict_in_flight => {
                 idle_since.checked_add(SUPERVISION_DEBOUNCE)
             }
+            SupervisorPhase::RetryPending { due_at, .. } if !verdict_in_flight => Some(*due_at),
             SupervisorPhase::DoneAuthorized {
                 idle_since,
                 last_gate_evaluation_epoch,
@@ -13391,6 +13466,9 @@ async fn process_supervisor_deadlines(
                     .checked_add(SUPERVISION_DEBOUNCE)
                     .is_some_and(|due| due <= now) =>
             {
+                Some(agent_id.clone())
+            }
+            SupervisorPhase::RetryPending { due_at, .. } if *due_at <= now => {
                 Some(agent_id.clone())
             }
             _ => None,
@@ -13454,10 +13532,30 @@ async fn launch_supervision_verdict(
     let Some(entry) = entries.get(&agent_id) else {
         return;
     };
-    let SupervisorPhase::Debouncing { idle_since } = &entry.phase else {
-        return;
+    let (
+        idle_since,
+        attempts_started,
+        pending_baseline,
+        retry_reason,
+        previous_verdict_settings,
+    ) = match &entry.phase {
+        SupervisorPhase::Debouncing { idle_since } => (*idle_since, 0, None, None, None),
+        SupervisorPhase::RetryPending {
+            idle_since,
+            baseline,
+            attempts_started,
+            last_failure_kind,
+            verdict_settings,
+            ..
+        } => (
+            *idle_since,
+            *attempts_started,
+            Some(baseline.clone()),
+            Some(last_failure_kind.clone()),
+            Some(*verdict_settings),
+        ),
+        _ => return,
     };
-    let idle_since = *idle_since;
     let activity_counter = entry.last_activity_counter;
     let Some(observation) = host.activity_summary_observation(&agent_id).await else {
         entries.remove(&agent_id);
@@ -13543,92 +13641,172 @@ async fn launch_supervision_verdict(
         kicks_since_user_message: context.kicks_since_user_message,
         session_id,
     };
-    entries.get_mut(&agent_id).expect("entry exists").phase =
-        SupervisorPhase::VerdictInFlight {
-            idle_since,
-            settings_epoch: settings.epoch,
-            baseline: baseline.clone(),
-        };
+    if pending_baseline
+        .as_ref()
+        .is_some_and(|pending| pending != &baseline)
+    {
+        entries.get_mut(&agent_id).expect("entry exists").phase =
+            SupervisorPhase::Dormant { idle_since };
+        return;
+    }
 
     let use_mock_backend = host.use_mock_backend().await;
     let capacity_tx = { host.state.lock().await.capacity_tx.clone() };
     let backend_kind = observation.start.backend_kind;
-    let retry_attempts = u32::from(settings.settings.retry_attempts);
     let cost_hint = settings.settings.cost_tier.as_cost_hint();
     let last_assistant_message = context.last_assistant_message;
     let last_error = context.last_error_since_user_message;
     let tx = verdict_tx.clone();
-    let semaphore = Arc::clone(semaphore);
-    let host = host.clone();
-    tokio::spawn(async move {
-        let result = match semaphore.acquire_owned().await {
-            Ok(permit) => {
-                let live_settings = host.supervisor_settings_signal().await;
-                if !live_settings.settings.enabled || live_settings.epoch != settings.epoch {
-                    drop(permit);
-                    let _ = tx.send(SupervisorVerdictTaskResult {
-                        agent_id,
-                        activity_counter,
-                        settings_epoch: settings.epoch,
-                        baseline,
-                        result: Err(
-                            "supervision settings changed before the verdict call started"
-                                .to_owned(),
-                        ),
-                    });
-                    return;
-                }
-                let result = crate::agent::supervisor::run_supervision_with_retries(
-                    retry_attempts,
-                    |attempt| {
-                        tracing::debug!(
-                            agent_id = %agent_id,
-                            attempt = attempt + 1,
-                            "starting agent supervision verdict attempt"
-                        );
-                        let request = crate::agent::supervisor::GenerateSupervisionVerdictRequest {
-                            verdict_agent_id: AgentId(Uuid::new_v4().to_string()),
-                            backend_kind,
-                            last_user_message: last_user_message.clone(),
-                            task_list: task_list.clone(),
-                            last_assistant_message: last_assistant_message.clone(),
-                            last_error: last_error.clone(),
-                            kicks_so_far: baseline.kicks_since_user_message,
-                            max_kicks,
-                            cost_hint,
-                            use_mock_backend,
-                            capacity_tx: capacity_tx.clone(),
-                        };
-                        async move {
-                            match tokio::time::timeout(
-                                SUPERVISION_GENERATION_TIMEOUT,
-                                crate::agent::supervisor::generate_supervision_verdict(request),
-                            )
-                            .await
-                            {
-                                Ok(result) => result,
-                                Err(_) => Err(format!(
-                                    "supervision verdict timed out after {}",
-                                    generation_timeout_label(SUPERVISION_GENERATION_TIMEOUT)
-                                )),
-                            }
-                        }
-                    },
-                )
-                .await;
-                drop(permit);
-                result
-            }
-            Err(_) => Err("agent supervision scheduler stopped".to_owned()),
+    let Ok(permit) = Arc::clone(semaphore).try_acquire_owned() else {
+        return;
+    };
+    let live_settings = host.supervisor_settings_signal().await;
+    let verdict_settings = VerdictSettingsFingerprint::from(settings.settings);
+    if !live_settings.settings.enabled
+        || VerdictSettingsFingerprint::from(live_settings.settings) != verdict_settings
+    {
+        drop(permit);
+        return;
+    }
+    let Some(live_observation) = host.activity_summary_observation(&agent_id).await else {
+        drop(permit);
+        entries.remove(&agent_id);
+        return;
+    };
+    if live_observation.status.activity_counter != activity_counter
+        || live_observation.status.terminated
+        || live_observation.status.is_active()
+        || live_observation.status.is_plan_approval_pending()
+    {
+        drop(permit);
+        observe_supervised_agents(host, entries).await;
+        return;
+    }
+    let attempts_started = attempts_started.saturating_add(1);
+    entries.get_mut(&agent_id).expect("entry exists").phase =
+        SupervisorPhase::VerdictInFlight {
+            idle_since,
+            baseline: baseline.clone(),
+            attempts_started,
+            verdict_settings,
         };
+    tracing::info!(
+        agent_id = %agent_id,
+        attempt = attempts_started,
+        maximum_attempts = settings.settings.retry_attempts.saturating_add(1),
+        retry_reason = ?retry_reason,
+        previous_verdict_settings = ?previous_verdict_settings,
+        "starting agent supervision verdict attempt"
+    );
+    tokio::spawn(async move {
+        let request = crate::agent::supervisor::GenerateSupervisionVerdictRequest {
+            verdict_agent_id: AgentId(Uuid::new_v4().to_string()),
+            backend_kind,
+            last_user_message,
+            task_list,
+            last_assistant_message,
+            last_error,
+            kicks_so_far: baseline.kicks_since_user_message,
+            max_kicks,
+            cost_hint,
+            use_mock_backend,
+            capacity_tx,
+        };
+        let result = match tokio::time::timeout(
+            SUPERVISION_GENERATION_TIMEOUT,
+            crate::agent::supervisor::generate_supervision_verdict(request),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(crate::agent::supervisor::SupervisionFailure {
+                kind: crate::agent::supervisor::SupervisionFailureKind::Timeout,
+                message: format!(
+                    "supervision verdict timed out after {}",
+                    generation_timeout_label(SUPERVISION_GENERATION_TIMEOUT)
+                ),
+            }),
+        };
+        drop(permit);
         let _ = tx.send(SupervisorVerdictTaskResult {
             agent_id,
             activity_counter,
-            settings_epoch: settings.epoch,
             baseline,
+            attempts_started,
+            verdict_settings,
             result,
         });
     });
+}
+
+fn schedule_supervision_retry(
+    entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
+    agent_id: &AgentId,
+    idle_since: Instant,
+    baseline: SupervisionBaseline,
+    attempts_started: u8,
+    settings: protocol::SupervisorSettings,
+    reason: SupervisionRetryReason,
+    message: Option<String>,
+) {
+    schedule_supervision_retry_at(
+        entries,
+        agent_id,
+        idle_since,
+        baseline,
+        attempts_started,
+        settings,
+        reason,
+        message,
+        Instant::now(),
+    );
+}
+
+fn schedule_supervision_retry_at(
+    entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
+    agent_id: &AgentId,
+    idle_since: Instant,
+    baseline: SupervisionBaseline,
+    attempts_started: u8,
+    settings: protocol::SupervisorSettings,
+    reason: SupervisionRetryReason,
+    message: Option<String>,
+    scheduled_at: Instant,
+) {
+    let maximum_attempts = settings.retry_attempts.saturating_add(1);
+    if attempts_started >= maximum_attempts {
+        entries.get_mut(agent_id).expect("entry exists").phase =
+            SupervisorPhase::Dormant { idle_since };
+        tracing::warn!(
+            agent_id = %agent_id,
+            attempts_started,
+            maximum_attempts,
+            failure_kind = ?reason,
+            error = ?message,
+            "agent supervision verdict attempts exhausted; leaving the agent idle"
+        );
+        return;
+    }
+    let delay = SUPERVISION_RETRY_DELAYS[usize::from(attempts_started.saturating_sub(1))];
+    let due_at = scheduled_at.checked_add(delay).unwrap_or(scheduled_at);
+    entries.get_mut(agent_id).expect("entry exists").phase = SupervisorPhase::RetryPending {
+        idle_since,
+        baseline,
+        attempts_started,
+        due_at,
+        last_failure_kind: reason.clone(),
+        verdict_settings: VerdictSettingsFingerprint::from(settings),
+    };
+    tracing::info!(
+        agent_id = %agent_id,
+        attempts_started,
+        maximum_attempts,
+        failure_kind = ?reason,
+        error = ?message,
+        backoff_seconds = delay.as_secs(),
+        next_due = ?due_at,
+        "agent supervision verdict failed; scheduling delayed attempt"
+    );
 }
 
 async fn accept_supervision_verdict_result(
@@ -13644,15 +13822,17 @@ async fn accept_supervision_verdict_result(
     };
     let SupervisorPhase::VerdictInFlight {
         idle_since,
-        settings_epoch,
         baseline,
+        attempts_started,
+        verdict_settings,
     } = &entry.phase
     else {
         return;
     };
     if entry.last_activity_counter != result.activity_counter
-        || *settings_epoch != result.settings_epoch
         || baseline != &result.baseline
+        || *attempts_started != result.attempts_started
+        || *verdict_settings != result.verdict_settings
     {
         tracing::debug!(
             agent_id = %result.agent_id,
@@ -13669,14 +13849,18 @@ async fn accept_supervision_verdict_result(
         );
         return;
     }
-    if settings.epoch != result.settings_epoch || live_settings.epoch != result.settings_epoch {
-        entries.get_mut(&result.agent_id).expect("entry exists").phase =
-            SupervisorPhase::Debouncing { idle_since };
-        tracing::debug!(
-            agent_id = %result.agent_id,
-            result_settings_epoch = result.settings_epoch,
-            live_settings_epoch = live_settings.epoch,
-            "dropping stale supervision verdict and rearming the idle generation"
+    if VerdictSettingsFingerprint::from(settings.settings) != result.verdict_settings
+        || VerdictSettingsFingerprint::from(live_settings.settings) != result.verdict_settings
+    {
+        schedule_supervision_retry(
+            entries,
+            &result.agent_id,
+            idle_since,
+            result.baseline.clone(),
+            result.attempts_started,
+            live_settings.settings,
+            SupervisionRetryReason::SettingsChanged,
+            None,
         );
         return;
     }
@@ -13730,14 +13914,16 @@ async fn accept_supervision_verdict_result(
         );
         return;
     }
-    if final_settings.epoch != result.settings_epoch {
-        entries.get_mut(&result.agent_id).expect("entry exists").phase =
-            SupervisorPhase::Debouncing { idle_since };
-        tracing::debug!(
-            agent_id = %result.agent_id,
-            result_settings_epoch = result.settings_epoch,
-            live_settings_epoch = final_settings.epoch,
-            "dropping supervision verdict superseded during final live checks"
+    if VerdictSettingsFingerprint::from(final_settings.settings) != result.verdict_settings {
+        schedule_supervision_retry(
+            entries,
+            &result.agent_id,
+            idle_since,
+            result.baseline.clone(),
+            result.attempts_started,
+            final_settings.settings,
+            SupervisionRetryReason::SettingsChanged,
+            None,
         );
         return;
     }
@@ -13745,16 +13931,25 @@ async fn accept_supervision_verdict_result(
     let verdict = match result.result {
         Ok(verdict) => verdict,
         Err(error) => {
-            tracing::warn!(
-                agent_id = %result.agent_id,
-                error = %error,
-                "agent supervision produced no verdict; leaving the agent alone"
+            schedule_supervision_retry(
+                entries,
+                &result.agent_id,
+                idle_since,
+                result.baseline,
+                result.attempts_started,
+                final_settings.settings,
+                SupervisionRetryReason::Failure(error.kind),
+                Some(error.message),
             );
-            entries.get_mut(&result.agent_id).expect("entry exists").phase =
-                SupervisorPhase::Dormant { idle_since };
             return;
         }
     };
+    tracing::info!(
+        agent_id = %result.agent_id,
+        attempts_started = result.attempts_started,
+        verdict = ?verdict,
+        "agent supervision verdict attempt succeeded"
+    );
     match verdict {
         crate::agent::supervisor::SupervisionVerdict::Continue { message } => {
             tracing::info!(
@@ -23152,8 +23347,9 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 last_activity_counter: activity_counter,
                 phase: SupervisorPhase::VerdictInFlight {
                     idle_since,
-                    settings_epoch: cached_settings.epoch,
                     baseline: baseline.clone(),
+                    attempts_started: 1,
+                    verdict_settings: VerdictSettingsFingerprint::from(cached_settings.settings),
                 },
             },
         )]);
@@ -23171,8 +23367,9 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 SupervisorVerdictTaskResult {
                     agent_id: result_agent_id,
                     activity_counter,
-                    settings_epoch: cached_settings.epoch,
                     baseline: result_baseline,
+                    attempts_started: 1,
+                    verdict_settings: VerdictSettingsFingerprint::from(cached_settings.settings),
                     result: Ok(crate::agent::supervisor::SupervisionVerdict::Continue {
                         message: "stale kick must not be sent".to_owned(),
                     }),
@@ -23200,8 +23397,12 @@ Rules: Record only what remains true and useful for future work; drop transient 
 
         assert!(matches!(
             entries.get(&agent_id).map(|entry| &entry.phase),
-            Some(SupervisorPhase::Debouncing { idle_since: preserved })
-                if *preserved == idle_since
+            Some(SupervisorPhase::RetryPending {
+                idle_since: preserved,
+                attempts_started: 1,
+                last_failure_kind: SupervisionRetryReason::SettingsChanged,
+                ..
+            }) if *preserved == idle_since
         ));
         let live_settings = fixture.host.supervisor_settings_signal().await;
         let context_after_stale_result = observation
@@ -23213,19 +23414,21 @@ Rules: Record only what remains true and useful for future work; drop transient 
             context_after_stale_result.kicks_since_user_message,
             baseline.kicks_since_user_message
         );
-        requeue_inflight_supervision_for_settings_change(
+        apply_live_retry_settings(
+            &agent_id,
             entries.get_mut(&agent_id).expect("scheduler entry"),
-            live_settings.epoch,
+            live_settings.settings,
         );
         assert!(matches!(
             entries.get(&agent_id).map(|entry| &entry.phase),
-            Some(SupervisorPhase::Debouncing { .. })
+            Some(SupervisorPhase::RetryPending { .. })
         ));
         entries.get_mut(&agent_id).expect("scheduler entry").phase =
             SupervisorPhase::VerdictInFlight {
                 idle_since,
-                settings_epoch: live_settings.epoch,
                 baseline: baseline.clone(),
+                attempts_started: 2,
+                verdict_settings: VerdictSettingsFingerprint::from(live_settings.settings),
             };
         accept_supervision_verdict_result(
             &fixture.host,
@@ -23234,8 +23437,9 @@ Rules: Record only what remains true and useful for future work; drop transient 
             SupervisorVerdictTaskResult {
                 agent_id: agent_id.clone(),
                 activity_counter,
-                settings_epoch: live_settings.epoch,
                 baseline: baseline.clone(),
+                attempts_started: 2,
+                verdict_settings: VerdictSettingsFingerprint::from(live_settings.settings),
                 result: Ok(crate::agent::supervisor::SupervisionVerdict::Done),
             },
         )
@@ -23255,8 +23459,9 @@ Rules: Record only what remains true and useful for future work; drop transient 
             SupervisorVerdictTaskResult {
                 agent_id: agent_id.clone(),
                 activity_counter,
-                settings_epoch: live_settings.epoch,
                 baseline,
+                attempts_started: 2,
+                verdict_settings: VerdictSettingsFingerprint::from(live_settings.settings),
                 result: Ok(crate::agent::supervisor::SupervisionVerdict::AwaitingUser),
             },
         )
@@ -23307,8 +23512,22 @@ Rules: Record only what remains true and useful for future work; drop transient 
         )]);
         let (verdict_tx, _verdict_rx) = mpsc::unbounded_channel();
         let (compaction_tx, _compaction_rx) = mpsc::unbounded_channel();
-        let semaphore = Arc::new(Semaphore::new(0));
-        semaphore.close();
+        let semaphore = Arc::new(Semaphore::new(1));
+
+        launch_supervision_verdict(
+            &fixture.host,
+            &mut entries,
+            agent_id.clone(),
+            stale_settings,
+            &verdict_tx,
+            &semaphore,
+        )
+        .await;
+        assert!(matches!(
+            entries.get(&agent_id).map(|entry| &entry.phase),
+            Some(SupervisorPhase::Debouncing { idle_since: preserved })
+                if *preserved == idle_since
+        ));
 
         process_supervisor_deadlines_from_signal(
             &fixture.host,
@@ -23323,10 +23542,11 @@ Rules: Record only what remains true and useful for future work; drop transient 
         assert!(matches!(
             entries.get(&agent_id).map(|entry| &entry.phase),
             Some(SupervisorPhase::VerdictInFlight {
-                settings_epoch,
+                verdict_settings,
                 idle_since: preserved,
                 ..
-            }) if *settings_epoch == live_settings.epoch && *preserved == idle_since
+            }) if *verdict_settings == VerdictSettingsFingerprint::from(live_settings.settings)
+                && *preserved == idle_since
         ));
 
         apply_supervisor_settings_change(
@@ -23339,9 +23559,9 @@ Rules: Record only what remains true and useful for future work; drop transient 
         assert!(matches!(
             entries.get(&agent_id).map(|entry| &entry.phase),
             Some(SupervisorPhase::VerdictInFlight {
-                settings_epoch,
+                verdict_settings,
                 ..
-            }) if *settings_epoch == live_settings.epoch
+            }) if *verdict_settings == VerdictSettingsFingerprint::from(live_settings.settings)
         ));
     }
 
@@ -23361,10 +23581,17 @@ Rules: Record only what remains true and useful for future work; drop transient 
             agent_id.clone(),
             SupervisorSchedulerEntry {
                 last_activity_counter: 1,
-                phase: SupervisorPhase::DoneAuthorized {
+                phase: SupervisorPhase::RetryPending {
                     idle_since: old_idle_since,
                     baseline,
-                    last_gate_evaluation_epoch: None,
+                    attempts_started: 1,
+                    due_at: Instant::now().checked_add(Duration::from_secs(30)).unwrap(),
+                    last_failure_kind: SupervisionRetryReason::Failure(
+                        crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+                    ),
+                    verdict_settings: VerdictSettingsFingerprint::from(
+                        protocol::SupervisorSettings::default(),
+                    ),
                 },
             },
         )]);
@@ -23407,6 +23634,172 @@ Rules: Record only what remains true and useful for future work; drop transient 
             Some(SupervisorPhase::Debouncing { idle_since })
                 if *idle_since >= reenabled_at && *idle_since != old_idle_since
         ));
+    }
+
+    #[tokio::test]
+    async fn activity_cancels_pending_retry_and_resets_generation() {
+        let fixture = compact_fixture().await;
+        let (agent_id, _) = spawn_idle_user_agent(&fixture.host, "retry activity reset").await;
+        let status = fixture
+            .host
+            .agent_status_snapshot(&agent_id)
+            .await
+            .expect("agent status");
+        let idle_since = Instant::now();
+        let mut entries = HashMap::from([(
+            agent_id.clone(),
+            SupervisorSchedulerEntry {
+                last_activity_counter: status.activity_counter,
+                phase: SupervisorPhase::RetryPending {
+                    idle_since,
+                    baseline: SupervisionBaseline {
+                        last_user_message: "retry activity reset".to_owned(),
+                        kicks_since_user_message: 0,
+                        session_id: None,
+                    },
+                    attempts_started: 1,
+                    due_at: idle_since.checked_add(Duration::from_secs(30)).unwrap(),
+                    last_failure_kind: SupervisionRetryReason::Failure(
+                        crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+                    ),
+                    verdict_settings: VerdictSettingsFingerprint::from(
+                        protocol::SupervisorSettings::default(),
+                    ),
+                },
+            },
+        )]);
+        let observation = fixture
+            .host
+            .activity_summary_observation(&agent_id)
+            .await
+            .expect("agent observation");
+        assert!(observation
+            .handle
+            .send_input(AgentInput::SendMessage(SendMessagePayload {
+                message: crate::backend::mock::MOCK_SLOW_TURN_SENTINEL.to_owned(),
+                images: None,
+                origin: Some(MessageOrigin::User),
+                tool_response: None,
+            }))
+            .await);
+        wait_for_agent_active(&fixture.host, &agent_id).await;
+        observe_supervised_agents(&fixture.host, &mut entries).await;
+
+        let entry = entries.get(&agent_id).expect("scheduler entry");
+        assert_ne!(entry.last_activity_counter, status.activity_counter);
+        assert!(matches!(entry.phase, SupervisorPhase::Active));
+    }
+
+    #[tokio::test]
+    async fn failed_verdict_retries_then_continue_delivers_one_kick() {
+        let fixture = compact_fixture().await;
+        let (agent_id, session_id) =
+            spawn_idle_user_agent(&fixture.host, "retry then recover").await;
+        fixture
+            .host
+            .set_setting(SetSettingPayload {
+                setting: HostSettingValue::SupervisorEnabled { enabled: true },
+            })
+            .await
+            .expect("enable supervisor");
+        let settings = fixture.host.supervisor_settings_signal().await;
+        let observation = fixture
+            .host
+            .activity_summary_observation(&agent_id)
+            .await
+            .expect("agent observation");
+        let context = observation
+            .handle
+            .read_supervision_context()
+            .await
+            .expect("supervision context");
+        let idle_since = Instant::now();
+        let baseline = SupervisionBaseline {
+            last_user_message: context.last_user_message.expect("last user message"),
+            kicks_since_user_message: context.kicks_since_user_message,
+            session_id: Some(session_id),
+        };
+        let activity_counter = observation.status.activity_counter;
+        let fingerprint = VerdictSettingsFingerprint::from(settings.settings);
+        let mut entries = HashMap::from([(
+            agent_id.clone(),
+            SupervisorSchedulerEntry {
+                last_activity_counter: activity_counter,
+                phase: SupervisorPhase::VerdictInFlight {
+                    idle_since,
+                    baseline: baseline.clone(),
+                    attempts_started: 1,
+                    verdict_settings: fingerprint,
+                },
+            },
+        )]);
+
+        accept_supervision_verdict_result(
+            &fixture.host,
+            &mut entries,
+            settings,
+            SupervisorVerdictTaskResult {
+                agent_id: agent_id.clone(),
+                activity_counter,
+                baseline: baseline.clone(),
+                attempts_started: 1,
+                verdict_settings: fingerprint,
+                result: Err(crate::agent::supervisor::SupervisionFailure {
+                    kind: crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+                    message: "temporary outage".to_owned(),
+                }),
+            },
+        )
+        .await;
+        assert!(matches!(
+            entries.get(&agent_id).map(|entry| &entry.phase),
+            Some(SupervisorPhase::RetryPending {
+                attempts_started: 1,
+                ..
+            })
+        ));
+
+        entries.get_mut(&agent_id).expect("scheduler entry").phase =
+            SupervisorPhase::VerdictInFlight {
+                idle_since,
+                baseline: baseline.clone(),
+                attempts_started: 2,
+                verdict_settings: fingerprint,
+            };
+        accept_supervision_verdict_result(
+            &fixture.host,
+            &mut entries,
+            settings,
+            SupervisorVerdictTaskResult {
+                agent_id: agent_id.clone(),
+                activity_counter,
+                baseline,
+                attempts_started: 2,
+                verdict_settings: fingerprint,
+                result: Ok(crate::agent::supervisor::SupervisionVerdict::Continue {
+                    message: "continue after recovery".to_owned(),
+                }),
+            },
+        )
+        .await;
+        assert!(matches!(
+            entries.get(&agent_id).map(|entry| &entry.phase),
+            Some(SupervisorPhase::Active)
+        ));
+        let mut kicks = 0;
+        for _ in 0..100 {
+            kicks = observation
+                .handle
+                .read_supervision_context()
+                .await
+                .expect("supervision context after recovery")
+                .kicks_since_user_message;
+            if kicks == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(kicks, 1);
     }
 
     async fn assert_settings_edit_rejects_actor_pending_compaction(
@@ -23593,61 +23986,283 @@ Rules: Record only what remains true and useful for future work; drop transient 
     }
 
     #[test]
-    fn supervisor_settings_change_requeues_only_inflight_verdicts() {
+    fn supervisor_retry_limit_changes_preserve_or_exhaust_pending_retry() {
         let idle_since = Instant::now();
+        let due_at = idle_since.checked_add(Duration::from_secs(30)).unwrap();
         let baseline = SupervisionBaseline {
             last_user_message: "request".to_owned(),
             kicks_since_user_message: 0,
             session_id: None,
         };
-        let mut inflight = SupervisorSchedulerEntry {
+        let mut pending = SupervisorSchedulerEntry {
             last_activity_counter: 4,
-            phase: SupervisorPhase::VerdictInFlight {
+            phase: SupervisorPhase::RetryPending {
                 idle_since,
-                settings_epoch: 1,
                 baseline: baseline.clone(),
+                attempts_started: 1,
+                due_at,
+                last_failure_kind: SupervisionRetryReason::Failure(
+                    crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+                ),
+                verdict_settings: VerdictSettingsFingerprint::from(
+                    protocol::SupervisorSettings::default(),
+                ),
             },
         };
-        requeue_inflight_supervision_for_settings_change(&mut inflight, 2);
+        let mut raised = protocol::SupervisorSettings::default();
+        raised.retry_attempts = 5;
+        raised.cost_tier = protocol::SupervisorCostTier::High;
+        apply_live_retry_settings(&AgentId("retry-limit".to_owned()), &mut pending, raised);
         assert!(matches!(
-            inflight.phase,
-            SupervisorPhase::Debouncing { idle_since: preserved }
-                if preserved == idle_since
-        ));
-
-        let mut current_inflight = SupervisorSchedulerEntry {
-            last_activity_counter: 4,
-            phase: SupervisorPhase::VerdictInFlight {
-                idle_since,
-                settings_epoch: 2,
-                baseline: baseline.clone(),
-            },
-        };
-        requeue_inflight_supervision_for_settings_change(&mut current_inflight, 2);
-        assert!(matches!(
-            current_inflight.phase,
-            SupervisorPhase::VerdictInFlight {
-                settings_epoch: 2,
+            pending.phase,
+            SupervisorPhase::RetryPending {
+                due_at: preserved_due,
+                attempts_started: 1,
+                verdict_settings,
                 ..
-            }
+            } if preserved_due == due_at
+                && verdict_settings == VerdictSettingsFingerprint::from(raised)
         ));
 
-        let mut done = SupervisorSchedulerEntry {
-            last_activity_counter: 4,
-            phase: SupervisorPhase::DoneAuthorized {
-                idle_since,
-                baseline,
-                last_gate_evaluation_epoch: None,
-            },
-        };
-        requeue_inflight_supervision_for_settings_change(&mut done, 2);
-        assert!(matches!(done.phase, SupervisorPhase::DoneAuthorized { .. }));
+        let mut lowered = raised;
+        lowered.retry_attempts = 0;
+        apply_live_retry_settings(&AgentId("retry-limit".to_owned()), &mut pending, lowered);
+        assert!(matches!(pending.phase, SupervisorPhase::Dormant { .. }));
+    }
 
-        let mut awaiting = SupervisorSchedulerEntry {
-            last_activity_counter: 4,
-            phase: SupervisorPhase::AwaitingUser { idle_since },
+    #[test]
+    fn supervisor_retry_backoff_and_caps_are_exact_and_finite() {
+        let agent_id = AgentId("retry-backoff".to_owned());
+        let idle_since = Instant::now();
+        let baseline = SupervisionBaseline {
+            last_user_message: "retry".to_owned(),
+            kicks_since_user_message: 0,
+            session_id: None,
         };
-        requeue_inflight_supervision_for_settings_change(&mut awaiting, 2);
-        assert!(matches!(awaiting.phase, SupervisorPhase::AwaitingUser { .. }));
+        let mut settings = protocol::SupervisorSettings::default();
+        settings.enabled = true;
+        settings.retry_attempts = 5;
+        assert_eq!(settings.retry_attempts.saturating_add(1), 6);
+        let mut entries = HashMap::from([(
+            agent_id.clone(),
+            SupervisorSchedulerEntry {
+                last_activity_counter: 1,
+                phase: SupervisorPhase::Dormant { idle_since },
+            },
+        )]);
+
+        for attempts_started in 1..=5 {
+            let scheduled_at = idle_since
+                .checked_add(Duration::from_secs(u64::from(attempts_started)))
+                .unwrap();
+            schedule_supervision_retry_at(
+                &mut entries,
+                &agent_id,
+                idle_since,
+                baseline.clone(),
+                attempts_started,
+                settings,
+                SupervisionRetryReason::Failure(
+                    crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+                ),
+                Some("outage".to_owned()),
+                scheduled_at,
+            );
+            let expected_due = scheduled_at
+                .checked_add(SUPERVISION_RETRY_DELAYS[usize::from(attempts_started - 1)])
+                .unwrap();
+            assert!(matches!(
+                entries.get(&agent_id).map(|entry| &entry.phase),
+                Some(SupervisorPhase::RetryPending {
+                    due_at,
+                    attempts_started: actual,
+                    ..
+                }) if *due_at == expected_due && *actual == attempts_started
+            ));
+            for _ in 0..100 {
+                assert_eq!(
+                    supervisor_next_deadline(
+                        &entries,
+                        SupervisorSettingsSignal { settings, epoch: 1 },
+                    ),
+                    Some(expected_due),
+                    "polling before a retry transition must not move its deadline"
+                );
+            }
+        }
+
+        schedule_supervision_retry(
+            &mut entries,
+            &agent_id,
+            idle_since,
+            baseline.clone(),
+            6,
+            settings,
+            SupervisionRetryReason::Failure(
+                crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+            ),
+            Some("outage".to_owned()),
+        );
+        assert!(matches!(
+            entries.get(&agent_id).map(|entry| &entry.phase),
+            Some(SupervisorPhase::Dormant { .. })
+        ));
+        assert_eq!(
+            supervisor_next_deadline(
+                &entries,
+                SupervisorSettingsSignal { settings, epoch: 1 },
+            ),
+            None
+        );
+
+        settings.retry_attempts = 1;
+        assert_eq!(settings.retry_attempts.saturating_add(1), 2);
+        schedule_supervision_retry_at(
+            &mut entries,
+            &agent_id,
+            idle_since,
+            baseline.clone(),
+            1,
+            settings,
+            SupervisionRetryReason::Failure(
+                crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+            ),
+            None,
+            idle_since,
+        );
+        assert!(matches!(
+            entries.get(&agent_id).map(|entry| &entry.phase),
+            Some(SupervisorPhase::RetryPending {
+                attempts_started: 1,
+                due_at,
+                ..
+            }) if *due_at == idle_since.checked_add(Duration::from_secs(30)).unwrap()
+        ));
+        schedule_supervision_retry_at(
+            &mut entries,
+            &agent_id,
+            idle_since,
+            baseline.clone(),
+            2,
+            settings,
+            SupervisionRetryReason::Failure(
+                crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+            ),
+            None,
+            idle_since,
+        );
+        assert!(matches!(
+            entries.get(&agent_id).map(|entry| &entry.phase),
+            Some(SupervisorPhase::Dormant { .. })
+        ));
+
+        settings.retry_attempts = 0;
+        assert_eq!(settings.retry_attempts.saturating_add(1), 1);
+        schedule_supervision_retry(
+            &mut entries,
+            &agent_id,
+            idle_since,
+            baseline,
+            1,
+            settings,
+            SupervisionRetryReason::Failure(
+                crate::agent::supervisor::SupervisionFailureKind::InvalidVerdict,
+            ),
+            None,
+        );
+        assert!(matches!(
+            entries.get(&agent_id).map(|entry| &entry.phase),
+            Some(SupervisorPhase::Dormant { .. })
+        ));
+    }
+
+    #[test]
+    fn supervisor_retry_deadlines_serialize_and_each_agent_stops_at_default_cap() {
+        let now = Instant::now();
+        let mut settings = protocol::SupervisorSettings::default();
+        settings.enabled = true;
+        assert_eq!(settings.retry_attempts.saturating_add(1), 2);
+        let fingerprint = VerdictSettingsFingerprint::from(settings);
+        let baseline = || SupervisionBaseline {
+            last_user_message: "retry".to_owned(),
+            kicks_since_user_message: 0,
+            session_id: None,
+        };
+        let mut entries = HashMap::new();
+        for index in 0..3 {
+            entries.insert(
+                AgentId(format!("retry-agent-{index}")),
+                SupervisorSchedulerEntry {
+                    last_activity_counter: 1,
+                    phase: SupervisorPhase::RetryPending {
+                        idle_since: now,
+                        baseline: baseline(),
+                        attempts_started: 1,
+                        due_at: now,
+                        last_failure_kind: SupervisionRetryReason::Failure(
+                            crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+                        ),
+                        verdict_settings: fingerprint,
+                    },
+                },
+            );
+        }
+        let active_id = AgentId("active-verdict".to_owned());
+        entries.insert(
+            active_id.clone(),
+            SupervisorSchedulerEntry {
+                last_activity_counter: 1,
+                phase: SupervisorPhase::VerdictInFlight {
+                    idle_since: now,
+                    baseline: baseline(),
+                    attempts_started: 1,
+                    verdict_settings: fingerprint,
+                },
+            },
+        );
+        assert_eq!(
+            supervisor_next_deadline(
+                &entries,
+                SupervisorSettingsSignal { settings, epoch: 1 },
+            ),
+            None,
+            "one in-flight call must suppress all due retry launches"
+        );
+        entries.remove(&active_id);
+        assert_eq!(
+            supervisor_next_deadline(
+                &entries,
+                SupervisorSettingsSignal { settings, epoch: 1 },
+            ),
+            Some(now)
+        );
+
+        let ids = entries.keys().cloned().collect::<Vec<_>>();
+        for agent_id in ids {
+            schedule_supervision_retry_at(
+                &mut entries,
+                &agent_id,
+                now,
+                baseline(),
+                2,
+                settings,
+                SupervisionRetryReason::Failure(
+                    crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+                ),
+                Some("outage".to_owned()),
+                now,
+            );
+        }
+        assert!(entries
+            .values()
+            .all(|entry| matches!(&entry.phase, SupervisorPhase::Dormant { .. })));
+        assert_eq!(
+            supervisor_next_deadline(
+                &entries,
+                SupervisorSettingsSignal { settings, epoch: 1 },
+            ),
+            None,
+            "three failing agents must stop after the documented 2N calls"
+        );
     }
 }

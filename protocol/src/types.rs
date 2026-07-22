@@ -46,6 +46,9 @@ mod supervisor_inactivity_delay_tests {
         );
         let settings = SupervisorSettings::default();
         assert_eq!(settings.auto_compact_inactivity_delay_seconds, 300);
+        assert_eq!(settings.retry_attempts, 1);
+        assert_eq!(SUPERVISOR_RETRY_ATTEMPTS_MIN, 0);
+        assert_eq!(SUPERVISOR_RETRY_ATTEMPTS_MAX, 5);
         let encoded = serde_json::to_value(settings).expect("serialize supervisor settings");
         let decoded: SupervisorSettings =
             serde_json::from_value(encoded).expect("deserialize supervisor settings");
@@ -2317,8 +2320,8 @@ pub struct SupervisorSettings {
     /// message. Prevents a supervisor/agent ping-pong loop.
     #[serde(default = "default_supervisor_max_kicks_per_task")]
     pub max_kicks_per_task: u8,
-    /// Extra attempts when a supervision call errors or returns output that
-    /// does not parse to a verdict. 1 means one retry after the first failure.
+    /// Extra delayed paid attempts when a supervision call errors or returns
+    /// output that does not parse to a verdict. 1 means two total calls.
     #[serde(default = "default_supervisor_retry_attempts")]
     pub retry_attempts: u8,
     /// Which model tier the supervision verdict runs on. `Low` is the cheap
@@ -2356,6 +2359,9 @@ pub fn default_supervisor_max_kicks_per_task() -> u8 {
 pub fn default_supervisor_retry_attempts() -> u8 {
     1
 }
+
+pub const SUPERVISOR_RETRY_ATTEMPTS_MIN: u8 = 0;
+pub const SUPERVISOR_RETRY_ATTEMPTS_MAX: u8 = 5;
 
 pub fn default_supervisor_auto_compact_min_context_tokens() -> u64 {
     200_000

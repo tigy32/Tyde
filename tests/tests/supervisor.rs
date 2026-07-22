@@ -23,6 +23,7 @@ const MOCK_CONTEXT_250K_SENTINEL: &str = "__mock_context_250k__";
 const MOCK_SUPERVISOR_DONE: &str = "__mock_supervisor_done__";
 const MOCK_SUPERVISOR_AWAITING_USER: &str = "__mock_supervisor_awaiting_user__";
 const MOCK_ACTIVE_IDLE_CYCLE: &str = "__mock_active_idle_cycle__";
+const MOCK_CODEX_INTERNAL_ERROR_TAIL: &str = "__mock_codex_internal_error_tail__";
 
 /// The supervisor debounces 3s after an idle transition before reading
 /// context, so supervisor-driven frames need a longer wait than ordinary
@@ -286,6 +287,141 @@ async fn supervisor_kicks_agent_after_error_and_respects_kick_budget() {
         &mut fixture.client,
         QUIET_WAIT,
         "second supervisor kick beyond the budget",
+        |env| is_supervisor_kick(env, &stream),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn enabling_after_exact_codex_error_tail_emits_one_kick() {
+    fixture::init_tracing();
+    let mut fixture = Fixture::new().await;
+    apply_supervisor_setting(
+        &mut fixture,
+        HostSettingValue::SupervisorMaxKicksPerTask { count: 1 },
+    )
+    .await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("codex-error-tail".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: format!(
+                    "recover {MOCK_USER_BUBBLES_SENTINEL} {MOCK_CODEX_INTERNAL_ERROR_TAIL}"
+                ),
+                images: None,
+                backend_kind: BackendKind::Codex,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn Codex-shaped mock agent");
+    let new_agent = wait_for_envelope(
+        &mut fixture.client,
+        Duration::from_secs(5),
+        "Codex-shaped NewAgent",
+        |env| env.kind == FrameKind::NewAgent,
+    )
+    .await
+    .parse_payload::<NewAgentPayload>()
+    .expect("parse NewAgent");
+    let stream = new_agent.instance_stream.clone();
+
+    for (label, predicate) in [
+        ("typing active", 0_u8),
+        ("normal tool request", 1),
+        ("successful tool completion", 2),
+        ("Codex warning", 3),
+        ("typing idle", 4),
+        ("recoverable error", 5),
+    ] {
+        let stream = stream.clone();
+        wait_for_envelope(
+            &mut fixture.client,
+            Duration::from_secs(5),
+            label,
+            move |env| {
+                assert_ne!(env.kind, FrameKind::AgentClosed, "tail must remain live");
+                if env.kind == FrameKind::AgentError {
+                    let error: protocol::AgentErrorPayload =
+                        env.parse_payload().expect("parse AgentError");
+                    assert!(!error.fatal, "tail error must not terminate the agent");
+                }
+                match (predicate, chat_event_on(env, &stream)) {
+                    (0, Some(ChatEvent::TypingStatusChanged(true))) => true,
+                    (1, Some(ChatEvent::ToolRequest(request))) => {
+                        request.tool_name == "Bash"
+                    }
+                    (2, Some(ChatEvent::ToolExecutionCompleted(result))) => result.success,
+                    (3, Some(ChatEvent::MessageAdded(message))) => {
+                        matches!(message.sender, MessageSender::Warning)
+                            && message.content == "Codex warning: Internal server error"
+                    }
+                    (4, Some(ChatEvent::TypingStatusChanged(false))) => true,
+                    (5, Some(ChatEvent::MessageAdded(message))) => {
+                        matches!(message.sender, MessageSender::Error)
+                            && message.content == "Internal server error"
+                    }
+                    _ => false,
+                }
+            },
+        )
+        .await;
+    }
+
+    fixture
+        .client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::SupervisorEnabled { enabled: true },
+        })
+        .await
+        .expect("enable supervisor after idle error tail");
+    wait_for_envelope(
+        &mut fixture.client,
+        Duration::from_secs(5),
+        "same-host enabled HostSettings",
+        |env| {
+            env.kind == FrameKind::HostSettings
+                && env.parse_payload::<HostSettingsPayload>().is_ok_and(|payload| {
+                    payload.settings.supervisor.enabled
+                })
+        },
+    )
+    .await;
+
+    let kick_stream = stream.clone();
+    wait_for_envelope(
+        &mut fixture.client,
+        SUPERVISION_WAIT,
+        "one supervisor kick after enable",
+        |env| is_supervisor_kick(env, &kick_stream),
+    )
+    .await;
+    let follow_up_stream = stream.clone();
+    wait_for_envelope(
+        &mut fixture.client,
+        SUPERVISION_WAIT,
+        "real follow-up turn after kick",
+        |env| {
+            is_assistant_message_containing(
+                env,
+                &follow_up_stream,
+                &format!("mock backend response to: {SUPERVISOR_MESSAGE_PREFIX}"),
+            )
+        },
+    )
+    .await;
+    assert_no_envelope(
+        &mut fixture.client,
+        QUIET_WAIT,
+        "second supervisor kick beyond max_kicks_per_task=1",
         |env| is_supervisor_kick(env, &stream),
     )
     .await;
@@ -665,4 +801,29 @@ async fn invalid_supervisor_delay_returns_typed_setting_target() {
             Some(HostSettingErrorTarget::SupervisorAutoCompactInactivityDelaySeconds)
         );
     }
+}
+
+#[tokio::test]
+async fn invalid_supervisor_retry_limit_returns_typed_setting_target() {
+    fixture::init_tracing();
+    let mut fixture = Fixture::new().await;
+    fixture
+        .client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::SupervisorRetryAttempts { count: 6 },
+        })
+        .await
+        .expect("send invalid retry setting");
+    let envelope = wait_for_envelope(
+        &mut fixture.client,
+        Duration::from_secs(5),
+        "typed invalid retry-attempt error",
+        |envelope| envelope.kind == FrameKind::CommandError,
+    )
+    .await;
+    let error: CommandErrorPayload = envelope.parse_payload().expect("parse CommandError");
+    assert_eq!(
+        error.setting_target,
+        Some(HostSettingErrorTarget::SupervisorRetryAttempts)
+    );
 }

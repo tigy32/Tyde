@@ -5267,6 +5267,12 @@ impl CodexInner {
         let message = params
             .get("message")
             .and_then(Value::as_str)
+            .or_else(|| {
+                params
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(Value::as_str)
+            })
             .unwrap_or("Codex error")
             .to_string();
         if let Some(tool_call_id) = codex_error_tool_call_id(params)
@@ -20998,6 +21004,67 @@ Do not describe the tool, and do not skip the tool call."#;
             &state,
             &json!({ "message": "Tool warning" })
         ));
+    }
+
+    #[test]
+    fn nested_error_then_failed_turn_emits_recoverable_idle_tail() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (inner, mut rx) = test_codex_inner();
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({ "threadId": "thread-test", "turn": { "id": "failed-turn" } }),
+                )
+                .await;
+            drain_events(&mut rx);
+            inner
+                .handle_notification(
+                    "error",
+                    &json!({ "error": { "message": "Internal server error" } }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "turn/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turn": {
+                            "id": "failed-turn",
+                            "status": "failed",
+                            "error": { "message": "Internal server error" }
+                        }
+                    }),
+                )
+                .await;
+
+            let events = drain_events(&mut rx);
+            assert_eq!(
+                event_kinds(&events),
+                vec!["MessageAdded", "TypingStatusChanged", "MessageAdded"]
+            );
+            assert_eq!(
+                events[0].pointer("/data/sender").and_then(Value::as_str),
+                Some("Warning")
+            );
+            assert_eq!(
+                events[0].pointer("/data/content").and_then(Value::as_str),
+                Some("Codex warning: Internal server error")
+            );
+            assert_eq!(events[1].pointer("/data").and_then(Value::as_bool), Some(false));
+            assert_eq!(
+                events[2].pointer("/data/sender").and_then(Value::as_str),
+                Some("Error")
+            );
+            assert_eq!(
+                events[2].pointer("/data/content").and_then(Value::as_str),
+                Some("Internal server error")
+            );
+            inner.rpc.shutdown().await;
+        });
     }
 
     #[test]
