@@ -4706,7 +4706,7 @@ struct SyntheticTycodeCompletion {
 impl TycodeStreamState {
     fn events_with_synthesized_completion(&mut self, events: Vec<ChatEvent>) -> Vec<ChatEvent> {
         let mut output = Vec::new();
-        for event in events {
+        for mut event in events {
             if let Some(events) = self.late_authoritative_stream_end_events(&event) {
                 output.extend(events);
                 continue;
@@ -4714,11 +4714,47 @@ impl TycodeStreamState {
             if let Some(stream_end) = self.synthesize_stream_end_before(&event) {
                 output.push(stream_end);
             }
+            self.inject_stream_identity(&mut event);
             self.update(&event);
             output.push(event);
         }
 
         output
+    }
+
+    /// The Tycode wire predates Tyde's stream identity contract: `StreamEnd`
+    /// carries no message id at all, and start/delta ids are advisory. Tyde
+    /// validators reject id-less stream frames, so the adapter must own the
+    /// translation: adopt the open stream's id for id-less frames and mint one
+    /// when Tycode never provided an id for the stream.
+    fn inject_stream_identity(&mut self, event: &mut ChatEvent) {
+        match event {
+            ChatEvent::StreamStart(start) => {
+                if start
+                    .message_id
+                    .as_ref()
+                    .is_none_or(|message_id| message_id.trim().is_empty())
+                {
+                    start.message_id = Some(minted_tycode_message_id());
+                }
+            }
+            ChatEvent::StreamDelta(delta) | ChatEvent::StreamReasoningDelta(delta) => {
+                if self.open
+                    && delta
+                        .message_id
+                        .as_ref()
+                        .is_none_or(|message_id| message_id.trim().is_empty())
+                {
+                    delta.message_id.clone_from(&self.message_id);
+                }
+            }
+            ChatEvent::StreamEnd(end) => {
+                if self.open && end.message.message_id.is_none() {
+                    end.message.message_id = self.message_id.clone().map(ChatMessageId);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn late_authoritative_stream_end_events(
@@ -4882,6 +4918,10 @@ fn unix_now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn minted_tycode_message_id() -> String {
+    format!("tycode-unidentified-{}", uuid::Uuid::new_v4())
 }
 
 #[cfg(test)]
@@ -5292,6 +5332,104 @@ mod tests {
             &end.message.sender,
             MessageSender::Assistant { agent } if agent == "tycode"
         ));
+        assert!(!stream_state.open);
+    }
+
+    /// Pinned to the tycode-subprocess 0.10.0 wire, captured live on
+    /// 2026-07-22: `StreamEnd` carries no message id anywhere (not top-level,
+    /// not inside `message`), and `TypingStatusChanged(false)` arrives after
+    /// the real `StreamEnd`. The adapter must stamp the open stream's id onto
+    /// the id-less end so Tyde's stream identity validators accept the turn;
+    /// before this injection the end was rejected as MissingMessageId and the
+    /// stuck active stream poisoned every later turn into a violation cascade.
+    #[test]
+    fn tycode_real_wire_id_less_stream_end_adopts_open_stream_identity() {
+        let turn = |message_id: &str, word: &str| {
+            [
+                serde_json::json!({ "kind": "TypingStatusChanged", "data": true }),
+                serde_json::json!({
+                    "kind": "StreamStart",
+                    "data": {
+                        "message_id": message_id,
+                        "agent": "tycode",
+                        "model": "qwen-plus",
+                        "model_version": "qwen-3.6-plus"
+                    }
+                }),
+                serde_json::json!({
+                    "kind": "StreamReasoningDelta",
+                    "data": { "message_id": message_id, "text": "thinking" }
+                }),
+                serde_json::json!({
+                    "kind": "StreamDelta",
+                    "data": { "message_id": message_id, "text": word }
+                }),
+                serde_json::json!({
+                    "kind": "StreamEnd",
+                    "data": {
+                        "message": {
+                            "timestamp": 1784723793481_u64,
+                            "sender": { "Assistant": { "agent": "tycode" } },
+                            "content": word,
+                            "reasoning": {
+                                "text": "thinking",
+                                "signature": null,
+                                "blob": null,
+                                "raw_json": null
+                            },
+                            "tool_calls": [],
+                            "model_info": { "model": "qwen-plus", "version": "qwen-3.6-plus" },
+                            "token_usage": {
+                                "input_tokens": 7405,
+                                "output_tokens": 40,
+                                "total_tokens": 7445,
+                                "cached_prompt_tokens": 0,
+                                "cache_creation_input_tokens": null,
+                                "reasoning_tokens": 34
+                            },
+                            "images": []
+                        }
+                    }
+                }),
+                serde_json::json!({ "kind": "TypingStatusChanged", "data": false }),
+            ]
+        };
+
+        let mut stream_state = TycodeStreamState::default();
+        let mut emitted = Vec::new();
+        for raw_event in turn("msg-1784723792531", "pong")
+            .into_iter()
+            .chain(turn("msg-1784723904489", "marco"))
+        {
+            emitted.extend(tycode_events_with_synthesized_completion(
+                map_tycode_value_to_chat_events(&raw_event),
+                &mut stream_state,
+            ));
+        }
+
+        let expected_ids = ["msg-1784723792531", "msg-1784723904489"];
+        let mut ends = 0;
+        for event in &emitted {
+            match event {
+                ChatEvent::StreamStart(start) => {
+                    assert_eq!(start.message_id.as_deref(), Some(expected_ids[ends]));
+                }
+                ChatEvent::StreamDelta(delta) | ChatEvent::StreamReasoningDelta(delta) => {
+                    assert_eq!(delta.message_id.as_deref(), Some(expected_ids[ends]));
+                }
+                ChatEvent::StreamEnd(end) => {
+                    assert_eq!(
+                        end.message.message_id.as_ref().map(|id| id.0.as_str()),
+                        Some(expected_ids[ends]),
+                        "id-less wire StreamEnd must adopt the open stream's id"
+                    );
+                    assert!(end.message.token_usage.is_some());
+                    ends += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(ends, 2, "both real StreamEnds must survive unduplicated");
         assert!(!stream_state.open);
     }
 
