@@ -11,11 +11,21 @@
 //! `ToolOutputMode`: operational awareness of running work must not
 //! disappear because the user prefers compact transcript history.
 //!
-//! Shape: one collapsed summary line ("2 running · 1 queued · …") that
-//! expands into per-process rows. When nothing is in flight the tray
-//! renders nothing at all. Finished items stay as muted rows until
-//! "Clear finished"; failures stay pinned until individually dismissed —
-//! a background failure must never scroll away silently.
+//! Shape: a dock attached to the top of the composer — a one-line
+//! summary header ("2 running · 1 queued · …") over per-process rows.
+//! It starts expanded so live work is visible without interaction;
+//! collapsing is an explicit, persisted choice. When nothing is in
+//! flight the tray renders nothing at all.
+//!
+//! The tray shows **active work only**: starting/running agents, running
+//! workflows and commands, and queued messages. Completed, idle, and
+//! failed items leave the tray the moment they stop being active —
+//! a deliberate product decision (2026-07) to keep this surface minimal.
+//! The earlier design kept finished rows until "Clear finished" and
+//! pinned failures until dismissed; in practice the dismissal state was
+//! session-local UI bookkeeping that resurrected rows, and the permanent
+//! record of every outcome (including failures) already lives in the
+//! transcript's tool cards and error output.
 
 use std::collections::HashSet;
 
@@ -24,10 +34,10 @@ use wasm_bindgen_futures::spawn_local;
 
 use protocol::{
     AgentActivityStats, AgentActivitySummary, AgentActivitySummaryStaleReason,
-    AgentActivitySummaryState, AgentControlProgressKind, AgentId, BackgroundTaskState,
+    AgentActivitySummaryState, AgentControlProgressKind, AgentId, BackendKind, BackgroundTaskState,
     BackgroundTaskStatus, CancelQueuedMessagePayload, FrameKind, QueuedMessageId,
-    SendQueuedMessageNowPayload, SubAgentProgress, ToolProgressUpdate, ToolRequestType,
-    WorkflowRunState, WorkflowRunStatus,
+    SendQueuedMessageNowPayload, SessionSettingValue, SubAgentProgress, ToolProgressUpdate,
+    ToolRequestType, WorkflowRunState, WorkflowRunStatus,
 };
 
 use crate::components::chat_message::token_badge_data;
@@ -43,6 +53,9 @@ fn local_storage() -> Option<web_sys::Storage> {
 }
 
 fn load_expanded() -> bool {
+    // Expanded is the default: with no persisted choice the tray must be
+    // readable at a glance, not a mystery one-liner. Only an explicit
+    // collapse (stored "false") starts it collapsed.
     local_storage()
         .and_then(|storage| {
             storage
@@ -51,7 +64,7 @@ fn load_expanded() -> bool {
                 .flatten()
         })
         .map(|value| value == "true")
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 fn persist_expanded(expanded: bool) {
@@ -94,6 +107,17 @@ impl ChildAgentStatus {
     }
 }
 
+fn backend_label(kind: BackendKind) -> &'static str {
+    match kind {
+        BackendKind::Tycode => "Tycode",
+        BackendKind::Kiro => "Kiro",
+        BackendKind::Claude => "Claude",
+        BackendKind::Codex => "Codex",
+        BackendKind::Antigravity => "Antigravity",
+        BackendKind::Hermes => "Hermes",
+    }
+}
+
 fn derive_child_status(state: &AppState, agent: &crate::state::AgentInfo) -> ChildAgentStatus {
     if let Some(error) = agent.fatal_error.clone() {
         return ChildAgentStatus::Failed(error);
@@ -114,29 +138,9 @@ fn derive_child_status(state: &AppState, agent: &crate::state::AgentInfo) -> Chi
     }
 }
 
-/// Session-local dismissal keys. Dismissing hides an item only in its
-/// terminal/idle state — an idle child that starts working again reappears.
-fn child_key(agent_id: &AgentId) -> String {
-    format!("ag:{}", agent_id.0)
-}
-
-fn workflow_key(call_id: &ToolCallId) -> String {
-    format!("wf:{}", call_id.0)
-}
-
-fn subagent_key(call_id: &ToolCallId) -> String {
-    format!("sa:{}", call_id.0)
-}
-
-fn command_key(call_id: &ToolCallId) -> String {
-    format!("cmd:{}", call_id.0)
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 struct TrayCounts {
     running: usize,
-    failed: usize,
-    finished: usize,
     queued: usize,
 }
 
@@ -171,11 +175,7 @@ impl TraySnapshot {
     }
 }
 
-fn compute_snapshot(
-    state: &AppState,
-    parent: &ActiveAgentRef,
-    dismissed: &HashSet<String>,
-) -> TraySnapshot {
+fn compute_snapshot(state: &AppState, parent: &ActiveAgentRef) -> TraySnapshot {
     let mut snapshot = TraySnapshot::default();
     let mut child_ids: HashSet<AgentId> = HashSet::new();
 
@@ -187,24 +187,15 @@ fn compute_snapshot(
                 continue;
             }
             child_ids.insert(agent.agent_id.clone());
+            // Active-only: an idle or failed child leaves the tray
+            // immediately. Its outcome stays on the transcript's cards.
             match derive_child_status(state, agent) {
                 ChildAgentStatus::Starting | ChildAgentStatus::Running => {
                     snapshot.counts.running += 1;
+                    snapshot.children.push(agent.agent_id.clone());
                 }
-                ChildAgentStatus::Idle => {
-                    if dismissed.contains(&child_key(&agent.agent_id)) {
-                        continue;
-                    }
-                    snapshot.counts.finished += 1;
-                }
-                ChildAgentStatus::Failed(_) => {
-                    if dismissed.contains(&child_key(&agent.agent_id)) {
-                        continue;
-                    }
-                    snapshot.counts.failed += 1;
-                }
+                ChildAgentStatus::Idle | ChildAgentStatus::Failed(_) => {}
             }
-            snapshot.children.push(agent.agent_id.clone());
         }
     });
 
@@ -215,38 +206,19 @@ fn compute_snapshot(
             }
             match progress.get().update {
                 ToolProgressUpdate::Workflow(run) => {
-                    match run.status {
-                        WorkflowRunStatus::Running => snapshot.counts.running += 1,
-                        WorkflowRunStatus::Failed => {
-                            if dismissed.contains(&workflow_key(call_id)) {
-                                continue;
-                            }
-                            snapshot.counts.failed += 1;
-                        }
-                        WorkflowRunStatus::Completed | WorkflowRunStatus::Unknown => {
-                            if dismissed.contains(&workflow_key(call_id)) {
-                                continue;
-                            }
-                            snapshot.counts.finished += 1;
-                        }
+                    if run.status == WorkflowRunStatus::Running {
+                        snapshot.counts.running += 1;
+                        snapshot.workflows.push(call_id.clone());
                     }
-                    snapshot.workflows.push(call_id.clone());
                 }
                 ToolProgressUpdate::SubAgent(sub) => {
                     // A sub-agent with a registry record already renders as a
                     // child row; a second row here would recreate the exact
                     // spawn/await duplication this tray exists to remove.
-                    if child_ids.contains(&sub.agent_id) {
+                    if child_ids.contains(&sub.agent_id) || sub.completed {
                         continue;
                     }
-                    if sub.completed {
-                        if dismissed.contains(&subagent_key(call_id)) {
-                            continue;
-                        }
-                        snapshot.counts.finished += 1;
-                    } else {
-                        snapshot.counts.running += 1;
-                    }
+                    snapshot.counts.running += 1;
                     snapshot.subagents.push(call_id.clone());
                 }
                 ToolProgressUpdate::AgentControl(progress)
@@ -265,24 +237,10 @@ fn compute_snapshot(
                         snapshot.pending_spawns.push((agent.agent_id, agent.name));
                     }
                 }
-                ToolProgressUpdate::BackgroundTask(task) => {
-                    match task.status {
-                        BackgroundTaskStatus::Running => snapshot.counts.running += 1,
-                        BackgroundTaskStatus::Failed => {
-                            if dismissed.contains(&command_key(call_id)) {
-                                continue;
-                            }
-                            snapshot.counts.failed += 1;
-                        }
-                        BackgroundTaskStatus::Completed
-                        | BackgroundTaskStatus::Stopped
-                        | BackgroundTaskStatus::Unknown => {
-                            if dismissed.contains(&command_key(call_id)) {
-                                continue;
-                            }
-                            snapshot.counts.finished += 1;
-                        }
-                    }
+                ToolProgressUpdate::BackgroundTask(task)
+                    if task.status == BackgroundTaskStatus::Running =>
+                {
+                    snapshot.counts.running += 1;
                     snapshot.commands.push(call_id.clone());
                 }
                 _ => {}
@@ -306,65 +264,11 @@ fn compute_snapshot(
     snapshot
 }
 
-/// Keys of everything currently in a finished (idle/completed) state, for
-/// the "Clear finished" action. Failures are deliberately excluded — they
-/// stay pinned until individually dismissed.
-fn finished_keys_untracked(state: &AppState, parent: &ActiveAgentRef) -> Vec<String> {
-    let mut keys = Vec::new();
-    state.agents.with_untracked(|agents| {
-        for agent in agents {
-            if agent.host_id != parent.host_id
-                || agent.parent_agent_id.as_ref() != Some(&parent.agent_id)
-            {
-                continue;
-            }
-            if agent.fatal_error.is_none()
-                && agent.started
-                && !state
-                    .agent_turn_active
-                    .with_untracked(|map| map.get(&agent.agent_id).copied().unwrap_or(false))
-                && !state
-                    .streaming_text
-                    .with_untracked(|map| map.contains_key(&agent.agent_id))
-            {
-                keys.push(child_key(&agent.agent_id));
-            }
-        }
-    });
-    state.tool_progress.with_untracked(|map| {
-        for ((agent_id, call_id), progress) in map.iter() {
-            if *agent_id != parent.agent_id {
-                continue;
-            }
-            match progress.get_untracked().update {
-                ToolProgressUpdate::Workflow(run)
-                    if run.status != WorkflowRunStatus::Running
-                        && run.status != WorkflowRunStatus::Failed =>
-                {
-                    keys.push(workflow_key(call_id));
-                }
-                ToolProgressUpdate::SubAgent(sub) if sub.completed => {
-                    keys.push(subagent_key(call_id));
-                }
-                ToolProgressUpdate::BackgroundTask(task)
-                    if task.status != BackgroundTaskStatus::Running
-                        && task.status != BackgroundTaskStatus::Failed =>
-                {
-                    keys.push(command_key(call_id));
-                }
-                _ => {}
-            }
-        }
-    });
-    keys
-}
-
 #[component]
 pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView {
     let state = expect_context::<AppState>();
 
     let expanded = RwSignal::new(load_expanded());
-    let dismissed: RwSignal<HashSet<String>> = RwSignal::new(HashSet::new());
 
     let snapshot = Memo::new({
         let state = state.clone();
@@ -372,7 +276,7 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
             let Some(parent) = agent_ref.get() else {
                 return TraySnapshot::default();
             };
-            dismissed.with(|dismissed| compute_snapshot(&state, &parent, dismissed))
+            compute_snapshot(&state, &parent)
         }
     });
 
@@ -417,14 +321,8 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
         if snapshot.counts.running > 0 {
             parts.push(format!("{} running", snapshot.counts.running));
         }
-        if snapshot.counts.failed > 0 {
-            parts.push(format!("{} failed", snapshot.counts.failed));
-        }
         if snapshot.counts.queued > 0 {
             parts.push(format!("{} queued", snapshot.counts.queued));
-        }
-        if snapshot.counts.finished > 0 {
-            parts.push(format!("{} finished", snapshot.counts.finished));
         }
         if let Some(waiting) = waiting.get() {
             parts.push(waiting);
@@ -432,24 +330,10 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
         parts.join(" \u{b7} ")
     };
 
-    let has_finished = move || snapshot.get().counts.finished > 0;
-
     let on_toggle = move |_: web_sys::MouseEvent| {
         let next = !expanded.get_untracked();
         expanded.set(next);
         persist_expanded(next);
-    };
-
-    // Parked in a `StoredValue` so the handler's captures are all `Copy`:
-    // the `Show` children closure must stay `Fn`, and a captured `AppState`
-    // would degrade it to `FnOnce`.
-    let clear_state = StoredValue::new_local(state.clone());
-    let on_clear = move |_: web_sys::MouseEvent| {
-        let Some(parent) = agent_ref.get_untracked() else {
-            return;
-        };
-        let keys = clear_state.with_value(|state| finished_keys_untracked(state, &parent));
-        dismissed.update(|set| set.extend(keys));
     };
 
     view! {
@@ -472,11 +356,7 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
                             key=|agent_id| agent_id.0.clone()
                             let:agent_id
                         >
-                            <ChildAgentRow
-                                parent_ref=agent_ref
-                                agent_id=agent_id
-                                dismissed=dismissed
-                            />
+                            <ChildAgentRow parent_ref=agent_ref agent_id=agent_id />
                         </For>
                         <For
                             each=move || snapshot.get().pending_spawns
@@ -497,11 +377,7 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
                             key=|call_id| call_id.0.clone()
                             let:call_id
                         >
-                            <WorkflowRow
-                                parent_ref=agent_ref
-                                tool_call_id=call_id
-                                dismissed=dismissed
-                            />
+                            <WorkflowRow parent_ref=agent_ref tool_call_id=call_id />
                         </For>
                         <For
                             each=move || snapshot.get().subagents
@@ -515,11 +391,7 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
                             key=|call_id| call_id.0.clone()
                             let:call_id
                         >
-                            <CommandRow
-                                parent_ref=agent_ref
-                                tool_call_id=call_id
-                                dismissed=dismissed
-                            />
+                            <CommandRow parent_ref=agent_ref tool_call_id=call_id />
                         </For>
                         <Show when=move || !snapshot.get().queued.is_empty()>
                             <div class="inflight-tray-queue">
@@ -531,15 +403,6 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
                                     <QueuedMessageRow id=id agent_ref=agent_ref />
                                 </For>
                             </div>
-                        </Show>
-                        <Show when=has_finished>
-                            <button
-                                type="button"
-                                class="inflight-tray-clear"
-                                on:click=on_clear
-                            >
-                                "Clear finished"
-                            </button>
                         </Show>
                     </div>
                 </Show>
@@ -553,11 +416,7 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
 /// merged successor of the spawn card's preview row and the await card's
 /// summary/stats row — one row, one surface.
 #[component]
-fn ChildAgentRow(
-    parent_ref: Signal<Option<ActiveAgentRef>>,
-    agent_id: AgentId,
-    dismissed: RwSignal<HashSet<String>>,
-) -> impl IntoView {
+fn ChildAgentRow(parent_ref: Signal<Option<ActiveAgentRef>>, agent_id: AgentId) -> impl IntoView {
     let state = expect_context::<AppState>();
 
     let display_name = Signal::derive({
@@ -578,6 +437,45 @@ fn ChildAgentRow(
                     .cloned()
             })?;
             Some(derive_child_status(&state, &agent))
+        }
+    });
+
+    // Backend + model provenance: "Codex · gpt-5.3" next to the status.
+    // The backend comes from the registry record. The model prefers the
+    // live stream announcement (what is actually serving this turn) and
+    // falls back to the agent's session-settings value; when neither is
+    // known yet the label is the backend alone — never a guessed model.
+    let backend_model = Signal::derive({
+        let state = state.clone();
+        let agent_id = agent_id.clone();
+        move || -> Option<String> {
+            let parent = parent_ref.get()?;
+            let backend = state.agents.with(|agents| {
+                agents
+                    .iter()
+                    .find(|agent| agent.host_id == parent.host_id && agent.agent_id == agent_id)
+                    .map(|agent| agent.backend_kind)
+            })?;
+            let model = state
+                .streaming_text
+                .with(|map| map.get(&agent_id).and_then(|stream| stream.model.clone()))
+                .or_else(|| {
+                    state.agent_session_settings.with(|map| {
+                        map.get(&agent_id)
+                            .and_then(|values| match values.0.get("model") {
+                                Some(SessionSettingValue::String(value))
+                                    if !value.trim().is_empty() =>
+                                {
+                                    Some(value.clone())
+                                }
+                                _ => None,
+                            })
+                    })
+                });
+            Some(match model {
+                Some(model) => format!("{} \u{b7} {model}", backend_label(backend)),
+                None => backend_label(backend).to_owned(),
+            })
         }
     });
 
@@ -641,17 +539,6 @@ fn ChildAgentRow(
         open_child_agent(&open_state, &parent.host_id, &open_agent_id);
     };
 
-    // Key precomputed into a `StoredValue` so the dismiss handler's captures
-    // are all `Copy` — the failed-only `Show` children closure must stay `Fn`.
-    let dismiss_key = StoredValue::new_local(child_key(&agent_id));
-    let on_dismiss = move |_: web_sys::MouseEvent| {
-        dismissed.update(|set| {
-            set.insert(dismiss_key.get_value());
-        });
-    };
-    let is_failed =
-        Signal::derive(move || matches!(status.get(), Some(ChildAgentStatus::Failed(_))));
-
     view! {
         <div class="tool-live-agent-row inflight-tray-row">
             <div class="tool-live-agent-main">
@@ -659,19 +546,12 @@ fn ChildAgentRow(
                 {move || status.get().map(|status| view! {
                     <span class=status.class()>{status.label()}</span>
                 })}
+                {move || backend_model.get().map(|label| view! {
+                    <span class="tool-live-agent-backend">{label}</span>
+                })}
             </div>
             <div class="inflight-tray-row-actions">
                 <button type="button" class="tool-live-link" on:click=on_open>"Open agent"</button>
-                <Show when=move || is_failed.get()>
-                    <button
-                        type="button"
-                        class="inflight-tray-dismiss"
-                        title="Dismiss this failure"
-                        on:click=on_dismiss
-                    >
-                        "\u{d7}"
-                    </button>
-                </Show>
             </div>
             {move || {
                 if let Some(text) = preview.get() {
@@ -707,7 +587,6 @@ fn ChildAgentRow(
 fn WorkflowRow(
     parent_ref: Signal<Option<ActiveAgentRef>>,
     tool_call_id: ToolCallId,
-    dismissed: RwSignal<HashSet<String>>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
 
@@ -769,20 +648,6 @@ fn WorkflowRow(
         );
     };
 
-    // Same `Copy`-captures requirement as the child row's dismiss handler.
-    let dismiss_key = StoredValue::new_local(workflow_key(&tool_call_id));
-    let on_dismiss = move |_: web_sys::MouseEvent| {
-        dismissed.update(|set| {
-            set.insert(dismiss_key.get_value());
-        });
-    };
-    let is_failed = Signal::derive(move || {
-        matches!(
-            run.get().map(|run| run.status),
-            Some(WorkflowRunStatus::Failed)
-        )
-    });
-
     view! {
         <div class="tool-live-agent-row inflight-tray-row">
             <div class="tool-live-agent-main">
@@ -793,16 +658,6 @@ fn WorkflowRow(
                 <button type="button" class="tool-live-link" on:click=on_open>
                     "Open workflow"
                 </button>
-                <Show when=move || is_failed.get()>
-                    <button
-                        type="button"
-                        class="inflight-tray-dismiss"
-                        title="Dismiss this failure"
-                        on:click=on_dismiss
-                    >
-                        "\u{d7}"
-                    </button>
-                </Show>
             </div>
         </div>
     }
@@ -818,14 +673,12 @@ fn background_status_label(status: BackgroundTaskStatus) -> &'static str {
     }
 }
 
-/// One backgrounded shell command. While it runs the row shows the
-/// command's description; once terminal, the CLI's notification summary
-/// (the only place the exit code exists) replaces it when present.
+/// One backgrounded shell command, shown only while it runs (the tray is
+/// active-only); the row carries the command's description.
 #[component]
 fn CommandRow(
     parent_ref: Signal<Option<ActiveAgentRef>>,
     tool_call_id: ToolCallId,
-    dismissed: RwSignal<HashSet<String>>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
 
@@ -867,38 +720,12 @@ fn CommandRow(
         _ => "tool-live-agent-status idle",
     };
 
-    // Same `Copy`-captures requirement as the other rows' dismiss handlers.
-    let dismiss_key = StoredValue::new_local(command_key(&tool_call_id));
-    let on_dismiss = move |_: web_sys::MouseEvent| {
-        dismissed.update(|set| {
-            set.insert(dismiss_key.get_value());
-        });
-    };
-    let is_failed = Signal::derive(move || {
-        matches!(
-            task.get().map(|task| task.status),
-            Some(BackgroundTaskStatus::Failed)
-        )
-    });
-
     view! {
         <div class="tool-live-agent-row inflight-tray-row">
             <div class="tool-live-agent-main">
                 <span class="tool-live-agent-name">{title}</span>
                 <span class=status_class>{status_label}</span>
             </div>
-            <Show when=move || is_failed.get()>
-                <div class="inflight-tray-row-actions">
-                    <button
-                        type="button"
-                        class="inflight-tray-dismiss"
-                        title="Dismiss this failure"
-                        on:click=on_dismiss
-                    >
-                        "\u{d7}"
-                    </button>
-                </div>
-            </Show>
         </div>
     }
 }
@@ -1273,6 +1100,16 @@ mod wasm_tests {
         }
     }
 
+    /// Mark a child as actively running. The tray is active-only (product
+    /// decision 2026-07): idle/failed children render nothing, so fixtures
+    /// that pin row *detail* (summaries, stats, backend/model) must keep
+    /// their child active or the row — correctly — vanishes.
+    fn set_turn_active(state: &AppState, agent_id: &str) {
+        state.agent_turn_active.update(|map| {
+            map.insert(AgentId(agent_id.to_owned()), true);
+        });
+    }
+
     fn mount_tray(setup: impl FnOnce(&AppState) + 'static) -> (HtmlElement, AppState) {
         // The tray persists its expanded state; clear it so one test's
         // expansion can't leak into the next.
@@ -1292,7 +1129,19 @@ mod wasm_tests {
         (container, state)
     }
 
+    /// Ensure the tray body is visible. The tray starts expanded by
+    /// default, so this is normally a no-op; it clicks the header only
+    /// when something left the tray collapsed. (It used to click
+    /// unconditionally back when collapsed was the default — an
+    /// unconditional click would now toggle the tray shut instead.)
     async fn expand(container: &HtmlElement) {
+        if container
+            .query_selector(".inflight-tray-body")
+            .unwrap()
+            .is_some()
+        {
+            return;
+        }
         let header = container
             .query_selector(".inflight-tray-header")
             .unwrap()
@@ -1301,6 +1150,52 @@ mod wasm_tests {
             .unwrap();
         header.click();
         next_tick().await;
+    }
+
+    /// The tray starts expanded: a fresh session (no persisted choice)
+    /// must show the live rows with zero interaction — a collapsed
+    /// one-liner hides what the surface exists to show. Collapsing is an
+    /// explicit click and persists as the user's choice.
+    #[wasm_bindgen_test]
+    async fn tray_starts_expanded_and_collapse_persists() {
+        let (container, _state) = mount_tray(|state| {
+            state
+                .agents
+                .update(|agents| agents.push(child_agent("agent-a", "Builder")));
+            state.agent_turn_active.update(|map| {
+                map.insert(AgentId("agent-a".to_owned()), true);
+            });
+        });
+        next_tick().await;
+
+        assert_eq!(
+            count(&container, ".inflight-tray-body"),
+            1,
+            "tray body is visible without any interaction"
+        );
+        let body = text(&container);
+        assert!(
+            body.contains("Builder") && body.contains("Running"),
+            "live rows render immediately on a fresh session: {body}"
+        );
+
+        let header = container
+            .query_selector(".inflight-tray-header")
+            .unwrap()
+            .expect("tray header exists")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        header.click();
+        next_tick().await;
+        assert_eq!(
+            count(&container, ".inflight-tray-body"),
+            0,
+            "clicking the header collapses the tray"
+        );
+        assert!(
+            !load_expanded(),
+            "the explicit collapse persists as the user's choice"
+        );
     }
 
     /// The common case — nothing in flight — must cost zero chrome: no tray
@@ -1388,10 +1283,13 @@ mod wasm_tests {
         );
     }
 
-    /// A failed child is pinned: counted in the collapsed line and named with
-    /// its error in the expanded row. Failures must not scroll away silently.
+    /// Product decision (2026-07): the tray is active-only, so a failed
+    /// child renders nothing here — not a pinned row, not a count. The
+    /// failure's record lives in the transcript (agent error output and
+    /// tool cards), which is where the old pinned-until-dismissed row
+    /// pointed anyway.
     #[wasm_bindgen_test]
-    async fn failed_child_is_pinned_and_named() {
+    async fn failed_child_is_not_shown() {
         let (container, _state) = mount_tray(|state| {
             let mut agent = child_agent("agent-b", "Broken Worker");
             agent.fatal_error = Some("backend crashed".to_owned());
@@ -1399,17 +1297,10 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        let body = text(&container);
-        assert!(
-            body.contains("1 failed"),
-            "collapsed line reports the failure: {body}"
-        );
-
-        expand(&container).await;
-        let body = text(&container);
-        assert!(
-            body.contains("Broken Worker") && body.contains("backend crashed"),
-            "the failed agent is named with its error: {body}"
+        assert_eq!(
+            count(&container, ".inflight-tray"),
+            0,
+            "a failed child renders no tray at all"
         );
     }
 
@@ -1499,56 +1390,50 @@ mod wasm_tests {
         );
     }
 
-    /// Once the command completes, the row surfaces the CLI's summary —
-    /// the only carrier of the exit code — counts as finished, and is
-    /// removed by "Clear finished".
+    /// A command that stops running leaves the tray the moment its terminal
+    /// status lands — active-only means no finished rows and no "Clear
+    /// finished" ceremony. Its exit-code summary lives on the tool card.
     #[wasm_bindgen_test]
-    async fn completed_background_command_shows_summary_and_clears() {
-        let (container, _state) = mount_tray(|state| {
+    async fn completed_background_command_leaves_the_tray() {
+        let (container, state) = mount_tray(|state| {
             seed_progress(
                 state,
-                background_command_progress(
-                    BackgroundTaskStatus::Completed,
-                    Some(
-                        "Background command \"Run repository validation\" completed (exit code 0)",
-                    ),
-                ),
+                background_command_progress(BackgroundTaskStatus::Running, None),
             );
         });
         next_tick().await;
 
         let body = text(&container);
         assert!(
-            body.contains("1 finished"),
-            "a completed command counts as finished: {body}"
+            body.contains("1 running"),
+            "the running command is visible first: {body}"
         );
 
-        expand(&container).await;
-        let body = text(&container);
-        assert!(
-            body.contains("completed (exit code 0)"),
-            "the finished row carries the exit-code summary: {body}"
+        let key = (
+            parent_ref().agent_id,
+            ToolCallId("toolu_bg_bash".to_owned()),
         );
-
-        let clear = container
-            .query_selector(".inflight-tray-clear")
-            .unwrap()
-            .expect("clear button exists")
-            .dyn_into::<HtmlElement>()
-            .unwrap();
-        clear.click();
+        let progress = state
+            .tool_progress
+            .with_untracked(|map| map.get(&key).cloned())
+            .expect("seeded progress entry exists");
+        progress.set(background_command_progress(
+            BackgroundTaskStatus::Completed,
+            Some("Background command \"Run repository validation\" completed (exit code 0)"),
+        ));
         next_tick().await;
+
         assert_eq!(
             count(&container, ".inflight-tray"),
             0,
-            "clearing the only finished command hides the tray"
+            "the command leaves the tray the moment it completes"
         );
     }
 
-    /// A failed background command stays pinned — it must not be swept by
-    /// "Clear finished" — until individually dismissed.
+    /// Product decision (2026-07): failed commands are not shown either —
+    /// the failure's record is the tool card, not the activity hub.
     #[wasm_bindgen_test]
-    async fn failed_background_command_pins_until_dismissed() {
+    async fn failed_background_command_is_not_shown() {
         let (container, _state) = mount_tray(|state| {
             seed_progress(
                 state,
@@ -1557,32 +1442,18 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        let body = text(&container);
-        assert!(
-            body.contains("1 failed"),
-            "a failed command counts as failed: {body}"
-        );
-
-        expand(&container).await;
-        let dismiss = container
-            .query_selector(".inflight-tray-dismiss")
-            .unwrap()
-            .expect("failed command row offers a dismiss action")
-            .dyn_into::<HtmlElement>()
-            .unwrap();
-        dismiss.click();
-        next_tick().await;
         assert_eq!(
             count(&container, ".inflight-tray"),
             0,
-            "dismissing the only failure hides the tray"
+            "a failed command renders no tray at all"
         );
     }
 
-    /// An idle (finished) child counts as finished, and "Clear finished"
-    /// removes it — after which the tray disappears entirely.
+    /// An idle child is not in-flight work: it never appears. (The old
+    /// design counted it as "finished" behind a Clear button; active-only
+    /// removed that state entirely.)
     #[wasm_bindgen_test]
-    async fn clear_finished_removes_idle_child_and_hides_tray() {
+    async fn idle_child_is_not_shown() {
         let (container, _state) = mount_tray(|state| {
             state
                 .agents
@@ -1590,26 +1461,10 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        let body = text(&container);
-        assert!(
-            body.contains("1 finished"),
-            "an idle child counts as finished: {body}"
-        );
-
-        expand(&container).await;
-        let clear = container
-            .query_selector(".inflight-tray-clear")
-            .unwrap()
-            .expect("clear button exists")
-            .dyn_into::<HtmlElement>()
-            .unwrap();
-        clear.click();
-        next_tick().await;
-
         assert_eq!(
             count(&container, ".inflight-tray"),
             0,
-            "clearing the only finished item hides the tray"
+            "an idle child renders no tray at all"
         );
     }
 
@@ -1735,9 +1590,9 @@ mod wasm_tests {
     /// Ported from `agent_control_spawn_card_tracks_live_agent_state`: a
     /// running child renders its live AppState name, Running status, the
     /// streaming preview, and an open action; when its stream and turn end
-    /// the row goes Idle and counts as finished.
+    /// the row leaves the tray — active-only, no finished state.
     #[wasm_bindgen_test]
-    async fn running_child_shows_streaming_preview_then_idles() {
+    async fn running_child_shows_streaming_preview_then_leaves_when_idle() {
         let (container, state) = mount_tray(|state| {
             state
                 .agents
@@ -1772,11 +1627,10 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        let body = text(&container);
-        assert!(body.contains("Idle"), "agent row goes idle: {body}");
-        assert!(
-            body.contains("1 finished"),
-            "an idle child counts as finished: {body}"
+        assert_eq!(
+            count(&container, ".inflight-tray"),
+            0,
+            "the row leaves the tray the moment the child goes idle"
         );
     }
 
@@ -1815,6 +1669,7 @@ mod wasm_tests {
             let mut info = child_agent("agent-a", "Awaited Worker");
             info.activity_summary = fresh_summary("Refactoring the auth module and adding tests");
             state.agents.update(|agents| agents.push(info));
+            set_turn_active(state, "agent-a");
         });
         next_tick().await;
         expand(&container).await;
@@ -1889,6 +1744,7 @@ mod wasm_tests {
             let mut info = child_agent("agent-a", "Awaited Worker");
             info.activity_summary = fresh_summary("Writing the migration");
             state.agents.update(|agents| agents.push(info));
+            set_turn_active(state, "agent-a");
             seed_stats(
                 state,
                 "agent-a",
@@ -1926,6 +1782,7 @@ mod wasm_tests {
             let mut info = child_agent("agent-a", "Awaited Worker");
             info.activity_summary = AgentActivitySummaryState::Disabled;
             state.agents.update(|agents| agents.push(info));
+            set_turn_active(state, "agent-a");
             seed_stats(
                 state,
                 "agent-a",
@@ -1974,6 +1831,7 @@ mod wasm_tests {
             let mut info = child_agent("agent-a", "Awaited Worker");
             info.activity_summary = AgentActivitySummaryState::Empty;
             state.agents.update(|agents| agents.push(info));
+            set_turn_active(state, "agent-a");
             seed_stats(
                 state,
                 "agent-a",
@@ -1999,6 +1857,7 @@ mod wasm_tests {
             let mut info = child_agent("agent-a", "Awaited Worker");
             info.activity_summary = fresh_summary("Doing work");
             state.agents.update(|agents| agents.push(info));
+            set_turn_active(state, "agent-a");
             seed_stats(
                 state,
                 "agent-a",
@@ -2032,6 +1891,7 @@ mod wasm_tests {
             let mut info = child_agent("agent-a", "Awaited Worker");
             info.activity_summary = AgentActivitySummaryState::Disabled;
             state.agents.update(|agents| agents.push(info));
+            set_turn_active(state, "agent-a");
             seed_stats(
                 state,
                 "agent-a",
@@ -2062,6 +1922,7 @@ mod wasm_tests {
             let mut info = child_agent("agent-a", "Awaited Worker");
             info.activity_summary = AgentActivitySummaryState::Disabled;
             state.agents.update(|agents| agents.push(info));
+            set_turn_active(state, "agent-a");
             seed_stats(
                 state,
                 "agent-a",
@@ -2126,6 +1987,7 @@ mod wasm_tests {
             let mut info = child_agent("agent-a", "Awaited Worker");
             info.activity_summary = AgentActivitySummaryState::Disabled;
             state.agents.update(|agents| agents.push(info));
+            set_turn_active(state, "agent-a");
             seed_stats(
                 state,
                 "agent-a",
@@ -2172,6 +2034,7 @@ mod wasm_tests {
             let mut info = child_agent("agent-a", "Awaited Worker");
             info.activity_summary = AgentActivitySummaryState::Disabled;
             state.agents.update(|agents| agents.push(info));
+            set_turn_active(state, "agent-a");
             seed_stats_on_host(
                 state,
                 "other-host",
@@ -2234,6 +2097,60 @@ mod wasm_tests {
         assert!(body.contains("Explore running"), "live status: {body}");
         assert!(body.contains("last tool: Read"), "last tool: {body}");
         assert!(body.contains("12 tool calls"), "tool count: {body}");
+    }
+
+    /// Each child row carries its backend + model provenance. The backend
+    /// comes from the registry record and always renders; the model prefers
+    /// the live stream's announcement (what is actually serving the turn)
+    /// over the session-settings value, and is omitted — backend alone —
+    /// when neither source knows it. Never a guessed model.
+    #[wasm_bindgen_test]
+    async fn child_row_shows_backend_and_model() {
+        let (container, state) = mount_tray(|state| {
+            state
+                .agents
+                .update(|agents| agents.push(child_agent("agent-a", "Worker")));
+            set_turn_active(state, "agent-a");
+        });
+        next_tick().await;
+        expand(&container).await;
+
+        let body = text(&container);
+        assert!(
+            body.contains("Codex"),
+            "the backend renders even before any model is known: {body}"
+        );
+
+        state.agent_session_settings.update(|map| {
+            let mut values = protocol::SessionSettingsValues::default();
+            values.0.insert(
+                "model".to_owned(),
+                protocol::SessionSettingValue::String("gpt-5.3-codex".to_owned()),
+            );
+            map.insert(AgentId("agent-a".to_owned()), values);
+        });
+        next_tick().await;
+        let body = text(&container);
+        assert!(
+            body.contains("Codex \u{b7} gpt-5.3-codex"),
+            "the session-settings model renders with the backend: {body}"
+        );
+
+        let mut stream = streaming_state("working on it");
+        stream.model = Some("gpt-5.3-spark".to_owned());
+        state.streaming_text.update(|map| {
+            map.insert(AgentId("agent-a".to_owned()), stream);
+        });
+        next_tick().await;
+        let body = text(&container);
+        assert!(
+            body.contains("Codex \u{b7} gpt-5.3-spark"),
+            "the live stream's model wins over session settings: {body}"
+        );
+        assert!(
+            !body.contains("gpt-5.3-codex"),
+            "the settings model is replaced, not shown alongside: {body}"
+        );
     }
 
     /// The open action on a child row opens that agent's chat — same
@@ -2319,6 +2236,7 @@ mod wasm_tests {
         let mut info = child_agent("agent-a", "Worker");
         info.activity_summary = fresh_summary(SUMMARY);
         state.agents.update(|agents| agents.push(info));
+        set_turn_active(&state, "agent-a");
         seed_progress(
             &state,
             control_progress("tyde_spawn_agent", AgentControlProgressKind::Spawn),
@@ -2358,35 +2276,6 @@ mod wasm_tests {
             count(&container, ".tool-live-agent-status"),
             1,
             "exactly one live status badge on screen — the tray's"
-        );
-    }
-
-    /// A failed child's dismiss control hides it; with nothing else in
-    /// flight the tray disappears. Failures are pinned until this explicit
-    /// dismissal — never auto-cleared.
-    #[wasm_bindgen_test]
-    async fn dismissing_failed_child_hides_it() {
-        let (container, _state) = mount_tray(|state| {
-            let mut agent = child_agent("agent-b", "Broken Worker");
-            agent.fatal_error = Some("backend crashed".to_owned());
-            state.agents.update(|agents| agents.push(agent));
-        });
-        next_tick().await;
-        expand(&container).await;
-
-        let dismiss = container
-            .query_selector(".inflight-tray-dismiss")
-            .unwrap()
-            .expect("failed row exposes a dismiss control")
-            .dyn_into::<HtmlElement>()
-            .unwrap();
-        dismiss.click();
-        next_tick().await;
-
-        assert_eq!(
-            count(&container, ".inflight-tray"),
-            0,
-            "dismissing the only failure hides the tray"
         );
     }
 }

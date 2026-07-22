@@ -748,12 +748,13 @@ fn agent_control_header_detail(progress: &AgentControlProgress) -> String {
     }
 }
 
-/// Receipt line for a spawn/await card: the referenced agents as open-agent
-/// actions, plus a pointer to the In-flight tray. Deliberately **not** a live
-/// monitor — per-agent status, previews, and stats render exactly once, in
-/// the tray. Rendering them here too is the spawn/await duplication the tray
-/// was introduced to remove: both cards derived identical live rows from the
-/// same global signals, so every child agent appeared twice on screen.
+/// Receipt list for a spawn/await card: one row per referenced agent — its
+/// live name with an "Open agent" action — plus a pointer to the In-flight
+/// tray. Deliberately **not** a live monitor — per-agent status, previews,
+/// and stats render exactly once, in the tray. Rendering them here too is
+/// the spawn/await duplication the tray was introduced to remove: both cards
+/// derived identical live rows from the same global signals, so every child
+/// agent appeared twice on screen.
 fn agent_control_receipt(
     parent_ref: Signal<Option<ActiveAgentRef>>,
     progress: AgentControlProgress,
@@ -794,13 +795,18 @@ fn agent_control_receipt(
                         open_child_agent(&state, &parent.host_id, &agent_id);
                     };
                     view! {
-                        <button
-                            type="button"
-                            class="tool-live-link tool-live-agent-receipt-link"
-                            on:click=on_open
-                        >
-                            {move || display_name.get()}
-                        </button>
+                        <div class="tool-live-agent-receipt-row">
+                            <span class="tool-live-agent-name">
+                                {move || display_name.get()}
+                            </span>
+                            <button
+                                type="button"
+                                class="tool-live-link tool-live-agent-receipt-link"
+                                on:click=on_open
+                            >
+                                "Open agent"
+                            </button>
+                        </div>
                     }
                 }
             </For>
@@ -1930,10 +1936,56 @@ mod live_card_wasm_tests {
         assert_eq!(opened.host_id, "host-1");
     }
 
+    /// The receipt is a vertical list: one row per referenced agent, each
+    /// carrying the agent's live name and its own "Open agent" action. This
+    /// replaces the inline chip run whose auto-margin buttons scattered
+    /// across the full card width.
+    #[wasm_bindgen_test]
+    async fn receipt_lists_each_agent_on_its_own_row() {
+        let entry = completed_other_request("toolu_agent_control", "tyde_await_agents");
+        let progress = ToolProgressData {
+            tool_call_id: "toolu_agent_control".to_owned(),
+            tool_name: "tyde_await_agents".to_owned(),
+            update: ToolProgressUpdate::AgentControl(AgentControlProgress {
+                progress_kind: AgentControlProgressKind::Await,
+                agents: vec![
+                    AgentControlAgentRef {
+                        agent_id: AgentId("agent-a".to_owned()),
+                        name: Some("Codex design".to_owned()),
+                    },
+                    AgentControlAgentRef {
+                        agent_id: AgentId("agent-b".to_owned()),
+                        name: Some("Claude design".to_owned()),
+                    },
+                ],
+            }),
+        };
+        let (container, _state) = mount_card(entry, Some(progress));
+        next_tick().await;
+
+        assert_eq!(
+            count(&container, ".tool-live-agent-receipt-row"),
+            2,
+            "one receipt row per referenced agent"
+        );
+        assert_eq!(
+            count(
+                &container,
+                ".tool-live-agent-receipt-row .tool-live-agent-receipt-link"
+            ),
+            2,
+            "each row carries its own open action"
+        );
+        let body = text(&container);
+        assert!(
+            body.contains("Codex design") && body.contains("Claude design"),
+            "every agent is named in the list: {body}"
+        );
+    }
+
     /// A native backend's wait card still exposes a working open action for
-    /// the awaited child — now as the receipt's named link rather than a
-    /// per-row "Open agent" button. The open contract is unchanged; the
-    /// label moved onto the agent's live name.
+    /// the awaited child. The open contract is unchanged; the action is the
+    /// row's "Open agent" button beside the agent's live name.
     #[wasm_bindgen_test]
     async fn native_codex_wait_card_opens_awaited_agent() {
         let entry = completed_other_request("native-wait", "wait");
