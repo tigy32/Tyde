@@ -170,6 +170,13 @@ enum AgentCommand {
         max_summary_bytes: usize,
         reply: oneshot::Sender<Result<CompactionSummary, String>>,
     },
+    CompactIfInactive {
+        expected_activity_counter: u64,
+        summary_prompt: String,
+        max_summary_bytes: usize,
+        accepted: oneshot::Sender<Result<(), String>>,
+        reply: oneshot::Sender<Result<CompactionSummary, String>>,
+    },
     ReleaseCompaction {
         reply: oneshot::Sender<()>,
     },
@@ -970,6 +977,37 @@ impl AgentHandle {
             return CompactionStart::Closed;
         }
         CompactionStart::Started(reply_rx)
+    }
+
+    pub async fn begin_compact_if_inactive(
+        &self,
+        expected_activity_counter: u64,
+        summary_prompt: String,
+        max_summary_bytes: usize,
+    ) -> CompactionStart {
+        if !self.accepting_input.load(Ordering::SeqCst) {
+            return CompactionStart::Rejected("agent is not accepting input".to_owned());
+        }
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(AgentCommand::CompactIfInactive {
+                expected_activity_counter,
+                summary_prompt,
+                max_summary_bytes,
+                accepted: accepted_tx,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return CompactionStart::Closed;
+        }
+        match accepted_rx.await {
+            Ok(Ok(())) => CompactionStart::Started(reply_rx),
+            Ok(Err(error)) => CompactionStart::Rejected(error),
+            Err(_) => CompactionStart::Closed,
+        }
     }
 
     pub async fn release_compaction(&self) -> bool {
@@ -2227,6 +2265,13 @@ pub(crate) fn spawn_agent_actor(
                         AgentCommand::Compact { reply, .. } => {
                             let _ = reply.send(Err("agent backend is starting".to_owned()));
                         }
+                        AgentCommand::CompactIfInactive {
+                            accepted, reply, ..
+                        } => {
+                            let error = "agent backend is starting".to_owned();
+                            let _ = accepted.send(Err(error.clone()));
+                            let _ = reply.send(Err(error));
+                        }
                         AgentCommand::ReleaseCompaction { reply } => {
                             let _ = reply.send(());
                         }
@@ -3283,6 +3328,14 @@ pub(crate) fn spawn_agent_actor(
                                         }
                                         _ => None,
                                     };
+                                    if !is_tool_response {
+                                        status_handle
+                                            .update(|status| {
+                                                status.activity_counter =
+                                                    status.activity_counter.saturating_add(1);
+                                            })
+                                            .await;
+                                    }
                                     if in_turn && !is_tool_response {
                                         let queued_message_id =
                                             QueuedMessageId(Uuid::new_v4().to_string());
@@ -3817,6 +3870,85 @@ pub(crate) fn spawn_agent_actor(
                                     )
                                     .await;
                                 }
+                            }
+                        }
+                        AgentCommand::CompactIfInactive {
+                            expected_activity_counter,
+                            summary_prompt,
+                            max_summary_bytes,
+                            accepted,
+                            reply,
+                        } => {
+                            let live_activity_counter =
+                                status_handle.snapshot().await.activity_counter;
+                            let reject = if live_activity_counter != expected_activity_counter {
+                                Some(format!(
+                                    "agent activity changed before automatic compaction (expected {expected_activity_counter}, current {live_activity_counter})"
+                                ))
+                            } else if matches!(lifecycle, ActorLifecycle::Closing) {
+                                Some("agent is closing".to_owned())
+                            } else if current_start.origin == AgentOrigin::BackendNative {
+                                Some("backend-native agents cannot be compacted".to_owned())
+                            } else if active_compaction.is_some() || compaction_blocked {
+                                Some("agent compaction is already in progress".to_owned())
+                            } else if current_session_id.is_none() {
+                                Some("agent has no session to compact".to_owned())
+                            } else if in_turn {
+                                Some("agent is busy".to_owned())
+                            } else if !queue.is_empty() {
+                                Some("agent has queued work".to_owned())
+                            } else {
+                                None
+                            };
+                            if let Some(error) = reject {
+                                let _ = accepted.send(Err(error.clone()));
+                                let _ = reply.send(Err(error));
+                                continue;
+                            }
+
+                            compaction_blocked = true;
+                            in_turn = true;
+                            idle_transition_armed = false;
+                            active_compaction = Some(ActiveCompaction {
+                                reply,
+                                summary: String::new(),
+                                max_summary_bytes: max_summary_bytes
+                                    .clamp(1, MAX_COMPACTION_SUMMARY_BYTES),
+                                error: None,
+                            });
+                            status_handle
+                                .update(|s| {
+                                    s.is_thinking = true;
+                                    s.turn_completed = false;
+                                    s.last_error = None;
+                                    s.activity_counter = s.activity_counter.saturating_add(1);
+                                })
+                                .await;
+                            let _ = accepted.send(Ok(()));
+                            let outcome = backend
+                                .as_ref()
+                                .expect("backend must exist while actor is running")
+                                .send_with_outcome(AgentInput::SendMessage(SendMessagePayload {
+                                    message: summary_prompt,
+                                    images: None,
+                                    origin: Some(MessageOrigin::User),
+                                    tool_response: None,
+                                }))
+                                .await;
+                            if !matches!(outcome, SendOutcome::Accepted) {
+                                let error = match outcome {
+                                    SendOutcome::Busy(_) => {
+                                        "agent backend rejected the compaction summary because it is busy"
+                                    }
+                                    SendOutcome::Closed => {
+                                        "agent backend closed before compaction could start"
+                                    }
+                                    SendOutcome::Accepted => unreachable!(),
+                                };
+                                finish_active_compaction_with_error(
+                                    &mut active_compaction,
+                                    error.to_owned(),
+                                );
                             }
                         }
                         AgentCommand::Compact {
@@ -4534,6 +4666,11 @@ pub(crate) fn spawn_relay_agent_actor(
                         AgentCommand::Compact { reply, .. } => {
                             let _ = reply.send(Err("backend-native agents cannot be compacted".to_owned()));
                         }
+                        AgentCommand::CompactIfInactive { accepted, reply, .. } => {
+                            let error = "backend-native agents cannot be compacted".to_owned();
+                            let _ = accepted.send(Err(error.clone()));
+                            let _ = reply.send(Err(error));
+                        }
                         AgentCommand::ReleaseCompaction { reply } => {
                             let _ = reply.send(());
                         }
@@ -4946,6 +5083,11 @@ async fn park_terminal_agent(
             AgentCommand::Compact { reply, .. } => {
                 let _ = reply.send(Err("agent is not running".to_owned()));
             }
+            AgentCommand::CompactIfInactive { accepted, reply, .. } => {
+                let error = "agent is not running".to_owned();
+                let _ = accepted.send(Err(error.clone()));
+                let _ = reply.send(Err(error));
+            }
             AgentCommand::ReleaseCompaction { reply } => {
                 let _ = reply.send(());
             }
@@ -5077,6 +5219,11 @@ async fn park_relay_terminal_agent(
             }
             AgentCommand::Compact { reply, .. } => {
                 let _ = reply.send(Err("backend-native agents cannot be compacted".to_owned()));
+            }
+            AgentCommand::CompactIfInactive { accepted, reply, .. } => {
+                let error = "backend-native agents cannot be compacted".to_owned();
+                let _ = accepted.send(Err(error.clone()));
+                let _ = reply.send(Err(error));
             }
             AgentCommand::ReleaseCompaction { reply } => {
                 let _ = reply.send(());
@@ -8194,6 +8341,11 @@ mod tests {
                     }
                     AgentCommand::Compact { reply, .. } => {
                         let _ = reply.send(Err("agent is not running".to_owned()));
+                    }
+                    AgentCommand::CompactIfInactive { accepted, reply, .. } => {
+                        let error = "agent is not running".to_owned();
+                        let _ = accepted.send(Err(error.clone()));
+                        let _ = reply.send(Err(error));
                     }
                     AgentCommand::ReleaseCompaction { reply } => {
                         let _ = reply.send(());

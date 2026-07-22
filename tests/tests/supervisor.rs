@@ -1,15 +1,16 @@
 //! Integration coverage for the agent supervisor: the hidden background
 //! verdict that kicks stalled agents and optionally auto-compacts finished
 //! ones. Runs entirely on the mock backend — the mock supervision verdict is
-//! Continue when an error is in context and Done otherwise.
+//! Continue when an error is in context, AwaitingUser for its explicit
+//! sentinel, and Done for its explicit sentinel or legacy default.
 
 mod fixture;
 
 use fixture::Fixture;
 use protocol::{
-    AgentClosedPayload, BackendKind, ChatEvent, Envelope, FrameKind, HostSettingValue,
-    HostSettingsPayload, MessageSender, NewAgentPayload, SUPERVISOR_MESSAGE_PREFIX,
-    SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
+    AgentClosedPayload, BackendKind, ChatEvent, CommandErrorPayload, Envelope, FrameKind,
+    HostSettingErrorTarget, HostSettingValue, HostSettingsPayload, MessageSender, NewAgentPayload,
+    SUPERVISOR_MESSAGE_PREFIX, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
 };
 use std::time::Duration;
 
@@ -19,6 +20,9 @@ const MOCK_ERROR_WITHOUT_IDLE_SENTINEL: &str = "__mock_error_without_idle__";
 /// them, so supervised sessions must run with bubbles on.
 const MOCK_USER_BUBBLES_SENTINEL: &str = "__mock_user_bubbles__";
 const MOCK_CONTEXT_250K_SENTINEL: &str = "__mock_context_250k__";
+const MOCK_SUPERVISOR_DONE: &str = "__mock_supervisor_done__";
+const MOCK_SUPERVISOR_AWAITING_USER: &str = "__mock_supervisor_awaiting_user__";
+const MOCK_ACTIVE_IDLE_CYCLE: &str = "__mock_active_idle_cycle__";
 
 /// The supervisor debounces 3s after an idle transition before reading
 /// context, so supervisor-driven frames need a longer wait than ordinary
@@ -125,6 +129,21 @@ async fn spawn_supervised_agent(
     name: &str,
     report_context: bool,
 ) -> NewAgentPayload {
+    spawn_supervised_agent_with_verdict(
+        fixture,
+        name,
+        report_context,
+        MOCK_SUPERVISOR_DONE,
+    )
+    .await
+}
+
+async fn spawn_supervised_agent_with_verdict(
+    fixture: &mut Fixture,
+    name: &str,
+    report_context: bool,
+    verdict_sentinel: &str,
+) -> NewAgentPayload {
     let context_sentinel = if report_context {
         MOCK_CONTEXT_250K_SENTINEL
     } else {
@@ -139,7 +158,9 @@ async fn spawn_supervised_agent(
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/test".to_owned()],
-                prompt: format!("hello {MOCK_USER_BUBBLES_SENTINEL} {context_sentinel}"),
+                prompt: format!(
+                    "hello {MOCK_USER_BUBBLES_SENTINEL} {context_sentinel} {verdict_sentinel}"
+                ),
                 images: None,
                 backend_kind: BackendKind::Claude,
                 launch_profile_id: None,
@@ -173,6 +194,10 @@ async fn spawn_supervised_agent(
 }
 
 async fn auto_compaction_fixture(threshold: u64) -> Fixture {
+    auto_compaction_fixture_with_delay(threshold, 1).await
+}
+
+async fn auto_compaction_fixture_with_delay(threshold: u64, delay_seconds: u32) -> Fixture {
     let mut fixture = Fixture::new().await;
     apply_supervisor_setting(
         &mut fixture,
@@ -182,6 +207,13 @@ async fn auto_compaction_fixture(threshold: u64) -> Fixture {
     apply_supervisor_setting(
         &mut fixture,
         HostSettingValue::SupervisorAutoCompactOnSuccess { enabled: true },
+    )
+    .await;
+    apply_supervisor_setting(
+        &mut fixture,
+        HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds {
+            seconds: delay_seconds,
+        },
     )
     .await;
     apply_supervisor_setting(
@@ -275,6 +307,61 @@ async fn supervisor_auto_compaction_skips_unavailable_context_at_zero_threshold(
 }
 
 #[tokio::test]
+async fn supervisor_and_auto_compact_gates_fail_independently() {
+    fixture::init_tracing();
+
+    let mut supervisor_off = Fixture::new().await;
+    apply_supervisor_setting(
+        &mut supervisor_off,
+        HostSettingValue::SupervisorAutoCompactOnSuccess { enabled: true },
+    )
+    .await;
+    apply_supervisor_setting(
+        &mut supervisor_off,
+        HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 1 },
+    )
+    .await;
+    apply_supervisor_setting(
+        &mut supervisor_off,
+        HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 200_000 },
+    )
+    .await;
+    spawn_supervised_agent(&mut supervisor_off, "supervisor-off-agent", true).await;
+    assert_no_envelope(
+        &mut supervisor_off.client,
+        Duration::from_secs(5),
+        "auto-compaction while the supervisor is disabled",
+        |env| env.kind == FrameKind::NewAgent,
+    )
+    .await;
+
+    let mut auto_compact_off = Fixture::new().await;
+    apply_supervisor_setting(
+        &mut auto_compact_off,
+        HostSettingValue::SupervisorEnabled { enabled: true },
+    )
+    .await;
+    apply_supervisor_setting(
+        &mut auto_compact_off,
+        HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 1 },
+    )
+    .await;
+    apply_supervisor_setting(
+        &mut auto_compact_off,
+        HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 200_000 },
+    )
+    .await;
+    spawn_supervised_agent(&mut auto_compact_off, "auto-compact-off-agent", true).await;
+    assert_no_envelope(
+        &mut auto_compact_off.client,
+        Duration::from_secs(5),
+        "auto-compaction while auto-compact is disabled",
+        |env| env.kind == FrameKind::NewAgent,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn supervisor_auto_compaction_skips_context_below_threshold() {
     fixture::init_tracing();
     let mut fixture = auto_compaction_fixture(300_000).await;
@@ -350,6 +437,149 @@ async fn supervisor_auto_compaction_runs_above_threshold_once() {
     .await;
 }
 
+#[tokio::test]
+async fn accepted_user_activity_invalidates_the_old_compaction_interval() {
+    fixture::init_tracing();
+    let mut fixture = auto_compaction_fixture_with_delay(200_000, 6).await;
+    let original = spawn_supervised_agent(&mut fixture, "supervised-race-agent", true).await;
+
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    fixture
+        .client
+        .send_message(
+            &original.instance_stream,
+            format!(
+                "continue {MOCK_USER_BUBBLES_SENTINEL} {MOCK_CONTEXT_250K_SENTINEL} {MOCK_SUPERVISOR_DONE} {MOCK_ACTIVE_IDLE_CYCLE}"
+            ),
+        )
+        .await
+        .expect("send activity before the old expiry");
+    let stream = original.instance_stream.clone();
+    wait_for_envelope(
+        &mut fixture.client,
+        Duration::from_secs(5),
+        "assistant response after intervening activity",
+        |env| is_assistant_message_containing(env, &stream, "mock backend response to: continue"),
+    )
+    .await;
+
+    assert_no_envelope(
+        &mut fixture.client,
+        Duration::from_secs(4),
+        "replacement from the stale first inactivity interval",
+        |env| env.kind == FrameKind::NewAgent,
+    )
+    .await;
+    wait_for_envelope(
+        &mut fixture.client,
+        SUPERVISION_WAIT,
+        "replacement after the next full inactivity interval",
+        |env| env.kind == FrameKind::NewAgent,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn accepted_done_uses_live_auto_compact_and_threshold_settings() {
+    fixture::init_tracing();
+    let mut fixture = Fixture::new().await;
+    apply_supervisor_setting(
+        &mut fixture,
+        HostSettingValue::SupervisorEnabled { enabled: true },
+    )
+    .await;
+    apply_supervisor_setting(
+        &mut fixture,
+        HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 1 },
+    )
+    .await;
+    apply_supervisor_setting(
+        &mut fixture,
+        HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 300_000 },
+    )
+    .await;
+    spawn_supervised_agent(&mut fixture, "live-settings-agent", true).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    apply_supervisor_setting(
+        &mut fixture,
+        HostSettingValue::SupervisorAutoCompactOnSuccess { enabled: true },
+    )
+    .await;
+    assert_no_envelope(
+        &mut fixture.client,
+        Duration::from_secs(1),
+        "compaction while live context is below the live threshold",
+        |env| env.kind == FrameKind::NewAgent,
+    )
+    .await;
+    apply_supervisor_setting(
+        &mut fixture,
+        HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 200_000 },
+    )
+    .await;
+    wait_for_envelope(
+        &mut fixture.client,
+        SUPERVISION_WAIT,
+        "compaction after the live threshold becomes eligible",
+        |env| env.kind == FrameKind::NewAgent,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn terminated_agent_cannot_compact_during_the_delay() {
+    fixture::init_tracing();
+    let mut fixture = auto_compaction_fixture_with_delay(200_000, 6).await;
+    let agent = spawn_supervised_agent(&mut fixture, "terminated-delay-agent", true).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    fixture
+        .client
+        .close_agent(&agent.instance_stream)
+        .await
+        .expect("close agent during inactivity delay");
+    assert_no_envelope(
+        &mut fixture.client,
+        Duration::from_secs(4),
+        "auto-compaction after termination during the delay",
+        |env| env.kind == FrameKind::NewAgent,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn supervisor_awaiting_user_neither_kicks_nor_compacts() {
+    fixture::init_tracing();
+    let mut fixture = auto_compaction_fixture(200_000).await;
+    let mut streams = Vec::new();
+    for (name, waiting_case) in [
+        ("awaiting-feedback", "feedback requested"),
+        ("awaiting-clarification", "clarification requested"),
+        ("awaiting-approval", "approval or decision requested"),
+        ("awaiting-plan-review", "plan presented for review"),
+    ] {
+        let agent = spawn_supervised_agent_with_verdict(
+            &mut fixture,
+            name,
+            true,
+            &format!("{MOCK_SUPERVISOR_AWAITING_USER} {waiting_case}"),
+        )
+        .await;
+        streams.push(agent.instance_stream);
+    }
+
+    assert_no_envelope(
+        &mut fixture.client,
+        QUIET_WAIT,
+        "kick or auto-compaction for an awaiting-user verdict",
+        |env| {
+            env.kind == FrameKind::NewAgent
+                || streams.iter().any(|stream| is_supervisor_kick(env, stream))
+        },
+    )
+    .await;
+}
+
 /// Settings sanity over the wire: every supervisor knob committed through
 /// SetSetting must round-trip into the fanned-out HostSettings payload.
 #[tokio::test]
@@ -360,6 +590,7 @@ async fn supervisor_settings_round_trip_over_the_wire() {
     for setting in [
         HostSettingValue::SupervisorEnabled { enabled: true },
         HostSettingValue::SupervisorAutoCompactOnSuccess { enabled: true },
+        HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 19 },
         HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 225_000 },
         HostSettingValue::SupervisorMaxKicksPerTask { count: 7 },
         HostSettingValue::SupervisorRetryAttempts { count: 2 },
@@ -390,9 +621,48 @@ async fn supervisor_settings_round_trip_over_the_wire() {
     assert!(payload.settings.supervisor.enabled);
     assert!(payload.settings.supervisor.auto_compact_on_success);
     assert_eq!(
-        payload.settings.supervisor.auto_compact_min_context_tokens,
+        payload
+            .settings
+            .supervisor
+            .auto_compact_inactivity_delay_seconds,
+        19
+    );
+    assert_eq!(
+        payload
+            .settings
+            .supervisor
+            .auto_compact_min_context_tokens,
         225_000
     );
     assert_eq!(payload.settings.supervisor.max_kicks_per_task, 7);
     assert_eq!(payload.settings.supervisor.retry_attempts, 3);
+}
+
+#[tokio::test]
+async fn invalid_supervisor_delay_returns_typed_setting_target() {
+    fixture::init_tracing();
+    let mut fixture = Fixture::new().await;
+    for seconds in [0_u32, 86_401] {
+        fixture
+            .client
+            .set_setting(SetSettingPayload {
+                setting: HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds {
+                    seconds,
+                },
+            })
+            .await
+            .expect("send invalid delay setting");
+        let envelope = wait_for_envelope(
+            &mut fixture.client,
+            Duration::from_secs(5),
+            "typed invalid inactivity delay error",
+            |envelope| envelope.kind == FrameKind::CommandError,
+        )
+        .await;
+        let error: CommandErrorPayload = envelope.parse_payload().expect("parse CommandError");
+        assert_eq!(
+            error.setting_target,
+            Some(HostSettingErrorTarget::SupervisorAutoCompactInactivityDelaySeconds)
+        );
+    }
 }

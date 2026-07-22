@@ -360,10 +360,63 @@ struct SupervisorSettingsSignal {
     epoch: u64,
 }
 
-#[derive(Default)]
 struct SupervisorSchedulerEntry {
-    was_active: bool,
-    in_flight: bool,
+    last_activity_counter: u64,
+    phase: SupervisorPhase,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SupervisionBaseline {
+    last_user_message: String,
+    kicks_since_user_message: u32,
+    session_id: Option<SessionId>,
+}
+
+enum SupervisorPhase {
+    Active,
+    Debouncing {
+        idle_since: Instant,
+    },
+    VerdictInFlight {
+        idle_since: Instant,
+        settings_epoch: u64,
+        baseline: SupervisionBaseline,
+    },
+    DoneAuthorized {
+        idle_since: Instant,
+        baseline: SupervisionBaseline,
+        last_gate_evaluation_epoch: Option<u64>,
+    },
+    AwaitingUser {
+        idle_since: Instant,
+    },
+    Dormant {
+        idle_since: Instant,
+    },
+    CompactionPending {
+        idle_since: Instant,
+    },
+    Compacting,
+}
+
+struct SupervisorVerdictTaskResult {
+    agent_id: AgentId,
+    activity_counter: u64,
+    settings_epoch: u64,
+    baseline: SupervisionBaseline,
+    result: Result<crate::agent::supervisor::SupervisionVerdict, String>,
+}
+
+enum SupervisorCompactionTaskEvent {
+    Started {
+        agent_id: AgentId,
+        activity_counter: u64,
+        accepted: bool,
+    },
+    Finished {
+        agent_id: AgentId,
+        activity_counter: u64,
+    },
 }
 
 #[derive(Clone)]
@@ -2943,7 +2996,7 @@ impl HostHandle {
         stream: Stream,
     ) -> AppResult<()> {
         let Some(compaction) = self
-            .begin_agent_compaction(agent_id, payload, stream)
+            .begin_agent_compaction(agent_id, payload, stream, None)
             .await?
         else {
             return Ok(());
@@ -2953,6 +3006,31 @@ impl HostHandle {
             host.finish_agent_compaction(compaction).await;
         });
         Ok(())
+    }
+
+    async fn compact_agent_if_inactive_in_background(
+        &self,
+        agent_id: AgentId,
+        expected_activity_counter: u64,
+        payload: AgentCompactPayload,
+        stream: Stream,
+    ) -> AppResult<bool> {
+        let Some(compaction) = self
+            .begin_agent_compaction(
+                agent_id,
+                payload,
+                stream,
+                Some(expected_activity_counter),
+            )
+            .await?
+        else {
+            return Ok(false);
+        };
+        let host = self.clone();
+        tokio::spawn(async move {
+            host.finish_agent_compaction(compaction).await;
+        });
+        Ok(true)
     }
 
     pub(crate) async fn compact_team(
@@ -2983,7 +3061,7 @@ impl HostHandle {
                 max_summary_bytes: payload.max_summary_bytes,
             };
             match self
-                .begin_agent_compaction(target_agent_id.clone(), agent_payload, agent_stream)
+                .begin_agent_compaction(target_agent_id.clone(), agent_payload, agent_stream, None)
                 .await?
             {
                 Some(compaction) => {
@@ -3188,7 +3266,7 @@ impl HostHandle {
         stream: Stream,
     ) -> AppResult<()> {
         let Some(compaction) = self
-            .begin_agent_compaction(agent_id, payload, stream)
+            .begin_agent_compaction(agent_id, payload, stream, None)
             .await?
         else {
             return Ok(());
@@ -3202,6 +3280,7 @@ impl HostHandle {
         agent_id: AgentId,
         payload: AgentCompactPayload,
         stream: Stream,
+        expected_activity_counter: Option<u64>,
     ) -> AppResult<Option<AgentCompaction>> {
         let summary_prompt = payload
             .summary_prompt
@@ -3322,20 +3401,19 @@ impl HostHandle {
             return Ok(None);
         }
 
-        send_agent_compact_notify(
-            &stream,
-            AgentCompactNotifyPayload {
-                status: AgentCompactStatus::Started,
-                old_agent_id: agent_id.clone(),
-                old_session_id: Some(old_session_id.clone()),
-                new_agent_id: None,
-                new_session_id: None,
-                summary_preview: None,
-                message: None,
-            },
-        );
-
-        let summary_rx = match agent_handle.begin_compact(summary_prompt, max_summary_bytes) {
+        let compaction_start = match expected_activity_counter {
+            Some(expected_activity_counter) => {
+                agent_handle
+                    .begin_compact_if_inactive(
+                        expected_activity_counter,
+                        summary_prompt,
+                        max_summary_bytes,
+                    )
+                    .await
+            }
+            None => agent_handle.begin_compact(summary_prompt, max_summary_bytes),
+        };
+        let summary_rx = match compaction_start {
             CompactionStart::Started(summary_rx) => summary_rx,
             CompactionStart::Rejected(error) => {
                 send_agent_compact_notify(
@@ -3368,6 +3446,18 @@ impl HostHandle {
                 return Ok(None);
             }
         };
+        send_agent_compact_notify(
+            &stream,
+            AgentCompactNotifyPayload {
+                status: AgentCompactStatus::Started,
+                old_agent_id: agent_id.clone(),
+                old_session_id: Some(old_session_id.clone()),
+                new_agent_id: None,
+                new_session_id: None,
+                summary_preview: None,
+                message: None,
+            },
+        );
         Ok(Some(AgentCompaction {
             agent_id,
             agent_handle,
@@ -12879,49 +12969,132 @@ fn spawn_agent_activity_summary_task(host: HostHandle) {
     }
 }
 
-/// Watches for active→idle agent transitions and runs one hidden supervision
-/// verdict per transition: the supervisor either accepts the turn as done
-/// (optionally auto-compacting the agent) or sends a follow-up message that
-/// kicks the agent back to work. Fully settings-gated; supervision failures
-/// never affect the supervised agent.
+/// Watches supervised agents with one scheduler-owned inactivity phase machine.
+/// Model verdicts and compaction work run in bounded detached tasks, but this
+/// task alone owns generations, phases, idle timestamps, and deadlines.
 fn spawn_agent_supervisor_task(host: HostHandle) {
     let worker = async move {
         let mut status_rx = host.subscribe_agent_status_changes().await;
         let mut settings_rx = host.supervisor_settings_receiver().await;
-        let (done_tx, mut done_rx) = mpsc::unbounded_channel::<AgentId>();
+        let (verdict_tx, mut verdict_rx) =
+            mpsc::unbounded_channel::<SupervisorVerdictTaskResult>();
+        let (compaction_tx, mut compaction_rx) =
+            mpsc::unbounded_channel::<SupervisorCompactionTaskEvent>();
         let semaphore = Arc::new(Semaphore::new(1));
         let mut entries = HashMap::<AgentId, SupervisorSchedulerEntry>::new();
+        let mut settings = *settings_rx.borrow();
+
+        if settings.settings.enabled {
+            observe_supervised_agents(&host, &mut entries).await;
+        }
 
         loop {
+            let next_deadline = supervisor_next_deadline(&entries, settings);
+            let sleep_until = next_deadline.unwrap_or_else(|| {
+                Instant::now()
+                    .checked_add(Duration::from_secs(86_400))
+                    .unwrap_or_else(Instant::now)
+            });
+            let deadline_sleep = tokio::time::sleep_until(sleep_until.into());
+            tokio::pin!(deadline_sleep);
+
             tokio::select! {
                 changed = status_rx.changed() => {
                     if changed.is_err() {
                         break;
                     }
-                    let settings = *settings_rx.borrow();
                     if settings.settings.enabled {
-                        observe_supervised_agents(
-                            &host,
-                            &mut entries,
-                            settings,
-                            &done_tx,
-                            &semaphore,
-                        )
-                        .await;
+                        observe_supervised_agents(&host, &mut entries).await;
                     }
                 }
                 changed = settings_rx.changed() => {
                     if changed.is_err() {
                         break;
                     }
-                    if !settings_rx.borrow().settings.enabled {
+                    let previous = settings;
+                    settings = *settings_rx.borrow();
+                    if !settings.settings.enabled {
+                        if previous.settings.enabled {
+                            tracing::info!("agent supervisor disabled; clearing inactivity state");
+                        }
                         entries.clear();
+                    } else if !previous.settings.enabled {
+                        tracing::info!("agent supervisor enabled; starting fresh inactivity intervals");
+                        entries.clear();
+                        observe_supervised_agents(&host, &mut entries).await;
+                    } else {
+                        observe_supervised_agents(&host, &mut entries).await;
+                        for entry in entries.values_mut() {
+                            requeue_inflight_supervision_for_settings_change(entry);
+                        }
                     }
                 }
-                Some(agent_id) = done_rx.recv() => {
-                    if let Some(entry) = entries.get_mut(&agent_id) {
-                        entry.in_flight = false;
+                Some(result) = verdict_rx.recv() => {
+                    accept_supervision_verdict_result(
+                        &host,
+                        &mut entries,
+                        settings,
+                        result,
+                    )
+                    .await;
+                }
+                Some(event) = compaction_rx.recv() => {
+                    match event {
+                        SupervisorCompactionTaskEvent::Started {
+                            agent_id,
+                            activity_counter,
+                            accepted,
+                        } => {
+                            let Some(entry) = entries.get_mut(&agent_id) else {
+                                continue;
+                            };
+                            if entry.last_activity_counter != activity_counter
+                                || !matches!(&entry.phase, SupervisorPhase::CompactionPending { .. })
+                            {
+                                continue;
+                            }
+                            if accepted {
+                                entry.phase = SupervisorPhase::Compacting;
+                                tracing::info!(
+                                    agent_id = %agent_id,
+                                    activity_counter,
+                                    "supervisor auto-compaction crossed the actor inactivity gate"
+                                );
+                            } else {
+                                let idle_since = supervisor_phase_idle_since(&entry.phase)
+                                    .unwrap_or_else(Instant::now);
+                                entry.phase = SupervisorPhase::Dormant { idle_since };
+                                tracing::info!(
+                                    agent_id = %agent_id,
+                                    activity_counter,
+                                    "supervisor auto-compaction rejected after intervening activity"
+                                );
+                                observe_supervised_agents(&host, &mut entries).await;
+                            }
+                        }
+                        SupervisorCompactionTaskEvent::Finished {
+                            agent_id,
+                            activity_counter,
+                        } => {
+                            if entries.get(&agent_id).is_some_and(|entry| {
+                                entry.last_activity_counter == activity_counter
+                                    && matches!(&entry.phase, SupervisorPhase::Compacting)
+                            }) {
+                                entries.remove(&agent_id);
+                            }
+                        }
                     }
+                }
+                _ = &mut deadline_sleep, if next_deadline.is_some() => {
+                    process_supervisor_deadlines(
+                        &host,
+                        &mut entries,
+                        settings,
+                        &verdict_tx,
+                        &compaction_tx,
+                        &semaphore,
+                    )
+                    .await;
                 }
             }
         }
@@ -12952,88 +13125,243 @@ fn spawn_agent_supervisor_task(host: HostHandle) {
     }
 }
 
-async fn observe_supervised_agents(
-    host: &HostHandle,
-    entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
-    settings: SupervisorSettingsSignal,
-    done_tx: &mpsc::UnboundedSender<AgentId>,
-    semaphore: &Arc<Semaphore>,
-) {
-    let observations = host.activity_summary_observations().await;
-    let live_agent_ids = observations
-        .iter()
-        .map(|observation| observation.agent_id.clone())
-        .collect::<HashSet<_>>();
-    entries.retain(|agent_id, _| live_agent_ids.contains(agent_id));
-
-    for observation in observations {
-        // Supervise only standalone user-driven agents. Orchestrated agents
-        // (teams, workflows, agent-control children, backend-native
-        // sub-agents) have their own coordinator watching them.
-        if !matches!(
-            observation.start.origin,
-            AgentOrigin::User | AgentOrigin::SideQuestion
-        ) || observation.start.parent_agent_id.is_some()
-        {
-            continue;
-        }
-
-        let entry = entries.entry(observation.agent_id.clone()).or_default();
-        let status = &observation.status;
-        if status.terminated {
-            entry.was_active = false;
-            continue;
-        }
-        if status.is_active() {
-            entry.was_active = true;
-            continue;
-        }
-        if !entry.was_active {
-            continue;
-        }
-        entry.was_active = false;
-        if entry.in_flight || status.is_plan_approval_pending() {
-            continue;
-        }
-        entry.in_flight = true;
-
-        let host = host.clone();
-        let agent_id = observation.agent_id.clone();
-        let done_tx = done_tx.clone();
-        let semaphore = Arc::clone(semaphore);
-        tokio::spawn(async move {
-            supervise_idle_agent(&host, &agent_id, settings, semaphore).await;
-            let _ = done_tx.send(agent_id);
-        });
+fn supervisor_phase_idle_since(phase: &SupervisorPhase) -> Option<Instant> {
+    match phase {
+        SupervisorPhase::Debouncing { idle_since }
+        | SupervisorPhase::VerdictInFlight { idle_since, .. }
+        | SupervisorPhase::DoneAuthorized { idle_since, .. }
+        | SupervisorPhase::AwaitingUser { idle_since, .. }
+        | SupervisorPhase::Dormant { idle_since }
+        | SupervisorPhase::CompactionPending { idle_since, .. } => Some(*idle_since),
+        SupervisorPhase::Active | SupervisorPhase::Compacting => None,
     }
 }
 
-async fn supervise_idle_agent(
-    host: &HostHandle,
-    agent_id: &AgentId,
-    settings: SupervisorSettingsSignal,
-    semaphore: Arc<Semaphore>,
-) {
-    tokio::time::sleep(SUPERVISION_DEBOUNCE).await;
-    let Ok(permit) = semaphore.acquire_owned().await else {
-        return;
-    };
+fn supervised_observation_is_eligible(observation: &ActivitySummaryObservation) -> bool {
+    matches!(
+        observation.start.origin,
+        AgentOrigin::User | AgentOrigin::SideQuestion
+    ) && observation.start.parent_agent_id.is_none()
+        && !observation.status.terminated
+}
 
-    // Re-observe after the debounce and the (possibly long) wait for the
-    // concurrency permit: the agent may have picked up new work.
-    let Some(observation) = host.activity_summary_observation(agent_id).await else {
+fn supervisor_phase_for_fresh_observation(
+    status: &crate::agent::registry::AgentStatus,
+    now: Instant,
+) -> SupervisorPhase {
+    if status.is_active() {
+        SupervisorPhase::Active
+    } else if status.is_plan_approval_pending() {
+        SupervisorPhase::Dormant { idle_since: now }
+    } else {
+        SupervisorPhase::Debouncing { idle_since: now }
+    }
+}
+
+fn requeue_inflight_supervision_for_settings_change(entry: &mut SupervisorSchedulerEntry) {
+    if let SupervisorPhase::VerdictInFlight { idle_since, .. } = &entry.phase {
+        entry.phase = SupervisorPhase::Debouncing {
+            idle_since: *idle_since,
+        };
+    }
+}
+
+async fn observe_supervised_agents(
+    host: &HostHandle,
+    entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
+) {
+    let observations = host.activity_summary_observations().await;
+    let eligible_ids = observations
+        .iter()
+        .filter(|observation| supervised_observation_is_eligible(observation))
+        .map(|observation| observation.agent_id.clone())
+        .collect::<HashSet<_>>();
+    entries.retain(|agent_id, _| eligible_ids.contains(agent_id));
+
+    for observation in observations
+        .into_iter()
+        .filter(supervised_observation_is_eligible)
+    {
+        let now = Instant::now();
+        let status = &observation.status;
+        let Some(entry) = entries.get_mut(&observation.agent_id) else {
+            let phase = supervisor_phase_for_fresh_observation(status, now);
+            entries.insert(
+                observation.agent_id,
+                SupervisorSchedulerEntry {
+                    last_activity_counter: status.activity_counter,
+                    phase,
+                },
+            );
+            continue;
+        };
+
+        let activity_changed = entry.last_activity_counter != status.activity_counter;
+        if activity_changed {
+            if matches!(
+                &entry.phase,
+                SupervisorPhase::CompactionPending { .. } | SupervisorPhase::Compacting
+            ) {
+                continue;
+            }
+            entry.last_activity_counter = status.activity_counter;
+            entry.phase = supervisor_phase_for_fresh_observation(status, now);
+            continue;
+        }
+
+        if status.is_active() {
+            if !matches!(&entry.phase, SupervisorPhase::Compacting) {
+                entry.phase = SupervisorPhase::Active;
+            }
+        } else if status.is_plan_approval_pending() {
+            if !matches!(&entry.phase, SupervisorPhase::Compacting) {
+                let idle_since = supervisor_phase_idle_since(&entry.phase).unwrap_or(now);
+                entry.phase = SupervisorPhase::Dormant { idle_since };
+            }
+        } else if matches!(&entry.phase, SupervisorPhase::Active) {
+            entry.phase = SupervisorPhase::Debouncing { idle_since: now };
+        }
+    }
+}
+
+fn supervisor_next_deadline(
+    entries: &HashMap<AgentId, SupervisorSchedulerEntry>,
+    settings: SupervisorSettingsSignal,
+) -> Option<Instant> {
+    entries
+        .values()
+        .filter_map(|entry| match &entry.phase {
+            SupervisorPhase::Debouncing { idle_since } => {
+                idle_since.checked_add(SUPERVISION_DEBOUNCE)
+            }
+            SupervisorPhase::DoneAuthorized {
+                idle_since,
+                last_gate_evaluation_epoch,
+                ..
+            } if settings.settings.auto_compact_on_success
+                && *last_gate_evaluation_epoch != Some(settings.epoch) =>
+            {
+                idle_since.checked_add(Duration::from_secs(u64::from(
+                    settings
+                        .settings
+                        .auto_compact_inactivity_delay_seconds,
+                )))
+            }
+            _ => None,
+        })
+        .min()
+}
+
+async fn process_supervisor_deadlines(
+    host: &HostHandle,
+    entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
+    settings: SupervisorSettingsSignal,
+    verdict_tx: &mpsc::UnboundedSender<SupervisorVerdictTaskResult>,
+    compaction_tx: &mpsc::UnboundedSender<SupervisorCompactionTaskEvent>,
+    semaphore: &Arc<Semaphore>,
+) {
+    let now = Instant::now();
+    let due_debounces = entries
+        .iter()
+        .filter_map(|(agent_id, entry)| match &entry.phase {
+            SupervisorPhase::Debouncing { idle_since }
+                if idle_since
+                    .checked_add(SUPERVISION_DEBOUNCE)
+                    .is_some_and(|due| due <= now) =>
+            {
+                Some(agent_id.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for agent_id in due_debounces {
+        launch_supervision_verdict(
+            host,
+            entries,
+            agent_id,
+            settings,
+            verdict_tx,
+            semaphore,
+        )
+        .await;
+    }
+
+    let now = Instant::now();
+    let due_compactions = entries
+        .iter()
+        .filter_map(|(agent_id, entry)| match &entry.phase {
+            SupervisorPhase::DoneAuthorized {
+                idle_since,
+                last_gate_evaluation_epoch,
+                ..
+            } if settings.settings.auto_compact_on_success
+                && *last_gate_evaluation_epoch != Some(settings.epoch)
+                && idle_since
+                    .checked_add(Duration::from_secs(u64::from(
+                        settings
+                            .settings
+                            .auto_compact_inactivity_delay_seconds,
+                    )))
+                    .is_some_and(|due| due <= now) =>
+            {
+                Some(agent_id.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for agent_id in due_compactions {
+        launch_supervisor_auto_compaction(
+            host,
+            entries,
+            agent_id,
+            settings,
+            compaction_tx,
+        )
+        .await;
+    }
+}
+
+async fn launch_supervision_verdict(
+    host: &HostHandle,
+    entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
+    agent_id: AgentId,
+    settings: SupervisorSettingsSignal,
+    verdict_tx: &mpsc::UnboundedSender<SupervisorVerdictTaskResult>,
+    semaphore: &Arc<Semaphore>,
+) {
+    let Some(entry) = entries.get(&agent_id) else {
         return;
     };
-    if observation.status.terminated
+    let SupervisorPhase::Debouncing { idle_since } = &entry.phase else {
+        return;
+    };
+    let idle_since = *idle_since;
+    let activity_counter = entry.last_activity_counter;
+    let Some(observation) = host.activity_summary_observation(&agent_id).await else {
+        entries.remove(&agent_id);
+        return;
+    };
+    if observation.status.activity_counter != activity_counter
+        || observation.status.terminated
         || observation.status.is_active()
         || observation.status.is_plan_approval_pending()
     {
+        observe_supervised_agents(host, entries).await;
         return;
     }
     let Some(context) = observation.handle.read_supervision_context().await else {
+        entries.insert(
+            agent_id,
+            SupervisorSchedulerEntry {
+                last_activity_counter: activity_counter,
+                phase: SupervisorPhase::Dormant { idle_since },
+            },
+        );
         return;
     };
     let Some(last_user_message) = context.last_user_message.clone() else {
+        entries.get_mut(&agent_id).expect("entry exists").phase =
+            SupervisorPhase::Dormant { idle_since };
         return;
     };
     if context.cancelled_since_user_message {
@@ -13041,6 +13369,8 @@ async fn supervise_idle_agent(
             agent_id = %agent_id,
             "skipping supervision: user cancelled work since their last message"
         );
+        entries.get_mut(&agent_id).expect("entry exists").phase =
+            SupervisorPhase::Dormant { idle_since };
         return;
     }
     let max_kicks = u32::from(settings.settings.max_kicks_per_task.max(1));
@@ -13050,6 +13380,8 @@ async fn supervise_idle_agent(
             kicks = context.kicks_since_user_message,
             "supervision kick budget exhausted; leaving the agent idle"
         );
+        entries.get_mut(&agent_id).expect("entry exists").phase =
+            SupervisorPhase::Dormant { idle_since };
         return;
     }
 
@@ -13062,122 +13394,213 @@ async fn supervise_idle_agent(
         }
         None => (None, None),
     };
-    // Already rotated (or mid-rotation): the idle transition after the
-    // compaction summary turn belongs to a dying agent.
     if session_record
         .as_ref()
         .is_some_and(|record| record.compacted_to_session_id.is_some())
     {
+        entries.get_mut(&agent_id).expect("entry exists").phase =
+            SupervisorPhase::Dormant { idle_since };
         return;
     }
-    let compacted_from_session = session_record
+    if session_record
         .as_ref()
-        .is_some_and(|record| record.compacted_from_session_id.is_some());
-    // A freshly compacted replacement agent idles right after digesting its
-    // bootstrap summary prompt. Supervising that turn would judge "done" and
-    // re-compact forever; wait for the first real user message instead.
-    if compacted_from_session && context.user_message_count <= 1 {
+        .is_some_and(|record| record.compacted_from_session_id.is_some())
+        && context.user_message_count <= 1
+    {
         tracing::debug!(
             agent_id = %agent_id,
             "skipping supervision: post-compaction bootstrap turn"
         );
+        entries.get_mut(&agent_id).expect("entry exists").phase =
+            SupervisorPhase::Dormant { idle_since };
         return;
     }
+
+    let baseline = SupervisionBaseline {
+        last_user_message: last_user_message.clone(),
+        kicks_since_user_message: context.kicks_since_user_message,
+        session_id,
+    };
+    entries.get_mut(&agent_id).expect("entry exists").phase =
+        SupervisorPhase::VerdictInFlight {
+            idle_since,
+            settings_epoch: settings.epoch,
+            baseline: baseline.clone(),
+        };
 
     let use_mock_backend = host.use_mock_backend().await;
     let capacity_tx = { host.state.lock().await.capacity_tx.clone() };
     let backend_kind = observation.start.backend_kind;
-    let verdict = crate::agent::supervisor::run_supervision_with_retries(
-        u32::from(settings.settings.retry_attempts),
-        |_attempt| {
-            let request = crate::agent::supervisor::GenerateSupervisionVerdictRequest {
-                verdict_agent_id: AgentId(Uuid::new_v4().to_string()),
-                backend_kind,
-                last_user_message: last_user_message.clone(),
-                task_list: task_list.clone(),
-                last_assistant_message: context.last_assistant_message.clone(),
-                last_error: context.last_error_since_user_message.clone(),
-                kicks_so_far: context.kicks_since_user_message,
-                max_kicks,
-                cost_hint: settings.settings.cost_tier.as_cost_hint(),
-                use_mock_backend,
-                capacity_tx: capacity_tx.clone(),
-            };
-            async move {
-                match tokio::time::timeout(
-                    SUPERVISION_GENERATION_TIMEOUT,
-                    crate::agent::supervisor::generate_supervision_verdict(request),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => Err(format!(
-                        "supervision verdict timed out after {}",
-                        generation_timeout_label(SUPERVISION_GENERATION_TIMEOUT)
-                    )),
+    let retry_attempts = u32::from(settings.settings.retry_attempts);
+    let cost_hint = settings.settings.cost_tier.as_cost_hint();
+    let last_assistant_message = context.last_assistant_message;
+    let last_error = context.last_error_since_user_message;
+    let tx = verdict_tx.clone();
+    let semaphore = Arc::clone(semaphore);
+    let host = host.clone();
+    tokio::spawn(async move {
+        let result = match semaphore.acquire_owned().await {
+            Ok(permit) => {
+                let live_settings = host.supervisor_settings_signal().await;
+                if !live_settings.settings.enabled || live_settings.epoch != settings.epoch {
+                    drop(permit);
+                    let _ = tx.send(SupervisorVerdictTaskResult {
+                        agent_id,
+                        activity_counter,
+                        settings_epoch: settings.epoch,
+                        baseline,
+                        result: Err(
+                            "supervision settings changed before the verdict call started"
+                                .to_owned(),
+                        ),
+                    });
+                    return;
                 }
+                let result = crate::agent::supervisor::run_supervision_with_retries(
+                    retry_attempts,
+                    |attempt| {
+                        tracing::debug!(
+                            agent_id = %agent_id,
+                            attempt = attempt + 1,
+                            "starting agent supervision verdict attempt"
+                        );
+                        let request = crate::agent::supervisor::GenerateSupervisionVerdictRequest {
+                            verdict_agent_id: AgentId(Uuid::new_v4().to_string()),
+                            backend_kind,
+                            last_user_message: last_user_message.clone(),
+                            task_list: task_list.clone(),
+                            last_assistant_message: last_assistant_message.clone(),
+                            last_error: last_error.clone(),
+                            kicks_so_far: baseline.kicks_since_user_message,
+                            max_kicks,
+                            cost_hint,
+                            use_mock_backend,
+                            capacity_tx: capacity_tx.clone(),
+                        };
+                        async move {
+                            match tokio::time::timeout(
+                                SUPERVISION_GENERATION_TIMEOUT,
+                                crate::agent::supervisor::generate_supervision_verdict(request),
+                            )
+                            .await
+                            {
+                                Ok(result) => result,
+                                Err(_) => Err(format!(
+                                    "supervision verdict timed out after {}",
+                                    generation_timeout_label(SUPERVISION_GENERATION_TIMEOUT)
+                                )),
+                            }
+                        }
+                    },
+                )
+                .await;
+                drop(permit);
+                result
             }
-        },
-    )
-    .await;
-    let verdict = match verdict {
-        Ok(verdict) => verdict,
-        Err(error) => {
-            tracing::warn!(
-                agent_id = %agent_id,
-                error = %error,
-                "agent supervision produced no verdict; leaving the agent alone"
-            );
-            return;
-        }
-    };
+            Err(_) => Err("agent supervision scheduler stopped".to_owned()),
+        };
+        let _ = tx.send(SupervisorVerdictTaskResult {
+            agent_id,
+            activity_counter,
+            settings_epoch: settings.epoch,
+            baseline,
+            result,
+        });
+    });
+}
 
-    // The verdict may be stale: settings can flip and the user can act while
-    // the model call runs. Re-validate everything cheap before acting.
-    let current_settings = host.supervisor_settings_signal().await;
-    if !current_settings.settings.enabled || current_settings.epoch != settings.epoch {
-        return;
-    }
-    let Some(observation) = host.activity_summary_observation(agent_id).await else {
-        return;
-    };
-    if observation.status.terminated
-        || observation.status.is_active()
-        || observation.status.is_plan_approval_pending()
-    {
-        return;
-    }
-    let Some(recheck) = observation.handle.read_supervision_context().await else {
+async fn accept_supervision_verdict_result(
+    host: &HostHandle,
+    entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
+    settings: SupervisorSettingsSignal,
+    result: SupervisorVerdictTaskResult,
+) {
+    let Some(entry) = entries.get(&result.agent_id) else {
         return;
     };
-    if recheck.last_user_message.as_deref() != Some(last_user_message.as_str())
-        || recheck.kicks_since_user_message != context.kicks_since_user_message
-        || recheck.cancelled_since_user_message
+    let SupervisorPhase::VerdictInFlight {
+        idle_since,
+        settings_epoch,
+        baseline,
+    } = &entry.phase
+    else {
+        return;
+    };
+    if entry.last_activity_counter != result.activity_counter
+        || *settings_epoch != result.settings_epoch
+        || settings.epoch != result.settings_epoch
+        || baseline != &result.baseline
     {
         tracing::debug!(
-            agent_id = %agent_id,
-            "dropping stale supervision verdict: conversation moved on"
+            agent_id = %result.agent_id,
+            "dropping stale supervision verdict: generation or settings changed"
         );
         return;
     }
-    drop(permit);
+    let idle_since = *idle_since;
+    let Some(observation) = host.activity_summary_observation(&result.agent_id).await else {
+        entries.remove(&result.agent_id);
+        return;
+    };
+    if observation.status.activity_counter != result.activity_counter
+        || observation.status.terminated
+        || observation.status.is_active()
+        || observation.status.is_plan_approval_pending()
+    {
+        observe_supervised_agents(host, entries).await;
+        return;
+    }
+    if observation.start.session_id != result.baseline.session_id {
+        entries.get_mut(&result.agent_id).expect("entry exists").phase =
+            SupervisorPhase::Dormant { idle_since };
+        return;
+    }
+    let Some(context) = observation.handle.read_supervision_context().await else {
+        entries.get_mut(&result.agent_id).expect("entry exists").phase =
+            SupervisorPhase::Dormant { idle_since };
+        tracing::warn!(
+            agent_id = %result.agent_id,
+            "dropping supervision verdict: live context reader is unavailable"
+        );
+        return;
+    };
+    if context.last_user_message.as_deref()
+        != Some(result.baseline.last_user_message.as_str())
+        || context.kicks_since_user_message != result.baseline.kicks_since_user_message
+        || context.cancelled_since_user_message
+        || !supervision_session_allows_action(host, &observation, &context).await
+    {
+        tracing::debug!(
+            agent_id = %result.agent_id,
+            "dropping stale supervision verdict: conversation moved on"
+        );
+        entries.get_mut(&result.agent_id).expect("entry exists").phase =
+            SupervisorPhase::Dormant { idle_since };
+        return;
+    }
 
+    let verdict = match result.result {
+        Ok(verdict) => verdict,
+        Err(error) => {
+            tracing::warn!(
+                agent_id = %result.agent_id,
+                error = %error,
+                "agent supervision produced no verdict; leaving the agent alone"
+            );
+            entries.get_mut(&result.agent_id).expect("entry exists").phase =
+                SupervisorPhase::Dormant { idle_since };
+            return;
+        }
+    };
     match verdict {
         crate::agent::supervisor::SupervisionVerdict::Continue { message } => {
             tracing::info!(
-                agent_id = %agent_id,
-                kick = context.kicks_since_user_message + 1,
-                max_kicks,
+                agent_id = %result.agent_id,
+                kick = result.baseline.kicks_since_user_message + 1,
                 "supervisor kicking idle agent to continue"
             );
-            if let Some(status_handle) = host.agent_status_handle(agent_id).await {
-                status_handle
-                    .update(|s| {
-                        s.turn_completed = false;
-                        s.activity_counter = s.activity_counter.saturating_add(1);
-                    })
-                    .await;
-            }
+            entries.get_mut(&result.agent_id).expect("entry exists").phase =
+                SupervisorPhase::Active;
             let sent = observation
                 .handle
                 .send_input(AgentInput::SendMessage(SendMessagePayload {
@@ -13189,39 +13612,164 @@ async fn supervise_idle_agent(
                 .await;
             if !sent {
                 tracing::warn!(
-                    agent_id = %agent_id,
+                    agent_id = %result.agent_id,
                     "supervisor kick could not be delivered: agent backend is closed"
                 );
             }
         }
-        crate::agent::supervisor::SupervisionVerdict::Done => {
-            tracing::info!(agent_id = %agent_id, "supervisor confirmed the task is done");
-            if current_settings.settings.auto_compact_on_success {
-                let threshold = current_settings.settings.auto_compact_min_context_tokens;
-                let current_context = recheck.current_context_input_tokens;
-                if supervisor_auto_compaction_eligible(current_context, threshold) {
-                    supervisor_auto_compact(host, agent_id).await;
-                } else {
-                    match current_context {
-                        Some(current) => {
-                            tracing::info!(
-                                agent_id = %agent_id,
-                                current_context_input_tokens = current,
-                                auto_compact_min_context_tokens = threshold,
-                                "skipping supervisor auto-compaction: current context is at or below the configured minimum"
-                            );
-                        }
-                        None => {
-                            tracing::info!(
-                                agent_id = %agent_id,
-                                auto_compact_min_context_tokens = threshold,
-                                "skipping supervisor auto-compaction: current context usage is unavailable"
-                            );
-                        }
-                    }
-                }
-            }
+        crate::agent::supervisor::SupervisionVerdict::AwaitingUser => {
+            tracing::info!(
+                agent_id = %result.agent_id,
+                "supervisor classified the idle turn as awaiting user input"
+            );
+            entries.get_mut(&result.agent_id).expect("entry exists").phase =
+                SupervisorPhase::AwaitingUser { idle_since };
         }
+        crate::agent::supervisor::SupervisionVerdict::Done => {
+            tracing::info!(
+                agent_id = %result.agent_id,
+                "supervisor confirmed the requested work is truly complete"
+            );
+            entries.get_mut(&result.agent_id).expect("entry exists").phase =
+                SupervisorPhase::DoneAuthorized {
+                    idle_since,
+                    baseline: result.baseline,
+                    last_gate_evaluation_epoch: None,
+                };
+        }
+    }
+}
+
+async fn supervision_session_allows_action(
+    host: &HostHandle,
+    observation: &ActivitySummaryObservation,
+    context: &crate::agent::supervisor::SupervisionContextSnapshot,
+) -> bool {
+    let Some(session_id) = observation.start.session_id.as_ref() else {
+        return true;
+    };
+    let session_store = { host.state.lock().await.session_store.clone() };
+    let record = session_store.lock().await.get(session_id);
+    let Some(record) = record else {
+        return false;
+    };
+    if record.compacted_to_session_id.is_some() {
+        return false;
+    }
+    !(record.compacted_from_session_id.is_some() && context.user_message_count <= 1)
+}
+
+async fn launch_supervisor_auto_compaction(
+    host: &HostHandle,
+    entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
+    agent_id: AgentId,
+    settings: SupervisorSettingsSignal,
+    compaction_tx: &mpsc::UnboundedSender<SupervisorCompactionTaskEvent>,
+) {
+    let Some(entry) = entries.get(&agent_id) else {
+        return;
+    };
+    let SupervisorPhase::DoneAuthorized {
+        idle_since,
+        baseline,
+        ..
+    } = &entry.phase
+    else {
+        return;
+    };
+    let idle_since = *idle_since;
+    let baseline = baseline.clone();
+    let activity_counter = entry.last_activity_counter;
+
+    if !settings.settings.enabled || !settings.settings.auto_compact_on_success {
+        return;
+    }
+    let Some(observation) = host.activity_summary_observation(&agent_id).await else {
+        entries.remove(&agent_id);
+        return;
+    };
+    if observation.status.activity_counter != activity_counter
+        || observation.status.terminated
+        || observation.status.is_active()
+        || observation.status.is_plan_approval_pending()
+    {
+        observe_supervised_agents(host, entries).await;
+        return;
+    }
+    if observation.start.session_id != baseline.session_id {
+        entries.get_mut(&agent_id).expect("entry exists").phase =
+            SupervisorPhase::Dormant { idle_since };
+        tracing::info!(
+            agent_id = %agent_id,
+            "skipping supervisor auto-compaction: session identity changed"
+        );
+        return;
+    }
+    let Some(context) = observation.handle.read_supervision_context().await else {
+        mark_supervisor_gate_evaluated(entries, &agent_id, settings.epoch);
+        tracing::info!(
+            agent_id = %agent_id,
+            "skipping supervisor auto-compaction: supervision context is unavailable"
+        );
+        return;
+    };
+    if context.last_user_message.as_deref() != Some(baseline.last_user_message.as_str())
+        || context.kicks_since_user_message != baseline.kicks_since_user_message
+        || context.cancelled_since_user_message
+        || !supervision_session_allows_action(host, &observation, &context).await
+    {
+        entries.get_mut(&agent_id).expect("entry exists").phase =
+            SupervisorPhase::Dormant { idle_since };
+        tracing::info!(
+            agent_id = %agent_id,
+            "skipping supervisor auto-compaction: conversation or session changed"
+        );
+        return;
+    }
+
+    let threshold = settings.settings.auto_compact_min_context_tokens;
+    let current_context = context.current_context_input_tokens;
+    if !supervisor_auto_compaction_eligible(current_context, threshold) {
+        mark_supervisor_gate_evaluated(entries, &agent_id, settings.epoch);
+        match current_context {
+            Some(current) => tracing::info!(
+                agent_id = %agent_id,
+                current_context_input_tokens = current,
+                auto_compact_min_context_tokens = threshold,
+                "skipping supervisor auto-compaction: current context is at or below the configured minimum"
+            ),
+            None => tracing::info!(
+                agent_id = %agent_id,
+                auto_compact_min_context_tokens = threshold,
+                "skipping supervisor auto-compaction: current context usage is unavailable"
+            ),
+        }
+        return;
+    }
+
+    entries.get_mut(&agent_id).expect("entry exists").phase =
+        SupervisorPhase::CompactionPending { idle_since };
+    let host = host.clone();
+    let tx = compaction_tx.clone();
+    tokio::spawn(async move {
+        supervisor_auto_compact(host, agent_id, activity_counter, tx).await;
+    });
+}
+
+fn mark_supervisor_gate_evaluated(
+    entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
+    agent_id: &AgentId,
+    settings_epoch: u64,
+) {
+    let Some(entry) = entries.get_mut(agent_id) else {
+        return;
+    };
+    if let SupervisorPhase::DoneAuthorized {
+        last_gate_evaluation_epoch,
+        ..
+    } = &mut entry.phase
+    {
+        *last_gate_evaluation_epoch = Some(settings_epoch);
     }
 }
 
@@ -13232,15 +13780,21 @@ fn supervisor_auto_compaction_eligible(
     current_context_input_tokens.is_some_and(|current| current > minimum_context_tokens)
 }
 
-async fn supervisor_auto_compact(host: &HostHandle, agent_id: &AgentId) {
+async fn supervisor_auto_compact(
+    host: HostHandle,
+    agent_id: AgentId,
+    expected_activity_counter: u64,
+    task_tx: mpsc::UnboundedSender<SupervisorCompactionTaskEvent>,
+) {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let stream = Stream::new(
         StreamPath(format!("/agent/{}/supervisor-compact", agent_id)),
         tx,
     );
-    if let Err(error) = host
-        .compact_agent_in_background(
+    let accepted = match host
+        .compact_agent_if_inactive_in_background(
             agent_id.clone(),
+            expected_activity_counter,
             AgentCompactPayload {
                 summary_prompt: None,
                 max_summary_bytes: None,
@@ -13249,11 +13803,22 @@ async fn supervisor_auto_compact(host: &HostHandle, agent_id: &AgentId) {
         )
         .await
     {
-        tracing::warn!(
-            agent_id = %agent_id,
-            error = %error,
-            "supervisor auto-compaction could not start"
-        );
+        Ok(accepted) => accepted,
+        Err(error) => {
+            tracing::warn!(
+                agent_id = %agent_id,
+                error = %error,
+                "supervisor auto-compaction could not start"
+            );
+            false
+        }
+    };
+    let _ = task_tx.send(SupervisorCompactionTaskEvent::Started {
+        agent_id: agent_id.clone(),
+        activity_counter: expected_activity_counter,
+        accepted,
+    });
+    if !accepted {
         return;
     }
 
@@ -13295,6 +13860,10 @@ async fn supervisor_auto_compact(host: &HostHandle, agent_id: &AgentId) {
             "supervisor auto-compaction did not reach a terminal notify in time"
         );
     }
+    let _ = task_tx.send(SupervisorCompactionTaskEvent::Finished {
+        agent_id,
+        activity_counter: expected_activity_counter,
+    });
 }
 
 async fn observe_activity_summary_agents(
@@ -22239,5 +22808,165 @@ Rules: Record only what remains true and useful for future work; drop transient 
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn supervisor_done_deadline_uses_live_delay_and_original_idle_since() {
+        let idle_since = Instant::now();
+        let agent_id = AgentId("supervisor-deadline".to_owned());
+        let mut entries = HashMap::new();
+        entries.insert(
+            agent_id,
+            SupervisorSchedulerEntry {
+                last_activity_counter: 7,
+                phase: SupervisorPhase::DoneAuthorized {
+                    idle_since,
+                    baseline: SupervisionBaseline {
+                        last_user_message: "done".to_owned(),
+                        kicks_since_user_message: 0,
+                        session_id: None,
+                    },
+                    last_gate_evaluation_epoch: None,
+                },
+            },
+        );
+        let mut supervisor = protocol::SupervisorSettings::default();
+        supervisor.enabled = true;
+        supervisor.auto_compact_on_success = true;
+        supervisor.auto_compact_inactivity_delay_seconds = 600;
+        assert_eq!(
+            supervisor_next_deadline(
+                &entries,
+                SupervisorSettingsSignal {
+                    settings: supervisor,
+                    epoch: 1,
+                },
+            ),
+            idle_since.checked_add(Duration::from_secs(600))
+        );
+        supervisor.auto_compact_inactivity_delay_seconds = 30;
+        assert_eq!(
+            supervisor_next_deadline(
+                &entries,
+                SupervisorSettingsSignal {
+                    settings: supervisor,
+                    epoch: 2,
+                },
+            ),
+            idle_since.checked_add(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn supervisor_failed_gate_is_suppressed_for_only_its_settings_epoch() {
+        let agent_id = AgentId("supervisor-gate".to_owned());
+        let idle_since = Instant::now();
+        let mut entries = HashMap::new();
+        entries.insert(
+            agent_id.clone(),
+            SupervisorSchedulerEntry {
+                last_activity_counter: 9,
+                phase: SupervisorPhase::DoneAuthorized {
+                    idle_since,
+                    baseline: SupervisionBaseline {
+                        last_user_message: "done".to_owned(),
+                        kicks_since_user_message: 0,
+                        session_id: None,
+                    },
+                    last_gate_evaluation_epoch: None,
+                },
+            },
+        );
+        mark_supervisor_gate_evaluated(&mut entries, &agent_id, 4);
+        let mut supervisor = protocol::SupervisorSettings::default();
+        supervisor.enabled = true;
+        supervisor.auto_compact_on_success = true;
+        supervisor.auto_compact_inactivity_delay_seconds = 1;
+        assert_eq!(
+            supervisor_next_deadline(
+                &entries,
+                SupervisorSettingsSignal {
+                    settings: supervisor,
+                    epoch: 4,
+                },
+            ),
+            None
+        );
+        assert_eq!(
+            supervisor_next_deadline(
+                &entries,
+                SupervisorSettingsSignal {
+                    settings: supervisor,
+                    epoch: 5,
+                },
+            ),
+            idle_since.checked_add(Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn supervisor_fresh_idle_observation_starts_a_new_interval() {
+        let now = Instant::now();
+        let idle = crate::agent::registry::AgentStatus {
+            started: true,
+            turn_completed: true,
+            activity_counter: 11,
+            ..Default::default()
+        };
+        assert!(matches!(
+            supervisor_phase_for_fresh_observation(&idle, now),
+            SupervisorPhase::Debouncing { idle_since } if idle_since == now
+        ));
+
+        let active = crate::agent::registry::AgentStatus {
+            is_thinking: true,
+            ..idle
+        };
+        assert!(matches!(
+            supervisor_phase_for_fresh_observation(&active, now),
+            SupervisorPhase::Active
+        ));
+    }
+
+    #[test]
+    fn supervisor_settings_change_requeues_only_inflight_verdicts() {
+        let idle_since = Instant::now();
+        let baseline = SupervisionBaseline {
+            last_user_message: "request".to_owned(),
+            kicks_since_user_message: 0,
+            session_id: None,
+        };
+        let mut inflight = SupervisorSchedulerEntry {
+            last_activity_counter: 4,
+            phase: SupervisorPhase::VerdictInFlight {
+                idle_since,
+                settings_epoch: 1,
+                baseline: baseline.clone(),
+            },
+        };
+        requeue_inflight_supervision_for_settings_change(&mut inflight);
+        assert!(matches!(
+            inflight.phase,
+            SupervisorPhase::Debouncing { idle_since: preserved }
+                if preserved == idle_since
+        ));
+
+        let mut done = SupervisorSchedulerEntry {
+            last_activity_counter: 4,
+            phase: SupervisorPhase::DoneAuthorized {
+                idle_since,
+                baseline,
+                last_gate_evaluation_epoch: None,
+            },
+        };
+        requeue_inflight_supervision_for_settings_change(&mut done);
+        assert!(matches!(done.phase, SupervisorPhase::DoneAuthorized { .. }));
+
+        let mut awaiting = SupervisorSchedulerEntry {
+            last_activity_counter: 4,
+            phase: SupervisorPhase::AwaitingUser { idle_since },
+        };
+        requeue_inflight_supervision_for_settings_change(&mut awaiting);
+        assert!(matches!(awaiting.phase, SupervisorPhase::AwaitingUser { .. }));
     }
 }

@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use protocol::{
     BackendKind, BackgroundAgentFeature, BrokerUrl, CodeIntelSettings, HostLaunchProfileConfig,
     HostSettingValue, HostSettings, LaunchProfileId,
+    SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX,
+    SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -362,6 +364,19 @@ fn apply_setting(settings: &mut HostSettings, setting: HostSettingValue) -> Resu
         HostSettingValue::SupervisorAutoCompactOnSuccess { enabled } => {
             settings.supervisor.auto_compact_on_success = enabled;
         }
+        HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds } => {
+            if !(SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN
+                ..=SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX)
+                .contains(&seconds)
+            {
+                return Err(format!(
+                    "supervisor auto-compact inactivity delay must be between {} and {} seconds",
+                    SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN,
+                    SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX,
+                ));
+            }
+            settings.supervisor.auto_compact_inactivity_delay_seconds = seconds;
+        }
         HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens } => {
             settings.supervisor.auto_compact_min_context_tokens = tokens;
         }
@@ -513,6 +528,17 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
         .is_some_and(|url| url.as_str().trim().is_empty())
     {
         return Err("mobile_broker_url must not be empty".to_owned());
+    }
+
+    if !(SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN
+        ..=SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX)
+        .contains(&settings.supervisor.auto_compact_inactivity_delay_seconds)
+    {
+        return Err(format!(
+            "supervisor auto-compact inactivity delay must be between {} and {} seconds",
+            SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN,
+            SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX,
+        ));
     }
 
     let code_intel = validate_code_intel_settings(settings.code_intel)?;

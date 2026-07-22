@@ -33,6 +33,40 @@ pub struct Version {
     pub patch: u32,
 }
 
+#[cfg(test)]
+mod supervisor_inactivity_delay_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_and_round_trips_as_three_hundred_seconds() {
+        assert_eq!(SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN, 1);
+        assert_eq!(
+            SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX,
+            86_400
+        );
+        let settings = SupervisorSettings::default();
+        assert_eq!(settings.auto_compact_inactivity_delay_seconds, 300);
+        let encoded = serde_json::to_value(settings).expect("serialize supervisor settings");
+        let decoded: SupervisorSettings =
+            serde_json::from_value(encoded).expect("deserialize supervisor settings");
+        assert_eq!(decoded.auto_compact_inactivity_delay_seconds, 300);
+    }
+
+    #[test]
+    fn legacy_supervisor_object_defaults_delay() {
+        let settings: SupervisorSettings = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "auto_compact_on_success": true,
+            "auto_compact_min_context_tokens": 200000,
+            "max_kicks_per_task": 3,
+            "retry_attempts": 1,
+            "cost_tier": "low"
+        }))
+        .expect("deserialize legacy supervisor settings");
+        assert_eq!(settings.auto_compact_inactivity_delay_seconds, 300);
+    }
+}
+
 impl fmt::Display for Version {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
@@ -2271,6 +2305,10 @@ pub struct SupervisorSettings {
     /// small warm context instead of resuming a huge cold session.
     #[serde(default)]
     pub auto_compact_on_success: bool,
+    /// Whole seconds of uninterrupted inactivity required before a successful
+    /// supervision verdict may start automatic compaction.
+    #[serde(default = "default_supervisor_auto_compact_inactivity_delay_seconds")]
+    pub auto_compact_inactivity_delay_seconds: u32,
     /// Minimum latest-assistant context size required before a successful
     /// supervision verdict may trigger automatic compaction.
     #[serde(default = "default_supervisor_auto_compact_min_context_tokens")]
@@ -2323,12 +2361,22 @@ pub fn default_supervisor_auto_compact_min_context_tokens() -> u64 {
     200_000
 }
 
+pub const SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN: u32 = 1;
+pub const SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX: u32 = 86_400;
+
+pub fn default_supervisor_auto_compact_inactivity_delay_seconds() -> u32 {
+    300
+}
+
 impl Default for SupervisorSettings {
     fn default() -> Self {
         Self {
             enabled: false,
             auto_compact_on_success: false,
-            auto_compact_min_context_tokens: default_supervisor_auto_compact_min_context_tokens(),
+            auto_compact_inactivity_delay_seconds:
+                default_supervisor_auto_compact_inactivity_delay_seconds(),
+            auto_compact_min_context_tokens:
+                default_supervisor_auto_compact_min_context_tokens(),
             max_kicks_per_task: default_supervisor_max_kicks_per_task(),
             retry_attempts: default_supervisor_retry_attempts(),
             cost_tier: SupervisorCostTier::default(),
@@ -2424,6 +2472,9 @@ pub enum HostSettingValue {
     SupervisorAutoCompactOnSuccess {
         enabled: bool,
     },
+    SupervisorAutoCompactInactivityDelaySeconds {
+        seconds: u32,
+    },
     SupervisorAutoCompactMinContextTokens {
         tokens: u64,
     },
@@ -2483,6 +2534,9 @@ impl HostSettingValue {
             Self::SupervisorAutoCompactOnSuccess { .. } => {
                 HostSettingErrorTarget::SupervisorAutoCompactOnSuccess
             }
+            Self::SupervisorAutoCompactInactivityDelaySeconds { .. } => {
+                HostSettingErrorTarget::SupervisorAutoCompactInactivityDelaySeconds
+            }
             Self::SupervisorAutoCompactMinContextTokens { .. } => {
                 HostSettingErrorTarget::SupervisorAutoCompactMinContextTokens
             }
@@ -2519,6 +2573,7 @@ pub enum HostSettingErrorTarget {
     BackgroundAgentFeatureEnabled,
     SupervisorEnabled,
     SupervisorAutoCompactOnSuccess,
+    SupervisorAutoCompactInactivityDelaySeconds,
     SupervisorAutoCompactMinContextTokens,
     SupervisorMaxKicksPerTask,
     SupervisorRetryAttempts,
@@ -7406,6 +7461,11 @@ mod command_error_serde_tests {
             HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 200_000 }
                 .error_target(),
             HostSettingErrorTarget::SupervisorAutoCompactMinContextTokens
+        );
+        assert_eq!(
+            HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 300 }
+                .error_target(),
+            HostSettingErrorTarget::SupervisorAutoCompactInactivityDelaySeconds
         );
     }
 

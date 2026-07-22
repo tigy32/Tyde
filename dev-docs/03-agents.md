@@ -814,12 +814,55 @@ without a context breakdown makes current-context usage unavailable; the
 server does not reuse an older turn or substitute per-request/per-turn token
 usage, cumulative agent activity totals, or root-plus-descendant task rollups.
 
-When “Auto-compact on success” is enabled, the supervisor compacts only when
-that known current-context value is strictly greater than the configured
-minimum. The minimum defaults to 200,000 tokens, so exactly 200,000 does not
-qualify. A setting of 0 removes the positive minimum but still requires a
-reported value. If current-context usage is unavailable, automatic compaction
-is skipped and logged; manual compaction is unaffected.
+The supervisor uses a private three-way verdict. `Done` means the requested
+work is truly complete and no user response is needed. `AwaitingUser` covers
+feedback, clarification, approval, a choice or decision, and a plan or
+proposal presented for review. `Continue` means executable work remains and
+causes a visible supervisor follow-up. Only `Done` authorizes automatic
+compaction; waiting on the user never does.
+
+`TypingStatusChanged` remains authoritative for active versus idle. Separately,
+the server's monotonic `activity_counter` identifies inactivity generations:
+accepted input and backend activity advance it, invalidating an old debounce,
+verdict, or compaction intent even when a watch notification coalesces a rapid
+active-to-idle cycle. The single supervisor scheduler records `idle_since` at
+the observed idle transition, waits the three-second verdict debounce, and
+judges that generation once. A successful `Done` verdict is retained while
+the scheduler waits; expiry performs only cheap live checks, not a second paid
+verdict call.
+
+Automatic compaction requires all four live conditions: the supervisor and
+auto-compact setting are enabled; the accepted verdict for the unchanged
+generation is `Done`; the full inactivity delay has elapsed; and the latest
+completed assistant turn has known current-context input tokens strictly
+greater than the configured threshold. The delay defaults to 300 seconds and
+accepts `1..=86_400` whole seconds. The threshold defaults to 200,000 tokens,
+so exactly 200,000 does not qualify. A threshold of 0 removes the positive
+minimum but still requires a reported value. Unavailable current context has
+no fallback to older, cumulative, or task usage and is skipped with a distinct
+log reason. Manual compaction is unaffected.
+
+Delay, threshold, and auto-compact changes apply live to an already accepted
+`Done` classification and preserve the original `idle_since`; accepted
+`Done`/`AwaitingUser` classifications are not re-judged for those edits.
+Changing settings while a verdict is in flight rejects that old-epoch result
+and re-launches classification for the same idle generation. Disabling the
+supervisor clears runtime state; enabling it begins a fresh interval. A host or
+scheduler restart likewise observes already-idle agents with a fresh
+`idle_since` and persists none of the generation, phase, verdict, or deadline.
+
+At expiry the host sends `CompactIfInactive(expected_activity_counter)` through
+the agent actor. The actor mailbox is the final linearization point: earlier
+accepted or queued input changes the counter and rejects stale automatic
+compaction, while a conditional compact accepted first legitimately crosses
+the gate. Rotation and post-compaction bootstrap guards still apply.
+
+The implementation guarantees only that compaction **starts no earlier than**
+the configured inactivity delay. This repository defines no provider cache
+TTL, and the 300-second default cannot guarantee that compaction starts or
+finishes before an external five-minute cache expires. If cache preservation
+becomes a hard SLA, product must provide a documented backend TTL and measured
+headroom below it rather than inventing a margin here.
 
 ---
 

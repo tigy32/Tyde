@@ -1,6 +1,6 @@
 //! Agent supervisor: a hidden one-shot model call that reviews an idle
 //! agent's last turn and decides whether the user's request is actually
-//! finished or the agent should be kicked back to work.
+//! finished, awaiting user input, or should be kicked back to work.
 //!
 //! Like the agent name generator, the supervisor is an implementation detail
 //! of the host — it never becomes a protocol entity. Each verdict runs on a
@@ -26,8 +26,11 @@ const SUPERVISION_ERROR_MAX_BYTES: usize = 2 * 1024;
 /// What the supervisor decided about an idle agent's turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SupervisionVerdict {
-    /// The user's request is complete (or legitimately waiting on the user).
+    /// The user's request is complete and no user response is needed.
     Done,
+    /// The agent needs feedback, clarification, approval, a choice, or plan
+    /// review before it can finish the request.
+    AwaitingUser,
     /// The agent stopped early; send this follow-up message to keep it going.
     Continue { message: String },
 }
@@ -253,30 +256,41 @@ async fn collect_supervision_events(
     Err("agent supervisor ended before producing a verdict".to_string())
 }
 
+pub(crate) const MOCK_SUPERVISOR_ERROR: &str = "__mock_supervisor_error__";
+pub(crate) const MOCK_SUPERVISOR_INVALID: &str = "__mock_supervisor_invalid__";
+pub(crate) const MOCK_SUPERVISOR_AWAITING_USER: &str =
+    "__mock_supervisor_awaiting_user__";
+pub(crate) const MOCK_SUPERVISOR_DONE: &str = "__mock_supervisor_done__";
+pub(crate) const MOCK_SUPERVISOR_CONTINUE: &str = "__mock_supervisor_continue__";
+
 fn generate_mock_supervision_verdict(
     request: &GenerateSupervisionVerdictRequest,
 ) -> Result<SupervisionVerdict, String> {
     if request
         .last_user_message
-        .contains("__mock_supervisor_error__")
+        .contains(MOCK_SUPERVISOR_ERROR)
     {
         return Err("mock supervision failure".to_owned());
     }
     if request
         .last_user_message
-        .contains("__mock_supervisor_invalid__")
+        .contains(MOCK_SUPERVISOR_INVALID)
     {
         return parse_supervision_verdict("this is not a verdict");
     }
     if request
         .last_user_message
-        .contains("__mock_supervisor_done__")
+        .contains(MOCK_SUPERVISOR_AWAITING_USER)
+    {
+        return Ok(SupervisionVerdict::AwaitingUser);
+    }
+    if request.last_user_message.contains(MOCK_SUPERVISOR_DONE)
     {
         return Ok(SupervisionVerdict::Done);
     }
     if request
         .last_user_message
-        .contains("__mock_supervisor_continue__")
+        .contains(MOCK_SUPERVISOR_CONTINUE)
         || request.last_error.is_some()
     {
         return Ok(SupervisionVerdict::Continue {
@@ -307,16 +321,22 @@ fn build_supervision_prompt(request: &GenerateSupervisionVerdictRequest) -> Stri
     format!(
         "You supervise a coding agent that just went idle. Decide whether it actually \
 finished the user's request or stopped early.\n\
-Reply with EXACTLY one of these two forms and nothing else:\n\
+Reply with EXACTLY one of these three forms and nothing else:\n\
 VERDICT: done\n\
+or\n\
+VERDICT: awaiting_user\n\
 or\n\
 VERDICT: continue\n\
 <one short follow-up message telling the agent to keep working and what remains>\n\
 Rules:\n\
-- Answer done when the agent's final message shows the request was completed, or the agent \
-is legitimately waiting for an answer or decision from the user.\n\
+- Answer done only when the user's requested work is actually complete and the agent expects no \
+user response to finish it.\n\
+- Answer awaiting_user when feedback, clarification, approval, a choice or decision, or review \
+of a plan or proposal is required. A completed plan document presented for approval is still \
+awaiting_user.\n\
 - Answer continue when an error interrupted the work, the agent stopped mid-task, or the \
-task list still has pending or in-progress items covered by the user's request.\n\
+task list still has pending or in-progress items covered by the user's request and the agent can \
+continue without user input.\n\
 - The follow-up message is sent verbatim to the agent. Keep it short and specific.\n\
 - Never invent new work or expand scope beyond the user's request.\n\n\
 User request:\n{user_message}\n\n\
@@ -398,6 +418,7 @@ pub(crate) fn parse_supervision_verdict(raw: &str) -> Result<SupervisionVerdict,
 
     match verdict_word.as_str() {
         "done" => Ok(SupervisionVerdict::Done),
+        "awaiting_user" => Ok(SupervisionVerdict::AwaitingUser),
         "continue" => {
             let message = lines
                 .collect::<Vec<_>>()
@@ -690,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_accepts_done_and_continue() {
+    fn parse_accepts_all_exact_verdicts() {
         assert_eq!(
             parse_supervision_verdict("VERDICT: done"),
             Ok(SupervisionVerdict::Done)
@@ -698,6 +719,10 @@ mod tests {
         assert_eq!(
             parse_supervision_verdict("verdict: Done\n"),
             Ok(SupervisionVerdict::Done)
+        );
+        assert_eq!(
+            parse_supervision_verdict("VERDICT: awaiting_user"),
+            Ok(SupervisionVerdict::AwaitingUser)
         );
         assert_eq!(
             parse_supervision_verdict("VERDICT: continue\nKeep going, task 3 is pending."),
@@ -714,6 +739,14 @@ mod tests {
             Ok(SupervisionVerdict::Done)
         );
         assert_eq!(
+            parse_supervision_verdict("```\n**VERDICT: awaiting_user**\nignored detail\n```"),
+            Ok(SupervisionVerdict::AwaitingUser)
+        );
+        assert_eq!(
+            parse_supervision_verdict("VERDICT: done\nignored detail"),
+            Ok(SupervisionVerdict::Done)
+        );
+        assert_eq!(
             parse_supervision_verdict("**VERDICT: continue**\nFinish the remaining tests."),
             Ok(SupervisionVerdict::Continue {
                 message: "Finish the remaining tests.".to_owned()
@@ -725,6 +758,9 @@ mod tests {
     fn parse_rejects_invalid_output() {
         assert!(parse_supervision_verdict("the task looks finished to me").is_err());
         assert!(parse_supervision_verdict("VERDICT: maybe").is_err());
+        assert!(parse_supervision_verdict("VERDICT: awaiting").is_err());
+        assert!(parse_supervision_verdict("VERDICT: done because complete").is_err());
+        assert!(parse_supervision_verdict("VERDICT: awaiting_user now").is_err());
         assert!(
             parse_supervision_verdict("VERDICT: continue\n\n").is_err(),
             "continue without a follow-up message must be rejected"
@@ -791,5 +827,42 @@ mod tests {
         assert!(prompt.contains("implement the parser"));
         assert!(prompt.contains("- [pending] write tests"));
         assert!(prompt.contains("1 of 3 allowed"));
+        assert!(prompt.contains("actually complete"));
+        assert!(prompt.contains("feedback, clarification, approval"));
+        assert!(prompt.contains("choice or decision"));
+        assert!(prompt.contains("plan or proposal"));
+        assert!(prompt.contains("completed plan document"));
+    }
+
+    #[test]
+    fn mock_sentinels_map_to_explicit_verdicts() {
+        fn request(last_user_message: &str) -> GenerateSupervisionVerdictRequest {
+            GenerateSupervisionVerdictRequest {
+                verdict_agent_id: AgentId("test".to_owned()),
+                backend_kind: BackendKind::Claude,
+                last_user_message: last_user_message.to_owned(),
+                task_list: None,
+                last_assistant_message: None,
+                last_error: None,
+                kicks_so_far: 0,
+                max_kicks: 3,
+                cost_hint: Some(SpawnCostHint::Low),
+                use_mock_backend: true,
+                capacity_tx: mpsc::unbounded_channel().0,
+            }
+        }
+
+        assert_eq!(
+            generate_mock_supervision_verdict(&request(MOCK_SUPERVISOR_DONE)),
+            Ok(SupervisionVerdict::Done)
+        );
+        assert_eq!(
+            generate_mock_supervision_verdict(&request(MOCK_SUPERVISOR_AWAITING_USER)),
+            Ok(SupervisionVerdict::AwaitingUser)
+        );
+        assert!(matches!(
+            generate_mock_supervision_verdict(&request(MOCK_SUPERVISOR_CONTINUE)),
+            Ok(SupervisionVerdict::Continue { .. })
+        ));
     }
 }

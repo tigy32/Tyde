@@ -47,6 +47,11 @@ const MOCK_COMPACT_SENTINEL: &str = "/compact";
 pub(crate) const MOCK_SLOW_TURN_SENTINEL: &str = "__mock_slow__";
 const MOCK_HOLD_UNTIL_INTERRUPT_SENTINEL: &str = "__mock_hold_until_interrupt__";
 pub(crate) const MOCK_DUPLICATE_IDLE_SENTINEL: &str = "__mock_duplicate_idle__";
+/// Emits an additional ordinary active→idle status cycle after a completed
+/// turn so scheduler tests can advance the inactivity generation without
+/// sleeps or hidden state inspection.
+pub(crate) const MOCK_ACTIVE_IDLE_CYCLE_SENTINEL: &str =
+    "__mock_active_idle_cycle__";
 /// Causes the mock backend task to emit `TypingStatusChanged(true)`, sleep 300 ms,
 /// then exit without completing the turn.  The events channel closes when the
 /// task exits, which drives the agent actor into `enter_terminal_failure`.
@@ -1174,6 +1179,18 @@ async fn emit_turn(
     }
 
     if user_message.contains(MOCK_DUPLICATE_IDLE_SENTINEL) {
+        return events_tx
+            .send(ChatEvent::TypingStatusChanged(false))
+            .is_ok();
+    }
+
+    if user_message.contains(MOCK_ACTIVE_IDLE_CYCLE_SENTINEL) {
+        if events_tx
+            .send(ChatEvent::TypingStatusChanged(true))
+            .is_err()
+        {
+            return false;
+        }
         return events_tx
             .send(ChatEvent::TypingStatusChanged(false))
             .is_ok();

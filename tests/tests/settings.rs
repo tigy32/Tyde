@@ -1060,6 +1060,7 @@ fn persisted_legacy_supervisor_uses_default_compaction_minimum() {
         .expect("read legacy supervisor settings")
         .supervisor;
     assert_eq!(supervisor.auto_compact_min_context_tokens, 200_000);
+    assert_eq!(supervisor.auto_compact_inactivity_delay_seconds, 300);
 }
 
 #[test]
@@ -1139,6 +1140,7 @@ fn supervisor_settings_default_apply_and_validate() {
         "auto-compact must default off"
     );
     assert_eq!(defaults.auto_compact_min_context_tokens, 200_000);
+    assert_eq!(defaults.auto_compact_inactivity_delay_seconds, 300);
     assert_eq!(defaults.max_kicks_per_task, 3);
     assert_eq!(defaults.retry_attempts, 1);
 
@@ -1151,7 +1153,49 @@ fn supervisor_settings_default_apply_and_validate() {
         .expect("enable auto-compact");
     assert!(settings.supervisor.auto_compact_on_success);
     let settings = store
-        .apply(HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 275_000 })
+        .apply(
+            HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 1 },
+        )
+        .expect("minimum inactivity delay is valid");
+    assert_eq!(settings.supervisor.auto_compact_inactivity_delay_seconds, 1);
+    let settings = store
+        .apply(
+            HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 86_400 },
+        )
+        .expect("maximum inactivity delay is valid");
+    assert_eq!(
+        settings.supervisor.auto_compact_inactivity_delay_seconds,
+        86_400
+    );
+    let settings = store
+        .apply(
+            HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 17 },
+        )
+        .expect("persist non-default inactivity delay");
+    assert_eq!(settings.supervisor.auto_compact_inactivity_delay_seconds, 17);
+    store
+        .apply(
+            HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 0 },
+        )
+        .expect_err("zero inactivity delay must be rejected");
+    store
+        .apply(
+            HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 86_401 },
+        )
+        .expect_err("inactivity delay above the maximum must be rejected");
+    assert_eq!(
+        store
+            .get()
+            .expect("read delay after rejected updates")
+            .supervisor
+            .auto_compact_inactivity_delay_seconds,
+        17,
+        "rejected updates must not clobber the prior valid delay"
+    );
+    let settings = store
+        .apply(
+            HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 275_000 },
+        )
         .expect("set auto-compact minimum context");
     assert_eq!(settings.supervisor.auto_compact_min_context_tokens, 275_000);
     assert_eq!(
@@ -1197,6 +1241,7 @@ fn supervisor_settings_default_apply_and_validate() {
     let persisted = store.get().expect("re-read persisted settings").supervisor;
     assert!(persisted.enabled);
     assert!(persisted.auto_compact_on_success);
+    assert_eq!(persisted.auto_compact_inactivity_delay_seconds, 17);
     assert_eq!(
         persisted.auto_compact_min_context_tokens, 0,
         "the explicit zero minimum must persist"
@@ -1211,6 +1256,35 @@ fn supervisor_settings_default_apply_and_validate() {
         protocol::SupervisorCostTier::High,
         "the verdict tier must survive the read-modify-write cycle"
     );
+}
+
+#[test]
+fn invalid_persisted_supervisor_inactivity_delay_is_rejected() {
+    for seconds in [0_u32, 86_401] {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{
+  "settings": {{
+    "enabled_backends": [],
+    "default_backend": null,
+    "supervisor": {{
+      "auto_compact_inactivity_delay_seconds": {seconds}
+    }}
+  }}
+}}"#
+            ),
+        )
+        .expect("write invalid supervisor settings store");
+        let error = HostSettingsStore::load(path)
+            .expect_err("invalid persisted inactivity delay must fail load");
+        assert!(
+            error.contains("inactivity delay must be between 1 and 86400 seconds"),
+            "unexpected error for {seconds}: {error}"
+        );
+    }
 }
 
 #[test]

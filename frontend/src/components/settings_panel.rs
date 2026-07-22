@@ -19,6 +19,8 @@ use protocol::{
     ProjectId, RunBackendSetupPayload, SessionSchemaEntry, SessionSettingField,
     SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SessionSettingsValues,
     SetSettingPayload, Skill, SkillId, Steering, SteeringId, SteeringScope, ToolPolicy,
+    SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX,
+    SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN,
 };
 
 use serde_json::{Map, Value};
@@ -2011,8 +2013,8 @@ fn BackgroundAgentFeaturesSection() -> impl IntoView {
 
 /// Agent supervisor settings. When an agent goes idle, a hidden background
 /// model call reviews the last user request, the task list, and the agent's
-/// final message, then either accepts the turn as done or sends a follow-up
-/// message that kicks the agent back to work. Every knob is host-scoped and
+/// final message, then classifies it as done, awaiting user input, or needing
+/// a follow-up that kicks the agent back to work. Every knob is host-scoped and
 /// committed as a typed `Supervisor*` host setting; the feature costs money
 /// per idle transition, so it defaults off.
 #[component]
@@ -2022,6 +2024,8 @@ fn SupervisorTab() -> impl IntoView {
     let state_for_enabled_disabled = state.clone();
     let state_for_compact_checked = state.clone();
     let state_for_compact_disabled = state.clone();
+    let state_for_compact_delay_value = state.clone();
+    let state_for_compact_delay_disabled = state.clone();
     let state_for_compact_min_value = state.clone();
     let state_for_compact_min_disabled = state.clone();
     let state_for_kicks_value = state.clone();
@@ -2061,7 +2065,43 @@ fn SupervisorTab() -> impl IntoView {
     let compact_disabled = move || {
         state_for_compact_disabled
             .selected_host_settings()
-            .is_none()
+            .is_none_or(|settings| !settings.supervisor.enabled)
+    };
+
+    let compact_delay_value = move || {
+        state_for_compact_delay_value
+            .selected_host_settings()
+            .map(|settings| {
+                settings
+                    .supervisor
+                    .auto_compact_inactivity_delay_seconds
+                    .to_string()
+            })
+            .unwrap_or_default()
+    };
+    let compact_delay_disabled = move || {
+        state_for_compact_delay_disabled
+            .selected_host_settings()
+            .is_none_or(|settings| {
+                !settings.supervisor.enabled || !settings.supervisor.auto_compact_on_success
+            })
+    };
+    let compact_delay_on_change = {
+        let state = state.clone();
+        move |ev: web_sys::Event| {
+            let target = ev.target().unwrap();
+            let input: web_sys::HtmlInputElement = target.unchecked_into();
+            if let Ok(seconds) = input.value().trim().parse::<u32>()
+                && (SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN
+                    ..=SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX)
+                    .contains(&seconds)
+            {
+                send_host_setting(
+                    &state,
+                    HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds },
+                );
+            }
+        }
     };
     let compact_on_toggle = {
         let state = state.clone();
@@ -2091,7 +2131,9 @@ fn SupervisorTab() -> impl IntoView {
     let compact_min_disabled = move || {
         state_for_compact_min_disabled
             .selected_host_settings()
-            .is_none()
+            .is_none_or(|settings| {
+                !settings.supervisor.enabled || !settings.supervisor.auto_compact_on_success
+            })
     };
     let compact_min_on_change = {
         let state = state.clone();
@@ -2213,7 +2255,7 @@ fn SupervisorTab() -> impl IntoView {
                 <div>
                     <label class="settings-label">"Auto-compact on success"</label>
                     <p class="settings-description">
-                        "When the supervisor confirms a task is finished, automatically compact the agent: its session is summarized and rotated into a fresh agent with a small warm context, so reusing it later does not pay to resume a huge cold session."
+                        "After the supervisor confirms the requested work is truly complete, automatically compact only after the inactivity delay has elapsed and the latest completed assistant turn reports a known current context strictly above the configured minimum."
                     </p>
                 </div>
                 <label class="settings-toggle">
@@ -2225,6 +2267,27 @@ fn SupervisorTab() -> impl IntoView {
                     />
                     <span class="settings-toggle-slider"></span>
                 </label>
+            </div>
+        </div>
+
+        <div class="settings-field">
+            <label class="settings-label">"Auto-compact inactivity delay"</label>
+            <p class="settings-description">
+                "Default 300 seconds (5 minutes); agent activity restarts the timer. Compaction starts only after true completion, this full quiet period, and a known current context strictly above the configured minimum."
+            </p>
+            <div class="settings-form-row" style="align-items: center;">
+                <input
+                    class="settings-input settings-supervisor-number-input"
+                    type="number"
+                    min=SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN
+                    max=SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX
+                    step="1"
+                    prop:value=compact_delay_value
+                    disabled=compact_delay_disabled
+                    aria-label="Supervisor auto-compact inactivity delay seconds"
+                    on:change=compact_delay_on_change
+                />
+                <span class="settings-supervisor-number-unit">"seconds"</span>
             </div>
         </div>
 
@@ -9126,12 +9189,42 @@ mod wasm_tests {
             .expect("auto-compact minimum context input renders")
             .dyn_into()
             .expect("auto-compact minimum context is an input");
+        let compact_delay: web_sys::HtmlInputElement = container
+            .query_selector(
+                "input[aria-label='Supervisor auto-compact inactivity delay seconds']",
+            )
+            .unwrap()
+            .expect("auto-compact inactivity delay input renders")
+            .dyn_into()
+            .expect("auto-compact inactivity delay is an input");
+        assert_eq!(
+            compact_delay.value(),
+            "300",
+            "auto-compact inactivity delay shows the server default"
+        );
+        let compact_delay_unit = compact_delay
+            .parent_element()
+            .expect("delay input has a form row")
+            .query_selector(".settings-supervisor-number-unit")
+            .unwrap()
+            .expect("auto-compact inactivity delay renders a visible unit");
+        assert_eq!(compact_delay_unit.text_content().as_deref(), Some("seconds"));
+        compact_delay.set_value("15");
+        dispatch_change(&compact_delay);
+        compact_delay.set_value("not-a-number");
+        dispatch_change(&compact_delay);
+        compact_delay.set_value("0");
+        dispatch_change(&compact_delay);
+        compact_delay.set_value("86401");
+        dispatch_change(&compact_delay);
         assert_eq!(
             compact_min.value(),
             "200000",
             "auto-compact minimum context shows the host default before edits"
         );
-        let compact_min_unit = container
+        let compact_min_unit = compact_min
+            .parent_element()
+            .expect("minimum input has a form row")
             .query_selector(".settings-supervisor-number-unit")
             .unwrap()
             .expect("auto-compact minimum context renders a visible unit");
@@ -9167,6 +9260,25 @@ mod wasm_tests {
         }
 
         let settings = recorded_set_setting_payloads(&calls);
+        assert!(
+            settings.iter().any(|s| {
+                s.get("kind").and_then(|k| k.as_str())
+                    == Some("supervisor_auto_compact_inactivity_delay_seconds")
+                    && s.get("seconds").and_then(|v| v.as_u64()) == Some(15)
+            }),
+            "editing the delay must emit the exact typed setting: {settings:?}"
+        );
+        assert_eq!(
+            settings
+                .iter()
+                .filter(|s| {
+                    s.get("kind").and_then(|k| k.as_str())
+                        == Some("supervisor_auto_compact_inactivity_delay_seconds")
+                })
+                .count(),
+            1,
+            "unparsable and out-of-range delay values must emit nothing: {settings:?}"
+        );
         assert!(
             settings.iter().any(|s| {
                 s.get("kind").and_then(|k| k.as_str())
@@ -9221,6 +9333,73 @@ mod wasm_tests {
                     && s.get("tier").and_then(|v| v.as_str()) == Some("high")
             }),
             "picking High must emit SupervisorCostTier tier=high: {settings:?}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn supervisor_auto_compact_controls_cascade_reactively() {
+        let container = make_container();
+        let state = AppState::new();
+        install_general_host_settings(&state, true, false, None);
+        state.settings_open.set(true);
+        let mounted_state = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(mounted_state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Supervisor");
+        next_tick().await;
+
+        let auto_compact = toggle_for_label(&container, "Auto-compact on success");
+        let delay: web_sys::HtmlInputElement = container
+            .query_selector(
+                "input[aria-label='Supervisor auto-compact inactivity delay seconds']",
+            )
+            .unwrap()
+            .expect("delay input")
+            .dyn_into()
+            .expect("delay input element");
+        let threshold: web_sys::HtmlInputElement = container
+            .query_selector(
+                "input[aria-label='Supervisor auto-compact minimum context tokens']",
+            )
+            .unwrap()
+            .expect("threshold input")
+            .dyn_into()
+            .expect("threshold input element");
+        assert!(auto_compact.disabled());
+        assert!(delay.disabled());
+        assert!(threshold.disabled());
+        assert_eq!(delay.value(), "300");
+
+        state.host_settings_by_host.update(|settings_by_host| {
+            let settings = settings_by_host
+                .get_mut("host-general")
+                .expect("same selected host settings");
+            settings.supervisor.enabled = true;
+            settings.supervisor.auto_compact_inactivity_delay_seconds = 41;
+        });
+        next_tick().await;
+        assert!(!auto_compact.disabled());
+        assert!(delay.disabled());
+        assert!(threshold.disabled());
+        assert_eq!(delay.value(), "41", "disabled values remain server-owned");
+
+        state.host_settings_by_host.update(|settings_by_host| {
+            let settings = settings_by_host
+                .get_mut("host-general")
+                .expect("same selected host settings");
+            settings.supervisor.auto_compact_on_success = true;
+            settings.supervisor.auto_compact_inactivity_delay_seconds = 57;
+        });
+        next_tick().await;
+        assert!(!delay.disabled());
+        assert!(!threshold.disabled());
+        assert_eq!(
+            delay.value(),
+            "57",
+            "same-host same-key updates must replace the displayed delay"
         );
     }
 
