@@ -829,7 +829,9 @@ active-to-idle cycle. The single supervisor scheduler records `idle_since` at
 the observed idle transition, waits the three-second verdict debounce, and
 judges that generation once. A successful `Done` verdict is retained while
 the scheduler waits; expiry performs only cheap live checks, not a second paid
-verdict call.
+verdict call. A late `MessageMetadataUpdated` patch counts as activity, so one
+arriving after idle begins restarts the interval and can trigger a fresh
+verdict; patches within the debounce coalesce into that generation.
 
 Automatic compaction requires all four live conditions: the supervisor and
 auto-compact setting are enabled; the accepted verdict for the unchanged
@@ -851,11 +853,13 @@ supervisor clears runtime state; enabling it begins a fresh interval. A host or
 scheduler restart likewise observes already-idle agents with a fresh
 `idle_since` and persists none of the generation, phase, verdict, or deadline.
 
-At expiry the host sends `CompactIfInactive(expected_activity_counter)` through
-the agent actor. The actor mailbox is the final linearization point: earlier
-accepted or queued input changes the counter and rejects stale automatic
-compaction, while a conditional compact accepted first legitimately crosses
-the gate. Rotation and post-compaction bootstrap guards still apply.
+At expiry the host sends a conditional compact carrying the expected activity
+counter and supervisor-settings epoch through the agent actor. The actor
+mailbox is the final linearization point: earlier accepted or queued input
+changes the counter, and an earlier committed settings edit changes the epoch,
+so either rejects stale automatic compaction. A conditional compact accepted
+first legitimately crosses the gate. Rotation and post-compaction bootstrap
+guards still apply.
 
 The implementation guarantees only that compaction **starts no earlier than**
 the configured inactivity delay. This repository defines no provider cache

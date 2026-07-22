@@ -172,6 +172,8 @@ enum AgentCommand {
     },
     CompactIfInactive {
         expected_activity_counter: u64,
+        expected_supervisor_settings_epoch: u64,
+        supervisor_settings_rx: watch::Receiver<crate::host::SupervisorSettingsSignal>,
         summary_prompt: String,
         max_summary_bytes: usize,
         accepted: oneshot::Sender<Result<(), String>>,
@@ -982,6 +984,8 @@ impl AgentHandle {
     pub async fn begin_compact_if_inactive(
         &self,
         expected_activity_counter: u64,
+        expected_supervisor_settings_epoch: u64,
+        supervisor_settings_rx: watch::Receiver<crate::host::SupervisorSettingsSignal>,
         summary_prompt: String,
         max_summary_bytes: usize,
     ) -> CompactionStart {
@@ -994,6 +998,8 @@ impl AgentHandle {
             .tx
             .send(AgentCommand::CompactIfInactive {
                 expected_activity_counter,
+                expected_supervisor_settings_epoch,
+                supervisor_settings_rx,
                 summary_prompt,
                 max_summary_bytes,
                 accepted: accepted_tx,
@@ -3874,14 +3880,25 @@ pub(crate) fn spawn_agent_actor(
                         }
                         AgentCommand::CompactIfInactive {
                             expected_activity_counter,
+                            expected_supervisor_settings_epoch,
+                            supervisor_settings_rx,
                             summary_prompt,
                             max_summary_bytes,
                             accepted,
                             reply,
                         } => {
+                            wait_for_compact_if_inactive_test_gate(&current_start.agent_id).await;
                             let live_activity_counter =
                                 status_handle.snapshot().await.activity_counter;
-                            let reject = if live_activity_counter != expected_activity_counter {
+                            let live_settings = *supervisor_settings_rx.borrow();
+                            let reject = if live_settings.epoch
+                                != expected_supervisor_settings_epoch
+                            {
+                                Some(format!(
+                                    "supervisor settings changed before automatic compaction (expected epoch {expected_supervisor_settings_epoch}, current {})",
+                                    live_settings.epoch
+                                ))
+                            } else if live_activity_counter != expected_activity_counter {
                                 Some(format!(
                                     "agent activity changed before automatic compaction (expected {expected_activity_counter}, current {live_activity_counter})"
                                 ))
@@ -4268,6 +4285,36 @@ static AGENT_STARTUP_TEST_GATE: std::sync::Mutex<Option<AgentStartupTestGate>> =
 #[cfg(test)]
 static AGENT_STARTUP_SELECTION_TEST_GATE: std::sync::Mutex<Option<AgentStartupTestGate>> =
     std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static COMPACT_IF_INACTIVE_TEST_GATE: std::sync::Mutex<Option<AgentStartupTestGate>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn install_compact_if_inactive_test_gate(
+    agent_id: AgentId,
+) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let replaced = COMPACT_IF_INACTIVE_TEST_GATE
+        .lock()
+        .expect("compact-if-inactive test gate mutex poisoned")
+        .replace(AgentStartupTestGate {
+            agent_id,
+            entered: entered_tx,
+            release: release_rx,
+        });
+    assert!(replaced.is_none(), "compact-if-inactive test gate already installed");
+    (entered_rx, release_tx)
+}
+
+#[cfg(test)]
+async fn wait_for_compact_if_inactive_test_gate(agent_id: &AgentId) {
+    wait_for_matching_agent_startup_test_gate(&COMPACT_IF_INACTIVE_TEST_GATE, agent_id).await;
+}
+
+#[cfg(not(test))]
+async fn wait_for_compact_if_inactive_test_gate(_agent_id: &AgentId) {}
 
 #[cfg(test)]
 async fn wait_for_agent_startup_test_gate(agent_id: &AgentId) {

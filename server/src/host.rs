@@ -355,9 +355,9 @@ struct ActivitySummarySettingsSignal {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SupervisorSettingsSignal {
-    settings: protocol::SupervisorSettings,
-    epoch: u64,
+pub(crate) struct SupervisorSettingsSignal {
+    pub(crate) settings: protocol::SupervisorSettings,
+    pub(crate) epoch: u64,
 }
 
 struct SupervisorSchedulerEntry {
@@ -3012,15 +3012,21 @@ impl HostHandle {
         &self,
         agent_id: AgentId,
         expected_activity_counter: u64,
+        expected_supervisor_settings_epoch: u64,
         payload: AgentCompactPayload,
         stream: Stream,
     ) -> AppResult<bool> {
+        let supervisor_settings_rx = self.supervisor_settings_receiver().await;
         let Some(compaction) = self
             .begin_agent_compaction(
                 agent_id,
                 payload,
                 stream,
-                Some(expected_activity_counter),
+                Some((
+                    expected_activity_counter,
+                    expected_supervisor_settings_epoch,
+                    supervisor_settings_rx,
+                )),
             )
             .await?
         else {
@@ -3280,7 +3286,11 @@ impl HostHandle {
         agent_id: AgentId,
         payload: AgentCompactPayload,
         stream: Stream,
-        expected_activity_counter: Option<u64>,
+        inactivity_gate: Option<(
+            u64,
+            u64,
+            watch::Receiver<SupervisorSettingsSignal>,
+        )>,
     ) -> AppResult<Option<AgentCompaction>> {
         let summary_prompt = payload
             .summary_prompt
@@ -3401,11 +3411,17 @@ impl HostHandle {
             return Ok(None);
         }
 
-        let compaction_start = match expected_activity_counter {
-            Some(expected_activity_counter) => {
+        let compaction_start = match inactivity_gate {
+            Some((
+                expected_activity_counter,
+                expected_supervisor_settings_epoch,
+                supervisor_settings_rx,
+            )) => {
                 agent_handle
                     .begin_compact_if_inactive(
                         expected_activity_counter,
+                        expected_supervisor_settings_epoch,
+                        supervisor_settings_rx,
                         summary_prompt,
                         max_summary_bytes,
                     )
@@ -13013,21 +13029,13 @@ fn spawn_agent_supervisor_task(host: HostHandle) {
                     }
                     let previous = settings;
                     settings = *settings_rx.borrow();
-                    if !settings.settings.enabled {
-                        if previous.settings.enabled {
-                            tracing::info!("agent supervisor disabled; clearing inactivity state");
-                        }
-                        entries.clear();
-                    } else if !previous.settings.enabled {
-                        tracing::info!("agent supervisor enabled; starting fresh inactivity intervals");
-                        entries.clear();
-                        observe_supervised_agents(&host, &mut entries).await;
-                    } else {
-                        observe_supervised_agents(&host, &mut entries).await;
-                        for entry in entries.values_mut() {
-                            requeue_inflight_supervision_for_settings_change(entry);
-                        }
-                    }
+                    apply_supervisor_settings_change(
+                        &host,
+                        &mut entries,
+                        previous,
+                        settings,
+                    )
+                    .await;
                 }
                 Some(result) = verdict_rx.recv() => {
                     accept_supervision_verdict_result(
@@ -13158,11 +13166,38 @@ fn supervisor_phase_for_fresh_observation(
     }
 }
 
+fn mark_supervisor_kick_pending(status: &mut crate::agent::registry::AgentStatus) {
+    status.turn_completed = false;
+}
+
 fn requeue_inflight_supervision_for_settings_change(entry: &mut SupervisorSchedulerEntry) {
     if let SupervisorPhase::VerdictInFlight { idle_since, .. } = &entry.phase {
         entry.phase = SupervisorPhase::Debouncing {
             idle_since: *idle_since,
         };
+    }
+}
+
+async fn apply_supervisor_settings_change(
+    host: &HostHandle,
+    entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
+    previous: SupervisorSettingsSignal,
+    current: SupervisorSettingsSignal,
+) {
+    if !current.settings.enabled {
+        if previous.settings.enabled {
+            tracing::info!("agent supervisor disabled; clearing inactivity state");
+        }
+        entries.clear();
+    } else if !previous.settings.enabled {
+        tracing::info!("agent supervisor enabled; starting fresh inactivity intervals");
+        entries.clear();
+        observe_supervised_agents(host, entries).await;
+    } else {
+        observe_supervised_agents(host, entries).await;
+        for entry in entries.values_mut() {
+            requeue_inflight_supervision_for_settings_change(entry);
+        }
     }
 }
 
@@ -13515,6 +13550,7 @@ async fn accept_supervision_verdict_result(
     settings: SupervisorSettingsSignal,
     result: SupervisorVerdictTaskResult,
 ) {
+    let live_settings = host.supervisor_settings_signal().await;
     let Some(entry) = entries.get(&result.agent_id) else {
         return;
     };
@@ -13528,16 +13564,34 @@ async fn accept_supervision_verdict_result(
     };
     if entry.last_activity_counter != result.activity_counter
         || *settings_epoch != result.settings_epoch
-        || settings.epoch != result.settings_epoch
         || baseline != &result.baseline
     {
         tracing::debug!(
             agent_id = %result.agent_id,
-            "dropping stale supervision verdict: generation or settings changed"
+            "dropping stale supervision verdict: generation changed"
         );
         return;
     }
     let idle_since = *idle_since;
+    if !live_settings.settings.enabled {
+        entries.remove(&result.agent_id);
+        tracing::debug!(
+            agent_id = %result.agent_id,
+            "dropping supervision verdict after the supervisor was disabled"
+        );
+        return;
+    }
+    if settings.epoch != result.settings_epoch || live_settings.epoch != result.settings_epoch {
+        entries.get_mut(&result.agent_id).expect("entry exists").phase =
+            SupervisorPhase::Debouncing { idle_since };
+        tracing::debug!(
+            agent_id = %result.agent_id,
+            result_settings_epoch = result.settings_epoch,
+            live_settings_epoch = live_settings.epoch,
+            "dropping stale supervision verdict and rearming the idle generation"
+        );
+        return;
+    }
     let Some(observation) = host.activity_summary_observation(&result.agent_id).await else {
         entries.remove(&result.agent_id);
         return;
@@ -13601,6 +13655,9 @@ async fn accept_supervision_verdict_result(
             );
             entries.get_mut(&result.agent_id).expect("entry exists").phase =
                 SupervisorPhase::Active;
+            if let Some(status_handle) = host.agent_status_handle(&result.agent_id).await {
+                status_handle.update(mark_supervisor_kick_pending).await;
+            }
             let sent = observation
                 .handle
                 .send_input(AgentInput::SendMessage(SendMessagePayload {
@@ -13752,7 +13809,7 @@ async fn launch_supervisor_auto_compaction(
     let host = host.clone();
     let tx = compaction_tx.clone();
     tokio::spawn(async move {
-        supervisor_auto_compact(host, agent_id, activity_counter, tx).await;
+        supervisor_auto_compact(host, agent_id, activity_counter, settings.epoch, tx).await;
     });
 }
 
@@ -13784,6 +13841,7 @@ async fn supervisor_auto_compact(
     host: HostHandle,
     agent_id: AgentId,
     expected_activity_counter: u64,
+    expected_supervisor_settings_epoch: u64,
     task_tx: mpsc::UnboundedSender<SupervisorCompactionTaskEvent>,
 ) {
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -13795,6 +13853,7 @@ async fn supervisor_auto_compact(
         .compact_agent_if_inactive_in_background(
             agent_id.clone(),
             expected_activity_counter,
+            expected_supervisor_settings_epoch,
             AgentCompactPayload {
                 summary_prompt: None,
                 max_summary_bytes: None,
@@ -22926,6 +22985,400 @@ Rules: Record only what remains true and useful for future work; drop transient 
             supervisor_phase_for_fresh_observation(&active, now),
             SupervisorPhase::Active
         ));
+    }
+
+    #[test]
+    fn supervisor_kick_is_active_before_backend_typing_starts() {
+        let now = Instant::now();
+        let mut status = crate::agent::registry::AgentStatus {
+            started: true,
+            turn_completed: true,
+            activity_counter: 21,
+            ..Default::default()
+        };
+
+        mark_supervisor_kick_pending(&mut status);
+        status.activity_counter += 1;
+
+        assert!(status.is_active());
+        assert!(matches!(
+            supervisor_phase_for_fresh_observation(&status, now),
+            SupervisorPhase::Active
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_verdict_rearms_from_authoritative_settings_epoch() {
+        let fixture = compact_fixture().await;
+        let (agent_id, session_id) =
+            spawn_idle_user_agent(&fixture.host, "stale verdict settings race").await;
+        let observation = fixture
+            .host
+            .activity_summary_observation(&agent_id)
+            .await
+            .expect("agent observation");
+        let context = observation
+            .handle
+            .read_supervision_context()
+            .await
+            .expect("supervision context");
+        fixture
+            .host
+            .set_setting(SetSettingPayload {
+                setting: HostSettingValue::SupervisorEnabled { enabled: true },
+            })
+            .await
+            .expect("enable supervisor");
+        let cached_settings = fixture.host.supervisor_settings_signal().await;
+        let idle_since = Instant::now();
+        let baseline = SupervisionBaseline {
+            last_user_message: context.last_user_message.expect("last user message"),
+            kicks_since_user_message: context.kicks_since_user_message,
+            session_id: Some(session_id),
+        };
+        let activity_counter = observation.status.activity_counter;
+        let mut entries = HashMap::from([(
+            agent_id.clone(),
+            SupervisorSchedulerEntry {
+                last_activity_counter: activity_counter,
+                phase: SupervisorPhase::VerdictInFlight {
+                    idle_since,
+                    settings_epoch: cached_settings.epoch,
+                    baseline: baseline.clone(),
+                },
+            },
+        )]);
+
+        fixture
+            .host
+            .set_setting(SetSettingPayload {
+                setting: HostSettingValue::SupervisorRetryAttempts { count: 2 },
+            })
+            .await
+            .expect("commit newer supervisor settings");
+        assert_ne!(
+            fixture.host.supervisor_settings_signal().await.epoch,
+            cached_settings.epoch
+        );
+        accept_supervision_verdict_result(
+            &fixture.host,
+            &mut entries,
+            cached_settings,
+            SupervisorVerdictTaskResult {
+                agent_id: agent_id.clone(),
+                activity_counter,
+                settings_epoch: cached_settings.epoch,
+                baseline: baseline.clone(),
+                result: Ok(crate::agent::supervisor::SupervisionVerdict::Done),
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            entries.get(&agent_id).map(|entry| &entry.phase),
+            Some(SupervisorPhase::Debouncing { idle_since: preserved })
+                if *preserved == idle_since
+        ));
+        requeue_inflight_supervision_for_settings_change(
+            entries.get_mut(&agent_id).expect("scheduler entry"),
+        );
+        assert!(matches!(
+            entries.get(&agent_id).map(|entry| &entry.phase),
+            Some(SupervisorPhase::Debouncing { .. })
+        ));
+
+        let live_settings = fixture.host.supervisor_settings_signal().await;
+        entries.get_mut(&agent_id).expect("scheduler entry").phase =
+            SupervisorPhase::VerdictInFlight {
+                idle_since,
+                settings_epoch: live_settings.epoch,
+                baseline: baseline.clone(),
+            };
+        accept_supervision_verdict_result(
+            &fixture.host,
+            &mut entries,
+            live_settings,
+            SupervisorVerdictTaskResult {
+                agent_id: agent_id.clone(),
+                activity_counter,
+                settings_epoch: live_settings.epoch,
+                baseline: baseline.clone(),
+                result: Ok(crate::agent::supervisor::SupervisionVerdict::Done),
+            },
+        )
+        .await;
+        assert!(matches!(
+            entries.get(&agent_id).map(|entry| &entry.phase),
+            Some(SupervisorPhase::DoneAuthorized {
+                idle_since: preserved,
+                ..
+            }) if *preserved == idle_since
+        ));
+
+        accept_supervision_verdict_result(
+            &fixture.host,
+            &mut entries,
+            live_settings,
+            SupervisorVerdictTaskResult {
+                agent_id: agent_id.clone(),
+                activity_counter,
+                settings_epoch: live_settings.epoch,
+                baseline,
+                result: Ok(crate::agent::supervisor::SupervisionVerdict::AwaitingUser),
+            },
+        )
+        .await;
+        assert!(matches!(
+            entries.get(&agent_id).map(|entry| &entry.phase),
+            Some(SupervisorPhase::DoneAuthorized { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn disable_then_enable_observes_idle_agent_with_fresh_interval() {
+        let fixture = compact_fixture().await;
+        let (agent_id, _) = spawn_idle_user_agent(&fixture.host, "restart interval").await;
+        let old_idle_since = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .expect("old instant");
+        let baseline = SupervisionBaseline {
+            last_user_message: "restart interval".to_owned(),
+            kicks_since_user_message: 0,
+            session_id: None,
+        };
+        let mut entries = HashMap::from([(
+            agent_id.clone(),
+            SupervisorSchedulerEntry {
+                last_activity_counter: 1,
+                phase: SupervisorPhase::DoneAuthorized {
+                    idle_since: old_idle_since,
+                    baseline,
+                    last_gate_evaluation_epoch: None,
+                },
+            },
+        )]);
+        let mut enabled = protocol::SupervisorSettings::default();
+        enabled.enabled = true;
+        let mut disabled = enabled;
+        disabled.enabled = false;
+
+        apply_supervisor_settings_change(
+            &fixture.host,
+            &mut entries,
+            SupervisorSettingsSignal {
+                settings: enabled,
+                epoch: 1,
+            },
+            SupervisorSettingsSignal {
+                settings: disabled,
+                epoch: 2,
+            },
+        )
+        .await;
+        assert!(entries.is_empty());
+
+        let reenabled_at = Instant::now();
+        apply_supervisor_settings_change(
+            &fixture.host,
+            &mut entries,
+            SupervisorSettingsSignal {
+                settings: disabled,
+                epoch: 2,
+            },
+            SupervisorSettingsSignal {
+                settings: enabled,
+                epoch: 3,
+            },
+        )
+        .await;
+        assert!(matches!(
+            entries.get(&agent_id).map(|entry| &entry.phase),
+            Some(SupervisorPhase::Debouncing { idle_since })
+                if *idle_since >= reenabled_at && *idle_since != old_idle_since
+        ));
+    }
+
+    async fn assert_settings_edit_rejects_actor_pending_compaction(
+        fixture: &CompactFixture,
+        agent_id: &AgentId,
+        setting: HostSettingValue,
+    ) {
+        let status = fixture
+            .host
+            .agent_status_snapshot(agent_id)
+            .await
+            .expect("agent status");
+        let signal = fixture.host.supervisor_settings_signal().await;
+        let (entered, release) =
+            crate::agent::install_compact_if_inactive_test_gate(agent_id.clone());
+        let host = fixture.host.clone();
+        let compact_agent_id = agent_id.clone();
+        let compact = tokio::spawn(async move {
+            let (stream, _rx) = compact_stream(&compact_agent_id);
+            host.compact_agent_if_inactive_in_background(
+                compact_agent_id,
+                status.activity_counter,
+                signal.epoch,
+                AgentCompactPayload {
+                    summary_prompt: None,
+                    max_summary_bytes: None,
+                },
+                stream,
+            )
+            .await
+        });
+
+        entered.await.expect("conditional compact reached actor gate");
+        fixture
+            .host
+            .set_setting(SetSettingPayload { setting })
+            .await
+            .expect("commit supervisor setting while actor gate is held");
+        release.send(()).expect("release actor gate");
+
+        assert!(!compact
+            .await
+            .expect("conditional compact task")
+            .expect("conditional compact request"));
+    }
+
+    #[tokio::test]
+    async fn actor_gate_rejects_each_stale_supervisor_setting_kind() {
+        let fixture = compact_fixture().await;
+        fixture
+            .host
+            .set_setting(SetSettingPayload {
+                setting: HostSettingValue::SupervisorEnabled { enabled: true },
+            })
+            .await
+            .expect("enable supervisor");
+        fixture
+            .host
+            .set_setting(SetSettingPayload {
+                setting: HostSettingValue::SupervisorAutoCompactOnSuccess { enabled: true },
+            })
+            .await
+            .expect("enable auto-compaction");
+        let (agent_id, _) = spawn_idle_user_agent(&fixture.host, "actor settings race").await;
+
+        assert_settings_edit_rejects_actor_pending_compaction(
+            &fixture,
+            &agent_id,
+            HostSettingValue::SupervisorEnabled { enabled: false },
+        )
+        .await;
+        fixture
+            .host
+            .set_setting(SetSettingPayload {
+                setting: HostSettingValue::SupervisorEnabled { enabled: true },
+            })
+            .await
+            .expect("restore supervisor");
+        assert_settings_edit_rejects_actor_pending_compaction(
+            &fixture,
+            &agent_id,
+            HostSettingValue::SupervisorAutoCompactOnSuccess { enabled: false },
+        )
+        .await;
+        assert_settings_edit_rejects_actor_pending_compaction(
+            &fixture,
+            &agent_id,
+            HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 900 },
+        )
+        .await;
+        assert_settings_edit_rejects_actor_pending_compaction(
+            &fixture,
+            &agent_id,
+            HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 900_000 },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn actor_gate_linearizes_activity_before_conditional_compaction() {
+        let fixture = compact_fixture().await;
+        let (agent_id, _) = spawn_idle_user_agent(&fixture.host, "activity wins race").await;
+        let observation = fixture
+            .host
+            .activity_summary_observation(&agent_id)
+            .await
+            .expect("agent observation");
+        let expected_counter = observation.status.activity_counter;
+        assert!(observation
+            .handle
+            .send_input(AgentInput::SendMessage(SendMessagePayload {
+                message: "new user activity".to_owned(),
+                images: None,
+                origin: Some(MessageOrigin::User),
+                tool_response: None,
+            }))
+            .await);
+        let signal = fixture.host.supervisor_settings_signal().await;
+        let (stream, _rx) = compact_stream(&agent_id);
+
+        let accepted = fixture
+            .host
+            .compact_agent_if_inactive_in_background(
+                agent_id,
+                expected_counter,
+                signal.epoch,
+                AgentCompactPayload {
+                    summary_prompt: None,
+                    max_summary_bytes: None,
+                },
+                stream,
+            )
+            .await
+            .expect("conditional compact request");
+
+        assert!(!accepted);
+    }
+
+    #[tokio::test]
+    async fn actor_gate_accepts_compaction_that_linearizes_first() {
+        let fixture = compact_fixture().await;
+        let (agent_id, _) = spawn_idle_user_agent(&fixture.host, "compaction wins race").await;
+        let observation = fixture
+            .host
+            .activity_summary_observation(&agent_id)
+            .await
+            .expect("agent observation");
+        let expected_counter = observation.status.activity_counter;
+        let agent_handle = observation.handle;
+        let signal = fixture.host.supervisor_settings_signal().await;
+        let (entered, release) =
+            crate::agent::install_compact_if_inactive_test_gate(agent_id.clone());
+        let host = fixture.host.clone();
+        let compact_agent_id = agent_id.clone();
+        let compact = tokio::spawn(async move {
+            let (stream, _rx) = compact_stream(&compact_agent_id);
+            host.compact_agent_if_inactive_in_background(
+                compact_agent_id,
+                expected_counter,
+                signal.epoch,
+                AgentCompactPayload {
+                    summary_prompt: None,
+                    max_summary_bytes: None,
+                },
+                stream,
+            )
+            .await
+        });
+        entered.await.expect("conditional compact reached actor gate");
+        release.send(()).expect("release actor gate");
+        assert!(compact
+            .await
+            .expect("conditional compact task")
+            .expect("conditional compact request"));
+
+        assert!(agent_handle
+            .send_input(AgentInput::SendMessage(SendMessagePayload {
+                message: "activity after compaction acceptance".to_owned(),
+                images: None,
+                origin: Some(MessageOrigin::User),
+                tool_response: None,
+            }))
+            .await);
     }
 
     #[test]

@@ -319,8 +319,9 @@ fn build_supervision_prompt(request: &GenerateSupervisionVerdictRequest) -> Stri
         .unwrap_or_else(|| "None".to_owned());
     let user_message = cap_text(&request.last_user_message, SUPERVISION_SECTION_MAX_BYTES);
     format!(
-        "You supervise a coding agent that just went idle. Decide whether it actually \
-finished the user's request or stopped early.\n\
+        "You supervise a coding agent that just went idle. Decide whether it finished the user's \
+request, is awaiting user feedback, clarification, approval, a choice, or plan review, or stopped \
+early while executable work remains.\n\
 Reply with EXACTLY one of these three forms and nothing else:\n\
 VERDICT: done\n\
 or\n\
@@ -828,6 +829,8 @@ mod tests {
         assert!(prompt.contains("- [pending] write tests"));
         assert!(prompt.contains("1 of 3 allowed"));
         assert!(prompt.contains("actually complete"));
+        assert!(prompt.contains("is awaiting user feedback"));
+        assert!(prompt.contains("stopped early while executable work remains"));
         assert!(prompt.contains("feedback, clarification, approval"));
         assert!(prompt.contains("choice or decision"));
         assert!(prompt.contains("plan or proposal"));
