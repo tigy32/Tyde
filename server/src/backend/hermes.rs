@@ -7,14 +7,14 @@ use std::{fs, io};
 
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use protocol::{
-    AgentInput, BackendConfigField, BackendConfigFieldType, BackendConfigPersistenceMode,
-    BackendConfigSchema, BackendConfigValues, BackendKind, BackendSetupDiagnosticCode, ChatEvent,
-    ChatMessage, ContextBreakdown, MessageSender, MessageTokenUsage, ModelInfo,
-    OperationCancelledData, SelectOption, SendMessageToolResponse, SessionId, SessionSettingField,
-    SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SessionSettingsValues,
-    StreamEndData, StreamStartData, StreamTextDeltaData, TokenUsage, TokenUsageUnavailableReason,
-    ToolExecutionCompletedData, ToolExecutionResult, ToolProgressData, ToolProgressUpdate,
-    ToolRequest, ToolRequestType, ToolUseData,
+    AgentInput, BackendConfigSnapshotStatus, BackendKind, BackendNativeSettingsSnapshot,
+    BackendSetupDiagnosticCode, ChatEvent, ChatMessage, ContextBreakdown, MessageSender,
+    MessageTokenUsage, ModelInfo, OperationCancelledData, SelectOption, SendMessageToolResponse,
+    SessionId, SessionSettingField, SessionSettingFieldType, SessionSettingValue,
+    SessionSettingsSchema, SessionSettingsValues, StreamEndData, StreamStartData,
+    StreamTextDeltaData, TokenUsage, TokenUsageUnavailableReason, ToolExecutionCompletedData,
+    ToolExecutionResult, ToolProgressData, ToolProgressUpdate, ToolRequest, ToolRequestType,
+    ToolUseData,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -27,9 +27,10 @@ use crate::backend::agent_control_progress::{
     PendingToolNormalizationFailure, await_progress_data_for_tool, normalize_tyde_chat_event,
     spawn_progress_data_for_tool_result,
 };
+use crate::backend::hermes_config::{self, HermesProfileRef};
 use crate::backend::{
     Backend, BackendSession, BackendSpawnConfig, BackendStartupError, EventStream,
-    StartupMcpServer, StartupMcpTransport, backend_config_text, backend_fork_unsupported_message,
+    StartupMcpServer, StartupMcpTransport, backend_fork_unsupported_message,
     render_combined_spawn_instructions, resolve_settings as resolve_backend_settings,
     tyde_owned_no_root_cwd,
 };
@@ -350,59 +351,6 @@ fn hermes_cost_hint_defaults(_cost_hint: protocol::SpawnCostHint) -> SessionSett
     SessionSettingsValues::default()
 }
 
-fn hermes_backend_config_schema() -> BackendConfigSchema {
-    BackendConfigSchema {
-        backend_kind: BackendKind::Hermes,
-        persistence_mode: BackendConfigPersistenceMode::TydeSettingsStore,
-        fields: vec![
-            BackendConfigField {
-                key: "default_model".to_string(),
-                label: "Default Model".to_string(),
-                description: Some(
-                    "Model id every new Hermes session starts with (e.g. \
-                     anthropic/claude-sonnet-5). The per-session Model setting \
-                     overrides this. Passed to Hermes verbatim, so it also works \
-                     for remote workspaces where a locally probed list would be wrong."
-                        .to_string(),
-                ),
-                field_type: BackendConfigFieldType::Text {
-                    default: None,
-                    placeholder: Some("provider/model-id".to_string()),
-                    multiline: false,
-                },
-            },
-            BackendConfigField {
-                key: "default_provider".to_string(),
-                label: "Default Provider".to_string(),
-                description: Some(
-                    "Provider slug for the default model (e.g. openrouter, anthropic). \
-                     Leave blank to let Hermes choose."
-                        .to_string(),
-                ),
-                field_type: BackendConfigFieldType::Text {
-                    default: None,
-                    placeholder: Some("openrouter".to_string()),
-                    multiline: false,
-                },
-            },
-            BackendConfigField {
-                key: "api_base_url".to_string(),
-                label: "API Base URL".to_string(),
-                description: Some(
-                    "Optional base URL override passed to Hermes at session start. \
-                     Leave blank to use Hermes defaults."
-                        .to_string(),
-                ),
-                field_type: BackendConfigFieldType::Text {
-                    default: None,
-                    placeholder: Some("https://…".to_string()),
-                    multiline: false,
-                },
-            },
-        ],
-    }
-}
-
 fn hermes_base_session_fields() -> Vec<SessionSettingField> {
     vec![
         SessionSettingField {
@@ -464,10 +412,6 @@ impl Backend for HermesBackend {
         }
     }
 
-    fn backend_config_schema() -> Option<BackendConfigSchema> {
-        Some(hermes_backend_config_schema())
-    }
-
     async fn spawn(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
@@ -475,18 +419,19 @@ impl Backend for HermesBackend {
     ) -> Result<(Self, EventStream), String> {
         reject_unverified_capabilities(&config, &initial_input)?;
         let resolved_settings = resolve_session_settings(&config);
+        let profile = resolve_session_profile(&resolved_settings)?;
         let expects_mcp_tools = !config.startup_mcp_servers.is_empty();
         let (gateway, mut gateway_events_rx) = HermesGatewayHandle::spawn(
             &workspace_roots,
             &config.startup_mcp_servers,
             &config.resolved_spawn_config.tool_policy,
+            &profile,
         )
         .await?;
         let create_params = build_session_create_params(
             &workspace_roots,
             &config.resolved_spawn_config,
             &resolved_settings,
-            &config.backend_config,
         )?;
         let create = gateway.request("session.create", create_params).await?;
         let ids = parse_session_create_ids(&create)?;
@@ -533,10 +478,13 @@ impl Backend for HermesBackend {
         session_id: SessionId,
     ) -> Result<(Self, EventStream), String> {
         reject_unverified_resume_capabilities(&config)?;
+        let resolved_settings = resolve_session_settings(&config);
+        let profile = resolve_session_profile(&resolved_settings)?;
         let (gateway, gateway_events_rx) = HermesGatewayHandle::spawn(
             &workspace_roots,
             &config.startup_mcp_servers,
             &config.resolved_spawn_config.tool_policy,
+            &profile,
         )
         .await?;
         let resume = gateway
@@ -603,8 +551,10 @@ impl Backend for HermesBackend {
     }
 
     async fn list_sessions() -> Result<Vec<BackendSession>, String> {
+        let profile = hermes_config::resolve_profile_ref(None)?;
         let (gateway, _gateway_events_rx) =
-            HermesGatewayHandle::spawn(&[], &[], &protocol::ToolPolicy::Unrestricted).await?;
+            HermesGatewayHandle::spawn(&[], &[], &protocol::ToolPolicy::Unrestricted, &profile)
+                .await?;
         let result = gateway
             .request("session.list", json!({ "limit": 200 }))
             .await;
@@ -664,47 +614,495 @@ impl HermesBackend {
     }
 }
 
+/// The session-setting key that selects a Hermes profile for the session's
+/// gateway (`"default"` or a `~/.hermes/profiles/<name>` directory name).
+pub(crate) const HERMES_PROFILE_SETTING: &str = "profile";
+
+/// A running Hermes session's gateway is bound to the profile's HERMES_HOME
+/// it was spawned with; the profile cannot change mid-session.
+pub(crate) fn validate_runtime_session_settings_update(
+    update: &SessionSettingsValues,
+) -> Result<(), String> {
+    if update.0.contains_key(HERMES_PROFILE_SETTING) {
+        return Err(
+            "Hermes profile cannot be changed on a running session; start a new Hermes session \
+             with the desired profile"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn resolve_session_profile(settings: &SessionSettingsValues) -> Result<HermesProfileRef, String> {
+    let name = match settings.0.get(HERMES_PROFILE_SETTING) {
+        Some(SessionSettingValue::String(name)) => Some(name.as_str()),
+        Some(SessionSettingValue::Null) | None => None,
+        Some(other) => {
+            return Err(format!(
+                "Hermes profile session setting must be a string, found {other:?}"
+            ));
+        }
+    };
+    hermes_config::resolve_profile_ref(name)
+}
+
+/// Probe one profile's gateway for its `model.options` payload.
+pub(crate) async fn probe_model_options(
+    workspace_roots: &[String],
+    profile: &HermesProfileRef,
+) -> Result<Value, String> {
+    let (gateway, _events) = HermesGatewayHandle::spawn(
+        workspace_roots,
+        &[],
+        &protocol::ToolPolicy::Unrestricted,
+        profile,
+    )
+    .await?;
+    let options = gateway.request("model.options", json!({})).await;
+    gateway.shutdown().await;
+    options
+}
+
+/// Build the Hermes backend-native settings snapshot: every discovered
+/// profile with its editable `config.yaml` projection plus live provider
+/// states probed from that profile's gateway. A failed provider probe is
+/// reported per-profile so config editing stays available; a broken profile
+/// config or failed discovery makes the whole snapshot visibly unavailable.
+pub(crate) async fn native_settings_snapshot(
+    workspace_roots: &[String],
+) -> BackendNativeSettingsSnapshot {
+    match native_settings_doc(workspace_roots).await {
+        Ok(doc) => match serde_json::to_value(&doc) {
+            Ok(settings) => BackendNativeSettingsSnapshot {
+                backend_kind: BackendKind::Hermes,
+                status: BackendConfigSnapshotStatus::Ready,
+                settings: Some(settings),
+                groups: Vec::new(),
+                message: None,
+                provenance: None,
+                advisories: Vec::new(),
+                managed_projection_recovery: None,
+            },
+            Err(error) => hermes_native_settings_unavailable(format!(
+                "failed to serialize Hermes settings snapshot: {error}"
+            )),
+        },
+        Err(error) => hermes_native_settings_unavailable(error),
+    }
+}
+
+fn hermes_native_settings_unavailable(message: String) -> BackendNativeSettingsSnapshot {
+    BackendNativeSettingsSnapshot {
+        backend_kind: BackendKind::Hermes,
+        status: BackendConfigSnapshotStatus::Unavailable,
+        settings: None,
+        groups: Vec::new(),
+        message: Some(message),
+        provenance: None,
+        advisories: Vec::new(),
+        managed_projection_recovery: None,
+    }
+}
+
+async fn native_settings_doc(
+    workspace_roots: &[String],
+) -> Result<protocol::hermes_config::HermesNativeSettingsDoc, String> {
+    use protocol::hermes_config::{HERMES_NATIVE_SETTINGS_VERSION, HermesProfileSettings};
+
+    let profiles = hermes_config::discover_profiles()?;
+    let probes = futures_util::future::join_all(
+        profiles
+            .iter()
+            .map(|profile| probe_model_options(workspace_roots, profile)),
+    )
+    .await;
+
+    let mut doc = protocol::hermes_config::HermesNativeSettingsDoc {
+        version: HERMES_NATIVE_SETTINGS_VERSION,
+        profiles: Vec::new(),
+        actions: Vec::new(),
+    };
+    for (profile, payload) in profiles.iter().zip(probes) {
+        let config = hermes_config::load_profile_config(&profile.home_dir)?;
+        let mut settings = HermesProfileSettings {
+            name: profile.name.clone(),
+            home_dir: profile.home_dir.to_string_lossy().to_string(),
+            config,
+            base_config: None,
+            providers: None,
+            providers_error: None,
+            active_model: None,
+            active_provider: None,
+        };
+        match payload.and_then(|payload| {
+            provider_states_from_payload(&payload).map(|providers| (payload, providers))
+        }) {
+            Ok((payload, providers)) => {
+                settings.active_model =
+                    optional_string(&payload, &["model"]).filter(|model| !model.trim().is_empty());
+                settings.active_provider = optional_string(&payload, &["provider"])
+                    .filter(|provider| !provider.trim().is_empty());
+                settings.providers = Some(providers);
+            }
+            Err(error) => settings.providers_error = Some(error),
+        }
+        doc.profiles.push(settings);
+    }
+    Ok(doc)
+}
+
+fn provider_states_from_payload(
+    value: &Value,
+) -> Result<Vec<protocol::hermes_config::HermesProviderState>, String> {
+    let providers = value
+        .get("providers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Hermes model.options response missing providers array".to_string())?;
+    let mut states = Vec::new();
+    for (index, provider) in providers.iter().enumerate() {
+        let context = format!("model.options providers[{index}]");
+        let slug = required_non_empty_string(provider, &["slug"], &context)?;
+        let name = optional_string(provider, &["name"]).unwrap_or_else(|| slug.clone());
+        let authenticated = provider
+            .get("authenticated")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| format!("{context}.authenticated must be a bool"))?;
+        let model_count = provider
+            .get("models")
+            .and_then(Value::as_array)
+            .map(|models| models.len() as u32)
+            .unwrap_or(0);
+        states.push(protocol::hermes_config::HermesProviderState {
+            slug,
+            name,
+            authenticated,
+            auth_type: optional_string(provider, &["auth_type"]),
+            key_env: optional_string(provider, &["key_env"]),
+            warning: optional_string(provider, &["warning"]),
+            model_count,
+        });
+    }
+    Ok(states)
+}
+
+/// Apply a client save of the Hermes native settings document: run its
+/// credential actions against each profile's gateway, then write changed
+/// per-profile config projections back to disk. The document (which may
+/// carry an API key inside an action) is never logged.
+pub(crate) async fn persist_native_settings(
+    settings: Value,
+    workspace_roots: &[String],
+) -> Result<(), String> {
+    use protocol::hermes_config::{
+        HERMES_NATIVE_SETTINGS_VERSION, HermesCredentialAction, HermesNativeSettingsDoc,
+    };
+
+    let doc: HermesNativeSettingsDoc = serde_json::from_value(settings)
+        .map_err(|error| format!("invalid Hermes settings document: {error}"))?;
+    if doc.version != HERMES_NATIVE_SETTINGS_VERSION {
+        return Err(format!(
+            "unsupported Hermes settings document version {} (expected {})",
+            doc.version, HERMES_NATIVE_SETTINGS_VERSION
+        ));
+    }
+
+    // Validate every profile section before any credential or config
+    // mutation: a bad document must be rejected whole, not half-applied and
+    // rediscovered later as a broken snapshot.
+    for profile_settings in &doc.profiles {
+        hermes_config::validate_profile_config(&profile_settings.config).map_err(|error| {
+            format!(
+                "invalid Hermes settings for profile '{}': {error}",
+                profile_settings.name
+            )
+        })?;
+    }
+
+    // Group credential actions per profile so each profile pays for one
+    // gateway spawn, and run them before config writes so a newly keyed
+    // provider is usable by the saved config.
+    let mut actions_by_profile: Vec<(HermesProfileRef, Vec<HermesCredentialAction>)> = Vec::new();
+    for action in &doc.actions {
+        let profile_name = match action {
+            HermesCredentialAction::SaveApiKey { profile, .. }
+            | HermesCredentialAction::Disconnect { profile, .. } => profile.as_str(),
+        };
+        let profile = hermes_config::resolve_profile_ref(Some(profile_name))?;
+        match actions_by_profile
+            .iter_mut()
+            .find(|(existing, _)| *existing == profile)
+        {
+            Some((_, actions)) => actions.push(action.clone()),
+            None => actions_by_profile.push((profile, vec![action.clone()])),
+        }
+    }
+    // Resolve profiles and conflict-check against the client's base BEFORE
+    // any mutation, so credential actions never run for a save whose config
+    // sections would then be refused: a save based on a stale snapshot must
+    // not silently overwrite whatever changed the config in the meantime
+    // (Hermes CLI, another client).
+    // Saves are serialized so two clients cannot interleave their
+    // check-then-write sequences and silently overwrite each other.
+    static HERMES_PERSIST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _persist_guard = HERMES_PERSIST_LOCK.lock().await;
+
+    let stale_save = |name: &str| {
+        format!(
+            "Hermes profile '{name}' configuration changed since it was loaded; \
+             reload the settings and re-apply your edits"
+        )
+    };
+    let mut config_writes = Vec::new();
+    for profile_settings in &doc.profiles {
+        let profile = hermes_config::resolve_profile_ref(Some(&profile_settings.name))?;
+        let current = hermes_config::load_profile_config(&profile.home_dir)?;
+        if current == profile_settings.config {
+            continue;
+        }
+        // A changed section without its base is an unverifiable save — refuse
+        // it rather than fall back to last-writer-wins.
+        let Some(base) = &profile_settings.base_config else {
+            return Err(format!(
+                "Hermes profile '{}' settings update is missing its base configuration; \
+                 reload the settings and try again",
+                profile_settings.name
+            ));
+        };
+        if current != *base {
+            return Err(stale_save(&profile_settings.name));
+        }
+        config_writes.push((profile, base.clone(), profile_settings.config.clone()));
+    }
+
+    for (profile, actions) in &actions_by_profile {
+        run_credential_actions_for_profile(workspace_roots, profile, actions).await?;
+    }
+
+    for (profile, base, config) in &config_writes {
+        // Credential actions awaited above; re-verify the base right before
+        // writing so an external edit in that window is refused, not
+        // overwritten.
+        let current = hermes_config::load_profile_config(&profile.home_dir)?;
+        if current != *base && current != *config {
+            return Err(stale_save(&profile.name));
+        }
+        hermes_config::apply_profile_config(&profile.home_dir, config)?;
+    }
+    Ok(())
+}
+
+async fn run_credential_actions_for_profile(
+    workspace_roots: &[String],
+    profile: &HermesProfileRef,
+    actions: &[protocol::hermes_config::HermesCredentialAction],
+) -> Result<(), String> {
+    use protocol::hermes_config::HermesCredentialAction;
+
+    let (gateway, _events) = HermesGatewayHandle::spawn(
+        workspace_roots,
+        &[],
+        &protocol::ToolPolicy::Unrestricted,
+        profile,
+    )
+    .await?;
+    let mut result = Ok(());
+    for action in actions {
+        let outcome = match action {
+            HermesCredentialAction::SaveApiKey {
+                provider, api_key, ..
+            } => {
+                if api_key.trim().is_empty() {
+                    Err(format!("no API key provided for provider '{provider}'"))
+                } else {
+                    gateway
+                        .request(
+                            "model.save_key",
+                            json!({ "slug": provider, "api_key": api_key }),
+                        )
+                        .await
+                        .map(|_| ())
+                }
+            }
+            HermesCredentialAction::Disconnect { provider, .. } => gateway
+                .request("model.disconnect", json!({ "slug": provider }))
+                .await
+                .map(|_| ()),
+        };
+        if let Err(error) = outcome {
+            result = Err(format!(
+                "Hermes credential update failed for profile '{}': {error}",
+                profile.name
+            ));
+            break;
+        }
+    }
+    gateway.shutdown().await;
+    result
+}
+
+/// One discovered Hermes profile as the launch-profile catalog sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HermesLaunchProfileInfo {
+    pub name: String,
+    /// `provider/model` summary of the profile's current selection, when its
+    /// gateway probe succeeded and reported one.
+    pub summary: Option<String>,
+    /// Why this profile is not selectable (its gateway probe failed).
+    pub error: Option<String>,
+}
+
+/// Result of the Hermes session-schema probe: the schema itself plus the
+/// discovered profiles that back its `profile` field, for launch-profile
+/// catalog synthesis.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct HermesSessionSchemaProbe {
+    pub schema: SessionSettingsSchema,
+    pub profiles: Vec<HermesLaunchProfileInfo>,
+}
+
 pub(crate) async fn probe_session_settings_schema(
     workspace_roots: &[String],
-) -> Result<SessionSettingsSchema, String> {
-    let (gateway, _events) =
-        HermesGatewayHandle::spawn(workspace_roots, &[], &protocol::ToolPolicy::Unrestricted)
-            .await?;
-    let options = gateway.request("model.options", json!({})).await;
-    gateway.shutdown().await;
-    session_settings_schema_from_model_options(&options?)
+) -> Result<HermesSessionSchemaProbe, String> {
+    let profiles = hermes_config::discover_profiles()?;
+    let probes = futures_util::future::join_all(
+        profiles
+            .iter()
+            .map(|profile| probe_model_options(workspace_roots, profile)),
+    )
+    .await;
+    session_schema_probe_from_model_options(&profiles, probes)
 }
 
-pub(crate) async fn probe_backend_config_snapshot(
-    workspace_roots: &[String],
-) -> Result<BackendConfigValues, String> {
-    let (gateway, _events) =
-        HermesGatewayHandle::spawn(workspace_roots, &[], &protocol::ToolPolicy::Unrestricted)
-            .await?;
-    let options = gateway.request("model.options", json!({})).await;
-    gateway.shutdown().await;
-    hermes_backend_config_snapshot_from_model_options(&options?)
+/// Assemble the session schema from per-profile `model.options` payloads.
+/// The default profile's payload must be usable (matching the pre-profile
+/// behavior of failing the schema when Hermes has no authenticated models);
+/// a broken named profile is reported per-profile instead of hiding the
+/// whole backend.
+fn session_schema_probe_from_model_options(
+    profiles: &[HermesProfileRef],
+    payloads: Vec<Result<Value, String>>,
+) -> Result<HermesSessionSchemaProbe, String> {
+    struct ProfileModels {
+        name: String,
+        options: Vec<SelectOption>,
+        default: Option<String>,
+    }
+
+    let mut infos = Vec::new();
+    let mut per_profile = Vec::new();
+    for (profile, payload) in profiles.iter().zip(payloads) {
+        let parsed = payload.and_then(|payload| {
+            model_select_options_from_payload(&payload)
+                .map(|(options, default)| (options, default, model_summary_from_payload(&payload)))
+        });
+        match parsed {
+            Ok((options, default, summary)) => {
+                infos.push(HermesLaunchProfileInfo {
+                    name: profile.name.clone(),
+                    summary,
+                    error: None,
+                });
+                per_profile.push(ProfileModels {
+                    name: profile.name.clone(),
+                    options,
+                    default,
+                });
+            }
+            Err(error) => {
+                if profile.is_default() {
+                    return Err(error);
+                }
+                infos.push(HermesLaunchProfileInfo {
+                    name: profile.name.clone(),
+                    summary: None,
+                    error: Some(error),
+                });
+            }
+        }
+    }
+
+    let default_profile = per_profile
+        .iter()
+        .find(|models| models.name == hermes_config_default_profile())
+        .ok_or_else(|| "Hermes default profile probe produced no models".to_string())?;
+
+    let mut fields = Vec::new();
+    if per_profile.len() > 1 {
+        fields.push(SessionSettingField {
+            key: HERMES_PROFILE_SETTING.to_string(),
+            label: "Profile".to_string(),
+            description: Some(
+                "Hermes profile (an independent HERMES_HOME with its own \
+                 configuration and credentials) backing this session."
+                    .to_string(),
+            ),
+            use_slider: false,
+            select_options_by_setting: None,
+            field_type: SessionSettingFieldType::Select {
+                options: per_profile
+                    .iter()
+                    .map(|models| SelectOption {
+                        value: models.name.clone(),
+                        label: if models.name == hermes_config_default_profile() {
+                            "Default".to_string()
+                        } else {
+                            models.name.clone()
+                        },
+                    })
+                    .collect(),
+                default: Some(hermes_config_default_profile().to_string()),
+                nullable: false,
+            },
+        });
+    }
+    fields.push(SessionSettingField {
+        key: "model".to_string(),
+        label: "Model".to_string(),
+        description: Some(
+            "Hermes model from authenticated providers reported by model.options.".to_string(),
+        ),
+        use_slider: false,
+        select_options_by_setting: (per_profile.len() > 1).then(|| {
+            protocol::SelectOptionsBySetting {
+                setting_key: HERMES_PROFILE_SETTING.to_string(),
+                values: per_profile
+                    .iter()
+                    .map(|models| protocol::SelectOptionsForValue {
+                        setting_value: models.name.clone(),
+                        options: models.options.clone(),
+                    })
+                    .collect(),
+            }
+        }),
+        field_type: SessionSettingFieldType::Select {
+            options: default_profile.options.clone(),
+            default: default_profile.default.clone(),
+            nullable: true,
+        },
+    });
+    fields.extend(hermes_base_session_fields());
+
+    Ok(HermesSessionSchemaProbe {
+        schema: SessionSettingsSchema {
+            backend_kind: BackendKind::Hermes,
+            fields,
+        },
+        profiles: infos,
+    })
 }
 
-fn hermes_backend_config_snapshot_from_model_options(
-    value: &Value,
-) -> Result<BackendConfigValues, String> {
-    let mut values = BackendConfigValues::default();
-    if let Some(model) = optional_present_non_empty_string(value, &["model"], "model.options")? {
-        values.0.insert(
-            "default_model".to_string(),
-            SessionSettingValue::String(model),
-        );
+fn hermes_config_default_profile() -> &'static str {
+    protocol::hermes_config::HERMES_DEFAULT_PROFILE
+}
+
+/// The profile's currently effective `provider/model` from a `model.options`
+/// payload, for display.
+fn model_summary_from_payload(value: &Value) -> Option<String> {
+    let model = optional_string(value, &["model"]).filter(|model| !model.trim().is_empty())?;
+    match optional_string(value, &["provider"]).filter(|provider| !provider.trim().is_empty()) {
+        Some(provider) => Some(format!("{provider}/{model}")),
+        None => Some(model),
     }
-    if let Some(provider) =
-        optional_present_non_empty_string(value, &["provider"], "model.options")?
-    {
-        values.0.insert(
-            "default_provider".to_string(),
-            SessionSettingValue::String(provider),
-        );
-    }
-    Ok(values)
 }
 
 impl HermesSessionActor {
@@ -1332,8 +1730,27 @@ impl HermesGatewayHandle {
         workspace_roots: &[String],
         startup_mcp_servers: &[StartupMcpServer],
         tool_policy: &protocol::ToolPolicy,
+        profile: &HermesProfileRef,
     ) -> Result<(Self, mpsc::UnboundedReceiver<HermesGatewayEvent>), String> {
         let mut target = resolve_gateway_spawn_target(workspace_roots).await?;
+        // A named profile is selected by pointing HERMES_HOME at its
+        // directory. Remote spawns run over SSH without env forwarding, so a
+        // named profile there would silently run against the wrong home —
+        // fail visibly instead. The default profile sets nothing and lets
+        // Hermes resolve its own home.
+        if !profile.is_default() {
+            if target.remote_host.is_some() {
+                return Err(format!(
+                    "Hermes profile '{}' cannot be used with an SSH-backed workspace; \
+                     profiles select a local HERMES_HOME directory",
+                    profile.name
+                ));
+            }
+            target.env.insert(
+                crate::backend::hermes_config::HERMES_HOME_ENV.to_string(),
+                profile.home_dir.to_string_lossy().to_string(),
+            );
+        }
         let mcp_runtime =
             prepare_hermes_mcp_runtime(&mut target, startup_mcp_servers, tool_policy).await?;
         let expects_mcp_tools = !startup_mcp_servers.is_empty();
@@ -2964,7 +3381,6 @@ fn build_session_create_params(
     workspace_roots: &[String],
     resolved: &ResolvedSpawnConfig,
     settings: &SessionSettingsValues,
-    backend_config: &BackendConfigValues,
 ) -> Result<Value, String> {
     let cwd = session_cwd(workspace_roots)?;
     let mut params = json!({
@@ -2978,20 +3394,9 @@ fn build_session_create_params(
         params["messages"] = json!([{ "role": "system", "content": instructions }]);
     }
 
-    // Host deep-config defaults are the baseline (lowest precedence). Because
-    // the model id is supplied verbatim rather than picked from a locally
-    // probed list, this is also the correct model source for remote workspaces.
-    if let Some(model) = backend_config_text(backend_config, "default_model") {
-        params["model"] = Value::String(model.to_string());
-    }
-    if let Some(provider) = backend_config_text(backend_config, "default_provider") {
-        params["provider"] = Value::String(provider.to_string());
-    }
-    if let Some(base_url) = backend_config_text(backend_config, "api_base_url") {
-        params["base_url"] = Value::String(base_url.to_string());
-    }
-
-    // Per-session model selection overrides the host default.
+    // No model/provider baseline is injected here: the selected profile's own
+    // Hermes config supplies the defaults, and Tyde manages that config
+    // directly. Only an explicit per-session model selection overrides it.
     if let Some(SessionSettingValue::String(model)) = settings.0.get("model") {
         if let Some(selection) = parse_hermes_model_setting(model) {
             params["model"] = Value::String(selection.model);
@@ -3084,9 +3489,11 @@ fn non_empty_trimmed(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-fn session_settings_schema_from_model_options(
+/// Parse a `model.options` payload into the per-profile model Select options
+/// plus the option matching the profile's current selection.
+fn model_select_options_from_payload(
     value: &Value,
-) -> Result<SessionSettingsSchema, String> {
+) -> Result<(Vec<SelectOption>, Option<String>), String> {
     let providers = value
         .get("providers")
         .and_then(Value::as_array)
@@ -3157,27 +3564,7 @@ fn session_settings_schema_from_model_options(
         );
     }
 
-    let mut fields = Vec::new();
-    fields.push(SessionSettingField {
-        key: "model".to_string(),
-        label: "Model".to_string(),
-        description: Some(
-            "Hermes model from authenticated providers reported by model.options.".to_string(),
-        ),
-        use_slider: false,
-        select_options_by_setting: None,
-        field_type: SessionSettingFieldType::Select {
-            options: model_options,
-            default: model_default,
-            nullable: true,
-        },
-    });
-    fields.extend(hermes_base_session_fields());
-
-    Ok(SessionSettingsSchema {
-        backend_kind: BackendKind::Hermes,
-        fields,
-    })
+    Ok((model_options, model_default))
 }
 
 fn parse_session_create_ids(value: &Value) -> Result<HermesSessionIds, String> {
@@ -4596,6 +4983,31 @@ mod tests {
         }
     }
 
+    /// Points profile discovery at a test-owned Hermes home so tests never
+    /// read the machine's real `~/.hermes`. Serialize with
+    /// `TEST_HERMES_OVERRIDE_LOCK` like the other overrides.
+    struct TestHermesHomeGuard {
+        old: Option<PathBuf>,
+    }
+
+    impl TestHermesHomeGuard {
+        fn set(path: &Path) -> Self {
+            let mut guard = hermes_config::TEST_HERMES_HOME
+                .lock()
+                .expect("test Hermes home mutex poisoned");
+            let old = guard.replace(path.to_path_buf());
+            Self { old }
+        }
+    }
+
+    impl Drop for TestHermesHomeGuard {
+        fn drop(&mut self) {
+            *hermes_config::TEST_HERMES_HOME
+                .lock()
+                .expect("test Hermes home mutex poisoned") = self.old.take();
+        }
+    }
+
     impl Drop for TestHermesPythonGuard {
         fn drop(&mut self) {
             *TEST_HERMES_PYTHON
@@ -5357,19 +5769,36 @@ for line in sys.stdin:
 "#,
         );
         let _guard = TestHermesPythonGuard::set(&fake);
+        let home = TempDir::new().expect("hermes home");
+        let _home_guard = TestHermesHomeGuard::set(home.path());
 
-        let schema = probe_session_settings_schema(&[dir.path().to_string_lossy().to_string()])
+        let probe = probe_session_settings_schema(&[dir.path().to_string_lossy().to_string()])
             .await
             .expect("schema");
 
         assert!(
-            schema.fields.iter().any(|field| field.key == "model"),
-            "dynamic Hermes schema must include model options: {schema:?}"
+            probe.schema.fields.iter().any(|field| field.key == "model"),
+            "dynamic Hermes schema must include model options: {probe:?}"
+        );
+        // A lone default profile needs no profile picker.
+        assert!(
+            probe
+                .schema
+                .fields
+                .iter()
+                .all(|field| field.key != "profile"),
+            "single-profile schema must not expose a profile field: {probe:?}"
+        );
+        assert_eq!(probe.profiles.len(), 1);
+        assert_eq!(probe.profiles[0].name, "default");
+        assert_eq!(
+            probe.profiles[0].summary.as_deref(),
+            Some("openrouter/anthropic/claude-haiku-4.5")
         );
     }
 
     #[tokio::test]
-    async fn hermes_backend_config_snapshot_uses_model_options() {
+    async fn hermes_native_settings_snapshot_reports_profiles_and_providers() {
         let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
         let dir = TempDir::new().expect("tempdir");
         let fake = write_fake_gateway(
@@ -5385,28 +5814,331 @@ for line in sys.stdin:
         print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{
             "provider":"openrouter",
             "model":"anthropic/claude-haiku-4.5",
-            "providers":[]
+            "providers":[
+                {"slug":"openrouter","name":"OpenRouter","authenticated":True,
+                 "auth_type":"api_key","key_env":"OPENROUTER_API_KEY",
+                 "models":["anthropic/claude-haiku-4.5"]},
+                {"slug":"anthropic","name":"Anthropic","authenticated":False,
+                 "auth_type":"api_key","key_env":"ANTHROPIC_API_KEY",
+                 "warning":"set ANTHROPIC_API_KEY","models":["claude-sonnet-5"]}
+            ]
         }}), flush=True)
     else:
         print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{}}), flush=True)
 "#,
         );
         let _guard = TestHermesPythonGuard::set(&fake);
+        let home = TempDir::new().expect("hermes home");
+        fs::write(
+            home.path().join("config.yaml"),
+            "model:\n  provider: openrouter\n  default: anthropic/claude-haiku-4.5\n",
+        )
+        .expect("write config");
+        fs::create_dir_all(home.path().join("profiles/grok")).expect("named profile");
+        let _home_guard = TestHermesHomeGuard::set(home.path());
 
-        let values = probe_backend_config_snapshot(&[dir.path().to_string_lossy().to_string()])
+        let snapshot = native_settings_snapshot(&[dir.path().to_string_lossy().to_string()]).await;
+
+        assert_eq!(snapshot.backend_kind, BackendKind::Hermes);
+        assert_eq!(snapshot.status, BackendConfigSnapshotStatus::Ready);
+        let doc: protocol::hermes_config::HermesNativeSettingsDoc =
+            serde_json::from_value(snapshot.settings.expect("settings doc")).expect("typed doc");
+        assert_eq!(doc.profiles.len(), 2);
+        let default = &doc.profiles[0];
+        assert_eq!(default.name, "default");
+        assert_eq!(default.config.model.provider.as_deref(), Some("openrouter"));
+        assert_eq!(
+            default.config.model.model.as_deref(),
+            Some("anthropic/claude-haiku-4.5")
+        );
+        assert_eq!(default.active_provider.as_deref(), Some("openrouter"));
+        let providers = default.providers.as_ref().expect("provider states");
+        assert_eq!(providers.len(), 2);
+        assert!(providers[0].authenticated);
+        assert!(!providers[1].authenticated);
+        assert_eq!(providers[1].key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+        assert_eq!(doc.profiles[1].name, "grok");
+        assert!(doc.actions.is_empty());
+    }
+
+    #[test]
+    fn hermes_multi_profile_schema_exposes_profile_select_and_per_profile_models() {
+        let profiles = vec![
+            HermesProfileRef {
+                name: "default".to_string(),
+                home_dir: PathBuf::from("/hermes-home"),
+            },
+            HermesProfileRef {
+                name: "claude".to_string(),
+                home_dir: PathBuf::from("/hermes-home/profiles/claude"),
+            },
+            HermesProfileRef {
+                name: "gpt".to_string(),
+                home_dir: PathBuf::from("/hermes-home/profiles/gpt"),
+            },
+        ];
+        let default_payload = json!({
+            "provider": "openrouter",
+            "model": "minimax/minimax-m3",
+            "providers": [{
+                "slug": "openrouter", "name": "OpenRouter", "authenticated": true,
+                "models": ["minimax/minimax-m3"]
+            }]
+        });
+        let claude_payload = json!({
+            "provider": "anthropic",
+            "model": "claude-sonnet-5",
+            "providers": [{
+                "slug": "anthropic", "name": "Anthropic", "authenticated": true,
+                "models": ["claude-sonnet-5"]
+            }]
+        });
+        let probe = session_schema_probe_from_model_options(
+            &profiles,
+            vec![
+                Ok(default_payload),
+                Ok(claude_payload),
+                Err("gateway exploded".to_string()),
+            ],
+        )
+        .expect("probe");
+
+        let profile_field = probe.schema.fields.first().expect("profile field first");
+        assert_eq!(profile_field.key, "profile");
+        match &profile_field.field_type {
+            SessionSettingFieldType::Select {
+                options,
+                default,
+                nullable,
+            } => {
+                let values: Vec<&str> = options.iter().map(|o| o.value.as_str()).collect();
+                assert_eq!(values, vec!["default", "claude"]);
+                assert_eq!(options[0].label, "Default");
+                assert_eq!(default.as_deref(), Some("default"));
+                assert!(!nullable);
+            }
+            other => panic!("profile must be Select, got {other:?}"),
+        }
+
+        let model_field = probe
+            .schema
+            .fields
+            .iter()
+            .find(|field| field.key == "model")
+            .expect("model field");
+        let by_profile = model_field
+            .select_options_by_setting
+            .as_ref()
+            .expect("per-profile model options");
+        assert_eq!(by_profile.setting_key, "profile");
+        assert_eq!(by_profile.values.len(), 2);
+        assert_eq!(by_profile.values[1].setting_value, "claude");
+        assert_eq!(
+            by_profile.values[1].options[0].value,
+            encode_model_option_value("claude-sonnet-5", Some("anthropic"))
+        );
+
+        assert_eq!(probe.profiles.len(), 3);
+        assert_eq!(
+            probe.profiles[1].summary.as_deref(),
+            Some("anthropic/claude-sonnet-5")
+        );
+        let broken = &probe.profiles[2];
+        assert_eq!(broken.name, "gpt");
+        assert!(
+            broken
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("gateway exploded")),
+            "broken profile must carry its probe error: {broken:?}"
+        );
+    }
+
+    #[test]
+    fn hermes_schema_fails_when_default_profile_probe_fails() {
+        let profiles = vec![HermesProfileRef {
+            name: "default".to_string(),
+            home_dir: PathBuf::from("/hermes-home"),
+        }];
+        let error = session_schema_probe_from_model_options(
+            &profiles,
+            vec![Err("no authenticated providers".to_string())],
+        )
+        .expect_err("default profile failure must fail the schema");
+        assert!(error.contains("no authenticated providers"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn hermes_persist_native_settings_runs_actions_and_writes_config() {
+        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
+        let dir = TempDir::new().expect("tempdir");
+        let rpc_log = dir.path().join("rpc.jsonl");
+        let fake = write_fake_gateway(
+            &dir,
+            &format!(
+                r#"
+import json, sys
+print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"gateway.ready","payload":{{"skin":"default"}}}}}}), flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    rid = req["id"]
+    method = req["method"]
+    with open({rpc_log:?}, "a") as f:
+        f.write(json.dumps({{"method": method, "params": req.get("params")}}) + "\n")
+    if method == "model.save_key":
+        print(json.dumps({{"jsonrpc":"2.0","id":rid,"result":{{"slug":req["params"]["slug"],"authenticated":True}}}}), flush=True)
+    elif method == "model.disconnect":
+        print(json.dumps({{"jsonrpc":"2.0","id":rid,"result":{{"disconnected":True}}}}), flush=True)
+    else:
+        print(json.dumps({{"jsonrpc":"2.0","id":rid,"result":{{}}}}), flush=True)
+"#
+            ),
+        );
+        let _guard = TestHermesPythonGuard::set(&fake);
+        let home = TempDir::new().expect("hermes home");
+        fs::write(
+            home.path().join("config.yaml"),
+            "model:\n  provider: openrouter\n  default: minimax/minimax-m3\ntoolsets:\n  - hermes-cli\n",
+        )
+        .expect("write config");
+        let _home_guard = TestHermesHomeGuard::set(home.path());
+
+        let mut doc = native_settings_doc(&[dir.path().to_string_lossy().to_string()])
             .await
-            .expect("backend config snapshot");
+            .expect("snapshot doc");
+        doc.profiles[0].base_config = Some(doc.profiles[0].config.clone());
+        doc.profiles[0].config.model.provider = Some("anthropic".to_string());
+        doc.profiles[0].config.model.model = Some("claude-sonnet-5".to_string());
+        doc.actions = vec![
+            protocol::hermes_config::HermesCredentialAction::SaveApiKey {
+                profile: "default".to_string(),
+                provider: "anthropic".to_string(),
+                api_key: "sk-test-value".to_string(),
+            },
+            protocol::hermes_config::HermesCredentialAction::Disconnect {
+                profile: "default".to_string(),
+                provider: "copilot".to_string(),
+            },
+        ];
 
-        assert_eq!(
-            values.0.get("default_model"),
-            Some(&SessionSettingValue::String(
-                "anthropic/claude-haiku-4.5".to_string()
-            ))
+        persist_native_settings(
+            serde_json::to_value(&doc).expect("doc to value"),
+            &[dir.path().to_string_lossy().to_string()],
+        )
+        .await
+        .expect("persist");
+
+        let rpc = fs::read_to_string(&rpc_log).expect("rpc log");
+        assert!(
+            rpc.contains("model.save_key") && rpc.contains("\"slug\": \"anthropic\""),
+            "save_key must reach the gateway: {rpc}"
         );
-        assert_eq!(
-            values.0.get("default_provider"),
-            Some(&SessionSettingValue::String("openrouter".to_string()))
+        assert!(rpc.contains("model.disconnect"), "{rpc}");
+
+        let config = fs::read_to_string(home.path().join("config.yaml")).expect("config");
+        assert!(config.contains("provider: anthropic"), "{config}");
+        assert!(config.contains("default: claude-sonnet-5"), "{config}");
+        assert!(
+            config.contains("hermes-cli"),
+            "unmodeled keys preserved: {config}"
         );
+    }
+
+    #[tokio::test]
+    async fn hermes_persist_skips_rewrite_for_unchanged_profiles() {
+        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
+        let home = TempDir::new().expect("hermes home");
+        let original = "# hand-written comment\nmodel:\n  provider: openrouter\n  default: minimax/minimax-m3\n";
+        fs::write(home.path().join("config.yaml"), original).expect("write config");
+        let _home_guard = TestHermesHomeGuard::set(home.path());
+
+        // An unchanged config section must not rewrite the file (which would
+        // drop comments); build the doc directly from disk without a gateway.
+        let doc = protocol::hermes_config::HermesNativeSettingsDoc {
+            version: protocol::hermes_config::HERMES_NATIVE_SETTINGS_VERSION,
+            profiles: vec![protocol::hermes_config::HermesProfileSettings {
+                name: "default".to_string(),
+                home_dir: home.path().to_string_lossy().to_string(),
+                config: hermes_config::load_profile_config(home.path()).expect("load"),
+                base_config: None,
+                providers: None,
+                providers_error: None,
+                active_model: None,
+                active_provider: None,
+            }],
+            actions: Vec::new(),
+        };
+        persist_native_settings(serde_json::to_value(&doc).expect("doc"), &[])
+            .await
+            .expect("persist");
+
+        let after = fs::read_to_string(home.path().join("config.yaml")).expect("config");
+        assert_eq!(after, original, "unchanged profile must not be rewritten");
+    }
+
+    fn default_profile_doc(
+        home: &Path,
+        config: protocol::hermes_config::HermesProfileConfig,
+        base_config: Option<protocol::hermes_config::HermesProfileConfig>,
+    ) -> protocol::hermes_config::HermesNativeSettingsDoc {
+        protocol::hermes_config::HermesNativeSettingsDoc {
+            version: protocol::hermes_config::HERMES_NATIVE_SETTINGS_VERSION,
+            profiles: vec![protocol::hermes_config::HermesProfileSettings {
+                name: "default".to_string(),
+                home_dir: home.to_string_lossy().to_string(),
+                config,
+                base_config,
+                providers: None,
+                providers_error: None,
+                active_model: None,
+                active_provider: None,
+            }],
+            actions: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn hermes_persist_refuses_stale_base_and_half_filled_fallbacks() {
+        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
+        let home = TempDir::new().expect("hermes home");
+        fs::write(
+            home.path().join("config.yaml"),
+            "model:\n  provider: openrouter\n  default: minimax/minimax-m3\n",
+        )
+        .expect("write config");
+        let _home_guard = TestHermesHomeGuard::set(home.path());
+
+        // Stale base: the disk changed after this snapshot was taken.
+        let stale_base = protocol::hermes_config::HermesProfileConfig::default();
+        let mut edited = stale_base.clone();
+        edited.agent.max_turns = Some(50);
+        let doc = default_profile_doc(home.path(), edited, Some(stale_base));
+        let error = persist_native_settings(serde_json::to_value(&doc).expect("doc"), &[])
+            .await
+            .expect_err("stale base must be refused");
+        assert!(error.contains("changed since it was loaded"), "{error}");
+        let raw = fs::read_to_string(home.path().join("config.yaml")).expect("config");
+        assert!(
+            !raw.contains("max_turns"),
+            "refused save must not touch the file: {raw}"
+        );
+
+        // Half-filled fallback: rejected before anything is written.
+        let mut invalid = hermes_config::load_profile_config(home.path()).expect("load");
+        invalid
+            .fallback_providers
+            .push(protocol::hermes_config::HermesFallbackProvider {
+                provider: "anthropic".to_string(),
+                model: String::new(),
+                extra: Default::default(),
+            });
+        let doc = default_profile_doc(home.path(), invalid, None);
+        let error = persist_native_settings(serde_json::to_value(&doc).expect("doc"), &[])
+            .await
+            .expect_err("half-filled fallback must be refused");
+        assert!(error.contains("provider and a model"), "{error}");
+        let raw = fs::read_to_string(home.path().join("config.yaml")).expect("config");
+        assert!(!raw.contains("fallback_providers"), "{raw}");
     }
 
     #[tokio::test]
@@ -5471,13 +6203,8 @@ for line in sys.stdin:
             access_mode: BackendAccessMode::ReadOnly,
             ..ResolvedSpawnConfig::default()
         };
-        let params = build_session_create_params(
-            &[],
-            &resolved,
-            &SessionSettingsValues::default(),
-            &BackendConfigValues::default(),
-        )
-        .expect("params");
+        let params = build_session_create_params(&[], &resolved, &SessionSettingsValues::default())
+            .expect("params");
         let cwd = params["cwd"].as_str().expect("cwd");
         assert!(
             cwd.ends_with(".tyde/hermes/no-root"),
@@ -5515,89 +6242,13 @@ for line in sys.stdin:
             .0
             .insert("fast".to_string(), SessionSettingValue::Bool(true));
 
-        let params = build_session_create_params(
-            &[],
-            &ResolvedSpawnConfig::default(),
-            &settings,
-            &BackendConfigValues::default(),
-        )
-        .expect("params");
+        let params = build_session_create_params(&[], &ResolvedSpawnConfig::default(), &settings)
+            .expect("params");
 
         assert_eq!(params["model"], "minimax/minimax-m2.7");
         assert_eq!(params["provider"], "openrouter");
         assert_eq!(params["reasoning_effort"], "none");
         assert_eq!(params["fast"], true);
-    }
-
-    #[test]
-    fn hermes_backend_config_defaults_apply_and_session_setting_overrides() {
-        let mut backend_config = BackendConfigValues::default();
-        backend_config.0.insert(
-            "default_model".to_string(),
-            SessionSettingValue::String("anthropic/claude-sonnet-5".to_string()),
-        );
-        backend_config.0.insert(
-            "default_provider".to_string(),
-            SessionSettingValue::String("openrouter".to_string()),
-        );
-        backend_config.0.insert(
-            "api_base_url".to_string(),
-            SessionSettingValue::String("https://example.test/v1".to_string()),
-        );
-
-        // No per-session model: host deep-config defaults apply verbatim.
-        let params = build_session_create_params(
-            &[],
-            &ResolvedSpawnConfig::default(),
-            &SessionSettingsValues::default(),
-            &backend_config,
-        )
-        .expect("params");
-        assert_eq!(params["model"], "anthropic/claude-sonnet-5");
-        assert_eq!(params["provider"], "openrouter");
-        assert_eq!(params["base_url"], "https://example.test/v1");
-
-        // Per-session model overrides the configured default model/provider,
-        // but the base URL from config still applies.
-        let mut settings = SessionSettingsValues::default();
-        settings.0.insert(
-            "model".to_string(),
-            SessionSettingValue::String(encode_model_option_value(
-                "minimax/minimax-m2.7",
-                Some("minimax"),
-            )),
-        );
-        let params = build_session_create_params(
-            &[],
-            &ResolvedSpawnConfig::default(),
-            &settings,
-            &backend_config,
-        )
-        .expect("params");
-        assert_eq!(params["model"], "minimax/minimax-m2.7");
-        assert_eq!(params["provider"], "minimax");
-        assert_eq!(params["base_url"], "https://example.test/v1");
-    }
-
-    #[test]
-    fn hermes_backend_config_schema_exposes_model_provider_base_url() {
-        let schema = hermes_backend_config_schema();
-        assert_eq!(schema.backend_kind, BackendKind::Hermes);
-        assert_eq!(
-            schema.persistence_mode,
-            BackendConfigPersistenceMode::TydeSettingsStore
-        );
-        let keys: Vec<&str> = schema.fields.iter().map(|f| f.key.as_str()).collect();
-        assert_eq!(
-            keys,
-            vec!["default_model", "default_provider", "api_base_url"]
-        );
-        assert!(
-            schema
-                .fields
-                .iter()
-                .all(|f| matches!(f.field_type, BackendConfigFieldType::Text { .. }))
-        );
     }
 
     #[test]
@@ -5623,9 +6274,22 @@ for line in sys.stdin:
         assert_eq!(legacy.provider.as_deref(), Some("anthropic"));
     }
 
+    /// Build a schema from one `model.options` payload as if it were the only
+    /// (default) profile — the pre-profile schema shape these tests pin.
+    fn schema_from_single_profile_payload(
+        payload: &Value,
+    ) -> Result<SessionSettingsSchema, String> {
+        let profiles = vec![HermesProfileRef {
+            name: protocol::hermes_config::HERMES_DEFAULT_PROFILE.to_string(),
+            home_dir: PathBuf::from("/nonexistent-hermes-home"),
+        }];
+        session_schema_probe_from_model_options(&profiles, vec![Ok(payload.clone())])
+            .map(|probe| probe.schema)
+    }
+
     #[test]
     fn hermes_model_options_schema_uses_authenticated_provider_models() {
-        let schema = session_settings_schema_from_model_options(&json!({
+        let schema = schema_from_single_profile_payload(&json!({
             "provider": "openrouter",
             "model": "minimax/minimax-m2.7",
             "providers": [
@@ -5690,7 +6354,7 @@ for line in sys.stdin:
 
     #[test]
     fn hermes_model_options_schema_does_not_infer_default_provider() {
-        let schema = session_settings_schema_from_model_options(&json!({
+        let schema = schema_from_single_profile_payload(&json!({
             "model": "shared/model",
             "providers": [
                 {
@@ -5780,7 +6444,7 @@ for line in sys.stdin:
                 "field model must be non-empty",
             ),
         ] {
-            let err = match session_settings_schema_from_model_options(&payload) {
+            let err = match schema_from_single_profile_payload(&payload) {
                 Ok(_) => panic!("{name} should fail"),
                 Err(err) => err,
             };
@@ -5830,7 +6494,7 @@ for line in sys.stdin:
                 "providers[0] 'openrouter' models[0] must be non-empty",
             ),
         ] {
-            let err = match session_settings_schema_from_model_options(&payload) {
+            let err = match schema_from_single_profile_payload(&payload) {
                 Ok(_) => panic!("{name} should fail"),
                 Err(err) => err,
             };

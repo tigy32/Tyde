@@ -3,9 +3,8 @@ use std::time::Duration;
 
 use client::{AgentEndpoint, AgentEvent, HostEndpoint, HostEvent, ProjectEvent};
 use protocol::{
-    AgentBootstrapEvent, BackendCapacityState, BackendConfigPersistenceMode, BackendKind,
-    ChatEvent, ProjectRootPath, ReviewSummaryScope, SendMessagePayload, SpawnAgentParams,
-    SpawnAgentPayload,
+    AgentBootstrapEvent, BackendCapacityState, BackendKind, ChatEvent, ProjectRootPath,
+    ReviewSummaryScope, SendMessagePayload, SpawnAgentParams, SpawnAgentPayload,
 };
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
@@ -323,22 +322,13 @@ async fn runtime_accepts_backend_config_schema_catalog() {
     } = connect_runtime(host).await;
     match next_host_event(&mut events, "initial host bootstrap").await {
         HostEvent::HostBootstrap(payload) => {
-            assert_eq!(
-                payload
-                    .backend_config_schemas
-                    .iter()
-                    .map(|schema| schema.backend_kind)
-                    .collect::<Vec<_>>(),
-                vec![BackendKind::Hermes]
-            );
-            let hermes_schema = payload
-                .backend_config_schemas
-                .iter()
-                .find(|schema| schema.backend_kind == BackendKind::Hermes)
-                .expect("Hermes backend config schema");
-            assert_eq!(
-                hermes_schema.persistence_mode,
-                BackendConfigPersistenceMode::TydeSettingsStore
+            // The runtime must accept a bootstrap whose deep-config schema
+            // catalog is empty — the current state now that Hermes manages
+            // its real config through backend-native settings instead.
+            assert!(
+                payload.backend_config_schemas.is_empty(),
+                "unexpected deep-config schemas: {:?}",
+                payload.backend_config_schemas
             );
         }
         _ => panic!("expected initial HostBootstrap"),

@@ -16,6 +16,7 @@ pub mod find_bar;
 pub mod git_panel;
 pub mod header;
 pub mod help_tour;
+pub mod hermes_settings;
 pub mod home_view;
 pub mod host_browser;
 pub mod hover_popover;

@@ -8488,6 +8488,278 @@ kbd {
     font-size: 0.9rem;
 }
 
+/* --- Hermes backend settings (bespoke page) ---
+   Profile chips + per-profile cards driven by the typed Hermes settings
+   document. Cards reuse the settings-native-group visual language; classes
+   here cover the pieces that have no generic counterpart (profile chips,
+   provider rows and badges, chip-list editors, fallback rows, save bar). */
+
+.settings-hermes-page {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+}
+
+.settings-hermes-banner {
+    padding: var(--space-2) var(--space-3);
+    background: var(--surface-2);
+    border: 1px solid var(--border-primary);
+    border-radius: 6px;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+}
+
+.settings-hermes-profiles {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+}
+
+.settings-hermes-profile-chip {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    padding: var(--space-1) var(--space-3);
+    color: var(--text-secondary);
+    background: var(--surface-1);
+    border: 1px solid var(--border-primary);
+    border-radius: 10px;
+    cursor: pointer;
+    text-align: left;
+    transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.settings-hermes-profile-chip:hover,
+.settings-hermes-profile-chip:focus-visible {
+    color: var(--text-primary);
+    border-color: var(--border-focus, var(--border-primary));
+}
+
+.settings-hermes-profile-chip-active {
+    color: var(--text-primary);
+    background: var(--surface-2);
+    border-color: var(--accent, var(--border-focus, var(--border-primary)));
+}
+
+.settings-hermes-profile-name {
+    font-size: 0.88rem;
+    font-weight: 600;
+}
+
+.settings-hermes-profile-sub {
+    font-size: 0.72rem;
+    color: var(--text-tertiary);
+    font-family: var(--font-mono, monospace);
+}
+
+.settings-hermes-provider-list {
+    display: flex;
+    flex-direction: column;
+}
+
+.settings-hermes-provider-row {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-2) 0;
+}
+
+.settings-hermes-provider-row + .settings-hermes-provider-row {
+    border-top: 1px solid var(--border-primary);
+}
+
+.settings-hermes-provider-line {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+}
+
+.settings-hermes-provider-info {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    flex: 1;
+    min-width: 0;
+}
+
+.settings-hermes-provider-name {
+    display: inline-flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    font-size: 0.9rem;
+    font-weight: 500;
+    color: var(--text-primary);
+}
+
+.settings-hermes-provider-slug {
+    font-size: 0.72rem;
+    color: var(--text-tertiary);
+    font-family: var(--font-mono, monospace);
+}
+
+.settings-hermes-provider-meta {
+    font-size: 0.78rem;
+    color: var(--text-secondary);
+}
+
+.settings-hermes-provider-warning {
+    margin: 0;
+    font-size: 0.78rem;
+    color: var(--warning, #e8a032);
+}
+
+.settings-hermes-provider-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex-shrink: 0;
+}
+
+.settings-hermes-badge {
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    border-radius: 999px;
+    padding: 1px var(--space-2);
+    border: 1px solid transparent;
+}
+
+.settings-hermes-badge-connected {
+    color: var(--success, #3fb950);
+    background: rgba(63, 185, 80, 0.12);
+    border-color: rgba(63, 185, 80, 0.35);
+}
+
+.settings-hermes-badge-muted {
+    color: var(--text-tertiary);
+    background: var(--surface-2);
+    border-color: var(--border-primary);
+}
+
+.settings-hermes-auth-hint {
+    font-size: 0.78rem;
+    color: var(--text-tertiary);
+}
+
+.settings-hermes-auth-hint code {
+    font-family: var(--font-mono, monospace);
+    font-size: 0.75rem;
+    background: var(--surface-2);
+    border-radius: 4px;
+    padding: 0 4px;
+}
+
+.settings-hermes-key-editor {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+}
+
+.settings-hermes-key-input {
+    width: 18rem;
+    max-width: 100%;
+}
+
+.settings-hermes-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: var(--space-3);
+}
+
+.settings-hermes-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-1);
+}
+
+.settings-hermes-chips:empty {
+    display: none;
+}
+
+.settings-hermes-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    padding: 1px var(--space-2);
+    font-size: 0.8rem;
+    color: var(--text-primary);
+    background: var(--surface-2);
+    border: 1px solid var(--border-primary);
+    border-radius: 999px;
+    font-family: var(--font-mono, monospace);
+}
+
+.settings-hermes-chip-remove {
+    border: none;
+    background: none;
+    padding: 0 2px;
+    font-size: 0.85rem;
+    line-height: 1;
+    color: var(--text-tertiary);
+    cursor: pointer;
+}
+
+.settings-hermes-chip-remove:hover {
+    color: var(--danger, #e5534b);
+}
+
+.settings-hermes-chip-add {
+    display: flex;
+    gap: var(--space-2);
+    max-width: 24rem;
+}
+
+.settings-hermes-fallback-rows {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+}
+
+.settings-hermes-fallback-rows:empty {
+    display: none;
+}
+
+.settings-hermes-fallback-row {
+    display: grid;
+    grid-template-columns: 1fr 1.4fr auto;
+    gap: var(--space-2);
+    align-items: center;
+}
+
+.settings-hermes-savebar-wrap {
+    position: sticky;
+    bottom: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding-top: var(--space-2);
+    background: var(--surface-0, var(--surface-1));
+    border-top: 1px solid var(--border-primary);
+}
+
+.settings-hermes-savebar {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding-bottom: var(--space-2);
+}
+
+.settings-hermes-savebar-spacer {
+    flex: 1;
+}
+
+.settings-hermes-dirty-note {
+    font-size: 0.82rem;
+    color: var(--warning, #e8a032);
+}
+
+.settings-hermes-saving-note {
+    font-size: 0.82rem;
+    color: var(--text-secondary);
+}
+
 /* --- Managed-projection disclosures (Tycode) ---
    Server-owned typed state rendered above the native settings groups. The
    hierarchy runs loudest to quietest: the one-time notice (new, actionable), the

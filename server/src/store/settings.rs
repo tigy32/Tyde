@@ -565,6 +565,16 @@ fn validate_launch_profile_configs(
                 profile.id
             ));
         }
+        if profile
+            .id
+            .0
+            .starts_with(crate::host::HERMES_PROFILE_LAUNCH_ID_PREFIX)
+        {
+            return Err(format!(
+                "launch profile {} conflicts with the server-synthesized Hermes profile namespace",
+                profile.id
+            ));
+        }
         if !seen.insert(profile.id.clone()) {
             return Err(format!("duplicate launch profile id {}", profile.id));
         }

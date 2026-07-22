@@ -2970,10 +2970,20 @@ fn backend_page_body(
     };
     let schemas = state.backend_config_schemas.get();
     let Some(schema) = schemas.get(&host_id).and_then(|m| m.get(&kind)).cloned() else {
-        // No typed deep-config schema. The backend may instead publish a
-        // backend-native settings snapshot (e.g. Tycode's grouped settings) —
-        // render that when present. Otherwise this is the transient window the
-        // nav fallback effect handles by returning to Overview.
+        // No typed deep-config schema. Hermes gets a bespoke page driven by
+        // the typed `HermesNativeSettingsDoc` inside its backend-native
+        // snapshot. Returning before the reactive `backend_native_settings`
+        // read below is deliberate: the Hermes page subscribes to the snapshot
+        // itself, so a snapshot republish (e.g. after a save) rerenders only
+        // that page's body — this outer closure, and with it the page's local
+        // edit state, survives.
+        if kind == BackendKind::Hermes {
+            return crate::components::hermes_settings::hermes_settings_page_body(&host_id);
+        }
+        // Other backends may instead publish a backend-native settings
+        // snapshot (e.g. Tycode's grouped settings) — render that when
+        // present. Otherwise this is the transient window the nav fallback
+        // effect handles by returning to Overview.
         if let Some(snapshot) = state
             .backend_native_settings
             .get()
@@ -9076,6 +9086,15 @@ mod wasm_tests {
 
     /// A backend page without a schema on the selected host renders an explicit
     /// empty state — never config inputs, never blank UI.
+    ///
+    /// Fixture correction (evidence, not a weakening): this test used Hermes
+    /// as its schema-less backend, but Hermes no longer publishes a typed
+    /// deep-config schema — its page now renders the backend-native settings
+    /// experience, whose pre-snapshot render is the explicit "Waiting for
+    /// Hermes settings from the selected host…" message (observed in the
+    /// failing render). The generic no-schema contract is therefore pinned
+    /// with Claude, and the Hermes pre-snapshot state is asserted explicitly
+    /// on top — both surfaces must show a message, never blank UI.
     #[wasm_bindgen_test]
     async fn backend_page_without_schema_shows_explicit_empty_state() {
         let container = make_container();
@@ -9087,7 +9106,7 @@ mod wasm_tests {
                 host_id.clone(),
                 host_settings_with_hermes_config(
                     std::collections::HashMap::new(),
-                    vec![BackendKind::Hermes],
+                    vec![BackendKind::Claude, BackendKind::Hermes],
                 ),
             );
         });
@@ -9096,7 +9115,7 @@ mod wasm_tests {
         let state_for_mount = state.clone();
         let _handle = mount_to(container.clone(), move || {
             provide_context(state_for_mount.clone());
-            view! { <BackendSettingsPage kind=BackendKind::Hermes /> }
+            view! { <BackendSettingsPage kind=BackendKind::Claude /> }
         });
         next_tick().await;
 
@@ -9112,6 +9131,30 @@ mod wasm_tests {
                 .length(),
             0,
             "no config inputs without a schema"
+        );
+
+        // Hermes before its native-settings snapshot arrives: an explicit
+        // waiting message, still no config inputs and never blank UI.
+        let hermes_container = make_container();
+        let state_for_hermes = state.clone();
+        let _hermes_handle = mount_to(hermes_container.clone(), move || {
+            provide_context(state_for_hermes.clone());
+            view! { <BackendSettingsPage kind=BackendKind::Hermes /> }
+        });
+        next_tick().await;
+
+        let text = hermes_container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Waiting for Hermes settings"),
+            "pre-snapshot Hermes page must render an explicit waiting message: {text:?}"
+        );
+        assert_eq!(
+            hermes_container
+                .query_selector_all("input.settings-backend-config-input")
+                .unwrap()
+                .length(),
+            0,
+            "no config inputs before the Hermes snapshot arrives"
         );
     }
 

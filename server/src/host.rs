@@ -535,6 +535,9 @@ pub(crate) struct HostState {
     codex_session_schema: CodexSessionSchemaState,
     kiro_session_schema: KiroSessionSchemaState,
     hermes_session_schema: HermesSessionSchemaState,
+    /// Hermes profiles discovered by the last session-schema probe; drives
+    /// the synthesized "Hermes — <profile>" launch-profile entries.
+    hermes_launch_profiles: Vec<crate::backend::hermes::HermesLaunchProfileInfo>,
     backend_config_snapshots: Vec<BackendConfigSnapshot>,
     backend_native_settings_snapshots: Vec<BackendNativeSettingsSnapshot>,
     backend_capacity: HashMap<BackendKind, BackendCapacitySnapshot>,
@@ -7023,17 +7026,37 @@ impl HostHandle {
         if let protocol::HostSettingValue::BackendNativeSettings { backend, settings } =
             &payload.setting
         {
-            if *backend != BackendKind::Tycode {
-                return Err(AppError::invalid(
-                    OPERATION,
-                    format!("{backend:?} does not support backend-native settings saves"),
-                ));
+            match backend {
+                BackendKind::Tycode => {
+                    crate::backend::tycode::persist_native_settings(settings.clone())
+                        .await
+                        .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+                    self.refresh_backend_config_snapshots_after_native_save()
+                        .await;
+                }
+                BackendKind::Hermes => {
+                    let workspace_root = hermes_probe_workspace_root()
+                        .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+                    crate::backend::hermes::persist_native_settings(
+                        settings.clone(),
+                        &[workspace_root],
+                    )
+                    .await
+                    .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+                    // A Hermes save can change credentials and model defaults,
+                    // so the session schema (model options per profile) must
+                    // re-probe alongside the settings snapshot.
+                    self.refresh_backend_config_snapshots_after_native_save()
+                        .await;
+                    self.refresh_session_schemas_with_fanout(true).await;
+                }
+                _ => {
+                    return Err(AppError::invalid(
+                        OPERATION,
+                        format!("{backend:?} does not support backend-native settings saves"),
+                    ));
+                }
             }
-            crate::backend::tycode::persist_native_settings(settings.clone())
-                .await
-                .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
-            self.refresh_backend_config_snapshots_after_native_save()
-                .await;
             return Ok(());
         }
 
@@ -7612,15 +7635,20 @@ impl HostHandle {
             KiroSessionSchemaState::Pending
         };
 
-        let hermes_session_schema = if !probe(protocol::BackendKind::Hermes)
+        // `None` keeps the previously discovered Hermes profiles (when the
+        // schema itself is kept); `Some` replaces them alongside the schema.
+        let (hermes_session_schema, hermes_profiles) = if !probe(protocol::BackendKind::Hermes)
             || (!retry_unavailable
                 && !matches!(&previous_hermes, HermesSessionSchemaState::Pending))
         {
-            previous_hermes
+            (previous_hermes, None)
         } else if enabled_backends.contains(&protocol::BackendKind::Hermes) {
             if skip_real_backend_probe {
-                HermesSessionSchemaState::Ready(
-                    <crate::backend::hermes::HermesBackend as crate::backend::Backend>::session_settings_schema(),
+                (
+                    HermesSessionSchemaState::Ready(
+                        <crate::backend::hermes::HermesBackend as crate::backend::Backend>::session_settings_schema(),
+                    ),
+                    Some(Vec::new()),
                 )
             } else {
                 let hermes_schema_or_last_good = |err: String| match prev_hermes_ready.clone() {
@@ -7628,9 +7656,9 @@ impl HostHandle {
                         tracing::warn!(
                             "Hermes session schema probe failed ({err}); keeping last-known-good schema"
                         );
-                        HermesSessionSchemaState::Ready(schema)
+                        (HermesSessionSchemaState::Ready(schema), None)
                     }
-                    None => HermesSessionSchemaState::Unavailable(err),
+                    None => (HermesSessionSchemaState::Unavailable(err), Some(Vec::new())),
                 };
                 match hermes_probe_workspace_root() {
                     Ok(workspace_root) => {
@@ -7639,7 +7667,10 @@ impl HostHandle {
                         ])
                         .await
                         {
-                            Ok(schema) => HermesSessionSchemaState::Ready(schema),
+                            Ok(probe) => (
+                                HermesSessionSchemaState::Ready(probe.schema),
+                                Some(probe.profiles),
+                            ),
                             Err(err) => {
                                 tracing::error!("failed to refresh Hermes session schema: {err}");
                                 hermes_schema_or_last_good(err)
@@ -7653,13 +7684,16 @@ impl HostHandle {
                 }
             }
         } else {
-            HermesSessionSchemaState::Pending
+            (HermesSessionSchemaState::Pending, Some(Vec::new()))
         };
 
         let mut state = self.state.lock().await;
         state.codex_session_schema = codex_session_schema;
         state.kiro_session_schema = kiro_session_schema;
         state.hermes_session_schema = hermes_session_schema;
+        if let Some(hermes_profiles) = hermes_profiles {
+            state.hermes_launch_profiles = hermes_profiles;
+        }
         fan_out_session_schemas(&mut state, force_emit).await;
         fan_out_backend_config_schemas(&mut state).await;
         fan_out_launch_profile_catalog(&mut state).await;
@@ -12473,6 +12507,7 @@ fn spawn_host_inner(
             codex_session_schema: CodexSessionSchemaState::Pending,
             kiro_session_schema: KiroSessionSchemaState::Pending,
             hermes_session_schema: HermesSessionSchemaState::Pending,
+            hermes_launch_profiles: Vec::new(),
             backend_config_snapshots: Vec::new(),
             backend_native_settings_snapshots: Vec::new(),
             backend_capacity: initial_backend_capacity_snapshots(),
@@ -15810,16 +15845,20 @@ async fn backend_config_snapshots_for_enabled_backends(
                     .native_settings
                     .push(crate::backend::tycode::native_settings_snapshot().await);
             }
-            _ => {
-                if let Some(snapshot) =
-                    crate::backend::backend_config_snapshot_for_backend(*kind, &workspace_roots)
-                        .await
-                {
-                    snapshots.backend_config.push(snapshot);
-                }
-            }
+            BackendKind::Hermes
+            | BackendKind::Kiro
+            | BackendKind::Claude
+            | BackendKind::Codex
+            | BackendKind::Antigravity => {}
         }
     }
+    // The Hermes snapshot is published regardless of enablement, like the
+    // deep-config schema catalog: its settings page edits Hermes's own
+    // config, which users legitimately configure before enabling the
+    // backend. An uninstalled Hermes yields a visible Unavailable snapshot.
+    snapshots
+        .native_settings
+        .push(crate::backend::hermes::native_settings_snapshot(&workspace_roots).await);
     snapshots
 }
 
@@ -16505,6 +16544,16 @@ fn launch_profile_catalog_for_settings(
         });
     }
 
+    // One synthesized entry per named Hermes profile, derived from the last
+    // schema probe's discovery. The default profile is already covered by the
+    // "hermes:default" backend-default entry above.
+    if settings
+        .enabled_backends
+        .contains(&protocol::BackendKind::Hermes)
+    {
+        synthesize_hermes_profile_entries(&state.hermes_launch_profiles, &mut entries);
+    }
+
     for config in &settings.launch_profiles {
         if settings.enabled_backends.contains(&config.backend_kind) {
             entries.push(launch_profile_entry_for_config(state, config));
@@ -16514,6 +16563,58 @@ fn launch_profile_catalog_for_settings(
     LaunchProfileCatalog {
         entries,
         default_profile_id: settings.default_backend.map(default_launch_profile_id),
+    }
+}
+
+/// Id namespace for launch profiles synthesized from Hermes profiles. Also
+/// reserved against user-configured launch-profile ids.
+pub(crate) const HERMES_PROFILE_LAUNCH_ID_PREFIX: &str = "hermes:profile:";
+
+/// Append one launch-profile entry per named Hermes profile: ready entries
+/// carry `{profile: <name>}` session settings; profiles whose gateway probe
+/// failed stay visible as unavailable entries with the probe error.
+fn synthesize_hermes_profile_entries(
+    infos: &[crate::backend::hermes::HermesLaunchProfileInfo],
+    entries: &mut Vec<LaunchProfileEntry>,
+) {
+    for info in infos {
+        if info.name == protocol::hermes_config::HERMES_DEFAULT_PROFILE {
+            continue;
+        }
+        let id = LaunchProfileId(format!("{HERMES_PROFILE_LAUNCH_ID_PREFIX}{}", info.name));
+        let label = format!("Hermes — {}", info.name);
+        match &info.error {
+            None => {
+                let mut session_settings = protocol::SessionSettingsValues::default();
+                session_settings.0.insert(
+                    crate::backend::hermes::HERMES_PROFILE_SETTING.to_owned(),
+                    protocol::SessionSettingValue::String(info.name.clone()),
+                );
+                entries.push(LaunchProfileEntry::Ready {
+                    profile: LaunchProfile {
+                        id,
+                        kind: LaunchProfileKind::BackendDefault,
+                        label,
+                        description: Some(match &info.summary {
+                            Some(summary) => format!(
+                                "Launch Hermes with its '{}' profile ({summary}).",
+                                info.name
+                            ),
+                            None => format!("Launch Hermes with its '{}' profile.", info.name),
+                        }),
+                        backend_kind: protocol::BackendKind::Hermes,
+                        session_settings,
+                    },
+                });
+            }
+            Some(error) => entries.push(LaunchProfileEntry::Unavailable {
+                id,
+                kind: LaunchProfileKind::BackendDefault,
+                backend_kind: protocol::BackendKind::Hermes,
+                label,
+                message: error.clone(),
+            }),
+        }
     }
 }
 
@@ -16967,6 +17068,62 @@ mod tests {
 
     static STARTUP_FAILURE_FANOUT_RACE_TEST_LOCK: tokio::sync::Mutex<()> =
         tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn hermes_profile_launch_entries_synthesize_ready_and_unavailable() {
+        use crate::backend::hermes::HermesLaunchProfileInfo;
+
+        let infos = vec![
+            HermesLaunchProfileInfo {
+                name: "default".to_string(),
+                summary: Some("openrouter/minimax-m3".to_string()),
+                error: None,
+            },
+            HermesLaunchProfileInfo {
+                name: "claude".to_string(),
+                summary: Some("anthropic/claude-sonnet-5".to_string()),
+                error: None,
+            },
+            HermesLaunchProfileInfo {
+                name: "gpt".to_string(),
+                summary: None,
+                error: Some("no authenticated providers".to_string()),
+            },
+        ];
+        let mut entries = Vec::new();
+        synthesize_hermes_profile_entries(&infos, &mut entries);
+
+        // The default profile is covered by "hermes:default", never duplicated.
+        assert_eq!(entries.len(), 2);
+        match &entries[0] {
+            LaunchProfileEntry::Ready { profile } => {
+                assert_eq!(profile.id.0, "hermes:profile:claude");
+                assert_eq!(profile.label, "Hermes — claude");
+                assert_eq!(profile.backend_kind, protocol::BackendKind::Hermes);
+                assert_eq!(
+                    profile.session_settings.0.get("profile"),
+                    Some(&protocol::SessionSettingValue::String("claude".to_string()))
+                );
+                assert!(
+                    profile
+                        .description
+                        .as_deref()
+                        .is_some_and(|d| d.contains("anthropic/claude-sonnet-5"))
+                );
+            }
+            other => panic!("expected ready entry, got {other:?}"),
+        }
+        match &entries[1] {
+            LaunchProfileEntry::Unavailable {
+                id, label, message, ..
+            } => {
+                assert_eq!(id.0, "hermes:profile:gpt");
+                assert_eq!(label, "Hermes — gpt");
+                assert!(message.contains("no authenticated providers"), "{message}");
+            }
+            other => panic!("expected unavailable entry, got {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn passive_adapter_ingress_is_isolated_per_host_channel() {

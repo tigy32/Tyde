@@ -2,14 +2,13 @@ use std::time::Duration;
 
 use client::ClientConfig;
 use protocol::{
-    BackendAccessMode, BackendConfigPersistenceMode, BackendKind, CommandErrorCode,
-    CommandErrorPayload, FrameKind, HostBootstrapPayload, HostBrowseInitial,
-    HostBrowseStartPayload, HostLaunchProfileConfig, HostSettingValue, LaunchProfileCatalog,
-    LaunchProfileCatalogPayload, LaunchProfileEntry, LaunchProfileId, LaunchProfileKind,
-    NewAgentPayload, ProjectBootstrapPayload, ProjectRootPath, ReviewSummaryScope, SessionId,
-    SessionListPageStatus, SessionListPayload, SessionSchemasPayload, SessionSettingValue,
-    SessionSettingsValues, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload,
-    TerminalCreatePayload, TerminalLaunchTarget,
+    BackendAccessMode, BackendKind, CommandErrorCode, CommandErrorPayload, FrameKind,
+    HostBootstrapPayload, HostBrowseInitial, HostBrowseStartPayload, HostLaunchProfileConfig,
+    HostSettingValue, LaunchProfileCatalog, LaunchProfileCatalogPayload, LaunchProfileEntry,
+    LaunchProfileId, LaunchProfileKind, NewAgentPayload, ProjectBootstrapPayload, ProjectRootPath,
+    ReviewSummaryScope, SessionId, SessionListPageStatus, SessionListPayload,
+    SessionSchemasPayload, SessionSettingValue, SessionSettingsValues, SetSettingPayload,
+    SpawnAgentParams, SpawnAgentPayload, TerminalCreatePayload, TerminalLaunchTarget,
 };
 use server::backend::BackendSession;
 use server::store::project::ProjectStore;
@@ -699,22 +698,13 @@ async fn host_bootstrap_includes_backend_config_schema_catalog() {
         bootstrap.settings.enabled_backends,
         vec![BackendKind::Claude]
     );
-    assert_eq!(
-        bootstrap
-            .backend_config_schemas
-            .iter()
-            .map(|schema| schema.backend_kind)
-            .collect::<Vec<_>>(),
-        vec![BackendKind::Hermes]
-    );
-    let hermes_schema = bootstrap
-        .backend_config_schemas
-        .iter()
-        .find(|schema| schema.backend_kind == BackendKind::Hermes)
-        .expect("Hermes backend config schema");
-    assert_eq!(
-        hermes_schema.persistence_mode,
-        BackendConfigPersistenceMode::TydeSettingsStore
+    // No built-in backend publishes a typed deep-config schema anymore
+    // (Hermes moved to backend-native settings), so the catalog ships empty
+    // rather than advertising a schema no backend serves.
+    assert!(
+        bootstrap.backend_config_schemas.is_empty(),
+        "unexpected deep-config schemas: {:?}",
+        bootstrap.backend_config_schemas
     );
     assert!(bootstrap.backend_config_snapshots.is_empty());
 }

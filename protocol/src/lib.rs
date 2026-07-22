@@ -1,5 +1,6 @@
 #[cfg(feature = "framing")]
 pub mod framing;
+pub mod hermes_config;
 pub mod types;
 pub mod validator;
 

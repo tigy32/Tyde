@@ -69,24 +69,6 @@ async fn expect_no_backend_setup_replay(client: &mut client::Connection) {
     }
 }
 
-async fn expect_host_settings(
-    client: &mut client::Connection,
-    context: &str,
-) -> HostSettingsPayload {
-    loop {
-        let env = client
-            .next_event()
-            .await
-            .unwrap_or_else(|err| panic!("next_event failed before {context}: {err:?}"))
-            .unwrap_or_else(|| panic!("connection closed before {context}"));
-        if env.kind == FrameKind::HostSettings {
-            return env
-                .parse_payload()
-                .unwrap_or_else(|err| panic!("failed to parse HostSettings for {context}: {err}"));
-        }
-    }
-}
-
 async fn expect_backend_config_snapshots(
     client: &mut client::Connection,
     context: &str,
@@ -1270,94 +1252,41 @@ fn backend_config_updates_merge_and_clear_explicitly_in_store() {
     let path = dir.path().join("settings.json");
     let store = HostSettingsStore::load(path).expect("load empty settings store");
 
-    let mut first = BackendConfigValues::default();
-    first.0.insert(
+    // No built-in backend publishes a typed deep-config schema anymore
+    // (Hermes moved to backend-native settings), so storing values for one
+    // is a visible refusal instead of a silent write.
+    let mut values = BackendConfigValues::default();
+    values.0.insert(
         "default_model".to_owned(),
         SessionSettingValue::String("anthropic/claude-sonnet-5".to_owned()),
     );
-    store
+    let err = store
         .apply(HostSettingValue::BackendConfig {
             backend: BackendKind::Hermes,
-            values: first,
+            values,
         })
-        .expect("set Hermes default model");
-
-    let mut second = BackendConfigValues::default();
-    second.0.insert(
-        "default_provider".to_owned(),
-        SessionSettingValue::String("anthropic".to_owned()),
-    );
-    let settings = store
-        .apply(HostSettingValue::BackendConfig {
-            backend: BackendKind::Hermes,
-            values: second,
-        })
-        .expect("merge Hermes default provider");
-    let values = settings
-        .backend_config
-        .get(&BackendKind::Hermes)
-        .expect("Hermes backend config");
-    assert_eq!(
-        values.0.get("default_model"),
-        Some(&SessionSettingValue::String(
-            "anthropic/claude-sonnet-5".to_owned()
-        ))
-    );
-    assert_eq!(
-        values.0.get("default_provider"),
-        Some(&SessionSettingValue::String("anthropic".to_owned()))
+        .expect_err("schema-less backend config writes must be refused");
+    assert!(
+        err.contains("does not support backend configuration"),
+        "{err}"
     );
 
-    let mut clear_one = BackendConfigValues::default();
-    clear_one
-        .0
-        .insert("default_model".to_owned(), SessionSettingValue::Null);
-    let settings = store
-        .apply(HostSettingValue::BackendConfig {
-            backend: BackendKind::Hermes,
-            values: clear_one,
-        })
-        .expect("clear Hermes default model");
-    let values = settings
-        .backend_config
-        .get(&BackendKind::Hermes)
-        .expect("Hermes backend config after clear");
-    assert!(!values.0.contains_key("default_model"));
-    assert_eq!(
-        values.0.get("default_provider"),
-        Some(&SessionSettingValue::String("anthropic".to_owned()))
-    );
-
+    // An explicit empty update still clears any stored entry and persists.
     let settings = store
         .apply(HostSettingValue::BackendConfig {
             backend: BackendKind::Hermes,
             values: BackendConfigValues::default(),
         })
-        .expect("clear entire Hermes config");
+        .expect("empty update clears backend config");
     assert!(!settings.backend_config.contains_key(&BackendKind::Hermes));
-
-    let mut tycode_provider = BackendConfigValues::default();
-    tycode_provider.0.insert(
-        "active_provider".to_owned(),
-        SessionSettingValue::String("default".to_owned()),
-    );
-    let err = store
-        .apply(HostSettingValue::BackendConfig {
-            backend: BackendKind::Tycode,
-            values: tycode_provider,
-        })
-        .expect_err("Tycode no longer stores native settings in Tyde host settings");
-    assert!(
-        err.contains("does not support backend configuration")
-            || err.contains("not defined by its schema"),
-        "unexpected Tycode backend-config store error: {err}"
-    );
 }
-
 #[tokio::test]
-async fn backend_config_updates_merge_through_client_events() {
+async fn backend_config_updates_are_refused_over_client_events() {
     let mut fixture = Fixture::new().await;
 
+    // No built-in backend accepts typed deep-config writes anymore (Hermes
+    // moved to backend-native settings), so a BackendConfig set must come
+    // back as a typed CommandError instead of a settings update.
     let mut model = BackendConfigValues::default();
     model.0.insert(
         "default_model".to_owned(),
@@ -1372,78 +1301,47 @@ async fn backend_config_updates_merge_through_client_events() {
             },
         })
         .await
-        .expect("set Hermes default model");
-    let settings = expect_host_settings(&mut fixture.client, "Hermes model setting").await;
-    assert_eq!(
-        settings
-            .settings
-            .backend_config
-            .get(&BackendKind::Hermes)
-            .and_then(|values| values.0.get("default_model")),
-        Some(&SessionSettingValue::String(
-            "anthropic/claude-sonnet-5".to_owned()
-        ))
-    );
+        .expect("send Hermes backend config set");
 
-    let mut provider = BackendConfigValues::default();
-    provider.0.insert(
-        "default_provider".to_owned(),
-        SessionSettingValue::String("anthropic".to_owned()),
-    );
-    fixture
-        .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::BackendConfig {
-                backend: BackendKind::Hermes,
-                values: provider,
-            },
-        })
-        .await
-        .expect("merge Hermes default provider");
-    let settings = expect_host_settings(&mut fixture.client, "Hermes provider setting").await;
-    let values = settings
-        .settings
-        .backend_config
-        .get(&BackendKind::Hermes)
-        .expect("Hermes backend config after merge");
-    assert_eq!(
-        values.0.get("default_model"),
-        Some(&SessionSettingValue::String(
-            "anthropic/claude-sonnet-5".to_owned()
-        ))
-    );
-    assert_eq!(
-        values.0.get("default_provider"),
-        Some(&SessionSettingValue::String("anthropic".to_owned()))
-    );
-
-    let mut clear = BackendConfigValues::default();
-    clear
-        .0
-        .insert("default_model".to_owned(), SessionSettingValue::Null);
-    fixture
-        .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::BackendConfig {
-                backend: BackendKind::Hermes,
-                values: clear,
-            },
-        })
-        .await
-        .expect("clear Hermes default model");
-    let settings = expect_host_settings(&mut fixture.client, "Hermes clear setting").await;
-    let values = settings
-        .settings
-        .backend_config
-        .get(&BackendKind::Hermes)
-        .expect("Hermes backend config after explicit clear");
-    assert!(!values.0.contains_key("default_model"));
-    assert_eq!(
-        values.0.get("default_provider"),
-        Some(&SessionSettingValue::String("anthropic".to_owned()))
-    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let now = tokio::time::Instant::now();
+        assert!(now < deadline, "timed out waiting for the refusal");
+        let env = match tokio::time::timeout(deadline - now, fixture.client.next_event()).await {
+            Ok(Ok(Some(env))) => env,
+            Ok(Ok(None)) => panic!("connection closed before the refusal"),
+            Ok(Err(err)) => panic!("next_event failed before the refusal: {err:?}"),
+            Err(_) => panic!("timed out waiting for the refusal"),
+        };
+        match env.kind {
+            FrameKind::CommandError => {
+                let error: CommandErrorPayload = env
+                    .parse_payload()
+                    .expect("parse CommandError for Hermes backend config refusal");
+                assert!(
+                    error
+                        .message
+                        .contains("does not support backend configuration"),
+                    "unexpected refusal message: {error:?}"
+                );
+                break;
+            }
+            FrameKind::HostSettings => {
+                let settings: HostSettingsPayload = env
+                    .parse_payload()
+                    .expect("parse HostSettings while awaiting the refusal");
+                assert!(
+                    !settings
+                        .settings
+                        .backend_config
+                        .contains_key(&BackendKind::Hermes),
+                    "refused Hermes backend config must never reach host settings"
+                );
+            }
+            _ => {}
+        }
+    }
 }
-
 #[test]
 fn generated_alias_never_overrides_user_alias() {
     let dir = tempfile::tempdir().expect("create tempdir");
