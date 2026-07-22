@@ -2022,6 +2022,8 @@ fn SupervisorTab() -> impl IntoView {
     let state_for_enabled_disabled = state.clone();
     let state_for_compact_checked = state.clone();
     let state_for_compact_disabled = state.clone();
+    let state_for_compact_min_value = state.clone();
+    let state_for_compact_min_disabled = state.clone();
     let state_for_kicks_value = state.clone();
     let state_for_kicks_disabled = state.clone();
     let state_for_retries_value = state.clone();
@@ -2072,6 +2074,36 @@ fn SupervisorTab() -> impl IntoView {
                     enabled: input.checked(),
                 },
             );
+        }
+    };
+
+    let compact_min_value = move || {
+        state_for_compact_min_value
+            .selected_host_settings()
+            .map(|settings| {
+                settings
+                    .supervisor
+                    .auto_compact_min_context_tokens
+                    .to_string()
+            })
+            .unwrap_or_default()
+    };
+    let compact_min_disabled = move || {
+        state_for_compact_min_disabled
+            .selected_host_settings()
+            .is_none()
+    };
+    let compact_min_on_change = {
+        let state = state.clone();
+        move |ev: web_sys::Event| {
+            let target = ev.target().unwrap();
+            let input: web_sys::HtmlInputElement = target.unchecked_into();
+            if let Ok(tokens) = input.value().trim().parse::<u64>() {
+                send_host_setting(
+                    &state,
+                    HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens },
+                );
+            }
         }
     };
 
@@ -2194,6 +2226,23 @@ fn SupervisorTab() -> impl IntoView {
                     <span class="settings-toggle-slider"></span>
                 </label>
             </div>
+        </div>
+
+        <div class="settings-field">
+            <label class="settings-label">"Auto-compact minimum context"</label>
+            <p class="settings-description">
+                "Automatically compact only when the latest completed assistant turn reports a context larger than this many tokens. The default is 200,000. Set 0 for no positive minimum; automatic compaction still waits for reported current-context data and skips the turn when that data is unavailable."
+            </p>
+            <input
+                class="settings-input settings-supervisor-number-input"
+                type="number"
+                min="0"
+                step="1000"
+                prop:value=compact_min_value
+                disabled=compact_min_disabled
+                aria-label="Supervisor auto-compact minimum context tokens"
+                on:change=compact_min_on_change
+            />
         </div>
 
         <div class="settings-field">
@@ -9067,6 +9116,25 @@ mod wasm_tests {
             .expect("kick limit input renders")
             .dyn_into()
             .expect("kick limit is an input");
+
+        let compact_min: web_sys::HtmlInputElement = container
+            .query_selector(
+                "input[aria-label='Supervisor auto-compact minimum context tokens']",
+            )
+            .unwrap()
+            .expect("auto-compact minimum context input renders")
+            .dyn_into()
+            .expect("auto-compact minimum context is an input");
+        assert_eq!(
+            compact_min.value(),
+            "200000",
+            "auto-compact minimum context shows the host default before edits"
+        );
+        compact_min.set_value("240000");
+        dispatch_change(&compact_min);
+        compact_min.set_value("0");
+        dispatch_change(&compact_min);
+
         assert_eq!(
             kicks.value(),
             "3",
@@ -9093,6 +9161,22 @@ mod wasm_tests {
         }
 
         let settings = recorded_set_setting_payloads(&calls);
+        assert!(
+            settings.iter().any(|s| {
+                s.get("kind").and_then(|k| k.as_str())
+                    == Some("supervisor_auto_compact_min_context_tokens")
+                    && s.get("tokens").and_then(|v| v.as_u64()) == Some(240_000)
+            }),
+            "editing the auto-compact minimum must emit a typed nonzero setting: {settings:?}"
+        );
+        assert!(
+            settings.iter().any(|s| {
+                s.get("kind").and_then(|k| k.as_str())
+                    == Some("supervisor_auto_compact_min_context_tokens")
+                    && s.get("tokens").and_then(|v| v.as_u64()) == Some(0)
+            }),
+            "zero must be committed as an explicit auto-compact minimum: {settings:?}"
+        );
         assert!(
             settings.iter().any(|s| {
                 s.get("kind").and_then(|k| k.as_str()) == Some("supervisor_max_kicks_per_task")

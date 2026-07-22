@@ -4,11 +4,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocol::{
     AgentId, AgentInput, BackendAccessMode, BackendKind, ChatEvent, ChatMessage, ChatMessageId,
-    MessageMetadataUpdateData, MessageSender, MessageTokenUsage, ModelInfo, OperationCancelledData,
-    OrchestrationAgentOrigin, OrchestrationAgentType, OrchestrationEvent, OrchestrationId,
-    OrchestrationPayload, SessionId, StreamEndData, StreamStartData, StreamTextDeltaData,
-    TokenUsage, ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy, ToolRequest,
-    ToolRequestType,
+    ContextBreakdown, MessageMetadataUpdateData, MessageSender, MessageTokenUsage, ModelInfo,
+    OperationCancelledData, OrchestrationAgentOrigin, OrchestrationAgentType, OrchestrationEvent,
+    OrchestrationId, OrchestrationPayload, SessionId, StreamEndData, StreamStartData,
+    StreamTextDeltaData, TokenUsage, ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy,
+    ToolRequest, ToolRequestType,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -74,6 +74,7 @@ const MOCK_HISTORY_SENTINEL: &str = "__mock_history__";
 const MOCK_CLOSE_RESUME_BEFORE_BARRIER_SENTINEL: &str = "__mock_close_resume_before_barrier__";
 const MOCK_LATE_USAGE_SENTINEL: &str = "__mock_late_usage__";
 const MOCK_NO_USAGE_SENTINEL: &str = "__mock_no_usage__";
+pub(crate) const MOCK_CONTEXT_250K_SENTINEL: &str = "__mock_context_250k__";
 const MOCK_ORCHESTRATION_SENTINEL: &str = "__mock_orchestration__";
 const MOCK_FAILED_TOOL_CALL_ID: &str = "mock-failed-tool";
 const MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID: &str = "mock-exit-plan-tool";
@@ -1117,7 +1118,17 @@ async fn emit_turn(
                 mock_turn_token_usage(),
             )
         }),
-        context_breakdown: None,
+        context_breakdown: user_message.contains(MOCK_CONTEXT_250K_SENTINEL).then(|| {
+            ContextBreakdown {
+                system_prompt_bytes: 100_000,
+                tool_io_bytes: 40_000,
+                conversation_history_bytes: 60_000,
+                reasoning_bytes: 20_000,
+                context_injection_bytes: 30_000,
+                input_tokens: 250_000,
+                context_window: 300_000,
+            }
+        }),
         images: None,
     };
 

@@ -2271,6 +2271,10 @@ pub struct SupervisorSettings {
     /// small warm context instead of resuming a huge cold session.
     #[serde(default)]
     pub auto_compact_on_success: bool,
+    /// Minimum latest-assistant context size required before a successful
+    /// supervision verdict may trigger automatic compaction.
+    #[serde(default = "default_supervisor_auto_compact_min_context_tokens")]
+    pub auto_compact_min_context_tokens: u64,
     /// Maximum consecutive supervisor kicks without an intervening real user
     /// message. Prevents a supervisor/agent ping-pong loop.
     #[serde(default = "default_supervisor_max_kicks_per_task")]
@@ -2315,11 +2319,17 @@ pub fn default_supervisor_retry_attempts() -> u8 {
     1
 }
 
+pub fn default_supervisor_auto_compact_min_context_tokens() -> u64 {
+    200_000
+}
+
 impl Default for SupervisorSettings {
     fn default() -> Self {
         Self {
             enabled: false,
             auto_compact_on_success: false,
+            auto_compact_min_context_tokens:
+                default_supervisor_auto_compact_min_context_tokens(),
             max_kicks_per_task: default_supervisor_max_kicks_per_task(),
             retry_attempts: default_supervisor_retry_attempts(),
             cost_tier: SupervisorCostTier::default(),
@@ -2415,6 +2425,9 @@ pub enum HostSettingValue {
     SupervisorAutoCompactOnSuccess {
         enabled: bool,
     },
+    SupervisorAutoCompactMinContextTokens {
+        tokens: u64,
+    },
     SupervisorMaxKicksPerTask {
         count: u8,
     },
@@ -2471,6 +2484,9 @@ impl HostSettingValue {
             Self::SupervisorAutoCompactOnSuccess { .. } => {
                 HostSettingErrorTarget::SupervisorAutoCompactOnSuccess
             }
+            Self::SupervisorAutoCompactMinContextTokens { .. } => {
+                HostSettingErrorTarget::SupervisorAutoCompactMinContextTokens
+            }
             Self::SupervisorMaxKicksPerTask { .. } => {
                 HostSettingErrorTarget::SupervisorMaxKicksPerTask
             }
@@ -2504,6 +2520,7 @@ pub enum HostSettingErrorTarget {
     BackgroundAgentFeatureEnabled,
     SupervisorEnabled,
     SupervisorAutoCompactOnSuccess,
+    SupervisorAutoCompactMinContextTokens,
     SupervisorMaxKicksPerTask,
     SupervisorRetryAttempts,
     SupervisorCostTier,
@@ -7370,6 +7387,11 @@ mod command_error_serde_tests {
         assert_eq!(
             HostSettingValue::EnableMobileConnections { enabled: true }.error_target(),
             HostSettingErrorTarget::EnableMobileConnections
+        );
+        assert_eq!(
+            HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 200_000 }
+                .error_target(),
+            HostSettingErrorTarget::SupervisorAutoCompactMinContextTokens
         );
     }
 

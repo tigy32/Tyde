@@ -1033,6 +1033,36 @@ fn persisted_empty_settings_are_valid() {
 }
 
 #[test]
+fn persisted_legacy_supervisor_uses_default_compaction_minimum() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let path = dir.path().join("settings.json");
+    fs::write(
+        &path,
+        r#"{
+  "settings": {
+    "enabled_backends": [],
+    "default_backend": null,
+    "supervisor": {
+      "enabled": true,
+      "auto_compact_on_success": true,
+      "max_kicks_per_task": 3,
+      "retry_attempts": 1,
+      "cost_tier": "low"
+    }
+  }
+}"#,
+    )
+    .expect("write legacy supervisor settings store");
+
+    let supervisor = HostSettingsStore::load(path)
+        .expect("load legacy supervisor settings")
+        .get()
+        .expect("read legacy supervisor settings")
+        .supervisor;
+    assert_eq!(supervisor.auto_compact_min_context_tokens, 200_000);
+}
+
+#[test]
 fn invalid_persisted_default_backend_is_rejected() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let path = dir.path().join("settings.json");
@@ -1108,6 +1138,7 @@ fn supervisor_settings_default_apply_and_validate() {
         !defaults.auto_compact_on_success,
         "auto-compact must default off"
     );
+    assert_eq!(defaults.auto_compact_min_context_tokens, 200_000);
     assert_eq!(defaults.max_kicks_per_task, 3);
     assert_eq!(defaults.retry_attempts, 1);
 
@@ -1119,6 +1150,28 @@ fn supervisor_settings_default_apply_and_validate() {
         .apply(HostSettingValue::SupervisorAutoCompactOnSuccess { enabled: true })
         .expect("enable auto-compact");
     assert!(settings.supervisor.auto_compact_on_success);
+    let settings = store
+        .apply(
+            HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 275_000 },
+        )
+        .expect("set auto-compact minimum context");
+    assert_eq!(
+        settings.supervisor.auto_compact_min_context_tokens,
+        275_000
+    );
+    assert_eq!(
+        store
+            .get()
+            .expect("re-read nonzero auto-compact minimum")
+            .supervisor
+            .auto_compact_min_context_tokens,
+        275_000,
+        "the nonzero minimum must survive the read-modify-write cycle"
+    );
+    let settings = store
+        .apply(HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 0 })
+        .expect("zero is a valid auto-compact minimum context");
+    assert_eq!(settings.supervisor.auto_compact_min_context_tokens, 0);
     let settings = store
         .apply(HostSettingValue::SupervisorMaxKicksPerTask { count: 5 })
         .expect("set kick limit");
@@ -1149,6 +1202,10 @@ fn supervisor_settings_default_apply_and_validate() {
     let persisted = store.get().expect("re-read persisted settings").supervisor;
     assert!(persisted.enabled);
     assert!(persisted.auto_compact_on_success);
+    assert_eq!(
+        persisted.auto_compact_min_context_tokens, 0,
+        "the explicit zero minimum must persist"
+    );
     assert_eq!(
         persisted.max_kicks_per_task, 5,
         "the rejected zero write must not clobber the stored kick limit"

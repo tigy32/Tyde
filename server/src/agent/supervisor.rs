@@ -47,6 +47,10 @@ pub(crate) struct SupervisionContextSnapshot {
     /// Consecutive supervisor kicks since the last real user message.
     pub kicks_since_user_message: u32,
     pub last_assistant_message: Option<String>,
+    /// Input-token footprint reported for the latest completed assistant
+    /// turn. Absence remains explicit so eligibility never falls back to a
+    /// cumulative or task-level usage value.
+    pub current_context_input_tokens: Option<u64>,
     /// Most recent error surfaced since the last real user message.
     pub last_error_since_user_message: Option<String>,
     /// The user cancelled/interrupted work since their last message (and no
@@ -57,6 +61,7 @@ pub(crate) struct SupervisionContextSnapshot {
 
 pub(crate) fn supervision_context_snapshot(event_log: &[Envelope]) -> SupervisionContextSnapshot {
     let mut snapshot = SupervisionContextSnapshot::default();
+    let mut latest_assistant_message_id = None;
     for envelope in event_log {
         if envelope.kind != FrameKind::ChatEvent {
             continue;
@@ -65,8 +70,22 @@ pub(crate) fn supervision_context_snapshot(event_log: &[Envelope]) -> Supervisio
             continue;
         };
         match event {
-            ChatEvent::MessageAdded(message) => observe_message(&mut snapshot, &message),
-            ChatEvent::StreamEnd(data) => observe_message(&mut snapshot, &data.message),
+            ChatEvent::MessageAdded(message) => {
+                observe_message(&mut snapshot, &mut latest_assistant_message_id, &message)
+            }
+            ChatEvent::StreamEnd(data) => observe_message(
+                &mut snapshot,
+                &mut latest_assistant_message_id,
+                &data.message,
+            ),
+            ChatEvent::MessageMetadataUpdated(update) => {
+                if latest_assistant_message_id.as_ref() == Some(&update.message_id)
+                    && let Some(context_breakdown) = update.context_breakdown
+                {
+                    snapshot.current_context_input_tokens =
+                        Some(context_breakdown.input_tokens);
+                }
+            }
             ChatEvent::OperationCancelled(_) => {
                 snapshot.cancelled_since_user_message = true;
             }
@@ -76,7 +95,11 @@ pub(crate) fn supervision_context_snapshot(event_log: &[Envelope]) -> Supervisio
     snapshot
 }
 
-fn observe_message(snapshot: &mut SupervisionContextSnapshot, message: &ChatMessage) {
+fn observe_message(
+    snapshot: &mut SupervisionContextSnapshot,
+    latest_assistant_message_id: &mut Option<protocol::ChatMessageId>,
+    message: &ChatMessage,
+) {
     match &message.sender {
         MessageSender::User => {
             if message.content.starts_with(SUPERVISOR_MESSAGE_PREFIX) {
@@ -93,6 +116,11 @@ fn observe_message(snapshot: &mut SupervisionContextSnapshot, message: &ChatMess
             snapshot.cancelled_since_user_message = false;
         }
         MessageSender::Assistant { .. } => {
+            *latest_assistant_message_id = message.message_id.clone();
+            snapshot.current_context_input_tokens = message
+                .context_breakdown
+                .as_ref()
+                .map(|breakdown| breakdown.input_tokens);
             if !message.content.trim().is_empty() {
                 snapshot.last_assistant_message = Some(message.content.clone());
             }
@@ -432,7 +460,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::{StreamEndData, StreamPath};
+    use protocol::{
+        ChatMessageId, ContextBreakdown, MessageMetadataUpdateData, StreamEndData, StreamPath,
+    };
 
     fn user_message(content: &str) -> ChatMessage {
         chat_message(MessageSender::User, content)
@@ -445,6 +475,29 @@ mod tests {
             },
             content,
         )
+    }
+
+    fn assistant_message_with_context(
+        message_id: &str,
+        content: &str,
+        input_tokens: Option<u64>,
+    ) -> ChatMessage {
+        let mut message = assistant_message(content);
+        message.message_id = Some(ChatMessageId(message_id.to_owned()));
+        message.context_breakdown = input_tokens.map(context_breakdown);
+        message
+    }
+
+    fn context_breakdown(input_tokens: u64) -> ContextBreakdown {
+        ContextBreakdown {
+            system_prompt_bytes: 1,
+            tool_io_bytes: 2,
+            conversation_history_bytes: 3,
+            reasoning_bytes: 4,
+            context_injection_bytes: 5,
+            input_tokens,
+            context_window: 300_000,
+        }
     }
 
     fn chat_message(sender: MessageSender, content: &str) -> ChatMessage {
@@ -499,6 +552,62 @@ mod tests {
         );
         assert!(snapshot.last_error_since_user_message.is_none());
         assert!(!snapshot.cancelled_since_user_message);
+    }
+
+    #[test]
+    fn snapshot_tracks_latest_assistant_context_and_matching_metadata() {
+        let mut log = vec![envelope(
+            1,
+            ChatEvent::StreamEnd(StreamEndData {
+                message: assistant_message_with_context("latest", "done", Some(210_000)),
+            }),
+        )];
+        assert_eq!(
+            supervision_context_snapshot(&log).current_context_input_tokens,
+            Some(210_000)
+        );
+
+        log.push(envelope(
+            2,
+            ChatEvent::MessageMetadataUpdated(MessageMetadataUpdateData {
+                message_id: ChatMessageId("older".to_owned()),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: Some(context_breakdown(220_000)),
+            }),
+        ));
+        assert_eq!(
+            supervision_context_snapshot(&log).current_context_input_tokens,
+            Some(210_000),
+            "metadata for another message must not replace the latest context"
+        );
+
+        log.push(envelope(
+            3,
+            ChatEvent::MessageMetadataUpdated(MessageMetadataUpdateData {
+                message_id: ChatMessageId("latest".to_owned()),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: Some(context_breakdown(230_000)),
+            }),
+        ));
+        assert_eq!(
+            supervision_context_snapshot(&log).current_context_input_tokens,
+            Some(230_000),
+            "matching metadata must replace the completed message breakdown"
+        );
+
+        log.push(envelope(
+            4,
+            ChatEvent::MessageAdded(assistant_message_with_context(
+                "newest", "new answer", None,
+            )),
+        ));
+        assert_eq!(
+            supervision_context_snapshot(&log).current_context_input_tokens,
+            None,
+            "a newer assistant completion without a breakdown must clear stale usage"
+        );
     }
 
     #[test]

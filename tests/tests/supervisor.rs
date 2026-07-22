@@ -7,9 +7,9 @@ mod fixture;
 
 use fixture::Fixture;
 use protocol::{
-    BackendKind, ChatEvent, Envelope, FrameKind, HostSettingValue, HostSettingsPayload,
-    MessageSender, NewAgentPayload, SUPERVISOR_MESSAGE_PREFIX, SetSettingPayload, SpawnAgentParams,
-    SpawnAgentPayload, StreamPath,
+    AgentClosedPayload, BackendKind, ChatEvent, Envelope, FrameKind, HostSettingValue,
+    HostSettingsPayload, MessageSender, NewAgentPayload, SUPERVISOR_MESSAGE_PREFIX,
+    SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
 };
 use std::time::Duration;
 
@@ -18,6 +18,7 @@ const MOCK_ERROR_WITHOUT_IDLE_SENTINEL: &str = "__mock_error_without_idle__";
 /// bubbles like real backends do — the supervisor's context reader consumes
 /// them, so supervised sessions must run with bubbles on.
 const MOCK_USER_BUBBLES_SENTINEL: &str = "__mock_user_bubbles__";
+const MOCK_CONTEXT_250K_SENTINEL: &str = "__mock_context_250k__";
 
 /// The supervisor debounces 3s after an idle transition before reading
 /// context, so supervisor-driven frames need a longer wait than ordinary
@@ -119,7 +120,16 @@ async fn apply_supervisor_setting(fixture: &mut Fixture, setting: HostSettingVal
     .await;
 }
 
-async fn spawn_supervised_agent(fixture: &mut Fixture, name: &str) -> StreamPath {
+async fn spawn_supervised_agent(
+    fixture: &mut Fixture,
+    name: &str,
+    report_context: bool,
+) -> NewAgentPayload {
+    let context_sentinel = if report_context {
+        MOCK_CONTEXT_250K_SENTINEL
+    } else {
+        ""
+    };
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -129,7 +139,7 @@ async fn spawn_supervised_agent(fixture: &mut Fixture, name: &str) -> StreamPath
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/test".to_owned()],
-                prompt: format!("hello {MOCK_USER_BUBBLES_SENTINEL}"),
+                prompt: format!("hello {MOCK_USER_BUBBLES_SENTINEL} {context_sentinel}"),
                 images: None,
                 backend_kind: BackendKind::Claude,
                 launch_profile_id: None,
@@ -159,7 +169,7 @@ async fn spawn_supervised_agent(fixture: &mut Fixture, name: &str) -> StreamPath
         |env| is_assistant_message_containing(env, &stream, "mock backend response to: hello"),
     )
     .await;
-    agent_stream
+    new_agent
 }
 
 /// Failure mode 1: a backend error card halts the turn. With the supervisor
@@ -182,7 +192,13 @@ async fn supervisor_kicks_agent_after_error_and_respects_kick_budget() {
     )
     .await;
 
-    let agent_stream = spawn_supervised_agent(&mut fixture, "supervised-error-agent").await;
+    let agent_stream = spawn_supervised_agent(
+        &mut fixture,
+        "supervised-error-agent",
+        false,
+    )
+    .await
+    .instance_stream;
 
     fixture
         .client
@@ -227,12 +243,11 @@ async fn supervisor_kicks_agent_after_error_and_respects_kick_budget() {
     .await;
 }
 
-/// Failure-free path: the supervisor confirms the task is done and, with
-/// auto-compact enabled, rotates the agent through compaction exactly once.
-/// The replacement agent's bootstrap turn must NOT be supervised into
-/// another compaction (that would loop forever).
+/// Failure-free paths lock the automatic-compaction context contract: absent,
+/// below-threshold, and exact-threshold usage do not compact; strictly greater
+/// known usage rotates once, and the replacement is protected from a loop.
 #[tokio::test]
-async fn supervisor_done_verdict_auto_compacts_once() {
+async fn supervisor_auto_compaction_respects_context_threshold() {
     fixture::init_tracing();
     let mut fixture = Fixture::new().await;
 
@@ -246,11 +261,57 @@ async fn supervisor_done_verdict_auto_compacts_once() {
         HostSettingValue::SupervisorAutoCompactOnSuccess { enabled: true },
     )
     .await;
+    apply_supervisor_setting(
+        &mut fixture,
+        HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 0 },
+    )
+    .await;
 
-    let _agent_stream = spawn_supervised_agent(&mut fixture, "supervised-done-agent").await;
+    spawn_supervised_agent(&mut fixture, "supervised-unavailable-agent", false).await;
+    assert_no_envelope(
+        &mut fixture.client,
+        QUIET_WAIT,
+        "auto-compaction when current context usage is unavailable",
+        |env| env.kind == FrameKind::NewAgent,
+    )
+    .await;
 
-    // Idle with no error → mock verdict Done → auto-compaction spawns a
-    // replacement agent and closes the original.
+    apply_supervisor_setting(
+        &mut fixture,
+        HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 300_000 },
+    )
+    .await;
+    spawn_supervised_agent(&mut fixture, "supervised-below-agent", true).await;
+    assert_no_envelope(
+        &mut fixture.client,
+        QUIET_WAIT,
+        "auto-compaction below the configured context minimum",
+        |env| env.kind == FrameKind::NewAgent,
+    )
+    .await;
+
+    apply_supervisor_setting(
+        &mut fixture,
+        HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 250_000 },
+    )
+    .await;
+    spawn_supervised_agent(&mut fixture, "supervised-equal-agent", true).await;
+    assert_no_envelope(
+        &mut fixture.client,
+        QUIET_WAIT,
+        "auto-compaction at exactly the configured context minimum",
+        |env| env.kind == FrameKind::NewAgent,
+    )
+    .await;
+
+    apply_supervisor_setting(
+        &mut fixture,
+        HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 200_000 },
+    )
+    .await;
+    let original = spawn_supervised_agent(&mut fixture, "supervised-done-agent", true).await;
+
+    // 250,000 > 200,000, so a Done verdict compacts the original.
     let env = wait_for_envelope(
         &mut fixture.client,
         SUPERVISION_WAIT,
@@ -263,13 +324,20 @@ async fn supervisor_done_verdict_auto_compacts_once() {
         replacement.name, "supervised-done-agent",
         "the compacted replacement keeps the original agent name"
     );
-    wait_for_envelope(
+    let env = wait_for_envelope(
         &mut fixture.client,
         SUPERVISION_WAIT,
         "AgentClosed for the compacted original agent",
-        |env| env.kind == FrameKind::AgentClosed,
+        |env| {
+            env.kind == FrameKind::AgentClosed
+                && env
+                    .parse_payload::<AgentClosedPayload>()
+                    .is_ok_and(|payload| payload.agent_id == original.agent_id)
+        },
     )
     .await;
+    let closed: AgentClosedPayload = env.parse_payload().expect("parse AgentClosed");
+    assert_eq!(closed.agent_id, original.agent_id);
 
     // The replacement idles after digesting its bootstrap summary. The
     // post-compaction guard must keep the supervisor from compacting again.
@@ -292,6 +360,7 @@ async fn supervisor_settings_round_trip_over_the_wire() {
     for setting in [
         HostSettingValue::SupervisorEnabled { enabled: true },
         HostSettingValue::SupervisorAutoCompactOnSuccess { enabled: true },
+        HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 225_000 },
         HostSettingValue::SupervisorMaxKicksPerTask { count: 7 },
         HostSettingValue::SupervisorRetryAttempts { count: 2 },
     ] {
@@ -320,6 +389,13 @@ async fn supervisor_settings_round_trip_over_the_wire() {
     let payload: HostSettingsPayload = env.parse_payload().expect("parse HostSettings");
     assert!(payload.settings.supervisor.enabled);
     assert!(payload.settings.supervisor.auto_compact_on_success);
+    assert_eq!(
+        payload
+            .settings
+            .supervisor
+            .auto_compact_min_context_tokens,
+        225_000
+    );
     assert_eq!(payload.settings.supervisor.max_kicks_per_task, 7);
     assert_eq!(payload.settings.supervisor.retry_attempts, 3);
 }

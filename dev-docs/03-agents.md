@@ -806,6 +806,21 @@ closed-descendant breakdown across a host restart needs a fuller per-agent usage
 store; the existing session store only has a total token count and not enough
 identity/model detail for this payload.
 
+The supervisor's automatic-compaction gate uses a separate, narrower value:
+the latest completed assistant turn's `ContextBreakdown.input_tokens`. A later
+`MessageMetadataUpdated` patch replaces that value only when its `message_id`
+matches the latest completed assistant message. A newer assistant completion
+without a context breakdown makes current-context usage unavailable; the
+server does not reuse an older turn or substitute per-request/per-turn token
+usage, cumulative agent activity totals, or root-plus-descendant task rollups.
+
+When “Auto-compact on success” is enabled, the supervisor compacts only when
+that known current-context value is strictly greater than the configured
+minimum. The minimum defaults to 200,000 tokens, so exactly 200,000 does not
+qualify. A setting of 0 removes the positive minimum but still requires a
+reported value. If current-context usage is unavailable, automatic compaction
+is skipped and logged; manual compaction is unaffected.
+
 ---
 
 ## 7. Backends

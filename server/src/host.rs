@@ -13163,10 +13163,41 @@ async fn supervise_idle_agent(
         crate::agent::supervisor::SupervisionVerdict::Done => {
             tracing::info!(agent_id = %agent_id, "supervisor confirmed the task is done");
             if current_settings.settings.auto_compact_on_success {
-                supervisor_auto_compact(host, agent_id).await;
+                let threshold = current_settings
+                    .settings
+                    .auto_compact_min_context_tokens;
+                let current_context = recheck.current_context_input_tokens;
+                if supervisor_auto_compaction_eligible(current_context, threshold) {
+                    supervisor_auto_compact(host, agent_id).await;
+                } else {
+                    match current_context {
+                        Some(current) => {
+                            tracing::info!(
+                                agent_id = %agent_id,
+                                current_context_input_tokens = current,
+                                auto_compact_min_context_tokens = threshold,
+                                "skipping supervisor auto-compaction: current context is at or below the configured minimum"
+                            );
+                        }
+                        None => {
+                            tracing::info!(
+                                agent_id = %agent_id,
+                                auto_compact_min_context_tokens = threshold,
+                                "skipping supervisor auto-compaction: current context usage is unavailable"
+                            );
+                        }
+                    }
+                }
             }
         }
     }
+}
+
+fn supervisor_auto_compaction_eligible(
+    current_context_input_tokens: Option<u64>,
+    minimum_context_tokens: u64,
+) -> bool {
+    current_context_input_tokens.is_some_and(|current| current > minimum_context_tokens)
 }
 
 async fn supervisor_auto_compact(host: &HostHandle, agent_id: &AgentId) {

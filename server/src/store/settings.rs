@@ -362,6 +362,9 @@ fn apply_setting(settings: &mut HostSettings, setting: HostSettingValue) -> Resu
         HostSettingValue::SupervisorAutoCompactOnSuccess { enabled } => {
             settings.supervisor.auto_compact_on_success = enabled;
         }
+        HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens } => {
+            settings.supervisor.auto_compact_min_context_tokens = tokens;
+        }
         HostSettingValue::SupervisorMaxKicksPerTask { count } => {
             if count == 0 {
                 return Err(
