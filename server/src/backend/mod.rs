@@ -11,6 +11,7 @@ pub mod setup;
 pub mod subprocess;
 pub mod turn_emitter;
 pub mod tycode;
+pub mod tycode_config;
 
 use std::collections::HashMap;
 

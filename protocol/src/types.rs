@@ -2443,22 +2443,6 @@ pub enum HostSettingValue {
         backend: BackendKind,
         settings: Value,
     },
-    /// Acknowledge the one-time notice for a specific server-owned Tycode
-    /// managed-settings projection. A mismatched projection id is a typed
-    /// `CommandErrorCode::Conflict`, never an acknowledgement of a newer
-    /// projection.
-    AcknowledgeTycodeProjectionNotice {
-        backend: BackendKind,
-        projection_id: TycodeProjectionId,
-    },
-    /// Clear only the server-owned Tycode managed projection after an explicit
-    /// recovery-required state. Both tokens must exactly match the state the
-    /// server reported; a stale token is a typed `CommandErrorCode::Conflict`.
-    ResetTycodeManagedProjection {
-        backend: BackendKind,
-        expected_projection_id: TycodeProjectionId,
-        expected_state_hash: TycodeProjectionStateHash,
-    },
     /// Replace all explicit server-owned Launch Profiles.
     LaunchProfiles {
         profiles: Vec<HostLaunchProfileConfig>,
@@ -2497,12 +2481,6 @@ impl HostSettingValue {
             }
             Self::BackendConfig { .. } => HostSettingErrorTarget::BackendConfig,
             Self::BackendNativeSettings { .. } => HostSettingErrorTarget::BackendNativeSettings,
-            Self::AcknowledgeTycodeProjectionNotice { .. } => {
-                HostSettingErrorTarget::AcknowledgeTycodeProjectionNotice
-            }
-            Self::ResetTycodeManagedProjection { .. } => {
-                HostSettingErrorTarget::ResetTycodeManagedProjection
-            }
             Self::LaunchProfiles { .. } => HostSettingErrorTarget::LaunchProfiles,
         }
     }
@@ -2532,8 +2510,6 @@ pub enum HostSettingErrorTarget {
     CodeIntelLanguageServerPath,
     BackendConfig,
     BackendNativeSettings,
-    AcknowledgeTycodeProjectionNotice,
-    ResetTycodeManagedProjection,
     LaunchProfiles,
 }
 
@@ -2928,73 +2904,10 @@ pub struct BackendNativeSettingsSnapshot {
     pub groups: Vec<BackendNativeSettingsGroup>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    /// Ownership/provenance for a server-managed native-settings projection.
-    /// Omitted for backends and snapshots that do not use a managed projection.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provenance: Option<BackendNativeSettingsProvenance>,
     /// Non-fatal diagnostics from a ready backend-native settings operation.
     /// They remain typed so renderers never infer settings safety from text.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub advisories: Vec<BackendNativeSettingsAdvisory>,
-    /// Server-owned recovery state for a managed native-settings projection.
-    /// It is absent during normal operation and never inferred by clients.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub managed_projection_recovery: Option<TycodeManagedProjectionRecoveryState>,
-}
-
-/// Server-owned provenance for a backend-native settings snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum BackendNativeSettingsProvenance {
-    TycodeManagedProjection {
-        managed_settings_path: HostAbsPath,
-        source_settings_path: HostAbsPath,
-        source: TycodeProjectionSource,
-        tycode_version: Version,
-        projection_id: TycodeProjectionId,
-        created_at_ms: u64,
-        source_digest: TycodeProjectionSourceDigest,
-        original_unchanged: bool,
-        notice_pending: bool,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TycodeProjectionSource {
-    SharedSettings,
-    Defaults,
-}
-
-/// Stable identity for one managed Tycode settings projection. The server
-/// compares this exact value before acknowledging a one-time notice.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct TycodeProjectionId(pub String);
-
-/// Digest of the original source bytes used when the managed projection was
-/// created. It is opaque to clients; only the server establishes its value.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct TycodeProjectionSourceDigest(pub String);
-
-/// Opaque hash of the server-observed managed projection and its transaction
-/// artifacts. It is compared exactly before an explicit managed reset.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct TycodeProjectionStateHash(pub String);
-
-/// Explicit recovery state for a managed Tycode projection. The UI may offer a
-/// reset only for this server-emitted state; it never reconstructs recovery
-/// needs from paths, files, or message text.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TycodeManagedProjectionRecoveryState {
-    ManagedProjectionResetRequired {
-        reason: String,
-        expected_projection_id: TycodeProjectionId,
-        expected_state_hash: TycodeProjectionStateHash,
-    },
 }
 
 /// Non-fatal, server-classified advisory associated with a native settings
@@ -3003,7 +2916,6 @@ pub enum TycodeManagedProjectionRecoveryState {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BackendNativeSettingsAdvisory {
     NoProviderConfigured { message: String },
-    UnsupportedActiveProvider { provider: String, message: String },
     BackendReported { message: String },
 }
 
@@ -7406,10 +7318,11 @@ mod command_error_serde_tests {
             serde_json::to_value(&legacy_payload).expect("serialize legacy command error");
         assert!(legacy_encoded.get("setting_target").is_none());
 
-        let setting = HostSettingValue::ResetTycodeManagedProjection {
+        // The error target must never echo the submitted value: a native
+        // settings save can carry credentials in its opaque settings document.
+        let setting = HostSettingValue::BackendNativeSettings {
             backend: BackendKind::Tycode,
-            expected_projection_id: TycodeProjectionId("projection-01J-secret".to_owned()),
-            expected_state_hash: TycodeProjectionStateHash("sha256:state-secret".to_owned()),
+            settings: serde_json::json!({"api_key": "native-save-secret"}),
         };
         let payload = CommandErrorPayload {
             stream: StreamPath("/host/settings".to_owned()),
@@ -7417,23 +7330,22 @@ mod command_error_serde_tests {
             setting_target: Some(setting.error_target()),
             operation: "set_setting".to_owned(),
             code: CommandErrorCode::Conflict,
-            message: "projection changed".to_owned(),
+            message: "settings changed".to_owned(),
             fatal: false,
         };
         let encoded = serde_json::to_value(&payload).expect("serialize typed command error");
         assert_eq!(
             encoded["setting_target"],
-            serde_json::json!("reset_tycode_managed_projection")
+            serde_json::json!("backend_native_settings")
         );
         let encoded_text = encoded.to_string();
-        assert!(!encoded_text.contains("projection-01J-secret"));
-        assert!(!encoded_text.contains("sha256:state-secret"));
+        assert!(!encoded_text.contains("native-save-secret"));
 
         let decoded: CommandErrorPayload =
             serde_json::from_value(encoded).expect("deserialize typed command error");
         assert_eq!(
             decoded.setting_target,
-            Some(HostSettingErrorTarget::ResetTycodeManagedProjection)
+            Some(HostSettingErrorTarget::BackendNativeSettings)
         );
     }
 
@@ -7721,64 +7633,31 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn tycode_managed_projection_snapshot_round_trips_typed_provenance_and_advisories() {
-        let provenance = BackendNativeSettingsProvenance::TycodeManagedProjection {
-            managed_settings_path: HostAbsPath(
-                "/Users/alice/.tycode/tyde-settings.toml".to_owned(),
-            ),
-            source_settings_path: HostAbsPath("/Users/alice/.tycode/settings.toml".to_owned()),
-            source: TycodeProjectionSource::SharedSettings,
-            tycode_version: Version {
-                major: 0,
-                minor: 10,
-                patch: 0,
-            },
-            projection_id: TycodeProjectionId("projection-01J".to_owned()),
-            created_at_ms: 1_760_000_000_000,
-            source_digest: TycodeProjectionSourceDigest("sha256:abc123".to_owned()),
-            original_unchanged: true,
-            notice_pending: true,
-        };
+    fn tycode_native_settings_snapshot_round_trips_typed_advisories() {
         let snapshot = BackendNativeSettingsSnapshot {
             backend_kind: BackendKind::Tycode,
             status: BackendConfigSnapshotStatus::Ready,
             settings: Some(serde_json::json!({"active_provider": "anthropic"})),
             groups: Vec::new(),
             message: None,
-            provenance: Some(provenance.clone()),
             advisories: vec![
                 BackendNativeSettingsAdvisory::NoProviderConfigured {
                     message: "Configure a provider to continue.".to_owned(),
-                },
-                BackendNativeSettingsAdvisory::UnsupportedActiveProvider {
-                    provider: "legacy-provider".to_owned(),
-                    message: "Choose a supported provider in Tyde's copy.".to_owned(),
                 },
                 BackendNativeSettingsAdvisory::BackendReported {
                     message: "Tycode reported a recoverable settings diagnostic.".to_owned(),
                 },
             ],
-            managed_projection_recovery: None,
         };
 
         let json = serde_json::to_value(&snapshot).expect("serialize native settings snapshot");
-        assert_eq!(json["provenance"]["kind"], "tycode_managed_projection");
-        assert_eq!(json["provenance"]["source"], "shared_settings");
-        assert_eq!(json["provenance"]["projection_id"], "projection-01J");
-        assert_eq!(json["provenance"]["source_digest"], "sha256:abc123");
         assert_eq!(json["advisories"][0]["kind"], "no_provider_configured");
-        assert_eq!(json["advisories"][1]["kind"], "unsupported_active_provider");
-        assert_eq!(json["advisories"][2]["kind"], "backend_reported");
+        assert_eq!(json["advisories"][1]["kind"], "backend_reported");
         assert_eq!(round_trip(&snapshot), snapshot);
-        assert_eq!(round_trip(&provenance), provenance);
-        assert_eq!(
-            round_trip(&TycodeProjectionSource::Defaults),
-            TycodeProjectionSource::Defaults
-        );
     }
 
     #[test]
-    fn native_settings_snapshot_defaults_new_projection_fields_for_legacy_hosts() {
+    fn native_settings_snapshot_defaults_optional_fields_for_legacy_hosts() {
         let legacy = serde_json::json!({
             "backend_kind": "tycode",
             "status": "ready",
@@ -7787,93 +7666,63 @@ mod search_serde_tests {
         });
         let snapshot: BackendNativeSettingsSnapshot =
             serde_json::from_value(legacy).expect("deserialize legacy native settings snapshot");
-        assert_eq!(snapshot.provenance, None);
         assert!(snapshot.advisories.is_empty());
-        assert_eq!(snapshot.managed_projection_recovery, None);
 
         let encoded = serde_json::to_value(snapshot).expect("serialize legacy-compatible snapshot");
-        assert!(encoded.get("provenance").is_none());
         assert!(encoded.get("advisories").is_none());
-        assert!(encoded.get("managed_projection_recovery").is_none());
     }
 
     #[test]
-    fn tycode_projection_notice_acknowledgement_round_trips_with_typed_id() {
-        let payload = SetSettingPayload {
-            setting: HostSettingValue::AcknowledgeTycodeProjectionNotice {
-                backend: BackendKind::Tycode,
-                projection_id: TycodeProjectionId("projection-01J".to_owned()),
-            },
+    fn tycode_profiles_doc_round_trips_actions_and_base_settings() {
+        use crate::tycode_config::{
+            TYCODE_NATIVE_SETTINGS_VERSION, TycodeNativeSettingsDoc, TycodeProfileAction,
+            TycodeProfileSettings,
         };
-        let json = serde_json::to_value(&payload).expect("serialize notice acknowledgement");
-        assert_eq!(
-            json,
-            serde_json::json!({
-                "setting": {
-                    "kind": "acknowledge_tycode_projection_notice",
-                    "backend": "tycode",
-                    "projection_id": "projection-01J",
-                },
-            })
-        );
-        assert_eq!(round_trip(&payload), payload);
-    }
 
-    #[test]
-    fn managed_projection_recovery_and_reset_round_trip_with_exact_tokens() {
-        let recovery = TycodeManagedProjectionRecoveryState::ManagedProjectionResetRequired {
-            reason: "The managed settings and transaction journal do not form a proven pair."
-                .to_owned(),
-            expected_projection_id: TycodeProjectionId("projection-recovery-01J".to_owned()),
-            expected_state_hash: TycodeProjectionStateHash("sha256:state-abc123".to_owned()),
-        };
-        let snapshot = BackendNativeSettingsSnapshot {
-            backend_kind: BackendKind::Tycode,
-            status: BackendConfigSnapshotStatus::Unavailable,
-            settings: None,
-            groups: Vec::new(),
-            message: Some("Managed projection recovery is required.".to_owned()),
-            provenance: None,
-            advisories: Vec::new(),
-            managed_projection_recovery: Some(recovery.clone()),
-        };
-        let snapshot_json =
-            serde_json::to_value(&snapshot).expect("serialize recovery native settings snapshot");
-        assert_eq!(
-            snapshot_json["managed_projection_recovery"]["kind"],
-            "managed_projection_reset_required"
-        );
-        assert_eq!(
-            snapshot_json["managed_projection_recovery"]["expected_projection_id"],
-            "projection-recovery-01J"
-        );
-        assert_eq!(
-            snapshot_json["managed_projection_recovery"]["expected_state_hash"],
-            "sha256:state-abc123"
-        );
-        assert_eq!(round_trip(&snapshot), snapshot);
-        assert_eq!(round_trip(&recovery), recovery);
-
-        let reset = SetSettingPayload {
-            setting: HostSettingValue::ResetTycodeManagedProjection {
-                backend: BackendKind::Tycode,
-                expected_projection_id: TycodeProjectionId("projection-recovery-01J".to_owned()),
-                expected_state_hash: TycodeProjectionStateHash("sha256:state-abc123".to_owned()),
-            },
-        };
-        let reset_json = serde_json::to_value(&reset).expect("serialize managed projection reset");
-        assert_eq!(
-            reset_json,
-            serde_json::json!({
-                "setting": {
-                    "kind": "reset_tycode_managed_projection",
-                    "backend": "tycode",
-                    "expected_projection_id": "projection-recovery-01J",
-                    "expected_state_hash": "sha256:state-abc123",
+        let doc = TycodeNativeSettingsDoc {
+            version: TYCODE_NATIVE_SETTINGS_VERSION,
+            profiles: vec![
+                TycodeProfileSettings {
+                    name: "default".to_owned(),
+                    settings_path: "/Users/alice/.tycode/settings.toml".to_owned(),
+                    settings: serde_json::json!({"model_quality": "high"}),
+                    base_settings: None,
                 },
-            })
-        );
-        assert_eq!(round_trip(&reset), reset);
+                TycodeProfileSettings {
+                    name: "work".to_owned(),
+                    settings_path: "/Users/alice/.tycode/profiles/work.toml".to_owned(),
+                    settings: serde_json::json!({"model_quality": "low"}),
+                    base_settings: Some(serde_json::json!({"model_quality": "high"})),
+                },
+            ],
+            actions: vec![
+                TycodeProfileAction::CreateProfile {
+                    name: "work".to_owned(),
+                    copy_from: None,
+                },
+                TycodeProfileAction::DeleteProfile {
+                    name: "scratch".to_owned(),
+                },
+            ],
+        };
+
+        let json = serde_json::to_value(&doc).expect("serialize Tycode profiles doc");
+        assert_eq!(json["profiles"][0]["name"], "default");
+        assert!(json["profiles"][0].get("base_settings").is_none());
+        assert_eq!(json["actions"][0]["kind"], "create_profile");
+        assert_eq!(json["actions"][1]["kind"], "delete_profile");
+        let decoded: TycodeNativeSettingsDoc =
+            serde_json::from_value(json).expect("deserialize Tycode profiles doc");
+        assert_eq!(decoded, doc);
+
+        // A server snapshot has no actions and omits the key entirely.
+        let bare = TycodeNativeSettingsDoc {
+            version: TYCODE_NATIVE_SETTINGS_VERSION,
+            profiles: Vec::new(),
+            actions: Vec::new(),
+        };
+        let bare_json = serde_json::to_value(&bare).expect("serialize bare doc");
+        assert!(bare_json.get("actions").is_none());
     }
 
     #[test]

@@ -345,16 +345,6 @@ fn apply_setting(settings: &mut HostSettings, setting: HostSettingValue) -> Resu
                 "{backend:?} native settings are owned by the backend and are not stored in Tyde host settings"
             ));
         }
-        HostSettingValue::AcknowledgeTycodeProjectionNotice { backend, .. } => {
-            return Err(format!(
-                "{backend:?} projection notice acknowledgements are owned by the backend and are not stored in Tyde host settings"
-            ));
-        }
-        HostSettingValue::ResetTycodeManagedProjection { backend, .. } => {
-            return Err(format!(
-                "{backend:?} managed projection resets are owned by the backend and are not stored in Tyde host settings"
-            ));
-        }
         HostSettingValue::LaunchProfiles { profiles } => {
             settings.launch_profiles = validate_launch_profile_configs(profiles)?;
         }
@@ -728,57 +718,6 @@ mod tests {
         assert!(
             !path.exists(),
             "no file is written so a later launch can seed once a CLI is installed"
-        );
-    }
-
-    #[test]
-    fn projection_notice_acknowledgement_is_not_persisted_as_host_settings() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("settings.json");
-        let store = HostSettingsStore::load(path.clone()).expect("load empty store");
-
-        let error = store
-            .apply(HostSettingValue::AcknowledgeTycodeProjectionNotice {
-                backend: BackendKind::Tycode,
-                projection_id: protocol::TycodeProjectionId("projection-01J".to_owned()),
-            })
-            .expect_err("projection notice acknowledgement must bypass host persistence");
-
-        assert_eq!(
-            error,
-            "Tycode projection notice acknowledgements are owned by the backend and are not stored in Tyde host settings"
-        );
-        assert!(!path.exists(), "rejected setting must not be persisted");
-    }
-
-    #[test]
-    fn managed_projection_reset_is_not_persisted_as_host_settings() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("settings.json");
-        let original = r#"{"settings":{"enabled_backends":["claude"],"default_backend":"claude"}}"#;
-        std::fs::write(&path, original).expect("write existing settings");
-        let store = HostSettingsStore::load(path.clone()).expect("load existing store");
-
-        let error = store
-            .apply(HostSettingValue::ResetTycodeManagedProjection {
-                backend: BackendKind::Tycode,
-                expected_projection_id: protocol::TycodeProjectionId(
-                    "projection-recovery-01J".to_owned(),
-                ),
-                expected_state_hash: protocol::TycodeProjectionStateHash(
-                    "sha256:state-abc123".to_owned(),
-                ),
-            })
-            .expect_err("managed projection reset must bypass host persistence");
-
-        assert_eq!(
-            error,
-            "Tycode managed projection resets are owned by the backend and are not stored in Tyde host settings"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&path).expect("read settings after rejected reset"),
-            original,
-            "rejected reset must not write host settings"
         );
     }
 

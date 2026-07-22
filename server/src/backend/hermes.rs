@@ -679,9 +679,7 @@ pub(crate) async fn native_settings_snapshot(
                 settings: Some(settings),
                 groups: Vec::new(),
                 message: None,
-                provenance: None,
                 advisories: Vec::new(),
-                managed_projection_recovery: None,
             },
             Err(error) => hermes_native_settings_unavailable(format!(
                 "failed to serialize Hermes settings snapshot: {error}"
@@ -698,9 +696,7 @@ fn hermes_native_settings_unavailable(message: String) -> BackendNativeSettingsS
         settings: None,
         groups: Vec::new(),
         message: Some(message),
-        provenance: None,
         advisories: Vec::new(),
-        managed_projection_recovery: None,
     }
 }
 

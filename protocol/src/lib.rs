@@ -1,6 +1,7 @@
 #[cfg(feature = "framing")]
 pub mod framing;
 pub mod hermes_config;
+pub mod tycode_config;
 pub mod types;
 pub mod validator;
 
@@ -34,17 +35,17 @@ pub use types::{
     BackendConfigFieldType, BackendConfigPersistenceMode, BackendConfigSchema,
     BackendConfigSchemasPayload, BackendConfigSnapshot, BackendConfigSnapshotStatus,
     BackendConfigSnapshotsPayload, BackendConfigValues, BackendKind, BackendNativeSettingsAdvisory,
-    BackendNativeSettingsGroup, BackendNativeSettingsGroupKind, BackendNativeSettingsProvenance,
-    BackendNativeSettingsSnapshot, BackendSetupAction, BackendSetupCommand, BackendSetupDiagnostic,
-    BackendSetupDiagnosticCode, BackendSetupInfo, BackendSetupPayload, BackendSetupStatus,
-    BackendTierConfig, BackgroundAgentFeature, BackgroundAgentFeaturesSettings,
-    BackgroundTaskState, BackgroundTaskStatus, BrokerUrl, BrowseBootstrapListing,
-    BrowseBootstrapPayload, BuiltInSmartViewId, ByteRange, CancelQueuedMessagePayload,
-    CancelWorkflowPayload, CapacityBucket, CapacityBucketId, CapacityBucketStatus,
-    CapacityCoverage, CapacityErrorCode, CapacityErrorDetail, CapacityFreshness, CapacityMeasure,
-    CapacityPlanLabel, CapacityReport, CapacityReset, CapacityScope, CapacitySource,
-    CapacityUnavailableReason, CapacityUnsupportedReason, CapacityWindow, ChatEvent, ChatMessage,
-    ChatMessageId, ClaudeLimitType, ClientErrorCode, ClientErrorPayload, CloseAgentPayload,
+    BackendNativeSettingsGroup, BackendNativeSettingsGroupKind, BackendNativeSettingsSnapshot,
+    BackendSetupAction, BackendSetupCommand, BackendSetupDiagnostic, BackendSetupDiagnosticCode,
+    BackendSetupInfo, BackendSetupPayload, BackendSetupStatus, BackendTierConfig,
+    BackgroundAgentFeature, BackgroundAgentFeaturesSettings, BackgroundTaskState,
+    BackgroundTaskStatus, BrokerUrl, BrowseBootstrapListing, BrowseBootstrapPayload,
+    BuiltInSmartViewId, ByteRange, CancelQueuedMessagePayload, CancelWorkflowPayload,
+    CapacityBucket, CapacityBucketId, CapacityBucketStatus, CapacityCoverage, CapacityErrorCode,
+    CapacityErrorDetail, CapacityFreshness, CapacityMeasure, CapacityPlanLabel, CapacityReport,
+    CapacityReset, CapacityScope, CapacitySource, CapacityUnavailableReason,
+    CapacityUnsupportedReason, CapacityWindow, ChatEvent, ChatMessage, ChatMessageId,
+    ClaudeLimitType, ClientErrorCode, ClientErrorPayload, CloseAgentPayload,
     CodeIntelCancelReferencesPayload, CodeIntelCompleteness, CodeIntelDiagnostic,
     CodeIntelDiagnosticsPayload, CodeIntelErrorCode, CodeIntelErrorContext, CodeIntelErrorPayload,
     CodeIntelFileModelPayload, CodeIntelFindReferencesPayload, CodeIntelHoverPayload,
@@ -140,18 +141,17 @@ pub use types::{
     TerminalSendPayload, TerminalStartPayload, TokenUsage, TokenUsageScope,
     TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionNormalizationFailure,
     ToolExecutionResult, ToolPolicy, ToolProgressData, ToolProgressUpdate, ToolRequest,
-    ToolRequestType, ToolUseData, TriggerSurface, TriggerWorkflowPayload,
-    TycodeManagedProjectionRecoveryState, TycodeModel, TycodeProjectionId, TycodeProjectionSource,
-    TycodeProjectionSourceDigest, TycodeProjectionStateHash, TydeAgentWaitStatus, UserSmartViewId,
-    ValueProvenance, Version, WelcomePayload, WorkbenchCreatePayload, WorkbenchRemovePayload,
-    WorkbenchRoot, WorkflowAgentState, WorkflowAgentStatus, WorkflowCatalogLocation,
-    WorkflowCoordinatorSpec, WorkflowDiagnostic, WorkflowDiagnosticSeverity, WorkflowId,
-    WorkflowInputControl, WorkflowInputOption, WorkflowInputSpec, WorkflowNotifyPayload,
-    WorkflowRefreshPayload, WorkflowRunId, WorkflowRunNotifyPayload, WorkflowRunSnapshot,
-    WorkflowRunSnapshotStatus, WorkflowRunState, WorkflowRunStatus, WorkflowSaveMode,
-    WorkflowSaveRequest, WorkflowSaveResponse, WorkflowSaveTarget, WorkflowSource,
-    WorkflowSourceScope, WorkflowStepRunId, WorkflowStepRunSnapshot, WorkflowStepRunSnapshotStatus,
-    WorkflowSummary, WorkflowTargetDirectory, WorkflowTargetsResponse,
+    ToolRequestType, ToolUseData, TriggerSurface, TriggerWorkflowPayload, TycodeModel,
+    TydeAgentWaitStatus, UserSmartViewId, ValueProvenance, Version, WelcomePayload,
+    WorkbenchCreatePayload, WorkbenchRemovePayload, WorkbenchRoot, WorkflowAgentState,
+    WorkflowAgentStatus, WorkflowCatalogLocation, WorkflowCoordinatorSpec, WorkflowDiagnostic,
+    WorkflowDiagnosticSeverity, WorkflowId, WorkflowInputControl, WorkflowInputOption,
+    WorkflowInputSpec, WorkflowNotifyPayload, WorkflowRefreshPayload, WorkflowRunId,
+    WorkflowRunNotifyPayload, WorkflowRunSnapshot, WorkflowRunSnapshotStatus, WorkflowRunState,
+    WorkflowRunStatus, WorkflowSaveMode, WorkflowSaveRequest, WorkflowSaveResponse,
+    WorkflowSaveTarget, WorkflowSource, WorkflowSourceScope, WorkflowStepRunId,
+    WorkflowStepRunSnapshot, WorkflowStepRunSnapshotStatus, WorkflowSummary,
+    WorkflowTargetDirectory, WorkflowTargetsResponse,
 };
 // Re-exported from host-config via types.rs; the bundle-key type for the
 // web/PWA client (see WelcomePayload::release_version).

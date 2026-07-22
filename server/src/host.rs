@@ -225,60 +225,6 @@ const BACKEND_SETUP_REFRESH_ORDER: [BackendSetupRefreshStep; 3] = [
     BackendSetupRefreshStep::BackendConfigSnapshots,
 ];
 
-fn tycode_projection_acknowledgement_app_error(
-    error: crate::backend::tycode::TycodeProjectionNoticeAcknowledgementError,
-) -> AppError {
-    const OPERATION: &str = "set_setting";
-    match error {
-        crate::backend::tycode::TycodeProjectionNoticeAcknowledgementError::Conflict(message) => {
-            AppError::conflict(OPERATION, message)
-        }
-        crate::backend::tycode::TycodeProjectionNoticeAcknowledgementError::Failed(message) => {
-            AppError::internal(OPERATION, anyhow!(message))
-        }
-    }
-}
-
-fn tycode_managed_projection_reset_app_error(
-    error: crate::backend::tycode::TycodeManagedProjectionResetError,
-) -> AppError {
-    const OPERATION: &str = "set_setting";
-    match error {
-        crate::backend::tycode::TycodeManagedProjectionResetError::Conflict(message) => {
-            AppError::conflict(OPERATION, message)
-        }
-        crate::backend::tycode::TycodeManagedProjectionResetError::Failed(message) => {
-            AppError::internal(OPERATION, anyhow!(message))
-        }
-    }
-}
-
-async fn run_tycode_runtime_setting_operation<
-    Token,
-    Error,
-    Operation,
-    OperationFuture,
-    MapError,
-    Refresh,
-    RefreshFuture,
->(
-    token: Token,
-    operation: Operation,
-    map_error: MapError,
-    refresh: Refresh,
-) -> AppResult<()>
-where
-    Operation: FnOnce(Token) -> OperationFuture,
-    OperationFuture: Future<Output = Result<(), Error>>,
-    MapError: FnOnce(Error) -> AppError,
-    Refresh: FnOnce() -> RefreshFuture,
-    RefreshFuture: Future<Output = ()>,
-{
-    let result = operation(token).await.map_err(map_error);
-    refresh().await;
-    result
-}
-
 pub(crate) struct DeferredAgentAttachment {
     host_stream: StreamPath,
     agent_stream: StreamPath,
@@ -6999,56 +6945,6 @@ impl HostHandle {
 
     pub(crate) async fn set_setting(&self, payload: SetSettingPayload) -> AppResult<()> {
         const OPERATION: &str = "set_setting";
-        if let protocol::HostSettingValue::AcknowledgeTycodeProjectionNotice {
-            backend,
-            projection_id,
-        } = &payload.setting
-        {
-            if *backend != BackendKind::Tycode {
-                return Err(AppError::invalid(
-                    OPERATION,
-                    format!("{backend:?} does not own a Tycode projection notice"),
-                ));
-            }
-            return run_tycode_runtime_setting_operation(
-                projection_id.clone(),
-                |projection_id| async move {
-                    crate::backend::tycode::acknowledge_tycode_projection_notice(&projection_id)
-                        .await
-                },
-                tycode_projection_acknowledgement_app_error,
-                || self.refresh_backend_config_snapshots_after_native_save(),
-            )
-            .await;
-        }
-
-        if let protocol::HostSettingValue::ResetTycodeManagedProjection {
-            backend,
-            expected_projection_id,
-            expected_state_hash,
-        } = &payload.setting
-        {
-            if *backend != BackendKind::Tycode {
-                return Err(AppError::invalid(
-                    OPERATION,
-                    format!("{backend:?} does not own a Tycode managed projection"),
-                ));
-            }
-            return run_tycode_runtime_setting_operation(
-                (expected_projection_id.clone(), expected_state_hash.clone()),
-                |(expected_projection_id, expected_state_hash)| async move {
-                    crate::backend::tycode::reset_tycode_managed_projection(
-                        &expected_projection_id,
-                        &expected_state_hash,
-                    )
-                    .await
-                },
-                tycode_managed_projection_reset_app_error,
-                || self.refresh_backend_config_snapshots_after_native_save(),
-            )
-            .await;
-        }
-
         if let protocol::HostSettingValue::BackendNativeSettings { backend, settings } =
             &payload.setting
         {
@@ -20665,9 +20561,7 @@ mod tests {
             })),
             groups: Vec::new(),
             message: None,
-            provenance: None,
             advisories: Vec::new(),
-            managed_projection_recovery: None,
         }];
 
         emit_backend_config_snapshots_for_subscriber(&[], &native_settings, &mut subscriber, false)
@@ -20707,136 +20601,6 @@ mod tests {
                 BackendSetupRefreshStep::BackendConfigSnapshots,
             ]
         );
-    }
-
-    #[test]
-    fn stale_projection_notice_maps_to_typed_conflict() {
-        let error = tycode_projection_acknowledgement_app_error(
-            crate::backend::tycode::TycodeProjectionNoticeAcknowledgementError::Conflict(
-                "newer projection".to_owned(),
-            ),
-        );
-
-        assert_eq!(error.kind, crate::error::AppErrorKind::Conflict);
-        assert_eq!(error.message, "newer projection");
-    }
-
-    #[tokio::test]
-    async fn projection_notice_success_echoes_exact_token_and_refreshes() {
-        let projection_id = protocol::TycodeProjectionId("projection-01J".to_owned());
-        let observed = Arc::new(Mutex::new(None));
-        let observed_by_operation = Arc::clone(&observed);
-        let refreshes = Arc::new(AtomicU64::new(0));
-        let refreshes_by_callback = Arc::clone(&refreshes);
-
-        run_tycode_runtime_setting_operation(
-            projection_id.clone(),
-            move |received| async move {
-                *observed_by_operation.lock().await = Some(received);
-                Ok::<(), crate::backend::tycode::TycodeProjectionNoticeAcknowledgementError>(())
-            },
-            tycode_projection_acknowledgement_app_error,
-            move || async move {
-                refreshes_by_callback.fetch_add(1, Ordering::SeqCst);
-            },
-        )
-        .await
-        .expect("projection acknowledgement");
-
-        assert_eq!(observed.lock().await.as_ref(), Some(&projection_id));
-        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn managed_projection_reset_success_echoes_exact_tokens_and_refreshes() {
-        let projection_id = protocol::TycodeProjectionId("projection-recovery-01J".to_owned());
-        let state_hash = protocol::TycodeProjectionStateHash("sha256:state-abc123".to_owned());
-        let observed = Arc::new(Mutex::new(None));
-        let observed_by_operation = Arc::clone(&observed);
-        let refreshes = Arc::new(AtomicU64::new(0));
-        let refreshes_by_callback = Arc::clone(&refreshes);
-
-        run_tycode_runtime_setting_operation(
-            (projection_id.clone(), state_hash.clone()),
-            move |received| async move {
-                *observed_by_operation.lock().await = Some(received);
-                Ok::<(), crate::backend::tycode::TycodeManagedProjectionResetError>(())
-            },
-            tycode_managed_projection_reset_app_error,
-            move || async move {
-                refreshes_by_callback.fetch_add(1, Ordering::SeqCst);
-            },
-        )
-        .await
-        .expect("managed projection reset");
-
-        let expected = (projection_id, state_hash);
-        assert_eq!(observed.lock().await.as_ref(), Some(&expected));
-        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn stale_managed_projection_reset_conflicts_without_fallback_and_refreshes() {
-        let projection_id = protocol::TycodeProjectionId("projection-stale".to_owned());
-        let state_hash = protocol::TycodeProjectionStateHash("sha256:stale".to_owned());
-        let managed_artifact = Arc::new(Mutex::new(b"managed bytes".to_vec()));
-        let artifact_seen_by_operation = Arc::clone(&managed_artifact);
-        let refreshes = Arc::new(AtomicU64::new(0));
-        let refreshes_by_callback = Arc::clone(&refreshes);
-
-        let error = run_tycode_runtime_setting_operation(
-            (projection_id.clone(), state_hash.clone()),
-            move |received| async move {
-                assert_eq!(received, (projection_id, state_hash));
-                assert_eq!(
-                    artifact_seen_by_operation.lock().await.as_slice(),
-                    b"managed bytes"
-                );
-                Err(
-                    crate::backend::tycode::TycodeManagedProjectionResetError::Conflict(
-                        "managed projection changed".to_owned(),
-                    ),
-                )
-            },
-            tycode_managed_projection_reset_app_error,
-            move || async move {
-                refreshes_by_callback.fetch_add(1, Ordering::SeqCst);
-            },
-        )
-        .await
-        .expect_err("stale reset must conflict");
-
-        assert_eq!(error.code(), protocol::CommandErrorCode::Conflict);
-        assert_eq!(error.message, "managed projection changed");
-        assert_eq!(managed_artifact.lock().await.as_slice(), b"managed bytes");
-        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn failed_managed_projection_reset_refreshes_and_surfaces_internal_error() {
-        let refreshes = Arc::new(AtomicU64::new(0));
-        let refreshes_by_callback = Arc::clone(&refreshes);
-
-        let error = run_tycode_runtime_setting_operation(
-            (),
-            |_| async {
-                Err(
-                    crate::backend::tycode::TycodeManagedProjectionResetError::Failed(
-                        "journal fsync failed".to_owned(),
-                    ),
-                )
-            },
-            tycode_managed_projection_reset_app_error,
-            move || async move {
-                refreshes_by_callback.fetch_add(1, Ordering::SeqCst);
-            },
-        )
-        .await
-        .expect_err("failed reset must surface an error");
-
-        assert_eq!(error.code(), protocol::CommandErrorCode::Internal);
-        assert_eq!(error.message, "journal fsync failed");
-        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

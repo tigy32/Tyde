@@ -10,15 +10,13 @@ use protocol::{
     AgentBootstrapEvent, AgentBootstrapPayload, AgentClosedPayload, AgentErrorPayload,
     AgentStartPayload, BackendConfigSnapshotStatus, BackendConfigSnapshotsPayload,
     BackendConfigValues, BackendKind, BackendNativeSettingsAdvisory,
-    BackendNativeSettingsGroupKind, BackendNativeSettingsProvenance, BackendSetupAction,
-    BackendSetupDiagnosticCode, BackendSetupPayload, BackendSetupStatus, ChatEvent,
-    CodeIntelProviderId, CommandErrorCode, CommandErrorPayload, Envelope, FrameKind,
-    HostExecutablePath, HostSettingValue, HostSettings, HostSettingsPayload, ListSessionsPayload,
-    NewAgentPayload, NewTerminalPayload, RunBackendSetupPayload, SessionId, SessionListPayload,
-    SessionSettingValue, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
-    TerminalBootstrapPayload, TerminalExitPayload, TerminalOutputPayload,
-    TycodeManagedProjectionRecoveryState, TycodeProjectionId, TycodeProjectionSource,
-    TycodeProjectionStateHash,
+    BackendNativeSettingsGroupKind, BackendSetupAction, BackendSetupDiagnosticCode,
+    BackendSetupPayload, BackendSetupStatus, ChatEvent, CodeIntelProviderId, CommandErrorCode,
+    CommandErrorPayload, Envelope, FrameKind, HostExecutablePath, HostSettingValue, HostSettings,
+    HostSettingsPayload, ListSessionsPayload, NewAgentPayload, NewTerminalPayload,
+    RunBackendSetupPayload, SessionId, SessionListPayload, SessionSettingValue, SetSettingPayload,
+    SpawnAgentParams, SpawnAgentPayload, StreamPath, TerminalBootstrapPayload, TerminalExitPayload,
+    TerminalOutputPayload,
 };
 use server::backend::BackendSession;
 use server::store::session::SessionStore;
@@ -885,46 +883,6 @@ fn tycode_native_snapshot(
         .expect("Tycode native settings snapshot")
 }
 
-fn managed_projection_fields(
-    snapshot: &protocol::BackendNativeSettingsSnapshot,
-) -> (
-    &protocol::HostAbsPath,
-    &TycodeProjectionId,
-    TycodeProjectionSource,
-    bool,
-) {
-    let BackendNativeSettingsProvenance::TycodeManagedProjection {
-        managed_settings_path,
-        source,
-        projection_id,
-        notice_pending,
-        ..
-    } = snapshot
-        .provenance
-        .as_ref()
-        .expect("Tycode managed projection provenance");
-    (
-        managed_settings_path,
-        projection_id,
-        *source,
-        *notice_pending,
-    )
-}
-
-fn managed_recovery_fields(
-    snapshot: &protocol::BackendNativeSettingsSnapshot,
-) -> (&str, &TycodeProjectionId, &TycodeProjectionStateHash) {
-    let TycodeManagedProjectionRecoveryState::ManagedProjectionResetRequired {
-        reason,
-        expected_projection_id,
-        expected_state_hash,
-    } = snapshot
-        .managed_projection_recovery
-        .as_ref()
-        .expect("typed Tycode managed projection recovery state");
-    (reason, expected_projection_id, expected_state_hash)
-}
-
 async fn send_host_payload<T: serde::Serialize>(
     client: &mut client::Connection,
     kind: FrameKind,
@@ -1685,7 +1643,22 @@ api_key = "shared-only-secret"
     let tycode = tycode_native_snapshot(&payload);
     assert_eq!(tycode.status, BackendConfigSnapshotStatus::Ready);
     assert!(tycode.message.is_none());
-    let settings = tycode.settings.as_ref().expect("current Tycode settings");
+    let doc = tycode.settings.as_ref().expect("current Tycode settings");
+    assert_eq!(doc["version"], 1);
+    let doc_profiles = doc["profiles"].as_array().expect("Tycode profiles");
+    assert_eq!(doc_profiles.len(), 1, "only the default profile exists");
+    assert_eq!(doc_profiles[0]["name"], "default");
+    assert_eq!(
+        doc_profiles[0]["settings_path"].as_str(),
+        Some(
+            temp_home
+                .path()
+                .join(".tycode/settings.toml")
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
+    let settings = &doc_profiles[0]["settings"];
     assert_eq!(settings["profile"], "default");
     assert_eq!(settings["active_provider"], "native-bedrock");
     assert_eq!(settings["default_agent"], "builder");
@@ -1725,251 +1698,64 @@ api_key = "shared-only-secret"
         "Tycode native settings should expose a nested module group: {:?}",
         tycode.groups
     );
-    let (managed_path, _, source, notice_pending) = managed_projection_fields(tycode);
-    assert_eq!(source, TycodeProjectionSource::SharedSettings);
-    assert!(notice_pending);
-    assert_eq!(
-        managed_path.0,
-        temp_home
-            .path()
-            .join(".tycode/tyde-settings.toml")
-            .to_string_lossy()
-    );
+    // Direct probing must never create or touch a Tyde-managed copy.
+    for retired in [
+        ".tycode/tyde-settings.toml",
+        ".tycode/tyde-settings.provenance.json",
+        ".tycode/tyde-settings.transaction.json",
+        ".tycode/tyde-settings.lock",
+    ] {
+        assert!(
+            !temp_home.path().join(retired).exists(),
+            "retired managed projection artifact {retired} must not be created"
+        );
+    }
     assert_eq!(
         std::fs::read(temp_home.path().join(".tycode/settings.toml"))
             .expect("re-read shared Tycode settings"),
         source_bytes,
-        "automatic managed projection creation must leave the shared source byte-identical"
+        "probing must leave the shared settings byte-identical"
     );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(temp_home.path().join(".tycode"))
-                .expect("stat Tycode settings directory")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o755
-        );
-        for path in [
-            temp_home.path().join(".tycode/tyde-settings.toml"),
-            temp_home
-                .path()
-                .join(".tycode/tyde-settings.provenance.json"),
-        ] {
-            assert_eq!(
-                std::fs::metadata(&path)
-                    .unwrap_or_else(|err| panic!("stat private projection file {path:?}: {err}"))
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o600
-            );
-        }
-    }
     let response = serde_json::to_string(&payload).expect("serialize typed settings response");
     assert!(
         !response.contains("shared-only-secret"),
-        "unsupported source-only secrets must not enter typed responses"
+        "unrecognized source-only tables are dropped by Tycode's own settings parser and must \
+         not enter typed responses"
     );
     let initial_spawns = fake
         .events()
         .into_iter()
         .filter(|event| event["type"] == "spawn")
         .collect::<Vec<_>>();
-    assert_eq!(
-        initial_spawns.len(),
-        6,
-        "non-default import must initialize and verify defaults, probe/normalize/verify the source copy, then probe the published path"
-    );
-    assert_eq!(
-        initial_spawns[0]["settings_path"],
-        initial_spawns[1]["settings_path"]
-    );
-    assert_ne!(initial_spawns[0]["pid"], initial_spawns[1]["pid"]);
-    assert_eq!(initial_spawns[0]["settings_existed_before"], false);
-    assert_eq!(initial_spawns[1]["settings_existed_before"], true);
-    assert_eq!(
-        initial_spawns[2]["settings_path"],
-        initial_spawns[3]["settings_path"]
-    );
-    assert_eq!(
-        initial_spawns[3]["settings_path"],
-        initial_spawns[4]["settings_path"]
-    );
-    assert_ne!(initial_spawns[2]["pid"], initial_spawns[3]["pid"]);
-    assert_ne!(initial_spawns[3]["pid"], initial_spawns[4]["pid"]);
-    assert_eq!(initial_spawns[5]["settings_path"], managed_path.0.as_str());
     let shared_path = temp_home
         .path()
         .join(".tycode/settings.toml")
         .to_string_lossy()
         .into_owned();
-    for spawn in initial_spawns {
-        assert_ne!(spawn["settings_path"].as_str(), Some(shared_path.as_str()));
-        let argv = spawn["argv"].as_array().expect("initial fake Tycode argv");
-        assert_eq!(
-            argv.iter()
-                .filter(|argument| argument.as_str() == Some("--settings-path"))
-                .count(),
-            1
-        );
-    }
-    let persistent_normalization = fake
-        .events()
-        .into_iter()
-        .find(|event| {
+    assert_eq!(
+        initial_spawns.len(),
+        1,
+        "direct probing needs exactly one subprocess against the shared settings file"
+    );
+    assert_eq!(
+        initial_spawns[0]["settings_path"].as_str(),
+        Some(shared_path.as_str())
+    );
+    assert_eq!(initial_spawns[0]["settings_existed_before"], true);
+    let argv = initial_spawns[0]["argv"]
+        .as_array()
+        .expect("initial fake Tycode argv");
+    assert_eq!(
+        argv.iter()
+            .filter(|argument| argument.as_str() == Some("--settings-path"))
+            .count(),
+        1
+    );
+    assert!(
+        !fake.events().iter().any(|event| {
             event["type"] == "command" && event["command"]["SaveSettings"]["persist"] == true
-        })
-        .expect("non-default source normalization SaveSettings command");
-    let normalized = &persistent_normalization["command"]["SaveSettings"]["settings"];
-    assert_eq!(normalized["default_agent"], "builder");
-    assert_eq!(normalized["providers"]["native-bedrock"]["type"], "bedrock");
-    assert_eq!(
-        normalized["providers"]["native-bedrock"]["mantle_region"],
-        "us-east-1"
-    );
-    assert_eq!(normalized["providers"]["openrouter-empty"]["api_key"], "");
-    let managed_toml = std::fs::read_to_string(temp_home.path().join(".tycode/tyde-settings.toml"))
-        .expect("read persisted normalized v0.10 settings");
-    assert!(managed_toml.contains("default_agent = \"builder\""));
-    assert!(managed_toml.contains("type = \"bedrock\""));
-    assert!(managed_toml.contains("mantle_region = \"us-east-1\""));
-    assert!(managed_toml.contains("type = \"openrouter\""));
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn tycode_owned_conventional_directory_is_accepted_but_writable_mode_is_rejected() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let _env_guard = env_lock().lock().await;
-
-    let conventional_home = tempfile::tempdir().expect("create conventional-mode HOME");
-    let conventional_fake = write_fake_tycode_binary(conventional_home.path());
-    let conventional_source = write_shared_tycode_settings(
-        conventional_home.path(),
-        r#"active_provider = "native-provider"
-
-[providers.native-provider]
-type = "mock"
-"#,
-    );
-    assert_eq!(
-        std::fs::metadata(conventional_home.path().join(".tycode"))
-            .expect("stat conventional Tycode directory before probe")
-            .permissions()
-            .mode()
-            & 0o777,
-        0o755
-    );
-    {
-        let _home = EnvVarGuard::set(
-            "HOME",
-            conventional_home.path().to_string_lossy().to_string(),
-        );
-        let _hermes =
-            EnvVarGuard::set("HERMES_PYTHON", "/definitely/not/hermes-python".to_string());
-        let mut fixture =
-            Fixture::new_with_real_backend_probe_for_enabled_backends(vec![BackendKind::Tycode])
-                .await;
-        let payload = expect_backend_config_snapshots(
-            &mut fixture.client,
-            "owned conventional 0755 Tycode directory",
-        )
-        .await;
-        assert_eq!(
-            tycode_native_snapshot(&payload).status,
-            BackendConfigSnapshotStatus::Ready
-        );
-    }
-    assert_eq!(
-        std::fs::read(conventional_home.path().join(".tycode/settings.toml"))
-            .expect("read conventional-mode shared settings after projection"),
-        conventional_source
-    );
-    assert_eq!(
-        std::fs::metadata(conventional_home.path().join(".tycode"))
-            .expect("stat conventional Tycode directory after probe")
-            .permissions()
-            .mode()
-            & 0o777,
-        0o755,
-        "Tyde must accept, not silently chmod, an owned conventional directory"
-    );
-    assert!(
-        conventional_fake
-            .events()
-            .iter()
-            .any(|event| event["type"] == "spawn"),
-        "accepted conventional directory should reach the pinned actor"
-    );
-
-    let writable_home = tempfile::tempdir().expect("create writable-mode HOME");
-    let writable_fake = write_fake_tycode_binary(writable_home.path());
-    let writable_source =
-        write_shared_tycode_settings(writable_home.path(), "# unsafe directory sentinel\n");
-    std::fs::set_permissions(
-        writable_home.path().join(".tycode"),
-        std::fs::Permissions::from_mode(0o775),
-    )
-    .expect("make Tycode directory group-writable");
-    {
-        let _home = EnvVarGuard::set("HOME", writable_home.path().to_string_lossy().to_string());
-        let _hermes =
-            EnvVarGuard::set("HERMES_PYTHON", "/definitely/not/hermes-python".to_string());
-        let mut fixture =
-            Fixture::new_with_real_backend_probe_for_enabled_backends(vec![BackendKind::Tycode])
-                .await;
-        let payload = expect_backend_config_snapshots(
-            &mut fixture.client,
-            "group-writable Tycode directory rejection",
-        )
-        .await;
-        let tycode = tycode_native_snapshot(&payload);
-        assert_eq!(tycode.status, BackendConfigSnapshotStatus::Unavailable);
-        assert!(tycode.settings.is_none());
-        assert!(tycode.groups.is_empty());
-        assert!(
-            tycode
-                .message
-                .as_deref()
-                .is_some_and(|message| message.contains("group- or world-writable")),
-            "unsafe-mode diagnostic should identify the rejected condition: {:?}",
-            tycode.message
-        );
-    }
-    assert_eq!(
-        std::fs::read(writable_home.path().join(".tycode/settings.toml"))
-            .expect("read rejected shared settings"),
-        writable_source
-    );
-    assert_eq!(
-        std::fs::metadata(writable_home.path().join(".tycode"))
-            .expect("stat rejected Tycode directory")
-            .permissions()
-            .mode()
-            & 0o777,
-        0o775
-    );
-    for name in [
-        "tyde-settings.toml",
-        "tyde-settings.provenance.json",
-        "tyde-settings.transaction.json",
-        "tyde-settings.recovery.json",
-    ] {
-        assert!(
-            !writable_home.path().join(".tycode").join(name).exists(),
-            "unsafe directory must not publish managed artifact {name}"
-        );
-    }
-    assert!(
-        writable_fake
-            .events()
-            .iter()
-            .all(|event| event["type"] != "spawn"),
-        "unsafe directory must fail before actor startup"
+        }),
+        "probing must never persist settings"
     );
 }
 
@@ -2002,16 +1788,14 @@ async fn backend_config_snapshots_report_tycode_native_settings_probe_failure() 
         .as_deref()
         .expect("Tycode probe failure message");
     assert_eq!(
-        message,
-        "Cannot start Tycode native settings probe without a verified managed settings projection: \
-         Tycode process exited during managed projection verification: verifying SettingsSchema in a fresh process",
-        "Tycode projection failure should identify the exact failed phase"
+        message, "Tycode process exited during native settings probe: waiting for SettingsSchema",
+        "Tycode probe failure should identify the exact failed phase"
     );
     assert!(tycode.settings.is_none());
     assert!(tycode.groups.is_empty());
     assert!(
         !temp_home.path().join(".tycode/tyde-settings.toml").exists(),
-        "failed normalization must not publish a managed projection"
+        "no Tyde-managed settings copy may ever be created"
     );
     for path in [
         temp_home
@@ -2218,24 +2002,36 @@ secret = "shared-save-secret"
     assert_eq!(
         initial_snapshot.status,
         BackendConfigSnapshotStatus::Ready,
-        "the typed v0.10 native settings contract must be ready before saving: {:?}",
+        "the typed native settings contract must be ready before saving: {:?}",
         initial_snapshot.message
     );
-    let mut updated_settings = initial_snapshot
+    let initial_doc = initial_snapshot
         .settings
         .clone()
         .expect("initial current Tycode settings");
-    updated_settings
+    assert_eq!(initial_doc["profiles"][0]["name"], "default");
+    let base_settings = initial_doc["profiles"][0]["settings"].clone();
+    let mut edited_settings = base_settings.clone();
+    edited_settings
         .as_object_mut()
         .expect("Tycode settings object")
         .insert("model_quality".to_string(), serde_json::json!("low"));
+    let save_doc = serde_json::json!({
+        "version": 1,
+        "profiles": [{
+            "name": "default",
+            "settings_path": initial_doc["profiles"][0]["settings_path"],
+            "settings": edited_settings,
+            "base_settings": base_settings,
+        }],
+    });
 
     fixture
         .client
         .set_setting(SetSettingPayload {
             setting: HostSettingValue::BackendNativeSettings {
                 backend: BackendKind::Tycode,
-                settings: updated_settings.clone(),
+                settings: save_doc,
             },
         })
         .await
@@ -2250,18 +2046,19 @@ secret = "shared-save-secret"
         .expect("refreshed Tycode native settings snapshot");
 
     assert_eq!(tycode.status, BackendConfigSnapshotStatus::Ready);
-    let refreshed_settings = tycode
+    let refreshed_doc = tycode
         .settings
         .as_ref()
         .expect("refreshed current settings");
+    let refreshed_settings = &refreshed_doc["profiles"][0]["settings"];
     assert_eq!(refreshed_settings["model_quality"], "low");
     assert_eq!(refreshed_settings["profile"], "default");
     assert_eq!(
-        refreshed_settings["providers"], updated_settings["providers"],
+        refreshed_settings["providers"], base_settings["providers"],
         "save and refresh must preserve unrelated provider settings"
     );
     assert_eq!(
-        refreshed_settings["modules"], updated_settings["modules"],
+        refreshed_settings["modules"], base_settings["modules"],
         "save and refresh must preserve unrelated module settings"
     );
     assert!(tycode.message.is_none());
@@ -2277,6 +2074,11 @@ secret = "shared-save-secret"
         "refreshed Tycode snapshot should retain grouped schemas: {:?}",
         tycode.groups
     );
+    let shared_path = temp_home
+        .path()
+        .join(".tycode/settings.toml")
+        .to_string_lossy()
+        .into_owned();
     let save_events = fake.events();
     let spawns = save_events[events_before_save..]
         .iter()
@@ -2285,90 +2087,15 @@ secret = "shared-save-secret"
     assert_eq!(
         spawns.len(),
         3,
-        "save must use a save process, a fresh verifier, and an authoritative managed-path probe"
+        "a save uses a stale-check probe, a save process, and the refresh probe"
     );
-    assert_eq!(spawns[0]["settings_path"], spawns[1]["settings_path"]);
-    assert_ne!(
-        spawns[0]["pid"], spawns[1]["pid"],
-        "post-save verification must run in a fresh process"
-    );
-    let managed = temp_home.path().join(".tycode/tyde-settings.toml");
-    assert_ne!(
-        spawns[0]["settings_path"],
-        managed.to_string_lossy().as_ref()
-    );
-    assert_eq!(
-        spawns[2]["settings_path"],
-        managed.to_string_lossy().as_ref()
-    );
-    for spawn in spawns {
-        let argv = spawn["argv"].as_array().expect("fake Tycode argv");
+    for spawn in &spawns {
         assert_eq!(
-            argv.iter()
-                .filter(|argument| argument.as_str() == Some("--settings-path"))
-                .count(),
-            1,
-            "every actor-bearing process must receive exactly one settings path: {argv:?}"
+            spawn["settings_path"].as_str(),
+            Some(shared_path.as_str()),
+            "every settings process must target the real shared settings file"
         );
-    }
-
-    let events_before_second_save = fake.events().len();
-    let mut second_update = refreshed_settings.clone();
-    second_update
-        .as_object_mut()
-        .expect("refreshed Tycode settings object")
-        .insert("model_quality".to_string(), serde_json::json!("high"));
-    fixture
-        .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::BackendNativeSettings {
-                backend: BackendKind::Tycode,
-                settings: second_update.clone(),
-            },
-        })
-        .await
-        .expect("persist a second Tycode native settings update through client");
-    let second_refresh = expect_backend_config_snapshots(
-        &mut fixture.client,
-        "native snapshot after second Tycode native settings persist",
-    )
-    .await;
-    let second_snapshot = tycode_native_snapshot(&second_refresh);
-    assert_eq!(second_snapshot.status, BackendConfigSnapshotStatus::Ready);
-    let second_settings = second_snapshot
-        .settings
-        .as_ref()
-        .expect("second refreshed current settings");
-    assert_eq!(second_settings["model_quality"], "high");
-    assert_eq!(second_settings["providers"], second_update["providers"]);
-    assert_eq!(second_settings["modules"], second_update["modules"]);
-    let second_events = fake.events();
-    let second_spawns = second_events[events_before_second_save..]
-        .iter()
-        .filter(|event| event["type"] == "spawn")
-        .collect::<Vec<_>>();
-    assert_eq!(
-        second_spawns.len(),
-        3,
-        "a subsequent native save must still use a save process, fresh verifier, and authoritative managed-path probe"
-    );
-    assert_eq!(
-        second_spawns[0]["settings_path"],
-        second_spawns[1]["settings_path"]
-    );
-    assert_ne!(second_spawns[0]["pid"], second_spawns[1]["pid"]);
-    assert_ne!(
-        second_spawns[0]["settings_path"],
-        managed.to_string_lossy().as_ref()
-    );
-    assert_eq!(
-        second_spawns[2]["settings_path"],
-        managed.to_string_lossy().as_ref()
-    );
-    for spawn in second_spawns {
-        let argv = spawn["argv"]
-            .as_array()
-            .expect("second-save fake Tycode argv");
+        let argv = spawn["argv"].as_array().expect("fake Tycode argv");
         assert_eq!(
             argv.iter()
                 .filter(|argument| argument.as_str() == Some("--settings-path"))
@@ -2376,11 +2103,68 @@ secret = "shared-save-secret"
             1
         );
     }
+    assert_ne!(spawns[0]["pid"], spawns[1]["pid"]);
+    let shared_toml = std::fs::read_to_string(temp_home.path().join(".tycode/settings.toml"))
+        .expect("read shared settings after direct native save");
+    assert!(
+        shared_toml.contains("model_quality = \"low\""),
+        "a direct save must write the real shared settings file: {shared_toml}"
+    );
+    assert_ne!(
+        shared_toml.as_bytes(),
+        source_bytes.as_slice(),
+        "direct saves edit the user's file instead of a managed copy"
+    );
+    assert!(
+        !temp_home.path().join(".tycode/tyde-settings.toml").exists(),
+        "no Tyde-managed settings copy may be created by a save"
+    );
+
+    // An unchanged document round-trips without writing the file again.
+    let events_before_second_save = fake.events().len();
+    let noop_doc = serde_json::json!({
+        "version": 1,
+        "profiles": [{
+            "name": "default",
+            "settings_path": refreshed_doc["profiles"][0]["settings_path"],
+            "settings": refreshed_settings,
+            "base_settings": refreshed_settings,
+        }],
+    });
+    fixture
+        .client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::BackendNativeSettings {
+                backend: BackendKind::Tycode,
+                settings: noop_doc,
+            },
+        })
+        .await
+        .expect("persist an unchanged Tycode native settings document");
+    let second_refresh = expect_backend_config_snapshots(
+        &mut fixture.client,
+        "native snapshot after unchanged Tycode native settings persist",
+    )
+    .await;
+    let second_snapshot = tycode_native_snapshot(&second_refresh);
+    assert_eq!(second_snapshot.status, BackendConfigSnapshotStatus::Ready);
+    let second_events = fake.events();
+    let second_spawns = second_events[events_before_second_save..]
+        .iter()
+        .filter(|event| event["type"] == "spawn")
+        .collect::<Vec<_>>();
     assert_eq!(
-        std::fs::read(temp_home.path().join(".tycode/settings.toml"))
-            .expect("re-read shared settings after repeated native saves"),
-        source_bytes,
-        "repeated native saves must leave the shared source byte-identical"
+        second_spawns.len(),
+        2,
+        "an unchanged save needs only the stale-check probe and the refresh probe"
+    );
+    assert!(
+        !second_events[events_before_second_save..]
+            .iter()
+            .any(|event| {
+                event["type"] == "command" && event["command"]["SaveSettings"]["persist"] == true
+            }),
+        "an unchanged save must not rewrite the settings file"
     );
 }
 
@@ -2410,23 +2194,13 @@ async fn tycode_pre_session_advisory_is_ready_but_post_command_error_is_unavaila
         BackendNativeSettingsAdvisory::NoProviderConfigured { message }
             if message.contains("No AI provider is configured")
     )));
-    let (_, projection_id, _, _) = managed_projection_fields(tycode);
-    let projection_id = projection_id.clone();
-
+    drop(fixture);
     fake.set_behavior(serde_json::json!({
         "pre_session_advisory": true,
         "post_command_error": true
     }));
-    fixture
-        .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::AcknowledgeTycodeProjectionNotice {
-                backend: BackendKind::Tycode,
-                projection_id,
-            },
-        })
-        .await
-        .expect("acknowledge projection notice before failing refresh");
+    let mut fixture =
+        Fixture::new_with_real_backend_probe_for_enabled_backends(vec![BackendKind::Tycode]).await;
     let unavailable = expect_backend_config_snapshots(
         &mut fixture.client,
         "Tycode Unavailable snapshot after post-command error",
@@ -2444,1136 +2218,7 @@ async fn tycode_pre_session_advisory_is_ready_but_post_command_error_is_unavaila
 }
 
 #[tokio::test]
-async fn tycode_defaults_are_ready_without_creating_shared_settings() {
-    let _env_guard = env_lock().lock().await;
-
-    let defaults_home = tempfile::tempdir().expect("create defaults HOME");
-    let fake = write_fake_tycode_binary(defaults_home.path());
-    let _home = EnvVarGuard::set("HOME", defaults_home.path().to_string_lossy().to_string());
-    let _hermes = EnvVarGuard::set("HERMES_PYTHON", "/definitely/not/hermes-python".to_string());
-    let mut defaults_fixture =
-        Fixture::new_with_real_backend_probe_for_enabled_backends(vec![BackendKind::Tycode]).await;
-    let defaults =
-        expect_backend_config_snapshots(&mut defaults_fixture.client, "Tycode defaults projection")
-            .await;
-    let tycode = tycode_native_snapshot(&defaults);
-    assert_eq!(tycode.status, BackendConfigSnapshotStatus::Ready);
-    let default_settings = tycode
-        .settings
-        .clone()
-        .expect("Tycode nonexistent-path default settings");
-    let (_, _, source, _) = managed_projection_fields(tycode);
-    assert_eq!(source, TycodeProjectionSource::Defaults);
-    assert!(tycode.advisories.iter().any(|advisory| matches!(
-        advisory,
-        BackendNativeSettingsAdvisory::NoProviderConfigured { .. }
-    )));
-    assert!(
-        !defaults_home.path().join(".tycode/settings.toml").exists(),
-        "defaults projection must not create or use the shared settings page"
-    );
-    let spawns = fake
-        .events()
-        .into_iter()
-        .filter(|event| event["type"] == "spawn")
-        .collect::<Vec<_>>();
-    assert_eq!(spawns.len(), 3);
-    assert_eq!(spawns[0]["settings_existed_before"], false);
-    assert_eq!(spawns[1]["settings_existed_before"], true);
-    assert_eq!(spawns[0]["settings_path"], spawns[1]["settings_path"]);
-    assert_ne!(spawns[0]["pid"], spawns[1]["pid"]);
-    assert_eq!(
-        spawns[2]["settings_path"],
-        defaults_home
-            .path()
-            .join(".tycode/tyde-settings.toml")
-            .to_string_lossy()
-            .as_ref()
-    );
-    assert!(fake.events().iter().all(|event| {
-        event["type"] != "command" || event["command"].get("SaveSettings").is_none()
-    }));
-    let managed = std::fs::read_to_string(defaults_home.path().join(".tycode/tyde-settings.toml"))
-        .expect("read Tycode-created default TOML");
-    assert!(managed.contains("default_agent = \"tycode\""));
-    assert!(managed.contains("review_level = \"None\""));
-    assert!(managed.contains("orchestration_mode = \"auto\""));
-    assert!(managed.contains("spawn_context_mode = \"Fork\""));
-    assert!(!managed.contains("model_quality"));
-    assert!(!managed.contains("reasoning_effort"));
-    assert!(!managed.trim_start().starts_with('{'));
-    defaults_fixture
-        .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::BackendNativeSettings {
-                backend: BackendKind::Tycode,
-                settings: default_settings,
-            },
-        })
-        .await
-        .expect("send explicit persistent default save");
-    let refusal = expect_command_error(
-        &mut defaults_fixture.client,
-        "v0.10 persistent semantic-default refusal",
-    )
-    .await;
-    assert_eq!(refusal.code, CommandErrorCode::Internal);
-    assert!(
-        refusal
-            .message
-            .contains("Refusing to persist empty settings")
-    );
-    assert_eq!(
-        std::fs::read_to_string(defaults_home.path().join(".tycode/tyde-settings.toml"))
-            .expect("read managed default after refused save"),
-        managed
-    );
-    assert!(!defaults_home.path().join(".tycode/settings.toml").exists());
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(defaults_home.path().join(".tycode"))
-                .expect("stat automatically created Tycode directory")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
-    }
-}
-
-#[tokio::test]
-async fn tycode_semantic_default_toml_sources_use_verified_nonexistent_path_artifact() {
-    let _env_guard = env_lock().lock().await;
-    let cases = [
-        ("empty", ""),
-        (
-            "comments",
-            "# Tycode CLI settings are intentionally empty\n",
-        ),
-        ("blank-default-agent", "default_agent = \"   \"\n"),
-        (
-            "explicit-defaults",
-            r#"default_agent = "tycode"
-autonomy_level = "fully_autonomous"
-review_level = "None"
-max_review_rounds = 3
-fanout_concurrency = 4
-orchestration_mode = "auto"
-orchestration_progress_messages = true
-swarm_models = []
-spawn_context_mode = "Fork"
-disable_custom_steering = false
-communication_tone = "concise_and_logical"
-disable_streaming = false
-
-[providers]
-
-[agent_models]
-
-[mcp_servers]
-
-[voice]
-
-[voice.tts_providers]
-
-[voice.stt_providers]
-
-[skills]
-enabled = true
-disabled_skills = []
-additional_dirs = []
-enable_claude_code_compat = true
-
-[modules]
-"#,
-        ),
-        (
-            "pruned-to-default",
-            r#"[providers.legacy]
-type = "unsupported-v09-provider"
-api_key = "never-return-this-secret"
-
-[unmodelled]
-value = "discarded only from Tyde's projection"
-"#,
-        ),
-    ];
-
-    for (label, source) in cases {
-        let home = tempfile::tempdir().expect("create semantic-default HOME");
-        let fake = write_fake_tycode_binary(home.path());
-        let source_bytes = write_shared_tycode_settings(home.path(), source);
-        {
-            let _home = EnvVarGuard::set("HOME", home.path().to_string_lossy().to_string());
-            let _hermes =
-                EnvVarGuard::set("HERMES_PYTHON", "/definitely/not/hermes-python".to_string());
-            let mut fixture = Fixture::new_with_real_backend_probe_for_enabled_backends(vec![
-                BackendKind::Tycode,
-            ])
-            .await;
-            let payload = expect_backend_config_snapshots(
-                &mut fixture.client,
-                &format!("{label} semantic-default projection"),
-            )
-            .await;
-            let tycode = tycode_native_snapshot(&payload);
-            assert_eq!(tycode.status, BackendConfigSnapshotStatus::Ready, "{label}");
-            let (_, _, source, _) = managed_projection_fields(tycode);
-            assert_eq!(source, TycodeProjectionSource::SharedSettings, "{label}");
-            assert!(tycode.advisories.iter().any(|advisory| matches!(
-                advisory,
-                BackendNativeSettingsAdvisory::NoProviderConfigured { .. }
-            )));
-            let serialized =
-                serde_json::to_string(&payload).expect("serialize semantic-default typed response");
-            assert!(!serialized.contains("never-return-this-secret"));
-        }
-
-        assert_eq!(
-            std::fs::read(home.path().join(".tycode/settings.toml"))
-                .expect("re-read semantic-default shared TOML"),
-            source_bytes,
-            "{label} source bytes"
-        );
-        let events = fake.events();
-        let spawns = events
-            .iter()
-            .filter(|event| event["type"] == "spawn")
-            .collect::<Vec<_>>();
-        assert_eq!(spawns.len(), 4, "{label} spawns: {spawns:#?}");
-        assert_eq!(spawns[0]["settings_existed_before"], false, "{label}");
-        assert_eq!(spawns[1]["settings_existed_before"], true, "{label}");
-        assert_eq!(spawns[0]["settings_path"], spawns[1]["settings_path"]);
-        assert_ne!(spawns[0]["pid"], spawns[1]["pid"]);
-        assert_ne!(spawns[2]["settings_path"], spawns[0]["settings_path"]);
-        assert_eq!(
-            spawns[3]["settings_path"],
-            home.path()
-                .join(".tycode/tyde-settings.toml")
-                .to_string_lossy()
-                .as_ref()
-        );
-        assert!(
-            events.iter().all(|event| {
-                event["type"] != "command" || event["command"].get("SaveSettings").is_none()
-            }),
-            "{label} must not use persistent SaveSettings: {events:#?}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn tycode_voice_provider_pruning_and_recognized_fields_match_v010() {
-    let _env_guard = env_lock().lock().await;
-
-    let unsupported_home = tempfile::tempdir().expect("create unsupported-voice HOME");
-    let unsupported_fake = write_fake_tycode_binary(unsupported_home.path());
-    let unsupported_source = write_shared_tycode_settings(
-        unsupported_home.path(),
-        r#"[voice.tts_providers.legacy-tts]
-type = "unsupported-tts"
-api_key = "unsupported-tts-secret"
-
-[voice.stt_providers.legacy-stt]
-type = "unsupported-stt"
-api_key = "unsupported-stt-secret"
-"#,
-    );
-    {
-        let _home = EnvVarGuard::set(
-            "HOME",
-            unsupported_home.path().to_string_lossy().to_string(),
-        );
-        let _hermes =
-            EnvVarGuard::set("HERMES_PYTHON", "/definitely/not/hermes-python".to_string());
-        let mut fixture =
-            Fixture::new_with_real_backend_probe_for_enabled_backends(vec![BackendKind::Tycode])
-                .await;
-        let payload = expect_backend_config_snapshots(
-            &mut fixture.client,
-            "unsupported-only voice settings semantic default",
-        )
-        .await;
-        let snapshot = tycode_native_snapshot(&payload);
-        assert_eq!(snapshot.status, BackendConfigSnapshotStatus::Ready);
-        let settings = snapshot
-            .settings
-            .as_ref()
-            .expect("settings after unsupported voice pruning");
-        assert_eq!(settings["voice"]["tts_providers"], serde_json::json!({}));
-        assert_eq!(settings["voice"]["stt_providers"], serde_json::json!({}));
-        assert!(snapshot.advisories.iter().any(|advisory| matches!(
-            advisory,
-            BackendNativeSettingsAdvisory::NoProviderConfigured { .. }
-        )));
-        let serialized =
-            serde_json::to_string(&payload).expect("serialize unsupported-only voice response");
-        assert!(!serialized.contains("unsupported-tts-secret"));
-        assert!(!serialized.contains("unsupported-stt-secret"));
-    }
-    assert_eq!(
-        std::fs::read(unsupported_home.path().join(".tycode/settings.toml"))
-            .expect("read unsupported-only voice source"),
-        unsupported_source
-    );
-    let unsupported_events = unsupported_fake.events();
-    let unsupported_log =
-        serde_json::to_string(&unsupported_events).expect("serialize unsupported voice fake log");
-    assert!(!unsupported_log.contains("unsupported-tts-secret"));
-    assert!(!unsupported_log.contains("unsupported-stt-secret"));
-    let unsupported_spawns = unsupported_events
-        .iter()
-        .filter(|event| event["type"] == "spawn")
-        .collect::<Vec<_>>();
-    assert_eq!(unsupported_spawns.len(), 4, "{unsupported_spawns:#?}");
-    assert!(unsupported_events.iter().all(|event| {
-        event["type"] != "command" || event["command"].get("SaveSettings").is_none()
-    }));
-    let unsupported_managed =
-        std::fs::read_to_string(unsupported_home.path().join(".tycode/tyde-settings.toml"))
-            .expect("read default projection for unsupported-only voice source");
-    assert!(!unsupported_managed.contains("legacy-tts"));
-    assert!(!unsupported_managed.contains("legacy-stt"));
-    assert!(!unsupported_managed.contains("unsupported-tts-secret"));
-    assert!(!unsupported_managed.contains("unsupported-stt-secret"));
-
-    let recognized_home = tempfile::tempdir().expect("create recognized-voice HOME");
-    let recognized_fake = write_fake_tycode_binary(recognized_home.path());
-    let recognized_source = write_shared_tycode_settings(
-        recognized_home.path(),
-        r#"[voice]
-default_tts = "polly"
-default_stt = "transcribe"
-
-[voice.tts_providers.polly]
-type = "aws_polly"
-profile = "tts-profile"
-
-[voice.tts_providers.eleven]
-type = "elevenlabs"
-api_key = ""
-voice_id = "voice-id"
-model_id = "tts-model"
-
-[voice.stt_providers.transcribe]
-type = "aws_transcribe"
-profile = "stt-profile"
-region = "eu-central-1"
-
-[voice.stt_providers.eleven]
-type = "elevenlabs"
-api_key = ""
-model_id = "stt-model"
-"#,
-    );
-    {
-        let _home = EnvVarGuard::set("HOME", recognized_home.path().to_string_lossy().to_string());
-        let _hermes =
-            EnvVarGuard::set("HERMES_PYTHON", "/definitely/not/hermes-python".to_string());
-        let mut fixture =
-            Fixture::new_with_real_backend_probe_for_enabled_backends(vec![BackendKind::Tycode])
-                .await;
-        let payload = expect_backend_config_snapshots(
-            &mut fixture.client,
-            "recognized v0.10 voice provider preservation",
-        )
-        .await;
-        let settings = tycode_native_snapshot(&payload)
-            .settings
-            .as_ref()
-            .expect("recognized voice settings");
-        assert_eq!(settings["voice"]["default_tts"], "polly");
-        assert_eq!(settings["voice"]["default_stt"], "transcribe");
-        assert_eq!(
-            settings["voice"]["tts_providers"]["polly"]["type"],
-            "aws_polly"
-        );
-        assert_eq!(
-            settings["voice"]["tts_providers"]["polly"]["profile"],
-            "tts-profile"
-        );
-        assert_eq!(
-            settings["voice"]["tts_providers"]["polly"]["region"],
-            "us-west-2"
-        );
-        assert_eq!(
-            settings["voice"]["tts_providers"]["eleven"]["voice_id"],
-            "voice-id"
-        );
-        assert_eq!(
-            settings["voice"]["tts_providers"]["eleven"]["model_id"],
-            "tts-model"
-        );
-        assert_eq!(
-            settings["voice"]["stt_providers"]["transcribe"]["type"],
-            "aws_transcribe"
-        );
-        assert_eq!(
-            settings["voice"]["stt_providers"]["transcribe"]["profile"],
-            "stt-profile"
-        );
-        assert_eq!(
-            settings["voice"]["stt_providers"]["transcribe"]["region"],
-            "eu-central-1"
-        );
-        assert_eq!(
-            settings["voice"]["stt_providers"]["eleven"]["model_id"],
-            "stt-model"
-        );
-    }
-    assert_eq!(
-        std::fs::read(recognized_home.path().join(".tycode/settings.toml"))
-            .expect("read recognized voice source"),
-        recognized_source
-    );
-    let recognized_events = recognized_fake.events();
-    let recognized_spawns = recognized_events
-        .iter()
-        .filter(|event| event["type"] == "spawn")
-        .collect::<Vec<_>>();
-    assert_eq!(recognized_spawns.len(), 6, "{recognized_spawns:#?}");
-    assert_ne!(recognized_spawns[3]["pid"], recognized_spawns[4]["pid"]);
-    assert_eq!(
-        recognized_spawns[3]["settings_path"],
-        recognized_spawns[4]["settings_path"]
-    );
-    let normalized = recognized_events
-        .iter()
-        .find_map(|event| event["command"].get("SaveSettings"))
-        .expect("recognized voice normalization save");
-    assert_eq!(normalized["persist"], true);
-    assert_eq!(
-        normalized["settings"]["voice"]["tts_providers"]["polly"]["region"],
-        "us-west-2"
-    );
-    assert_eq!(
-        normalized["settings"]["voice"]["tts_providers"]["eleven"]["voice_id"],
-        "voice-id"
-    );
-    assert_eq!(
-        normalized["settings"]["voice"]["stt_providers"]["transcribe"]["profile"],
-        "stt-profile"
-    );
-    assert_eq!(
-        normalized["settings"]["voice"]["stt_providers"]["eleven"]["model_id"],
-        "stt-model"
-    );
-    let recognized_managed =
-        std::fs::read_to_string(recognized_home.path().join(".tycode/tyde-settings.toml"))
-            .expect("read normalized recognized voice settings");
-    assert!(recognized_managed.contains("type = \"aws_polly\""));
-    assert!(recognized_managed.contains("region = \"us-west-2\""));
-    assert!(recognized_managed.contains("type = \"aws_transcribe\""));
-    assert!(recognized_managed.contains("voice_id = \"voice-id\""));
-    assert!(recognized_managed.contains("model_id = \"stt-model\""));
-}
-
-#[tokio::test]
-async fn tycode_dangling_provider_is_ready_without_secret_or_shared_fallback() {
-    let _env_guard = env_lock().lock().await;
-    let dangling_home = tempfile::tempdir().expect("create dangling-provider HOME");
-    write_fake_tycode_binary(dangling_home.path());
-    let source_bytes = write_shared_tycode_settings(
-        dangling_home.path(),
-        r#"active_provider = "legacy-provider"
-
-[providers.legacy-provider]
-type = "unsupported-v09-provider"
-api_key = "shared-only-secret"
-
-[voice_provider]
-type = "unsupported-voice"
-credential = "shared-only-voice-secret"
-"#,
-    );
-    let _home = EnvVarGuard::set("HOME", dangling_home.path().to_string_lossy().to_string());
-    let _hermes = EnvVarGuard::set("HERMES_PYTHON", "/definitely/not/hermes-python".to_string());
-    let mut dangling_fixture =
-        Fixture::new_with_real_backend_probe_for_enabled_backends(vec![BackendKind::Tycode]).await;
-    let dangling = expect_backend_config_snapshots(
-        &mut dangling_fixture.client,
-        "Tycode dangling-provider projection",
-    )
-    .await;
-    let tycode = tycode_native_snapshot(&dangling);
-    assert_eq!(tycode.status, BackendConfigSnapshotStatus::Ready);
-    assert_eq!(
-        tycode.settings.as_ref().expect("dangling settings")["active_provider"],
-        "legacy-provider"
-    );
-    let advisory_message = tycode
-        .advisories
-        .iter()
-        .find_map(|advisory| match advisory {
-            BackendNativeSettingsAdvisory::UnsupportedActiveProvider { provider, message }
-                if provider == "legacy-provider" =>
-            {
-                Some(message.as_str())
-            }
-            _ => None,
-        })
-        .expect("typed unsupported-active-provider advisory");
-    assert!(advisory_message.contains("cannot model"));
-    assert!(
-        !advisory_message.contains("is unchanged")
-            && !advisory_message.contains("still contains")
-            && !advisory_message.contains("still there"),
-        "the typed protocol advisory must not claim the shared file's current contents: {advisory_message}"
-    );
-    assert_eq!(
-        std::fs::read(dangling_home.path().join(".tycode/settings.toml"))
-            .expect("re-read dangling-provider source"),
-        source_bytes
-    );
-    let response = serde_json::to_string(&dangling).expect("serialize dangling response");
-    assert!(!response.contains("shared-only-secret"));
-    assert!(!response.contains("shared-only-voice-secret"));
-}
-
-#[tokio::test]
-async fn tycode_notice_acknowledgement_conflicts_stale_id_and_never_reimports_source() {
-    let _env_guard = env_lock().lock().await;
-    let temp_home = tempfile::tempdir().expect("create temp HOME");
-    let fake = write_fake_tycode_binary(temp_home.path());
-    let source_bytes = write_shared_tycode_settings(
-        temp_home.path(),
-        r#"active_provider = "native-provider"
-model_quality = "high"
-
-[providers.native-provider]
-type = "mock"
-"#,
-    );
-    let _home = EnvVarGuard::set("HOME", temp_home.path().to_string_lossy().to_string());
-    let _hermes_python =
-        EnvVarGuard::set("HERMES_PYTHON", "/definitely/not/hermes-python".to_string());
-    let mut fixture =
-        Fixture::new_with_real_backend_probe_for_enabled_backends(vec![BackendKind::Tycode]).await;
-    let initial =
-        expect_backend_config_snapshots(&mut fixture.client, "initial Tycode projection").await;
-    let tycode = tycode_native_snapshot(&initial);
-    let (_, projection_id, _, notice_pending) = managed_projection_fields(tycode);
-    assert!(notice_pending);
-    let projection_id = projection_id.clone();
-    let managed = temp_home.path().join(".tycode/tyde-settings.toml");
-    let provenance = temp_home
-        .path()
-        .join(".tycode/tyde-settings.provenance.json");
-    let managed_before_conflict =
-        std::fs::read(&managed).expect("read managed settings before stale acknowledgement");
-    let provenance_before_conflict =
-        std::fs::read(&provenance).expect("read provenance before stale acknowledgement");
-    let invocations_before_conflict = fake.events().len();
-
-    fixture
-        .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::AcknowledgeTycodeProjectionNotice {
-                backend: BackendKind::Tycode,
-                projection_id: TycodeProjectionId("stale-projection-id".to_string()),
-            },
-        })
-        .await
-        .expect("send stale Tycode projection acknowledgement");
-    let (conflict, conflict_refresh) = expect_command_error_and_backend_config(
-        &mut fixture.client,
-        "stale projection acknowledgement conflict and refresh",
-    )
-    .await;
-    assert_eq!(conflict.request_kind, FrameKind::SetSetting);
-    assert_eq!(conflict.code, CommandErrorCode::Conflict);
-    assert!(!conflict.fatal);
-    let conflict_snapshot = tycode_native_snapshot(&conflict_refresh);
-    let (_, refreshed_projection_id, _, refreshed_notice_pending) =
-        managed_projection_fields(conflict_snapshot);
-    assert_eq!(refreshed_projection_id, &projection_id);
-    assert!(refreshed_notice_pending);
-    assert_eq!(
-        std::fs::read(&managed).expect("managed settings after stale acknowledgement"),
-        managed_before_conflict
-    );
-    assert_eq!(
-        std::fs::read(&provenance).expect("provenance after stale acknowledgement"),
-        provenance_before_conflict
-    );
-    let conflict_events = fake.events();
-    let conflict_spawns = conflict_events[invocations_before_conflict..]
-        .iter()
-        .filter(|event| event["type"] == "spawn")
-        .collect::<Vec<_>>();
-    assert_eq!(conflict_spawns.len(), 1);
-    assert_eq!(
-        conflict_spawns[0]["settings_path"],
-        managed.to_string_lossy().as_ref()
-    );
-
-    assert_eq!(
-        std::fs::read(temp_home.path().join(".tycode/settings.toml"))
-            .expect("read source after stale acknowledgement conflict"),
-        source_bytes,
-        "stale notice acknowledgement must preserve the initial shared source bytes"
-    );
-
-    let changed_source = write_shared_tycode_settings(
-        temp_home.path(),
-        r#"active_provider = "native-provider"
-model_quality = "low"
-
-[providers.native-provider]
-type = "mock"
-"#,
-    );
-    fixture
-        .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::AcknowledgeTycodeProjectionNotice {
-                backend: BackendKind::Tycode,
-                projection_id,
-            },
-        })
-        .await
-        .expect("acknowledge current Tycode projection notice");
-    let acknowledged = expect_backend_config_snapshots(
-        &mut fixture.client,
-        "acknowledged Tycode projection snapshot",
-    )
-    .await;
-    let tycode = tycode_native_snapshot(&acknowledged);
-    let (_, _, _, notice_pending) = managed_projection_fields(tycode);
-    assert!(!notice_pending);
-    assert_eq!(
-        tycode.settings.as_ref().expect("managed settings")["model_quality"],
-        "high",
-        "an existing projection must never re-import later shared-file changes"
-    );
-    assert_eq!(
-        std::fs::read(temp_home.path().join(".tycode/settings.toml"))
-            .expect("read deliberately changed shared settings"),
-        changed_source
-    );
-}
-
-#[tokio::test]
-async fn tycode_malformed_transaction_journal_surfaces_resettable_typed_recovery() {
-    let _env_guard = env_lock().lock().await;
-    let home = tempfile::tempdir().expect("create malformed-journal HOME");
-    write_fake_tycode_binary(home.path());
-    let source_bytes = write_shared_tycode_settings(
-        home.path(),
-        r#"active_provider = "native-provider"
-default_agent = "builder"
-
-[providers.native-provider]
-type = "mock"
-"#,
-    );
-    let _home = EnvVarGuard::set("HOME", home.path().to_string_lossy().to_string());
-    let _hermes = EnvVarGuard::set("HERMES_PYTHON", "/definitely/not/hermes-python".to_string());
-    let mut fixture =
-        Fixture::new_with_real_backend_probe_for_enabled_backends(vec![BackendKind::Tycode]).await;
-    let initial =
-        expect_backend_config_snapshots(&mut fixture.client, "malformed-journal initial state")
-            .await;
-    let initial_snapshot = tycode_native_snapshot(&initial);
-    let (_, projection_id, _, _) = managed_projection_fields(initial_snapshot);
-    let projection_id = projection_id.clone();
-    let directory = home.path().join(".tycode");
-    let journal = directory.join("tyde-settings.transaction.json");
-    let malformed = b"{ not a Tycode transaction journal\n";
-    std::fs::write(&journal, malformed).expect("write malformed transaction journal");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600))
-            .expect("secure malformed transaction journal");
-    }
-
-    fixture
-        .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::AcknowledgeTycodeProjectionNotice {
-                backend: BackendKind::Tycode,
-                projection_id,
-            },
-        })
-        .await
-        .expect("request refresh that encounters malformed journal");
-    let (discovery_error, recovery_payload) = expect_command_error_and_backend_config(
-        &mut fixture.client,
-        "malformed journal typed recovery",
-    )
-    .await;
-    assert_eq!(discovery_error.code, CommandErrorCode::Internal);
-    let snapshot = tycode_native_snapshot(&recovery_payload);
-    assert_eq!(snapshot.status, BackendConfigSnapshotStatus::Unavailable);
-    assert!(snapshot.settings.is_none());
-    assert!(snapshot.groups.is_empty());
-    let (reason, expected_id, expected_hash) = managed_recovery_fields(snapshot);
-    assert!(
-        reason.contains("Failed to parse Tycode transaction journal"),
-        "malformed journal should be reported as the recovery reason: {reason}"
-    );
-    assert_eq!(
-        std::fs::read(&journal).expect("read preserved malformed journal"),
-        malformed,
-        "recovery discovery must preserve malformed evidence until exact reset"
-    );
-
-    fixture
-        .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::ResetTycodeManagedProjection {
-                backend: BackendKind::Tycode,
-                expected_projection_id: expected_id.clone(),
-                expected_state_hash: expected_hash.clone(),
-            },
-        })
-        .await
-        .expect("send exact reset for malformed journal recovery");
-    let rederived = expect_backend_config_snapshots(
-        &mut fixture.client,
-        "malformed journal exact reset rederivation",
-    )
-    .await;
-    let rederived = tycode_native_snapshot(&rederived);
-    assert_eq!(rederived.status, BackendConfigSnapshotStatus::Ready);
-    assert!(rederived.managed_projection_recovery.is_none());
-    assert_eq!(
-        rederived
-            .settings
-            .as_ref()
-            .expect("rederived settings after malformed journal reset")["default_agent"],
-        "builder"
-    );
-    assert!(!journal.exists());
-    assert_eq!(
-        std::fs::read(home.path().join(".tycode/settings.toml"))
-            .expect("read shared settings after malformed journal reset"),
-        source_bytes
-    );
-}
-
-#[tokio::test]
-async fn tycode_typed_reset_conflicts_without_deletion_then_rederives_current_source() {
-    let _env_guard = env_lock().lock().await;
-    let home = tempfile::tempdir().expect("create reset HOME");
-    let fake = write_fake_tycode_binary(home.path());
-    let original_source = write_shared_tycode_settings(
-        home.path(),
-        r#"active_provider = "native-provider"
-model_quality = "high"
-
-[providers.native-provider]
-type = "mock"
-"#,
-    );
-    let _home = EnvVarGuard::set("HOME", home.path().to_string_lossy().to_string());
-    let _hermes = EnvVarGuard::set("HERMES_PYTHON", "/definitely/not/hermes-python".to_string());
-    let mut fixture =
-        Fixture::new_with_real_backend_probe_for_enabled_backends(vec![BackendKind::Tycode]).await;
-    let initial =
-        expect_backend_config_snapshots(&mut fixture.client, "reset initial projection").await;
-    let initial_snapshot = tycode_native_snapshot(&initial);
-    let (_, projection_id, _, _) = managed_projection_fields(initial_snapshot);
-    let projection_id = projection_id.clone();
-    let mut tyde_only_settings = initial_snapshot
-        .settings
-        .clone()
-        .expect("initial reset settings");
-    tyde_only_settings["model_quality"] = serde_json::json!("low");
-    fixture
-        .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::BackendNativeSettings {
-                backend: BackendKind::Tycode,
-                settings: tyde_only_settings,
-            },
-        })
-        .await
-        .expect("save Tyde-only edit before reset");
-    let saved =
-        expect_backend_config_snapshots(&mut fixture.client, "Tyde-only save before reset").await;
-    assert_eq!(
-        tycode_native_snapshot(&saved)
-            .settings
-            .as_ref()
-            .expect("saved Tyde settings")["model_quality"],
-        "low"
-    );
-    assert_eq!(
-        std::fs::read(home.path().join(".tycode/settings.toml"))
-            .expect("read source after Tyde-only save"),
-        original_source
-    );
-
-    let current_source = write_shared_tycode_settings(
-        home.path(),
-        r#"active_provider = "native-provider"
-model_quality = "current-source"
-
-[providers.native-provider]
-type = "mock"
-
-[shared_only]
-secret = "reset-shared-secret"
-"#,
-    );
-    let directory = home.path().join(".tycode");
-    let managed = directory.join("tyde-settings.toml");
-    let provenance = directory.join("tyde-settings.provenance.json");
-    let recovery = directory.join("tyde-settings.recovery.json");
-    let journal = directory.join("tyde-settings.transaction.json");
-    let lock = directory.join("tyde-settings.lock");
-    let mut tampered = std::fs::read(&managed).expect("read managed settings before tamper");
-    tampered.extend_from_slice(b"\n# reset integration tamper\n");
-    std::fs::write(&managed, &tampered).expect("tamper managed settings for reset state");
-
-    fixture
-        .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::AcknowledgeTycodeProjectionNotice {
-                backend: BackendKind::Tycode,
-                projection_id,
-            },
-        })
-        .await
-        .expect("request refresh that discovers managed corruption");
-    let (discovery_error, recovery_payload) = expect_command_error_and_backend_config(
-        &mut fixture.client,
-        "typed reset-required discovery",
-    )
-    .await;
-    assert_eq!(discovery_error.code, CommandErrorCode::Internal);
-    let recovery_snapshot = tycode_native_snapshot(&recovery_payload);
-    assert_eq!(
-        recovery_snapshot.status,
-        BackendConfigSnapshotStatus::Unavailable
-    );
-    assert!(recovery_snapshot.settings.is_none());
-    assert!(recovery_snapshot.groups.is_empty());
-    let (reason, expected_id, expected_hash) = managed_recovery_fields(recovery_snapshot);
-    assert!(reason.contains("integrity check failed"));
-    let expected_id = expected_id.clone();
-    let expected_hash = expected_hash.clone();
-    let serialized =
-        serde_json::to_string(&recovery_payload).expect("serialize typed reset-required response");
-    assert!(serialized.contains("managed_projection_reset_required"));
-    assert!(!serialized.contains("reset-shared-secret"));
-
-    let preserved_before_conflicts = [
-        std::fs::read(&managed).expect("read managed reset inventory"),
-        std::fs::read(&provenance).expect("read provenance reset inventory"),
-        std::fs::read(&recovery).expect("read recovery reset inventory"),
-    ];
-    let stale_id_setting = SetSettingPayload {
-        setting: HostSettingValue::ResetTycodeManagedProjection {
-            backend: BackendKind::Tycode,
-            expected_projection_id: TycodeProjectionId("stale-projection".to_string()),
-            expected_state_hash: expected_hash.clone(),
-        },
-    };
-    let stale_id_json =
-        serde_json::to_value(&stale_id_setting).expect("serialize typed stale-id reset command");
-    assert_eq!(
-        stale_id_json["setting"]["kind"],
-        "reset_tycode_managed_projection"
-    );
-    assert_eq!(
-        stale_id_json["setting"]["expected_state_hash"],
-        expected_hash.0
-    );
-    fixture
-        .client
-        .set_setting(stale_id_setting)
-        .await
-        .expect("send stale projection reset");
-    let (stale_id_error, _) = expect_command_error_and_backend_config(
-        &mut fixture.client,
-        "stale projection reset conflict",
-    )
-    .await;
-    assert_eq!(stale_id_error.code, CommandErrorCode::Conflict);
-    assert_eq!(
-        [
-            std::fs::read(&managed).expect("managed after stale id"),
-            std::fs::read(&provenance).expect("provenance after stale id"),
-            std::fs::read(&recovery).expect("recovery after stale id"),
-        ],
-        preserved_before_conflicts
-    );
-
-    fixture
-        .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::ResetTycodeManagedProjection {
-                backend: BackendKind::Tycode,
-                expected_projection_id: expected_id.clone(),
-                expected_state_hash: TycodeProjectionStateHash("sha256:stale-state".to_string()),
-            },
-        })
-        .await
-        .expect("send stale state-hash reset");
-    let (stale_hash_error, _) = expect_command_error_and_backend_config(
-        &mut fixture.client,
-        "stale state hash reset conflict",
-    )
-    .await;
-    assert_eq!(stale_hash_error.code, CommandErrorCode::Conflict);
-    assert_eq!(
-        [
-            std::fs::read(&managed).expect("managed after stale hash"),
-            std::fs::read(&provenance).expect("provenance after stale hash"),
-            std::fs::read(&recovery).expect("recovery after stale hash"),
-        ],
-        preserved_before_conflicts
-    );
-
-    let transaction_owned = [
-        ".tyde-settings.atomic-integration-reset.txn",
-        ".tyde-settings.prejournal-source-integration-reset.txn",
-        ".tyde-settings.integration-reset.managed-stage.txn",
-        ".tyde-settings.integration-reset.provenance-stage.txn",
-        ".tyde-settings.integration-reset.managed-backup.txn",
-        ".tyde-settings.integration-reset.provenance-backup.txn",
-    ]
-    .map(|name| directory.join(name));
-    for path in &transaction_owned {
-        std::fs::write(path, b"transaction-owned reset artifact")
-            .unwrap_or_else(|err| panic!("write transaction-owned reset artifact {path:?}: {err}"));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        for path in &transaction_owned {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap_or_else(
-                |err| panic!("secure transaction-owned reset artifact {path:?}: {err}"),
-            );
-        }
-    }
-    let unrelated = directory.join("user-owned.keep");
-    std::fs::write(&unrelated, b"not managed by the reset transaction")
-        .expect("write unrelated sentinel");
-    fixture
-        .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::ResetTycodeManagedProjection {
-                backend: BackendKind::Tycode,
-                expected_projection_id: expected_id,
-                expected_state_hash: expected_hash,
-            },
-        })
-        .await
-        .expect("send reset made stale by inventory change");
-    let (inventory_conflict, refreshed_recovery_payload) = expect_command_error_and_backend_config(
-        &mut fixture.client,
-        "inventory-changing reset conflict",
-    )
-    .await;
-    assert_eq!(inventory_conflict.code, CommandErrorCode::Conflict);
-    assert!(transaction_owned.iter().all(|path| path.is_file()));
-    assert!(unrelated.is_file());
-    let (_, refreshed_id, refreshed_hash) =
-        managed_recovery_fields(tycode_native_snapshot(&refreshed_recovery_payload));
-    let exact_reset = SetSettingPayload {
-        setting: HostSettingValue::ResetTycodeManagedProjection {
-            backend: BackendKind::Tycode,
-            expected_projection_id: refreshed_id.clone(),
-            expected_state_hash: refreshed_hash.clone(),
-        },
-    };
-    let exact_reset_json =
-        serde_json::to_string(&exact_reset).expect("serialize exact typed reset command");
-    assert!(exact_reset_json.contains("reset_tycode_managed_projection"));
-    assert!(!exact_reset_json.contains("reset-shared-secret"));
-    let events_before_reset = fake.events().len();
-    fixture
-        .client
-        .set_setting(exact_reset)
-        .await
-        .expect("send exact-token managed projection reset");
-    let rederived = expect_backend_config_snapshots(
-        &mut fixture.client,
-        "authoritative snapshot after exact reset",
-    )
-    .await;
-    let rederived_snapshot = tycode_native_snapshot(&rederived);
-    assert_eq!(
-        rederived_snapshot.status,
-        BackendConfigSnapshotStatus::Ready
-    );
-    assert!(rederived_snapshot.managed_projection_recovery.is_none());
-    assert_eq!(
-        rederived_snapshot
-            .settings
-            .as_ref()
-            .expect("rederived current-source settings")["model_quality"],
-        "current-source",
-        "confirmed reset must lose the old Tyde-only edit and lazily derive the current source"
-    );
-    let (_, rederived_id, source, _) = managed_projection_fields(rederived_snapshot);
-    assert_ne!(rederived_id, refreshed_id);
-    assert_eq!(source, TycodeProjectionSource::SharedSettings);
-    assert_eq!(
-        std::fs::read(home.path().join(".tycode/settings.toml"))
-            .expect("read shared settings after exact reset"),
-        current_source
-    );
-    assert!(transaction_owned.iter().all(|path| !path.exists()));
-    assert!(unrelated.is_file());
-    assert!(
-        lock.is_file(),
-        "reset must preserve the serialization lock file"
-    );
-    assert!(!journal.exists());
-    assert!(!recovery.exists());
-    let remaining_transaction_artifacts = std::fs::read_dir(&directory)
-        .expect("inspect reset directory")
-        .filter_map(Result::ok)
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.starts_with(".tyde-settings.") && name.ends_with(".txn"))
-        .collect::<Vec<_>>();
-    assert!(
-        remaining_transaction_artifacts.is_empty(),
-        "reset left managed transaction artifacts: {remaining_transaction_artifacts:?}"
-    );
-    let response = serde_json::to_string(&rederived).expect("serialize rederived response");
-    assert!(!response.contains("reset-shared-secret"));
-    let shared_path = home
-        .path()
-        .join(".tycode/settings.toml")
-        .to_string_lossy()
-        .into_owned();
-    for event in &fake.events()[events_before_reset..] {
-        if event["type"] != "spawn" {
-            continue;
-        }
-        assert_ne!(event["settings_path"].as_str(), Some(shared_path.as_str()));
-        let argv = event["argv"].as_array().expect("reset rederive argv");
-        assert_eq!(
-            argv.iter()
-                .filter(|argument| argument.as_str() == Some("--settings-path"))
-                .count(),
-            1
-        );
-    }
-}
-
-#[tokio::test]
-async fn tycode_save_verification_version_and_hash_fail_closed_without_fallback() {
-    let _env_guard = env_lock().lock().await;
-    let temp_home = tempfile::tempdir().expect("create temp HOME");
-    let fake = write_fake_tycode_binary(temp_home.path());
-    let source_bytes = write_shared_tycode_settings(
-        temp_home.path(),
-        r#"active_provider = "native-provider"
-model_quality = "high"
-
-[providers.native-provider]
-type = "mock"
-"#,
-    );
-    let _home = EnvVarGuard::set("HOME", temp_home.path().to_string_lossy().to_string());
-    let _hermes_python =
-        EnvVarGuard::set("HERMES_PYTHON", "/definitely/not/hermes-python".to_string());
-    let mut fixture =
-        Fixture::new_with_real_backend_probe_for_enabled_backends(vec![BackendKind::Tycode]).await;
-    let initial =
-        expect_backend_config_snapshots(&mut fixture.client, "initial verified projection").await;
-    let mut update = tycode_native_snapshot(&initial)
-        .settings
-        .clone()
-        .expect("initial managed settings");
-    update["model_quality"] = serde_json::json!("low");
-    let managed = temp_home.path().join(".tycode/tyde-settings.toml");
-    let provenance = temp_home
-        .path()
-        .join(".tycode/tyde-settings.provenance.json");
-    let managed_before = std::fs::read(&managed).expect("read managed settings before failures");
-
-    fake.set_behavior(serde_json::json!({ "mismatch_on_fresh_process": true }));
-    fixture
-        .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::BackendNativeSettings {
-                backend: BackendKind::Tycode,
-                settings: update.clone(),
-            },
-        })
-        .await
-        .expect("send save that fails fresh-process verification");
-    let verification_error =
-        expect_command_error(&mut fixture.client, "fresh-process verification failure").await;
-    assert_eq!(verification_error.code, CommandErrorCode::Internal);
-    assert!(
-        verification_error
-            .message
-            .contains("Fresh-process verification"),
-        "unexpected verification failure: {}",
-        verification_error.message
-    );
-    assert_eq!(
-        std::fs::read(&managed).expect("read managed settings after failed verification"),
-        managed_before,
-        "failed fresh-process verification must retain the prior authoritative projection"
-    );
-    fake.set_behavior(serde_json::json!({}));
-
-    let provenance_before = std::fs::read(&provenance).expect("read projection provenance");
-    let mut version_tamper: serde_json::Value =
-        serde_json::from_slice(&provenance_before).expect("parse projection provenance");
-    version_tamper["provenance"]["tycode_version"]["minor"] = serde_json::json!(9);
-    std::fs::write(
-        &provenance,
-        serde_json::to_vec_pretty(&version_tamper).expect("serialize version tamper"),
-    )
-    .expect("write version-tampered provenance");
-    let events_before_version = fake.events().len();
-    fixture
-        .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::BackendNativeSettings {
-                backend: BackendKind::Tycode,
-                settings: update.clone(),
-            },
-        })
-        .await
-        .expect("send save against wrong-version provenance");
-    let version_error = expect_command_error(&mut fixture.client, "version fail closed").await;
-    assert_eq!(version_error.code, CommandErrorCode::Internal);
-    assert!(version_error.message.contains("pinned version 0.10.0"));
-    assert_eq!(fake.events().len(), events_before_version);
-
-    std::fs::write(&provenance, &provenance_before).expect("restore exact provenance bytes");
-    let mut hash_tamper = managed_before.clone();
-    hash_tamper.extend_from_slice(b"\n# tampered");
-    std::fs::write(&managed, hash_tamper).expect("tamper managed settings bytes");
-    let events_before_hash = fake.events().len();
-    fixture
-        .client
-        .set_setting(SetSettingPayload {
-            setting: HostSettingValue::BackendNativeSettings {
-                backend: BackendKind::Tycode,
-                settings: update,
-            },
-        })
-        .await
-        .expect("send save against hash-tampered projection");
-    let hash_error = expect_command_error(&mut fixture.client, "hash fail closed").await;
-    assert_eq!(hash_error.code, CommandErrorCode::Internal);
-    assert!(hash_error.message.contains("integrity check failed"));
-    assert_eq!(fake.events().len(), events_before_hash);
-    assert_eq!(
-        std::fs::read(temp_home.path().join(".tycode/settings.toml"))
-            .expect("re-read shared settings after failures"),
-        source_bytes,
-        "verification, version, and hash failures must never fall back to or rewrite the source"
-    );
-}
-
-#[tokio::test]
-async fn tycode_client_spawn_resume_and_session_storage_use_managed_sibling_path() {
+async fn tycode_client_spawn_resume_and_session_storage_use_shared_settings_path() {
     let _env_guard = env_lock().lock().await;
     let temp_home = tempfile::tempdir().expect("create temp HOME");
     let fake = write_fake_tycode_binary(temp_home.path());
@@ -3645,9 +2290,9 @@ type = "mock"
     )
     .await;
 
-    let managed = temp_home
+    let shared = temp_home
         .path()
-        .join(".tycode/tyde-settings.toml")
+        .join(".tycode/settings.toml")
         .to_string_lossy()
         .to_string();
     let spawn_events = fake.events();
@@ -3655,7 +2300,7 @@ type = "mock"
         .iter()
         .find(|event| event["type"] == "spawn")
         .expect("new-session fake process spawn");
-    assert_eq!(new_session_spawn["settings_path"], managed);
+    assert_eq!(new_session_spawn["settings_path"], shared);
     assert!(
         temp_home
             .path()
@@ -3730,7 +2375,7 @@ type = "mock"
         .iter()
         .find(|event| event["type"] == "spawn")
         .expect("resume fake process spawn");
-    assert_eq!(resume_spawn["settings_path"], managed);
+    assert_eq!(resume_spawn["settings_path"], shared);
     let resume_commands = resume_events[events_before_resume..]
         .iter()
         .filter(|event| event["type"] == "command")
@@ -3749,14 +2394,11 @@ type = "mock"
     );
     assert_eq!(
         new_session_spawn["settings_path"], resume_spawn["settings_path"],
-        "new-session and resume must receive the identical managed settings path"
+        "new-session and resume must receive the identical shared settings path"
     );
     assert!(
-        !temp_home
-            .path()
-            .join(".tycode/tyde-settings/sessions")
-            .exists(),
-        "the managed filename must not become a profile session root"
+        !temp_home.path().join(".tycode/tyde-settings.toml").exists(),
+        "no Tyde-managed settings copy may be created for sessions"
     );
     assert_eq!(
         std::fs::read(temp_home.path().join(".tycode/settings.toml"))

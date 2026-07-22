@@ -503,21 +503,7 @@ mod tests {
 
     #[test]
     fn set_setting_command_errors_have_value_free_typed_targets() {
-        let reset_projection_id = "projection-reset-01J";
-        let reset_state_hash = "sha256:reset-state";
         let cases = [
-            (
-                protocol::HostSettingValue::ResetTycodeManagedProjection {
-                    backend: protocol::BackendKind::Tycode,
-                    expected_projection_id: protocol::TycodeProjectionId(
-                        reset_projection_id.to_owned(),
-                    ),
-                    expected_state_hash: protocol::TycodeProjectionStateHash(
-                        reset_state_hash.to_owned(),
-                    ),
-                },
-                HostSettingErrorTarget::ResetTycodeManagedProjection,
-            ),
             (
                 protocol::HostSettingValue::BackendNativeSettings {
                     backend: protocol::BackendKind::Tycode,
@@ -559,19 +545,8 @@ mod tests {
                 serde_json::to_value(expected_target).expect("serialize setting target")
             );
             let encoded = encoded.to_string();
-            assert!(!encoded.contains(reset_projection_id));
-            assert!(!encoded.contains(reset_state_hash));
             assert!(!encoded.contains("native-secret"));
         }
-
-        let reset_error = command_error_payload(
-            protocol::StreamPath("/host/error-target".to_owned()),
-            FrameKind::SetSetting,
-            Some(HostSettingErrorTarget::ResetTycodeManagedProjection),
-            &AppError::conflict("set_setting", "reset token is stale"),
-        );
-        let encoded = serde_json::to_string(&reset_error).expect("serialize reset error");
-        assert!(encoded.contains("reset_tycode_managed_projection"));
     }
 
     #[test]
@@ -582,8 +557,8 @@ mod tests {
             seq: 1,
             payload: serde_json::json!({
                 "setting": {
-                    "kind": "reset_tycode_managed_projection",
-                    "expected_projection_id": {"unexpected": "raw-token"},
+                    "kind": "unknown_setting_kind",
+                    "secret_token": {"unexpected": "raw-token"},
                 },
             }),
         };
