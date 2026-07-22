@@ -509,16 +509,33 @@ unique name, prompt marker, command marker, and final-answer marker.
    Also confirm the selected project and conversation restore consistently:
    project rail, editor, chat, footer, and agent panel must not disagree or
    require clicking an agent merely to repair bootstrap state.
-4. Exercise **Resume** on completed, cancelled, and failed sessions where
-   supported. Confirm history loads without blocking unrelated commands and
-   the first new turn follows the lifecycle oracle.
-5. Exercise **Fork** from a known point. Confirm prior history is present once,
+4. From the rendered **History** panel, locate completed, cancelled, and failed
+   sessions and exercise **Resume** on each supported state. Record the source
+   session identity, backend, model, project, terminal state, and last unique
+   marker before clicking Resume. Do not send a prompt as part of the resume
+   action. Confirm exactly one resumed conversation opens, its prior history
+   appears exactly once and in order, no turn starts merely because it was
+   resumed, and unrelated commands remain responsive while history loads.
+5. Use every resumed session rather than treating successful history rendering
+   as proof of a working resume. Send a unique context-dependent prompt that
+   requires information from before the resume, observe its active lifecycle,
+   and confirm exactly one correct terminal response. Then send a second unique
+   prompt in the same resumed conversation and exercise one supported tool.
+   Confirm both turns use the original backend/provider session, retain the
+   selected model and settings, append to the same History entry, and do not
+   duplicate old messages, usage, tools, or session rows.
+6. Leave and reopen the newly used resumed conversation from **History**.
+   Confirm the pre-resume history and both post-resume turns replay once, the
+   final state stays idle, and the conversation remains usable for another
+   bounded turn. Repeat after a frontend reload and after restarting the dev
+   instance against the same disposable stores.
+7. Exercise **Fork** from a known point. Confirm prior history is present once,
    later source history is absent, and source/fork usage and statuses do not
    leak into one another.
-6. Exercise manual or automatic compaction when supported. Confirm the agent
+8. Exercise manual or automatic compaction when supported. Confirm the agent
    shows Compacting, never completed during compaction, history remains
    coherent, and the next turn succeeds with plausible context usage.
-7. Restart the dev instance against the same disposable stores and repeat
+9. Restart the dev instance against the same disposable stores and repeat
    replay checks. In-memory correctness alone is not enough.
 
 ## 13. Exercise multiple clients and connectivity
