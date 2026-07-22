@@ -5,14 +5,20 @@ desktop application. This is an end-to-end product audit, not a smoke test and
 not a substitute for deterministic backend tests or `./dev.sh check`.
 
 Real backend turns can spend money. Obtain explicit approval before starting
-them. A certification run intentionally favors coverage over cost, but every
-prompt and command must still be bounded.
+them. Certification favors feature coverage, but it must obtain that coverage
+with the cheapest suitable models, bounded prompts, and bounded commands.
 
 ## Certification contract
 
 A run certifies one exact combination of Tyde commit, backend CLI version,
-provider, model, access mode, reasoning level, host OS, and frontend build. A
-different combination is a different run.
+provider, access mode, reasoning level, host OS, and frontend build. Record the
+model used for every case. A run may use more than one model when the cheapest
+default model does not expose every backend capability.
+
+Run the complete workflow independently for every backend being certified,
+including Claude, Codex, Tycode, and any other enabled backend. Evidence from
+one backend cannot satisfy a case for another; shared setup evidence is the
+only exception.
 
 Do not infer one visible state from another. Seeing correct final output does
 not prove that the agent was shown as active while it ran. Seeing a completed
@@ -35,14 +41,46 @@ For every applicable case, inspect all rendered surfaces that expose it:
 - a second connected client when the case calls for one.
 
 An unsupported capability may be marked `N/A` only after recording why the
-backend or selected mode cannot expose it. An unattempted applicable case is a
-failure, not `N/A`.
+backend cannot expose it through any available model in the selected mode. A
+limitation of the chosen cheap model is a reason to select the next-cheapest
+capable model, not a reason to mark the backend feature `N/A`. An unattempted
+applicable case is a failure.
+
+### Cost-controlled model selection
+
+The purpose of this workflow is to certify Tyde's backend integration, not to
+benchmark model intelligence. Use deterministic prompts that explicitly ask
+for the feature under test rather than relying on a powerful model to infer the
+test plan.
+
+1. Choose the cheapest reliable model exposed by the backend as its default QA
+   model. Current examples include GPT Luna or Haiku for Claude and MiniMax for
+   Tycode; use the cheapest currently available equivalent when catalogs or
+   prices change.
+2. Run every feature the default model supports on that model, including all
+   lifecycle, replay, cancellation, concurrency, and multi-client cases. Do not
+   reserve cheap models for a reduced smoke pass.
+3. If the default model lacks a required capability such as image handling,
+   extended reasoning, native task tracking, or native sub-agents, switch only
+   that capability and its adjacent regression cases to the cheapest model on
+   the same backend that supports it.
+4. Do not select an expensive or production-default model merely because it is
+   more capable conversationally. Use it only when no cheaper model can emit
+   the protocol feature being certified.
+5. Record the model, reason for selection, request/usage totals, and estimated
+   cost for every case. The evidence index must make model switches explicit.
+6. A backend is not certified until every feature exposed by at least one of
+   its available models has been exercised. Passing all features of one cheap
+   but capability-limited model is insufficient.
+7. Certification applies to the backend feature paths and the models actually
+   recorded. It does not claim that untested models produce equivalent answer
+   quality.
 
 ## 1. Prepare and record the run
 
 1. Confirm the backend CLI is installed and starts successfully outside Tyde.
-2. Configure provider credentials and model in the same environment from
-   which the Tyde host will launch.
+2. Configure provider credentials and the default cheap QA model in the same
+   environment from which the Tyde host will launch.
 3. Confirm the backend is enabled in **Settings → Backends** and Tyde reports
    the expected installed version.
 4. Use a disposable workspace. Do not point destructive tool tests at a real
@@ -50,16 +88,18 @@ failure, not `N/A`.
 5. Record:
    - Tyde commit and whether the tree is clean;
    - backend and CLI version;
-   - provider and model;
+   - provider, default cheap QA model, and any capability-specific models;
    - access mode, reasoning level, and backend-native settings;
    - host OS and architecture;
    - frontend URL, viewport, and browser version;
    - run start time and tester.
-6. Build a capability matrix before testing. Include text, reasoning, file
-   read, file write, foreground command, background command, cancellation,
-   permission approval, user question, task list, image input/output,
-   backend-native sub-agents, Tyde-managed agents, resume, fork, and
-   compaction. Mark each `required` or `unsupported` with a reason.
+6. Build a capability-and-model matrix before testing. Include text, reasoning,
+   file read, file write, foreground command, background command,
+   cancellation, permission approval, user question, task list, image
+   input/output, backend-native sub-agents, Tyde-managed agents, resume, fork,
+   and compaction. Assign the cheapest capable model to every required row.
+   Mark a row `unsupported` only when no model available through that backend
+   exposes it, and record the evidence.
 7. Prepare unique marker strings for every prompt, command, file, and child.
    Reusing a marker can hide duplicated or misrouted events.
 
@@ -457,11 +497,21 @@ unique name, prompt marker, command marker, and final-answer marker.
    turn.
 4. Switch model where supported and verify message metadata and usage identify
    the actual model used for each turn.
-5. Attach a small image when supported. Confirm preview, send, backend receipt,
+5. When a capability-specific model is needed, switch from the default cheap
+   model, exercise the capability and its lifecycle/replay regressions, then
+   switch back. Confirm history keeps the actual model on every old message and
+   new turns use the newly selected model only.
+6. Attach a small image when supported. Confirm preview, send, backend receipt,
    final rendering, replay, and fork behavior. Unsupported media must be
    rejected before backend spend.
-6. Request image output when supported. Confirm the image and associated typed
+7. Request image output when supported. Confirm the image and associated typed
    event both survive replay and neither replaces the other.
+8. Change the host default backend. Confirm new chats use the new default while
+   existing chats retain their original backend, model, settings, and session.
+9. Run bounded turns concurrently on two different backends using their cheap
+   QA models. Confirm status, output, tools, usage, capacity, settings, and
+   errors remain isolated and every backend label identifies the actual
+   producer.
 
 ## 15. Presentation, accessibility, and performance audit
 
@@ -517,6 +567,10 @@ and every temporal state was observed while held. In particular:
   concurrency, replay, resume, fork, compaction, reconnect, settings, and media
   paths applicable to the backend complete without missing, duplicated,
   misordered, or misattributed events;
+- every feature exposed by any available model on the backend was exercised on
+  the cheapest capable model, with every model switch and its cost recorded;
+- the complete workflow passed independently for every backend being
+  certified, without borrowing feature evidence from another backend;
 - every running state reaches exactly one truthful terminal state and no late
   event contradicts it;
 - usage is populated, refreshed, attributed to the correct root or child, and
