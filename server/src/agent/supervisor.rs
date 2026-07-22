@@ -611,6 +611,36 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_accepts_late_matching_context_metadata() {
+        let mut log = vec![envelope(
+            1,
+            ChatEvent::StreamEnd(StreamEndData {
+                message: assistant_message_with_context("late", "done", None),
+            }),
+        )];
+        assert_eq!(
+            supervision_context_snapshot(&log).current_context_input_tokens,
+            None,
+            "the completed assistant turn starts without context usage"
+        );
+
+        log.push(envelope(
+            2,
+            ChatEvent::MessageMetadataUpdated(MessageMetadataUpdateData {
+                message_id: ChatMessageId("late".to_owned()),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: Some(context_breakdown(240_000)),
+            }),
+        ));
+        assert_eq!(
+            supervision_context_snapshot(&log).current_context_input_tokens,
+            Some(240_000),
+            "matching late metadata must promote unavailable usage to known usage"
+        );
+    }
+
+    #[test]
     fn snapshot_counts_kicks_and_resets_on_real_user_message() {
         let kick = format!("{SUPERVISOR_MESSAGE_PREFIX}keep going");
         let log = vec![

@@ -172,6 +172,26 @@ async fn spawn_supervised_agent(
     new_agent
 }
 
+async fn auto_compaction_fixture(threshold: u64) -> Fixture {
+    let mut fixture = Fixture::new().await;
+    apply_supervisor_setting(
+        &mut fixture,
+        HostSettingValue::SupervisorEnabled { enabled: true },
+    )
+    .await;
+    apply_supervisor_setting(
+        &mut fixture,
+        HostSettingValue::SupervisorAutoCompactOnSuccess { enabled: true },
+    )
+    .await;
+    apply_supervisor_setting(
+        &mut fixture,
+        HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: threshold },
+    )
+    .await;
+    fixture
+}
+
 /// Failure mode 1: a backend error card halts the turn. With the supervisor
 /// enabled, the idle agent must receive a visible supervisor-prefixed kick
 /// (the mock verdict is Continue because an error is in the context) which
@@ -243,29 +263,10 @@ async fn supervisor_kicks_agent_after_error_and_respects_kick_budget() {
     .await;
 }
 
-/// Failure-free paths lock the automatic-compaction context contract: absent,
-/// below-threshold, and exact-threshold usage do not compact; strictly greater
-/// known usage rotates once, and the replacement is protected from a loop.
 #[tokio::test]
-async fn supervisor_auto_compaction_respects_context_threshold() {
+async fn supervisor_auto_compaction_skips_unavailable_context_at_zero_threshold() {
     fixture::init_tracing();
-    let mut fixture = Fixture::new().await;
-
-    apply_supervisor_setting(
-        &mut fixture,
-        HostSettingValue::SupervisorEnabled { enabled: true },
-    )
-    .await;
-    apply_supervisor_setting(
-        &mut fixture,
-        HostSettingValue::SupervisorAutoCompactOnSuccess { enabled: true },
-    )
-    .await;
-    apply_supervisor_setting(
-        &mut fixture,
-        HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 0 },
-    )
-    .await;
+    let mut fixture = auto_compaction_fixture(0).await;
 
     spawn_supervised_agent(&mut fixture, "supervised-unavailable-agent", false).await;
     assert_no_envelope(
@@ -275,12 +276,13 @@ async fn supervisor_auto_compaction_respects_context_threshold() {
         |env| env.kind == FrameKind::NewAgent,
     )
     .await;
+}
 
-    apply_supervisor_setting(
-        &mut fixture,
-        HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 300_000 },
-    )
-    .await;
+#[tokio::test]
+async fn supervisor_auto_compaction_skips_context_below_threshold() {
+    fixture::init_tracing();
+    let mut fixture = auto_compaction_fixture(300_000).await;
+
     spawn_supervised_agent(&mut fixture, "supervised-below-agent", true).await;
     assert_no_envelope(
         &mut fixture.client,
@@ -289,12 +291,13 @@ async fn supervisor_auto_compaction_respects_context_threshold() {
         |env| env.kind == FrameKind::NewAgent,
     )
     .await;
+}
 
-    apply_supervisor_setting(
-        &mut fixture,
-        HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 250_000 },
-    )
-    .await;
+#[tokio::test]
+async fn supervisor_auto_compaction_skips_context_equal_to_threshold() {
+    fixture::init_tracing();
+    let mut fixture = auto_compaction_fixture(250_000).await;
+
     spawn_supervised_agent(&mut fixture, "supervised-equal-agent", true).await;
     assert_no_envelope(
         &mut fixture.client,
@@ -303,12 +306,13 @@ async fn supervisor_auto_compaction_respects_context_threshold() {
         |env| env.kind == FrameKind::NewAgent,
     )
     .await;
+}
 
-    apply_supervisor_setting(
-        &mut fixture,
-        HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 200_000 },
-    )
-    .await;
+#[tokio::test]
+async fn supervisor_auto_compaction_runs_above_threshold_once() {
+    fixture::init_tracing();
+    let mut fixture = auto_compaction_fixture(200_000).await;
+
     let original = spawn_supervised_agent(&mut fixture, "supervised-done-agent", true).await;
 
     // 250,000 > 200,000, so a Done verdict compacts the original.

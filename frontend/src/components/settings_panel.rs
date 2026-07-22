@@ -2233,16 +2233,19 @@ fn SupervisorTab() -> impl IntoView {
             <p class="settings-description">
                 "Automatically compact only when the latest completed assistant turn reports a context larger than this many tokens. The default is 200,000. Set 0 for no positive minimum; automatic compaction still waits for reported current-context data and skips the turn when that data is unavailable."
             </p>
-            <input
-                class="settings-input settings-supervisor-number-input"
-                type="number"
-                min="0"
-                step="1000"
-                prop:value=compact_min_value
-                disabled=compact_min_disabled
-                aria-label="Supervisor auto-compact minimum context tokens"
-                on:change=compact_min_on_change
-            />
+            <div class="settings-form-row" style="align-items: center;">
+                <input
+                    class="settings-input settings-supervisor-number-input"
+                    type="number"
+                    min="0"
+                    step="1000"
+                    prop:value=compact_min_value
+                    disabled=compact_min_disabled
+                    aria-label="Supervisor auto-compact minimum context tokens"
+                    on:change=compact_min_on_change
+                />
+                <span class="settings-supervisor-number-unit">"tokens"</span>
+            </div>
         </div>
 
         <div class="settings-field">
@@ -9130,6 +9133,11 @@ mod wasm_tests {
             "200000",
             "auto-compact minimum context shows the host default before edits"
         );
+        let compact_min_unit = container
+            .query_selector(".settings-supervisor-number-unit")
+            .unwrap()
+            .expect("auto-compact minimum context renders a visible unit");
+        assert_eq!(compact_min_unit.text_content().as_deref(), Some("tokens"));
         compact_min.set_value("240000");
         dispatch_change(&compact_min);
         compact_min.set_value("0");
