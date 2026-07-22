@@ -1118,17 +1118,19 @@ async fn emit_turn(
                 mock_turn_token_usage(),
             )
         }),
-        context_breakdown: user_message.contains(MOCK_CONTEXT_250K_SENTINEL).then(|| {
-            ContextBreakdown {
-                system_prompt_bytes: 100_000,
-                tool_io_bytes: 40_000,
-                conversation_history_bytes: 60_000,
-                reasoning_bytes: 20_000,
-                context_injection_bytes: 30_000,
-                input_tokens: 250_000,
-                context_window: 300_000,
-            }
-        }),
+        context_breakdown: user_message
+            .contains(MOCK_CONTEXT_250K_SENTINEL)
+            .then_some({
+                ContextBreakdown {
+                    system_prompt_bytes: 100_000,
+                    tool_io_bytes: 40_000,
+                    conversation_history_bytes: 60_000,
+                    reasoning_bytes: 20_000,
+                    context_injection_bytes: 30_000,
+                    input_tokens: 250_000,
+                    context_window: 300_000,
+                }
+            }),
         images: None,
     };
 

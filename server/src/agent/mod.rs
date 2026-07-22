@@ -17,8 +17,7 @@ use protocol::{
     SessionSettingsPayload, SessionSettingsValues, SpawnCostHint, StreamEndData, StreamStartData,
     StreamTextDeltaData, TaskTokenUsageAmount, TaskTokenUsageScope,
     TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
-    ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy,
-    ToolRequestType,
+    ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy, ToolRequestType,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -4170,16 +4169,25 @@ where
     }
 }
 
+pub(crate) struct RelayEventReceivers {
+    pub events: mpsc::UnboundedReceiver<ChatEvent>,
+    pub model_usage: mpsc::UnboundedReceiver<ModelRequestTokenUsage>,
+    pub total_usage: mpsc::UnboundedReceiver<u64>,
+}
+
 pub(crate) fn spawn_relay_agent_actor(
     agent_id: AgentId,
     start: AgentStartPayload,
-    mut events: mpsc::UnboundedReceiver<ChatEvent>,
-    mut model_usage: mpsc::UnboundedReceiver<ModelRequestTokenUsage>,
-    mut total_usage: mpsc::UnboundedReceiver<u64>,
+    receivers: RelayEventReceivers,
     session_store: Arc<Mutex<SessionStore>>,
     session_id: SessionId,
     status_handle: registry::AgentStatusHandle,
 ) -> AgentHandle {
+    let RelayEventReceivers {
+        mut events,
+        mut model_usage,
+        mut total_usage,
+    } = receivers;
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentCommand>();
     let accepting_input = Arc::new(AtomicBool::new(true));
     let accepting_input_task = Arc::clone(&accepting_input);
@@ -6386,14 +6394,11 @@ fn agent_usage_snapshot_from_log(
             _ => {}
         }
     }
-    if let Some(total_tokens) = latest_stats
-        .as_ref()
-        .and_then(|stats| {
-            stats
-                .token_usage_total_only
-                .filter(|total| *total >= stats.token_usage.total_tokens)
-        })
-    {
+    if let Some(total_tokens) = latest_stats.as_ref().and_then(|stats| {
+        stats
+            .token_usage_total_only
+            .filter(|total| *total >= stats.token_usage.total_tokens)
+    }) {
         return AgentUsageSnapshot {
             start: start.clone(),
             usage: TaskTokenUsageScope::Known {
@@ -6896,16 +6901,16 @@ fn project_legacy_native_collaboration_event(event: &mut ChatEvent) {
                         "agent_count": legacy_codex_agent_count(result),
                     }),
                 };
-                completion.error = (!completion.success)
-                    .then(|| format!("{} failed", completion.tool_name));
+                completion.error =
+                    (!completion.success).then(|| format!("{} failed", completion.tool_name));
             } else if legacy_claude_agent_result(&completion.tool_name, result) {
                 completion.tool_result = ToolExecutionResult::Other {
                     result: serde_json::json!({
                         "status": if completion.success { "completed" } else { "failed" },
                     }),
                 };
-                completion.error = (!completion.success)
-                    .then(|| format!("{} failed", completion.tool_name));
+                completion.error =
+                    (!completion.success).then(|| format!("{} failed", completion.tool_name));
             }
         }
         _ => {}
@@ -6947,9 +6952,14 @@ fn legacy_codex_agent_count(value: &serde_json::Value) -> usize {
 fn legacy_claude_agent_request(tool_name: &str, args: &serde_json::Value) -> bool {
     matches!(tool_name, "Task" | "Agent")
         && args.get("prompt").is_some()
-        && ["subagent_type", "run_in_background", "description", "resume"]
-            .into_iter()
-            .any(|key| args.get(key).is_some())
+        && [
+            "subagent_type",
+            "run_in_background",
+            "description",
+            "resume",
+        ]
+        .into_iter()
+        .any(|key| args.get(key).is_some())
 }
 
 fn legacy_claude_agent_result(tool_name: &str, result: &serde_json::Value) -> bool {
@@ -7290,12 +7300,11 @@ mod tests {
         AgentControlLatestOutput, AgentControlOutput, AgentId, AgentInput, AgentStartPayload,
         BackendKind, ChatEvent, ChatMessage, ChatMessageId, FrameKind, MessageMetadataUpdateData,
         MessageSender, MessageTokenUsage, ModelInfo, ModelRequestId, ModelRequestTokenUsage,
-        ModelTurnId,
-        ReasoningData, ServerGeneratedChatMessageIdOrigin, ServerGeneratedChatMessageIdentity,
-        SessionId, StreamEndData, StreamPath, StreamStartData, StreamTextDeltaData, TaskList,
-        TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope,
-        TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult, ToolRequest,
-        ToolRequestType, ToolUseData,
+        ModelTurnId, ReasoningData, ServerGeneratedChatMessageIdOrigin,
+        ServerGeneratedChatMessageIdentity, SessionId, StreamEndData, StreamPath, StreamStartData,
+        StreamTextDeltaData, TaskList, TaskTokenUsageScope, TaskTokenUsageUnavailableReason,
+        TokenUsage, TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData,
+        ToolExecutionResult, ToolRequest, ToolRequestType, ToolUseData,
     };
     use tokio::sync::{Mutex, mpsc, watch};
     use tokio::time::timeout;
@@ -7304,16 +7313,16 @@ mod tests {
         AGENT_STARTUP_SELECTION_TEST_GATE, AGENT_STARTUP_TEST_GATE, AgentActivityStatsTracker,
         AgentActorRuntimeContext, AgentCommand, AgentHandle, AgentNameChangeContext,
         AgentReplayState, AgentStartupFailure, AgentStartupTestGate,
-        GenerateAgentActivitySummaryRequest, InterruptOutcome,
+        GenerateAgentActivitySummaryRequest, InterruptOutcome, RelayEventReceivers,
         ResolvedSpawnRequest, activity_history_snapshot, agent_name_generation_spawn_config,
-        agent_usage_snapshot_from_log, append_chat_event, append_event,
-        apply_generated_agent_name, attach_subscriber,
-        attach_subscriber_with_latest_output, collect_agent_activity_summary_events,
-        collect_agent_name_events, current_latest_output, generate_mock_name,
-        ingest_gated_replay_event, known_turn_usage, output_events_since, replay_envelope,
-        resolve_backend_session_settings, sanitize_generated_agent_name, session_history_window,
-        spawn_agent_actor, spawn_relay_agent_actor, terminal_input_rejected_payload,
-        upsert_activity_stats_snapshot,
+        agent_usage_snapshot_from_log, append_chat_event, append_event, apply_generated_agent_name,
+        attach_subscriber, attach_subscriber_with_latest_output,
+        collect_agent_activity_summary_events, collect_agent_name_events, current_latest_output,
+        generate_mock_name, ingest_gated_replay_event, known_turn_usage, output_events_since,
+        project_legacy_native_collaboration_event, replay_envelope,
+        resolve_backend_session_settings, sanitize_generated_agent_name,
+        session_history_entries_from_log, session_history_window, spawn_agent_actor,
+        spawn_relay_agent_actor, terminal_input_rejected_payload, upsert_activity_stats_snapshot,
     };
     use crate::agent::customization::ResolvedSpawnConfig;
     use crate::agent::registry::AgentStatusHandle;
@@ -9091,9 +9100,11 @@ mod tests {
         let handle = spawn_relay_agent_actor(
             start.agent_id.clone(),
             start,
-            event_rx,
-            model_usage_rx,
-            total_usage_rx,
+            RelayEventReceivers {
+                events: event_rx,
+                model_usage: model_usage_rx,
+                total_usage: total_usage_rx,
+            },
             session_store,
             SessionId("relay-session".to_owned()),
             status_handle,
@@ -9175,9 +9186,11 @@ mod tests {
         let handle = spawn_relay_agent_actor(
             start.agent_id.clone(),
             start,
-            event_rx,
-            model_usage_rx,
-            total_usage_rx,
+            RelayEventReceivers {
+                events: event_rx,
+                model_usage: model_usage_rx,
+                total_usage: total_usage_rx,
+            },
             session_store,
             SessionId("relay-codex-session".to_owned()),
             status_handle,
@@ -9387,9 +9400,11 @@ mod tests {
         let handle = spawn_relay_agent_actor(
             start.agent_id.clone(),
             start,
-            event_rx,
-            model_rx,
-            total_rx,
+            RelayEventReceivers {
+                events: event_rx,
+                model_usage: model_rx,
+                total_usage: total_rx,
+            },
             session_store,
             SessionId("relay-idle-session".to_owned()),
             status_handle,
@@ -9472,11 +9487,13 @@ mod tests {
             ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
                 tool_call_id: "claude-call".to_owned(),
                 tool_name: "Task".to_owned(),
-                tool_result: ToolExecutionResult::Other { result: serde_json::json!({
-                    "agentId": "claude-provider-agent-id",
-                    "output_file": "/private/tmp/claude-child-output",
-                    "content": "provider control prose"
-                }) },
+                tool_result: ToolExecutionResult::Other {
+                    result: serde_json::json!({
+                        "agentId": "claude-provider-agent-id",
+                        "output_file": "/private/tmp/claude-child-output",
+                        "content": "provider control prose"
+                    }),
+                },
                 success: true,
                 error: None,
                 normalization_failure: None,
@@ -9484,13 +9501,15 @@ mod tests {
             ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
                 tool_call_id: "codex-call".to_owned(),
                 tool_name: "spawnAgent".to_owned(),
-                tool_result: ToolExecutionResult::Other { result: serde_json::json!({
-                    "type": "collabAgentToolCall", "tool": "spawnAgent",
-                    "senderThreadId": "codex-parent-thread-id",
-                    "receiverThreadId": "codex-child-thread-id",
-                    "output_file": "/tmp/codex-child-output",
-                    "content": "codex transport control prose"
-                }) },
+                tool_result: ToolExecutionResult::Other {
+                    result: serde_json::json!({
+                        "type": "collabAgentToolCall", "tool": "spawnAgent",
+                        "senderThreadId": "codex-parent-thread-id",
+                        "receiverThreadId": "codex-child-thread-id",
+                        "output_file": "/tmp/codex-child-output",
+                        "content": "codex transport control prose"
+                    }),
+                },
                 success: true,
                 error: None,
                 normalization_failure: None,
@@ -9517,20 +9536,30 @@ mod tests {
         ));
         let encoded = serde_json::to_string(&events).expect("serialize projected replay");
         for private in [
-            "claude-session-secret", "claude-provider-agent-id",
-            "codex-parent-thread-id", "codex-child-thread-id", "/private/tmp",
-            "/tmp/codex", "provider control prose", "codex transport control prose",
+            "claude-session-secret",
+            "claude-provider-agent-id",
+            "codex-parent-thread-id",
+            "codex-child-thread-id",
+            "/private/tmp",
+            "/tmp/codex",
+            "provider control prose",
+            "codex transport control prose",
         ] {
-            assert!(!encoded.contains(private), "replay leaked {private}: {encoded}");
+            assert!(
+                !encoded.contains(private),
+                "replay leaked {private}: {encoded}"
+            );
         }
 
         let mut ordinary = ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
             tool_call_id: "ordinary".to_owned(),
             tool_name: "custom_report".to_owned(),
-            tool_result: ToolExecutionResult::Other { result: serde_json::json!({
-                "content": "ordinary tool payload",
-                "output_file": "/tmp/user-requested-report"
-            }) },
+            tool_result: ToolExecutionResult::Other {
+                result: serde_json::json!({
+                    "content": "ordinary tool payload",
+                    "output_file": "/tmp/user-requested-report"
+                }),
+            },
             success: true,
             error: None,
             normalization_failure: None,

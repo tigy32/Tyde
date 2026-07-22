@@ -2328,8 +2328,7 @@ impl Default for SupervisorSettings {
         Self {
             enabled: false,
             auto_compact_on_success: false,
-            auto_compact_min_context_tokens:
-                default_supervisor_auto_compact_min_context_tokens(),
+            auto_compact_min_context_tokens: default_supervisor_auto_compact_min_context_tokens(),
             max_kicks_per_task: default_supervisor_max_kicks_per_task(),
             retry_attempts: default_supervisor_retry_attempts(),
             cost_tier: SupervisorCostTier::default(),

@@ -9802,16 +9802,13 @@ impl HostHandle {
 
         let (start, agent_handle, agent_visibility) = {
             let mut state = self.state.lock().await;
-            let spawned =
-                state
-                    .registry
-                    .spawn_relay(
-                        relay_request,
-                        event_rx,
-                        model_usage_rx,
-                        total_usage_rx,
-                        Arc::clone(&session_store),
-                    );
+            let spawned = state.registry.spawn_relay(
+                relay_request,
+                event_rx,
+                model_usage_rx,
+                total_usage_rx,
+                Arc::clone(&session_store),
+            );
             state
                 .agent_sessions
                 .insert(spawned.start.agent_id.clone(), session_id.clone());
@@ -13200,9 +13197,7 @@ async fn supervise_idle_agent(
         crate::agent::supervisor::SupervisionVerdict::Done => {
             tracing::info!(agent_id = %agent_id, "supervisor confirmed the task is done");
             if current_settings.settings.auto_compact_on_success {
-                let threshold = current_settings
-                    .settings
-                    .auto_compact_min_context_tokens;
+                let threshold = current_settings.settings.auto_compact_min_context_tokens;
                 let current_context = recheck.current_context_input_tokens;
                 if supervisor_auto_compaction_eligible(current_context, threshold) {
                     supervisor_auto_compact(host, agent_id).await;

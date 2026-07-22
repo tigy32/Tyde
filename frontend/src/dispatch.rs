@@ -1035,10 +1035,8 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 );
                 if result == TabUpgradeResult::Updated
                     && origin == AgentOrigin::User
-                    && let Some(values) = state.take_pending_agent_session_settings(
-                        host_id,
-                        project_id.as_ref(),
-                    )
+                    && let Some(values) =
+                        state.take_pending_agent_session_settings(host_id, project_id.as_ref())
                 {
                     state.agent_session_settings.update(|settings| {
                         settings.insert(new_active_agent.agent_id.clone(), values);

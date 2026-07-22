@@ -149,7 +149,10 @@ thread_local! {
 #[cfg(target_arch = "wasm32")]
 fn load_active_project() -> Option<ActiveProjectRef> {
     let storage = web_sys::window()?.local_storage().ok().flatten()?;
-    let encoded = storage.get_item(ACTIVE_PROJECT_STORAGE_KEY).ok().flatten()?;
+    let encoded = storage
+        .get_item(ACTIVE_PROJECT_STORAGE_KEY)
+        .ok()
+        .flatten()?;
     match serde_json::from_str(&encoded) {
         Ok(project) => Some(project),
         Err(error) => {
@@ -2178,6 +2181,9 @@ pub struct PendingAgentSessionSettings {
     values: SessionSettingsValues,
 }
 
+type PendingAgentSessionSettingsByProject =
+    HashMap<(String, Option<ProjectId>), VecDeque<PendingAgentSessionSettings>>;
+
 /// Latest server-emitted Add-report shuffle suggestion plus a monotonic
 /// `serial` so the open dialog can apply only fresh suggestions and
 /// ignore stale ones still sitting in state on re-open.
@@ -2592,8 +2598,7 @@ pub struct AppState {
     /// not arrived yet. The host stream publishes agent identity before the
     /// agent stream publishes authoritative effective settings; retaining the
     /// submitted values prevents that expected gap from masquerading as Auto.
-    pub pending_agent_session_settings:
-        RwSignal<HashMap<(String, Option<ProjectId>), VecDeque<PendingAgentSessionSettings>>>,
+    pub pending_agent_session_settings: RwSignal<PendingAgentSessionSettingsByProject>,
     next_pending_agent_session_settings_id: RwSignal<u64>,
     pub draft_session_settings: RwSignal<SessionSettingsValues>,
     /// Whether the user has actually edited `draft_session_settings` in the
@@ -8963,11 +8968,7 @@ mod tests {
                 second.clone(),
             );
 
-            state.discard_pending_agent_session_settings(
-                "host",
-                Some(&project_id),
-                first_id,
-            );
+            state.discard_pending_agent_session_settings("host", Some(&project_id), first_id);
 
             assert_eq!(
                 state.take_pending_agent_session_settings("host", Some(&project_id)),
@@ -8991,9 +8992,13 @@ mod tests {
                 SessionSettingsValues::default(),
             );
             state.clear_host_runtime("host");
-            assert!(state.pending_agent_session_settings.with_untracked(|pending| {
-                pending.keys().all(|(host_id, _)| host_id == "other-host")
-            }));
+            assert!(
+                state
+                    .pending_agent_session_settings
+                    .with_untracked(|pending| {
+                        pending.keys().all(|(host_id, _)| host_id == "other-host")
+                    })
+            );
         });
     }
 
@@ -9006,7 +9011,9 @@ mod tests {
                 host_id: "restored-host".to_owned(),
                 project_id: ProjectId("restored-project".to_owned()),
             };
-            state.pending_active_project_restore.set(Some(restored.clone()));
+            state
+                .pending_active_project_restore
+                .set(Some(restored.clone()));
             state.projects.update(|projects| {
                 projects.push(ProjectInfo {
                     host_id: restored.host_id.clone(),

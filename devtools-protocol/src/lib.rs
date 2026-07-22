@@ -275,16 +275,10 @@ mod tests {
             ("TYDE_STEERING_STORE_PATH", "steering.json"),
             ("TYDE_SKILLS_STORE_PATH", "skills.json"),
             ("TYDE_SKILLS_DIR_PATH", "skills"),
-            (
-                "TYDE_MOBILE_PAIRINGS_STORE_PATH",
-                "mobile_pairings.json",
-            ),
+            ("TYDE_MOBILE_PAIRINGS_STORE_PATH", "mobile_pairings.json"),
             ("TYDE_WORKFLOW_RUN_STORE_PATH", "workflow_runs.json"),
             ("TYDE_GLOBAL_WORKFLOWS_DIR", "global_workflows"),
-            (
-                "TYDE_CONFIGURED_HOST_STORE_PATH",
-                "configured_hosts.json",
-            ),
+            ("TYDE_CONFIGURED_HOST_STORE_PATH", "configured_hosts.json"),
             ("TYDE_TRACING_DIR_PATH", "tracing"),
         ];
         assert_eq!(

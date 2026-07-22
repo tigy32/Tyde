@@ -1151,14 +1151,9 @@ fn supervisor_settings_default_apply_and_validate() {
         .expect("enable auto-compact");
     assert!(settings.supervisor.auto_compact_on_success);
     let settings = store
-        .apply(
-            HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 275_000 },
-        )
+        .apply(HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 275_000 })
         .expect("set auto-compact minimum context");
-    assert_eq!(
-        settings.supervisor.auto_compact_min_context_tokens,
-        275_000
-    );
+    assert_eq!(settings.supervisor.auto_compact_min_context_tokens, 275_000);
     assert_eq!(
         store
             .get()

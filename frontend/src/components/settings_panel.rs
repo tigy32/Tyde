@@ -9121,9 +9121,7 @@ mod wasm_tests {
             .expect("kick limit is an input");
 
         let compact_min: web_sys::HtmlInputElement = container
-            .query_selector(
-                "input[aria-label='Supervisor auto-compact minimum context tokens']",
-            )
+            .query_selector("input[aria-label='Supervisor auto-compact minimum context tokens']")
             .unwrap()
             .expect("auto-compact minimum context input renders")
             .dyn_into()

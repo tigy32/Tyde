@@ -3219,11 +3219,7 @@ async fn read_claude_stdout_persistent(
                 &mut subagent_streams,
             )
             .await;
-            observe_local_agent_task_usage(
-                &value,
-                &mut local_agent_tasks,
-                &mut subagent_streams,
-            );
+            observe_local_agent_task_usage(&value, &mut local_agent_tasks, &mut subagent_streams);
             known_subagent_ids.extend(subagent_streams.keys().cloned());
             // A background sub-agent completes via `task_notification`, which
             // arrives on the parent stream after the parent's turn `result`.
@@ -4474,8 +4470,16 @@ struct BackgroundTaskEntry {
 
 fn background_task_parent_tool_use_id(value: &Value) -> Option<&str> {
     extract_parent_tool_use_id(value)
-        .or_else(|| value.pointer("/data/parent_tool_use_id").and_then(Value::as_str))
-        .or_else(|| value.pointer("/message/parent_tool_use_id").and_then(Value::as_str))
+        .or_else(|| {
+            value
+                .pointer("/data/parent_tool_use_id")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            value
+                .pointer("/message/parent_tool_use_id")
+                .and_then(Value::as_str)
+        })
         .filter(|id| !id.is_empty())
 }
 
@@ -4546,16 +4550,16 @@ fn capture_background_command_output(
     if !path.starts_with(&temp_root) {
         return Err("Claude command output path was outside the temporary directory");
     }
-    let metadata = std::fs::metadata(&path)
-        .map_err(|_| "Claude command output file was unavailable")?;
+    let metadata =
+        std::fs::metadata(&path).map_err(|_| "Claude command output file was unavailable")?;
     if !metadata.is_file() {
         return Err("Claude command output file was unavailable");
     }
     if metadata.len() > BACKGROUND_COMMAND_OUTPUT_LIMIT {
         return Err("Claude command output exceeded the capture limit");
     }
-    let file = std::fs::File::open(path)
-        .map_err(|_| "Claude command output file was unavailable")?;
+    let file =
+        std::fs::File::open(path).map_err(|_| "Claude command output file was unavailable")?;
     let mut bytes = Vec::with_capacity(BACKGROUND_COMMAND_OUTPUT_LIMIT as usize);
     file.take(BACKGROUND_COMMAND_OUTPUT_LIMIT + 1)
         .read_to_end(&mut bytes)
@@ -4586,11 +4590,13 @@ fn capture_background_command_output(
     if !has_structured_field {
         return Err("Claude command output was not structurally available");
     }
-    Ok(parse_run_command_result_from_value(&value, 0).unwrap_or(ClaudeRunCommandResult {
-        exit_code: 0,
-        stdout: String::new(),
-        stderr: String::new(),
-    }))
+    Ok(
+        parse_run_command_result_from_value(&value, 0).unwrap_or(ClaudeRunCommandResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        }),
+    )
 }
 
 fn emit_background_task_snapshot(emitter: &TurnEmitter, entry: &BackgroundTaskEntry) {
@@ -4611,24 +4617,21 @@ fn emit_background_task_completion(emitter: &TurnEmitter, entry: &BackgroundTask
             tool_name: "Bash",
             tool_result: result.as_tool_result(),
             success: result.exit_code == 0,
-            error: (result.exit_code != 0)
-                .then_some("Background command exited non-zero"),
+            error: (result.exit_code != 0).then_some("Background command exited non-zero"),
         });
         return;
     }
     let (success, tool_result, error) = match entry.state.status {
-        BackgroundTaskStatus::Completed => {
-            (
-                true,
-                json!({
-                    "kind": "RunCommand",
-                    "exit_code": 0,
-                    "stdout": "",
-                    "stderr": "",
-                }),
-                None,
-            )
-        }
+        BackgroundTaskStatus::Completed => (
+            true,
+            json!({
+                "kind": "RunCommand",
+                "exit_code": 0,
+                "stdout": "",
+                "stderr": "",
+            }),
+            None,
+        ),
         BackgroundTaskStatus::Stopped => (
             false,
             json!({
@@ -4836,12 +4839,7 @@ fn handle_background_bash_task_frame(
             }),
         );
     }
-    handle_background_bash_task_frame_with_owners(
-        value,
-        background_tasks,
-        emitter,
-        &HashMap::new(),
-    )
+    handle_background_bash_task_frame_with_owners(value, background_tasks, emitter, &HashMap::new())
 }
 
 async fn detect_subagent_task_system_spawns(
@@ -4958,9 +4956,7 @@ fn observe_local_agent_task_usage(
         stream.reported_total_tokens = Some(total_tokens);
         stream.inner.emitter.total_only_token_usage(total_tokens);
     }
-    if is_notification
-        && let Some(task_id) = system.task_id
-    {
+    if is_notification && let Some(task_id) = system.task_id {
         task_to_tool_use.remove(&task_id);
     }
 }
@@ -9602,9 +9598,8 @@ fn spawn_claude_subagent_event_bridge(
                 continue;
             }
             if raw.get("kind").and_then(Value::as_str) == Some("TotalOnlyTokenUsage")
-                && let Some(total_tokens) = raw
-                    .pointer("/data/total_tokens")
-                    .and_then(Value::as_u64)
+                && let Some(total_tokens) =
+                    raw.pointer("/data/total_tokens").and_then(Value::as_u64)
             {
                 if total_usage_tx.send(total_tokens).is_err() {
                     break;
@@ -10774,7 +10769,9 @@ mod tests {
         let third = rx.recv().await.expect("third");
         assert_eq!(event_kind(&third), Some("ToolExecutionCompleted"));
         assert_eq!(
-            third.pointer("/data/tool_result/kind").and_then(Value::as_str),
+            third
+                .pointer("/data/tool_result/kind")
+                .and_then(Value::as_str),
             Some("Cancelled")
         );
         assert_eq!(
@@ -11213,12 +11210,8 @@ mod tests {
             let (event_tx, event_rx) = mpsc::unbounded_channel();
             let (model_usage_tx, mut model_usage_rx) = mpsc::unbounded_channel();
             let (total_usage_tx, mut total_usage_rx) = mpsc::unbounded_channel();
-            tokio::spawn(async move {
-                while model_usage_rx.recv().await.is_some() {}
-            });
-            tokio::spawn(async move {
-                while total_usage_rx.recv().await.is_some() {}
-            });
+            tokio::spawn(async move { while model_usage_rx.recv().await.is_some() {} });
+            tokio::spawn(async move { while total_usage_rx.recv().await.is_some() {} });
             self.event_receivers
                 .lock()
                 .expect("event receiver mutex")
@@ -11848,9 +11841,7 @@ for raw_line in sys.stdin:
             Some("TotalOnlyTokenUsage")
         );
         assert_eq!(
-            total
-                .pointer("/data/total_tokens")
-                .and_then(Value::as_u64),
+            total.pointer("/data/total_tokens").and_then(Value::as_u64),
             Some(47)
         );
         assert!(child_rx.try_recv().is_err());
@@ -16557,11 +16548,7 @@ for raw_line in sys.stdin:
     }
 
     fn bash_task_notification_frame(status: &str, summary: &str) -> Value {
-        bash_task_notification_frame_with_output(
-            status,
-            summary,
-            "/tmp/tasks/b4r45rw5t.output",
-        )
+        bash_task_notification_frame_with_output(status, summary, "/tmp/tasks/b4r45rw5t.output")
     }
 
     fn bash_task_notification_frame_with_output(
@@ -16670,7 +16657,9 @@ for raw_line in sys.stdin:
             .find(|event| event_kind(event) == Some("ToolExecutionCompleted"))
             .expect("terminal notification should complete the launch tool");
         assert_eq!(
-            completion.pointer("/data/tool_result/kind").and_then(Value::as_str),
+            completion
+                .pointer("/data/tool_result/kind")
+                .and_then(Value::as_str),
             Some("RunCommand")
         );
         assert_eq!(
@@ -16680,11 +16669,15 @@ for raw_line in sys.stdin:
             Some(7)
         );
         assert_eq!(
-            completion.pointer("/data/tool_result/stdout").and_then(Value::as_str),
+            completion
+                .pointer("/data/tool_result/stdout")
+                .and_then(Value::as_str),
             Some("partial output")
         );
         assert_eq!(
-            completion.pointer("/data/tool_result/stderr").and_then(Value::as_str),
+            completion
+                .pointer("/data/tool_result/stderr")
+                .and_then(Value::as_str),
             Some("command failed")
         );
         assert_eq!(
@@ -16693,8 +16686,7 @@ for raw_line in sys.stdin:
         );
         let terminal_progress = events
             .iter()
-            .filter(|event| event_kind(event) == Some("ToolProgress"))
-            .last()
+            .rfind(|event| event_kind(event) == Some("ToolProgress"))
             .expect("terminal progress should remain available to the card");
         assert_eq!(
             terminal_progress
@@ -16737,7 +16729,9 @@ for raw_line in sys.stdin:
             .find(|event| event_kind(event) == Some("ToolExecutionCompleted"))
             .expect("terminal completion");
         assert_eq!(
-            completion.pointer("/data/tool_result/stdout").and_then(Value::as_str),
+            completion
+                .pointer("/data/tool_result/stdout")
+                .and_then(Value::as_str),
             Some("finished work")
         );
         assert_eq!(
@@ -16759,7 +16753,10 @@ for raw_line in sys.stdin:
 
         let snapshots = recv_background_snapshots(&mut rx);
         let terminal = snapshots.last().expect("terminal snapshot");
-        assert_eq!(terminal.summary.as_deref(), Some("Background command finished"));
+        assert_eq!(
+            terminal.summary.as_deref(),
+            Some("Background command finished")
+        );
         let unavailable = terminal
             .output_unavailable
             .as_deref()
@@ -16811,7 +16808,13 @@ for raw_line in sys.stdin:
             &parent_emitter,
             &streams,
         ));
-        assert!(tasks.get("child-task").expect("registered task").owner.is_none());
+        assert!(
+            tasks
+                .get("child-task")
+                .expect("registered task")
+                .owner
+                .is_none()
+        );
 
         consume_subagent_event(
             streams.get_mut("toolu_child").expect("child stream"),
@@ -16840,12 +16843,14 @@ for raw_line in sys.stdin:
                 }]}
             }),
         );
-        assert!(streams
-            .get("toolu_child")
-            .expect("child stream")
-            .inner
-            .emitter
-            .has_pending_tool_request("toolu_child_bash"));
+        assert!(
+            streams
+                .get("toolu_child")
+                .expect("child stream")
+                .inner
+                .emitter
+                .has_pending_tool_request("toolu_child_bash")
+        );
         assert!(handle_background_bash_task_frame_with_owners(
             &json!({
                 "type": "system",
@@ -16863,10 +16868,8 @@ for raw_line in sys.stdin:
         let mut child_events = emitter.take_event_rx("toolu_child");
         let completion = timeout(Duration::from_secs(1), async {
             loop {
-                if let protocol::ChatEvent::ToolExecutionCompleted(completion) = child_events
-                    .recv()
-                    .await
-                    .expect("child event channel")
+                if let protocol::ChatEvent::ToolExecutionCompleted(completion) =
+                    child_events.recv().await.expect("child event channel")
                 {
                     break completion;
                 }
@@ -16890,10 +16893,12 @@ for raw_line in sys.stdin:
                 &json!({ "command": "sleep 30", "run_in_background": true }),
             ),
         );
-        assert!(child
-            .inner
-            .emitter
-            .detach_tool("toolu_child_bash_cancelled"));
+        assert!(
+            child
+                .inner
+                .emitter
+                .detach_tool("toolu_child_bash_cancelled")
+        );
         assert!(handle_background_bash_task_frame_with_owners(
             &json!({
                 "type": "system", "subtype": "task_started",
@@ -16920,10 +16925,8 @@ for raw_line in sys.stdin:
         ));
         let cancelled = timeout(Duration::from_secs(1), async {
             loop {
-                if let protocol::ChatEvent::ToolExecutionCompleted(completion) = child_events
-                    .recv()
-                    .await
-                    .expect("child event channel")
+                if let protocol::ChatEvent::ToolExecutionCompleted(completion) =
+                    child_events.recv().await.expect("child event channel")
                     && completion.tool_call_id == "toolu_child_bash_cancelled"
                 {
                     break completion;
@@ -16996,7 +16999,11 @@ for raw_line in sys.stdin:
         );
 
         let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-        assert!(events.iter().any(|event| event_kind(event) == Some("ToolRequest")));
+        assert!(
+            events
+                .iter()
+                .any(|event| event_kind(event) == Some("ToolRequest"))
+        );
         assert!(
             events
                 .iter()

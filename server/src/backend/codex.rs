@@ -5208,16 +5208,19 @@ impl CodexInner {
                         .map(|usage| (Arc::clone(&stream.emitter), usage))
                     })
             } else {
-                state.subagent_streams.get_mut(stream_key).and_then(|stream| {
-                    record_model_request_token_usage(
-                        &mut stream.model_token_usage_by_turn,
-                        turn_id,
-                        request,
-                        cumulative,
-                        context_window,
-                    )
-                    .map(|usage| (Arc::clone(&stream.emitter), usage))
-                })
+                state
+                    .subagent_streams
+                    .get_mut(stream_key)
+                    .and_then(|stream| {
+                        record_model_request_token_usage(
+                            &mut stream.model_token_usage_by_turn,
+                            turn_id,
+                            request,
+                            cumulative,
+                            context_window,
+                        )
+                        .map(|usage| (Arc::clone(&stream.emitter), usage))
+                    })
             }
         };
         if let Some((emitter, usage)) = recorded {
@@ -6555,8 +6558,9 @@ impl CodexInner {
                         }
                     }
                     (None, true)
-                } else if let Some(stream) =
-                    state.completed_subagent_streams.get_mut(&receiver_thread_id)
+                } else if let Some(stream) = state
+                    .completed_subagent_streams
+                    .get_mut(&receiver_thread_id)
                 {
                     if crate::sub_agent::child_name_is_better(&stream.agent_name, &spawn.name) {
                         stream.agent_name = spawn.name.clone();
@@ -6583,10 +6587,13 @@ impl CodexInner {
                         );
                         (None, false)
                     } else {
-                        (Some(format!(
-                            "Codex ownership invariant failed: child thread '{}' has contradictory pending spawn metadata ('{}' and '{}')",
-                            receiver_thread_id, existing.item_id, spawn.item_id
-                        )), false)
+                        (
+                            Some(format!(
+                                "Codex ownership invariant failed: child thread '{}' has contradictory pending spawn metadata ('{}' and '{}')",
+                                receiver_thread_id, existing.item_id, spawn.item_id
+                            )),
+                            false,
+                        )
                     }
                 } else {
                     tracing::debug!(
@@ -6793,11 +6800,7 @@ impl CodexInner {
         let child_agent_id = handle.agent_id.clone();
         let spawned_agent = child_agent_id.clone();
         let (raw_event_tx, raw_event_rx) = mpsc::unbounded_channel();
-        spawn_codex_subagent_event_bridge(
-            raw_event_rx,
-            handle.event_tx,
-            handle.model_usage_tx,
-        );
+        spawn_codex_subagent_event_bridge(raw_event_rx, handle.event_tx, handle.model_usage_tx);
         let emitter = Arc::new(TurnEmitter::new_for_agent(
             raw_event_tx,
             AgentName(CODEX_AGENT_NAME),
@@ -10531,14 +10534,13 @@ fn normalize_codex_collaboration_chat_event(event: ChatEvent) -> ChatEvent {
             if let protocol::ToolExecutionResult::Other { result } = &completion.tool_result
                 && codex_is_collaboration_item(result)
             {
-                completion.tool_result = serde_json::from_value(
-                    codex_public_collaboration_result_with_name(
+                completion.tool_result =
+                    serde_json::from_value(codex_public_collaboration_result_with_name(
                         &completion.tool_name,
                         result,
                         completion.success,
-                    ),
-                )
-                .expect("Codex collaboration result projection must be canonical");
+                    ))
+                    .expect("Codex collaboration result projection must be canonical");
                 if !completion.success {
                     completion.error = Some(format!("{} failed", completion.tool_name));
                 }
@@ -11190,6 +11192,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, MutexGuard, OnceLock};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tokio::time::timeout;
 
     static CODEX_FAKE_APP_SERVER_SERIAL: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
 
@@ -15061,16 +15064,10 @@ for line in sys.stdin:
                     self.next_agent_id.fetch_add(1, Ordering::Relaxed)
                 ));
                 let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
-                let (model_usage_tx, mut model_usage_rx) =
-                    tokio::sync::mpsc::unbounded_channel();
-                let (total_usage_tx, mut total_usage_rx) =
-                    tokio::sync::mpsc::unbounded_channel();
-                tokio::spawn(async move {
-                    while model_usage_rx.recv().await.is_some() {}
-                });
-                tokio::spawn(async move {
-                    while total_usage_rx.recv().await.is_some() {}
-                });
+                let (model_usage_tx, mut model_usage_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (total_usage_tx, mut total_usage_rx) = tokio::sync::mpsc::unbounded_channel();
+                tokio::spawn(async move { while model_usage_rx.recv().await.is_some() {} });
+                tokio::spawn(async move { while total_usage_rx.recv().await.is_some() {} });
                 let events_by_agent_id = Arc::clone(&self.events_by_agent_id);
                 let agent_id_for_events = agent_id.clone();
                 tokio::spawn(async move {
@@ -17244,14 +17241,18 @@ Do not describe the tool, and do not skip the tool call."#;
                 "child token usage must not emit into parent stream: {parent_events:?}"
             );
 
-            let subagent_events = drain_events(&mut subagent_rx);
+            let mut subagent_events = Vec::new();
+            while let Ok(event) = subagent_rx.try_recv() {
+                subagent_events.push(event);
+            }
             let model_usage = subagent_events
                 .iter()
                 .find(|event| {
-                    event.get("kind").and_then(Value::as_str)
-                        == Some("ModelRequestTokenUsage")
+                    event.get("kind").and_then(Value::as_str) == Some("ModelRequestTokenUsage")
                 })
-                .expect("authoritative child model-request usage");
+                .unwrap_or_else(|| {
+                    panic!("authoritative child model-request usage; events={subagent_events:#?}")
+                });
             assert_eq!(
                 model_usage
                     .pointer("/data/request/total_tokens")
@@ -21609,9 +21610,7 @@ Do not describe the tool, and do not skip the tool call."#;
             Some("wait")
         );
         assert_eq!(
-            request
-                .pointer("/args/agent_count")
-                .and_then(Value::as_u64),
+            request.pointer("/args/agent_count").and_then(Value::as_u64),
             Some(1)
         );
         assert_eq!(

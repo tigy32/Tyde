@@ -31,11 +31,7 @@ pub(crate) fn child_name_is_better(current: &str, candidate: &str) -> bool {
 
 fn child_name_quality(name: &str) -> u8 {
     let trimmed = name.trim();
-    let normalized = trimmed
-        .to_ascii_lowercase()
-        .replace('-', " ")
-        .replace('_', " ")
-        .replace('/', " ");
+    let normalized = trimmed.to_ascii_lowercase().replace(['-', '_', '/'], " ");
     if normalized.is_empty() {
         return 0;
     }
@@ -44,13 +40,7 @@ fn child_name_quality(name: &str) -> u8 {
     }
     if matches!(
         normalized.as_str(),
-        "agent"
-            | "child"
-            | "child agent"
-            | "sub agent"
-            | "task"
-            | "spawnagent"
-            | "general purpose"
+        "agent" | "child" | "child agent" | "sub agent" | "task" | "spawnagent" | "general purpose"
     ) {
         return 1;
     }

@@ -212,13 +212,9 @@ async fn supervisor_kicks_agent_after_error_and_respects_kick_budget() {
     )
     .await;
 
-    let agent_stream = spawn_supervised_agent(
-        &mut fixture,
-        "supervised-error-agent",
-        false,
-    )
-    .await
-    .instance_stream;
+    let agent_stream = spawn_supervised_agent(&mut fixture, "supervised-error-agent", false)
+        .await
+        .instance_stream;
 
     fixture
         .client
@@ -394,10 +390,7 @@ async fn supervisor_settings_round_trip_over_the_wire() {
     assert!(payload.settings.supervisor.enabled);
     assert!(payload.settings.supervisor.auto_compact_on_success);
     assert_eq!(
-        payload
-            .settings
-            .supervisor
-            .auto_compact_min_context_tokens,
+        payload.settings.supervisor.auto_compact_min_context_tokens,
         225_000
     );
     assert_eq!(payload.settings.supervisor.max_kicks_per_task, 7);

@@ -13,7 +13,8 @@ use uuid::Uuid;
 
 use crate::agent::customization::ResolvedSpawnConfig;
 use crate::agent::{
-    AgentActorRuntimeResources, AgentHandle, now_ms, spawn_agent_actor, spawn_relay_agent_actor,
+    AgentActorRuntimeResources, AgentHandle, RelayEventReceivers, now_ms, spawn_agent_actor,
+    spawn_relay_agent_actor,
 };
 use crate::agent_control_mcp::{
     AGENT_CONTROL_AWAIT_MCP_SERVER_NAME, AGENT_CONTROL_MCP_SERVER_NAME, AgentControlMcpHandle,
@@ -339,9 +340,11 @@ impl AgentRegistry {
         let handle = spawn_relay_agent_actor(
             agent_id.clone(),
             start.clone(),
-            events,
-            model_usage,
-            total_usage,
+            RelayEventReceivers {
+                events,
+                model_usage,
+                total_usage,
+            },
             session_store,
             request.session_id,
             status_handle.clone(),

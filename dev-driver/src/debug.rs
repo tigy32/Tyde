@@ -11,9 +11,9 @@ use devtools_protocol::{
     BoundedDebugOutput, DebugOutputSlice, UiDebugRequest, UiDebugResponse,
     dev_instance_mutable_paths,
 };
+use protocol::{Project, ProjectId, ProjectRootPath, ProjectSource};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use protocol::{Project, ProjectId, ProjectRootPath, ProjectSource};
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
@@ -671,19 +671,18 @@ async fn debug_events(
         let record = instances
             .get(&input.instance_id)
             .ok_or_else(|| format!("unknown instance_id '{}'", input.instance_id))?;
-        let output = record
+        record
             .startup_output
             .lock()
             .expect("startup output mutex poisoned")
-            .read(input.cursor, max_bytes);
-        output
+            .read(input.cursor, max_bytes)
     };
     Ok(debug_events_result(input.instance_id, output))
 }
 
 fn debug_events_result(instance_id: String, output: DebugOutputSlice) -> DebugEventsResult {
     let events = (!output.output.is_empty())
-        .then(|| DebugOutputEvent {
+        .then_some(DebugOutputEvent {
             cursor: output.cursor,
             kind: "process_output",
             output: output.output,
@@ -980,10 +979,7 @@ fn append_startup_output(output: &StdMutex<BoundedDebugOutput>, bytes: &[u8]) {
     output.append(bytes);
 }
 
-fn with_startup_diagnostics(
-    message: String,
-    output: &StdMutex<BoundedDebugOutput>,
-) -> String {
+fn with_startup_diagnostics(message: String, output: &StdMutex<BoundedDebugOutput>) -> String {
     let output = output.lock().expect("startup output mutex poisoned");
     let diagnostics = if output.is_empty() {
         "startup output was empty".to_string()
@@ -1335,7 +1331,10 @@ mod tests {
         for entry in devtools_protocol::DEV_INSTANCE_MUTABLE_PATHS {
             let expected_path = store_dir.join(entry.relative_path);
             assert_eq!(
-                configured.get(std::ffi::OsStr::new(entry.env)).copied().flatten(),
+                configured
+                    .get(std::ffi::OsStr::new(entry.env))
+                    .copied()
+                    .flatten(),
                 Some(expected_path.as_os_str()),
                 "launcher did not isolate {}",
                 entry.env
@@ -1356,7 +1355,11 @@ mod tests {
         let records = contents["records"].as_object().expect("records object");
         assert_eq!(records.len(), 1);
         assert_eq!(
-            records["dev-instance"]["source"]["Standalone"]["roots"][0],
+            records["dev-instance"]["source"]["kind"],
+            Value::String("standalone".to_owned())
+        );
+        assert_eq!(
+            records["dev-instance"]["source"]["roots"][0],
             Value::String(project.path().display().to_string())
         );
     }

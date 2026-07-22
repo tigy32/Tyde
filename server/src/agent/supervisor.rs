@@ -82,8 +82,7 @@ pub(crate) fn supervision_context_snapshot(event_log: &[Envelope]) -> Supervisio
                 if latest_assistant_message_id.as_ref() == Some(&update.message_id)
                     && let Some(context_breakdown) = update.context_breakdown
                 {
-                    snapshot.current_context_input_tokens =
-                        Some(context_breakdown.input_tokens);
+                    snapshot.current_context_input_tokens = Some(context_breakdown.input_tokens);
                 }
             }
             ChatEvent::OperationCancelled(_) => {
@@ -599,9 +598,7 @@ mod tests {
 
         log.push(envelope(
             4,
-            ChatEvent::MessageAdded(assistant_message_with_context(
-                "newest", "new answer", None,
-            )),
+            ChatEvent::MessageAdded(assistant_message_with_context("newest", "new answer", None)),
         ));
         assert_eq!(
             supervision_context_snapshot(&log).current_context_input_tokens,

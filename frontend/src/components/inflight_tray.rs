@@ -122,9 +122,9 @@ fn backend_label(kind: BackendKind) -> &'static str {
 fn derive_child_status(state: &AppState, agent: &crate::state::AgentInfo) -> ChildAgentStatus {
     let derived = state.compaction_in_progress.with(|compaction| {
         state.agent_turn_active.with(|turn_active| {
-            state.streaming_text.with(|streaming| {
-                derive_agent_state(agent, streaming, turn_active, compaction)
-            })
+            state
+                .streaming_text
+                .with(|streaming| derive_agent_state(agent, streaming, turn_active, compaction))
         })
     });
     match derived {

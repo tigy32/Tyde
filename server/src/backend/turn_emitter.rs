@@ -2811,7 +2811,9 @@ mod tests {
         assert_protocol_valid(&events);
         let completions = events
             .iter()
-            .filter(|event| event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted"))
+            .filter(|event| {
+                event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
+            })
             .collect::<Vec<_>>();
         assert_eq!(completions.len(), 1);
         assert_eq!(
@@ -2821,7 +2823,9 @@ mod tests {
             Some("tool-background")
         );
         assert_eq!(
-            completions[0].pointer("/data/success").and_then(Value::as_bool),
+            completions[0]
+                .pointer("/data/success")
+                .and_then(Value::as_bool),
             Some(true)
         );
     }

@@ -7444,7 +7444,7 @@ async fn uds_host_owner_waits_for_spawn_operation_drain_on_entry_failure() {
 }
 
 #[tokio::test]
-async fn failed_generated_name_keeps_agent_and_emits_typed_nonfatal_error() {
+async fn failed_generated_name_keeps_fallback_without_user_error() {
     let mut fixture = Fixture::new().await;
     let gate = fixture.install_agent_name_test_gate().await;
 
@@ -7485,40 +7485,42 @@ async fn failed_generated_name_keeps_agent_and_emits_typed_nonfatal_error() {
     assert_eq!(start.name, new_agent.name);
 
     gate.release_one();
-    let error = loop {
+    assert_eq!(gate.wait_until_completed().await, 0);
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("name failure publication barrier");
+    loop {
         let env = fixture
             .client
             .next_event()
             .await
-            .expect("read typed generated-name failure")
+            .expect("read name failure publication barrier")
             .expect("connection remained open");
-        assert_ne!(
-            env.kind,
-            FrameKind::CommandError,
-            "name generation failure must not become a router frame"
+        assert!(
+            env.kind != FrameKind::AgentError || env.stream != new_agent.instance_stream,
+            "optional name generation failure must not enter the conversation"
         );
-        if env.kind == FrameKind::AgentError && env.stream == new_agent.instance_stream {
-            break env
-                .parse_payload::<AgentErrorPayload>()
-                .expect("parse generated-name AgentError");
+        if env.kind == FrameKind::SessionList {
+            break;
         }
-    };
-    assert_eq!(error.code, AgentErrorCode::Internal);
-    assert!(!error.fatal);
-    assert!(error.message.contains("mock agent name generation failure"));
-    assert_eq!(gate.wait_until_completed().await, 0);
+    }
 
     let (mut late_client, bootstrap) = fixture.connect_with_bootstrap().await;
     let late_agent = bootstrapped_agent(&bootstrap, &new_agent.agent_id);
     assert_eq!(late_agent.name, new_agent.name);
-    let replayed = expect_agent_error_containing(
+    let replay = expect_raw_agent_bootstrap_on_stream(
         &mut late_client,
         &late_agent.instance_stream,
-        "mock agent name generation failure",
-        "replayed generated-name failure",
+        "fallback generated-name replay",
     )
     .await;
-    assert!(!replayed.fatal);
+    assert!(replay.events.iter().all(|event| !matches!(
+        event,
+        AgentBootstrapEvent::AgentError(error)
+            if error.message.contains("mock agent name generation failure")
+    )));
 }
 
 #[tokio::test]

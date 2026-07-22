@@ -281,9 +281,10 @@ pub fn ToolCardView(owner_agent_ref: AgentRef, entry: ToolRequestEntry) -> impl 
 
     let is_completed = entry.result.is_some();
     let success = entry.result.as_ref().map(|r| r.success).unwrap_or(false);
-    let cancelled = entry.result.as_ref().is_some_and(|result| {
-        matches!(&result.tool_result, ToolExecutionResult::Cancelled { .. })
-    });
+    let cancelled = entry
+        .result
+        .as_ref()
+        .is_some_and(|result| matches!(&result.tool_result, ToolExecutionResult::Cancelled { .. }));
     let result_summary = entry
         .result
         .as_ref()
