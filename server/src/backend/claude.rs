@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -53,6 +54,7 @@ struct SubAgentStream {
     /// progress updates so the frontend can link to the sub-agent view.
     agent_id: protocol::AgentId,
     agent_name: String,
+    name_update_tx: Option<mpsc::UnboundedSender<String>>,
     /// Emitter of the PARENT agent, used for the progress updates above.
     parent_emitter: Arc<TurnEmitter>,
     last_progress_emit: std::time::Instant,
@@ -62,6 +64,12 @@ struct SubAgentStream {
     /// be finalized on the `task_notification` completion frame rather than
     /// torn down early when that placeholder tool_result arrives.
     execution: SubAgentExecution,
+    /// Lifetime telemetry. `ClaudeStdoutSummary::tool_calls` is phase-local
+    /// and is cleared after every tool result, so it cannot back the parent
+    /// card's final count.
+    seen_tool_call_ids: HashSet<String>,
+    last_tool_name: Option<String>,
+    reported_total_tokens: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -671,6 +679,10 @@ struct ClaudeSystemFrame {
     #[serde(default)]
     tool_use_id: Option<String>,
     #[serde(default)]
+    output_file: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
     workflow_name: Option<String>,
     /// Partial-update object on `task_updated` frames. Only `status` is
     /// consumed; the CLI also sends fields like `end_time`.
@@ -691,6 +703,10 @@ struct ClaudeSystemFrame {
 struct ClaudeTaskPatch {
     #[serde(default)]
     status: Option<String>,
+    #[serde(default)]
+    output_file: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1174,8 +1190,7 @@ impl ClaudeInner {
     }
 
     /// Start a user turn, or report that the backend is busy with a turn it
-    /// already has in flight (e.g. one it opened on its own initiative after a
-    /// sub-agent wakeup). On `Busy` nothing is emitted or consumed — the
+    /// already has in flight. On `Busy` nothing is emitted or consumed — the
     /// caller retains the message and requeues it above the backend.
     async fn start_turn(
         self: Arc<Self>,
@@ -1405,6 +1420,7 @@ impl ClaudeInner {
                         known_context_window,
                         result_model_hint.or(model_hint),
                         turn_usage,
+                        false,
                     )
                     .await
                     && summary.emitted_phase_count == 0
@@ -1424,6 +1440,7 @@ impl ClaudeInner {
                     known_context_window,
                     None,
                     turn_usage,
+                    true,
                 )
                 .await;
                 let quiesced_waiters = self.clear_active_turn(turn_id).await;
@@ -1447,6 +1464,7 @@ impl ClaudeInner {
                         known_context_window,
                         None,
                         turn_usage,
+                        false,
                     )
                     .await;
                 let detail = summary.error_message().unwrap_or(error);
@@ -1460,61 +1478,6 @@ impl ClaudeInner {
         if self.take_restart_process_after_turn().await {
             self.shutdown_process().await;
         }
-    }
-
-    /// Open a turn for output the Claude CLI produced on its own initiative,
-    /// with no pending user message — e.g. when the model resumes after a
-    /// background sub-agent finishes. Mirrors the scaffolding `start_turn`
-    /// builds (allocate a turn id, emit typing + stream start, spawn the
-    /// finalizer that awaits the outcome) so the unsolicited turn flows
-    /// through the exact same completion path as a user-initiated one.
-    /// Returns `None` if a turn is somehow already active.
-    async fn begin_cli_initiated_turn(self: &Arc<Self>) -> Option<u64> {
-        let (turn_id, ephemeral, conversation_history_bytes, model_hint, outcome_rx) = {
-            let mut state = self.state.lock().await;
-            if state.closing || state.active_turn.is_some() {
-                return None;
-            }
-            let turn_id = CLAUDE_TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let (outcome_tx, outcome_rx) = oneshot::channel();
-            state.active_turn = Some(ActiveTurn {
-                id: turn_id,
-                outcome_tx: Some(outcome_tx),
-                interrupt_requested: false,
-                pending_ask_user_question: None,
-                pending_exit_plan_mode: None,
-                quiesced_waiters: Vec::new(),
-            });
-            (
-                turn_id,
-                state.ephemeral,
-                state.conversation_bytes_total,
-                state.model.clone(),
-                outcome_rx,
-            )
-        };
-
-        let message_id = format!("claude-msg-{turn_id}");
-        self.emit_typing_status(true);
-        self.emit_stream_start(&message_id, model_hint.clone());
-
-        let this = Arc::clone(self);
-        tokio::spawn(async move {
-            let outcome = outcome_rx.await.unwrap_or_else(|_| TurnOutcome::Failed {
-                summary: ClaudeStdoutSummary::default(),
-                error: "Claude turn ended before returning a result".to_string(),
-            });
-            this.finalize_turn(
-                turn_id,
-                outcome,
-                ephemeral,
-                conversation_history_bytes,
-                model_hint,
-            )
-            .await;
-        });
-
-        Some(turn_id)
     }
 
     async fn write_turn_to_persistent_process(
@@ -2522,6 +2485,12 @@ impl ClaudeInner {
         } else {
             None
         };
+        let tool_result = claude_public_tool_result(tool_name, success, tool_result);
+        let error = if is_subagent_tool_name(tool_name) && !success {
+            Some("Agent task failed".to_owned())
+        } else {
+            error
+        };
         let completed = ToolCompletedPayload {
             tool_call_id,
             tool_name,
@@ -2705,6 +2674,7 @@ impl ClaudeInner {
         known_context_window: Option<u64>,
         model_hint: Option<String>,
         turn_usage: Option<ClaudeTurnUsage>,
+        cancelled: bool,
     ) -> bool {
         // The Context Usage breakdown must reflect the context-window fill — the
         // last API call's prompt footprint — which lives on `summary.usage`
@@ -2757,11 +2727,7 @@ impl ClaudeInner {
             for tool_call in &phase.tool_calls {
                 emit_tool_request_with_tracking(summary, self, tool_call);
             }
-            auto_close_unresolved_tool_requests(
-                summary,
-                self,
-                "Claude ended the turn before returning a result for this streamed tool request.",
-            );
+            close_terminal_tool_requests(summary, self, cancelled);
             return true;
         }
 
@@ -2787,11 +2753,7 @@ impl ClaudeInner {
                     Some(context_breakdown),
                 );
             }
-            auto_close_unresolved_tool_requests(
-                summary,
-                self,
-                "Claude ended the turn before returning a result for this streamed tool request.",
-            );
+            close_terminal_tool_requests(summary, self, cancelled);
             return true;
         }
 
@@ -2814,11 +2776,7 @@ impl ClaudeInner {
         }
 
         if !summary.unresolved_tool_requests.is_empty() {
-            auto_close_unresolved_tool_requests(
-                summary,
-                self,
-                "Claude ended the turn before returning a result for this streamed tool request.",
-            );
+            close_terminal_tool_requests(summary, self, cancelled);
             return true;
         }
 
@@ -3196,6 +3154,7 @@ async fn read_claude_stdout_persistent(
     let mut subagent_streams: HashMap<String, SubAgentStream> = HashMap::new();
     let mut known_subagent_ids = HashSet::new();
     let mut pending_subagent_prompts: HashMap<u64, PendingSubAgentPrompt> = HashMap::new();
+    let mut local_agent_tasks: HashMap<String, String> = HashMap::new();
     // Keyed by task_id; lives at loop scope (not per-turn) because a
     // workflow's task frames keep arriving after its turn completes.
     let mut workflow_runs: HashMap<String, WorkflowRunEntry> = HashMap::new();
@@ -3233,7 +3192,12 @@ async fn read_claude_stdout_persistent(
         if handle_workflow_task_frame(&value, &mut workflow_runs, &inner.emitter) {
             continue;
         }
-        if handle_background_bash_task_frame(&value, &mut background_tasks, &inner.emitter) {
+        if handle_background_bash_task_frame_with_owners(
+            &value,
+            &mut background_tasks,
+            &inner.emitter,
+            &subagent_streams,
+        ) {
             continue;
         }
 
@@ -3255,6 +3219,11 @@ async fn read_claude_stdout_persistent(
                 &mut subagent_streams,
             )
             .await;
+            observe_local_agent_task_usage(
+                &value,
+                &mut local_agent_tasks,
+                &mut subagent_streams,
+            );
             known_subagent_ids.extend(subagent_streams.keys().cloned());
             // A background sub-agent completes via `task_notification`, which
             // arrives on the parent stream after the parent's turn `result`.
@@ -3270,6 +3239,17 @@ async fn read_claude_stdout_persistent(
                 parent_id,
                 &value,
             );
+            for entry in background_tasks
+                .values_mut()
+                .filter(|entry| entry.owner.is_none())
+            {
+                entry.owner = resolve_background_task_owner(
+                    &entry.tool_use_id,
+                    entry.parent_tool_use_id.as_deref(),
+                    &inner.emitter,
+                    &subagent_streams,
+                );
+            }
             continue;
         }
 
@@ -3286,36 +3266,26 @@ async fn read_claude_stdout_persistent(
         }
 
         let _turn_event_guard = inner.turn_event_gate.lock().await;
-        let (turn_id, model_hint) =
-            match prepare_persistent_stdout_turn(&inner, &mut turn_state).await {
-                Some(turn) => turn,
-                None => {
-                    // No user-initiated turn is active, yet the CLI is emitting
-                    // fresh turn output. This happens when the model resumes on
-                    // its own after a background sub-agent finishes: the parent
-                    // turn's `result` already completed, then a new `init` +
-                    // assistant + `result` sequence arrives. Adopt it as a
-                    // first-class turn so the follow-up isn't silently dropped.
-                    if !is_cli_turn_start_event(&value) {
-                        continue;
-                    }
-                    if inner.begin_cli_initiated_turn().await.is_none() {
-                        continue;
-                    }
-                    match prepare_persistent_stdout_turn(&inner, &mut turn_state).await {
-                        Some(turn) => turn,
-                        None => continue,
-                    }
-                }
-            };
+        let Some((turn_id, model_hint)) =
+            prepare_persistent_stdout_turn(&inner, &mut turn_state).await
+        else {
+            // Background-child completion is already materialized on the
+            // child's stream above. Claude may subsequently wake the parent
+            // and emit an unsolicited init/assistant/result sequence; it has
+            // no user turn to own it, so it must not become a duplicate parent
+            // response.
+            continue;
+        };
 
-        consume_claude_stream_value(
+        let interrupt_requested = inner.active_turn_interrupted(turn_id).await;
+        consume_claude_stream_value_with_interrupt(
             &value,
             &mut turn_state.summary,
             &mut turn_state.segment,
             &inner,
             &turn_state.base_message_id,
             &mut turn_state.current_message_id,
+            interrupt_requested,
         );
 
         if subagent_emitter.is_some() {
@@ -3368,22 +3338,6 @@ async fn read_claude_stdout_persistent(
             .await;
     }
     inner.mark_process_exited().await;
-}
-
-/// Whether a parent-stream frame (already excluded from sub-agent routing)
-/// marks the start of fresh turn content. Used to decide when to adopt
-/// CLI-initiated output as a new turn. Deliberately excludes lone `result`
-/// and `user` frames so a stray terminal frame never spawns an empty turn.
-fn is_cli_turn_start_event(value: &Value) -> bool {
-    let event_type = value
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    match event_type {
-        "assistant" | "stream_event" | "event" => true,
-        "system" => value.get("subtype").and_then(Value::as_str) == Some("init"),
-        other => is_stream_event_type(other),
-    }
 }
 
 async fn prepare_persistent_stdout_turn(
@@ -4111,6 +4065,10 @@ fn consume_subagent_event(stream: &mut SubAgentStream, value: &Value) {
         &mut sa_message_id,
     );
     stream.message_id = sa_message_id;
+    for tool in &stream.summary.tool_calls {
+        stream.seen_tool_call_ids.insert(tool.id.clone());
+        stream.last_tool_name = Some(tool.name.clone());
+    }
     maybe_emit_subagent_progress(stream);
 }
 
@@ -4125,12 +4083,8 @@ fn subagent_progress_data(stream: &SubAgentStream, completed: bool) -> ToolProgr
         update: ToolProgressUpdate::SubAgent(protocol::SubAgentProgress {
             agent_id: stream.agent_id.clone(),
             agent_name: stream.agent_name.clone(),
-            last_tool_name: stream
-                .summary
-                .tool_calls
-                .last()
-                .map(|tool| tool.name.clone()),
-            tool_calls: stream.summary.tool_calls.len() as u64,
+            last_tool_name: stream.last_tool_name.clone(),
+            tool_calls: stream.seen_tool_call_ids.len() as u64,
             completed,
         }),
     }
@@ -4184,6 +4138,13 @@ async fn ensure_subagent_stream(
         if let Some(parent_tool_name) = parent_tool_name {
             stream.parent_tool_name = parent_tool_name;
         }
+        if crate::sub_agent::child_name_is_better(&stream.agent_name, &name) {
+            stream.agent_name = name.clone();
+            if let Some(tx) = &stream.name_update_tx {
+                let _ = tx.send(name);
+            }
+            parent_emitter.tool_progress(&subagent_progress_data(stream, false));
+        }
         return;
     }
 
@@ -4210,7 +4171,12 @@ async fn ensure_subagent_stream(
         }
     };
     let (raw_event_tx, raw_event_rx) = mpsc::unbounded_channel();
-    spawn_claude_subagent_event_bridge(raw_event_rx, handle.event_tx.clone());
+    spawn_claude_subagent_event_bridge(
+        raw_event_rx,
+        handle.event_tx.clone(),
+        handle.model_usage_tx.clone(),
+        handle.total_usage_tx.clone(),
+    );
 
     // Create a ClaudeInner that routes events to the sub-agent's channel.
     let sa_inner = Arc::new(ClaudeInner {
@@ -4238,9 +4204,13 @@ async fn ensure_subagent_stream(
         parent_tool_name: parent_tool_name.unwrap_or_else(|| "Task".to_owned()),
         agent_id: handle.agent_id,
         agent_name: name,
+        name_update_tx: handle.name_update_tx,
         parent_emitter: parent_emitter.clone(),
         last_progress_emit: std::time::Instant::now(),
         execution,
+        seen_tool_call_ids: HashSet::new(),
+        last_tool_name: None,
+        reported_total_tokens: None,
     };
     // Unthrottled spawn update: the Task card learns the sub-agent's id
     // (for its "Open agent" link) as soon as the agent exists.
@@ -4495,7 +4465,132 @@ fn handle_workflow_task_frame(
 
 struct BackgroundTaskEntry {
     tool_use_id: String,
+    owner: Option<Arc<TurnEmitter>>,
+    parent_tool_use_id: Option<String>,
     state: BackgroundTaskState,
+    output: Option<ClaudeRunCommandResult>,
+    output_path: Option<String>,
+}
+
+fn background_task_parent_tool_use_id(value: &Value) -> Option<&str> {
+    extract_parent_tool_use_id(value)
+        .or_else(|| value.pointer("/data/parent_tool_use_id").and_then(Value::as_str))
+        .or_else(|| value.pointer("/message/parent_tool_use_id").and_then(Value::as_str))
+        .filter(|id| !id.is_empty())
+}
+
+fn resolve_background_task_owner(
+    tool_use_id: &str,
+    parent_tool_use_id: Option<&str>,
+    root_emitter: &Arc<TurnEmitter>,
+    subagent_streams: &HashMap<String, SubAgentStream>,
+) -> Option<Arc<TurnEmitter>> {
+    let explicit_owner = parent_tool_use_id.and_then(|parent_id| subagent_streams.get(parent_id));
+    let inferred_owners = subagent_streams
+        .values()
+        .filter(|stream| {
+            stream.inner.emitter.has_pending_tool_request(tool_use_id)
+                || stream.summary.tool_call_by_id.contains_key(tool_use_id)
+                || stream
+                    .summary
+                    .tool_calls
+                    .iter()
+                    .any(|tool| tool.id == tool_use_id)
+        })
+        .collect::<Vec<_>>();
+    if inferred_owners.len() == 1 {
+        return Some(Arc::clone(&inferred_owners[0].inner.emitter));
+    }
+    if inferred_owners.len() > 1 {
+        return None;
+    }
+    if let Some(stream) = explicit_owner {
+        return Some(Arc::clone(&stream.inner.emitter));
+    }
+    root_emitter
+        .has_pending_tool_request(tool_use_id)
+        .then(|| Arc::clone(root_emitter))
+}
+
+fn refresh_background_task_owner(
+    value: &Value,
+    entry: &mut BackgroundTaskEntry,
+    root_emitter: &Arc<TurnEmitter>,
+    subagent_streams: &HashMap<String, SubAgentStream>,
+) {
+    if let Some(parent_tool_use_id) = background_task_parent_tool_use_id(value) {
+        entry.parent_tool_use_id = Some(parent_tool_use_id.to_owned());
+    }
+    if entry.owner.is_none() {
+        entry.owner = resolve_background_task_owner(
+            &entry.tool_use_id,
+            entry.parent_tool_use_id.as_deref(),
+            root_emitter,
+            subagent_streams,
+        );
+    }
+}
+
+const BACKGROUND_COMMAND_OUTPUT_LIMIT: u64 = 64 * 1024;
+
+fn capture_background_command_output(
+    output_file: Option<&str>,
+) -> Result<ClaudeRunCommandResult, &'static str> {
+    let Some(raw_path) = output_file.map(str::trim).filter(|path| !path.is_empty()) else {
+        return Err("Claude did not provide a structured command output file");
+    };
+    let temp_root = std::fs::canonicalize(std::env::temp_dir())
+        .map_err(|_| "Claude command output file was unavailable")?;
+    let path = std::fs::canonicalize(raw_path)
+        .map_err(|_| "Claude command output file was unavailable")?;
+    if !path.starts_with(&temp_root) {
+        return Err("Claude command output path was outside the temporary directory");
+    }
+    let metadata = std::fs::metadata(&path)
+        .map_err(|_| "Claude command output file was unavailable")?;
+    if !metadata.is_file() {
+        return Err("Claude command output file was unavailable");
+    }
+    if metadata.len() > BACKGROUND_COMMAND_OUTPUT_LIMIT {
+        return Err("Claude command output exceeded the capture limit");
+    }
+    let file = std::fs::File::open(path)
+        .map_err(|_| "Claude command output file was unavailable")?;
+    let mut bytes = Vec::with_capacity(BACKGROUND_COMMAND_OUTPUT_LIMIT as usize);
+    file.take(BACKGROUND_COMMAND_OUTPUT_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "Claude command output file was unavailable")?;
+    if bytes.len() as u64 > BACKGROUND_COMMAND_OUTPUT_LIMIT {
+        return Err("Claude command output exceeded the capture limit");
+    }
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| "Claude command output was not structurally available")?;
+    let Value::Object(map) = &value else {
+        return Err("Claude command output was not structurally available");
+    };
+    let has_structured_field = [
+        "exit_code",
+        "exitCode",
+        "code",
+        "return_code",
+        "returnCode",
+        "stdout",
+        "output",
+        "std_out",
+        "stderr",
+        "error",
+        "std_err",
+    ]
+    .iter()
+    .any(|key| map.contains_key(*key));
+    if !has_structured_field {
+        return Err("Claude command output was not structurally available");
+    }
+    Ok(parse_run_command_result_from_value(&value, 0).unwrap_or(ClaudeRunCommandResult {
+        exit_code: 0,
+        stdout: String::new(),
+        stderr: String::new(),
+    }))
 }
 
 fn emit_background_task_snapshot(emitter: &TurnEmitter, entry: &BackgroundTaskEntry) {
@@ -4503,6 +4598,66 @@ fn emit_background_task_snapshot(emitter: &TurnEmitter, entry: &BackgroundTaskEn
         tool_call_id: entry.tool_use_id.clone(),
         tool_name: "Bash".to_string(),
         update: ToolProgressUpdate::BackgroundTask(entry.state.clone()),
+    });
+}
+
+fn emit_background_task_completion(emitter: &TurnEmitter, entry: &BackgroundTaskEntry) {
+    let summary = entry.state.summary.as_deref().unwrap_or_default();
+    if let Some(result) = entry.output.as_ref()
+        && entry.state.status != BackgroundTaskStatus::Stopped
+    {
+        emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id: &entry.tool_use_id,
+            tool_name: "Bash",
+            tool_result: result.as_tool_result(),
+            success: result.exit_code == 0,
+            error: (result.exit_code != 0)
+                .then_some("Background command exited non-zero"),
+        });
+        return;
+    }
+    let (success, tool_result, error) = match entry.state.status {
+        BackgroundTaskStatus::Completed => {
+            (
+                true,
+                json!({
+                    "kind": "RunCommand",
+                    "exit_code": 0,
+                    "stdout": "",
+                    "stderr": "",
+                }),
+                None,
+            )
+        }
+        BackgroundTaskStatus::Stopped => (
+            false,
+            json!({
+                "kind": "Cancelled",
+                "message": "Background command stopped",
+            }),
+            None,
+        ),
+        BackgroundTaskStatus::Failed | BackgroundTaskStatus::Unknown => {
+            let message = normalize_nonempty(summary)
+                .unwrap_or_else(|| "Background command failed".to_string());
+            (
+                false,
+                json!({
+                    "kind": "Error",
+                    "short_message": first_line_trimmed(&message, 140),
+                    "detailed_message": message,
+                }),
+                Some("Background command failed".to_string()),
+            )
+        }
+        BackgroundTaskStatus::Running => return,
+    };
+    emitter.tool_completed(ToolCompletedPayload {
+        tool_call_id: &entry.tool_use_id,
+        tool_name: "Bash",
+        tool_result,
+        success,
+        error: error.as_deref(),
     });
 }
 
@@ -4533,11 +4688,14 @@ fn map_background_task_patch_status(raw: &str) -> BackgroundTaskStatus {
 /// `task_notification {status: "stopped"}`. There are no `task_progress`
 /// frames for bash tasks, and `task_updated`/`task_notification` carry
 /// no task_type — membership in the registry seeded by `task_started` is
-/// the filter.
-fn handle_background_bash_task_frame(
+/// the filter. Ownership may be absent on the start frame, so it is resolved
+/// from positive tool-request evidence and retried on later lifecycle frames.
+/// Once resolved, the owner remains fixed for the detached lifetime.
+fn handle_background_bash_task_frame_with_owners(
     value: &Value,
     background_tasks: &mut HashMap<String, BackgroundTaskEntry>,
-    emitter: &TurnEmitter,
+    root_emitter: &Arc<TurnEmitter>,
+    subagent_streams: &HashMap<String, SubAgentStream>,
 ) -> bool {
     if value.get("type").and_then(Value::as_str) != Some("system") {
         return false;
@@ -4559,16 +4717,37 @@ fn handle_background_bash_task_frame(
                 tracing::warn!("ignoring local_bash task_started without tool_use_id: {value}");
                 return true;
             };
+            let parent_tool_use_id = background_task_parent_tool_use_id(value).map(str::to_owned);
+            let owner = resolve_background_task_owner(
+                &tool_use_id,
+                parent_tool_use_id.as_deref(),
+                root_emitter,
+                subagent_streams,
+            );
             let entry = BackgroundTaskEntry {
                 tool_use_id,
+                owner,
+                parent_tool_use_id,
                 state: BackgroundTaskState {
                     task_id: task_id.clone(),
                     description: system.description.as_deref().and_then(normalize_nonempty),
                     status: BackgroundTaskStatus::Running,
                     summary: None,
+                    output_unavailable: None,
                 },
+                output: None,
+                output_path: None,
             };
-            emit_background_task_snapshot(emitter, &entry);
+            tracing::debug!(
+                task_id,
+                tool_use_id = entry.tool_use_id,
+                parent_tool_use_id = entry.parent_tool_use_id.as_deref().unwrap_or(""),
+                owner_resolved = entry.owner.is_some(),
+                "registered background Bash task ownership"
+            );
+            if let Some(owner) = entry.owner.as_deref() {
+                emit_background_task_snapshot(owner, &entry);
+            }
             background_tasks.insert(task_id, entry);
             true
         }
@@ -4576,23 +4755,31 @@ fn handle_background_bash_task_frame(
             let Some(entry) = background_tasks.get_mut(&task_id) else {
                 return false;
             };
-            let Some(status) = system
-                .patch
-                .as_ref()
-                .and_then(|patch| patch.status.as_deref())
-            else {
+            refresh_background_task_owner(value, entry, root_emitter, subagent_streams);
+            let patch = system.patch.as_ref();
+            if let Some(path) = patch
+                .and_then(|patch| patch.output_file.as_ref().or(patch.path.as_ref()))
+                .map(String::as_str)
+                .and_then(normalize_nonempty)
+            {
+                entry.output_path = Some(path);
+            }
+            let Some(status) = patch.and_then(|patch| patch.status.as_deref()) else {
                 // A patch with no status (e.g. output-file bookkeeping)
                 // changes nothing the tray renders.
                 return true;
             };
             entry.state.status = map_background_task_patch_status(status);
-            emit_background_task_snapshot(emitter, entry);
+            if let Some(owner) = entry.owner.as_ref().map(Arc::clone) {
+                emit_background_task_snapshot(&owner, entry);
+            }
             true
         }
         ClaudeSystemEvent::TaskNotification => {
             let Some(mut entry) = background_tasks.remove(&task_id) else {
                 return false;
             };
+            refresh_background_task_owner(value, &mut entry, root_emitter, subagent_streams);
             entry.state.status = match system.status.as_deref() {
                 Some("completed") => BackgroundTaskStatus::Completed,
                 Some("stopped") | Some("killed") => BackgroundTaskStatus::Stopped,
@@ -4603,11 +4790,58 @@ fn handle_background_bash_task_frame(
                 }
             };
             entry.state.summary = system.summary.as_deref().and_then(normalize_nonempty);
-            emit_background_task_snapshot(emitter, &entry);
+            let output_path = system
+                .output_file
+                .as_deref()
+                .or(system.path.as_deref())
+                .or(entry.output_path.as_deref());
+            match capture_background_command_output(output_path) {
+                Ok(output) => entry.output = Some(output),
+                Err(reason) => entry.state.output_unavailable = Some(reason.to_owned()),
+            }
+            if let Some(owner) = entry.owner.as_deref() {
+                emit_background_task_snapshot(owner, &entry);
+                emit_background_task_completion(owner, &entry);
+            } else {
+                tracing::error!(
+                    task_id,
+                    tool_use_id = entry.tool_use_id,
+                    parent_tool_use_id = entry.parent_tool_use_id.as_deref().unwrap_or(""),
+                    "dropping terminal background Bash frame because ownership remained unresolved"
+                );
+            }
             true
         }
         _ => false,
     }
+}
+
+#[cfg(test)]
+fn handle_background_bash_task_frame(
+    value: &Value,
+    background_tasks: &mut HashMap<String, BackgroundTaskEntry>,
+    emitter: &Arc<TurnEmitter>,
+) -> bool {
+    if value.get("subtype").and_then(Value::as_str) == Some("task_started")
+        && let Some(tool_use_id) = value.get("tool_use_id").and_then(Value::as_str)
+        && !emitter.has_pending_tool_request(tool_use_id)
+    {
+        emitter.tool_request(
+            tool_use_id,
+            "Bash",
+            json!({
+                "kind": "RunCommand",
+                "command": "test background command",
+                "working_directory": "",
+            }),
+        );
+    }
+    handle_background_bash_task_frame_with_owners(
+        value,
+        background_tasks,
+        emitter,
+        &HashMap::new(),
+    )
 }
 
 async fn detect_subagent_task_system_spawns(
@@ -4670,6 +4904,64 @@ async fn detect_subagent_task_system_spawns(
         && let Some(initial_prompt) = prompt.as_deref().or(task_name.as_deref())
     {
         emit_subagent_task_prompt_if_needed(stream, initial_prompt);
+    }
+}
+
+/// Captured Claude Code local-agent lifecycle:
+/// `task_started { task_id, tool_use_id, task_type: "local_agent" }` seeds
+/// correlation, then `task_progress` and sometimes `task_notification` carry
+/// `usage.total_tokens`. Only that numeric field is authoritative here;
+/// summaries and status prose are never parsed as accounting data.
+fn observe_local_agent_task_usage(
+    value: &Value,
+    task_to_tool_use: &mut HashMap<String, String>,
+    streams: &mut HashMap<String, SubAgentStream>,
+) {
+    if value.get("type").and_then(Value::as_str) != Some("system") {
+        return;
+    }
+    let Ok(system) = parse_claude_system_frame(value) else {
+        return;
+    };
+    let event = system.event();
+    let is_notification = event == ClaudeSystemEvent::TaskNotification;
+    if event == ClaudeSystemEvent::TaskStarted
+        && system.task_type.as_deref() == Some("local_agent")
+        && let (Some(task_id), Some(tool_use_id)) =
+            (system.task_id.as_deref(), system.tool_use_id.as_deref())
+    {
+        task_to_tool_use.insert(task_id.to_owned(), tool_use_id.to_owned());
+    }
+    if !matches!(
+        &event,
+        ClaudeSystemEvent::TaskProgress | ClaudeSystemEvent::TaskNotification
+    ) {
+        return;
+    }
+    let tool_use_id = system
+        .tool_use_id
+        .as_deref()
+        .or_else(|| {
+            system
+                .task_id
+                .as_deref()
+                .and_then(|task_id| task_to_tool_use.get(task_id).map(String::as_str))
+        })
+        .map(str::to_owned);
+    if let Some(tool_use_id) = tool_use_id
+        && let Some(total_tokens) = system.usage.and_then(|usage| usage.total_tokens)
+        && let Some(stream) = streams.get_mut(&tool_use_id)
+        && stream
+            .reported_total_tokens
+            .is_none_or(|reported| total_tokens > reported)
+    {
+        stream.reported_total_tokens = Some(total_tokens);
+        stream.inner.emitter.total_only_token_usage(total_tokens);
+    }
+    if is_notification
+        && let Some(task_id) = system.task_id
+    {
+        task_to_tool_use.remove(&task_id);
     }
 }
 
@@ -4987,6 +5279,11 @@ fn finalize_subagent_stream(mut stream: SubAgentStream, outcome: SubAgentFinalOu
             None,
         );
     }
+    // Child liveness is owned by the child stream, not by the parent Task
+    // card's completed progress snapshot. Without an explicit idle marker the
+    // relay agent can remain Active after its final StreamEnd (or forever when
+    // the notification has no renderable text/usage).
+    stream.inner.emitter.typing_status_changed(false);
     // Unthrottled final update with the closing stats.
     stream
         .parent_emitter
@@ -5101,6 +5398,26 @@ fn consume_claude_stream_value(
     base_message_id: &str,
     current_message_id: &mut String,
 ) {
+    consume_claude_stream_value_with_interrupt(
+        value,
+        summary,
+        segment,
+        inner,
+        base_message_id,
+        current_message_id,
+        false,
+    );
+}
+
+fn consume_claude_stream_value_with_interrupt(
+    value: &Value,
+    summary: &mut ClaudeStdoutSummary,
+    segment: &mut SegmentState,
+    inner: &ClaudeInner,
+    base_message_id: &str,
+    current_message_id: &mut String,
+    interrupt_requested: bool,
+) {
     if let Some(session_id) = value.get("session_id").and_then(Value::as_str) {
         let is_new_session = summary.session_id.as_deref() != Some(session_id);
         summary.session_id = Some(session_id.to_string());
@@ -5182,7 +5499,7 @@ fn consume_claude_stream_value(
             );
         }
         "user" => {
-            consume_user_tool_result(value, summary, segment, inner);
+            consume_user_tool_result(value, summary, segment, inner, interrupt_requested);
         }
         "result" => {
             if let Some(session_id) = value.get("session_id").and_then(Value::as_str) {
@@ -5430,6 +5747,7 @@ fn consume_user_tool_result(
     summary: &mut ClaudeStdoutSummary,
     segment: &mut SegmentState,
     inner: &ClaudeInner,
+    interrupt_requested: bool,
 ) {
     let Some(message) = value.get("message") else {
         return;
@@ -5470,15 +5788,48 @@ fn consume_user_tool_result(
             );
             continue;
         }
-        if summary
+        if !summary
             .unresolved_tool_requests
-            .remove(&completion.tool_call_id)
-            .is_none()
+            .contains_key(&completion.tool_call_id)
         {
             tracing::debug!(
                 tool_call_id = completion.tool_call_id,
                 "skipping Claude tool completion without emitted ToolRequest"
             );
+            continue;
+        }
+        // Claude answers an interrupt with a synthetic errored tool_result
+        // containing provider control instructions. The turn's authoritative
+        // cancellation tail owns this completion; treating the text as Bash
+        // stderr fabricates an exit code and leaks internal prose.
+        if interrupt_requested && !completion.success {
+            continue;
+        }
+        summary
+            .unresolved_tool_requests
+            .remove(&completion.tool_call_id);
+
+        // A background Bash tool_result only acknowledges launch. Its process
+        // remains live and is completed from task_notification below, where
+        // the CLI reports the authoritative terminal state.
+        let background_launch = summary
+            .tool_call_by_id
+            .get(&completion.tool_call_id)
+            .is_some_and(|tool| {
+                claude_is_run_command_tool_name(&tool.name)
+                    && tool
+                        .arguments
+                        .get("run_in_background")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+            });
+        if background_launch {
+            if !inner.emitter.detach_tool(&completion.tool_call_id) {
+                tracing::warn!(
+                    tool_call_id = completion.tool_call_id,
+                    "background Bash launch could not detach its emitted tool request"
+                );
+            }
             continue;
         }
         inner.emit_tool_execution_completed(
@@ -5690,6 +6041,38 @@ fn auto_close_unresolved_tool_requests(
                 "detailed_message": message,
             }),
             Some(message.to_string()),
+        );
+    }
+}
+
+fn close_terminal_tool_requests(
+    summary: &mut ClaudeStdoutSummary,
+    inner: &ClaudeInner,
+    cancelled: bool,
+) {
+    if !cancelled {
+        auto_close_unresolved_tool_requests(
+            summary,
+            inner,
+            "Claude ended the turn before returning a result for this streamed tool request.",
+        );
+        return;
+    }
+
+    let unresolved = std::mem::take(&mut summary.unresolved_tool_requests);
+    for (tool_call_id, tool_name) in unresolved {
+        summary
+            .auto_closed_tool_requests
+            .insert(tool_call_id.clone());
+        inner.emit_tool_execution_completed(
+            &tool_call_id,
+            &tool_name,
+            false,
+            json!({
+                "kind": "Cancelled",
+                "message": "Cancelled by user",
+            }),
+            None,
         );
     }
 }
@@ -7392,6 +7775,15 @@ fn claude_argument_bool(arguments: &Value, keys: &[&str]) -> Option<bool> {
 }
 
 fn claude_tool_request_type(tool_name: &str, arguments: &Value) -> Value {
+    if is_subagent_tool_name(tool_name) {
+        let prompt = claude_argument_string(arguments, &["prompt"])
+            .or_else(|| claude_argument_string(arguments, &["description"]));
+        let name = claude_argument_string(arguments, &["name"])
+            .or_else(|| claude_argument_string(arguments, &["description"]));
+        return serde_json::to_value(protocol::ToolRequestType::AgentSpawn { prompt, name })
+            .expect("serialize Claude agent spawn request");
+    }
+
     if let Some(preview) = claude_modify_preview(tool_name, arguments) {
         return json!({
             "kind": "ModifyFile",
@@ -7451,6 +7843,19 @@ fn claude_tool_request_type(tool_name: &str, arguments: &Value) -> Value {
             "arguments": arguments,
         }
     })
+}
+
+fn claude_public_tool_result(tool_name: &str, success: bool, tool_result: Value) -> Value {
+    if !is_subagent_tool_name(tool_name) {
+        return tool_result;
+    }
+
+    serde_json::to_value(protocol::ToolExecutionResult::Other {
+        result: json!({
+            "status": if success { "completed" } else { "failed" },
+        }),
+    })
+    .expect("serialize Claude agent result")
 }
 
 fn claude_home_dir() -> Result<PathBuf, String> {
@@ -9182,9 +9587,30 @@ fn claude_steering_content(config: &BackendSpawnConfig) -> Option<String> {
 fn spawn_claude_subagent_event_bridge(
     mut raw_rx: mpsc::UnboundedReceiver<Value>,
     event_tx: mpsc::UnboundedSender<ChatEvent>,
+    model_usage_tx: mpsc::UnboundedSender<protocol::ModelRequestTokenUsage>,
+    total_usage_tx: mpsc::UnboundedSender<u64>,
 ) {
     tokio::spawn(async move {
         while let Some(raw) = raw_rx.recv().await {
+            if raw.get("kind").and_then(Value::as_str) == Some("ModelRequestTokenUsage")
+                && let Some(data) = raw.get("data")
+                && let Ok(usage) = serde_json::from_value(data.clone())
+            {
+                if model_usage_tx.send(usage).is_err() {
+                    break;
+                }
+                continue;
+            }
+            if raw.get("kind").and_then(Value::as_str) == Some("TotalOnlyTokenUsage")
+                && let Some(total_tokens) = raw
+                    .pointer("/data/total_tokens")
+                    .and_then(Value::as_u64)
+            {
+                if total_usage_tx.send(total_tokens).is_err() {
+                    break;
+                }
+                continue;
+            }
             let event = match serde_json::from_value::<ChatEvent>(raw.clone()) {
                 Ok(event) => event,
                 Err(_) => match raw.get("kind").and_then(Value::as_str).unwrap_or_default() {
@@ -10337,7 +10763,7 @@ mod tests {
 
         // Cancel fires the terminal path.
         inner
-            .emit_terminal_phase_or_placeholder(&mut summary, 0, None, None, None)
+            .emit_terminal_phase_or_placeholder(&mut summary, 0, None, None, None, true)
             .await;
         inner.emit_operation_cancelled("Claude turn cancelled.");
 
@@ -10347,8 +10773,92 @@ mod tests {
         assert_eq!(event_kind(&second), Some("ToolRequest"));
         let third = rx.recv().await.expect("third");
         assert_eq!(event_kind(&third), Some("ToolExecutionCompleted"));
+        assert_eq!(
+            third.pointer("/data/tool_result/kind").and_then(Value::as_str),
+            Some("Cancelled")
+        );
+        assert_eq!(
+            third.pointer("/data/success").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(third.pointer("/data/tool_result/exit_code").is_none());
+        assert!(third.pointer("/data/tool_result/stderr").is_none());
         let fourth = rx.recv().await.expect("fourth");
         assert_eq!(event_kind(&fourth), Some("OperationCancelled"));
+    }
+
+    #[tokio::test]
+    async fn interrupt_control_prose_is_not_fabricated_as_command_failure() {
+        let (inner, mut rx) = make_test_inner();
+        let mut summary = ClaudeStdoutSummary::default();
+        let mut segment = SegmentState::default();
+        let base_id = "claude-msg-cancel".to_string();
+        let mut current_id = base_id.clone();
+
+        consume_claude_stream_value(
+            &json!({
+                "type": "assistant",
+                "message": {
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu-interrupted-bash",
+                        "name": "Bash",
+                        "input": {"command": "sleep 9999"}
+                    }]
+                }
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+        consume_claude_stream_value_with_interrupt(
+            &json!({
+                "type": "user",
+                "message": {
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu-interrupted-bash",
+                        "is_error": true,
+                        "content": "You have 8168 weighted tokens left"
+                    }]
+                }
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+            true,
+        );
+
+        assert!(
+            summary
+                .unresolved_tool_requests
+                .contains_key("toolu-interrupted-bash"),
+            "the cancellation tail must retain ownership of the pending tool"
+        );
+        inner
+            .emit_terminal_phase_or_placeholder(&mut summary, 0, None, None, None, true)
+            .await;
+
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        let completions = events
+            .iter()
+            .filter(|event| event_kind(event) == Some("ToolExecutionCompleted"))
+            .collect::<Vec<_>>();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(
+            completions[0]
+                .pointer("/data/tool_result/kind")
+                .and_then(Value::as_str),
+            Some("Cancelled")
+        );
+        let encoded = completions[0].to_string();
+        assert!(!encoded.contains("weighted tokens"));
+        assert!(!encoded.contains("exit_code"));
+        assert!(!encoded.contains("stderr"));
     }
 
     #[tokio::test]
@@ -10701,6 +11211,14 @@ mod tests {
                 self.next_id.fetch_add(1, Ordering::SeqCst)
             ));
             let (event_tx, event_rx) = mpsc::unbounded_channel();
+            let (model_usage_tx, mut model_usage_rx) = mpsc::unbounded_channel();
+            let (total_usage_tx, mut total_usage_rx) = mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                while model_usage_rx.recv().await.is_some() {}
+            });
+            tokio::spawn(async move {
+                while total_usage_rx.recv().await.is_some() {}
+            });
             self.event_receivers
                 .lock()
                 .expect("event receiver mutex")
@@ -10716,7 +11234,15 @@ mod tests {
                     session_id_hint,
                     agent_id: agent_id.clone(),
                 });
-            Box::pin(async move { Ok(SubAgentHandle { event_tx, agent_id }) })
+            Box::pin(async move {
+                Ok(SubAgentHandle {
+                    event_tx,
+                    model_usage_tx,
+                    total_usage_tx,
+                    agent_id,
+                    name_update_tx: None,
+                })
+            })
         }
     }
 
@@ -11094,9 +11620,13 @@ for raw_line in sys.stdin:
                 parent_tool_name: "Task".to_string(),
                 agent_id: protocol::AgentId("child-agent".to_string()),
                 agent_name: "Child".to_string(),
+                name_update_tx: None,
                 parent_emitter,
                 last_progress_emit: std::time::Instant::now(),
                 execution: SubAgentExecution::Foreground,
+                seen_tool_call_ids: HashSet::new(),
+                last_tool_name: None,
+                reported_total_tokens: None,
             };
 
             close_current_subagent_phase(&mut stream.summary, &mut stream.segment, &stream.inner);
@@ -11242,9 +11772,13 @@ for raw_line in sys.stdin:
                 parent_tool_name: "Task".to_string(),
                 agent_id: protocol::AgentId(format!("child-{tool_use_id}")),
                 agent_name: "Child".to_string(),
+                name_update_tx: None,
                 parent_emitter,
                 last_progress_emit: std::time::Instant::now(),
                 execution: SubAgentExecution::Unknown,
+                seen_tool_call_ids: HashSet::new(),
+                last_tool_name: None,
+                reported_total_tokens: None,
             },
             child_rx,
         )
@@ -11258,6 +11792,192 @@ for raw_line in sys.stdin:
         let progress = subagent_progress_data(&stream, false);
         assert_eq!(progress.tool_call_id, "toolu-agent");
         assert_eq!(progress.tool_name, "Agent");
+    }
+
+    #[test]
+    fn local_agent_progress_correlates_task_id_and_emits_total_only_usage() {
+        let (stream, mut child_rx) = usage_only_subagent_stream("toolu-local", false);
+        let mut streams = HashMap::from([("toolu-local".to_owned(), stream)]);
+        let mut task_to_tool_use = HashMap::new();
+
+        observe_local_agent_task_usage(
+            &json!({
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": "task-local",
+                "tool_use_id": "toolu-local",
+                "task_type": "local_agent"
+            }),
+            &mut task_to_tool_use,
+            &mut streams,
+        );
+        observe_local_agent_task_usage(
+            &json!({
+                "type": "system",
+                "subtype": "task_progress",
+                "task_id": "task-local",
+                "usage": { "tool_uses": 2, "duration_ms": 900 }
+            }),
+            &mut task_to_tool_use,
+            &mut streams,
+        );
+        assert!(
+            child_rx.try_recv().is_err(),
+            "a frame without total_tokens must not fabricate usage"
+        );
+        observe_local_agent_task_usage(
+            &json!({
+                "type": "system",
+                "subtype": "task_progress",
+                "task_id": "task-local",
+                "usage": {
+                    "total_tokens": 47,
+                    "tool_uses": 3,
+                    "duration_ms": 1200
+                }
+            }),
+            &mut task_to_tool_use,
+            &mut streams,
+        );
+
+        let total = child_rx
+            .try_recv()
+            .expect("total-only usage event should be emitted");
+        assert_eq!(
+            total.get("kind").and_then(Value::as_str),
+            Some("TotalOnlyTokenUsage")
+        );
+        assert_eq!(
+            total
+                .pointer("/data/total_tokens")
+                .and_then(Value::as_u64),
+            Some(47)
+        );
+        assert!(child_rx.try_recv().is_err());
+
+        observe_local_agent_task_usage(
+            &json!({
+                "type": "system",
+                "subtype": "task_notification",
+                "task_id": "task-local",
+                "status": "completed",
+                "usage": { "total_tokens": 53 }
+            }),
+            &mut task_to_tool_use,
+            &mut streams,
+        );
+        assert!(!task_to_tool_use.contains_key("task-local"));
+        let terminal_total = child_rx
+            .try_recv()
+            .expect("notification aggregate should update total-only usage");
+        assert_eq!(
+            terminal_total
+                .pointer("/data/total_tokens")
+                .and_then(Value::as_u64),
+            Some(53)
+        );
+    }
+
+    #[test]
+    fn subagent_progress_retains_tool_telemetry_after_phase_reset() {
+        let (mut stream, _child_rx) = usage_only_subagent_stream("toolu-agent", false);
+
+        consume_subagent_event(
+            &mut stream,
+            &json!({
+                "type": "assistant",
+                "message": {
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu-child-bash",
+                        "name": "Bash",
+                        "input": {"command": "pwd"}
+                    }]
+                }
+            }),
+        );
+        consume_subagent_event(
+            &mut stream,
+            &json!({
+                "type": "user",
+                "message": {
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu-child-bash",
+                        "is_error": false,
+                        "content": "ok"
+                    }]
+                }
+            }),
+        );
+
+        assert!(
+            stream.summary.tool_calls.is_empty(),
+            "the phase-local tool list should have reset"
+        );
+        let progress = subagent_progress_data(&stream, true);
+        let ToolProgressUpdate::SubAgent(progress) = progress.update else {
+            panic!("expected sub-agent progress");
+        };
+        assert_eq!(progress.tool_calls, 1);
+        assert_eq!(progress.last_tool_name.as_deref(), Some("Bash"));
+    }
+
+    #[tokio::test]
+    async fn later_claude_spawn_metadata_enriches_only_generic_child_name() {
+        let emitter = TestSubAgentEmitter::default();
+        let (parent_emitter, _parent_rx) = test_parent_emitter();
+        let (mut stream, _child_rx) = usage_only_subagent_stream("toolu-name", false);
+        stream.agent_name = "Agent".to_owned();
+        let (name_tx, mut name_rx) = mpsc::unbounded_channel();
+        stream.name_update_tx = Some(name_tx);
+        let mut streams = HashMap::from([("toolu-name".to_owned(), stream)]);
+
+        ensure_subagent_stream(
+            &emitter,
+            &parent_emitter,
+            &mut streams,
+            SubAgentSpawnSpec {
+                tool_use_id: "toolu-name".to_owned(),
+                parent_tool_name: Some("Agent".to_owned()),
+                name: "Review Authentication".to_owned(),
+                description: "Inspect the authentication flow".to_owned(),
+                agent_type: "general-purpose".to_owned(),
+                session_id_hint: None,
+                execution: SubAgentExecution::Foreground,
+            },
+        )
+        .await;
+        assert_eq!(
+            streams.get("toolu-name").unwrap().agent_name,
+            "Review Authentication"
+        );
+        assert_eq!(name_rx.try_recv().unwrap(), "Review Authentication");
+
+        ensure_subagent_stream(
+            &emitter,
+            &parent_emitter,
+            &mut streams,
+            SubAgentSpawnSpec {
+                tool_use_id: "toolu-name".to_owned(),
+                parent_tool_name: None,
+                name: "Agent".to_owned(),
+                description: String::new(),
+                agent_type: "local_agent".to_owned(),
+                session_id_hint: None,
+                execution: SubAgentExecution::Unknown,
+            },
+        )
+        .await;
+        assert_eq!(
+            streams.get("toolu-name").unwrap().agent_name,
+            "Review Authentication"
+        );
+        assert!(name_rx.try_recv().is_err());
+        assert!(
+            emitter.spawn_records().is_empty(),
+            "enrichment must not register a duplicate child"
+        );
     }
 
     async fn assert_usage_only_child_terminal_is_known(
@@ -11282,9 +12002,12 @@ for raw_line in sys.stdin:
         );
         assert_eq!(stream_end_turn_total_tokens(&stream_end), Some(31));
         assert_eq!(stream_end_cumulative_total_tokens(&stream_end), Some(31));
+        let idle = child_rx.recv().await.expect("usage-only child idle");
+        assert_eq!(event_kind(&idle), Some("TypingStatusChanged"));
+        assert_eq!(idle.get("data").and_then(Value::as_bool), Some(false));
         assert!(
             child_rx.try_recv().is_err(),
-            "usage-only completion should emit exactly one identified stream"
+            "usage-only completion should end with one explicit idle marker"
         );
 
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
@@ -11420,6 +12143,9 @@ for raw_line in sys.stdin:
             Some("qa-child-done")
         );
         assert_eq!(stream_end_turn_total_tokens(&stream_end), Some(31));
+        let idle = child_rx.recv().await.expect("background child idle");
+        assert_eq!(event_kind(&idle), Some("TypingStatusChanged"));
+        assert_eq!(idle.get("data").and_then(Value::as_bool), Some(false));
     }
 
     #[tokio::test]
@@ -14935,6 +15661,7 @@ for raw_line in sys.stdin:
                 Some(1_000_000),
                 None,
                 Some(turn_usage),
+                false,
             )
             .await;
 
@@ -15830,17 +16557,45 @@ for raw_line in sys.stdin:
     }
 
     fn bash_task_notification_frame(status: &str, summary: &str) -> Value {
+        bash_task_notification_frame_with_output(
+            status,
+            summary,
+            "/tmp/tasks/b4r45rw5t.output",
+        )
+    }
+
+    fn bash_task_notification_frame_with_output(
+        status: &str,
+        summary: &str,
+        output_file: &str,
+    ) -> Value {
         json!({
             "type": "system",
             "subtype": "task_notification",
             "task_id": "b4r45rw5t",
             "tool_use_id": "toolu_01Ay3XKHPknVQCy2L7zkvvH6",
             "status": status,
-            "output_file": "/tmp/tasks/b4r45rw5t.output",
+            "output_file": output_file,
             "summary": summary,
             "uuid": "afd817b8-9970-481d-98ae-afbea37a4c2b",
             "session_id": "824611e6-870f-4441-b7d2-5b19dcf3f803"
         })
+    }
+
+    #[test]
+    fn background_bash_parent_id_accepts_nested_system_shapes() {
+        assert_eq!(
+            background_task_parent_tool_use_id(&json!({
+                "data": { "parent_tool_use_id": "toolu_child" }
+            })),
+            Some("toolu_child")
+        );
+        assert_eq!(
+            background_task_parent_tool_use_id(&json!({
+                "message": { "parent_tool_use_id": "toolu_child" }
+            })),
+            Some("toolu_child")
+        );
     }
 
     #[test]
@@ -15883,6 +16638,370 @@ for raw_line in sys.stdin:
             Some(
                 "Background command \"Sleep 10 seconds then echo marker\" completed (exit code 0)"
             )
+        );
+    }
+
+    #[test]
+    fn background_bash_notification_emits_authoritative_terminal_completion() {
+        let (inner, mut rx) = make_test_inner();
+        let mut tasks: HashMap<String, BackgroundTaskEntry> = HashMap::new();
+        let temp = tempfile::tempdir().expect("temp output dir");
+        let output_file = temp.path().join("background-output.json");
+        std::fs::write(
+            &output_file,
+            br#"{"exit_code":7,"stdout":"partial output","stderr":"command failed"}"#,
+        )
+        .expect("write structured command output");
+
+        handle_background_bash_task_frame(&bash_task_started_frame(), &mut tasks, &inner.emitter);
+        handle_background_bash_task_frame(
+            &bash_task_notification_frame_with_output(
+                "completed",
+                "Background command finished",
+                output_file.to_str().expect("utf-8 output path"),
+            ),
+            &mut tasks,
+            &inner.emitter,
+        );
+
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        let completion = events
+            .iter()
+            .find(|event| event_kind(event) == Some("ToolExecutionCompleted"))
+            .expect("terminal notification should complete the launch tool");
+        assert_eq!(
+            completion.pointer("/data/tool_result/kind").and_then(Value::as_str),
+            Some("RunCommand")
+        );
+        assert_eq!(
+            completion
+                .pointer("/data/tool_result/exit_code")
+                .and_then(Value::as_i64),
+            Some(7)
+        );
+        assert_eq!(
+            completion.pointer("/data/tool_result/stdout").and_then(Value::as_str),
+            Some("partial output")
+        );
+        assert_eq!(
+            completion.pointer("/data/tool_result/stderr").and_then(Value::as_str),
+            Some("command failed")
+        );
+        assert_eq!(
+            completion.pointer("/data/success").and_then(Value::as_bool),
+            Some(false)
+        );
+        let terminal_progress = events
+            .iter()
+            .filter(|event| event_kind(event) == Some("ToolProgress"))
+            .last()
+            .expect("terminal progress should remain available to the card");
+        assert_eq!(
+            terminal_progress
+                .pointer("/data/update/status")
+                .and_then(Value::as_str),
+            Some("completed")
+        );
+        assert_eq!(
+            terminal_progress
+                .pointer("/data/update/summary")
+                .and_then(Value::as_str),
+            Some("Background command finished")
+        );
+    }
+
+    #[test]
+    fn background_bash_structured_success_output_reaches_terminal_result() {
+        let (inner, mut rx) = make_test_inner();
+        let mut tasks: HashMap<String, BackgroundTaskEntry> = HashMap::new();
+        let temp = tempfile::tempdir().expect("temp output dir");
+        let output_file = temp.path().join("background-output.json");
+        std::fs::write(
+            &output_file,
+            br#"{"exit_code":0,"stdout":"finished work","stderr":""}"#,
+        )
+        .expect("write structured command output");
+
+        handle_background_bash_task_frame(&bash_task_started_frame(), &mut tasks, &inner.emitter);
+        handle_background_bash_task_frame(
+            &bash_task_notification_frame_with_output(
+                "completed",
+                "Background command finished",
+                output_file.to_str().expect("utf-8 output path"),
+            ),
+            &mut tasks,
+            &inner.emitter,
+        );
+
+        let completion = std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|event| event_kind(event) == Some("ToolExecutionCompleted"))
+            .expect("terminal completion");
+        assert_eq!(
+            completion.pointer("/data/tool_result/stdout").and_then(Value::as_str),
+            Some("finished work")
+        );
+        assert_eq!(
+            completion.pointer("/data/success").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn background_bash_missing_output_is_explicit_without_leaking_path() {
+        let (inner, mut rx) = make_test_inner();
+        let mut tasks: HashMap<String, BackgroundTaskEntry> = HashMap::new();
+        handle_background_bash_task_frame(&bash_task_started_frame(), &mut tasks, &inner.emitter);
+        handle_background_bash_task_frame(
+            &bash_task_notification_frame("completed", "Background command finished"),
+            &mut tasks,
+            &inner.emitter,
+        );
+
+        let snapshots = recv_background_snapshots(&mut rx);
+        let terminal = snapshots.last().expect("terminal snapshot");
+        assert_eq!(terminal.summary.as_deref(), Some("Background command finished"));
+        let unavailable = terminal
+            .output_unavailable
+            .as_deref()
+            .expect("missing output must be explicit");
+        assert!(unavailable.contains("unavailable"));
+        assert!(!unavailable.contains("/tmp/"));
+    }
+
+    #[tokio::test]
+    async fn background_child_bash_completion_uses_child_detached_request() {
+        let emitter = TestSubAgentEmitter::default();
+        let (parent_emitter, mut parent_events) = test_parent_emitter();
+        let mut streams = HashMap::new();
+        let mut pending_prompts = HashMap::new();
+        detect_subagent_spawns(
+            &json!({
+                "type": "assistant",
+                "message": { "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_child",
+                    "name": "Agent",
+                    "input": {
+                        "description": "Run a delayed command",
+                        "prompt": "Run a delayed command",
+                        "run_in_background": true
+                    }
+                }]}
+            }),
+            &emitter,
+            &parent_emitter,
+            &mut streams,
+            &mut pending_prompts,
+        )
+        .await;
+
+        let mut tasks = HashMap::new();
+        // Live Claude may publish task_started before the child's correlated
+        // Bash tool_use, and may omit parent_tool_use_id. Keep the task
+        // unresolved until later frames provide positive ownership evidence.
+        assert!(handle_background_bash_task_frame_with_owners(
+            &json!({
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": "child-task",
+                "tool_use_id": "toolu_child_bash",
+                "task_type": "local_bash"
+            }),
+            &mut tasks,
+            &parent_emitter,
+            &streams,
+        ));
+        assert!(tasks.get("child-task").expect("registered task").owner.is_none());
+
+        consume_subagent_event(
+            streams.get_mut("toolu_child").expect("child stream"),
+            &json!({
+                "type": "assistant",
+                "parent_tool_use_id": "toolu_child",
+                "message": { "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_child_bash",
+                    "name": "Bash",
+                    "input": { "command": "sleep 1", "run_in_background": true }
+                }]}
+            }),
+        );
+
+        consume_subagent_event(
+            streams.get_mut("toolu_child").expect("child stream"),
+            &json!({
+                "type": "user",
+                "parent_tool_use_id": "toolu_child",
+                "message": { "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_child_bash",
+                    "is_error": false,
+                    "content": "Command running in background"
+                }]}
+            }),
+        );
+        assert!(streams
+            .get("toolu_child")
+            .expect("child stream")
+            .inner
+            .emitter
+            .has_pending_tool_request("toolu_child_bash"));
+        assert!(handle_background_bash_task_frame_with_owners(
+            &json!({
+                "type": "system",
+                "subtype": "task_notification",
+                "task_id": "child-task",
+                "tool_use_id": "toolu_child_bash",
+                "status": "completed",
+                "summary": "Background command finished"
+            }),
+            &mut tasks,
+            &parent_emitter,
+            &streams,
+        ));
+
+        let mut child_events = emitter.take_event_rx("toolu_child");
+        let completion = timeout(Duration::from_secs(1), async {
+            loop {
+                if let protocol::ChatEvent::ToolExecutionCompleted(completion) = child_events
+                    .recv()
+                    .await
+                    .expect("child event channel")
+                {
+                    break completion;
+                }
+            }
+        })
+        .await
+        .expect("child Bash completion");
+        assert_eq!(completion.tool_call_id, "toolu_child_bash");
+        assert!(completion.success);
+        assert!(matches!(
+            completion.tool_result,
+            protocol::ToolExecutionResult::RunCommand { exit_code: 0, .. }
+        ));
+
+        let child = streams.get("toolu_child").expect("child stream");
+        child.inner.emitter.tool_request(
+            "toolu_child_bash_cancelled",
+            "Bash",
+            claude_tool_request_type(
+                "Bash",
+                &json!({ "command": "sleep 30", "run_in_background": true }),
+            ),
+        );
+        assert!(child
+            .inner
+            .emitter
+            .detach_tool("toolu_child_bash_cancelled"));
+        assert!(handle_background_bash_task_frame_with_owners(
+            &json!({
+                "type": "system", "subtype": "task_started",
+                "task_id": "child-task-cancelled",
+                "tool_use_id": "toolu_child_bash_cancelled",
+                "task_type": "local_bash",
+                "parent_tool_use_id": "toolu_mismatched_parent"
+            }),
+            &mut tasks,
+            &parent_emitter,
+            &streams,
+        ));
+        assert!(handle_background_bash_task_frame_with_owners(
+            &json!({
+                "type": "system", "subtype": "task_notification",
+                "task_id": "child-task-cancelled",
+                "tool_use_id": "toolu_child_bash_cancelled",
+                "status": "stopped",
+                "summary": "Background command stopped"
+            }),
+            &mut tasks,
+            &parent_emitter,
+            &streams,
+        ));
+        let cancelled = timeout(Duration::from_secs(1), async {
+            loop {
+                if let protocol::ChatEvent::ToolExecutionCompleted(completion) = child_events
+                    .recv()
+                    .await
+                    .expect("child event channel")
+                    && completion.tool_call_id == "toolu_child_bash_cancelled"
+                {
+                    break completion;
+                }
+            }
+        })
+        .await
+        .expect("child Bash cancellation");
+        assert!(!cancelled.success);
+        assert!(matches!(
+            cancelled.tool_result,
+            protocol::ToolExecutionResult::Cancelled { .. }
+        ));
+
+        while let Ok(event) = parent_events.try_recv() {
+            assert_ne!(
+                event.pointer("/data/tool_call_id").and_then(Value::as_str),
+                Some("toolu_child_bash"),
+                "child Bash completion must never synthesize a root-owned request"
+            );
+        }
+    }
+
+    #[test]
+    fn background_bash_launch_ack_does_not_complete_running_tool() {
+        let (inner, mut rx) = make_test_inner();
+        let mut summary = ClaudeStdoutSummary::default();
+        let mut segment = SegmentState::default();
+        let base_id = "claude-msg-bg".to_string();
+        let mut current_id = base_id.clone();
+
+        consume_claude_stream_value(
+            &json!({
+                "type": "assistant",
+                "message": {
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu-bg-bash",
+                        "name": "Bash",
+                        "input": {
+                            "command": "sleep 10",
+                            "run_in_background": true
+                        }
+                    }]
+                }
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+        consume_claude_stream_value(
+            &json!({
+                "type": "user",
+                "message": {
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu-bg-bash",
+                        "is_error": false,
+                        "content": "Command running in background"
+                    }]
+                }
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| event_kind(event) == Some("ToolRequest")));
+        assert!(
+            events
+                .iter()
+                .all(|event| event_kind(event) != Some("ToolExecutionCompleted")),
+            "the launch acknowledgement is not a terminal process result"
         );
     }
 
@@ -16124,27 +17243,6 @@ for raw_line in sys.stdin:
             streams.is_empty(),
             "sub-agent stream should be removed after tool_result completion"
         );
-    }
-
-    #[test]
-    fn is_cli_turn_start_event_classifies_frames() {
-        // Fresh turn content opens a CLI-initiated turn.
-        assert!(is_cli_turn_start_event(&json!({"type": "assistant"})));
-        assert!(is_cli_turn_start_event(
-            &json!({"type": "system", "subtype": "init"})
-        ));
-        assert!(is_cli_turn_start_event(&json!({"type": "stream_event"})));
-        assert!(is_cli_turn_start_event(&json!({"type": "message_start"})));
-
-        // Terminal / non-content frames must NOT spawn an empty turn.
-        assert!(!is_cli_turn_start_event(&json!({"type": "result"})));
-        assert!(!is_cli_turn_start_event(&json!({"type": "user"})));
-        assert!(!is_cli_turn_start_event(
-            &json!({"type": "system", "subtype": "task_notification"})
-        ));
-        assert!(!is_cli_turn_start_event(
-            &json!({"type": "rate_limit_event"})
-        ));
     }
 
     #[tokio::test]
@@ -16642,7 +17740,7 @@ for raw_line in sys.stdin:
         };
 
         let emitted = inner
-            .emit_terminal_phase_or_placeholder(&mut summary, 0, None, None, None)
+            .emit_terminal_phase_or_placeholder(&mut summary, 0, None, None, None, false)
             .await;
         assert!(
             emitted,
@@ -17718,6 +18816,83 @@ for raw_line in sys.stdin:
     }
 
     #[test]
+    fn claude_agent_tool_projection_excludes_provider_metadata() {
+        let request = claude_tool_request_type(
+            "Task",
+            &json!({
+                "prompt": "Inspect the relay",
+                "description": "Relay investigator",
+                "subagent_type": "Explore",
+                "resume": "provider-session-id",
+                "output_file": "/private/tmp/claude/task-output.txt"
+            }),
+        );
+        let parsed: protocol::ToolRequestType =
+            serde_json::from_value(request.clone()).expect("typed Claude agent request");
+        assert!(matches!(
+            parsed,
+            protocol::ToolRequestType::AgentSpawn { prompt, name }
+                if prompt.as_deref() == Some("Inspect the relay")
+                    && name.as_deref() == Some("Relay investigator")
+        ));
+
+        let result = claude_public_tool_result(
+            "Task",
+            true,
+            json!({
+                "agentId": "provider-agent-id",
+                "output_file": "/private/tmp/claude/task-output.txt",
+                "content": "provider control prose"
+            }),
+        );
+        let encoded = serde_json::to_string(&(request, result)).expect("serialize projection");
+        assert!(!encoded.contains("provider-session-id"));
+        assert!(!encoded.contains("provider-agent-id"));
+        assert!(!encoded.contains("/private/tmp"));
+        assert!(!encoded.contains("provider control prose"));
+    }
+
+    #[test]
+    fn claude_agent_adapter_emits_only_projected_failure() {
+        let (inner, mut rx) = make_test_inner();
+        let tool_call = ClaudeToolCall {
+            id: "task-call".to_owned(),
+            name: "Agent".to_owned(),
+            arguments: json!({
+                "prompt": "Inspect the relay",
+                "description": "Relay investigator",
+                "resume": "provider-session-id"
+            }),
+        };
+        inner.emit_tool_request(&tool_call);
+        inner.emit_tool_execution_completed(
+            &tool_call.id,
+            &tool_call.name,
+            false,
+            json!({
+                "kind": "Other",
+                "result": {
+                    "agentId": "provider-agent-id",
+                    "outputPath": "/private/tmp/claude/output.txt"
+                }
+            }),
+            Some("provider control prose /private/tmp/claude/output.txt".to_owned()),
+        );
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(serde_json::to_string(&event).expect("serialize emitted event"));
+        }
+        let encoded = events.join("\n");
+        assert!(encoded.contains("AgentSpawn"));
+        assert!(encoded.contains("Agent task failed"));
+        assert!(!encoded.contains("provider-session-id"));
+        assert!(!encoded.contains("provider-agent-id"));
+        assert!(!encoded.contains("/private/tmp"));
+        assert!(!encoded.contains("provider control prose"));
+    }
+
+    #[test]
     fn claude_tool_request_type_maps_read_to_read_files() {
         let request = claude_tool_request_type(
             "Read",
@@ -18577,8 +19752,15 @@ for raw_line in sys.stdin:
     #[tokio::test]
     async fn pending_subagent_prompt_is_emitted_on_content_block_stop() {
         let (relay_event_tx, mut relay_event_rx) = mpsc::unbounded_channel();
+        let (model_usage_tx, _model_usage_rx) = mpsc::unbounded_channel();
+        let (total_usage_tx, _total_usage_rx) = mpsc::unbounded_channel();
         let (raw_event_tx, raw_event_rx) = mpsc::unbounded_channel();
-        spawn_claude_subagent_event_bridge(raw_event_rx, relay_event_tx.clone());
+        spawn_claude_subagent_event_bridge(
+            raw_event_rx,
+            relay_event_tx.clone(),
+            model_usage_tx,
+            total_usage_tx,
+        );
         let mut streams = HashMap::new();
         streams.insert(
             "toolu_spawn".to_string(),
@@ -18601,9 +19783,13 @@ for raw_line in sys.stdin:
                 parent_tool_name: "Task".to_string(),
                 agent_id: protocol::AgentId("test-subagent".to_string()),
                 agent_name: "Agent".to_string(),
+                name_update_tx: None,
                 parent_emitter: test_parent_emitter().0,
                 last_progress_emit: std::time::Instant::now(),
                 execution: SubAgentExecution::Foreground,
+                seen_tool_call_ids: HashSet::new(),
+                last_tool_name: None,
+                reported_total_tokens: None,
             },
         );
 
@@ -18636,6 +19822,30 @@ for raw_line in sys.stdin:
         };
         assert_eq!(message.content, "Say \"hello world\" and nothing else.");
         assert!(pending_prompts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn claude_child_bridge_routes_total_only_usage_outside_chat() {
+        let (raw_tx, raw_rx) = mpsc::unbounded_channel();
+        let (chat_tx, mut chat_rx) = mpsc::unbounded_channel();
+        let (model_tx, _model_rx) = mpsc::unbounded_channel();
+        let (total_tx, mut total_rx) = mpsc::unbounded_channel();
+        spawn_claude_subagent_event_bridge(raw_rx, chat_tx, model_tx, total_tx);
+
+        raw_tx
+            .send(json!({
+                "kind": "TotalOnlyTokenUsage",
+                "data": { "total_tokens": 47 }
+            }))
+            .expect("raw bridge should be open");
+
+        assert_eq!(
+            timeout(Duration::from_secs(1), total_rx.recv())
+                .await
+                .expect("total-only usage should cross child bridge"),
+            Some(47)
+        );
+        assert!(chat_rx.try_recv().is_err());
     }
 
     #[tokio::test]

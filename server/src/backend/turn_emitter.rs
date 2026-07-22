@@ -64,6 +64,7 @@ struct TurnEmitterState {
     terminal_stream_message_ids: HashSet<ChatMessageId>,
     identity_violation_reported: bool,
     emitted_tool_requests: IndexMap<String, EmittedToolRequest>,
+    detached_tool_requests: IndexMap<String, EmittedToolRequest>,
     completed_tool_requests: HashSet<String>,
     normalization_failures: HashMap<String, PendingToolNormalizationFailure>,
 }
@@ -167,6 +168,7 @@ impl TurnEmitter {
                 terminal_stream_message_ids: HashSet::new(),
                 identity_violation_reported: false,
                 emitted_tool_requests: IndexMap::new(),
+                detached_tool_requests: IndexMap::new(),
                 completed_tool_requests: HashSet::new(),
                 normalization_failures: HashMap::new(),
             }),
@@ -354,6 +356,24 @@ impl TurnEmitter {
         self.lock().tool_completed(data, None)
     }
 
+    /// Move a tool out of turn ownership while retaining its request identity.
+    /// Detached tools survive later turn resets/cancellation and are completed
+    /// by their own out-of-band terminal notification.
+    pub fn detach_tool(&self, tool_call_id: &str) -> bool {
+        let mut state = self.lock();
+        let Some(request) = state.emitted_tool_requests.shift_remove(tool_call_id) else {
+            return state.detached_tool_requests.contains_key(tool_call_id);
+        };
+        state
+            .detached_tool_requests
+            .insert(tool_call_id.to_owned(), request);
+        true
+    }
+
+    pub(crate) fn has_pending_tool_request(&self, tool_call_id: &str) -> bool {
+        self.lock().is_tool_pending(tool_call_id)
+    }
+
     pub fn tool_completed_with_normalization_failure(
         &self,
         data: ToolCompletedPayload<'_>,
@@ -502,6 +522,13 @@ impl TurnEmitter {
         }));
     }
 
+    pub fn total_only_token_usage(&self, total_tokens: u64) {
+        self.lock().send(json!({
+            "kind": "TotalOnlyTokenUsage",
+            "data": { "total_tokens": total_tokens },
+        }));
+    }
+
     // ---------- Misc chat events ----------
 
     pub fn typing_status_changed(&self, typing: bool) {
@@ -560,6 +587,7 @@ impl TurnEmitter {
     pub fn conversation_cleared(&self) {
         let mut state = self.lock();
         state.reset_turn_state();
+        state.detached_tool_requests.clear();
         state.terminal_stream_message_ids.clear();
         state.identity_violation_reported = false;
         state.send(json!({ "kind": "ConversationCleared" }));
@@ -809,7 +837,10 @@ impl TurnEmitterState {
                 provider_tool_type
             }
         };
-        if let Some(request) = self.emitted_tool_requests.get(tool_call_id)
+        if let Some(request) = self
+            .emitted_tool_requests
+            .get(tool_call_id)
+            .or_else(|| self.detached_tool_requests.get(tool_call_id))
             && (self.completed_tool_requests.contains(tool_call_id)
                 || (request.name == tool_name && request.arguments == tool_type))
         {
@@ -998,7 +1029,10 @@ impl TurnEmitterState {
     }
 
     fn send_tool_progress(&self, data: &protocol::ToolProgressData) {
-        if let Some(request) = self.emitted_tool_requests.get(&data.tool_call_id)
+        if let Some(request) = self
+            .emitted_tool_requests
+            .get(&data.tool_call_id)
+            .or_else(|| self.detached_tool_requests.get(&data.tool_call_id))
             && request.name != data.tool_name
         {
             tracing::error!(
@@ -1064,6 +1098,7 @@ impl TurnEmitterState {
     ) {
         self.completed_tool_requests
             .insert(tool_call_id.to_string());
+        self.detached_tool_requests.shift_remove(tool_call_id);
         let error_value = error
             .map(|s| Value::String(s.to_owned()))
             .unwrap_or(Value::Null);
@@ -1288,6 +1323,7 @@ impl TurnEmitterState {
     fn pending_tool_name(&self, tool_call_id: &str) -> Option<&String> {
         self.emitted_tool_requests
             .get(tool_call_id)
+            .or_else(|| self.detached_tool_requests.get(tool_call_id))
             .map(|request| &request.name)
             .filter(|_| !self.completed_tool_requests.contains(tool_call_id))
     }
@@ -1410,7 +1446,10 @@ fn stream_identity_violation_message(violation: StreamIdentityViolation) -> &'st
 }
 
 fn cancelled_tool_result(detailed_message: &str) -> Value {
-    failed_tool_result("Cancelled", detailed_message)
+    json!({
+        "kind": "Cancelled",
+        "message": detailed_message,
+    })
 }
 
 fn failed_tool_result(short_message: &str, detailed_message: &str) -> Value {
@@ -2742,6 +2781,47 @@ mod tests {
             completions[0]
                 .pointer("/data/success")
                 .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn detached_tool_survives_unrelated_turn_cancellation_and_completes_once() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new_for_agent(tx, AgentName("claude"));
+        emitter.tool_request("tool-background", "Bash", run_command_request());
+        assert!(emitter.detach_tool("tool-background"));
+
+        emitter.operation_cancelled("later turn cancelled");
+        emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id: "tool-background",
+            tool_name: "Bash",
+            tool_result: json!({
+                "kind": "RunCommand",
+                "exit_code": 0,
+                "stdout": "done",
+                "stderr": "",
+            }),
+            success: true,
+            error: None,
+        });
+        drop(emitter);
+
+        let events = recv_events(&mut rx);
+        assert_protocol_valid(&events);
+        let completions = events
+            .iter()
+            .filter(|event| event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted"))
+            .collect::<Vec<_>>();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(
+            completions[0]
+                .pointer("/data/tool_call_id")
+                .and_then(Value::as_str),
+            Some("tool-background")
+        );
+        assert_eq!(
+            completions[0].pointer("/data/success").and_then(Value::as_bool),
             Some(true)
         );
     }

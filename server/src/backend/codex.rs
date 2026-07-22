@@ -1296,6 +1296,8 @@ struct CodexSubAgentStream {
     spawn_item_id: String,
     activity_item_id: Option<String>,
     agent_path: String,
+    agent_name: String,
+    name_update_tx: Option<mpsc::UnboundedSender<String>>,
     sender_thread_id: String,
     active_turn_id: Option<String>,
     current_message_id: Option<ChatMessageId>,
@@ -1317,6 +1319,7 @@ struct CodexSubAgentStream {
     next_generated_identity_ordinal: u64,
     pending_message_metadata: Option<PendingCodexMessageMetadata>,
     token_usage_by_turn: HashMap<String, Value>,
+    model_token_usage_by_turn: HashMap<String, CodexTurnTokenUsage>,
 }
 
 impl CodexSubAgentStream {
@@ -1355,8 +1358,11 @@ struct CompletedCodexSubAgentStream {
     spawn_item_id: String,
     activity_item_id: Option<String>,
     agent_path: String,
+    agent_name: String,
+    name_update_tx: Option<mpsc::UnboundedSender<String>>,
     sender_thread_id: String,
     pending_message_metadata: Option<PendingCodexMessageMetadata>,
+    model_token_usage_by_turn: HashMap<String, CodexTurnTokenUsage>,
 }
 
 fn completed_codex_subagent_stream(stream: CodexSubAgentStream) -> CompletedCodexSubAgentStream {
@@ -1366,8 +1372,11 @@ fn completed_codex_subagent_stream(stream: CodexSubAgentStream) -> CompletedCode
         spawn_item_id: stream.spawn_item_id,
         activity_item_id: stream.activity_item_id,
         agent_path: stream.agent_path,
+        agent_name: stream.agent_name,
+        name_update_tx: stream.name_update_tx,
         sender_thread_id: stream.sender_thread_id,
         pending_message_metadata: stream.pending_message_metadata,
+        model_token_usage_by_turn: stream.model_token_usage_by_turn,
     }
 }
 
@@ -4151,7 +4160,20 @@ impl CodexInner {
                 }
                 (container, call_ids)
             }
-            "collabToolCall" | "collabAgentToolCall" | "mcpToolCall" | "dynamicToolCall" => {
+            "collabToolCall" | "collabAgentToolCall" => {
+                let tool_name = item
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .unwrap_or(item_type)
+                    .to_string();
+                let container = emitter.tool_request_in_container(
+                    &item_id,
+                    &tool_name,
+                    codex_public_tool_request_type(&tool_name, item),
+                );
+                (container, vec![item_id])
+            }
+            "mcpToolCall" | "dynamicToolCall" => {
                 let tool_name = item
                     .get("tool")
                     .and_then(Value::as_str)
@@ -4421,13 +4443,11 @@ impl CodexInner {
                 } else {
                     Some(format!("{tool_name} failed"))
                 };
+                let tool_result = codex_public_collaboration_result(item, success);
                 let container = emitter.tool_completed(ToolCompletedPayload {
                     tool_call_id: &item_id,
                     tool_name,
-                    tool_result: json!({
-                        "kind": "Other",
-                        "result": item
-                    }),
+                    tool_result,
                     success,
                     error: error_message.as_deref(),
                 });
@@ -4851,6 +4871,8 @@ impl CodexInner {
         stream_key: &str,
         model: &str,
     ) {
+        self.emit_subagent_model_request_usage(params, stream_key, model, false)
+            .await;
         let Some((turn_id, token_usage)) = extract_turn_token_usage(params, Some(model)) else {
             return;
         };
@@ -4910,6 +4932,8 @@ impl CodexInner {
         stream_key: &str,
         model: &str,
     ) {
+        self.emit_subagent_model_request_usage(params, stream_key, model, true)
+            .await;
         let Some((turn_id, token_usage)) = extract_turn_token_usage(params, Some(model)) else {
             return;
         };
@@ -4957,6 +4981,8 @@ impl CodexInner {
     }
 
     async fn handle_subagent_turn_completed(&self, params: &Value, stream_key: &str, model: &str) {
+        self.emit_subagent_model_request_usage(params, stream_key, model, false)
+            .await;
         self.close_subagent_tool_container_if_open(stream_key).await;
         let turn_status = params
             .get("turn")
@@ -5151,6 +5177,52 @@ impl CodexInner {
             status = turn_status,
             "Codex child turn completed; retaining ownership for possible follow-up"
         );
+    }
+
+    async fn emit_subagent_model_request_usage(
+        &self,
+        params: &Value,
+        stream_key: &str,
+        model: &str,
+        completed: bool,
+    ) {
+        let Some((turn_id, request, cumulative, context_window)) =
+            extract_model_request_token_usage(params, Some(model))
+        else {
+            return;
+        };
+        let recorded = {
+            let mut state = self.state.lock().await;
+            if completed {
+                state
+                    .completed_subagent_streams
+                    .get_mut(stream_key)
+                    .and_then(|stream| {
+                        record_model_request_token_usage(
+                            &mut stream.model_token_usage_by_turn,
+                            turn_id,
+                            request,
+                            cumulative,
+                            context_window,
+                        )
+                        .map(|usage| (Arc::clone(&stream.emitter), usage))
+                    })
+            } else {
+                state.subagent_streams.get_mut(stream_key).and_then(|stream| {
+                    record_model_request_token_usage(
+                        &mut stream.model_token_usage_by_turn,
+                        turn_id,
+                        request,
+                        cumulative,
+                        context_window,
+                    )
+                    .map(|usage| (Arc::clone(&stream.emitter), usage))
+                })
+            }
+        };
+        if let Some((emitter, usage)) = recorded {
+            emitter.model_request_token_usage(&usage);
+        }
     }
 
     async fn handle_legacy_codex_event(&self, method: &str, params: &Value) {
@@ -6464,7 +6536,7 @@ impl CodexInner {
             }
             let receiver_thread_id = spawn.receiver_thread_id.clone();
             let fallback_agent_path = spawn.name.clone();
-            let conflict = {
+            let (conflict, already_registered) = {
                 let mut state = self.state.lock().await;
                 if spawn.sender_thread_id != state.thread_id {
                     let message = format!(
@@ -6474,23 +6546,47 @@ impl CodexInner {
                     state
                         .conflicting_subagent_threads
                         .insert(receiver_thread_id.clone(), message.clone());
-                    Some(message)
+                    (Some(message), false)
+                } else if let Some(stream) = state.subagent_streams.get_mut(&receiver_thread_id) {
+                    if crate::sub_agent::child_name_is_better(&stream.agent_name, &spawn.name) {
+                        stream.agent_name = spawn.name.clone();
+                        if let Some(tx) = &stream.name_update_tx {
+                            let _ = tx.send(spawn.name.clone());
+                        }
+                    }
+                    (None, true)
+                } else if let Some(stream) =
+                    state.completed_subagent_streams.get_mut(&receiver_thread_id)
+                {
+                    if crate::sub_agent::child_name_is_better(&stream.agent_name, &spawn.name) {
+                        stream.agent_name = spawn.name.clone();
+                        if let Some(tx) = &stream.name_update_tx {
+                            let _ = tx.send(spawn.name.clone());
+                        }
+                    }
+                    (None, true)
                 } else if let Some(existing) =
-                    state.pending_subagent_spawns.get(&receiver_thread_id)
+                    state.pending_subagent_spawns.get_mut(&receiver_thread_id)
                 {
                     if existing.item_id == spawn.item_id
                         && existing.sender_thread_id == spawn.sender_thread_id
                     {
+                        if crate::sub_agent::child_name_is_better(&existing.name, &spawn.name) {
+                            existing.name = spawn.name;
+                        }
+                        if existing.prompt.is_none() {
+                            existing.prompt = spawn.prompt;
+                        }
                         tracing::debug!(
                             receiver_thread_id = receiver_thread_id.as_str(),
                             "Repeated authoritative Codex child spawn metadata"
                         );
-                        None
+                        (None, false)
                     } else {
-                        Some(format!(
+                        (Some(format!(
                             "Codex ownership invariant failed: child thread '{}' has contradictory pending spawn metadata ('{}' and '{}')",
                             receiver_thread_id, existing.item_id, spawn.item_id
-                        ))
+                        )), false)
                     }
                 } else {
                     tracing::debug!(
@@ -6502,7 +6598,7 @@ impl CodexInner {
                     state
                         .pending_subagent_spawns
                         .insert(receiver_thread_id.clone(), spawn);
-                    None
+                    (None, false)
                 }
             };
             if let Some(message) = conflict {
@@ -6513,7 +6609,7 @@ impl CodexInner {
                 self.emitter.backend_error(&message);
                 continue;
             }
-            if register_from_completed_spawn {
+            if register_from_completed_spawn && !already_registered {
                 self.register_codex_subagent_activity_if_needed(&json!({
                     "type": "subAgentActivity",
                     "kind": "started",
@@ -6663,6 +6759,7 @@ impl CodexInner {
         let progress_tool_call_id = spawn_item_id.clone();
         let spawn_tool_name = spawn.tool_name.clone();
         let spawn_prompt = spawn.prompt.clone();
+        let spawn_name = spawn.name.clone();
         let sender_thread_id = spawn.sender_thread_id.clone();
         let handle = match subagent_sink
             .on_subagent_spawned(
@@ -6696,7 +6793,11 @@ impl CodexInner {
         let child_agent_id = handle.agent_id.clone();
         let spawned_agent = child_agent_id.clone();
         let (raw_event_tx, raw_event_rx) = mpsc::unbounded_channel();
-        spawn_codex_subagent_event_bridge(raw_event_rx, handle.event_tx);
+        spawn_codex_subagent_event_bridge(
+            raw_event_rx,
+            handle.event_tx,
+            handle.model_usage_tx,
+        );
         let emitter = Arc::new(TurnEmitter::new_for_agent(
             raw_event_tx,
             AgentName(CODEX_AGENT_NAME),
@@ -6725,6 +6826,8 @@ impl CodexInner {
                         spawn_item_id: spawn_item_id.clone(),
                         activity_item_id: activity.item_id.clone(),
                         agent_path: activity.agent_path.clone(),
+                        agent_name: spawn_name,
+                        name_update_tx: handle.name_update_tx,
                         sender_thread_id,
                         active_turn_id: None,
                         current_message_id: None,
@@ -6745,6 +6848,7 @@ impl CodexInner {
                         next_generated_identity_ordinal: 1,
                         pending_message_metadata: None,
                         token_usage_by_turn: HashMap::new(),
+                        model_token_usage_by_turn: HashMap::new(),
                         current_images: Vec::new(),
                     },
                 );
@@ -10180,7 +10284,12 @@ fn emit_codex_tool_request(
     tool_name: &str,
     arguments: &Value,
 ) -> Option<ChatMessageId> {
-    let tool_type = parse_codex_subagent_collabs(arguments)
+    let tool_type = codex_public_tool_request_type(tool_name, arguments);
+    emitter.tool_request_in_container(tool_call_id, tool_name, tool_type)
+}
+
+fn codex_public_tool_request_type(tool_name: &str, arguments: &Value) -> Value {
+    parse_codex_subagent_collabs(arguments)
         .into_iter()
         .next()
         .map(|spawn| {
@@ -10190,27 +10299,84 @@ fn emit_codex_tool_request(
             })
             .expect("serialize native Codex agent spawn")
         })
-        .unwrap_or_else(|| json!({ "kind": "Other", "args": arguments }));
-    emitter.tool_request_in_container(tool_call_id, tool_name, tool_type)
+        .unwrap_or_else(|| {
+            if codex_is_collaboration_item(arguments) {
+                json!({
+                    "kind": "Other",
+                    "args": {
+                        "action": tool_name,
+                        "agent_count": codex_native_wait_thread_ids(arguments).len(),
+                    }
+                })
+            } else {
+                json!({ "kind": "Other", "args": arguments })
+            }
+        })
 }
 
 fn normalize_codex_tool_result(
     _emitter: &TurnEmitter,
     _tool_call_id: &str,
-    _tool_name: &str,
+    tool_name: &str,
     tool_result: Value,
-    _success: bool,
+    success: bool,
 ) -> (Value, Option<ToolExecutionNormalizationFailure>) {
+    if let Some(item) = tool_result
+        .get("result")
+        .filter(|item| codex_is_collaboration_item(item))
+    {
+        return (
+            codex_public_collaboration_result_with_name(tool_name, item, success),
+            None,
+        );
+    }
     (tool_result, None)
+}
+
+fn codex_is_collaboration_item(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("collabToolCall" | "collabAgentToolCall")
+    )
+}
+
+fn codex_public_collaboration_result(item: &Value, success: bool) -> Value {
+    let tool_name = item
+        .get("tool")
+        .and_then(Value::as_str)
+        .unwrap_or("collab_tool");
+    codex_public_collaboration_result_with_name(tool_name, item, success)
+}
+
+fn codex_public_collaboration_result_with_name(
+    tool_name: &str,
+    item: &Value,
+    success: bool,
+) -> Value {
+    serde_json::to_value(protocol::ToolExecutionResult::Other {
+        result: json!({
+            "action": tool_name,
+            "status": if success { "completed" } else { "failed" },
+            "agent_count": codex_native_wait_thread_ids(item).len(),
+        }),
+    })
+    .expect("serialize Codex collaboration result")
 }
 
 fn spawn_codex_subagent_event_bridge(
     mut raw_rx: mpsc::UnboundedReceiver<Value>,
     event_tx: mpsc::UnboundedSender<ChatEvent>,
+    model_usage_tx: mpsc::UnboundedSender<ModelRequestTokenUsage>,
 ) {
     tokio::spawn(async move {
         let mut normalization_failures = HashMap::new();
         while let Some(raw) = raw_rx.recv().await {
+            if let Some(usage) = model_request_token_usage_from_raw(&raw) {
+                if model_usage_tx.send(usage).is_err() {
+                    break;
+                }
+                continue;
+            }
             if !forward_codex_backend_event(raw, &event_tx, &mut normalization_failures) {
                 break;
             }
@@ -10288,6 +10454,7 @@ fn codex_backend_event_from_raw(
         Ok(event) => {
             let (chat_event, normalization_error) =
                 normalize_tyde_chat_event(event, _normalization_failures);
+            let chat_event = normalize_codex_collaboration_chat_event(chat_event);
             Some(CodexForwardedBackendEvent {
                 chat_event,
                 terminal: false,
@@ -10343,6 +10510,42 @@ fn codex_backend_event_from_raw(
                 }
             }
         }
+    }
+}
+
+fn normalize_codex_collaboration_chat_event(event: ChatEvent) -> ChatEvent {
+    match event {
+        ChatEvent::ToolRequest(mut request) => {
+            if let protocol::ToolRequestType::Other { args } = &request.tool_type
+                && codex_is_collaboration_item(args)
+            {
+                request.tool_type = serde_json::from_value(codex_public_tool_request_type(
+                    &request.tool_name,
+                    args,
+                ))
+                .expect("Codex collaboration request projection must be canonical");
+            }
+            ChatEvent::ToolRequest(request)
+        }
+        ChatEvent::ToolExecutionCompleted(mut completion) => {
+            if let protocol::ToolExecutionResult::Other { result } = &completion.tool_result
+                && codex_is_collaboration_item(result)
+            {
+                completion.tool_result = serde_json::from_value(
+                    codex_public_collaboration_result_with_name(
+                        &completion.tool_name,
+                        result,
+                        completion.success,
+                    ),
+                )
+                .expect("Codex collaboration result projection must be canonical");
+                if !completion.success {
+                    completion.error = Some(format!("{} failed", completion.tool_name));
+                }
+            }
+            ChatEvent::ToolExecutionCompleted(completion)
+        }
+        other => other,
     }
 }
 
@@ -13405,6 +13608,8 @@ for line in sys.stdin:
                 spawn_item_id: receiver_thread_id.to_string(),
                 activity_item_id: None,
                 agent_path: receiver_thread_id.to_string(),
+                agent_name: "Sub-agent".to_string(),
+                name_update_tx: None,
                 sender_thread_id: "thread-parent".to_string(),
                 active_turn_id: None,
                 current_message_id: None,
@@ -13425,6 +13630,7 @@ for line in sys.stdin:
                 next_generated_identity_ordinal: 1,
                 pending_message_metadata: None,
                 token_usage_by_turn: HashMap::new(),
+                model_token_usage_by_turn: HashMap::new(),
                 current_images: Vec::new(),
             },
         );
@@ -13467,6 +13673,41 @@ for line in sys.stdin:
             serde_json::to_value(event).expect("serialize forwarded event"),
             raw
         );
+    }
+
+    #[test]
+    fn forwarded_collaboration_event_is_projected_before_chat_event_boundary() {
+        let raw = json!({
+            "kind": "ToolExecutionCompleted",
+            "data": {
+                "tool_call_id": "wait-call",
+                "tool_name": "wait",
+                "tool_result": {
+                    "kind": "Other",
+                    "result": {
+                        "type": "collabAgentToolCall",
+                        "tool": "wait",
+                        "senderThreadId": "parent-thread-secret",
+                        "agentsStates": {
+                            "child-thread-secret": {
+                                "status": "completed",
+                                "outputPath": "/private/tmp/codex/output.txt"
+                            }
+                        }
+                    }
+                },
+                "success": true,
+                "error": null
+            }
+        });
+
+        let (_, event) = forwarded_visible_codex_event(raw);
+        let encoded = serde_json::to_string(&event).expect("serialize forwarded event");
+        assert!(encoded.contains("agent_count"));
+        assert!(!encoded.contains("parent-thread-secret"));
+        assert!(!encoded.contains("child-thread-secret"));
+        assert!(!encoded.contains("agentsStates"));
+        assert!(!encoded.contains("/private/tmp"));
     }
 
     #[test]
@@ -13655,6 +13896,48 @@ for line in sys.stdin:
             &chat_tx,
             &mut normalization_failures,
         ));
+        assert!(chat_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn native_child_bridge_preserves_model_request_usage() {
+        let usage = ModelRequestTokenUsage {
+            request_id: ModelRequestId {
+                turn_id: ModelTurnId("child-turn".to_owned()),
+                sequence: 1,
+            },
+            request: TokenUsage {
+                total_tokens: 9,
+                ..TokenUsage::default()
+            },
+            turn: TokenUsage {
+                total_tokens: 9,
+                ..TokenUsage::default()
+            },
+            cumulative: TokenUsage {
+                total_tokens: 9,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(200_000),
+        };
+        let (raw_tx, raw_rx) = mpsc::unbounded_channel();
+        let (chat_tx, mut chat_rx) = mpsc::unbounded_channel();
+        let (usage_tx, mut usage_rx) = mpsc::unbounded_channel();
+        spawn_codex_subagent_event_bridge(raw_rx, chat_tx, usage_tx);
+
+        raw_tx
+            .send(json!({
+                "kind": "ModelRequestTokenUsage",
+                "data": serde_json::to_value(&usage).expect("serialize usage")
+            }))
+            .expect("raw bridge should be open");
+
+        assert_eq!(
+            timeout(Duration::from_secs(1), usage_rx.recv())
+                .await
+                .expect("usage should cross child bridge"),
+            Some(usage)
+        );
         assert!(chat_rx.try_recv().is_err());
     }
 
@@ -14778,6 +15061,16 @@ for line in sys.stdin:
                     self.next_agent_id.fetch_add(1, Ordering::Relaxed)
                 ));
                 let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
+                let (model_usage_tx, mut model_usage_rx) =
+                    tokio::sync::mpsc::unbounded_channel();
+                let (total_usage_tx, mut total_usage_rx) =
+                    tokio::sync::mpsc::unbounded_channel();
+                tokio::spawn(async move {
+                    while model_usage_rx.recv().await.is_some() {}
+                });
+                tokio::spawn(async move {
+                    while total_usage_rx.recv().await.is_some() {}
+                });
                 let events_by_agent_id = Arc::clone(&self.events_by_agent_id);
                 let agent_id_for_events = agent_id.clone();
                 tokio::spawn(async move {
@@ -14804,7 +15097,13 @@ for line in sys.stdin:
                     agent_id: agent_id.clone(),
                     native_thread_id,
                 });
-                Ok(SubAgentHandle { event_tx, agent_id })
+                Ok(SubAgentHandle {
+                    event_tx,
+                    model_usage_tx,
+                    total_usage_tx,
+                    agent_id,
+                    name_update_tx: None,
+                })
             })
         }
     }
@@ -16946,6 +17245,19 @@ Do not describe the tool, and do not skip the tool call."#;
             );
 
             let subagent_events = drain_events(&mut subagent_rx);
+            let model_usage = subagent_events
+                .iter()
+                .find(|event| {
+                    event.get("kind").and_then(Value::as_str)
+                        == Some("ModelRequestTokenUsage")
+                })
+                .expect("authoritative child model-request usage");
+            assert_eq!(
+                model_usage
+                    .pointer("/data/request/total_tokens")
+                    .and_then(Value::as_u64),
+                Some(12)
+            );
             let stream_end = subagent_events
                 .iter()
                 .find(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"))
@@ -21014,6 +21326,83 @@ Do not describe the tool, and do not skip the tool call."#;
     }
 
     #[test]
+    fn later_codex_spawn_metadata_enriches_only_generic_child_name() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (inner, _parent_rx) = test_codex_inner();
+            let (child_tx, _child_rx) = mpsc::unbounded_channel();
+            attach_test_codex_subagent(&inner, child_tx, "thread-child").await;
+            let (name_tx, mut name_rx) = mpsc::unbounded_channel();
+            {
+                let mut state = inner.state.lock().await;
+                let stream = state.subagent_streams.get_mut("thread-child").unwrap();
+                stream.agent_name = "Sub-agent".to_owned();
+                stream.name_update_tx = Some(name_tx);
+            }
+
+            inner
+                .record_codex_subagent_spawn_metadata_if_needed(
+                    None,
+                    None,
+                    &json!({
+                        "type": "collabAgentToolCall",
+                        "id": "spawn-child",
+                        "tool": "spawnAgent",
+                        "senderThreadId": "thread-parent",
+                        "receiverThreadId": "thread-child",
+                        "receiverAgentName": "Auth Reviewer",
+                        "receiverAgentType": "reviewer",
+                        "prompt": "Review authentication"
+                    }),
+                )
+                .await;
+            assert_eq!(name_rx.try_recv().unwrap(), "Auth Reviewer");
+            assert_eq!(
+                inner
+                    .state
+                    .lock()
+                    .await
+                    .subagent_streams
+                    .get("thread-child")
+                    .unwrap()
+                    .agent_name,
+                "Auth Reviewer"
+            );
+
+            inner
+                .record_codex_subagent_spawn_metadata_if_needed(
+                    None,
+                    None,
+                    &json!({
+                        "type": "collabAgentToolCall",
+                        "id": "spawn-child",
+                        "tool": "spawnAgent",
+                        "senderThreadId": "thread-parent",
+                        "receiverThreadId": "thread-child",
+                        "receiverAgentName": "Sub-agent",
+                        "prompt": "Review authentication"
+                    }),
+                )
+                .await;
+            assert!(name_rx.try_recv().is_err());
+            assert_eq!(
+                inner
+                    .state
+                    .lock()
+                    .await
+                    .subagent_streams
+                    .get("thread-child")
+                    .unwrap()
+                    .agent_name,
+                "Auth Reviewer"
+            );
+        });
+    }
+
+    #[test]
     fn completed_spawn_agent_array_registers_child_before_child_turn() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -21194,6 +21583,75 @@ Do not describe the tool, and do not skip the tool call."#;
             })),
             vec!["child-a", "child-b"]
         );
+    }
+
+    #[test]
+    fn collaboration_projection_excludes_codex_transport_metadata() {
+        let item = json!({
+            "type": "collabAgentToolCall",
+            "id": "provider-item-id",
+            "tool": "wait",
+            "senderThreadId": "parent-thread-secret",
+            "receiverThreadId": "child-thread-secret",
+            "agentsStates": {
+                "child-thread-secret": {
+                    "status": "completed",
+                    "outputPath": "/private/tmp/codex/output.txt",
+                    "message": "provider control prose"
+                }
+            }
+        });
+
+        let request = codex_public_tool_request_type("wait", &item);
+        let result = codex_public_collaboration_result(&item, true);
+        assert_eq!(
+            request.pointer("/args/action").and_then(Value::as_str),
+            Some("wait")
+        );
+        assert_eq!(
+            request
+                .pointer("/args/agent_count")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            result.pointer("/result/status").and_then(Value::as_str),
+            Some("completed")
+        );
+        let encoded = serde_json::to_string(&(request, result)).expect("serialize projection");
+        assert!(!encoded.contains("provider-item-id"));
+        assert!(!encoded.contains("parent-thread-secret"));
+        assert!(!encoded.contains("child-thread-secret"));
+        assert!(!encoded.contains("/private/tmp"));
+        assert!(!encoded.contains("provider control prose"));
+        assert!(!encoded.contains("agentsStates"));
+    }
+
+    #[test]
+    fn collaboration_spawn_projection_is_typed_without_thread_ids() {
+        let item = json!({
+            "type": "collabAgentToolCall",
+            "id": "spawn-call",
+            "tool": "spawnAgent",
+            "senderThreadId": "parent-thread-secret",
+            "receiverThreadId": "child-thread-secret",
+            "receiverAgentName": "Reviewer",
+            "receiverAgentType": "worker",
+            "prompt": "Review the adapter"
+        });
+
+        let request = codex_public_tool_request_type("spawnAgent", &item);
+        let parsed: protocol::ToolRequestType =
+            serde_json::from_value(request.clone()).expect("typed Codex spawn request");
+        assert!(matches!(
+            parsed,
+            protocol::ToolRequestType::AgentSpawn { prompt, name }
+                if prompt.as_deref() == Some("Review the adapter")
+                    && name.as_deref() == Some("Reviewer")
+        ));
+        let encoded = serde_json::to_string(&request).expect("serialize request");
+        assert!(!encoded.contains("parent-thread-secret"));
+        assert!(!encoded.contains("child-thread-secret"));
     }
 
     #[test]

@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 38;
+pub const PROTOCOL_VERSION: u32 = 39;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -3809,6 +3809,11 @@ pub struct AgentActivityStats {
     pub tool_calls: u64,
     #[serde(default)]
     pub token_usage: TokenUsage,
+    /// Authoritative aggregate when a backend reports only a total and no
+    /// input/output split. Kept separate so zero-valued component fields are
+    /// never mistaken for provider-reported zeros.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_usage_total_only: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_through_seq: Option<u64>,
 }
@@ -6941,11 +6946,14 @@ pub struct BackgroundTaskState {
     #[serde(default)]
     pub description: Option<String>,
     pub status: BackgroundTaskStatus,
-    /// Completion summary from the `task_notification` frame, e.g.
-    /// `Background command "…" completed (exit code 0)`. The exit code
-    /// exists only inside this text; the CLI reports no structured field.
+    /// Completion summary from the `task_notification` frame. It remains
+    /// presentation-only; command results are never inferred from this prose.
     #[serde(default)]
     pub summary: Option<String>,
+    /// Why final stdout/stderr could not be captured. This is backend-owned
+    /// metadata, never command stderr and never an internal temporary path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_unavailable: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -7099,6 +7107,13 @@ pub struct ToolExecutionCompletedData {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum ToolExecutionResult {
+    /// The containing turn was cancelled before the tool produced an
+    /// authoritative result. This is deliberately distinct from `Error`: a
+    /// cancelled command did not necessarily exit non-zero, and provider
+    /// control prose is not command stderr.
+    Cancelled {
+        message: String,
+    },
     ModifyFile {
         lines_added: u64,
         lines_removed: u64,
@@ -7450,8 +7465,8 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_thirty_eight() {
-        assert_eq!(PROTOCOL_VERSION, 38);
+    fn protocol_version_is_thirty_nine() {
+        assert_eq!(PROTOCOL_VERSION, 39);
     }
 
     #[test]
@@ -7791,6 +7806,7 @@ mod search_serde_tests {
                 cache_creation_input_tokens: Some(1),
                 reasoning_tokens: Some(2),
             },
+            token_usage_total_only: Some(15),
             source_through_seq: Some(42),
         };
         let payload = AgentActivityStatsPayload {

@@ -18,6 +18,7 @@ use protocol::{
     StreamTextDeltaData, TaskTokenUsageAmount, TaskTokenUsageScope,
     TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
     ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy,
+    ToolRequestType,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -530,6 +531,18 @@ impl AgentActivityStatsTracker {
         &self,
         reported_usage_floor: Option<&TokenUsage>,
     ) -> (TaskTokenUsageScope, Option<String>) {
+        if let Some(total_tokens) = self
+            .stats
+            .token_usage_total_only
+            .filter(|total| *total >= self.stats.token_usage.total_tokens)
+        {
+            return (
+                TaskTokenUsageScope::Known {
+                    usage: Box::new(TaskTokenUsageAmount::total_only(total_tokens)),
+                },
+                self.latest_model.clone(),
+            );
+        }
         if self.token_usage_by_source.is_empty() {
             return (
                 TaskTokenUsageScope::Unavailable {
@@ -666,6 +679,21 @@ impl AgentActivityStatsTracker {
             },
         );
         self.stats.token_usage = usage.cumulative;
+        self.stats.source_through_seq = Some(source_seq);
+        self.stats != previous
+    }
+
+    fn observe_total_only_token_usage(&mut self, total_tokens: u64, source_seq: u64) -> bool {
+        if self.token_usage_tracking_mode != TokenUsageTrackingMode::Messages {
+            return false;
+        }
+        let previous = self.stats.clone();
+        self.stats.token_usage_total_only = Some(
+            self.stats
+                .token_usage_total_only
+                .unwrap_or_default()
+                .max(total_tokens),
+        );
         self.stats.source_through_seq = Some(source_seq);
         self.stats != previous
     }
@@ -4146,6 +4174,8 @@ pub(crate) fn spawn_relay_agent_actor(
     agent_id: AgentId,
     start: AgentStartPayload,
     mut events: mpsc::UnboundedReceiver<ChatEvent>,
+    mut model_usage: mpsc::UnboundedReceiver<ModelRequestTokenUsage>,
+    mut total_usage: mpsc::UnboundedReceiver<u64>,
     session_store: Arc<Mutex<SessionStore>>,
     session_id: SessionId,
     status_handle: registry::AgentStatusHandle,
@@ -4164,7 +4194,7 @@ pub(crate) fn spawn_relay_agent_actor(
         let mut last_stream_identity_violation: Option<StreamIdentityViolation> = None;
         let mut subscribers: Vec<Stream> = Vec::new();
         let mut active_stream_text = String::new();
-        let mut activity_stats = AgentActivityStatsTracker::default();
+        let mut activity_stats = AgentActivityStatsTracker::for_backend(start.backend_kind);
         let mut activity_event_seq = 0_u64;
         let mut current_start = start;
         let mut pending_alias = None;
@@ -4172,6 +4202,8 @@ pub(crate) fn spawn_relay_agent_actor(
         let mut pending_tool_response_ids: HashSet<String> = HashSet::new();
         let mut lifecycle = ActorLifecycle::Running;
         let mut close_reply: Option<oneshot::Sender<()>> = None;
+        let mut model_usage_open = true;
+        let mut total_usage_open = true;
 
         status_handle
             .update(|s| {
@@ -4202,8 +4234,74 @@ pub(crate) fn spawn_relay_agent_actor(
                 .observe_event_log(&event_log)
                 .expect("typed relay replay log must project latest output");
             tokio::select! {
+                maybe_usage = model_usage.recv(), if model_usage_open => {
+                    let Some(usage) = maybe_usage else {
+                        model_usage_open = false;
+                        continue;
+                    };
+                    let source_seq = activity_event_seq;
+                    activity_event_seq = activity_event_seq.saturating_add(1);
+                    if activity_stats.observe_model_request_token_usage(usage, source_seq) {
+                        upsert_activity_stats_snapshot(
+                            &canonical_stream,
+                            &mut event_log,
+                            &mut subscribers,
+                            &current_start.agent_id,
+                            activity_stats.snapshot(),
+                        )
+                        .await;
+                    }
+                }
+                maybe_total = total_usage.recv(), if total_usage_open => {
+                    let Some(total_tokens) = maybe_total else {
+                        total_usage_open = false;
+                        continue;
+                    };
+                    let source_seq = activity_event_seq;
+                    activity_event_seq = activity_event_seq.saturating_add(1);
+                    if activity_stats.observe_total_only_token_usage(total_tokens, source_seq) {
+                        upsert_activity_stats_snapshot(
+                            &canonical_stream,
+                            &mut event_log,
+                            &mut subscribers,
+                            &current_start.agent_id,
+                            activity_stats.snapshot(),
+                        )
+                        .await;
+                    }
+                }
                 maybe_event = events.recv() => {
                     let Some(mut event) = maybe_event else {
+                        while let Ok(usage) = model_usage.try_recv() {
+                            let source_seq = activity_event_seq;
+                            activity_event_seq = activity_event_seq.saturating_add(1);
+                            if activity_stats.observe_model_request_token_usage(usage, source_seq) {
+                                upsert_activity_stats_snapshot(
+                                    &canonical_stream,
+                                    &mut event_log,
+                                    &mut subscribers,
+                                    &current_start.agent_id,
+                                    activity_stats.snapshot(),
+                                )
+                                .await;
+                            }
+                        }
+                        while let Ok(total_tokens) = total_usage.try_recv() {
+                            let source_seq = activity_event_seq;
+                            activity_event_seq = activity_event_seq.saturating_add(1);
+                            if activity_stats
+                                .observe_total_only_token_usage(total_tokens, source_seq)
+                            {
+                                upsert_activity_stats_snapshot(
+                                    &canonical_stream,
+                                    &mut event_log,
+                                    &mut subscribers,
+                                    &current_start.agent_id,
+                                    activity_stats.snapshot(),
+                                )
+                                .await;
+                            }
+                        }
                         if matches!(lifecycle, ActorLifecycle::Closing) {
                             let reply = close_reply
                                 .take()
@@ -4323,6 +4421,7 @@ pub(crate) fn spawn_relay_agent_actor(
                             in_turn = typing;
                             status_handle.update(|s| {
                                 s.is_thinking = typing;
+                                s.turn_completed = !typing;
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
                         }
@@ -4996,39 +5095,20 @@ async fn apply_generated_agent_name(
     let name = match result {
         Ok(name) => name,
         Err(error) => {
-            let payload = AgentErrorPayload {
-                agent_id: context.current_start.agent_id.clone(),
-                code: AgentErrorCode::Internal,
-                message: format!("automatic agent name generation failed: {error}"),
-                fatal: false,
-            };
-            append_event(
-                &format!("/agent/{}", context.current_start.agent_id),
-                context.event_log,
-                context.subscribers,
-                FrameKind::AgentError,
-                &payload,
-            )
-            .await;
+            tracing::warn!(
+                agent_id = %context.current_start.agent_id,
+                error = %error,
+                "automatic agent name generation failed; retaining fallback name"
+            );
             return false;
         }
     };
     let trimmed = name.trim();
     if trimmed.is_empty() {
-        let payload = AgentErrorPayload {
-            agent_id: context.current_start.agent_id.clone(),
-            code: AgentErrorCode::Internal,
-            message: "automatic agent name generation failed: generated name was empty".to_owned(),
-            fatal: false,
-        };
-        append_event(
-            &format!("/agent/{}", context.current_start.agent_id),
-            context.event_log,
-            context.subscribers,
-            FrameKind::AgentError,
-            &payload,
-        )
-        .await;
+        tracing::warn!(
+            agent_id = %context.current_start.agent_id,
+            "automatic agent name generation returned an empty name; retaining fallback name"
+        );
         return false;
     }
 
@@ -5346,6 +5426,7 @@ fn interrupted_tool_completion(completion: &ToolExecutionCompletedData) -> bool 
     }
 
     match &completion.tool_result {
+        ToolExecutionResult::Cancelled { .. } => false,
         ToolExecutionResult::Error {
             short_message,
             detailed_message,
@@ -5576,6 +5657,7 @@ async fn ingest_gated_replay_event(
     active_stream_text: &mut String,
     activity_event_seq: &mut u64,
 ) {
+    project_legacy_native_collaboration_event(event);
     if let Err(violation) = validate_chat_event_stream_identity(replay_state, event) {
         let error = stream_identity_violation_event(violation);
         record_chat_event_for_replay(canonical_stream, event_log, replay_state, &error)
@@ -6304,6 +6386,22 @@ fn agent_usage_snapshot_from_log(
             _ => {}
         }
     }
+    if let Some(total_tokens) = latest_stats
+        .as_ref()
+        .and_then(|stats| {
+            stats
+                .token_usage_total_only
+                .filter(|total| *total >= stats.token_usage.total_tokens)
+        })
+    {
+        return AgentUsageSnapshot {
+            start: start.clone(),
+            usage: TaskTokenUsageScope::Known {
+                usage: Box::new(TaskTokenUsageAmount::total_only(total_tokens)),
+            },
+            model: tracker.latest_model,
+        };
+    }
     if start.backend_kind == BackendKind::Codex
         && let Some(stats) = latest_stats.as_ref()
         && stats.token_usage.total_tokens > 0
@@ -6744,14 +6842,138 @@ fn history_message_start(entries: &[(u64, ChatEvent)], terminal_index: usize) ->
         .unwrap_or(terminal_index)
 }
 
+/// Older session logs persisted provider-native collaboration payloads as
+/// unrestricted `Other` values. Project only shapes that carry an explicit
+/// Claude/Codex collaboration fingerprint; unrelated `Other` tools remain
+/// byte-for-byte unchanged.
+fn project_legacy_native_collaboration_event(event: &mut ChatEvent) {
+    match event {
+        ChatEvent::ToolRequest(request) => {
+            let ToolRequestType::Other { args } = &request.tool_type else {
+                return;
+            };
+            if legacy_codex_collaboration_value(args) {
+                let prompt = nonempty_json_string(args, "prompt");
+                let name = nonempty_json_string(args, "receiverAgentName");
+                let action = args
+                    .get("tool")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(request.tool_name.as_str());
+                if prompt.is_some()
+                    && matches!(action.to_ascii_lowercase().as_str(), "spawn" | "spawnagent")
+                {
+                    request.tool_type = ToolRequestType::AgentSpawn { prompt, name };
+                } else {
+                    request.tool_type = ToolRequestType::Other {
+                        args: serde_json::json!({
+                            "action": action,
+                            "agent_count": legacy_codex_agent_count(args),
+                        }),
+                    };
+                }
+            } else if legacy_claude_agent_request(&request.tool_name, args) {
+                let prompt = ["prompt", "task", "instruction", "message"]
+                    .into_iter()
+                    .find_map(|key| nonempty_json_string(args, key));
+                let name = nonempty_json_string(args, "description")
+                    .or_else(|| nonempty_json_string(args, "subagent_type"));
+                request.tool_type = ToolRequestType::AgentSpawn { prompt, name };
+            }
+        }
+        ChatEvent::ToolExecutionCompleted(completion) => {
+            let ToolExecutionResult::Other { result } = &completion.tool_result else {
+                return;
+            };
+            if legacy_codex_collaboration_value(result) {
+                let action = result
+                    .get("tool")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(completion.tool_name.as_str());
+                completion.tool_result = ToolExecutionResult::Other {
+                    result: serde_json::json!({
+                        "action": action,
+                        "status": if completion.success { "completed" } else { "failed" },
+                        "agent_count": legacy_codex_agent_count(result),
+                    }),
+                };
+                completion.error = (!completion.success)
+                    .then(|| format!("{} failed", completion.tool_name));
+            } else if legacy_claude_agent_result(&completion.tool_name, result) {
+                completion.tool_result = ToolExecutionResult::Other {
+                    result: serde_json::json!({
+                        "status": if completion.success { "completed" } else { "failed" },
+                    }),
+                };
+                completion.error = (!completion.success)
+                    .then(|| format!("{} failed", completion.tool_name));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn nonempty_json_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn legacy_codex_collaboration_value(value: &serde_json::Value) -> bool {
+    matches!(
+        value.get("type").and_then(serde_json::Value::as_str),
+        Some("collabToolCall" | "collabAgentToolCall")
+    )
+}
+
+fn legacy_codex_agent_count(value: &serde_json::Value) -> usize {
+    if let Some(ids) = value
+        .get("receiverThreadIds")
+        .and_then(serde_json::Value::as_array)
+    {
+        return ids.len();
+    }
+    if value.get("receiverThreadId").is_some() {
+        return 1;
+    }
+    value
+        .get("agentsStates")
+        .and_then(serde_json::Value::as_object)
+        .map_or(0, serde_json::Map::len)
+}
+
+fn legacy_claude_agent_request(tool_name: &str, args: &serde_json::Value) -> bool {
+    matches!(tool_name, "Task" | "Agent")
+        && args.get("prompt").is_some()
+        && ["subagent_type", "run_in_background", "description", "resume"]
+            .into_iter()
+            .any(|key| args.get(key).is_some())
+}
+
+fn legacy_claude_agent_result(tool_name: &str, result: &serde_json::Value) -> bool {
+    matches!(tool_name, "Task" | "Agent")
+        && [
+            "agentId",
+            "agent_id",
+            "session_id",
+            "task_id",
+            "output_file",
+        ]
+        .into_iter()
+        .any(|key| result.get(key).is_some())
+}
+
 fn session_history_entries_from_log(event_log: &[Envelope]) -> Vec<(u64, ChatEvent)> {
     let mut events = Vec::new();
     for envelope in event_log {
         if envelope.kind != FrameKind::ChatEvent {
             continue;
         }
-        let event: ChatEvent = serde_json::from_value(envelope.payload.clone())
+        let mut event: ChatEvent = serde_json::from_value(envelope.payload.clone())
             .expect("failed to parse ChatEvent from replay log");
+        project_legacy_native_collaboration_event(&mut event);
         match event {
             ChatEvent::MessageMetadataUpdated(update) => {
                 if !fold_message_metadata_update_into_history_events(&mut events, &update) {
@@ -7066,8 +7288,9 @@ mod tests {
     use protocol::{
         AgentActivityStats, AgentActivityStatsPayload, AgentBootstrapEvent, AgentBootstrapPayload,
         AgentControlLatestOutput, AgentControlOutput, AgentId, AgentInput, AgentStartPayload,
-        ChatEvent, ChatMessage, ChatMessageId, FrameKind, MessageMetadataUpdateData, MessageSender,
-        MessageTokenUsage, ModelInfo, ModelRequestId, ModelRequestTokenUsage, ModelTurnId,
+        BackendKind, ChatEvent, ChatMessage, ChatMessageId, FrameKind, MessageMetadataUpdateData,
+        MessageSender, MessageTokenUsage, ModelInfo, ModelRequestId, ModelRequestTokenUsage,
+        ModelTurnId,
         ReasoningData, ServerGeneratedChatMessageIdOrigin, ServerGeneratedChatMessageIdentity,
         SessionId, StreamEndData, StreamPath, StreamStartData, StreamTextDeltaData, TaskList,
         TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope,
@@ -7079,10 +7302,12 @@ mod tests {
 
     use super::{
         AGENT_STARTUP_SELECTION_TEST_GATE, AGENT_STARTUP_TEST_GATE, AgentActivityStatsTracker,
-        AgentActorRuntimeContext, AgentCommand, AgentHandle, AgentReplayState, AgentStartupFailure,
-        AgentStartupTestGate, GenerateAgentActivitySummaryRequest, InterruptOutcome,
+        AgentActorRuntimeContext, AgentCommand, AgentHandle, AgentNameChangeContext,
+        AgentReplayState, AgentStartupFailure, AgentStartupTestGate,
+        GenerateAgentActivitySummaryRequest, InterruptOutcome,
         ResolvedSpawnRequest, activity_history_snapshot, agent_name_generation_spawn_config,
-        agent_usage_snapshot_from_log, append_chat_event, append_event, attach_subscriber,
+        agent_usage_snapshot_from_log, append_chat_event, append_event,
+        apply_generated_agent_name, attach_subscriber,
         attach_subscriber_with_latest_output, collect_agent_activity_summary_events,
         collect_agent_name_events, current_latest_output, generate_mock_name,
         ingest_gated_replay_event, known_turn_usage, output_events_since, replay_envelope,
@@ -8643,6 +8868,7 @@ mod tests {
                 last_output_line: None,
                 tool_calls: 0,
                 token_usage: token_usage(30),
+                token_usage_total_only: None,
                 source_through_seq: Some(7),
             },
         };
@@ -8704,6 +8930,7 @@ mod tests {
                 last_output_line: None,
                 tool_calls: 0,
                 token_usage: token_usage(30),
+                token_usage_total_only: None,
                 source_through_seq: Some(7),
             },
         };
@@ -8754,6 +8981,7 @@ mod tests {
                 last_output_line: None,
                 tool_calls: 0,
                 token_usage: token_usage(12),
+                token_usage_total_only: None,
                 source_through_seq: Some(7),
             },
         };
@@ -8775,6 +9003,37 @@ mod tests {
             }
             other => panic!("expected stats-only fallback usage, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn usage_snapshot_from_log_preserves_total_only_activity_snapshot() {
+        let mut start = test_agent_start("total-only-stats-agent");
+        start.backend_kind = BackendKind::Claude;
+        let payload = AgentActivityStatsPayload {
+            agent_id: start.agent_id.clone(),
+            stats: AgentActivityStats {
+                token_usage_total_only: Some(53),
+                source_through_seq: Some(4),
+                ..AgentActivityStats::default()
+            },
+        };
+        let event_log = vec![
+            protocol::Envelope::from_payload(
+                StreamPath("/agent/total-only-stats-agent".to_owned()),
+                FrameKind::AgentActivityStats,
+                0,
+                &payload,
+            )
+            .expect("serialize total-only stats"),
+        ];
+
+        let snapshot = agent_usage_snapshot_from_log(&start, &event_log);
+        let TaskTokenUsageScope::Known { usage } = snapshot.usage else {
+            panic!("total-only activity snapshot should remain known");
+        };
+        assert_eq!(usage.total_tokens, 53);
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.output_tokens, None);
     }
 
     #[test]
@@ -8801,6 +9060,21 @@ mod tests {
         assert_eq!(stats.snapshot().source_through_seq, Some(8));
     }
 
+    #[test]
+    fn claude_total_only_usage_is_known_without_invented_components() {
+        let mut stats = AgentActivityStatsTracker::for_backend(BackendKind::Claude);
+        assert!(stats.observe_total_only_token_usage(31, 4));
+
+        let (usage, _) = stats.usage_snapshot();
+        let TaskTokenUsageScope::Known { usage } = usage else {
+            panic!("aggregate provider usage should be known");
+        };
+        assert_eq!(usage.total_tokens, 31);
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.output_tokens, None);
+        assert_eq!(stats.snapshot().token_usage_total_only, Some(31));
+    }
+
     #[tokio::test]
     async fn relay_activity_stats_accumulate_subagent_turn_usage() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -8808,13 +9082,18 @@ mod tests {
         let session_store = Arc::new(Mutex::new(
             SessionStore::load(session_store_path).expect("load session store"),
         ));
-        let start = test_agent_start("relay-stats-agent");
+        let mut start = test_agent_start("relay-stats-agent");
+        start.backend_kind = BackendKind::Claude;
         let (status_handle, _status_rx) = AgentStatusHandle::new();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (model_usage_tx, model_usage_rx) = mpsc::unbounded_channel();
+        let (total_usage_tx, total_usage_rx) = mpsc::unbounded_channel();
         let handle = spawn_relay_agent_actor(
             start.agent_id.clone(),
             start,
             event_rx,
+            model_usage_rx,
+            total_usage_rx,
             session_store,
             SessionId("relay-session".to_owned()),
             status_handle,
@@ -8835,6 +9114,21 @@ mod tests {
         event_tx
             .send(stream_end_with_usage("message-2", "second", 7))
             .expect("relay event channel should be open");
+        model_usage_tx
+            .send(ModelRequestTokenUsage {
+                request_id: ModelRequestId {
+                    turn_id: ModelTurnId("claude-child-turn".to_owned()),
+                    sequence: 1,
+                },
+                request: token_usage(17),
+                turn: token_usage(17),
+                cumulative: token_usage(17),
+                model_context_window: None,
+            })
+            .expect("relay model usage channel should be open");
+        total_usage_tx
+            .send(31)
+            .expect("relay total-only usage channel should be open");
 
         let stats = timeout(Duration::from_secs(1), async {
             loop {
@@ -8845,6 +9139,7 @@ mod tests {
                 if event.kind == FrameKind::AgentActivityStats
                     && let Ok(payload) = event.parse_payload::<AgentActivityStatsPayload>()
                     && payload.stats.token_usage.total_tokens == 17
+                    && payload.stats.token_usage_total_only == Some(31)
                     && payload.stats.last_output_line.as_deref() == Some("second")
                 {
                     return payload.stats;
@@ -8857,8 +9152,82 @@ mod tests {
         assert_eq!(stats.token_usage.total_tokens, 17);
         assert_eq!(stats.token_usage.input_tokens, 8);
         assert_eq!(stats.token_usage.output_tokens, 9);
+        assert_eq!(stats.token_usage_total_only, Some(31));
         assert_eq!(stats.last_output_line.as_deref(), Some("second"));
         drop(event_tx);
+        drop(model_usage_tx);
+        drop(total_usage_tx);
+        assert!(handle.close().await);
+    }
+
+    #[tokio::test]
+    async fn relay_preserves_codex_model_request_usage_in_live_and_replay_stats() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session_store = Arc::new(Mutex::new(
+            SessionStore::load(dir.path().join("sessions.json")).expect("load session store"),
+        ));
+        let mut start = test_agent_start("relay-codex-usage");
+        start.backend_kind = BackendKind::Codex;
+        let (status_handle, _status_rx) = AgentStatusHandle::new();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (model_usage_tx, model_usage_rx) = mpsc::unbounded_channel();
+        let (_total_usage_tx, total_usage_rx) = mpsc::unbounded_channel();
+        let handle = spawn_relay_agent_actor(
+            start.agent_id.clone(),
+            start,
+            event_rx,
+            model_usage_rx,
+            total_usage_rx,
+            session_store,
+            SessionId("relay-codex-session".to_owned()),
+            status_handle,
+        );
+        let (live_tx, mut live_rx) = mpsc::unbounded_channel();
+        assert!(handle.attach(replay_stream(live_tx)).await);
+        let _ = recv_agent_bootstrap_events(&mut live_rx, "Codex relay bootstrap").await;
+
+        model_usage_tx
+            .send(ModelRequestTokenUsage {
+                request_id: ModelRequestId {
+                    turn_id: ModelTurnId("child-turn".to_owned()),
+                    sequence: 1,
+                },
+                request: token_usage(11),
+                turn: token_usage(11),
+                cumulative: token_usage(11),
+                model_context_window: Some(200_000),
+            })
+            .expect("relay model usage channel should be open");
+
+        let live_stats = timeout(Duration::from_secs(1), async {
+            loop {
+                let event = live_rx.recv().await.expect("live relay stream");
+                if event.kind == FrameKind::AgentActivityStats
+                    && let Ok(payload) = event.parse_payload::<AgentActivityStatsPayload>()
+                    && payload.stats.token_usage.total_tokens == 11
+                {
+                    return payload.stats;
+                }
+            }
+        })
+        .await
+        .expect("live model usage stats");
+        assert_eq!(live_stats.token_usage.total_tokens, 11);
+
+        let (replay_tx, mut replay_rx) = mpsc::unbounded_channel();
+        assert!(handle.attach(replay_stream(replay_tx)).await);
+        let replay = recv_agent_bootstrap_events(&mut replay_rx, "Codex usage replay").await;
+        let replay_stats = replay
+            .iter()
+            .find_map(|event| match event {
+                AgentBootstrapEvent::AgentActivityStats(payload) => Some(&payload.stats),
+                _ => None,
+            })
+            .expect("replay activity stats");
+        assert_eq!(replay_stats.token_usage.total_tokens, 11);
+
+        drop(event_tx);
+        drop(model_usage_tx);
         assert!(handle.close().await);
     }
 
@@ -8885,6 +9254,7 @@ mod tests {
                 last_output_line: Some("latest output".to_owned()),
                 tool_calls: 3,
                 token_usage: token_usage(30),
+                token_usage_total_only: None,
                 source_through_seq: Some(9),
             },
         )
@@ -8999,6 +9369,177 @@ mod tests {
         assert_eq!(
             sanitize_generated_agent_name("  \"fix login flow\" ").unwrap(),
             "Fix Login Flow"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_idle_marker_makes_native_child_inactive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session_store = Arc::new(Mutex::new(
+            SessionStore::load(dir.path().join("sessions.json")).expect("load session store"),
+        ));
+        let start = test_agent_start("relay-idle-child");
+        let (status_handle, _status_rx) = AgentStatusHandle::new();
+        let status = status_handle.clone();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (_model_tx, model_rx) = mpsc::unbounded_channel();
+        let (_total_tx, total_rx) = mpsc::unbounded_channel();
+        let handle = spawn_relay_agent_actor(
+            start.agent_id.clone(),
+            start,
+            event_rx,
+            model_rx,
+            total_rx,
+            session_store,
+            SessionId("relay-idle-session".to_owned()),
+            status_handle,
+        );
+
+        event_tx
+            .send(ChatEvent::TypingStatusChanged(false))
+            .expect("relay event channel should be open");
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = status.snapshot().await;
+                if snapshot.turn_completed {
+                    assert!(!snapshot.is_thinking);
+                    assert!(!snapshot.is_active());
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("relay idle should update child status");
+
+        drop(event_tx);
+        assert!(handle.close().await);
+    }
+
+    #[tokio::test]
+    async fn generated_name_timeout_retains_fallback_without_agent_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session_store = Arc::new(Mutex::new(
+            SessionStore::load(dir.path().join("sessions.json")).expect("load session store"),
+        ));
+        let mut current_start = test_agent_start("name-timeout-agent");
+        current_start.name = "Inspect Backend".to_owned();
+        let original = current_start.clone();
+        let (start_tx, _start_rx) = watch::channel(current_start.clone());
+        let mut pending_alias = None;
+        let mut event_log = Vec::new();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut subscribers = vec![Stream::new(
+            StreamPath("/agent/name-timeout-agent".to_owned()),
+            event_tx,
+        )];
+
+        let applied = apply_generated_agent_name(
+            AgentNameChangeContext {
+                session_store: &session_store,
+                session_id: None,
+                pending_alias: &mut pending_alias,
+                current_start: &mut current_start,
+                start_tx: &start_tx,
+                event_log: &mut event_log,
+                subscribers: &mut subscribers,
+            },
+            Err("agent name generation timed out after 30 seconds".to_owned()),
+        )
+        .await;
+
+        assert!(!applied);
+        assert_eq!(current_start.name, original.name);
+        assert!(pending_alias.is_none());
+        assert!(event_log.is_empty());
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn legacy_native_collaboration_replay_is_sanitized_but_other_tools_are_not() {
+        let mut events = vec![
+            ChatEvent::ToolRequest(protocol::ToolRequest {
+                tool_call_id: "claude-call".to_owned(),
+                tool_name: "Task".to_owned(),
+                tool_type: ToolRequestType::Other {
+                    args: serde_json::json!({
+                        "prompt": "Inspect authentication", "description": "Auth investigator",
+                        "subagent_type": "Explore", "resume": "claude-session-secret",
+                        "output_file": "/private/tmp/claude-child-output"
+                    }),
+                },
+            }),
+            ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
+                tool_call_id: "claude-call".to_owned(),
+                tool_name: "Task".to_owned(),
+                tool_result: ToolExecutionResult::Other { result: serde_json::json!({
+                    "agentId": "claude-provider-agent-id",
+                    "output_file": "/private/tmp/claude-child-output",
+                    "content": "provider control prose"
+                }) },
+                success: true,
+                error: None,
+                normalization_failure: None,
+            }),
+            ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
+                tool_call_id: "codex-call".to_owned(),
+                tool_name: "spawnAgent".to_owned(),
+                tool_result: ToolExecutionResult::Other { result: serde_json::json!({
+                    "type": "collabAgentToolCall", "tool": "spawnAgent",
+                    "senderThreadId": "codex-parent-thread-id",
+                    "receiverThreadId": "codex-child-thread-id",
+                    "output_file": "/tmp/codex-child-output",
+                    "content": "codex transport control prose"
+                }) },
+                success: true,
+                error: None,
+                normalization_failure: None,
+            }),
+        ];
+        let replay_log = events
+            .iter()
+            .enumerate()
+            .map(|(seq, event)| {
+                replay_envelope("/agent/legacy", seq as u64, FrameKind::ChatEvent, event)
+            })
+            .collect::<Vec<_>>();
+        let replay = session_history_entries_from_log(&replay_log)
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect::<Vec<_>>();
+        events = replay;
+        assert!(matches!(
+            &events[0],
+            ChatEvent::ToolRequest(protocol::ToolRequest {
+                tool_type: ToolRequestType::AgentSpawn { prompt, name }, ..
+            }) if prompt.as_deref() == Some("Inspect authentication")
+                && name.as_deref() == Some("Auth investigator")
+        ));
+        let encoded = serde_json::to_string(&events).expect("serialize projected replay");
+        for private in [
+            "claude-session-secret", "claude-provider-agent-id",
+            "codex-parent-thread-id", "codex-child-thread-id", "/private/tmp",
+            "/tmp/codex", "provider control prose", "codex transport control prose",
+        ] {
+            assert!(!encoded.contains(private), "replay leaked {private}: {encoded}");
+        }
+
+        let mut ordinary = ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
+            tool_call_id: "ordinary".to_owned(),
+            tool_name: "custom_report".to_owned(),
+            tool_result: ToolExecutionResult::Other { result: serde_json::json!({
+                "content": "ordinary tool payload",
+                "output_file": "/tmp/user-requested-report"
+            }) },
+            success: true,
+            error: None,
+            normalization_failure: None,
+        });
+        let original = serde_json::to_value(&ordinary).expect("serialize ordinary tool");
+        project_legacy_native_collaboration_event(&mut ordinary);
+        assert_eq!(
+            serde_json::to_value(&ordinary).expect("serialize projected ordinary tool"),
+            original
         );
     }
 

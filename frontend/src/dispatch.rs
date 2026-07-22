@@ -1033,6 +1033,17 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     &new_active_agent,
                     &agent_name_for_upgrade,
                 );
+                if result == TabUpgradeResult::Updated
+                    && origin == AgentOrigin::User
+                    && let Some(values) = state.take_pending_agent_session_settings(
+                        host_id,
+                        project_id.as_ref(),
+                    )
+                {
+                    state.agent_session_settings.update(|settings| {
+                        settings.insert(new_active_agent.agent_id.clone(), values);
+                    });
+                }
                 if result != TabUpgradeResult::Updated {
                     log::warn!(
                         "NewAgent user upgrade did not find one exact draft intent host={} agent={} project={:?}: {:?}",
@@ -4674,6 +4685,17 @@ pub fn apply_chat_event(state: &AppState, host_id: &str, agent_id: &AgentId, eve
             // workers as if current. Bootstrap replay runs through this same
             // reducer, so replayed history segments identically.
             if matches!(message.sender, protocol::MessageSender::User) {
+                // Receiving work is itself an active-turn transition. In
+                // particular, backend-native children are registered with
+                // their prompt before the backend can emit its first typing or
+                // stream event. Treating the absence of that later event as
+                // idleness makes a newly registered child flash Completed
+                // while it is still starting. The backend's explicit
+                // TypingStatusChanged(false), cancellation, or fatal error
+                // remains the terminal authority.
+                state.agent_turn_active.update(|map| {
+                    map.insert(agent_id.clone(), true);
+                });
                 state.orchestration.update(|map| {
                     if let Some(log) = map.get_mut(&agent_id) {
                         log.retain(is_root_orchestration_record);
@@ -4931,6 +4953,9 @@ pub fn apply_chat_event(state: &AppState, host_id: &str, agent_id: &AgentId, eve
             state.streaming_text.update(|map| {
                 map.remove(&agent_id);
             });
+            state.agent_turn_active.update(|map| {
+                map.remove(&agent_id);
+            });
             // Close any in-flight orchestration: Tycode drops fan-outs and
             // workers without terminal events on cancel, so the panel would
             // otherwise show them stuck "running".
@@ -5129,6 +5154,7 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
         }));
         sort_project_infos(projects);
     });
+    state.restore_active_project_after_host_bootstrap(host_id);
     state.mcp_servers.update(|map| {
         let host_map = map.entry(host_id.to_string()).or_default();
         host_map.clear();
@@ -5953,6 +5979,56 @@ mod tests {
     // "last row" put the tool card on the *error* message and left the assistant
     // row that made the call with `tool_calls` non-empty and zero tool cards. That
     // is QA D1: the empty assistant bubble and the missing fallback card.
+
+    #[test]
+    fn unanswered_user_message_keeps_registered_agent_active_until_terminal_signal() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let agent_id = AgentId("native-child".to_owned());
+            let user_message = protocol::ChatMessage {
+                message_id: None,
+                timestamp: 1,
+                sender: protocol::MessageSender::User,
+                content: "inspect the backend".to_owned(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            };
+
+            apply_chat_event(
+                &state,
+                "host",
+                &agent_id,
+                ChatEvent::MessageAdded(user_message),
+            );
+            assert_eq!(
+                state
+                    .agent_turn_active
+                    .with_untracked(|map| map.get(&agent_id).copied()),
+                Some(true),
+                "registration prompt is active work before the first stream event"
+            );
+
+            apply_chat_event(
+                &state,
+                "host",
+                &agent_id,
+                ChatEvent::OperationCancelled(protocol::OperationCancelledData {
+                    message: "cancelled".to_owned(),
+                }),
+            );
+            assert!(
+                !state
+                    .agent_turn_active
+                    .with_untracked(|map| map.contains_key(&agent_id)),
+                "cancellation is an explicit terminal transition"
+            );
+        });
+    }
 
     fn tool_use(id: &str, name: &str) -> protocol::ToolUseData {
         protocol::ToolUseData {
@@ -7112,6 +7188,62 @@ mod tests {
                     })
                 );
             });
+        });
+    }
+
+    #[test]
+    fn new_agent_keeps_submitted_settings_until_authoritative_snapshot() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host_id = "settings-handoff-host";
+            let project_id = ProjectId("settings-handoff-project".to_owned());
+            prime_host_for_tests(&state, host_id);
+            state.active_project.set(Some(ActiveProjectRef {
+                host_id: host_id.to_owned(),
+                project_id: project_id.clone(),
+            }));
+            state.open_tab(TabContent::empty_chat(), "New Chat".to_owned(), true);
+
+            let submitted = protocol::SessionSettingsValues(HashMap::from([
+                (
+                    "model".to_owned(),
+                    protocol::SessionSettingValue::String("claude-haiku".to_owned()),
+                ),
+                (
+                    "effort".to_owned(),
+                    protocol::SessionSettingValue::String("low".to_owned()),
+                ),
+            ]));
+            state.queue_pending_agent_session_settings(
+                host_id.to_owned(),
+                Some(project_id.clone()),
+                submitted.clone(),
+            );
+
+            dispatch_envelope(
+                &state,
+                host_id,
+                new_agent_envelope(
+                    host_id,
+                    "settings-agent",
+                    "Settings Agent",
+                    Some(project_id),
+                    None,
+                ),
+            );
+
+            assert_eq!(
+                state
+                    .agent_session_settings
+                    .with_untracked(|settings| settings.get(&AgentId("settings-agent".to_owned())).cloned()),
+                Some(submitted),
+                "the NewAgent-to-SessionSettings gap must retain submitted values instead of rendering Auto"
+            );
+            assert!(
+                state.pending_agent_session_settings.with_untracked(|pending| pending.is_empty()),
+                "the provisional value transfers exactly once to the new agent"
+            );
         });
     }
 

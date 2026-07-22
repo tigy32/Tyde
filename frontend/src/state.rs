@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::bridge::{ConfiguredHost, RemoteHostLifecycleStatus};
 use leptos::prelude::*;
@@ -121,6 +121,8 @@ impl AgentMonitorKey {
 /// so no data is lost, only ephemeral UI state like scroll position.
 pub const TAB_LRU_CAPACITY: usize = 2;
 pub const CENTER_SPLIT_RATIO_STORAGE_KEY: &str = "tyde-center-split-ratio";
+#[cfg(target_arch = "wasm32")]
+const ACTIVE_PROJECT_STORAGE_KEY: &str = "tyde-active-project";
 
 /// Id of the builtin "Default" custom agent. It backs every spawn that picks
 /// no explicit agent, so pickers that already offer a "Default agent" row
@@ -143,6 +145,49 @@ const OVERLAY_RECONCILE_TIMEOUT_MS: i32 = 4000;
 thread_local! {
     static NEXT_TAB_ID: Cell<u64> = const { Cell::new(0) };
 }
+
+#[cfg(target_arch = "wasm32")]
+fn load_active_project() -> Option<ActiveProjectRef> {
+    let storage = web_sys::window()?.local_storage().ok().flatten()?;
+    let encoded = storage.get_item(ACTIVE_PROJECT_STORAGE_KEY).ok().flatten()?;
+    match serde_json::from_str(&encoded) {
+        Ok(project) => Some(project),
+        Err(error) => {
+            log::warn!("invalid persisted active project: {error}");
+            let _ = storage.remove_item(ACTIVE_PROJECT_STORAGE_KEY);
+            None
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_active_project() -> Option<ActiveProjectRef> {
+    None
+}
+
+#[cfg(target_arch = "wasm32")]
+fn persist_active_project(project: Option<&ActiveProjectRef>) {
+    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    else {
+        return;
+    };
+    match project {
+        Some(project) => match serde_json::to_string(project) {
+            Ok(encoded) => {
+                if let Err(error) = storage.set_item(ACTIVE_PROJECT_STORAGE_KEY, &encoded) {
+                    log::warn!("failed to persist active project: {error:?}");
+                }
+            }
+            Err(error) => log::warn!("failed to encode active project: {error}"),
+        },
+        None => {
+            let _ = storage.remove_item(ACTIVE_PROJECT_STORAGE_KEY);
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn persist_active_project(_project: Option<&ActiveProjectRef>) {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TabId(pub u64);
@@ -2121,10 +2166,16 @@ pub struct ProjectViewMemory {
     pub diff_contents: HashMap<DiffKey, DiffViewState>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ActiveProjectRef {
     pub host_id: String,
     pub project_id: ProjectId,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingAgentSessionSettings {
+    id: u64,
+    values: SessionSettingsValues,
 }
 
 /// Latest server-emitted Add-report shuffle suggestion plus a monotonic
@@ -2325,6 +2376,10 @@ pub struct AppState {
     pub agents: RwSignal<Vec<AgentInfo>>,
     pub sessions: RwSignal<Vec<SessionInfo>>,
     pub active_project: RwSignal<Option<ActiveProjectRef>>,
+    /// Cold-start selection restored only after its owning host has published
+    /// the project catalog. Catalog ownership and UI navigation are distinct;
+    /// bootstrap must not guess the latter from whichever agent arrives first.
+    pub pending_active_project_restore: RwSignal<Option<ActiveProjectRef>>,
     /// Derived from `center_zone.composer_owner()`. The focused pane's active
     /// chat wins; when a file pane is focused, the other pane's active chat
     /// remains the singleton composer owner. Read-only by design.
@@ -2533,6 +2588,13 @@ pub struct AppState {
     /// terminal becomes active even if another terminal was already selected.
     pub pending_terminal_focus: RwSignal<Option<String>>,
     pub agent_session_settings: RwSignal<HashMap<AgentId, SessionSettingsValues>>,
+    /// User-visible settings submitted for a draft whose `NewAgent` echo has
+    /// not arrived yet. The host stream publishes agent identity before the
+    /// agent stream publishes authoritative effective settings; retaining the
+    /// submitted values prevents that expected gap from masquerading as Auto.
+    pub pending_agent_session_settings:
+        RwSignal<HashMap<(String, Option<ProjectId>), VecDeque<PendingAgentSessionSettings>>>,
+    next_pending_agent_session_settings_id: RwSignal<u64>,
     pub draft_session_settings: RwSignal<SessionSettingsValues>,
     /// Whether the user has actually edited `draft_session_settings` in the
     /// session-settings bar. Reset when a new-chat draft starts. When a launch
@@ -2799,6 +2861,7 @@ impl AppState {
             agents: RwSignal::new(Vec::new()),
             sessions: RwSignal::new(Vec::new()),
             active_project: RwSignal::new(None),
+            pending_active_project_restore: RwSignal::new(load_active_project()),
             active_agent,
             chat_rows: RwSignal::new(HashMap::new()),
             chat_tool_rows: RwSignal::new(HashMap::new()),
@@ -2868,6 +2931,8 @@ impl AppState {
             native_settings_save_state: RwSignal::new(HashMap::new()),
             pending_terminal_focus: RwSignal::new(None),
             agent_session_settings: RwSignal::new(HashMap::new()),
+            pending_agent_session_settings: RwSignal::new(HashMap::new()),
+            next_pending_agent_session_settings_id: RwSignal::new(0),
             draft_session_settings: RwSignal::new(SessionSettingsValues::default()),
             draft_session_settings_dirty: RwSignal::new(false),
             font_size: RwSignal::new(13),
@@ -3671,6 +3736,87 @@ impl AppState {
         self.active_project.get_untracked()
     }
 
+    pub fn queue_pending_agent_session_settings(
+        &self,
+        host_id: String,
+        project_id: Option<ProjectId>,
+        values: SessionSettingsValues,
+    ) -> u64 {
+        let id = self.next_pending_agent_session_settings_id.get_untracked();
+        self.next_pending_agent_session_settings_id
+            .set(id.wrapping_add(1));
+        self.pending_agent_session_settings.update(|pending| {
+            pending
+                .entry((host_id, project_id))
+                .or_default()
+                .push_back(PendingAgentSessionSettings { id, values });
+        });
+        id
+    }
+
+    pub fn discard_pending_agent_session_settings(
+        &self,
+        host_id: &str,
+        project_id: Option<&ProjectId>,
+        id: u64,
+    ) {
+        let key = (host_id.to_owned(), project_id.cloned());
+        self.pending_agent_session_settings.update(|pending| {
+            let remove_key = if let Some(queue) = pending.get_mut(&key) {
+                queue.retain(|entry| entry.id != id);
+                queue.is_empty()
+            } else {
+                false
+            };
+            if remove_key {
+                pending.remove(&key);
+            }
+        });
+    }
+
+    pub fn take_pending_agent_session_settings(
+        &self,
+        host_id: &str,
+        project_id: Option<&ProjectId>,
+    ) -> Option<SessionSettingsValues> {
+        let key = (host_id.to_owned(), project_id.cloned());
+        self.pending_agent_session_settings
+            .try_update(|pending| {
+                let queue = pending.get_mut(&key)?;
+                let entry = queue.pop_front()?;
+                if queue.is_empty() {
+                    pending.remove(&key);
+                }
+                Some(entry.values)
+            })
+            .flatten()
+    }
+
+    pub fn restore_active_project_after_host_bootstrap(&self, host_id: &str) {
+        let Some(pending) = self
+            .pending_active_project_restore
+            .get_untracked()
+            .filter(|pending| pending.host_id == host_id)
+        else {
+            return;
+        };
+        self.pending_active_project_restore.set(None);
+
+        if self.active_project.get_untracked().is_some() {
+            return;
+        }
+        let exists = self.projects.with_untracked(|projects| {
+            projects.iter().any(|project| {
+                project.host_id == pending.host_id && project.project.id == pending.project_id
+            })
+        });
+        if exists {
+            self.switch_active_project(Some(pending));
+        } else {
+            persist_active_project(None);
+        }
+    }
+
     /// Whether the project at `(host_id, project_id)` accepts ProjectAddRoot /
     /// ProjectDeleteRoot. Per §6.5/§6.6 of the workbenches design doc:
     ///
@@ -3729,6 +3875,7 @@ impl AppState {
         });
 
         self.active_project.set(next.clone());
+        persist_active_project(next.as_ref());
 
         // Notify the host that this project became active so the server can warm
         // code intelligence and restore recent history. This is the one central
@@ -3833,6 +3980,8 @@ impl AppState {
     }
 
     pub fn clear_host_runtime(&self, host_id: &str) {
+        self.pending_agent_session_settings
+            .update(|pending| pending.retain(|(pending_host, _), _| pending_host != host_id));
         let host_project_ids: HashSet<ProjectId> = self.projects.with_untracked(|projects| {
             projects
                 .iter()
@@ -8786,6 +8935,128 @@ mod tests {
                 1,
                 "unknown message id must not append a row"
             );
+        });
+    }
+
+    #[test]
+    fn pending_agent_settings_cleanup_is_request_scoped_and_fifo() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let project_id = ProjectId("project".to_owned());
+            let first = SessionSettingsValues(HashMap::from([(
+                "model".to_owned(),
+                protocol::SessionSettingValue::String("first".to_owned()),
+            )]));
+            let second = SessionSettingsValues(HashMap::from([(
+                "model".to_owned(),
+                protocol::SessionSettingValue::String("second".to_owned()),
+            )]));
+            let first_id = state.queue_pending_agent_session_settings(
+                "host".to_owned(),
+                Some(project_id.clone()),
+                first,
+            );
+            state.queue_pending_agent_session_settings(
+                "host".to_owned(),
+                Some(project_id.clone()),
+                second.clone(),
+            );
+
+            state.discard_pending_agent_session_settings(
+                "host",
+                Some(&project_id),
+                first_id,
+            );
+
+            assert_eq!(
+                state.take_pending_agent_session_settings("host", Some(&project_id)),
+                Some(second),
+                "one failed send must not delete a later pending handoff"
+            );
+            assert!(
+                state
+                    .pending_agent_session_settings
+                    .with_untracked(HashMap::is_empty)
+            );
+
+            state.queue_pending_agent_session_settings(
+                "host".to_owned(),
+                Some(project_id.clone()),
+                SessionSettingsValues::default(),
+            );
+            state.queue_pending_agent_session_settings(
+                "other-host".to_owned(),
+                None,
+                SessionSettingsValues::default(),
+            );
+            state.clear_host_runtime("host");
+            assert!(state.pending_agent_session_settings.with_untracked(|pending| {
+                pending.keys().all(|(host_id, _)| host_id == "other-host")
+            }));
+        });
+    }
+
+    #[test]
+    fn active_project_restore_waits_for_owning_host_and_respects_new_selection() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let restored = ActiveProjectRef {
+                host_id: "restored-host".to_owned(),
+                project_id: ProjectId("restored-project".to_owned()),
+            };
+            state.pending_active_project_restore.set(Some(restored.clone()));
+            state.projects.update(|projects| {
+                projects.push(ProjectInfo {
+                    host_id: restored.host_id.clone(),
+                    project: Project {
+                        id: restored.project_id.clone(),
+                        name: "Restored".to_owned(),
+                        sort_order: 0,
+                        source: protocol::ProjectSource::Standalone {
+                            roots: vec![ProjectRootPath("/restored".to_owned())],
+                        },
+                    },
+                });
+            });
+
+            state.restore_active_project_after_host_bootstrap("other-host");
+            assert_eq!(
+                state.pending_active_project_restore.get_untracked(),
+                Some(restored.clone())
+            );
+            state.restore_active_project_after_host_bootstrap("restored-host");
+            assert_eq!(state.active_project.get_untracked(), Some(restored.clone()));
+
+            let newly_selected = ActiveProjectRef {
+                host_id: "new-host".to_owned(),
+                project_id: ProjectId("new-project".to_owned()),
+            };
+            state.active_project.set(Some(newly_selected.clone()));
+            state.pending_active_project_restore.set(Some(restored));
+            state.restore_active_project_after_host_bootstrap("restored-host");
+            assert_eq!(
+                state.active_project.get_untracked(),
+                Some(newly_selected),
+                "late bootstrap must not override a newer user selection"
+            );
+            assert_eq!(state.pending_active_project_restore.get_untracked(), None);
+
+            let missing_state = AppState::new();
+            missing_state
+                .pending_active_project_restore
+                .set(Some(ActiveProjectRef {
+                    host_id: "missing-host".to_owned(),
+                    project_id: ProjectId("missing-project".to_owned()),
+                }));
+            missing_state.restore_active_project_after_host_bootstrap("missing-host");
+            assert_eq!(
+                missing_state.pending_active_project_restore.get_untracked(),
+                None,
+                "an authoritative catalog must retire a stale persisted selection"
+            );
+            assert_eq!(missing_state.active_project.get_untracked(), None);
         });
     }
 }

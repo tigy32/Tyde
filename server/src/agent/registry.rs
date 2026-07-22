@@ -313,6 +313,8 @@ impl AgentRegistry {
         &mut self,
         request: RelaySpawnRequest,
         events: mpsc::UnboundedReceiver<ChatEvent>,
+        model_usage: mpsc::UnboundedReceiver<protocol::ModelRequestTokenUsage>,
+        total_usage: mpsc::UnboundedReceiver<u64>,
         session_store: Arc<Mutex<SessionStore>>,
     ) -> SpawnedRelayAgent {
         let agent_id = AgentId(Uuid::new_v4().to_string());
@@ -338,6 +340,8 @@ impl AgentRegistry {
             agent_id.clone(),
             start.clone(),
             events,
+            model_usage,
+            total_usage,
             session_store,
             request.session_id,
             status_handle.clone(),

@@ -2857,8 +2857,25 @@ impl HostHandle {
                 AGENT_NAME_GENERATION_TIMEOUT,
             )
             .await;
-            if agent_handle.apply_generated_name(result).await == Some(true) {
-                host.fan_out_session_lists().await;
+            match result {
+                Ok(name) if !name.trim().is_empty() => {
+                    if agent_handle.apply_generated_name(Ok(name)).await == Some(true) {
+                        host.fan_out_session_lists().await;
+                    }
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        agent_id = %agent_handle.snapshot().agent_id,
+                        "automatic agent name generation returned an empty name"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        agent_id = %agent_handle.snapshot().agent_id,
+                        %error,
+                        "automatic agent name generation failed"
+                    );
+                }
             }
             notify_agent_name_test_completion(test_completion);
         });
@@ -9752,6 +9769,9 @@ impl HostHandle {
             .clone()
             .unwrap_or_else(|| SessionId(Uuid::new_v4().to_string()));
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (model_usage_tx, model_usage_rx) = mpsc::unbounded_channel();
+        let (total_usage_tx, total_usage_rx) = mpsc::unbounded_channel();
+        let (name_update_tx, mut name_update_rx) = mpsc::unbounded_channel::<String>();
         if !request.description.trim().is_empty() {
             event_tx
                 .send(ChatEvent::MessageAdded(ChatMessage {
@@ -9785,7 +9805,13 @@ impl HostHandle {
             let spawned =
                 state
                     .registry
-                    .spawn_relay(relay_request, event_rx, Arc::clone(&session_store));
+                    .spawn_relay(
+                        relay_request,
+                        event_rx,
+                        model_usage_rx,
+                        total_usage_rx,
+                        Arc::clone(&session_store),
+                    );
             state
                 .agent_sessions
                 .insert(spawned.start.agent_id.clone(), session_id.clone());
@@ -9893,9 +9919,21 @@ impl HostHandle {
 
         self.fan_out_session_lists().await;
 
+        let naming_handle = agent_handle.clone();
+        tokio::spawn(async move {
+            while let Some(name) = name_update_rx.recv().await {
+                if naming_handle.apply_generated_name(Ok(name)).await.is_none() {
+                    break;
+                }
+            }
+        });
+
         Ok(SubAgentHandle {
             event_tx,
+            model_usage_tx,
+            total_usage_tx,
             agent_id: start.agent_id,
+            name_update_tx: Some(name_update_tx),
         })
     }
 
@@ -12136,6 +12174,8 @@ pub fn spawn_host() -> HostHandle {
     let mobile_pairings_path = MobilePairingsStore::default_path().unwrap_or_else(|err| {
         panic!("failed to resolve default mobile pairings store path: {err}")
     });
+    let workflow_runs_path = WorkflowRunStore::default_path()
+        .unwrap_or_else(|err| panic!("failed to resolve default workflow run store path: {err}"));
     spawn_host_inner(
         HostStorePaths {
             session: session_path,
@@ -12150,10 +12190,7 @@ pub fn spawn_host() -> HostHandle {
             skills_index: skills_index_path,
             skills_root_dir,
             mobile_pairings: mobile_pairings_path,
-            workflow_runs: crate::paths::home_dir()
-                .unwrap_or_else(|err| panic!("failed to resolve home dir: {err}"))
-                .join(".tyde")
-                .join("workflow_runs.json"),
+            workflow_runs: workflow_runs_path,
         },
         false,
         HostRuntimeConfig::default(),

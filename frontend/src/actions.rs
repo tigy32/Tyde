@@ -301,8 +301,14 @@ pub fn spawn_new_chat(
     let session_settings = if defer_to_profile || draft_settings.0.is_empty() {
         None
     } else {
-        Some(draft_settings)
+        Some(draft_settings.clone())
     };
+    let pending_settings_project_id = project_id.clone();
+    let pending_settings_id = state.queue_pending_agent_session_settings(
+        host_id.clone(),
+        pending_settings_project_id.clone(),
+        draft_settings,
+    );
 
     state.draft_backend_override.set(None);
     state.draft_custom_agent_id.set(None);
@@ -312,6 +318,7 @@ pub fn spawn_new_chat(
         .set(SessionSettingsValues::default());
     state.draft_session_settings_dirty.set(false);
 
+    let pending_state = state.clone();
     spawn_local(async move {
         let payload = SpawnAgentPayload {
             name: None,
@@ -331,6 +338,11 @@ pub fn spawn_new_chat(
         };
         if let Err(error) = send_frame(&host_id, host_stream, FrameKind::SpawnAgent, &payload).await
         {
+            pending_state.discard_pending_agent_session_settings(
+                &host_id,
+                pending_settings_project_id.as_ref(),
+                pending_settings_id,
+            );
             log::error!("failed to send SpawnAgent: {error}");
             on_send_error(error);
         }

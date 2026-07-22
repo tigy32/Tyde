@@ -281,6 +281,9 @@ pub fn ToolCardView(owner_agent_ref: AgentRef, entry: ToolRequestEntry) -> impl 
 
     let is_completed = entry.result.is_some();
     let success = entry.result.as_ref().map(|r| r.success).unwrap_or(false);
+    let cancelled = entry.result.as_ref().is_some_and(|result| {
+        matches!(&result.tool_result, ToolExecutionResult::Cancelled { .. })
+    });
     let result_summary = entry
         .result
         .as_ref()
@@ -300,7 +303,14 @@ pub fn ToolCardView(owner_agent_ref: AgentRef, entry: ToolRequestEntry) -> impl 
             "Tool failed: canonical data could not be normalized",
         )
     } else if is_completed {
-        if success {
+        if cancelled {
+            (
+                "completed cancelled",
+                "\u{2013}",
+                "tool-card-cancelled",
+                "Tool was cancelled",
+            )
+        } else if success {
             (
                 "completed success",
                 "\u{2713}",

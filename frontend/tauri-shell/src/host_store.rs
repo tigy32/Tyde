@@ -1,6 +1,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use devtools_protocol::CONFIGURED_HOST_STORE_PATH_ENV;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -8,8 +9,6 @@ pub use host_config::{
     ConfiguredHost, ConfiguredHostStore, HostTransportConfig, LOCAL_HOST_ID,
     RemoteHostLifecycleConfig, UpsertConfiguredHostRequest,
 };
-
-const HOST_STORE_PATH_ENV: &str = "TYDE_CONFIGURED_HOST_STORE_PATH";
 
 #[derive(Debug, Clone)]
 pub struct HostStore {
@@ -30,7 +29,7 @@ impl HostStore {
     }
 
     pub fn default_path() -> Result<PathBuf, String> {
-        if let Ok(path) = std::env::var(HOST_STORE_PATH_ENV) {
+        if let Ok(path) = std::env::var(CONFIGURED_HOST_STORE_PATH_ENV) {
             let trimmed = path.trim();
             if !trimmed.is_empty() {
                 return Ok(PathBuf::from(trimmed));

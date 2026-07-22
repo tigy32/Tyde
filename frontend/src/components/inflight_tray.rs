@@ -40,6 +40,7 @@ use protocol::{
     ToolRequestType, WorkflowRunState, WorkflowRunStatus,
 };
 
+use crate::components::agents_panel::{DerivedAgentState, derive_agent_state};
 use crate::components::chat_message::token_badge_data;
 use crate::components::tool_card::{agent_display_name, open_child_agent};
 use crate::components::workflow_view::run_status_label;
@@ -119,22 +120,23 @@ fn backend_label(kind: BackendKind) -> &'static str {
 }
 
 fn derive_child_status(state: &AppState, agent: &crate::state::AgentInfo) -> ChildAgentStatus {
-    if let Some(error) = agent.fatal_error.clone() {
-        return ChildAgentStatus::Failed(error);
-    }
-    if !agent.started {
-        return ChildAgentStatus::Starting;
-    }
-    let typing = state
-        .agent_turn_active
-        .with(|map| map.get(&agent.agent_id).copied().unwrap_or(false));
-    let streaming = state
-        .streaming_text
-        .with(|map| map.contains_key(&agent.agent_id));
-    if typing || streaming {
-        ChildAgentStatus::Running
-    } else {
-        ChildAgentStatus::Idle
+    let derived = state.compaction_in_progress.with(|compaction| {
+        state.agent_turn_active.with(|turn_active| {
+            state.streaming_text.with(|streaming| {
+                derive_agent_state(agent, streaming, turn_active, compaction)
+            })
+        })
+    });
+    match derived {
+        DerivedAgentState::Initializing => ChildAgentStatus::Starting,
+        DerivedAgentState::Thinking | DerivedAgentState::Compacting => ChildAgentStatus::Running,
+        DerivedAgentState::Idle => ChildAgentStatus::Idle,
+        DerivedAgentState::Terminated => ChildAgentStatus::Failed(
+            agent
+                .fatal_error
+                .clone()
+                .unwrap_or_else(|| "Agent terminated".to_owned()),
+        ),
     }
 }
 
@@ -1359,6 +1361,7 @@ mod wasm_tests {
                 description: Some("Run repository validation".to_owned()),
                 status,
                 summary: summary.map(str::to_owned),
+                output_unavailable: None,
             }),
         }
     }
@@ -1504,6 +1507,7 @@ mod wasm_tests {
             last_output_line: last_output_line.map(|s| s.to_owned()),
             tool_calls,
             token_usage,
+            token_usage_total_only: None,
             source_through_seq: None,
         }
     }

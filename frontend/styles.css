@@ -3038,6 +3038,11 @@ kbd {
     color: var(--error);
 }
 
+.tool-status-text.cancelled,
+.tool-cancelled {
+    color: var(--text-tertiary);
+}
+
 .tool-card-malformed {
     border-color: color-mix(in srgb, var(--error) 45%, var(--border-primary));
 }

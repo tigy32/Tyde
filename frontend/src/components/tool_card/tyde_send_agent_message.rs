@@ -73,6 +73,7 @@ pub(crate) fn render(
 
 fn result_kind(result: &ToolExecutionResult) -> &'static str {
     match result {
+        ToolExecutionResult::Cancelled { .. } => "Cancelled",
         ToolExecutionResult::ModifyFile { .. } => "ModifyFile",
         ToolExecutionResult::RunCommand { .. } => "RunCommand",
         ToolExecutionResult::ReadFiles { .. } => "ReadFiles",

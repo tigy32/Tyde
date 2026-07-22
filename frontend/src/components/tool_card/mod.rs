@@ -16,9 +16,10 @@ use std::sync::Arc;
 
 use leptos::prelude::*;
 use protocol::{
-    AgentControlProgress, AgentControlProgressKind, SubAgentProgress, ToolExecutionCompletedData,
-    ToolExecutionNormalizationFailure, ToolExecutionResult, ToolProgressData, ToolProgressUpdate,
-    ToolRequestType, WorkflowRunState, WorkflowRunStatus,
+    AgentControlProgress, AgentControlProgressKind, BackgroundTaskState, BackgroundTaskStatus,
+    SubAgentProgress, ToolExecutionCompletedData, ToolExecutionNormalizationFailure,
+    ToolExecutionResult, ToolProgressData, ToolProgressUpdate, ToolRequestType, WorkflowRunState,
+    WorkflowRunStatus,
 };
 use wasm_bindgen::JsCast;
 
@@ -390,6 +391,11 @@ pub fn ToolCardView(
             Some(ToolProgressUpdate::AgentControl(progress)) => Some(progress),
             _ => None,
         });
+    let background_task: Signal<Option<BackgroundTaskState>> =
+        Signal::derive(move || match progress.get().map(|data| data.update) {
+            Some(ToolProgressUpdate::BackgroundTask(task)) => Some(task),
+            _ => None,
+        });
     // A background task can outlive its tool call: the Workflow tool
     // result is just the run id, the real work keeps going. Agent-control
     // cards deliberately don't contribute — child-agent liveness renders in
@@ -401,6 +407,9 @@ pub fn ToolCardView(
             || subagent_progress
                 .get()
                 .is_some_and(|progress| !progress.completed)
+            || background_task
+                .get()
+                .is_some_and(|task| task.status == BackgroundTaskStatus::Running)
     });
     // The body shape (workflow panel vs regular renderer) flips at most
     // once, when the first snapshot arrives — memoized so per-snapshot
@@ -410,11 +419,16 @@ pub fn ToolCardView(
     let has_result = result.is_some();
     let result_success =
         result.as_ref().map(|r| r.success).unwrap_or(false) && !normalization_failed;
+    let result_cancelled = result
+        .as_ref()
+        .is_some_and(|result| matches!(&result.tool_result, ToolExecutionResult::Cancelled { .. }));
     let result_failed = has_result && !result_success;
 
     let status_class = move || {
         if !has_result || (background_running.get() && !result_failed) {
             "tool-status-text pending"
+        } else if result_cancelled {
+            "tool-status-text cancelled"
         } else if result_success {
             "tool-status-text success"
         } else {
@@ -425,6 +439,8 @@ pub fn ToolCardView(
     let status_label = move || {
         if !has_result || (background_running.get() && !result_failed) {
             "Running\u{2026}".to_owned()
+        } else if result_cancelled {
+            "Cancelled".to_owned()
         } else if result_success {
             "Done".to_owned()
         } else {
@@ -458,6 +474,11 @@ pub fn ToolCardView(
                 agent_control_progress
                     .get()
                     .map(|progress| agent_control_header_detail(&progress))
+            })
+            .or_else(|| {
+                background_task
+                    .get()
+                    .and_then(|task| task.summary.or(task.description))
             })
             .or_else(|| recipient_detail.get())
             .or_else(|| header_detail.clone())
@@ -610,7 +631,7 @@ pub fn ToolCardView(
 ///
 /// Errors short-circuit the dispatch — any completed tool whose result is
 /// `Error` renders via `error_result`, regardless of which request kind issued
-/// it.
+/// it. Cancellation is likewise terminal, but is not presented as a failure.
 fn render_body(
     agent_ref: Signal<Option<ActiveAgentRef>>,
     tool_call_id: &str,
@@ -620,6 +641,12 @@ fn render_body(
     mode: ToolOutputMode,
     result_failed: bool,
 ) -> AnyView {
+    if let Some(ToolExecutionResult::Cancelled { message }) = result {
+        return view! {
+            <div class="tool-cancelled" role="status">{message.clone()}</div>
+        }
+        .into_any();
+    }
     if let Some(ToolExecutionResult::Error { .. }) = result {
         return error_result::render(result.unwrap(), malformed_payload, mode).into_any();
     }
@@ -1003,6 +1030,7 @@ pub(crate) fn completion_header_summary(
     result: &ToolExecutionResult,
 ) -> String {
     match result {
+        ToolExecutionResult::Cancelled { .. } => "cancelled".to_owned(),
         ToolExecutionResult::ModifyFile {
             lines_added,
             lines_removed,
@@ -1717,6 +1745,7 @@ mod live_card_wasm_tests {
             last_output_line: last_output_line.map(|s| s.to_owned()),
             tool_calls,
             token_usage,
+            token_usage_total_only: None,
             source_through_seq: None,
         }
     }

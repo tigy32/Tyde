@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use devtools_protocol::WORKFLOW_RUN_STORE_PATH_ENV;
 use protocol::{WorkflowRunId, WorkflowRunSnapshot, WorkflowRunSnapshotStatus};
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +21,14 @@ pub(crate) struct WorkflowRunStore {
 }
 
 impl WorkflowRunStore {
+    pub(crate) fn default_path() -> Result<PathBuf, String> {
+        let override_path = std::env::var(WORKFLOW_RUN_STORE_PATH_ENV).ok();
+        if let Some(path) = resolve_override_path(override_path.as_deref()) {
+            return Ok(path);
+        }
+        Ok(default_path_for_home(&crate::paths::home_dir()?))
+    }
+
     pub(crate) fn load(path: PathBuf) -> Result<Self, String> {
         let mut runs = read_from_disk(&path)?;
         let now = crate::agent::now_ms();
@@ -58,6 +67,17 @@ impl WorkflowRunStore {
     fn save_current(&self) -> Result<(), String> {
         save(&self.path, &self.runs)
     }
+}
+
+fn resolve_override_path(override_path: Option<&str>) -> Option<PathBuf> {
+    override_path
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+fn default_path_for_home(home_dir: &Path) -> PathBuf {
+    home_dir.join(".tyde").join("workflow_runs.json")
 }
 
 fn read_from_disk(path: &Path) -> Result<HashMap<WorkflowRunId, WorkflowRunSnapshot>, String> {
@@ -125,13 +145,15 @@ fn save(path: &Path, runs: &HashMap<WorkflowRunId, WorkflowRunSnapshot>) -> Resu
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use protocol::{
         BackendAccessMode, BackendKind, ProjectRootPath, WorkflowCoordinatorSpec, WorkflowId,
         WorkflowRunId, WorkflowRunSnapshot, WorkflowRunSnapshotStatus, WorkflowSource,
         WorkflowSourceScope,
     };
 
-    use super::WorkflowRunStore;
+    use super::{WorkflowRunStore, default_path_for_home, resolve_override_path};
 
     fn run(status: WorkflowRunSnapshotStatus) -> WorkflowRunSnapshot {
         WorkflowRunSnapshot {
@@ -183,5 +205,19 @@ mod tests {
                 .contains("restarted")
         );
         assert!(loaded.completed_at_ms.is_some());
+    }
+
+    #[test]
+    fn workflow_run_store_path_honors_override() {
+        assert_eq!(
+            resolve_override_path(Some(" /isolated/workflow_runs.json ")),
+            Some(PathBuf::from("/isolated/workflow_runs.json"))
+        );
+        assert_eq!(resolve_override_path(Some(" ")), None);
+        assert_eq!(resolve_override_path(None), None);
+        assert_eq!(
+            default_path_for_home(Path::new("/home/user")),
+            PathBuf::from("/home/user/.tyde/workflow_runs.json")
+        );
     }
 }

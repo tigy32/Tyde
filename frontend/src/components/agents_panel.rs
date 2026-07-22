@@ -1559,6 +1559,14 @@ fn agent_card(
         let derived = derived.clone();
         move || status_icon(&derived())
     };
+    let status_title_sig = {
+        let derived = derived.clone();
+        move || status_label(&derived())
+    };
+    let status_label_sig = {
+        let derived = derived.clone();
+        move || status_label(&derived())
+    };
 
     // Compact (Compact/Rotate) action — gated on the agent being idle on a
     // connected host with at least one chat row, and not already mid-
@@ -1832,7 +1840,10 @@ fn agent_card(
                 </div>
             </div>
             <div class="agent-card-bottom">
-                <span class=status_class_sig>{status_icon_sig}</span>
+                <span class=status_class_sig title=status_title_sig>
+                    <span aria-hidden="true">{status_icon_sig}</span>
+                    <span class="visually-hidden">{status_label_sig}</span>
+                </span>
                 <span class="agent-card-time">{relative_time(created)}</span>
                 {move || custom_agent_name().map(|n| {
                     let title = format!("Custom agent: {n}");
@@ -3050,6 +3061,36 @@ mod wasm_tests {
             compact_btn(&container).is_none(),
             "compact button must be hidden while the agent is taking a turn"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn status_exposes_text_and_hides_decorative_glyph() {
+        let container = make_container();
+        let state = make_app_state("h");
+        push_agent(&state, "h", "a-accessible", "Agent", true);
+        state.agent_turn_active.update(|map| {
+            map.insert(AgentId("a-accessible".to_owned()), true);
+        });
+        let _handle = mount_panel(&container, state);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let status = container
+            .query_selector(".agent-card-status")
+            .unwrap()
+            .expect("status present");
+        assert_eq!(status.get_attribute("title").as_deref(), Some("Thinking"));
+        let text = status
+            .query_selector(".visually-hidden")
+            .unwrap()
+            .expect("accessible status text present");
+        assert_eq!(text.text_content().as_deref(), Some("Thinking"));
+        let glyph = status
+            .query_selector("[aria-hidden='true']")
+            .unwrap()
+            .expect("decorative glyph present");
+        assert_eq!(glyph.get_attribute("aria-hidden").as_deref(), Some("true"));
     }
 
     /// No chat rows yet — compaction is wasted spend on an unused agent.

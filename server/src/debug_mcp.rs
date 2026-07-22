@@ -8,7 +8,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::{Json, Router, response::IntoResponse, routing::get};
 use client::ClientConfig;
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
-use devtools_protocol::{UiDebugRequest, UiDebugResponse};
+use devtools_protocol::{
+    BoundedDebugOutput, DebugOutputSlice, UiDebugRequest, UiDebugResponse,
+    dev_instance_mutable_paths,
+};
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::{router::tool::ToolRouter, tool::Extension, wrapper::Parameters},
@@ -23,6 +26,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use protocol::{Project, ProjectId, ProjectRootPath, ProjectSource};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::Command;
@@ -33,7 +37,6 @@ use uuid::Uuid;
 use crate::process_env;
 
 pub const DEBUG_REPO_ROOT_HEADER: &str = "x-tyde-debug-repo-root";
-const MOBILE_PAIRINGS_STORE_PATH_ENV: &str = "TYDE_MOBILE_PAIRINGS_STORE_PATH";
 const START_TIMEOUT: Duration = Duration::from_secs(105);
 const STARTUP_LOG_TAIL_BYTES: usize = 32 * 1024;
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:0";
@@ -58,7 +61,7 @@ struct DevInstanceRecord {
     frontend_url: String,
     config_path: PathBuf,
     store_dir: PathBuf,
-    startup_output: Arc<StdMutex<Vec<u8>>>,
+    startup_output: Arc<StdMutex<BoundedDebugOutput>>,
     startup_capture_tasks: Vec<tokio::task::JoinHandle<()>>,
     child: AsyncGroupChild,
     started_at_ms: u64,
@@ -73,6 +76,8 @@ struct DevInstanceSummary {
     host_addr: String,
     ui_debug_addr: String,
     status: String,
+    frontend_port: u16,
+    started_at_ms: u64,
 }
 
 #[derive(Clone)]
@@ -114,6 +119,61 @@ struct EvaluateToolInput {
     timeout_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DebugEventsToolInput {
+    instance_id: String,
+    cursor: Option<u64>,
+    #[schemars(range(min = 1, max = 32768))]
+    max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DebugSnapshotToolInput {
+    instance_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DebugCapabilities {
+    process_output_events: bool,
+    monotonic_output_cursors: bool,
+    instance_snapshot: bool,
+    ui_evaluate: bool,
+    screenshot: bool,
+    second_client: bool,
+    screenshot_reason: &'static str,
+    second_client_reason: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DebugEventsResult {
+    instance_id: String,
+    events: Vec<DebugOutputEvent>,
+    next_cursor: u64,
+    oldest_cursor: u64,
+    truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DebugOutputEvent {
+    cursor: u64,
+    kind: &'static str,
+    output: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DebugSnapshotResult {
+    instance: DevInstanceSummary,
+    ready: bool,
+    output_cursor: u64,
+    capabilities: DebugCapabilities,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StartInstanceResult {
@@ -131,6 +191,19 @@ fn ok_json<T: Serialize>(value: T) -> Result<CallToolResult, McpError> {
 
 fn err_text(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![Content::text(message.into())])
+}
+
+fn debug_capabilities() -> DebugCapabilities {
+    DebugCapabilities {
+        process_output_events: true,
+        monotonic_output_cursors: true,
+        instance_snapshot: true,
+        ui_evaluate: true,
+        screenshot: false,
+        second_client: false,
+        screenshot_reason: "the desktop UI-debug endpoint does not implement capture_screenshot",
+        second_client_reason: "the debug launcher does not expose an isolated second-client harness",
+    }
 }
 
 fn repo_root_from_parts(parts: &axum::http::request::Parts) -> Option<PathBuf> {
@@ -207,6 +280,42 @@ impl TydeDebugMcpServer {
             Err(err) => Ok(err_text(err)),
         }
     }
+
+    #[tool(
+        description = "Read bounded combined process output from a launched instance. Pass the returned nextCursor to resume without rereading output; truncated is true if the requested cursor fell behind the retained window."
+    )]
+    async fn tyde_debug_events(
+        &self,
+        Parameters(input): Parameters<DebugEventsToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        match debug_events(&self.state, input).await {
+            Ok(result) => ok_json(result),
+            Err(err) => Ok(err_text(err)),
+        }
+    }
+
+    #[tool(
+        description = "Return a non-visual snapshot of a launched instance's process status, readiness, output cursor, and supported debug capabilities."
+    )]
+    async fn tyde_debug_snapshot(
+        &self,
+        Parameters(input): Parameters<DebugSnapshotToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        match debug_snapshot(&self.state, &input.instance_id).await {
+            Ok(result) => ok_json(result),
+            Err(err) => Ok(err_text(err)),
+        }
+    }
+
+    #[tool(
+        description = "Report debug capabilities explicitly. Unsupported screenshot and second-client automation are false so QA can fail closed."
+    )]
+    async fn tyde_debug_capabilities(
+        &self,
+        Parameters(_input): Parameters<EmptyToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        ok_json(debug_capabilities())
+    }
 }
 
 #[tool_handler]
@@ -214,7 +323,7 @@ impl ServerHandler for TydeDebugMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Tyde server hosted debug MCP. Start a child Tyde dev instance with tyde_dev_instance_start, then inspect or drive its frontend with tyde_debug_evaluate. Dev instances are launched with hot reload disabled, so restart the instance when you want it to pick up code changes."
+                "Tyde server hosted debug MCP. Start a child Tyde dev instance with tyde_dev_instance_start; inspect process output with tyde_debug_events, take a non-visual status snapshot with tyde_debug_snapshot, and drive its frontend with tyde_debug_evaluate. Check tyde_debug_capabilities before requiring screenshots or a second client; unsupported capabilities are reported false. Dev instances are launched with hot reload disabled, so restart the instance when you want it to pick up code changes."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -300,13 +409,13 @@ async fn start_instance(
     let ui_debug_addr = loopback_addr(ui_debug_port);
     let frontend_url = format!("http://127.0.0.1:{frontend_port}");
     let store_dir = dev_instance_store_dir(&instance_id);
-    let mobile_pairings_path = store_dir.join("mobile_pairings.json");
     std::fs::create_dir_all(&store_dir).map_err(|err| {
         format!(
             "failed to create dev instance store dir {}: {err}",
             store_dir.display()
         )
     })?;
+    seed_dev_project_store(&store_dir, &project_dir, &instance_id)?;
 
     let config_path = write_dev_config(&project_dir, frontend_port, &instance_id)?;
     let mut command = tauri_dev_command(&config_path)?;
@@ -315,15 +424,17 @@ async fn start_instance(
         .env("TYDE_DEV_INSTANCE", "1")
         .env("TYDE_DEV_HOST_BIND_ADDR", host_addr.to_string())
         .env("TYDE_DEV_UI_DEBUG_BIND_ADDR", ui_debug_addr.to_string())
-        .env(MOBILE_PAIRINGS_STORE_PATH_ENV, &mobile_pairings_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    configure_dev_instance_environment(&mut command, &store_dir);
 
     let mut child = command
         .group_spawn()
         .map_err(|err| format!("failed to spawn Tyde dev instance: {err}"))?;
-    let startup_output = Arc::new(StdMutex::new(Vec::new()));
+    let startup_output = Arc::new(StdMutex::new(BoundedDebugOutput::new(
+        STARTUP_LOG_TAIL_BYTES,
+    )));
     let stdout = child
         .inner()
         .stdout
@@ -376,6 +487,42 @@ async fn start_instance(
     Ok(result)
 }
 
+fn configure_dev_instance_environment(command: &mut Command, store_dir: &Path) {
+    for (env, path) in dev_instance_mutable_paths(store_dir) {
+        command.env(env, path);
+    }
+}
+
+fn seed_dev_project_store(
+    store_dir: &Path,
+    project_dir: &Path,
+    instance_id: &str,
+) -> Result<(), String> {
+    let project_id = ProjectId(format!("dev-{instance_id}"));
+    let name = project_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Tyde Dev Project")
+        .to_owned();
+    let project = Project {
+        id: project_id.clone(),
+        name,
+        sort_order: 0,
+        source: ProjectSource::Standalone {
+            roots: vec![ProjectRootPath(project_dir.display().to_string())],
+        },
+    };
+    let records = HashMap::from([(project_id.0.clone(), project)]);
+    let contents = json!({ "version": 2, "records": records });
+    std::fs::write(
+        store_dir.join("projects.json"),
+        serde_json::to_vec_pretty(&contents)
+            .map_err(|err| format!("failed to serialize dev project store: {err}"))?,
+    )
+    .map_err(|err| format!("failed to seed dev project store: {err}"))
+}
+
 async fn stop_instance(
     state: &Arc<DebugMcpState>,
     instance_id: &str,
@@ -395,22 +542,10 @@ async fn stop_instance(
 async fn list_instances(state: &Arc<DebugMcpState>) -> Result<Vec<DevInstanceSummary>, String> {
     let mut instances = state.instances.lock().await;
     let mut summaries = Vec::with_capacity(instances.len());
-    let mut dead_ids = Vec::new();
 
-    for (id, record) in instances.iter_mut() {
+    for record in instances.values_mut() {
         let summary = dev_instance_summary(record).await;
-        if summary.status != "running" {
-            dead_ids.push(id.clone());
-        }
         summaries.push(summary);
-    }
-
-    for id in dead_ids {
-        if let Some(mut record) = instances.remove(&id) {
-            let _ = record.child.start_kill();
-            let _ = tokio::fs::remove_file(record.config_path).await;
-            let _ = tokio::fs::remove_dir_all(record.store_dir).await;
-        }
     }
 
     summaries.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
@@ -443,6 +578,72 @@ async fn evaluate_instance(
         UiDebugResponse::Error { message } => Err(message),
         other => Err(format!("unexpected evaluate response: {other:?}")),
     }
+}
+
+async fn debug_events(
+    state: &Arc<DebugMcpState>,
+    input: DebugEventsToolInput,
+) -> Result<DebugEventsResult, String> {
+    let max_bytes = input.max_bytes.unwrap_or(STARTUP_LOG_TAIL_BYTES);
+    if !(1..=STARTUP_LOG_TAIL_BYTES).contains(&max_bytes) {
+        return Err(format!(
+            "max_bytes must be between 1 and {STARTUP_LOG_TAIL_BYTES}"
+        ));
+    }
+    let output = {
+        let instances = state.instances.lock().await;
+        let record = instances
+            .get(&input.instance_id)
+            .ok_or_else(|| format!("unknown instance_id '{}'", input.instance_id))?;
+        let output = record
+            .startup_output
+            .lock()
+            .expect("startup output mutex poisoned")
+            .read(input.cursor, max_bytes);
+        output
+    };
+    Ok(debug_events_result(input.instance_id, output))
+}
+
+fn debug_events_result(instance_id: String, output: DebugOutputSlice) -> DebugEventsResult {
+    let events = (!output.output.is_empty())
+        .then(|| DebugOutputEvent {
+            cursor: output.cursor,
+            kind: "process_output",
+            output: output.output,
+        })
+        .into_iter()
+        .collect();
+    DebugEventsResult {
+        instance_id,
+        events,
+        next_cursor: output.next_cursor,
+        oldest_cursor: output.oldest_cursor,
+        truncated: output.truncated,
+    }
+}
+
+async fn debug_snapshot(
+    state: &Arc<DebugMcpState>,
+    instance_id: &str,
+) -> Result<DebugSnapshotResult, String> {
+    let mut instances = state.instances.lock().await;
+    let record = instances
+        .get_mut(instance_id)
+        .ok_or_else(|| format!("unknown instance_id '{instance_id}'"))?;
+    let output_cursor = record
+        .startup_output
+        .lock()
+        .expect("startup output mutex poisoned")
+        .next_cursor();
+    let instance = dev_instance_summary(record).await;
+    let ready = instance.status == "running";
+    Ok(DebugSnapshotResult {
+        instance,
+        ready,
+        output_cursor,
+        capabilities: debug_capabilities(),
+    })
 }
 
 async fn wait_for_instance_ready(record: &mut DevInstanceRecord) -> Result<(), String> {
@@ -520,8 +721,6 @@ async fn dev_instance_summary(record: &mut DevInstanceRecord) -> DevInstanceSumm
         Ok(None) => "running".to_string(),
         Err(err) => format!("status_error({err})"),
     };
-    let _ = record.frontend_port;
-    let _ = record.started_at_ms;
     DevInstanceSummary {
         instance_id: record.instance_id.clone(),
         project_dir: record.project_dir.display().to_string(),
@@ -529,6 +728,8 @@ async fn dev_instance_summary(record: &mut DevInstanceRecord) -> DevInstanceSumm
         host_addr: record.host_addr.to_string(),
         ui_debug_addr: record.ui_debug_addr.to_string(),
         status,
+        frontend_port: record.frontend_port,
+        started_at_ms: record.started_at_ms,
     }
 }
 
@@ -660,7 +861,7 @@ fn tauri_dev_command_with_cli(config_path: &Path, cargo_tauri: &Path) -> Command
 
 async fn capture_startup_output(
     mut reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
-    output: Arc<StdMutex<Vec<u8>>>,
+    output: Arc<StdMutex<BoundedDebugOutput>>,
 ) {
     let mut chunk = [0_u8; 4096];
     loop {
@@ -672,32 +873,24 @@ async fn capture_startup_output(
     }
 }
 
-fn append_startup_output(output: &StdMutex<Vec<u8>>, bytes: &[u8]) {
+fn append_startup_output(output: &StdMutex<BoundedDebugOutput>, bytes: &[u8]) {
     let mut output = output.lock().expect("startup output mutex poisoned");
-    if bytes.len() >= STARTUP_LOG_TAIL_BYTES {
-        output.clear();
-        output.extend_from_slice(&bytes[bytes.len() - STARTUP_LOG_TAIL_BYTES..]);
-        return;
-    }
-    let overflow = output
-        .len()
-        .saturating_add(bytes.len())
-        .saturating_sub(STARTUP_LOG_TAIL_BYTES);
-    if overflow > 0 {
-        output.drain(..overflow);
-    }
-    output.extend_from_slice(bytes);
+    output.append(bytes);
 }
 
-fn with_startup_diagnostics(message: String, output: &StdMutex<Vec<u8>>) -> String {
+fn with_startup_diagnostics(
+    message: String,
+    output: &StdMutex<BoundedDebugOutput>,
+) -> String {
     let output = output.lock().expect("startup output mutex poisoned");
     let diagnostics = if output.is_empty() {
         "startup output was empty".to_string()
     } else {
+        let tail = output.read(None, STARTUP_LOG_TAIL_BYTES);
         format!(
             "startup output (last {} bytes):\n{}",
             output.len(),
-            String::from_utf8_lossy(output.as_slice()).trim_end()
+            tail.output.trim_end()
         )
     };
     format!("{message}\n{diagnostics}")
@@ -864,7 +1057,7 @@ mod tests {
     #[test]
     fn startup_diagnostics_include_bounded_output_tail() {
         let marker = b"actionable cargo-tauri failure\n";
-        let output = StdMutex::new(Vec::new());
+        let output = StdMutex::new(BoundedDebugOutput::new(STARTUP_LOG_TAIL_BYTES));
         append_startup_output(&output, &vec![b'x'; STARTUP_LOG_TAIL_BYTES + 17]);
         append_startup_output(&output, marker);
 
@@ -875,6 +1068,68 @@ mod tests {
         assert_eq!(
             output.lock().expect("startup output").len(),
             STARTUP_LOG_TAIL_BYTES
+        );
+    }
+
+    #[test]
+    fn debug_capabilities_fail_closed_for_unsupported_surfaces() {
+        let capabilities = debug_capabilities();
+        assert!(!capabilities.screenshot);
+        assert!(!capabilities.second_client);
+        assert!(capabilities.process_output_events);
+        assert!(capabilities.monotonic_output_cursors);
+    }
+
+    #[test]
+    fn debug_events_exposes_resume_cursor_without_empty_event() {
+        let result = debug_events_result(
+            "instance".to_owned(),
+            DebugOutputSlice {
+                cursor: 12,
+                next_cursor: 12,
+                oldest_cursor: 4,
+                truncated: false,
+                output: String::new(),
+            },
+        );
+        assert!(result.events.is_empty());
+        assert_eq!(result.next_cursor, 12);
+        assert_eq!(result.oldest_cursor, 4);
+    }
+
+    #[test]
+    fn dev_instance_environment_isolates_every_mutable_path() {
+        let store_dir = Path::new("/isolated/tyde-instance");
+        let mut command = Command::new("tyde");
+        configure_dev_instance_environment(&mut command, store_dir);
+        let configured = command.as_std().get_envs().collect::<HashMap<_, _>>();
+
+        for entry in devtools_protocol::DEV_INSTANCE_MUTABLE_PATHS {
+            let expected_path = store_dir.join(entry.relative_path);
+            assert_eq!(
+                configured.get(std::ffi::OsStr::new(entry.env)).copied().flatten(),
+                Some(expected_path.as_os_str()),
+                "launcher did not isolate {}",
+                entry.env
+            );
+        }
+    }
+
+    #[test]
+    fn dev_instance_seeds_only_requested_project() {
+        let store = tempfile::tempdir().expect("store dir");
+        let project = tempfile::tempdir().expect("project dir");
+        seed_dev_project_store(store.path(), project.path(), "instance")
+            .expect("seed project store");
+        let contents: Value = serde_json::from_slice(
+            &std::fs::read(store.path().join("projects.json")).expect("read project store"),
+        )
+        .expect("parse project store");
+        let records = contents["records"].as_object().expect("records object");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records["dev-instance"]["source"]["Standalone"]["roots"][0],
+            Value::String(project.path().display().to_string())
         );
     }
 
