@@ -24,9 +24,10 @@ use wasm_bindgen_futures::spawn_local;
 
 use protocol::{
     AgentActivityStats, AgentActivitySummary, AgentActivitySummaryStaleReason,
-    AgentActivitySummaryState, AgentControlProgressKind, AgentId, CancelQueuedMessagePayload,
-    FrameKind, QueuedMessageId, SendQueuedMessageNowPayload, SubAgentProgress, ToolProgressUpdate,
-    ToolRequestType, WorkflowRunState, WorkflowRunStatus,
+    AgentActivitySummaryState, AgentControlProgressKind, AgentId, BackgroundTaskState,
+    BackgroundTaskStatus, CancelQueuedMessagePayload, FrameKind, QueuedMessageId,
+    SendQueuedMessageNowPayload, SubAgentProgress, ToolProgressUpdate, ToolRequestType,
+    WorkflowRunState, WorkflowRunStatus,
 };
 
 use crate::components::chat_message::token_badge_data;
@@ -127,6 +128,10 @@ fn subagent_key(call_id: &ToolCallId) -> String {
     format!("sa:{}", call_id.0)
 }
 
+fn command_key(call_id: &ToolCallId) -> String {
+    format!("cmd:{}", call_id.0)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 struct TrayCounts {
     running: usize,
@@ -148,6 +153,9 @@ struct TraySnapshot {
     pending_spawns: Vec<(AgentId, Option<String>)>,
     workflows: Vec<ToolCallId>,
     subagents: Vec<ToolCallId>,
+    /// Backgrounded shell commands (`run_in_background` Bash calls), from
+    /// server-reduced `BackgroundTask` progress snapshots.
+    commands: Vec<ToolCallId>,
     queued: Vec<QueuedMessageId>,
     counts: TrayCounts,
 }
@@ -158,6 +166,7 @@ impl TraySnapshot {
             && self.pending_spawns.is_empty()
             && self.workflows.is_empty()
             && self.subagents.is_empty()
+            && self.commands.is_empty()
             && self.queued.is_empty()
     }
 }
@@ -256,6 +265,26 @@ fn compute_snapshot(
                         snapshot.pending_spawns.push((agent.agent_id, agent.name));
                     }
                 }
+                ToolProgressUpdate::BackgroundTask(task) => {
+                    match task.status {
+                        BackgroundTaskStatus::Running => snapshot.counts.running += 1,
+                        BackgroundTaskStatus::Failed => {
+                            if dismissed.contains(&command_key(call_id)) {
+                                continue;
+                            }
+                            snapshot.counts.failed += 1;
+                        }
+                        BackgroundTaskStatus::Completed
+                        | BackgroundTaskStatus::Stopped
+                        | BackgroundTaskStatus::Unknown => {
+                            if dismissed.contains(&command_key(call_id)) {
+                                continue;
+                            }
+                            snapshot.counts.finished += 1;
+                        }
+                    }
+                    snapshot.commands.push(call_id.clone());
+                }
                 _ => {}
             }
         }
@@ -264,6 +293,7 @@ fn compute_snapshot(
     // between renders.
     snapshot.workflows.sort_by(|a, b| a.0.cmp(&b.0));
     snapshot.subagents.sort_by(|a, b| a.0.cmp(&b.0));
+    snapshot.commands.sort_by(|a, b| a.0.cmp(&b.0));
     snapshot.pending_spawns.sort_by(|a, b| a.0.0.cmp(&b.0.0));
 
     snapshot.queued = state.agent_message_queue.with(|queue| {
@@ -315,6 +345,12 @@ fn finished_keys_untracked(state: &AppState, parent: &ActiveAgentRef) -> Vec<Str
                 }
                 ToolProgressUpdate::SubAgent(sub) if sub.completed => {
                     keys.push(subagent_key(call_id));
+                }
+                ToolProgressUpdate::BackgroundTask(task)
+                    if task.status != BackgroundTaskStatus::Running
+                        && task.status != BackgroundTaskStatus::Failed =>
+                {
+                    keys.push(command_key(call_id));
                 }
                 _ => {}
             }
@@ -473,6 +509,17 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
                             let:call_id
                         >
                             <SubagentRow parent_ref=agent_ref tool_call_id=call_id />
+                        </For>
+                        <For
+                            each=move || snapshot.get().commands
+                            key=|call_id| call_id.0.clone()
+                            let:call_id
+                        >
+                            <CommandRow
+                                parent_ref=agent_ref
+                                tool_call_id=call_id
+                                dismissed=dismissed
+                            />
                         </For>
                         <Show when=move || !snapshot.get().queued.is_empty()>
                             <div class="inflight-tray-queue">
@@ -757,6 +804,101 @@ fn WorkflowRow(
                     </button>
                 </Show>
             </div>
+        </div>
+    }
+}
+
+fn background_status_label(status: BackgroundTaskStatus) -> &'static str {
+    match status {
+        BackgroundTaskStatus::Running => "Running",
+        BackgroundTaskStatus::Completed => "Completed",
+        BackgroundTaskStatus::Stopped => "Stopped",
+        BackgroundTaskStatus::Failed => "Failed",
+        BackgroundTaskStatus::Unknown => "Unknown",
+    }
+}
+
+/// One backgrounded shell command. While it runs the row shows the
+/// command's description; once terminal, the CLI's notification summary
+/// (the only place the exit code exists) replaces it when present.
+#[component]
+fn CommandRow(
+    parent_ref: Signal<Option<ActiveAgentRef>>,
+    tool_call_id: ToolCallId,
+    dismissed: RwSignal<HashSet<String>>,
+) -> impl IntoView {
+    let state = expect_context::<AppState>();
+
+    let task: Signal<Option<BackgroundTaskState>> = Signal::derive({
+        let state = state.clone();
+        let tool_call_id = tool_call_id.clone();
+        move || {
+            let parent = parent_ref.get()?;
+            let key = (parent.agent_id, tool_call_id.clone());
+            let progress = state.tool_progress.with(|map| map.get(&key).cloned())?;
+            match progress.get().update {
+                ToolProgressUpdate::BackgroundTask(task) => Some(task),
+                _ => None,
+            }
+        }
+    });
+
+    let title = move || {
+        task.get().map(|task| {
+            let fallback = || format!("Background command {}", task.task_id);
+            if task.status == BackgroundTaskStatus::Running {
+                task.description.clone().unwrap_or_else(fallback)
+            } else {
+                task.summary
+                    .clone()
+                    .or_else(|| task.description.clone())
+                    .unwrap_or_else(fallback)
+            }
+        })
+    };
+
+    let status_label = move || {
+        task.get()
+            .map(|task| background_status_label(task.status).to_owned())
+    };
+    let status_class = move || match task.get().map(|task| task.status) {
+        Some(BackgroundTaskStatus::Running) => "tool-live-agent-status running",
+        Some(BackgroundTaskStatus::Failed) => "tool-live-agent-status failed",
+        _ => "tool-live-agent-status idle",
+    };
+
+    // Same `Copy`-captures requirement as the other rows' dismiss handlers.
+    let dismiss_key = StoredValue::new_local(command_key(&tool_call_id));
+    let on_dismiss = move |_: web_sys::MouseEvent| {
+        dismissed.update(|set| {
+            set.insert(dismiss_key.get_value());
+        });
+    };
+    let is_failed = Signal::derive(move || {
+        matches!(
+            task.get().map(|task| task.status),
+            Some(BackgroundTaskStatus::Failed)
+        )
+    });
+
+    view! {
+        <div class="tool-live-agent-row inflight-tray-row">
+            <div class="tool-live-agent-main">
+                <span class="tool-live-agent-name">{title}</span>
+                <span class=status_class>{status_label}</span>
+            </div>
+            <Show when=move || is_failed.get()>
+                <div class="inflight-tray-row-actions">
+                    <button
+                        type="button"
+                        class="inflight-tray-dismiss"
+                        title="Dismiss this failure"
+                        on:click=on_dismiss
+                    >
+                        "\u{d7}"
+                    </button>
+                </div>
+            </Show>
         </div>
     }
 }
@@ -1311,6 +1453,129 @@ mod wasm_tests {
         assert!(
             body.contains("review-changes"),
             "the workflow row is named: {body}"
+        );
+    }
+
+    fn background_command_progress(
+        status: BackgroundTaskStatus,
+        summary: Option<&str>,
+    ) -> ToolProgressData {
+        ToolProgressData {
+            tool_call_id: "toolu_bg_bash".to_owned(),
+            tool_name: "Bash".to_owned(),
+            update: ToolProgressUpdate::BackgroundTask(BackgroundTaskState {
+                task_id: "task-bg".to_owned(),
+                description: Some("Run repository validation".to_owned()),
+                status,
+                summary: summary.map(str::to_owned),
+            }),
+        }
+    }
+
+    /// A backgrounded shell command is in-flight work: it must count as
+    /// running and render a row naming it — the exact class of state that
+    /// used to be invisible because the server dropped bash task frames.
+    #[wasm_bindgen_test]
+    async fn running_background_command_renders_named_row() {
+        let (container, _state) = mount_tray(|state| {
+            seed_progress(
+                state,
+                background_command_progress(BackgroundTaskStatus::Running, None),
+            );
+        });
+        next_tick().await;
+
+        let body = text(&container);
+        assert!(
+            body.contains("1 running"),
+            "collapsed line counts the background command: {body}"
+        );
+
+        expand(&container).await;
+        let body = text(&container);
+        assert!(
+            body.contains("Run repository validation") && body.contains("Running"),
+            "the command row shows its description and live status: {body}"
+        );
+    }
+
+    /// Once the command completes, the row surfaces the CLI's summary —
+    /// the only carrier of the exit code — counts as finished, and is
+    /// removed by "Clear finished".
+    #[wasm_bindgen_test]
+    async fn completed_background_command_shows_summary_and_clears() {
+        let (container, _state) = mount_tray(|state| {
+            seed_progress(
+                state,
+                background_command_progress(
+                    BackgroundTaskStatus::Completed,
+                    Some(
+                        "Background command \"Run repository validation\" completed (exit code 0)",
+                    ),
+                ),
+            );
+        });
+        next_tick().await;
+
+        let body = text(&container);
+        assert!(
+            body.contains("1 finished"),
+            "a completed command counts as finished: {body}"
+        );
+
+        expand(&container).await;
+        let body = text(&container);
+        assert!(
+            body.contains("completed (exit code 0)"),
+            "the finished row carries the exit-code summary: {body}"
+        );
+
+        let clear = container
+            .query_selector(".inflight-tray-clear")
+            .unwrap()
+            .expect("clear button exists")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        clear.click();
+        next_tick().await;
+        assert_eq!(
+            count(&container, ".inflight-tray"),
+            0,
+            "clearing the only finished command hides the tray"
+        );
+    }
+
+    /// A failed background command stays pinned — it must not be swept by
+    /// "Clear finished" — until individually dismissed.
+    #[wasm_bindgen_test]
+    async fn failed_background_command_pins_until_dismissed() {
+        let (container, _state) = mount_tray(|state| {
+            seed_progress(
+                state,
+                background_command_progress(BackgroundTaskStatus::Failed, None),
+            );
+        });
+        next_tick().await;
+
+        let body = text(&container);
+        assert!(
+            body.contains("1 failed"),
+            "a failed command counts as failed: {body}"
+        );
+
+        expand(&container).await;
+        let dismiss = container
+            .query_selector(".inflight-tray-dismiss")
+            .unwrap()
+            .expect("failed command row offers a dismiss action")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        dismiss.click();
+        next_tick().await;
+        assert_eq!(
+            count(&container, ".inflight-tray"),
+            0,
+            "dismissing the only failure hides the tray"
         );
     }
 

@@ -6881,7 +6881,44 @@ pub enum ToolProgressUpdate {
     SubAgent(SubAgentProgress),
     Workflow(WorkflowRunState),
     AgentControl(AgentControlProgress),
+    BackgroundTask(BackgroundTaskState),
     Other { payload: Value },
+}
+
+/// Live status of a backgrounded shell command (Claude Code `Bash` with
+/// `run_in_background: true`), reduced server-side from the CLI's task
+/// system frames (`task_started` / `task_updated` / `task_notification`).
+/// Keyed to the launching tool call by `tool_call_id`, like a workflow.
+/// The command string itself never appears in task frames — consumers
+/// that want it join with the originating tool request by `tool_call_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundTaskState {
+    /// The CLI's task id (distinct from the tool_use id).
+    pub task_id: String,
+    /// Human description from the `task_started` frame — the model's
+    /// `description` argument to the Bash tool.
+    #[serde(default)]
+    pub description: Option<String>,
+    pub status: BackgroundTaskStatus,
+    /// Completion summary from the `task_notification` frame, e.g.
+    /// `Background command "…" completed (exit code 0)`. The exit code
+    /// exists only inside this text; the CLI reports no structured field.
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundTaskStatus {
+    Running,
+    Completed,
+    /// Ended without completing — killed at session teardown or via
+    /// TaskStop (`task_updated` patch status `killed`, notification
+    /// status `stopped`).
+    Stopped,
+    Failed,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Live status of a sub-agent spawned by a Task-style tool call,

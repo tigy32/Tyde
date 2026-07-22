@@ -16,11 +16,12 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use protocol::{
-    BackendAccessMode, CapacityBucket, CapacityBucketId, CapacityBucketStatus, CapacityCoverage,
-    CapacityMeasure, CapacityReport, CapacityReset, CapacityScope, CapacitySource,
-    CapacityUnavailableReason, CapacityWindow, ClaudeLimitType, ExitPlanModeDecision,
-    SendMessageToolResponse, SessionId, ToolPolicy, ToolProgressData, ToolProgressUpdate,
-    ValueProvenance, WorkflowAgentState, WorkflowAgentStatus, WorkflowRunState, WorkflowRunStatus,
+    BackendAccessMode, BackgroundTaskState, BackgroundTaskStatus, CapacityBucket, CapacityBucketId,
+    CapacityBucketStatus, CapacityCoverage, CapacityMeasure, CapacityReport, CapacityReset,
+    CapacityScope, CapacitySource, CapacityUnavailableReason, CapacityWindow, ClaudeLimitType,
+    ExitPlanModeDecision, SendMessageToolResponse, SessionId, ToolPolicy, ToolProgressData,
+    ToolProgressUpdate, ValueProvenance, WorkflowAgentState, WorkflowAgentStatus, WorkflowRunState,
+    WorkflowRunStatus,
 };
 
 use crate::backend::turn_emitter::{
@@ -671,6 +672,10 @@ struct ClaudeSystemFrame {
     tool_use_id: Option<String>,
     #[serde(default)]
     workflow_name: Option<String>,
+    /// Partial-update object on `task_updated` frames. Only `status` is
+    /// consumed; the CLI also sends fields like `end_time`.
+    #[serde(default)]
+    patch: Option<ClaudeTaskPatch>,
     /// Aggregate usage on `task_progress` frames.
     #[serde(default)]
     usage: Option<ClaudeTaskUsage>,
@@ -680,6 +685,12 @@ struct ClaudeSystemFrame {
     /// rest of the frame.
     #[serde(default)]
     workflow_progress: Option<Vec<Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeTaskPatch {
+    #[serde(default)]
+    status: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3188,6 +3199,9 @@ async fn read_claude_stdout_persistent(
     // Keyed by task_id; lives at loop scope (not per-turn) because a
     // workflow's task frames keep arriving after its turn completes.
     let mut workflow_runs: HashMap<String, WorkflowRunEntry> = HashMap::new();
+    // Keyed by task_id; loop scope for the same reason — a backgrounded
+    // command's terminal frames arrive after the launching turn ends.
+    let mut background_tasks: HashMap<String, BackgroundTaskEntry> = HashMap::new();
 
     while let Ok(Some(line)) = lines.next_line().await {
         let trimmed = line.trim();
@@ -3217,6 +3231,9 @@ async fn read_claude_stdout_persistent(
         }
 
         if handle_workflow_task_frame(&value, &mut workflow_runs, &inner.emitter) {
+            continue;
+        }
+        if handle_background_bash_task_frame(&value, &mut background_tasks, &inner.emitter) {
             continue;
         }
 
@@ -3322,7 +3339,7 @@ async fn read_claude_stdout_persistent(
     }
 
     for (_tool_use_id, stream) in subagent_streams.drain() {
-        finalize_subagent_stream(stream);
+        finalize_subagent_stream(stream, SubAgentFinalOutcome::default());
     }
 
     fail_pending_control_waiters(&control_waiters, "Claude CLI process exited").await;
@@ -4476,6 +4493,123 @@ fn handle_workflow_task_frame(
     }
 }
 
+struct BackgroundTaskEntry {
+    tool_use_id: String,
+    state: BackgroundTaskState,
+}
+
+fn emit_background_task_snapshot(emitter: &TurnEmitter, entry: &BackgroundTaskEntry) {
+    emitter.tool_progress(&ToolProgressData {
+        tool_call_id: entry.tool_use_id.clone(),
+        tool_name: "Bash".to_string(),
+        update: ToolProgressUpdate::BackgroundTask(entry.state.clone()),
+    });
+}
+
+fn map_background_task_patch_status(raw: &str) -> BackgroundTaskStatus {
+    match raw {
+        "running" => BackgroundTaskStatus::Running,
+        "completed" => BackgroundTaskStatus::Completed,
+        "killed" | "stopped" => BackgroundTaskStatus::Stopped,
+        "failed" | "error" => BackgroundTaskStatus::Failed,
+        other => {
+            tracing::warn!("unknown background task_updated patch status: {other:?}");
+            BackgroundTaskStatus::Unknown
+        }
+    }
+}
+
+/// Consume a `local_bash` background-command task frame if `value` is
+/// one. Like `handle_workflow_task_frame`, this runs pre-gate in
+/// `read_claude_stdout_persistent`: a backgrounded command outlives the
+/// turn that launched it, and its terminal frames can arrive between
+/// turns where the per-turn path would drop them.
+///
+/// Captured lifecycles (Claude Code 2.1.217; fixtures in the tests):
+/// `task_started` (task_type `local_bash`) → on natural completion
+/// `task_updated {patch: {status: "completed"}}` then `task_notification
+/// {status: "completed", summary}` — or, when the session ends while the
+/// command still runs, `task_updated {patch: {status: "killed"}}` then
+/// `task_notification {status: "stopped"}`. There are no `task_progress`
+/// frames for bash tasks, and `task_updated`/`task_notification` carry
+/// no task_type — membership in the registry seeded by `task_started` is
+/// the filter.
+fn handle_background_bash_task_frame(
+    value: &Value,
+    background_tasks: &mut HashMap<String, BackgroundTaskEntry>,
+    emitter: &TurnEmitter,
+) -> bool {
+    if value.get("type").and_then(Value::as_str) != Some("system") {
+        return false;
+    }
+    let Ok(system) = parse_claude_system_frame(value) else {
+        return false;
+    };
+    let Some(task_id) = system.task_id.as_deref().and_then(normalize_nonempty) else {
+        return false;
+    };
+
+    match system.event() {
+        ClaudeSystemEvent::TaskStarted => {
+            if system.task_type.as_deref() != Some("local_bash") {
+                return false;
+            }
+            let Some(tool_use_id) = system.tool_use_id.as_deref().and_then(normalize_nonempty)
+            else {
+                tracing::warn!("ignoring local_bash task_started without tool_use_id: {value}");
+                return true;
+            };
+            let entry = BackgroundTaskEntry {
+                tool_use_id,
+                state: BackgroundTaskState {
+                    task_id: task_id.clone(),
+                    description: system.description.as_deref().and_then(normalize_nonempty),
+                    status: BackgroundTaskStatus::Running,
+                    summary: None,
+                },
+            };
+            emit_background_task_snapshot(emitter, &entry);
+            background_tasks.insert(task_id, entry);
+            true
+        }
+        ClaudeSystemEvent::TaskUpdated => {
+            let Some(entry) = background_tasks.get_mut(&task_id) else {
+                return false;
+            };
+            let Some(status) = system
+                .patch
+                .as_ref()
+                .and_then(|patch| patch.status.as_deref())
+            else {
+                // A patch with no status (e.g. output-file bookkeeping)
+                // changes nothing the tray renders.
+                return true;
+            };
+            entry.state.status = map_background_task_patch_status(status);
+            emit_background_task_snapshot(emitter, entry);
+            true
+        }
+        ClaudeSystemEvent::TaskNotification => {
+            let Some(mut entry) = background_tasks.remove(&task_id) else {
+                return false;
+            };
+            entry.state.status = match system.status.as_deref() {
+                Some("completed") => BackgroundTaskStatus::Completed,
+                Some("stopped") | Some("killed") => BackgroundTaskStatus::Stopped,
+                Some("failed") | Some("error") => BackgroundTaskStatus::Failed,
+                other => {
+                    tracing::warn!("unknown background task_notification status: {other:?}");
+                    BackgroundTaskStatus::Unknown
+                }
+            };
+            entry.state.summary = system.summary.as_deref().and_then(normalize_nonempty);
+            emit_background_task_snapshot(emitter, &entry);
+            true
+        }
+        _ => false,
+    }
+}
+
 async fn detect_subagent_task_system_spawns(
     value: &Value,
     emitter: &dyn SubAgentEmitter,
@@ -4708,6 +4842,45 @@ async fn detect_subagent_spawns(
     }
 }
 
+/// Terminal sub-agent data the CLI reports only *outside* the child's
+/// correlated stream. The CLI never forwards the child's final assistant
+/// turn as a `parent_tool_use_id` frame (verified against 2.1.217): the
+/// final text travels solely in the parent's Task `tool_use_result` (and,
+/// for background agents, the `task_notification` summary), and the final
+/// API call's usage solely in `tool_use_result.usage`. Without carrying
+/// these into finalization, the child chat ends on an empty placeholder
+/// and the final turn's output tokens go unreported.
+#[derive(Default)]
+struct SubAgentFinalOutcome {
+    text: Option<String>,
+    usage: Option<Value>,
+}
+
+/// Pull the child's final message and last-call usage from a Task
+/// tool_result frame's frame-level `tool_use_result` object.
+fn extract_subagent_final_outcome(value: &Value) -> SubAgentFinalOutcome {
+    let Some(result) = value.get("tool_use_result") else {
+        return SubAgentFinalOutcome::default();
+    };
+    let text = result
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|text| !text.trim().is_empty());
+    // Normalize the CLI's raw usage keys (`cache_read_input_tokens`,
+    // missing `total_tokens`) into the canonical shape `add_token_usage`
+    // and the emitters consume.
+    let usage = parse_token_usage(result.get("usage"));
+    SubAgentFinalOutcome { text, usage }
+}
+
 /// Detect tool_result events for sub-agent tools and finalize the sub-agent.
 async fn detect_subagent_completions(value: &Value, streams: &mut HashMap<String, SubAgentStream>) {
     // tool_result appears in "user" type messages with content blocks
@@ -4726,6 +4899,9 @@ async fn detect_subagent_completions(value: &Value, streams: &mut HashMap<String
         Some(c) => c,
         None => return,
     };
+    // `tool_use_result` is frame-level, so it can describe only one
+    // tool_result; hand it to the first matching stream and no other.
+    let mut final_outcome = Some(extract_subagent_final_outcome(value));
     for block in content {
         let block_type = block
             .get("type")
@@ -4747,15 +4923,50 @@ async fn detect_subagent_completions(value: &Value, streams: &mut HashMap<String
             Some(SubAgentExecution::Foreground) | None => {}
         }
         if let Some(stream) = streams.remove(tool_use_id) {
-            finalize_subagent_stream(stream);
+            finalize_subagent_stream(stream, final_outcome.take().unwrap_or_default());
         }
     }
 }
 
 /// Flush and close out a sub-agent stream, emitting its final progress stats.
-fn finalize_subagent_stream(mut stream: SubAgentStream) {
+/// `outcome` carries the final assistant text/usage the CLI reports outside
+/// the correlated stream (see `SubAgentFinalOutcome`); callers with no such
+/// data (process exit) pass `SubAgentFinalOutcome::default()`.
+fn finalize_subagent_stream(mut stream: SubAgentStream, outcome: SubAgentFinalOutcome) {
     flush_pending_tool_uses_with_fallback(&mut stream.summary, &mut stream.segment);
+    if let Some(text) = outcome
+        .text
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        // The phase machinery prefers streamed text over `assistant_text`,
+        // so if a future CLI starts forwarding the final turn on the
+        // correlated stream this stays render-once.
+        stream.summary.assistant_text = Some(text.to_owned());
+    }
+    if let Some(usage) = outcome.usage {
+        stream.summary.usage = Some(match stream.summary.usage.take() {
+            Some(existing) => add_token_usage(Some(&existing), &usage),
+            None => usage,
+        });
+    }
     if phase_has_pending_output(&stream.summary, &stream.segment) {
+        // The child's previous phase closed on its last tool_result, so an
+        // injected final message opens a fresh segment: a StreamStart may
+        // still be owed before the closing StreamEnd (no-op otherwise).
+        let base_message_id = stream.message_id.clone();
+        let mut terminal_message_id = base_message_id.clone();
+        let model = stream.summary.model.clone();
+        maybe_emit_next_stream_start(
+            &mut stream.summary,
+            &mut stream.segment,
+            &stream.inner,
+            &base_message_id,
+            &mut terminal_message_id,
+            model,
+        );
+        stream.message_id = terminal_message_id;
         close_current_subagent_phase(&mut stream.summary, &mut stream.segment, &stream.inner);
     } else if let Some(turn_usage) = subagent_terminal_usage(&stream.summary) {
         let base_message_id = stream.message_id.clone();
@@ -4830,7 +5041,16 @@ fn finalize_background_subagent_completion(
         return;
     };
     if let Some(stream) = streams.remove(tool_use_id) {
-        finalize_subagent_stream(stream);
+        // On a completed agent the notification `summary` is the child's
+        // final assistant text — the only carrier of it for background
+        // agents. Other statuses describe the failure, not the answer.
+        // No usage here: the notification reports only an unsplittable
+        // total, and fabricating an input/output split would be dishonest.
+        let text = (value.get("status").and_then(Value::as_str) == Some("completed"))
+            .then(|| value.get("summary").and_then(Value::as_str))
+            .flatten()
+            .map(str::to_owned);
+        finalize_subagent_stream(stream, SubAgentFinalOutcome { text, usage: None });
     }
 }
 
@@ -4933,11 +5153,11 @@ fn consume_claude_stream_value(
                 ClaudeSystemEvent::CompactBoundary => {
                     summary.control_event = Some(ClaudeControlEvent::ConversationCompacted);
                 }
-                // Workflow task frames are consumed pre-gate in
-                // `read_claude_stdout_persistent` (they keep arriving
-                // between turns, when this per-turn path never runs);
-                // anything reaching here is a non-workflow task event
-                // with nothing to render.
+                // Workflow and local_bash background-command task frames
+                // are consumed pre-gate in `read_claude_stdout_persistent`
+                // (they keep arriving between turns, when this per-turn
+                // path never runs); anything reaching here is some other
+                // task event with nothing to render.
                 ClaudeSystemEvent::TaskStarted
                 | ClaudeSystemEvent::TaskProgress
                 | ClaudeSystemEvent::TaskNotification
@@ -11109,11 +11329,104 @@ for raw_line in sys.stdin:
         }
     }
 
+    /// The CLI never forwards a sub-agent's final assistant turn as a
+    /// correlated frame (verified against 2.1.217): the text and last-call
+    /// usage exist only in the parent's Task `tool_use_result`. Finalizing
+    /// a foreground child must materialize both in the child's chat.
+    #[tokio::test]
+    async fn foreground_task_result_materializes_final_child_message() {
+        let (mut stream, mut child_rx) = usage_only_subagent_stream("toolu_task_fg", true);
+        stream.execution = SubAgentExecution::Foreground;
+        let mut streams = HashMap::from([("toolu_task_fg".to_string(), stream)]);
+
+        // Captured 2.1.217 frame shape (trimmed): the message block carries
+        // the text plus an agentId/usage postscript; `tool_use_result` is
+        // the authoritative final content and usage.
+        detect_subagent_completions(
+            &json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [{
+                        "tool_use_id": "toolu_task_fg",
+                        "type": "tool_result",
+                        "content": [
+                            {"type": "text", "text": "qa-child-done"},
+                            {"type": "text", "text": "agentId: aa62c69 (use SendMessage...)\n<usage>subagent_tokens: 8512</usage>"}
+                        ]
+                    }]
+                },
+                "tool_use_result": {
+                    "status": "completed",
+                    "agentId": "aa62c69",
+                    "content": [{"type": "text", "text": "qa-child-done"}],
+                    "usage": {
+                        "input_tokens": 2,
+                        "output_tokens": 8,
+                        "cache_read_input_tokens": 8398,
+                        "cache_creation_input_tokens": 104
+                    }
+                }
+            }),
+            &mut streams,
+        )
+        .await;
+        assert!(streams.is_empty(), "foreground stream is finalized");
+
+        let stream_start = child_rx.recv().await.expect("final message StreamStart");
+        assert_eq!(event_kind(&stream_start), Some("StreamStart"));
+        let stream_end = child_rx.recv().await.expect("final message StreamEnd");
+        assert_eq!(event_kind(&stream_end), Some("StreamEnd"));
+        let message = stream_end_message(&stream_end);
+        assert_eq!(
+            message.get("content").and_then(Value::as_str),
+            Some("qa-child-done"),
+            "the child's final text renders, not an empty placeholder"
+        );
+        // Turn usage = accumulated intermediate calls (2/29/31) + the final
+        // call (2/8/10 after normalization) — the output tokens that used
+        // to go unreported.
+        assert_eq!(stream_end_turn_total_tokens(&stream_end), Some(41));
+    }
+
+    /// A background sub-agent's final text arrives only in its completion
+    /// `task_notification` summary; finalization must render it.
+    #[tokio::test]
+    async fn background_notification_materializes_final_child_message() {
+        let (stream, mut child_rx) = usage_only_subagent_stream("toolu_task_bg", true);
+        let mut streams = HashMap::from([("toolu_task_bg".to_string(), stream)]);
+
+        finalize_background_subagent_completion(
+            &json!({
+                "type": "system",
+                "subtype": "task_notification",
+                "task_id": "aa62c69083a72aa6f",
+                "tool_use_id": "toolu_task_bg",
+                "status": "completed",
+                "summary": "qa-child-done",
+            }),
+            &mut streams,
+        );
+        assert!(streams.is_empty());
+
+        let stream_start = child_rx.recv().await.expect("final message StreamStart");
+        assert_eq!(event_kind(&stream_start), Some("StreamStart"));
+        let stream_end = child_rx.recv().await.expect("final message StreamEnd");
+        assert_eq!(event_kind(&stream_end), Some("StreamEnd"));
+        assert_eq!(
+            stream_end_message(&stream_end)
+                .get("content")
+                .and_then(Value::as_str),
+            Some("qa-child-done")
+        );
+        assert_eq!(stream_end_turn_total_tokens(&stream_end), Some(31));
+    }
+
     #[tokio::test]
     async fn stdout_eof_emits_tool_only_usage_terminal_without_renderable_payload() {
         let (stream, mut child_rx) = usage_only_subagent_stream("toolu-eof", true);
 
-        finalize_subagent_stream(stream);
+        finalize_subagent_stream(stream, SubAgentFinalOutcome::default());
 
         assert_usage_only_child_terminal_is_known(&mut child_rx).await;
     }
@@ -15466,6 +15779,177 @@ for raw_line in sys.stdin:
             &inner.emitter,
         ));
         assert!(recv_tool_progress(&mut rx).is_empty());
+    }
+
+    // ---- Background bash task-frame reducer (fixtures captured from a
+    // live CLI 2.1.217 probe; see handle_background_bash_task_frame) ----
+
+    fn recv_background_snapshots(
+        rx: &mut mpsc::UnboundedReceiver<Value>,
+    ) -> Vec<BackgroundTaskState> {
+        let mut snapshots = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if event.get("kind").and_then(Value::as_str) != Some("ToolProgress") {
+                continue;
+            }
+            let data: ToolProgressData =
+                serde_json::from_value(event.get("data").cloned().unwrap_or(Value::Null))
+                    .expect("ToolProgress payload parses");
+            assert_eq!(data.tool_call_id, "toolu_01Ay3XKHPknVQCy2L7zkvvH6");
+            assert_eq!(data.tool_name, "Bash");
+            let ToolProgressUpdate::BackgroundTask(state) = data.update else {
+                panic!("expected BackgroundTask update");
+            };
+            snapshots.push(state);
+        }
+        snapshots
+    }
+
+    fn bash_task_started_frame() -> Value {
+        json!({
+            "type": "system",
+            "subtype": "task_started",
+            "task_id": "b4r45rw5t",
+            "tool_use_id": "toolu_01Ay3XKHPknVQCy2L7zkvvH6",
+            "description": "Sleep 10 seconds then echo marker",
+            "task_type": "local_bash",
+            "uuid": "22004eab-f638-49f8-a39e-5a0bc878ee06",
+            "session_id": "824611e6-870f-4441-b7d2-5b19dcf3f803"
+        })
+    }
+
+    fn bash_task_updated_frame(status: &str) -> Value {
+        json!({
+            "type": "system",
+            "subtype": "task_updated",
+            "task_id": "b4r45rw5t",
+            "patch": {"status": status, "end_time": 1784721586519_u64},
+            "uuid": "e886ecc0-1333-447d-8bd7-dac590c588e4",
+            "session_id": "824611e6-870f-4441-b7d2-5b19dcf3f803"
+        })
+    }
+
+    fn bash_task_notification_frame(status: &str, summary: &str) -> Value {
+        json!({
+            "type": "system",
+            "subtype": "task_notification",
+            "task_id": "b4r45rw5t",
+            "tool_use_id": "toolu_01Ay3XKHPknVQCy2L7zkvvH6",
+            "status": status,
+            "output_file": "/tmp/tasks/b4r45rw5t.output",
+            "summary": summary,
+            "uuid": "afd817b8-9970-481d-98ae-afbea37a4c2b",
+            "session_id": "824611e6-870f-4441-b7d2-5b19dcf3f803"
+        })
+    }
+
+    #[test]
+    fn background_bash_completion_lifecycle_reduces_to_snapshots() {
+        let (inner, mut rx) = make_test_inner();
+        let mut tasks: HashMap<String, BackgroundTaskEntry> = HashMap::new();
+
+        assert!(handle_background_bash_task_frame(
+            &bash_task_started_frame(),
+            &mut tasks,
+            &inner.emitter,
+        ));
+        assert!(handle_background_bash_task_frame(
+            &bash_task_updated_frame("completed"),
+            &mut tasks,
+            &inner.emitter,
+        ));
+        assert!(handle_background_bash_task_frame(
+            &bash_task_notification_frame(
+                "completed",
+                "Background command \"Sleep 10 seconds then echo marker\" completed (exit code 0)",
+            ),
+            &mut tasks,
+            &inner.emitter,
+        ));
+        assert!(tasks.is_empty(), "task is dropped after its notification");
+
+        let snapshots = recv_background_snapshots(&mut rx);
+        assert_eq!(snapshots.len(), 3);
+        assert_eq!(snapshots[0].status, BackgroundTaskStatus::Running);
+        assert_eq!(
+            snapshots[0].description.as_deref(),
+            Some("Sleep 10 seconds then echo marker")
+        );
+        assert_eq!(snapshots[1].status, BackgroundTaskStatus::Completed);
+        let last = snapshots.last().unwrap();
+        assert_eq!(last.status, BackgroundTaskStatus::Completed);
+        assert_eq!(
+            last.summary.as_deref(),
+            Some(
+                "Background command \"Sleep 10 seconds then echo marker\" completed (exit code 0)"
+            )
+        );
+    }
+
+    #[test]
+    fn background_bash_teardown_kill_maps_to_stopped() {
+        let (inner, mut rx) = make_test_inner();
+        let mut tasks: HashMap<String, BackgroundTaskEntry> = HashMap::new();
+
+        handle_background_bash_task_frame(&bash_task_started_frame(), &mut tasks, &inner.emitter);
+        assert!(handle_background_bash_task_frame(
+            &bash_task_updated_frame("killed"),
+            &mut tasks,
+            &inner.emitter,
+        ));
+        assert!(handle_background_bash_task_frame(
+            &bash_task_notification_frame("stopped", "Sleep 10 seconds then echo marker"),
+            &mut tasks,
+            &inner.emitter,
+        ));
+
+        let snapshots = recv_background_snapshots(&mut rx);
+        assert_eq!(snapshots.len(), 3);
+        assert_eq!(snapshots[1].status, BackgroundTaskStatus::Stopped);
+        assert_eq!(snapshots[2].status, BackgroundTaskStatus::Stopped);
+    }
+
+    #[test]
+    fn background_bash_ignores_foreign_task_frames() {
+        let (inner, mut rx) = make_test_inner();
+        let mut tasks: HashMap<String, BackgroundTaskEntry> = HashMap::new();
+
+        // Agent and workflow tasks belong to other reducers.
+        assert!(!handle_background_bash_task_frame(
+            &json!({
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": "task-agent",
+                "tool_use_id": "toolu_task",
+                "task_type": "local_agent",
+            }),
+            &mut tasks,
+            &inner.emitter,
+        ));
+        // task_updated / task_notification carry no task_type; ones for
+        // task_ids we never registered must fall through untouched.
+        assert!(!handle_background_bash_task_frame(
+            &bash_task_updated_frame("completed"),
+            &mut tasks,
+            &inner.emitter,
+        ));
+        assert!(!handle_background_bash_task_frame(
+            &bash_task_notification_frame("completed", "done"),
+            &mut tasks,
+            &inner.emitter,
+        ));
+        // The background_tasks_changed roster snapshot has no task_id and
+        // is not consumed by this reducer.
+        assert!(!handle_background_bash_task_frame(
+            &json!({
+                "type": "system",
+                "subtype": "background_tasks_changed",
+                "tasks": [{"task_id": "b4r45rw5t", "task_type": "local_bash"}],
+            }),
+            &mut tasks,
+            &inner.emitter,
+        ));
+        assert!(recv_background_snapshots(&mut rx).is_empty());
     }
 
     #[test]
