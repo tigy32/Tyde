@@ -66,27 +66,6 @@ pub enum NativeSettingsSaveState {
     Failed { message: String },
 }
 
-/// The outcome of an explicit `ResetTycodeManagedProjection`. See
-/// [`AppState::managed_projection_reset`].
-///
-/// The reset is the one action in settings that deletes data, and it is offered
-/// from a card on a page that is otherwise inert. Its refusal therefore has to be
-/// visible *where the user acted* — not only in the global host status line,
-/// where a rejected reset reads as a button that did nothing.
-#[derive(Clone, Debug, PartialEq)]
-pub enum ManagedProjectionResetState {
-    /// Sent; the server has not answered. Nothing has happened on disk yet, and
-    /// nothing in the UI may change on its own until the server says so.
-    Pending,
-    /// The server refused it, and this is the refusal verbatim. `Conflict` is the
-    /// typed stale-token refusal: the projection moved after the reset was
-    /// offered, so the tokens no longer match and the server removed nothing.
-    Refused {
-        code: protocol::CommandErrorCode,
-        message: String,
-    },
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentInfo {
     pub host_id: String,
@@ -2549,17 +2528,6 @@ pub struct AppState {
     /// stays a projection of server-owned state, not an invented client model.
     pub native_settings_save_state:
         RwSignal<HashMap<String, HashMap<BackendKind, NativeSettingsSaveState>>>,
-    /// Outcome of the last explicit managed-projection reset, keyed by host id then
-    /// backend kind.
-    ///
-    /// `Pending` is written when the command is sent, and resolved *only* by the
-    /// server: a typed `CommandError` makes it `Refused`, and a snapshot that no
-    /// longer carries a recovery state removes it (the reset landed and the state
-    /// it referred to is gone). Nothing here is written optimistically — a refused
-    /// reset must not look like it did anything, and a reset the server has not
-    /// answered must not look like it succeeded.
-    pub managed_projection_reset:
-        RwSignal<HashMap<String, HashMap<BackendKind, ManagedProjectionResetState>>>,
     /// Host id for which the next `NewTerminal` should steal focus. Set when the
     /// user clicks Install/Sign-in; consumed in the dispatcher so the new
     /// terminal becomes active even if another terminal was already selected.
@@ -2897,7 +2865,6 @@ impl AppState {
             backend_config_snapshots: RwSignal::new(HashMap::new()),
             backend_capacity: RwSignal::new(HashMap::new()),
             backend_native_settings: RwSignal::new(HashMap::new()),
-            managed_projection_reset: RwSignal::new(HashMap::new()),
             native_settings_save_state: RwSignal::new(HashMap::new()),
             pending_terminal_focus: RwSignal::new(None),
             agent_session_settings: RwSignal::new(HashMap::new()),
@@ -4138,12 +4105,6 @@ impl AppState {
             snapshots.remove(host_id);
         });
         self.native_settings_save_state.update(|states| {
-            states.remove(host_id);
-        });
-        // A reset outcome describes a projection on a host we are no longer
-        // connected to. Replaying it against the next connection's snapshot would
-        // be a refusal attached to state it never referred to.
-        self.managed_projection_reset.update(|states| {
             states.remove(host_id);
         });
         self.schemas_loaded_for_host.update(|loaded| {

@@ -8402,6 +8402,83 @@ kbd {
     background: var(--surface-0, var(--surface-1));
 }
 
+/* Tycode settings profiles: one chip per settings file above the shared
+   schema-driven form, plus the inline create control. */
+.settings-native-profile-chips {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+    margin-bottom: var(--space-3);
+    padding-bottom: var(--space-3);
+    border-bottom: 1px solid var(--border-primary);
+}
+
+.settings-native-profile-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-3);
+    font-size: 0.85rem;
+    font-family: var(--font-mono, monospace);
+    color: var(--text-secondary);
+    background: var(--surface-1);
+    border: 1px solid var(--border-primary);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.settings-native-profile-chip:hover,
+.settings-native-profile-chip:focus-visible {
+    color: var(--text-primary);
+    border-color: var(--border-secondary);
+}
+
+.settings-native-profile-chip-active {
+    color: var(--text-primary);
+    background: var(--surface-2);
+    border-color: var(--accent-primary);
+    font-weight: 600;
+}
+
+.settings-native-profile-chip-new {
+    font-style: italic;
+    border-style: dashed;
+}
+
+.settings-native-profile-create {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+
+.settings-native-profile-create-form {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+
+.settings-native-profile-create-form[hidden] {
+    display: none;
+}
+
+.settings-native-profile-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    margin-bottom: var(--space-3);
+}
+
+/* Profile files live at absolute paths; wrap instead of pushing the page. */
+.settings-native-profile-path {
+    font-family: var(--font-mono, monospace);
+    font-size: 0.78rem;
+    color: var(--text-tertiary);
+    overflow-wrap: anywhere;
+}
+
 .settings-native-tab {
     display: inline-flex;
     align-items: center;
@@ -8874,69 +8951,6 @@ kbd {
     gap: var(--space-2);
 }
 
-/* Quietest, and permanent: the copy/shared-file split is a standing fact, not an
-   event. `overflow-wrap` matters — these lines carry absolute paths that would
-   otherwise push the settings page sideways on a narrow window. */
-.settings-native-ownership {
-    margin: 0;
-    color: var(--text-tertiary);
-    font-size: 0.82rem;
-    line-height: 1.5;
-    overflow-wrap: anywhere;
-}
-
-/* The one-time notice. Accent-tinted so it reads as informational and new,
-   distinct from the advisories below it, which sit on the neutral surface. */
-.settings-native-notice {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-    padding: var(--space-3);
-    background: var(--accent-subtle);
-    border: 1px solid var(--border-primary);
-    border-left: 3px solid var(--accent-primary);
-    border-radius: 6px;
-}
-
-.settings-native-notice-title {
-    margin: 0;
-    color: var(--text-primary);
-    font-size: 0.9rem;
-    font-weight: 600;
-}
-
-.settings-native-notice-text {
-    margin: 0;
-    color: var(--text-secondary);
-    font-size: 0.85rem;
-    line-height: 1.5;
-    overflow-wrap: anywhere;
-}
-
-/* Matches the `.settings-btn` idiom rather than borrowing the class, so the
-   notice keeps its own compact scale. The global `:focus-visible` ring applies;
-   the border shift below is an additional cue, never a replacement for it. */
-.settings-native-notice-dismiss {
-    align-self: flex-start;
-    height: 28px;
-    padding: 0 var(--space-3);
-    font-family: inherit;
-    font-size: 0.85rem;
-    font-weight: 500;
-    color: var(--text-primary);
-    background: var(--surface-3);
-    border: 1px solid var(--border-primary);
-    border-radius: 6px;
-    cursor: pointer;
-    transition: background 0.15s, border-color 0.15s, color 0.15s;
-}
-
-.settings-native-notice-dismiss:hover,
-.settings-native-notice-dismiss:focus-visible {
-    background: var(--surface-2);
-    border-color: var(--border-secondary);
-}
-
 /* One card per typed advisory. The left bar carries the severity; the title
    colour reinforces it. A `Ready` snapshot stays editable while these are up, so
    nothing here dims or overlays the controls below. */
@@ -8966,17 +8980,6 @@ kbd {
     overflow-wrap: anywhere;
 }
 
-/* `role="status"`: the active provider cannot be modelled in Tyde's copy. The
-   settings remain Ready and editable so the user can choose a supported one;
-   this is the visually strongest advisory, but its live region stays polite. */
-.settings-native-advisory-unsupported {
-    border-left-color: var(--error);
-}
-
-.settings-native-advisory-unsupported .settings-native-advisory-title {
-    color: var(--error);
-}
-
 /* `role="status"`: actionable but not broken — configure a provider. */
 .settings-native-advisory-no-provider {
     border-left-color: var(--warning);
@@ -8992,110 +8995,9 @@ kbd {
     border-left-color: var(--border-secondary);
 }
 
-/* Managed-projection recovery. This is the only state that blocks the backend
-   outright, so it sits first and reads loudest — but it is still `role="status"`,
-   not an alert: the server publishes it on every refresh while the projection
-   stays wedged, and an assertive region would re-announce the whole card each
-   time. The button it carries only *opens* a confirmation; the destructive
-   confirm lives in `.settings-confirm-modal`, styled with the existing danger
-   button. */
-.settings-native-reset {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-    padding: var(--space-3);
-    background: var(--surface-2);
-    border: 1px solid var(--border-primary);
-    border-left: 3px solid var(--error);
-    border-radius: 6px;
-}
-
-.settings-native-reset-title {
-    margin: 0;
-    color: var(--error);
-    font-size: 0.9rem;
-    font-weight: 600;
-}
-
-.settings-native-reset-text {
-    margin: 0;
-    color: var(--text-secondary);
-    font-size: 0.85rem;
-    line-height: 1.5;
-    overflow-wrap: anywhere;
-}
-
-/* The server's refusal of a reset, rendered on the card the reset was offered
- * from. Sits directly above the action so the answer and the control that
- * produced it read as one thing — a refusal reported only in the far-corner host
- * status line makes a destructive button look like it did nothing. */
-.settings-native-reset-refusal {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-1);
-    padding: var(--space-2);
-    background: var(--surface-2);
-    border: 1px solid var(--error);
-    border-left-width: 3px;
-    border-radius: 6px;
-}
-
-.settings-native-reset-refusal-title {
-    margin: 0;
-    font-size: 0.85rem;
-    font-weight: 600;
-    color: var(--error);
-}
-
-.settings-native-reset-refusal-text {
-    margin: 0;
-    font-size: 0.85rem;
-    line-height: 1.5;
-    color: var(--text-secondary);
-    /* Server reasons carry projection ids and absolute paths. */
-    overflow-wrap: anywhere;
-}
-
-.settings-native-reset-action {
-    align-self: flex-start;
-    height: 28px;
-    padding: 0 var(--space-3);
-    font-family: inherit;
-    font-size: 0.85rem;
-    font-weight: 500;
-    color: var(--text-primary);
-    background: var(--surface-3);
-    border: 1px solid var(--border-primary);
-    border-radius: 6px;
-    cursor: pointer;
-    transition: background 0.15s, border-color 0.15s, color 0.15s;
-}
-
-.settings-native-reset-action:hover,
-.settings-native-reset-action:focus-visible {
-    color: var(--error);
-    background: var(--surface-2);
-    border-color: var(--error);
-}
-
 @media (max-width: 800px) {
-    .settings-native-reset,
-    .settings-native-notice,
     .settings-native-advisory {
         padding: var(--space-2);
-    }
-
-    /* A full-width target is easier to hit on a narrow/touch viewport. */
-    .settings-native-reset-action,
-    .settings-native-notice-dismiss {
-        align-self: stretch;
-    }
-}
-
-@media (prefers-reduced-motion: reduce) {
-    .settings-native-reset-action,
-    .settings-native-notice-dismiss {
-        transition: none;
     }
 }
 

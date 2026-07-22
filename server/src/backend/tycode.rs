@@ -203,6 +203,15 @@ fn resolve_session_profile(
     tycode_config::resolve_profile_ref_in(&tycode_home_dir()?, name)
 }
 
+/// Make sure the Tycode home directory exists before pointing the subprocess
+/// at a settings file inside it. On a fresh machine Tycode itself creates its
+/// defaults file on first run, but only if the directory exists for it to
+/// write into.
+fn ensure_tycode_home_dir(home: &Path) -> Result<(), String> {
+    fs::create_dir_all(home)
+        .map_err(|err| format!("Failed to create the Tycode home {}: {err}", home.display()))
+}
+
 /// Remove files left behind by the retired Tyde-managed settings projection.
 /// The artifacts are inert — nothing reads them anymore — so a failed removal
 /// must not block a launch or probe, but it is logged loudly so stale copies
@@ -234,6 +243,7 @@ async fn tycode_session_command(
     let profile = resolve_session_profile(&resolved)
         .map_err(|err| format!("Cannot start Tycode {}: {err}", purpose.description()))?;
     let home = tycode_home_dir()?;
+    ensure_tycode_home_dir(&home)?;
     cleanup_retired_projection_artifacts(&home);
     let subprocess = subprocess_bin()
         .await
@@ -258,18 +268,19 @@ async fn tycode_settings_command(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Which reply the settings conversation is currently waiting for.
 enum TycodeSettingsOperationPhase {
-    AwaitSessionStarted,
-    AwaitSettingsSchema,
-    AwaitSettingsSaved,
+    SessionStarted,
+    SettingsSchema,
+    SettingsSaved,
 }
 
 impl TycodeSettingsOperationPhase {
     fn description(self) -> &'static str {
         match self {
-            Self::AwaitSessionStarted => "waiting for SessionStarted",
-            Self::AwaitSettingsSchema => "waiting for SettingsSchema",
-            Self::AwaitSettingsSaved => "waiting for SettingsSchema after SaveSettings",
+            Self::SessionStarted => "waiting for SessionStarted",
+            Self::SettingsSchema => "waiting for SettingsSchema",
+            Self::SettingsSaved => "waiting for SettingsSchema after SaveSettings",
         }
     }
 }
@@ -326,14 +337,14 @@ fn classify_tycode_settings_event(
         return TycodeSettingsEventClassification::Fatal(tycode_text_diagnostic(error));
     }
     if let Some(error) = tycode_message_added_error(value) {
-        return if phase == TycodeSettingsOperationPhase::AwaitSessionStarted {
+        return if phase == TycodeSettingsOperationPhase::SessionStarted {
             TycodeSettingsEventClassification::CollectAdvisory(tycode_settings_advisory(error))
         } else {
             TycodeSettingsEventClassification::Fatal(tycode_text_diagnostic(error))
         };
     }
     if tycode_session_started(value).is_some() {
-        return if phase == TycodeSettingsOperationPhase::AwaitSessionStarted {
+        return if phase == TycodeSettingsOperationPhase::SessionStarted {
             TycodeSettingsEventClassification::RequiredResult(
                 TycodeSettingsRequiredResult::SessionStarted,
             )
@@ -344,7 +355,7 @@ fn classify_tycode_settings_event(
         };
     }
     if let Some(schema) = tycode_settings_schema_data(value) {
-        return if phase == TycodeSettingsOperationPhase::AwaitSessionStarted {
+        return if phase == TycodeSettingsOperationPhase::SessionStarted {
             TycodeSettingsEventClassification::Fatal(
                 "Tycode emitted SettingsSchema before SessionStarted".to_string(),
             )
@@ -413,7 +424,7 @@ async fn run_tycode_settings_operation(
     })?;
     let last_stderr_line = spawn_tycode_stderr_logger(stderr);
     let mut lines = BufReader::new(stdout).lines();
-    let mut phase = TycodeSettingsOperationPhase::AwaitSessionStarted;
+    let mut phase = TycodeSettingsOperationPhase::SessionStarted;
     let mut advisories = Vec::new();
     let deadline = tokio::time::Instant::now() + tycode_startup_timeout();
 
@@ -485,7 +496,7 @@ async fn run_tycode_settings_operation(
                 TycodeSettingsRequiredResult::SessionStarted,
             ) => match &operation {
                 TycodeSettingsOperation::Probe => {
-                    phase = TycodeSettingsOperationPhase::AwaitSettingsSchema;
+                    phase = TycodeSettingsOperationPhase::SettingsSchema;
                     if !write_command(&mut stdin, &Value::String("GetSettingsSchema".to_string()))
                         .await
                     {
@@ -497,7 +508,7 @@ async fn run_tycode_settings_operation(
                     }
                 }
                 TycodeSettingsOperation::Save(settings) => {
-                    phase = TycodeSettingsOperationPhase::AwaitSettingsSaved;
+                    phase = TycodeSettingsOperationPhase::SettingsSaved;
                     if !write_command(
                         &mut stdin,
                         &serde_json::json!({
@@ -1278,6 +1289,7 @@ pub(crate) async fn native_settings_snapshot() -> BackendNativeSettingsSnapshot 
 /// serves them all — so it rides once in the snapshot's generic field.
 async fn probe_native_settings_snapshot() -> Result<BackendNativeSettingsSnapshot, String> {
     let home = tycode_home_dir()?;
+    ensure_tycode_home_dir(&home)?;
     cleanup_retired_projection_artifacts(&home);
     let profiles = tycode_config::discover_profiles_in(&home)?;
 
@@ -1373,6 +1385,7 @@ pub(crate) async fn persist_native_settings(settings: Value) -> Result<(), Strin
         ));
     }
     let home = tycode_home_dir()?;
+    ensure_tycode_home_dir(&home)?;
 
     // Saves are serialized so two clients cannot interleave their
     // check-then-write sequences and silently overwrite each other.
@@ -4314,17 +4327,14 @@ mod tests {
         });
 
         assert!(matches!(
-            classify_tycode_settings_event(
-                TycodeSettingsOperationPhase::AwaitSessionStarted,
-                &event
-            ),
+            classify_tycode_settings_event(TycodeSettingsOperationPhase::SessionStarted, &event),
             TycodeSettingsEventClassification::CollectAdvisory(
                 BackendNativeSettingsAdvisory::NoProviderConfigured { .. }
             )
         ));
         assert!(matches!(
             classify_tycode_settings_event(
-                TycodeSettingsOperationPhase::AwaitSettingsSchema,
+                TycodeSettingsOperationPhase::SettingsSchema,
                 &event
             ),
             TycodeSettingsEventClassification::Fatal(message)
@@ -4341,7 +4351,7 @@ mod tests {
 
         assert!(matches!(
             classify_tycode_settings_event(
-                TycodeSettingsOperationPhase::AwaitSessionStarted,
+                TycodeSettingsOperationPhase::SessionStarted,
                 &event
             ),
             TycodeSettingsEventClassification::Fatal(message)
@@ -4838,10 +4848,9 @@ mod tests {
             .expect("persist Tycode backend config");
 
         let commands = read_fake_commands(&log);
-        assert_eq!(commands.len(), 4, "commands: {commands:#?}");
+        assert_eq!(commands.len(), 3, "commands: {commands:#?}");
         assert_eq!(commands[0], Value::String("GetSettingsSchema".to_string()));
         assert_eq!(commands[2], Value::String("GetSettingsSchema".to_string()));
-        assert_eq!(commands[3], Value::String("GetSettingsSchema".to_string()));
 
         let save = commands[1]
             .get("SaveSettings")
@@ -4881,7 +4890,21 @@ mod tests {
         assert_eq!(snapshot.status, BackendConfigSnapshotStatus::Ready);
         let mut expected_settings = settings.clone();
         expected_settings["profile"] = Value::String("default".to_string());
-        assert_eq!(snapshot.settings.as_ref(), Some(&expected_settings));
+        let doc = snapshot
+            .settings
+            .as_ref()
+            .expect("Tycode profiles document");
+        assert_eq!(doc["version"], 1);
+        let doc_profiles = doc["profiles"].as_array().expect("profiles list");
+        assert_eq!(doc_profiles.len(), 1);
+        assert_eq!(doc_profiles[0]["name"], "default");
+        assert!(
+            doc_profiles[0]["settings_path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with(".tycode/settings.toml")),
+            "default profile must be backed by the shared settings file: {doc:?}"
+        );
+        assert_eq!(doc_profiles[0]["settings"], expected_settings);
         assert!(
             snapshot
                 .groups
@@ -5075,10 +5098,9 @@ mod tests {
             .expect("persist Tycode backend config with explicit null");
 
         let commands = read_fake_commands(&log);
-        assert_eq!(commands.len(), 4, "commands: {commands:#?}");
+        assert_eq!(commands.len(), 3, "commands: {commands:#?}");
         assert_eq!(commands[0], Value::String("GetSettingsSchema".to_string()));
         assert_eq!(commands[2], Value::String("GetSettingsSchema".to_string()));
-        assert_eq!(commands[3], Value::String("GetSettingsSchema".to_string()));
 
         let save = commands[1]
             .get("SaveSettings")
@@ -5135,10 +5157,9 @@ mod tests {
             .expect("persist Tycode backend config with removed key");
 
         let commands = read_fake_commands(&log);
-        assert_eq!(commands.len(), 4, "commands: {commands:#?}");
+        assert_eq!(commands.len(), 3, "commands: {commands:#?}");
         assert_eq!(commands[0], Value::String("GetSettingsSchema".to_string()));
         assert_eq!(commands[2], Value::String("GetSettingsSchema".to_string()));
-        assert_eq!(commands[3], Value::String("GetSettingsSchema".to_string()));
 
         let save = commands[1]
             .get("SaveSettings")
@@ -5425,38 +5446,6 @@ mod tests {
         }
     }
 
-    struct TestTycodeRootAgentSupportGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        previous_set_root_agent_supported: Option<bool>,
-    }
-
-    impl TestTycodeRootAgentSupportGuard {
-        fn set(supported: bool) -> Self {
-            let lock = TEST_TYCODE_SUBPROCESS_MUTEX
-                .lock()
-                .expect("test Tycode subprocess mutex poisoned");
-            let mut configured_set_root_agent_supported = TEST_TYCODE_SET_ROOT_AGENT_SUPPORTED
-                .lock()
-                .expect("test Tycode SetRootAgent support mutex poisoned");
-            let previous_set_root_agent_supported =
-                configured_set_root_agent_supported.replace(supported);
-            drop(configured_set_root_agent_supported);
-            Self {
-                _lock: lock,
-                previous_set_root_agent_supported,
-            }
-        }
-    }
-
-    impl Drop for TestTycodeRootAgentSupportGuard {
-        fn drop(&mut self) {
-            *TEST_TYCODE_SET_ROOT_AGENT_SUPPORTED
-                .lock()
-                .expect("test Tycode SetRootAgent support mutex poisoned") =
-                self.previous_set_root_agent_supported.take();
-        }
-    }
-
     /// Pins both the Tycode home (profile discovery reads the filesystem) and
     /// the SetRootAgent support flag, so schema tests never observe the
     /// developer's real `~/.tycode`.
@@ -5611,13 +5600,6 @@ mod tests {
 
     fn write_fake_tycode_subprocess_rejecting_root_agent(dir: &Path, settings: &Value) -> String {
         write_fake_tycode_subprocess_with_options(dir, settings, false, true, false)
-    }
-
-    fn write_fake_tycode_subprocess_canonicalizing_native_settings(
-        dir: &Path,
-        settings: &Value,
-    ) -> String {
-        write_fake_tycode_subprocess_with_options(dir, settings, false, false, true)
     }
 
     fn write_fake_tycode_subprocess_with_pre_session_advisory(

@@ -35,12 +35,12 @@ use protocol::{
 use crate::line_source::FileLines;
 use crate::state::{
     ActiveAgentRef, ActiveProjectRef, ActiveTerminalRef, AgentInfo, AppState, CenterZoneState,
-    ChatMessageEntry, CodeIntelKey, ConnectionStatus, FileResourceKey, ManagedProjectionResetState,
-    NativeSettingsSaveState, OpenFile, OrchestrationRecord, PaneId, PendingFileNavigation,
-    PendingFileOpen, ProjectInfo, ProjectReferencesMode, ProjectReferencesUiState,
-    ReviewActionTarget, SessionHistoryState, SessionInfo, StreamingState, StreamingToolRequest,
-    TabContent, TabId, TerminalInfo, ToolCallId, ToolRequestEntry, TransientEvent,
-    WorkflowPanelError, reduce_diff_response, root_display_name, sort_project_infos,
+    ChatMessageEntry, CodeIntelKey, ConnectionStatus, FileResourceKey, NativeSettingsSaveState,
+    OpenFile, OrchestrationRecord, PaneId, PendingFileNavigation, PendingFileOpen, ProjectInfo,
+    ProjectReferencesMode, ProjectReferencesUiState, ReviewActionTarget, SessionHistoryState,
+    SessionInfo, StreamingState, StreamingToolRequest, TabContent, TabId, TerminalInfo, ToolCallId,
+    ToolRequestEntry, TransientEvent, WorkflowPanelError, reduce_diff_response, root_display_name,
+    sort_project_infos,
 };
 
 struct FrontendSeqValidator {
@@ -497,10 +497,10 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     errors.insert(host_id.to_string(), message);
                 });
                 clear_session_history_loading_on_error(state, host_id, &payload);
-                // The two routes below both correlate on the typed `setting_target`,
-                // never on "a SetSetting failed while something was in flight". A
-                // native save and a projection reset are *both* `SetSetting`, so a
-                // heuristic here reports each one's failure against the other.
+                // The route below correlates on the typed `setting_target`, never
+                // on "a SetSetting failed while something was in flight" — a
+                // heuristic there would report an unrelated command's failure
+                // against the save.
                 //
                 // A backend-native settings save is a `SetSetting` whose result
                 // only lands via a refreshed native snapshot. If the server
@@ -509,12 +509,6 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 // settings page stuck in "Saving…" forever. Flip it to `Failed`
                 // so controls unlock and the server's reason is shown.
                 fail_native_settings_pending_on_error(state, host_id, &payload);
-                // The reset is the one destructive action in settings, and it is
-                // offered from a card on a page with no other controls. A refusal
-                // that lands only in the global host status line reads, from the
-                // point of action, as a button that did nothing — so route it to
-                // the card.
-                refuse_managed_projection_reset_on_error(state, host_id, &payload);
                 // Release any review-side pending gate the rejected
                 // command was holding. Without this, a server-side
                 // failure (unknown project, git error, malformed
@@ -793,18 +787,6 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         .iter()
                         .map(|snapshot| snapshot.backend_kind)
                         .collect();
-                    // A snapshot that no longer carries a recovery state is the
-                    // server saying the wedge is gone — the reset landed, or the
-                    // projection was rebuilt. Any reset outcome described *that*
-                    // state, so it goes with it. A snapshot that still carries
-                    // recovery leaves a refusal exactly where it is: a Conflict
-                    // removed nothing, and the card has to keep saying so.
-                    let backends_without_recovery: Vec<_> = payload
-                        .native_settings
-                        .iter()
-                        .filter(|snapshot| snapshot.managed_projection_recovery.is_none())
-                        .map(|snapshot| snapshot.backend_kind)
-                        .collect();
                     state.backend_native_settings.update(|snapshots_by_host| {
                         let host_snapshots =
                             snapshots_by_host.entry(host_id.to_string()).or_default();
@@ -821,18 +803,6 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                                 }
                                 if by_kind.is_empty() {
                                     states_by_host.remove(host_id);
-                                }
-                            }
-                        });
-                    }
-                    if !backends_without_recovery.is_empty() {
-                        state.managed_projection_reset.update(|by_host| {
-                            if let Some(by_kind) = by_host.get_mut(host_id) {
-                                for kind in &backends_without_recovery {
-                                    by_kind.remove(kind);
-                                }
-                                if by_kind.is_empty() {
-                                    by_host.remove(host_id);
                                 }
                             }
                         });
@@ -3561,98 +3531,18 @@ fn clear_workflow_error_for_kinds(state: &AppState, host_id: &str, kinds: &[Fram
     });
 }
 
-/// Drop the optimistic-gate state any pending review-shaped command
-/// was holding, scoped exactly to the command that failed.
-///
-/// `request_kind` distinguishes a `ReviewCreate` (the "Review changes"
-/// button gate, keyed by host+project) from a `ReviewAction` (the
-/// Submit/Cancel/AddComment/etc. gates, keyed by review id and target).
-/// Anything else is ignored — those frames don't have a per-request UI
-/// gate to release.
-/// Release the native-settings save gate when a `SetSetting` command is rejected
-/// by the server. A native save's result only arrives via a refreshed native
-/// snapshot; a server-side rejection emits none, so any in-flight `Pending` save
-/// would otherwise keep the native settings page disabled and stuck in
-/// "Saving…". `CommandError` carries no backend/setting discriminator, so mark
-/// every `Pending` native save on this host `Failed` with the server's message —
-/// conservative and scoped to native settings (existing `Failed` entries and
-/// non-native command errors are left untouched).
-/// Attach a rejected reset to the recovery card that offered it.
-///
-/// Correlation is exact and typed. A `SetSetting` error now carries a value-free
-/// `setting_target`, and only `ResetTycodeManagedProjection` is *this* command's
-/// answer. Nothing else may be read as one:
-///
-/// - **An absent target** is an older host that predates the field. That is the
-///   absence of correlation, not a weak signal in favour of one — inferring "it was
-///   probably ours" is exactly the guess the protocol added this field to remove.
-/// - **`Malformed`** says the payload was not a valid host-setting value at all, so
-///   it identifies no setting.
-/// - **Any other target** — a native save, a legacy backend config, a launch
-///   profile — is a different command that happened to fail while a reset was in
-///   flight.
-///
-/// This used to be a heuristic: *any* `SetSetting` error arriving while a reset was
-/// pending was taken as that reset's answer. A native-settings save failing at the
-/// same moment would have been reported on the recovery card as the reset's refusal
-/// — the wrong message against the wrong action, and, for a non-`Conflict` code,
-/// stripped of the "nothing was deleted" guarantee the user actually needed.
-///
-/// The pending marker still names the **backend**, because the target is
-/// deliberately value-free and carries no `BackendKind`; the dispatch host id names
-/// the host, so a reset refused on one host cannot answer another's.
-///
-/// The refusal is recorded, never acted on. A `Conflict` means the server compared
-/// the tokens against what it holds, found them stale, and **removed nothing** — so
-/// no local state may change on the strength of it.
-fn refuse_managed_projection_reset_on_error(
-    state: &AppState,
-    host_id: &str,
-    payload: &CommandErrorPayload,
-) {
-    if !matches!(payload.request_kind, FrameKind::SetSetting) {
-        return;
-    }
-    if payload.setting_target != Some(HostSettingErrorTarget::ResetTycodeManagedProjection) {
-        return;
-    }
-    let has_pending = state.managed_projection_reset.with_untracked(|by_host| {
-        by_host.get(host_id).is_some_and(|by_kind| {
-            by_kind
-                .values()
-                .any(|reset| matches!(reset, ManagedProjectionResetState::Pending))
-        })
-    });
-    if !has_pending {
-        return;
-    }
-    state.managed_projection_reset.update(|by_host| {
-        if let Some(by_kind) = by_host.get_mut(host_id) {
-            for reset in by_kind.values_mut() {
-                if matches!(reset, ManagedProjectionResetState::Pending) {
-                    *reset = ManagedProjectionResetState::Refused {
-                        code: payload.code,
-                        message: payload.message.clone(),
-                    };
-                }
-            }
-        }
-    });
-}
-
 /// Release an in-flight native-settings save that the server rejected.
 ///
-/// Correlation is exact and typed, symmetrically with
-/// `refuse_managed_projection_reset_on_error`: only a `SetSetting` error whose
+/// Correlation is exact and typed: only a `SetSetting` error whose
 /// `setting_target` is `BackendNativeSettings` is *this* save's answer.
 ///
-/// It used to match on `request_kind` alone, which is the same heuristic — and the
-/// same bug — in mirror image. A rejected managed-projection **reset** arriving while
-/// a native save was in flight would have failed the save and shown the reset's error
-/// text on the settings page, against a save the server never even refused. A
-/// `Malformed` payload denotes no setting; an absent target is an older host that
-/// cannot correlate at all, which is the absence of a signal rather than a weak one
-/// in favour. Neither may fail a save that is still waiting for its own answer.
+/// It used to match on `request_kind` alone, which was a heuristic — and a bug.
+/// Any other host setting rejected while a native save was in flight would have
+/// failed the save and shown the other command's error text on the settings page,
+/// against a save the server never even refused. A `Malformed` payload denotes no
+/// setting; an absent target is an older host that cannot correlate at all, which
+/// is the absence of a signal rather than a weak one in favour. Neither may fail
+/// a save that is still waiting for its own answer.
 ///
 /// (An absent target therefore leaves the save gated. That is the correct trade: a
 /// current server sets the target on *every* `SetSetting` error — `Malformed` when
@@ -3692,6 +3582,14 @@ fn fail_native_settings_pending_on_error(
     });
 }
 
+/// Drop the optimistic-gate state any pending review-shaped command
+/// was holding, scoped exactly to the command that failed.
+///
+/// `request_kind` distinguishes a `ReviewCreate` (the "Review changes"
+/// button gate, keyed by host+project) from a `ReviewAction` (the
+/// Submit/Cancel/AddComment/etc. gates, keyed by review id and target).
+/// Anything else is ignored — those frames don't have a per-request UI
+/// gate to release.
 fn clear_review_pending_on_error(state: &AppState, host_id: &str, payload: &CommandErrorPayload) {
     match payload.request_kind {
         FrameKind::ReviewCreate => {

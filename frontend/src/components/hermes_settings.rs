@@ -1813,9 +1813,7 @@ mod wasm_tests {
             settings: Some(serde_json::to_value(fixture_doc()).unwrap()),
             groups: Vec::new(),
             message: None,
-            provenance: None,
             advisories: Vec::new(),
-            managed_projection_recovery: None,
         };
         state.backend_native_settings.update(|by_host| {
             by_host

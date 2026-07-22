@@ -11,11 +11,11 @@ use protocol::{
     AgentStartPayload, BackendConfigSnapshotStatus, BackendConfigSnapshotsPayload,
     BackendConfigValues, BackendKind, BackendNativeSettingsAdvisory,
     BackendNativeSettingsGroupKind, BackendSetupAction, BackendSetupDiagnosticCode,
-    BackendSetupPayload, BackendSetupStatus, ChatEvent, CodeIntelProviderId, CommandErrorCode,
-    CommandErrorPayload, Envelope, FrameKind, HostExecutablePath, HostSettingValue, HostSettings,
-    HostSettingsPayload, ListSessionsPayload, NewAgentPayload, NewTerminalPayload,
-    RunBackendSetupPayload, SessionId, SessionListPayload, SessionSettingValue, SetSettingPayload,
-    SpawnAgentParams, SpawnAgentPayload, StreamPath, TerminalBootstrapPayload, TerminalExitPayload,
+    BackendSetupPayload, BackendSetupStatus, ChatEvent, CodeIntelProviderId, CommandErrorPayload,
+    Envelope, FrameKind, HostExecutablePath, HostSettingValue, HostSettings, HostSettingsPayload,
+    ListSessionsPayload, NewAgentPayload, NewTerminalPayload, RunBackendSetupPayload, SessionId,
+    SessionListPayload, SessionSettingValue, SetSettingPayload, SpawnAgentParams,
+    SpawnAgentPayload, StreamPath, TerminalBootstrapPayload, TerminalExitPayload,
     TerminalOutputPayload,
 };
 use server::backend::BackendSession;
@@ -905,57 +905,6 @@ async fn send_host_payload<T: serde::Serialize>(
     protocol::write_envelope(&mut client.writer, &envelope)
         .await
         .expect("send host payload");
-}
-
-async fn expect_command_error(
-    client: &mut client::Connection,
-    context: &str,
-) -> CommandErrorPayload {
-    loop {
-        let env = client
-            .next_event()
-            .await
-            .unwrap_or_else(|err| panic!("next_event failed before {context}: {err:?}"))
-            .unwrap_or_else(|| panic!("connection closed before {context}"));
-        if env.kind == FrameKind::CommandError {
-            return env
-                .parse_payload()
-                .unwrap_or_else(|err| panic!("parse CommandError for {context}: {err}"));
-        }
-    }
-}
-
-async fn expect_command_error_and_backend_config(
-    client: &mut client::Connection,
-    context: &str,
-) -> (CommandErrorPayload, BackendConfigSnapshotsPayload) {
-    let mut error = None;
-    let mut snapshots = None;
-    while error.is_none() || snapshots.is_none() {
-        let env = client
-            .next_event()
-            .await
-            .unwrap_or_else(|err| panic!("next_event failed before {context}: {err:?}"))
-            .unwrap_or_else(|| panic!("connection closed before {context}"));
-        match env.kind {
-            FrameKind::CommandError => {
-                error = Some(
-                    env.parse_payload()
-                        .unwrap_or_else(|err| panic!("parse CommandError for {context}: {err}")),
-                );
-            }
-            FrameKind::BackendConfigSnapshots => {
-                snapshots = Some(env.parse_payload().unwrap_or_else(|err| {
-                    panic!("parse BackendConfigSnapshots for {context}: {err}")
-                }));
-            }
-            _ => {}
-        }
-    }
-    (
-        error.expect("command error collected"),
-        snapshots.expect("backend snapshots collected"),
-    )
 }
 
 fn write_fake_hermes_install(home: &Path) -> PathBuf {
@@ -1875,9 +1824,7 @@ async fn tycode_requires_installed_artifact_and_successful_exact_version_exit() 
         assert_eq!(tycode.status, BackendConfigSnapshotStatus::Unavailable);
         assert_eq!(
             tycode.message.as_deref(),
-            Some(
-                "Cannot start Tycode native settings probe without a verified managed settings projection: Cannot start Tycode managed projection verification: tycode-subprocess not found"
-            )
+            Some("Cannot start Tycode native settings probe: tycode-subprocess not found")
         );
         assert!(
             !imposter_log.exists(),
