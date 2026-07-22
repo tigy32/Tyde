@@ -9093,7 +9093,8 @@ mod tests {
 
         assert_eq!(
             collect_agent_name_events(&mut events).await.unwrap(),
-            "Tyde Backend QA"
+            // sanitize_generated_agent_name title-cases each word.
+            "Tyde Backend Qa"
         );
     }
 
