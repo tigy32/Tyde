@@ -46,6 +46,25 @@ limitation of the chosen cheap model is a reason to select the next-cheapest
 capable model, not a reason to mark the backend feature `N/A`. An unattempted
 applicable case is a failure.
 
+### Missing functionality is a failure
+
+Certification is closed-world: every applicable matrix row and every required
+rendered surface must have an explicit result. Missing UI, missing events,
+missing progress, missing terminal state, or a feature that works on one
+backend but not another is `FAIL`; it is never silently omitted, inferred from
+the final answer, or downgraded to an observation.
+
+For example, if Codex starts a background command but the in-flight tray never
+shows its running row, the background-command case fails even when the command
+eventually returns correct output. Claude passing the same case does not cover
+Codex. The tester must record and report the Codex failure.
+
+Every run report must include all `FAIL`, `BLOCKED`, `NOT TESTED`, and justified
+`N/A` results. A QA agent must not return an overall pass, a shortened list of
+only successful cases, or a generic “looks good” verdict while any required row
+is missing. Discovering one failure does not authorize skipping the remaining
+matrix; continue when safe so the report exposes the full release risk.
+
 ### Cost-controlled model selection
 
 The purpose of this workflow is to certify Tyde's backend integration, not to
@@ -83,8 +102,9 @@ test plan.
    environment from which the Tyde host will launch.
 3. Confirm the backend is enabled in **Settings → Backends** and Tyde reports
    the expected installed version.
-4. Use a disposable workspace. Do not point destructive tool tests at a real
-   project.
+4. Use a disposable workspace and a disposable Tyde dev instance. Do not point
+   destructive tool tests at a real project or run certification against the
+   operator's everyday Tyde host.
 5. Record:
    - Tyde commit and whether the tree is clean;
    - backend and CLI version;
@@ -103,10 +123,16 @@ test plan.
 7. Prepare unique marker strings for every prompt, command, file, and child.
    Reusing a marker can hide duplicated or misrouted events.
 8. Prove that the QA environment uses disposable project, session, review, and
-   frontend stores, not merely a disposable filesystem workspace. Record the
-   store locations and confirm they contain no production records. A dev
-   instance that silently reuses the operator's normal stores cannot certify a
-   backend.
+   frontend stores, not merely a disposable filesystem workspace.
+   `tyde_dev_instance_start` redirects every mutable store, including
+   `TYDE_SESSION_STORE_PATH`, into an instance-specific temporary directory;
+   `tyde_dev_instance_stop` removes that directory. Require
+   `storesEphemeral: true` in the start result, record `storeDir` and
+   `sessionStorePath`, and confirm they contain no production records. Abort
+   before creating an agent if this attestation is missing or either path
+   points at the operator's normal stores. Running on the operator's normal
+   host, polluting its session history, or silently reusing any normal store is
+   an immediate setup `FAIL` and cannot certify a backend.
 9. Confirm the available driver can capture screenshots, rendered DOM,
    console/backend events, and a separately controlled second client. Treat a
    missing required observation channel as `BLOCKED`, not as permission to
@@ -115,16 +141,26 @@ test plan.
 ## 2. Start a clean Tyde dev instance
 
 1. Call `tyde_dev_instance_start` with the repository root as `project_dir`.
-2. Keep the returned `instance_id`; every later debug call must use it.
-3. Open the returned `frontend_url` and wait for the home screen to finish
+2. Before any backend call, require `storesEphemeral: true`, confirm the
+   returned `sessionStorePath` is beneath the returned `storeDir`, and record
+   both paths. This is a hard preflight gate, not optional evidence collected
+   after the run.
+3. Keep the returned `instance_id`; every later debug call must use it.
+4. Create and control test agents only through the returned child
+   `frontend_url`. Never use the QA controller's own Tyde chat, its agent
+   control tools, or the operator host to create a test agent. If the QA
+   controller itself is launched as an agent on the operator host, that
+   controller also pollutes session history; run certification from an
+   external controller or an already-isolated dev instance instead.
+5. Open the returned `frontend_url` and wait for the home screen to finish
    loading.
-4. Check the initial console and rendered UI for startup errors.
-5. Confirm no prior agents, chats, tool cards, or in-flight rows from another
+6. Check the initial console and rendered UI for startup errors.
+7. Confirm no prior agents, chats, tool cards, or in-flight rows from another
    run are present in the disposable store.
-6. Confirm the project rail, selected-project label, footer, and error banner
+8. Confirm the project rail, selected-project label, footer, and error banner
    all refer to the disposable project. A stale deleted workbench, missing
    project root, or global error inherited from another store fails setup.
-7. If code changes during the test, stop the instance and start a new one.
+9. If code changes during the test, stop the instance and start a new one.
    Dev instances intentionally do not hot-reload.
 
 Use `tyde_debug_evaluate` for DOM inspection and ordinary browser input for
@@ -317,6 +353,8 @@ and after replay.
    `exit 0`. After the in-flight row disappears, the original card must retain
    the real final stdout, stderr, exit status, and terminal state through
    replay and restart.
+   Absence of the running row on any applicable backend is `FAIL`, even if the
+   command completes successfully or another backend renders it correctly.
 6. **Non-zero exit:** run a harmless command that exits non-zero. Confirm the
    typed result includes its exit code and failure treatment without turning
    into an unrelated top-level protocol error.
@@ -623,9 +661,10 @@ unique name, prompt marker, command marker, and final-answer marker.
 
 ## 16. Evidence, rerun, and cleanup
 
-Keep an evidence index for every numbered case, not only failures:
+Keep an evidence index for every numbered case and every backend, not only
+successes or failures. The index must contain no blank or omitted rows:
 
-- `PASS`, `FAIL`, or justified `N/A`;
+- `PASS`, `FAIL`, `BLOCKED`, `NOT TESTED`, or justified `N/A`;
 - exact prompt and unique markers;
 - before, held-active, transition, and terminal screenshots;
 - relevant rendered DOM text from `tyde_debug_evaluate`;
@@ -636,6 +675,11 @@ Keep an evidence index for every numbered case, not only failures:
 - backend, provider, model, settings, commit, and `instance_id`;
 - observed timestamps and reproduction attempts.
 
+Report failures as they are found and repeat all of them in the final report.
+Never suppress a failure because the final response succeeded, the defect seems
+backend-specific, a different backend passed, or implementation code appears
+to explain the behavior.
+
 For every failure, restart a clean instance and reproduce it once without
 changing code. Preserve both attempts. After a fix, run the original case,
 adjacent lifecycle cases, and then the entire certification workflow from a
@@ -643,13 +687,17 @@ clean instance. A targeted retest alone does not recertify the backend.
 
 Finally, call `tyde_dev_instance_stop` with the saved `instance_id`. Confirm it
 no longer appears in `tyde_dev_instance_list` and no backend child process from
-the run remains alive.
+the run remains alive. Confirm the returned `storeDir` no longer exists; a
+surviving session store is cleanup `FAIL`.
 
 ## Pass criteria
 
 The backend passes only when every required matrix entry has linked evidence
 and every temporal state was observed while held. In particular:
 
+- every applicable function and rendered surface is present; missing
+  functionality is a failure, including backend-specific omissions such as a
+  background task that runs but never appears in the in-flight tray;
 - no root or child is ever rendered completed while authoritative work is
   still running;
 - agent cards, Active view, chat controls, live cards, in-flight tray, and
@@ -674,4 +722,5 @@ and every temporal state was observed while held. In particular:
   a clean instance.
 
 Missing evidence, an unobserved transient state, or an unexplained `N/A` means
-the backend is not certified.
+the backend is not certified. Any `FAIL`, `BLOCKED`, or `NOT TESTED` row also
+means the backend is not certified and must be reported explicitly.

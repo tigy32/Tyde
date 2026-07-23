@@ -86,6 +86,9 @@ struct DevInstanceRecord {
 struct DevInstanceSummary {
     instance_id: String,
     project_dir: String,
+    store_dir: String,
+    session_store_path: String,
+    stores_ephemeral: bool,
     frontend_url: String,
     host_addr: String,
     ui_debug_addr: String,
@@ -304,6 +307,9 @@ struct StartInstanceResult {
     instance_id: String,
     status: &'static str,
     project_dir: String,
+    store_dir: String,
+    session_store_path: String,
+    stores_ephemeral: bool,
     frontend_url: String,
     host_addr: String,
     ui_debug_addr: String,
@@ -313,7 +319,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "tyde_dev_instance_start",
-            description: "Launch a Tyde desktop dev instance on this host and wait until its typed host and UI-debug loopback endpoints are ready.",
+            description: "Launch a Tyde desktop dev instance with isolated ephemeral stores and wait until its typed host and UI-debug loopback endpoints are ready. Returns the store paths and isolation attestation.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -552,6 +558,9 @@ async fn start_instance(
         instance_id: instance_id.clone(),
         status: "ready",
         project_dir: record.project_dir.display().to_string(),
+        store_dir: record.store_dir.display().to_string(),
+        session_store_path: record.store_dir.join("sessions.json").display().to_string(),
+        stores_ephemeral: true,
         frontend_url: frontend_url.clone(),
         host_addr: record.host_addr.to_string(),
         ui_debug_addr: record.ui_debug_addr.to_string(),
@@ -803,6 +812,9 @@ async fn dev_instance_summary(record: &mut DevInstanceRecord) -> DevInstanceSumm
     DevInstanceSummary {
         instance_id: record.instance_id.clone(),
         project_dir: record.project_dir.display().to_string(),
+        store_dir: record.store_dir.display().to_string(),
+        session_store_path: record.store_dir.join("sessions.json").display().to_string(),
+        stores_ephemeral: true,
         frontend_url: record.frontend_url.clone(),
         host_addr: record.host_addr.to_string(),
         ui_debug_addr: record.ui_debug_addr.to_string(),
