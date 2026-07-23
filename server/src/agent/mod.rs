@@ -1531,19 +1531,7 @@ pub(crate) async fn generate_agent_activity_summary(
         build_activity_summary_prompt(rendered_history, request.previous_summary.as_deref());
     let logged_prompt_len = prompt.len();
     let target_workspace_root_count = request.workspace_roots.len();
-    let resolved_spawn_config = crate::agent::customization::ResolvedSpawnConfig {
-        access_mode: BackendAccessMode::ReadOnly,
-        ..Default::default()
-    };
-    let spawn_config = BackendSpawnConfig {
-        execution_mode: BackendExecutionMode::Agent,
-        cost_hint: Some(SpawnCostHint::Low),
-        custom_agent_id: None,
-        startup_mcp_servers: Vec::new(),
-        session_settings: None,
-        backend_config: Default::default(),
-        resolved_spawn_config,
-    };
+    let spawn_config = agent_name_generation_spawn_config();
     let initial_input = SendMessagePayload {
         message: prompt,
         images: None,
@@ -1551,10 +1539,9 @@ pub(crate) async fn generate_agent_activity_summary(
         tool_response: None,
     };
     let (host_sub_agent_spawn_tx, _host_sub_agent_spawn_rx) = mpsc::unbounded_channel();
-    // Some backends require a real workspace root at spawn time. The helper
-    // keeps the summarized agent's roots but remains read-only and has no MCP
-    // servers, so it can read context without write/tool side effects.
-    let workspace_roots = request.workspace_roots.clone();
+    let isolated_workspace = tempfile::tempdir()
+        .map_err(|err| format!("failed to create isolated activity summary workspace: {err}"))?;
+    let workspace_roots = vec![isolated_workspace.path().to_string_lossy().into_owned()];
     let (_backend, mut events, _session_id) = match spawn_backend(
         &request.summary_agent_id,
         request.backend_kind,

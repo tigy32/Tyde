@@ -6987,12 +6987,11 @@ pub enum ToolProgressUpdate {
     Other { payload: Value },
 }
 
-/// Live status of a backgrounded shell command (Claude Code `Bash` with
-/// `run_in_background: true`), reduced server-side from the CLI's task
-/// system frames (`task_started` / `task_updated` / `task_notification`).
+/// Live status of a backgrounded shell command, reduced server-side from
+/// backend-native process/task lifecycle frames.
 /// Keyed to the launching tool call by `tool_call_id`, like a workflow.
-/// The command string itself never appears in task frames — consumers
-/// that want it join with the originating tool request by `tool_call_id`.
+/// Backends may include a display description; consumers can otherwise join
+/// with the originating tool request by `tool_call_id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackgroundTaskState {
     /// The CLI's task id (distinct from the tool_use id).

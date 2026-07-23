@@ -15,12 +15,13 @@ use tokio::task::JoinHandle;
 use protocol::types::StreamIdentityViolation;
 use protocol::{
     AgentControlAgentRef, AgentControlProgress, AgentControlProgressKind, BackendAccessMode,
-    CapacityBucket, CapacityBucketId, CapacityCoverage, CapacityMeasure, CapacityPlanLabel,
-    CapacityReport, CapacityReset, CapacityScope, CapacitySource, CapacityUnavailableReason,
-    CapacityWindow, ChatMessageId, CodexLimitSlot, ImageData, ModelRequestId,
-    ModelRequestTokenUsage, ModelTurnId, ServerGeneratedChatMessageIdOrigin,
-    ServerGeneratedChatMessageIdentity, TokenUsage, TokenUsageUnavailableReason,
-    ToolExecutionNormalizationFailure, ToolProgressData, ToolProgressUpdate, ValueProvenance,
+    BackgroundTaskState, BackgroundTaskStatus, CapacityBucket, CapacityBucketId, CapacityCoverage,
+    CapacityMeasure, CapacityPlanLabel, CapacityReport, CapacityReset, CapacityScope,
+    CapacitySource, CapacityUnavailableReason, CapacityWindow, ChatMessageId, CodexLimitSlot,
+    ImageData, ModelRequestId, ModelRequestTokenUsage, ModelTurnId,
+    ServerGeneratedChatMessageIdOrigin, ServerGeneratedChatMessageIdentity, TokenUsage,
+    TokenUsageUnavailableReason, ToolExecutionNormalizationFailure, ToolProgressData,
+    ToolProgressUpdate, ValueProvenance,
 };
 
 use crate::agent_control_mcp::AGENT_CONTROL_AWAIT_MCP_SERVER_NAME;
@@ -5825,6 +5826,11 @@ impl CodexInner {
                     }),
                 )
                 .await;
+                if let Some(progress) =
+                    codex_background_command_progress(&item_id, item, BackgroundTaskStatus::Running)
+                {
+                    self.emitter.tool_progress(&progress);
+                }
             }
             "fileChange" => {
                 let item_id = self
@@ -6382,6 +6388,17 @@ impl CodexInner {
                     },
                 )
                 .await;
+                if let Some(progress) = codex_background_command_progress(
+                    &item_id,
+                    item,
+                    if success {
+                        BackgroundTaskStatus::Completed
+                    } else {
+                        BackgroundTaskStatus::Failed
+                    },
+                ) {
+                    self.emitter.tool_progress(&progress);
+                }
             }
             "fileChange" => {
                 let item_id = self
@@ -8829,6 +8846,58 @@ fn estimate_command_execution_tool_bytes(item: &Value) -> u64 {
         .saturating_add(value_str_len(item, "aggregatedOutput"))
 }
 
+fn codex_background_command_progress(
+    tool_call_id: &str,
+    item: &Value,
+    status: BackgroundTaskStatus,
+) -> Option<ToolProgressData> {
+    let process_id = item
+        .get("processId")
+        .or_else(|| item.get("process_id"))
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| value.as_u64().map(|value| value.to_string()))
+        })
+        .filter(|value| !value.trim().is_empty())?;
+    let command = item
+        .get("command")
+        .and_then(Value::as_str)
+        .filter(|command| !command.trim().is_empty())
+        .map(str::to_owned);
+    let summary = match status {
+        BackgroundTaskStatus::Completed => Some(format!(
+            "Exited with code {}",
+            item.get("exitCode")
+                .or_else(|| item.get("exit_code"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+        )),
+        BackgroundTaskStatus::Failed => Some(format!(
+            "Exited with code {}",
+            item.get("exitCode")
+                .or_else(|| item.get("exit_code"))
+                .and_then(Value::as_i64)
+                .unwrap_or(-1)
+        )),
+        BackgroundTaskStatus::Running
+        | BackgroundTaskStatus::Stopped
+        | BackgroundTaskStatus::Unknown => None,
+    };
+    Some(ToolProgressData {
+        tool_call_id: tool_call_id.to_owned(),
+        tool_name: "run_command".to_owned(),
+        update: ToolProgressUpdate::BackgroundTask(BackgroundTaskState {
+            task_id: process_id,
+            description: command,
+            status,
+            summary,
+            output_unavailable: None,
+        }),
+    })
+}
+
 fn estimate_file_change_tool_bytes(item: &Value) -> u64 {
     let mut total = 0u64;
     if let Some(changes) = item.get("changes").and_then(Value::as_array) {
@@ -9067,6 +9136,7 @@ fn create_codex_inference_home() -> Result<tempfile::TempDir, String> {
     }
 
     let source_auth = codex_native_home()?.join("auth.json");
+    let mut copied_file_auth = false;
     match std::fs::metadata(&source_auth) {
         Ok(metadata) => {
             if !metadata.is_file() {
@@ -9090,6 +9160,7 @@ fn create_codex_inference_home() -> Result<tempfile::TempDir, String> {
             isolated
                 .sync_all()
                 .map_err(|err| format!("Failed to persist isolated Codex authentication: {err}"))?;
+            copied_file_auth = true;
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => {
@@ -9111,8 +9182,9 @@ fn create_codex_inference_home() -> Result<tempfile::TempDir, String> {
         .open(config_path)
         .map_err(|err| format!("Failed to create isolated Codex configuration: {err}"))?;
     use std::io::Write as _;
+    let credential_store = if copied_file_auth { "file" } else { "auto" };
     config
-        .write_all(b"cli_auth_credentials_store = \"file\"\n")
+        .write_all(format!("cli_auth_credentials_store = \"{credential_store}\"\n").as_bytes())
         .map_err(|err| format!("Failed to write isolated Codex configuration: {err}"))?;
     config
         .sync_all()
@@ -11286,6 +11358,22 @@ mod tests {
                 .ends_with(std::path::Path::new(".tyde").join("codex").join("no-root"))
         );
         assert!(codex_runtime_workspace_roots(&[], &root).is_empty());
+    }
+
+    #[test]
+    fn codex_inference_home_uses_native_auth_store_when_file_auth_is_absent() {
+        let native_home = tempfile::tempdir().expect("native Codex home fixture");
+        let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
+            std::path::PathBuf::from("/bin/true"),
+            Some(native_home.path().to_path_buf()),
+        );
+
+        let isolated = create_codex_inference_home().expect("create isolated inference home");
+        let config = std::fs::read_to_string(isolated.path().join("config.toml"))
+            .expect("read isolated inference config");
+
+        assert_eq!(config, "cli_auth_credentials_store = \"auto\"\n");
+        assert!(!isolated.path().join("auth.json").exists());
     }
 
     #[test]
@@ -18908,11 +18996,13 @@ Do not describe the tool, and do not skip the tool call."#;
                     "StreamEnd",
                     "StreamStart",
                     "ToolRequest",
+                    "ToolProgress",
                     "StreamEnd",
                     "TypingStatusChanged",
                     "StreamStart",
                     "StreamDelta",
                     "ToolExecutionCompleted",
+                    "ToolProgress",
                     "StreamEnd",
                     "MessageMetadataUpdated",
                     "TypingStatusChanged",
@@ -18936,6 +19026,29 @@ Do not describe the tool, and do not skip the tool call."#;
                     .pointer("/data/success")
                     .and_then(Value::as_bool),
                 Some(true)
+            );
+            let progress = events
+                .iter()
+                .filter(|event| event.get("kind").and_then(Value::as_str) == Some("ToolProgress"))
+                .collect::<Vec<_>>();
+            assert_eq!(progress.len(), 2);
+            assert_eq!(
+                progress[0]
+                    .pointer("/data/update/status")
+                    .and_then(Value::as_str),
+                Some("running")
+            );
+            assert_eq!(
+                progress[1]
+                    .pointer("/data/update/status")
+                    .and_then(Value::as_str),
+                Some("completed")
+            );
+            assert_eq!(
+                progress[0]
+                    .pointer("/data/update/task_id")
+                    .and_then(Value::as_str),
+                Some("1234")
             );
             inner.rpc.shutdown().await;
         });

@@ -4666,6 +4666,11 @@ pub fn apply_chat_event(state: &AppState, host_id: &str, agent_id: &AgentId, eve
                     map.remove(&agent_id);
                 }
             });
+            if !typing {
+                state.streaming_text.update(|map| {
+                    map.remove(&agent_id);
+                });
+            }
         }
         ChatEvent::MessageAdded(message) => {
             log::trace!(
@@ -6024,6 +6029,50 @@ mod tests {
                     .agent_turn_active
                     .with_untracked(|map| map.contains_key(&agent_id)),
                 "cancellation is an explicit terminal transition"
+            );
+        });
+    }
+
+    #[test]
+    fn terminal_typing_status_clears_stale_stream_state() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let agent_id = AgentId("settled-agent".to_owned());
+
+            apply_chat_event(
+                &state,
+                "host",
+                &agent_id,
+                ChatEvent::TypingStatusChanged(true),
+            );
+            apply_chat_event(
+                &state,
+                "host",
+                &agent_id,
+                ChatEvent::StreamStart(protocol::StreamStartData {
+                    message_id: Some("stale-stream".to_owned()),
+                    agent: "codex".to_owned(),
+                    model: None,
+                }),
+            );
+            apply_chat_event(
+                &state,
+                "host",
+                &agent_id,
+                ChatEvent::TypingStatusChanged(false),
+            );
+
+            assert!(
+                !state
+                    .agent_turn_active
+                    .with_untracked(|map| map.contains_key(&agent_id))
+            );
+            assert!(
+                !state
+                    .streaming_text
+                    .with_untracked(|map| map.contains_key(&agent_id)),
+                "the authoritative idle marker must not leave the UI thinking forever"
             );
         });
     }

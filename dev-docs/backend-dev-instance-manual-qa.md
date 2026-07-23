@@ -586,6 +586,19 @@ unique name, prompt marker, command marker, and final-answer marker.
    QA models. Confirm status, output, tools, usage, capacity, settings, and
    errors remain isolated and every backend label identifies the actual
    producer.
+10. Enable agent activity summaries and hold a normal turn long enough for a
+    summary attempt. Confirm the summary reaches a non-error state, the hidden
+    helper never appears as an agent or tool user, and backend logs contain no
+    authentication or tool-policy failure. Repeat after reloading the client.
+11. Enable the supervisor and run one bounded case that produces `done`, one
+    that requires `awaiting_user`, and one safe interrupted case that requires
+    `continue`. Confirm the hidden verdict call authenticates on this backend,
+    no retry-exhaustion warning appears for helper failure, and the visible
+    agent status remains authoritative while the verdict runs.
+12. After a completed supervised turn, reload and reconnect while the terminal
+    warning or final assistant card is visible. Confirm the agent remains idle,
+    the composer sends normally rather than queueing, and no stale stream makes
+    any surface return to Thinking.
 
 ## 15. Presentation, accessibility, and performance audit
 

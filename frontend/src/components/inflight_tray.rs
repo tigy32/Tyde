@@ -159,8 +159,8 @@ struct TraySnapshot {
     pending_spawns: Vec<(AgentId, Option<String>)>,
     workflows: Vec<ToolCallId>,
     subagents: Vec<ToolCallId>,
-    /// Backgrounded shell commands (`run_in_background` Bash calls), from
-    /// server-reduced `BackgroundTask` progress snapshots.
+    /// Backgrounded shell commands from server-reduced `BackgroundTask`
+    /// progress snapshots.
     commands: Vec<ToolCallId>,
     queued: Vec<QueuedMessageId>,
     counts: TrayCounts,
