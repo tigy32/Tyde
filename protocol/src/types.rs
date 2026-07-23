@@ -40,10 +40,7 @@ mod supervisor_inactivity_delay_tests {
     #[test]
     fn defaults_and_round_trips_as_three_hundred_seconds() {
         assert_eq!(SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN, 1);
-        assert_eq!(
-            SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX,
-            86_400
-        );
+        assert_eq!(SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX, 86_400);
         let settings = SupervisorSettings::default();
         assert_eq!(settings.auto_compact_inactivity_delay_seconds, 300);
         assert_eq!(settings.retry_attempts, 1);
@@ -2381,8 +2378,7 @@ impl Default for SupervisorSettings {
             auto_compact_on_success: false,
             auto_compact_inactivity_delay_seconds:
                 default_supervisor_auto_compact_inactivity_delay_seconds(),
-            auto_compact_min_context_tokens:
-                default_supervisor_auto_compact_min_context_tokens(),
+            auto_compact_min_context_tokens: default_supervisor_auto_compact_min_context_tokens(),
             max_kicks_per_task: default_supervisor_max_kicks_per_task(),
             retry_attempts: default_supervisor_retry_attempts(),
             cost_tier: SupervisorCostTier::default(),

@@ -85,11 +85,10 @@ use crate::agent::registry::{
 };
 use crate::agent::{
     AgentHandle, AgentUsageSnapshot, AppendSupervisorWarningOutcome, CompactionStart,
-    CompactionSummary,
-    DEFAULT_COMPACTION_SUMMARY_MAX_BYTES, GenerateAgentActivitySummaryRequest,
+    CompactionSummary, DEFAULT_COMPACTION_SUMMARY_MAX_BYTES, GenerateAgentActivitySummaryRequest,
     GenerateAgentNameRequest, InterruptOutcome, MAX_COMPACTION_SUMMARY_BYTES,
-    SupervisorVerdictStart, derive_agent_name,
-    generate_agent_activity_summary, generate_agent_name,
+    SupervisorVerdictStart, derive_agent_name, generate_agent_activity_summary,
+    generate_agent_name,
 };
 use crate::agent_control_mcp::AgentControlMcpHandle;
 use crate::backend::setup;
@@ -356,9 +355,8 @@ const SUPERVISION_RETRY_DELAYS: [Duration; 5] = [
     Duration::from_secs(240),
     Duration::from_secs(480),
 ];
-const _: () = assert!(
-    SUPERVISION_RETRY_DELAYS.len() == protocol::SUPERVISOR_RETRY_ATTEMPTS_MAX as usize
-);
+const _: () =
+    assert!(SUPERVISION_RETRY_DELAYS.len() == protocol::SUPERVISOR_RETRY_ATTEMPTS_MAX as usize);
 /// How long the supervisor waits for an auto-compaction it requested to
 /// reach a terminal notify before giving up on observing it (the compaction
 /// itself keeps running server-side either way).
@@ -615,11 +613,10 @@ struct SupervisorVerdictCallTestGate {
 }
 
 #[cfg(test)]
-fn supervisor_verdict_call_test_gates(
-) -> &'static StdMutex<HashMap<AgentId, SupervisorVerdictCallTestGate>> {
-    static GATES: std::sync::OnceLock<
-        StdMutex<HashMap<AgentId, SupervisorVerdictCallTestGate>>,
-    > = std::sync::OnceLock::new();
+fn supervisor_verdict_call_test_gates()
+-> &'static StdMutex<HashMap<AgentId, SupervisorVerdictCallTestGate>> {
+    static GATES: std::sync::OnceLock<StdMutex<HashMap<AgentId, SupervisorVerdictCallTestGate>>> =
+        std::sync::OnceLock::new();
     GATES.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
@@ -3564,11 +3561,7 @@ impl HostHandle {
         agent_id: AgentId,
         payload: AgentCompactPayload,
         stream: Stream,
-        inactivity_gate: Option<(
-            u64,
-            u64,
-            watch::Receiver<SupervisorSettingsSignal>,
-        )>,
+        inactivity_gate: Option<(u64, u64, watch::Receiver<SupervisorSettingsSignal>)>,
     ) -> AppResult<Option<AgentCompaction>> {
         let summary_prompt = payload
             .summary_prompt
@@ -13275,8 +13268,7 @@ fn spawn_agent_supervisor_task(host: HostHandle) {
     let worker = async move {
         let mut status_rx = host.subscribe_agent_status_changes().await;
         let mut settings_rx = host.supervisor_settings_receiver().await;
-        let (verdict_tx, mut verdict_rx) =
-            mpsc::unbounded_channel::<SupervisorVerdictTaskEvent>();
+        let (verdict_tx, mut verdict_rx) = mpsc::unbounded_channel::<SupervisorVerdictTaskEvent>();
         let (compaction_tx, mut compaction_rx) =
             mpsc::unbounded_channel::<SupervisorCompactionTaskEvent>();
         let semaphore = Arc::new(Semaphore::new(1));
@@ -13759,9 +13751,7 @@ fn supervisor_next_deadline(
                 && *last_gate_evaluation_epoch != Some(settings.epoch) =>
             {
                 idle_since.checked_add(Duration::from_secs(u64::from(
-                    settings
-                        .settings
-                        .auto_compact_inactivity_delay_seconds,
+                    settings.settings.auto_compact_inactivity_delay_seconds,
                 )))
             }
             _ => None,
@@ -13846,9 +13836,7 @@ async fn process_supervisor_deadlines_at(
                 && *last_gate_evaluation_epoch != Some(settings.epoch)
                 && idle_since
                     .checked_add(Duration::from_secs(u64::from(
-                        settings
-                            .settings
-                            .auto_compact_inactivity_delay_seconds,
+                        settings.settings.auto_compact_inactivity_delay_seconds,
                     )))
                     .is_some_and(|due| due <= now) =>
             {
@@ -13858,14 +13846,7 @@ async fn process_supervisor_deadlines_at(
         })
         .collect::<Vec<_>>();
     for agent_id in due_compactions {
-        launch_supervisor_auto_compaction(
-            host,
-            entries,
-            agent_id,
-            settings,
-            compaction_tx,
-        )
-        .await;
+        launch_supervisor_auto_compaction(host, entries, agent_id, settings, compaction_tx).await;
     }
 }
 
@@ -13884,30 +13865,25 @@ async fn launch_supervision_verdict(
     let Some(entry) = entries.get(&agent_id) else {
         return;
     };
-    let (
-        idle_since,
-        attempts_started,
-        pending_baseline,
-        retry_reason,
-        previous_verdict_settings,
-    ) = match &entry.phase {
-        SupervisorPhase::Debouncing { idle_since } => (*idle_since, 0, None, None, None),
-        SupervisorPhase::RetryPending {
-            idle_since,
-            baseline,
-            attempts_started,
-            last_failure_kind,
-            verdict_settings,
-            ..
-        } => (
-            *idle_since,
-            *attempts_started,
-            Some(baseline.clone()),
-            Some(last_failure_kind.clone()),
-            Some(*verdict_settings),
-        ),
-        _ => return,
-    };
+    let (idle_since, attempts_started, pending_baseline, retry_reason, previous_verdict_settings) =
+        match &entry.phase {
+            SupervisorPhase::Debouncing { idle_since } => (*idle_since, 0, None, None, None),
+            SupervisorPhase::RetryPending {
+                idle_since,
+                baseline,
+                attempts_started,
+                last_failure_kind,
+                verdict_settings,
+                ..
+            } => (
+                *idle_since,
+                *attempts_started,
+                Some(baseline.clone()),
+                Some(last_failure_kind.clone()),
+                Some(*verdict_settings),
+            ),
+            _ => return,
+        };
     let activity_counter = entry.last_activity_counter;
     let Some(observation) = host.activity_summary_observation(&agent_id).await else {
         entries.remove(&agent_id);
@@ -14013,11 +13989,7 @@ async fn launch_supervision_verdict(
     let settings_rx = host.supervisor_settings_receiver().await;
     match observation
         .handle
-        .begin_supervisor_verdict_if_inactive(
-            activity_counter,
-            verdict_settings,
-            settings_rx,
-        )
+        .begin_supervisor_verdict_if_inactive(activity_counter, verdict_settings, settings_rx)
         .await
     {
         SupervisorVerdictStart::Accepted => {}
@@ -14050,13 +14022,12 @@ async fn launch_supervision_verdict(
         return;
     };
     let attempts_started = attempts_started.saturating_add(1);
-    entries.get_mut(&agent_id).expect("entry exists").phase =
-        SupervisorPhase::VerdictInFlight {
-            idle_since,
-            baseline: baseline.clone(),
-            attempts_started,
-            verdict_settings,
-        };
+    entries.get_mut(&agent_id).expect("entry exists").phase = SupervisorPhase::VerdictInFlight {
+        idle_since,
+        baseline: baseline.clone(),
+        attempts_started,
+        verdict_settings,
+    };
     tracing::info!(
         agent_id = %agent_id,
         attempt = attempts_started,
@@ -14308,8 +14279,10 @@ async fn accept_supervision_verdict_result(
             result_dequeued_at,
         ) == SupervisionRetrySchedule::Exhausted
         {
-            entries.get_mut(&result.agent_id).expect("entry exists").phase =
-                SupervisorPhase::Dormant { idle_since };
+            entries
+                .get_mut(&result.agent_id)
+                .expect("entry exists")
+                .phase = SupervisorPhase::Dormant { idle_since };
         }
         return;
     }
@@ -14326,21 +14299,24 @@ async fn accept_supervision_verdict_result(
         return;
     }
     if observation.start.session_id != result.baseline.session_id {
-        entries.get_mut(&result.agent_id).expect("entry exists").phase =
-            SupervisorPhase::Dormant { idle_since };
+        entries
+            .get_mut(&result.agent_id)
+            .expect("entry exists")
+            .phase = SupervisorPhase::Dormant { idle_since };
         return;
     }
     let Some(context) = observation.handle.read_supervision_context().await else {
-        entries.get_mut(&result.agent_id).expect("entry exists").phase =
-            SupervisorPhase::Dormant { idle_since };
+        entries
+            .get_mut(&result.agent_id)
+            .expect("entry exists")
+            .phase = SupervisorPhase::Dormant { idle_since };
         tracing::warn!(
             agent_id = %result.agent_id,
             "dropping supervision verdict: live context reader is unavailable"
         );
         return;
     };
-    if context.last_user_message.as_deref()
-        != Some(result.baseline.last_user_message.as_str())
+    if context.last_user_message.as_deref() != Some(result.baseline.last_user_message.as_str())
         || context.kicks_since_user_message != result.baseline.kicks_since_user_message
         || context.cancelled_since_user_message
         || !supervision_session_allows_action(host, &observation, &context).await
@@ -14349,8 +14325,10 @@ async fn accept_supervision_verdict_result(
             agent_id = %result.agent_id,
             "dropping stale supervision verdict: conversation moved on"
         );
-        entries.get_mut(&result.agent_id).expect("entry exists").phase =
-            SupervisorPhase::Dormant { idle_since };
+        entries
+            .get_mut(&result.agent_id)
+            .expect("entry exists")
+            .phase = SupervisorPhase::Dormant { idle_since };
         return;
     }
 
@@ -14376,8 +14354,10 @@ async fn accept_supervision_verdict_result(
             result_dequeued_at,
         ) == SupervisionRetrySchedule::Exhausted
         {
-            entries.get_mut(&result.agent_id).expect("entry exists").phase =
-                SupervisorPhase::Dormant { idle_since };
+            entries
+                .get_mut(&result.agent_id)
+                .expect("entry exists")
+                .phase = SupervisorPhase::Dormant { idle_since };
         }
         return;
     }
@@ -14434,8 +14414,10 @@ async fn accept_supervision_verdict_result(
                 kick = result.baseline.kicks_since_user_message + 1,
                 "supervisor kicking idle agent to continue"
             );
-            entries.get_mut(&result.agent_id).expect("entry exists").phase =
-                SupervisorPhase::Active;
+            entries
+                .get_mut(&result.agent_id)
+                .expect("entry exists")
+                .phase = SupervisorPhase::Active;
             if let Some(status_handle) = host.agent_status_handle(&result.agent_id).await {
                 status_handle.update(mark_supervisor_kick_pending).await;
             }
@@ -14460,20 +14442,24 @@ async fn accept_supervision_verdict_result(
                 agent_id = %result.agent_id,
                 "supervisor classified the idle turn as awaiting user input"
             );
-            entries.get_mut(&result.agent_id).expect("entry exists").phase =
-                SupervisorPhase::AwaitingUser { idle_since };
+            entries
+                .get_mut(&result.agent_id)
+                .expect("entry exists")
+                .phase = SupervisorPhase::AwaitingUser { idle_since };
         }
         crate::agent::supervisor::SupervisionVerdict::Done => {
             tracing::info!(
                 agent_id = %result.agent_id,
                 "supervisor confirmed the requested work is truly complete"
             );
-            entries.get_mut(&result.agent_id).expect("entry exists").phase =
-                SupervisorPhase::DoneAuthorized {
-                    idle_since,
-                    baseline: result.baseline,
-                    last_gate_evaluation_epoch: None,
-                };
+            entries
+                .get_mut(&result.agent_id)
+                .expect("entry exists")
+                .phase = SupervisorPhase::DoneAuthorized {
+                idle_since,
+                baseline: result.baseline,
+                last_gate_evaluation_epoch: None,
+            };
         }
     }
 }
@@ -23865,8 +23851,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             },
         )]);
 
-        let (entered, release) =
-            install_supervisor_verdict_post_sample_test_gate(agent_id.clone());
+        let (entered, release) = install_supervisor_verdict_post_sample_test_gate(agent_id.clone());
         let host = fixture.host.clone();
         let result_agent_id = agent_id.clone();
         let result_baseline = baseline.clone();
@@ -24512,7 +24497,9 @@ Rules: Record only what remains true and useful for future work; drop transient 
             entries
         });
 
-        entered.await.expect("warning command reached final settings gate");
+        entered
+            .await
+            .expect("warning command reached final settings gate");
         fixture
             .host
             .set_setting(SetSettingPayload {
@@ -24552,8 +24539,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
     #[tokio::test]
     async fn failure_backed_live_cap_reduction_warns_but_settings_only_does_not() {
         let fixture = compact_fixture().await;
-        let (agent_id, _) =
-            spawn_idle_user_agent(&fixture.host, "live retry cap reduction").await;
+        let (agent_id, _) = spawn_idle_user_agent(&fixture.host, "live retry cap reduction").await;
         fixture
             .host
             .set_setting(SetSettingPayload {
@@ -24640,7 +24626,9 @@ Rules: Record only what remains true and useful for future work; drop transient 
         assert!(matches!(
             apply_live_retry_settings(
                 &settings_only_id,
-                entries.get_mut(&settings_only_id).expect("settings-only entry"),
+                entries
+                    .get_mut(&settings_only_id)
+                    .expect("settings-only entry"),
                 current.settings,
             ),
             LiveRetrySettingsResult::SettingsExhausted {
@@ -24827,9 +24815,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 .await;
                 if expected_attempt < expected_calls {
                     let expected_due = result_at
-                        .checked_add(
-                            SUPERVISION_RETRY_DELAYS[usize::from(expected_attempt - 1)],
-                        )
+                        .checked_add(SUPERVISION_RETRY_DELAYS[usize::from(expected_attempt - 1)])
                         .unwrap();
                     assert!(matches!(
                         entries.get(&agent_id).map(|entry| &entry.phase),
@@ -24921,8 +24907,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         let (compaction_tx, _compaction_rx) = mpsc::unbounded_channel();
         let semaphore = Arc::new(Semaphore::new(1));
         let mut verdict_task_state = SupervisorVerdictTaskState::default();
-        let (mut starts, releases) =
-            install_supervisor_verdict_call_test_gate(agent_id.clone());
+        let (mut starts, releases) = install_supervisor_verdict_call_test_gate(agent_id.clone());
 
         process_supervisor_deadlines_at(
             &fixture.host,
@@ -24938,15 +24923,17 @@ Rules: Record only what remains true and useful for future work; drop transient 
         let first_start = starts.recv().await.expect("first held verdict call");
         assert_eq!(first_start.attempts_started, 1);
 
-        assert!(observation
-            .handle
-            .send_input(AgentInput::SendMessage(SendMessagePayload {
-                message: crate::backend::mock::MOCK_SLOW_TURN_SENTINEL.to_owned(),
-                images: None,
-                origin: Some(MessageOrigin::User),
-                tool_response: None,
-            }))
-            .await);
+        assert!(
+            observation
+                .handle
+                .send_input(AgentInput::SendMessage(SendMessagePayload {
+                    message: crate::backend::mock::MOCK_SLOW_TURN_SENTINEL.to_owned(),
+                    images: None,
+                    origin: Some(MessageOrigin::User),
+                    tool_response: None,
+                }))
+                .await
+        );
         wait_for_agent_active(&fixture.host, &agent_id).await;
         observe_supervised_agents(&fixture.host, &mut entries).await;
         assert!(matches!(
@@ -25020,13 +25007,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .await
             .expect("disable supervisor while call is held");
         let disabled = fixture.host.supervisor_settings_signal().await;
-        apply_supervisor_settings_change(
-            &fixture.host,
-            &mut entries,
-            settings,
-            disabled,
-        )
-        .await;
+        apply_supervisor_settings_change(&fixture.host, &mut entries, settings, disabled).await;
         assert!(entries.is_empty());
         fixture
             .host
@@ -25036,13 +25017,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .await
             .expect("re-enable supervisor while old call is held");
         let reenabled = fixture.host.supervisor_settings_signal().await;
-        apply_supervisor_settings_change(
-            &fixture.host,
-            &mut entries,
-            disabled,
-            reenabled,
-        )
-        .await;
+        apply_supervisor_settings_change(&fixture.host, &mut entries, disabled, reenabled).await;
         let reenabled_due = match entries.get(&agent_id).map(|entry| &entry.phase) {
             Some(SupervisorPhase::Debouncing { idle_since }) => {
                 idle_since.checked_add(SUPERVISION_DEBOUNCE).unwrap()
@@ -25163,7 +25138,10 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 .activity_counter
                 > observation.status.activity_counter
         );
-        assert_eq!(observation.handle.interrupt().await, InterruptOutcome::Interrupted);
+        assert_eq!(
+            observation.handle.interrupt().await,
+            InterruptOutcome::Interrupted
+        );
     }
 
     #[tokio::test]
@@ -25218,8 +25196,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         let semaphore = Arc::new(Semaphore::new(1));
         let (pre_start_entered, pre_start_release) =
             crate::agent::install_begin_supervisor_verdict_test_gate(agent_id.clone());
-        let (mut starts, releases) =
-            install_supervisor_verdict_call_test_gate(agent_id.clone());
+        let (mut starts, releases) = install_supervisor_verdict_call_test_gate(agent_id.clone());
 
         let host = fixture.host.clone();
         let task_verdict_tx = verdict_tx.clone();
@@ -25491,7 +25468,9 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .await
         });
 
-        entered.await.expect("conditional compact reached actor gate");
+        entered
+            .await
+            .expect("conditional compact reached actor gate");
         fixture
             .host
             .set_setting(SetSettingPayload { setting })
@@ -25499,10 +25478,12 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .expect("commit supervisor setting while actor gate is held");
         release.send(()).expect("release actor gate");
 
-        assert!(!compact
-            .await
-            .expect("conditional compact task")
-            .expect("conditional compact request"));
+        assert!(
+            !compact
+                .await
+                .expect("conditional compact task")
+                .expect("conditional compact request")
+        );
     }
 
     #[tokio::test]
@@ -25567,15 +25548,17 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .await
             .expect("agent observation");
         let expected_counter = observation.status.activity_counter;
-        assert!(observation
-            .handle
-            .send_input(AgentInput::SendMessage(SendMessagePayload {
-                message: "new user activity".to_owned(),
-                images: None,
-                origin: Some(MessageOrigin::User),
-                tool_response: None,
-            }))
-            .await);
+        assert!(
+            observation
+                .handle
+                .send_input(AgentInput::SendMessage(SendMessagePayload {
+                    message: "new user activity".to_owned(),
+                    images: None,
+                    origin: Some(MessageOrigin::User),
+                    tool_response: None,
+                }))
+                .await
+        );
         let signal = fixture.host.supervisor_settings_signal().await;
         let (stream, _rx) = compact_stream(&agent_id);
 
@@ -25627,21 +25610,27 @@ Rules: Record only what remains true and useful for future work; drop transient 
             )
             .await
         });
-        entered.await.expect("conditional compact reached actor gate");
-        release.send(()).expect("release actor gate");
-        assert!(compact
+        entered
             .await
-            .expect("conditional compact task")
-            .expect("conditional compact request"));
+            .expect("conditional compact reached actor gate");
+        release.send(()).expect("release actor gate");
+        assert!(
+            compact
+                .await
+                .expect("conditional compact task")
+                .expect("conditional compact request")
+        );
 
-        assert!(agent_handle
-            .send_input(AgentInput::SendMessage(SendMessagePayload {
-                message: "activity after compaction acceptance".to_owned(),
-                images: None,
-                origin: Some(MessageOrigin::User),
-                tool_response: None,
-            }))
-            .await);
+        assert!(
+            agent_handle
+                .send_input(AgentInput::SendMessage(SendMessagePayload {
+                    message: "activity after compaction acceptance".to_owned(),
+                    images: None,
+                    origin: Some(MessageOrigin::User),
+                    tool_response: None,
+                }))
+                .await
+        );
     }
 
     #[test]
@@ -25686,11 +25675,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         let mut lowered = raised;
         lowered.retry_attempts = 0;
         assert!(matches!(
-            apply_live_retry_settings(
-                &AgentId("retry-limit".to_owned()),
-                &mut pending,
-                lowered
-            ),
+            apply_live_retry_settings(&AgentId("retry-limit".to_owned()), &mut pending, lowered),
             LiveRetrySettingsResult::FailureExhausted {
                 attempts_started: 1,
                 ..
@@ -25729,17 +25714,17 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 .unwrap();
             assert_eq!(
                 schedule_supervision_retry_at(
-                &mut entries,
-                &agent_id,
-                idle_since,
-                baseline.clone(),
-                attempts_started,
-                settings,
-                SupervisionRetryReason::Failure(
-                    crate::agent::supervisor::SupervisionFailureKind::BackendStream,
-                ),
-                Some("outage".to_owned()),
-                scheduled_at,
+                    &mut entries,
+                    &agent_id,
+                    idle_since,
+                    baseline.clone(),
+                    attempts_started,
+                    settings,
+                    SupervisionRetryReason::Failure(
+                        crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+                    ),
+                    Some("outage".to_owned()),
+                    scheduled_at,
                 ),
                 SupervisionRetrySchedule::Pending
             );
@@ -25767,19 +25752,22 @@ Rules: Record only what remains true and useful for future work; drop transient 
             }
         }
 
-        assert_eq!(schedule_supervision_retry_at(
-            &mut entries,
-            &agent_id,
-            idle_since,
-            baseline.clone(),
-            6,
-            settings,
-            SupervisionRetryReason::Failure(
-                crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+        assert_eq!(
+            schedule_supervision_retry_at(
+                &mut entries,
+                &agent_id,
+                idle_since,
+                baseline.clone(),
+                6,
+                settings,
+                SupervisionRetryReason::Failure(
+                    crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+                ),
+                Some("outage".to_owned()),
+                Instant::now(),
             ),
-            Some("outage".to_owned()),
-            Instant::now(),
-        ), SupervisionRetrySchedule::Exhausted);
+            SupervisionRetrySchedule::Exhausted
+        );
         assert!(matches!(
             entries.get(&agent_id).map(|entry| &entry.phase),
             Some(SupervisorPhase::FailureExhausted { .. })
@@ -25798,19 +25786,22 @@ Rules: Record only what remains true and useful for future work; drop transient 
 
         settings.retry_attempts = 1;
         assert_eq!(settings.retry_attempts.saturating_add(1), 2);
-        assert_eq!(schedule_supervision_retry_at(
-            &mut entries,
-            &agent_id,
-            idle_since,
-            baseline.clone(),
-            1,
-            settings,
-            SupervisionRetryReason::Failure(
-                crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+        assert_eq!(
+            schedule_supervision_retry_at(
+                &mut entries,
+                &agent_id,
+                idle_since,
+                baseline.clone(),
+                1,
+                settings,
+                SupervisionRetryReason::Failure(
+                    crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+                ),
+                None,
+                idle_since,
             ),
-            None,
-            idle_since,
-        ), SupervisionRetrySchedule::Pending);
+            SupervisionRetrySchedule::Pending
+        );
         assert!(matches!(
             entries.get(&agent_id).map(|entry| &entry.phase),
             Some(SupervisorPhase::RetryPending {
@@ -25819,19 +25810,22 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 ..
             }) if *due_at == idle_since.checked_add(Duration::from_secs(30)).unwrap()
         ));
-        assert_eq!(schedule_supervision_retry_at(
-            &mut entries,
-            &agent_id,
-            idle_since,
-            baseline.clone(),
-            2,
-            settings,
-            SupervisionRetryReason::Failure(
-                crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+        assert_eq!(
+            schedule_supervision_retry_at(
+                &mut entries,
+                &agent_id,
+                idle_since,
+                baseline.clone(),
+                2,
+                settings,
+                SupervisionRetryReason::Failure(
+                    crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+                ),
+                None,
+                idle_since,
             ),
-            None,
-            idle_since,
-        ), SupervisionRetrySchedule::Exhausted);
+            SupervisionRetrySchedule::Exhausted
+        );
         assert!(matches!(
             entries.get(&agent_id).map(|entry| &entry.phase),
             Some(SupervisorPhase::FailureExhausted {
@@ -25850,19 +25844,22 @@ Rules: Record only what remains true and useful for future work; drop transient 
 
         settings.retry_attempts = 0;
         assert_eq!(settings.retry_attempts.saturating_add(1), 1);
-        assert_eq!(schedule_supervision_retry_at(
-            &mut entries,
-            &agent_id,
-            idle_since,
-            baseline,
-            1,
-            settings,
-            SupervisionRetryReason::Failure(
-                crate::agent::supervisor::SupervisionFailureKind::InvalidVerdict,
+        assert_eq!(
+            schedule_supervision_retry_at(
+                &mut entries,
+                &agent_id,
+                idle_since,
+                baseline,
+                1,
+                settings,
+                SupervisionRetryReason::Failure(
+                    crate::agent::supervisor::SupervisionFailureKind::InvalidVerdict,
+                ),
+                None,
+                Instant::now(),
             ),
-            None,
-            Instant::now(),
-        ), SupervisionRetrySchedule::Exhausted);
+            SupervisionRetrySchedule::Exhausted
+        );
     }
 
     #[test]
@@ -25930,19 +25927,22 @@ Rules: Record only what remains true and useful for future work; drop transient 
 
         let ids = entries.keys().cloned().collect::<Vec<_>>();
         for agent_id in ids {
-            assert_eq!(schedule_supervision_retry_at(
-                &mut entries,
-                &agent_id,
-                now,
-                baseline(),
-                2,
-                settings,
-                SupervisionRetryReason::Failure(
-                    crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+            assert_eq!(
+                schedule_supervision_retry_at(
+                    &mut entries,
+                    &agent_id,
+                    now,
+                    baseline(),
+                    2,
+                    settings,
+                    SupervisionRetryReason::Failure(
+                        crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+                    ),
+                    Some("outage".to_owned()),
+                    now,
                 ),
-                Some("outage".to_owned()),
-                now,
-            ), SupervisionRetrySchedule::Exhausted);
+                SupervisionRetrySchedule::Exhausted
+            );
         }
     }
 }

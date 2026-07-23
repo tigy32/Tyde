@@ -2379,8 +2379,7 @@ pub(crate) fn spawn_agent_actor(
                             });
                         }
                         AgentCommand::AppendSupervisorFailureWarningIfInactive {
-                            reply,
-                            ..
+                            reply, ..
                         } => {
                             let _ = reply.send(AppendSupervisorWarningOutcome::Ineligible);
                         }
@@ -4507,20 +4506,18 @@ static COMPACT_IF_INACTIVE_TEST_GATE: std::sync::Mutex<Option<AgentStartupTestGa
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
-fn begin_supervisor_verdict_test_gates(
-) -> &'static std::sync::Mutex<HashMap<AgentId, AgentStartupTestGate>> {
-    static GATES: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<AgentId, AgentStartupTestGate>>,
-    > = std::sync::OnceLock::new();
+fn begin_supervisor_verdict_test_gates()
+-> &'static std::sync::Mutex<HashMap<AgentId, AgentStartupTestGate>> {
+    static GATES: std::sync::OnceLock<std::sync::Mutex<HashMap<AgentId, AgentStartupTestGate>>> =
+        std::sync::OnceLock::new();
     GATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
 #[cfg(test)]
-fn append_supervisor_warning_test_gates(
-) -> &'static std::sync::Mutex<HashMap<AgentId, AgentStartupTestGate>> {
-    static GATES: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<AgentId, AgentStartupTestGate>>,
-    > = std::sync::OnceLock::new();
+fn append_supervisor_warning_test_gates()
+-> &'static std::sync::Mutex<HashMap<AgentId, AgentStartupTestGate>> {
+    static GATES: std::sync::OnceLock<std::sync::Mutex<HashMap<AgentId, AgentStartupTestGate>>> =
+        std::sync::OnceLock::new();
     GATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
@@ -4613,7 +4610,10 @@ pub(crate) fn install_compact_if_inactive_test_gate(
             entered: entered_tx,
             release: release_rx,
         });
-    assert!(replaced.is_none(), "compact-if-inactive test gate already installed");
+    assert!(
+        replaced.is_none(),
+        "compact-if-inactive test gate already installed"
+    );
     (entered_rx, release_tx)
 }
 
@@ -5487,7 +5487,9 @@ async fn park_terminal_agent(
             AgentCommand::AppendSupervisorFailureWarningIfInactive { reply, .. } => {
                 let _ = reply.send(AppendSupervisorWarningOutcome::Closed);
             }
-            AgentCommand::CompactIfInactive { accepted, reply, .. } => {
+            AgentCommand::CompactIfInactive {
+                accepted, reply, ..
+            } => {
                 let error = "agent is not running".to_owned();
                 let _ = accepted.send(Err(error.clone()));
                 let _ = reply.send(Err(error));
@@ -5637,7 +5639,9 @@ async fn park_relay_terminal_agent(
             AgentCommand::AppendSupervisorFailureWarningIfInactive { reply, .. } => {
                 let _ = reply.send(AppendSupervisorWarningOutcome::Closed);
             }
-            AgentCommand::CompactIfInactive { accepted, reply, .. } => {
+            AgentCommand::CompactIfInactive {
+                accepted, reply, ..
+            } => {
                 let error = "backend-native agents cannot be compacted".to_owned();
                 let _ = accepted.send(Err(error.clone()));
                 let _ = reply.send(Err(error));
@@ -7934,11 +7938,11 @@ mod tests {
         AgentStartPayload, BackendKind, ChatEvent, ChatMessage, ChatMessageId, FrameKind,
         MessageMetadataUpdateData, MessageSender, MessageTokenUsage, ModelInfo, ModelRequestId,
         ModelRequestTokenUsage, ModelTurnId, QueuedMessagesPayload, ReasoningData,
-        ServerGeneratedChatMessageIdOrigin,
-        ServerGeneratedChatMessageIdentity, SessionId, StreamEndData, StreamPath, StreamStartData,
-        StreamTextDeltaData, TaskList, TaskTokenUsageScope, TaskTokenUsageUnavailableReason,
-        TokenUsage, TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData,
-        ToolExecutionResult, ToolRequest, ToolRequestType, ToolUseData,
+        ServerGeneratedChatMessageIdOrigin, ServerGeneratedChatMessageIdentity, SessionId,
+        StreamEndData, StreamPath, StreamStartData, StreamTextDeltaData, TaskList,
+        TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope,
+        TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult, ToolRequest,
+        ToolRequestType, ToolUseData,
     };
     use tokio::sync::{Mutex, mpsc, watch};
     use tokio::time::timeout;
@@ -8635,7 +8639,9 @@ mod tests {
             ))
             .count();
 
-        status_handle.update(|status| status.is_thinking = true).await;
+        status_handle
+            .update(|status| status.is_thinking = true)
+            .await;
         assert_eq!(
             handle
                 .append_supervisor_failure_warning_if_inactive(
@@ -8692,7 +8698,10 @@ mod tests {
             super::AppendSupervisorWarningOutcome::AlreadyAppended
         );
         let after_status = status_handle.snapshot().await;
-        assert_eq!(after_status.activity_counter, before_status.activity_counter);
+        assert_eq!(
+            after_status.activity_counter,
+            before_status.activity_counter
+        );
         assert_eq!(after_status.is_thinking, before_status.is_thinking);
         assert_eq!(after_status.turn_completed, before_status.turn_completed);
         assert_eq!(
@@ -8753,10 +8762,7 @@ mod tests {
             super::AppendSupervisorWarningOutcome::ActivityChanged
         );
 
-        let changed = crate::host::SupervisorSettingsSignal {
-            settings,
-            epoch: 2,
-        };
+        let changed = crate::host::SupervisorSettingsSignal { settings, epoch: 2 };
         let (_changed_tx, changed_rx) = watch::channel(changed);
         assert_eq!(
             handle
@@ -8917,8 +8923,7 @@ mod tests {
         let expected = crate::host::SupervisorSettingsSignal { settings, epoch: 1 };
         let (settings_tx, settings_rx) = watch::channel(expected);
         let activity_counter = status_handle.snapshot().await.activity_counter;
-        let (entered, release) =
-            super::install_append_supervisor_warning_test_gate(agent_id);
+        let (entered, release) = super::install_append_supervisor_warning_test_gate(agent_id);
         let warning_handle = handle.clone();
         let append = tokio::spawn(async move {
             warning_handle
@@ -9153,7 +9158,9 @@ mod tests {
                     AgentCommand::AppendSupervisorFailureWarningIfInactive { reply, .. } => {
                         let _ = reply.send(AppendSupervisorWarningOutcome::Closed);
                     }
-                    AgentCommand::CompactIfInactive { accepted, reply, .. } => {
+                    AgentCommand::CompactIfInactive {
+                        accepted, reply, ..
+                    } => {
                         let error = "agent is not running".to_owned();
                         let _ = accepted.send(Err(error.clone()));
                         let _ = reply.send(Err(error));

@@ -8,10 +8,10 @@ mod fixture;
 
 use fixture::Fixture;
 use protocol::{
-    AgentClosedPayload, BackendKind, ChatEvent, CommandErrorPayload, Envelope, FrameKind,
-    FetchSessionHistoryPayload, HostSettingErrorTarget, HostSettingValue, HostSettingsPayload,
-    MessageSender, NewAgentPayload, SUPERVISOR_MESSAGE_PREFIX, SetSettingPayload,
-    SpawnAgentParams, SpawnAgentPayload, StreamPath,
+    AgentClosedPayload, BackendKind, ChatEvent, CommandErrorPayload, Envelope,
+    FetchSessionHistoryPayload, FrameKind, HostSettingErrorTarget, HostSettingValue,
+    HostSettingsPayload, MessageSender, NewAgentPayload, SUPERVISOR_MESSAGE_PREFIX,
+    SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
 };
 use std::time::Duration;
 
@@ -105,7 +105,10 @@ fn supervisor_failure_warning(env: &Envelope) -> Option<(StreamPath, String)> {
                 && matches!(message.sender, MessageSender::Warning)
                 && message.content.starts_with(
                     "Supervisor could not verify whether this task was complete after ",
-                ) => Some((env.stream.clone(), message.content)),
+                ) =>
+        {
+            Some((env.stream.clone(), message.content))
+        }
         _ => None,
     }
 }
@@ -144,13 +147,7 @@ async fn spawn_supervised_agent(
     name: &str,
     report_context: bool,
 ) -> NewAgentPayload {
-    spawn_supervised_agent_with_verdict(
-        fixture,
-        name,
-        report_context,
-        MOCK_SUPERVISOR_DONE,
-    )
-    .await
+    spawn_supervised_agent_with_verdict(fixture, name, report_context, MOCK_SUPERVISOR_DONE).await
 }
 
 async fn spawn_supervised_agent_with_verdict(
@@ -295,9 +292,7 @@ async fn exhausted_supervisor_failure_warns_once_per_activity_generation() {
         &mut fixture.client,
         Duration::from_secs(5),
         "affected actor history",
-        |env| {
-            env.kind == FrameKind::SessionHistory && env.stream == affected.instance_stream
-        },
+        |env| env.kind == FrameKind::SessionHistory && env.stream == affected.instance_stream,
     )
     .await
     .parse_payload::<protocol::SessionHistoryPayload>()
@@ -367,9 +362,7 @@ async fn exhausted_supervisor_failure_warns_once_per_activity_generation() {
         &mut fixture.client,
         Duration::from_secs(5),
         "history for both warning generations",
-        |env| {
-            env.kind == FrameKind::SessionHistory && env.stream == affected.instance_stream
-        },
+        |env| env.kind == FrameKind::SessionHistory && env.stream == affected.instance_stream,
     )
     .await
     .parse_payload::<protocol::SessionHistoryPayload>()
@@ -577,9 +570,7 @@ async fn enabling_after_exact_codex_error_tail_emits_one_kick() {
                 }
                 match (predicate, chat_event_on(env, &stream)) {
                     (0, Some(ChatEvent::TypingStatusChanged(true))) => true,
-                    (1, Some(ChatEvent::ToolRequest(request))) => {
-                        request.tool_name == "Bash"
-                    }
+                    (1, Some(ChatEvent::ToolRequest(request))) => request.tool_name == "Bash",
                     (2, Some(ChatEvent::ToolExecutionCompleted(result))) => result.success,
                     (3, Some(ChatEvent::MessageAdded(message))) => {
                         matches!(message.sender, MessageSender::Warning)
@@ -610,9 +601,9 @@ async fn enabling_after_exact_codex_error_tail_emits_one_kick() {
         "same-host enabled HostSettings",
         |env| {
             env.kind == FrameKind::HostSettings
-                && env.parse_payload::<HostSettingsPayload>().is_ok_and(|payload| {
-                    payload.settings.supervisor.enabled
-                })
+                && env
+                    .parse_payload::<HostSettingsPayload>()
+                    .is_ok_and(|payload| payload.settings.supervisor.enabled)
         },
     )
     .await;
@@ -985,10 +976,7 @@ async fn supervisor_settings_round_trip_over_the_wire() {
         19
     );
     assert_eq!(
-        payload
-            .settings
-            .supervisor
-            .auto_compact_min_context_tokens,
+        payload.settings.supervisor.auto_compact_min_context_tokens,
         225_000
     );
     assert_eq!(payload.settings.supervisor.max_kicks_per_task, 7);
@@ -1003,9 +991,7 @@ async fn invalid_supervisor_delay_returns_typed_setting_target() {
         fixture
             .client
             .set_setting(SetSettingPayload {
-                setting: HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds {
-                    seconds,
-                },
+                setting: HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds },
             })
             .await
             .expect("send invalid delay setting");

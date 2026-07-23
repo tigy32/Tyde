@@ -1153,35 +1153,28 @@ fn supervisor_settings_default_apply_and_validate() {
         .expect("enable auto-compact");
     assert!(settings.supervisor.auto_compact_on_success);
     let settings = store
-        .apply(
-            HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 1 },
-        )
+        .apply(HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 1 })
         .expect("minimum inactivity delay is valid");
     assert_eq!(settings.supervisor.auto_compact_inactivity_delay_seconds, 1);
     let settings = store
-        .apply(
-            HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 86_400 },
-        )
+        .apply(HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 86_400 })
         .expect("maximum inactivity delay is valid");
     assert_eq!(
         settings.supervisor.auto_compact_inactivity_delay_seconds,
         86_400
     );
     let settings = store
-        .apply(
-            HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 17 },
-        )
+        .apply(HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 17 })
         .expect("persist non-default inactivity delay");
-    assert_eq!(settings.supervisor.auto_compact_inactivity_delay_seconds, 17);
+    assert_eq!(
+        settings.supervisor.auto_compact_inactivity_delay_seconds,
+        17
+    );
     store
-        .apply(
-            HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 0 },
-        )
+        .apply(HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 0 })
         .expect_err("zero inactivity delay must be rejected");
     store
-        .apply(
-            HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 86_401 },
-        )
+        .apply(HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds: 86_401 })
         .expect_err("inactivity delay above the maximum must be rejected");
     assert_eq!(
         store
@@ -1193,9 +1186,7 @@ fn supervisor_settings_default_apply_and_validate() {
         "rejected updates must not clobber the prior valid delay"
     );
     let settings = store
-        .apply(
-            HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 275_000 },
-        )
+        .apply(HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 275_000 })
         .expect("set auto-compact minimum context");
     assert_eq!(settings.supervisor.auto_compact_min_context_tokens, 275_000);
     assert_eq!(
@@ -1309,8 +1300,8 @@ fn invalid_persisted_supervisor_retry_attempts_is_rejected() {
 }"#,
     )
     .expect("write invalid supervisor settings store");
-    let error = HostSettingsStore::load(path)
-        .expect_err("invalid persisted retry attempts must fail load");
+    let error =
+        HostSettingsStore::load(path).expect_err("invalid persisted retry attempts must fail load");
     assert!(error.contains("retry attempts must be between 0 and 5"));
 }
 

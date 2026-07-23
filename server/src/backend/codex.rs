@@ -21054,7 +21054,10 @@ Do not describe the tool, and do not skip the tool call."#;
                 events[0].pointer("/data/content").and_then(Value::as_str),
                 Some("Codex warning: Internal server error")
             );
-            assert_eq!(events[1].pointer("/data").and_then(Value::as_bool), Some(false));
+            assert_eq!(
+                events[1].pointer("/data").and_then(Value::as_bool),
+                Some(false)
+            );
             assert_eq!(
                 events[2].pointer("/data/sender").and_then(Value::as_str),
                 Some("Error")

@@ -16,12 +16,11 @@ use protocol::{
     HostExecutablePath, HostLaunchProfileConfig, HostSettingValue, LaunchProfileId,
     McpServerConfig, McpServerId, McpTransportConfig, MobileAccessStatePayload, MobileBrokerStatus,
     MobileDeviceState, MobilePairingOfferId, MobilePairingOfferPayload, MobilePairingState,
-    ProjectId, RunBackendSetupPayload, SessionSchemaEntry, SessionSettingField,
+    ProjectId, RunBackendSetupPayload, SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX,
+    SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN, SUPERVISOR_RETRY_ATTEMPTS_MAX,
+    SUPERVISOR_RETRY_ATTEMPTS_MIN, SessionSchemaEntry, SessionSettingField,
     SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SessionSettingsValues,
     SetSettingPayload, Skill, SkillId, Steering, SteeringId, SteeringScope, ToolPolicy,
-    SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX,
-    SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN,
-    SUPERVISOR_RETRY_ATTEMPTS_MAX, SUPERVISOR_RETRY_ATTEMPTS_MIN,
 };
 
 use serde_json::{Map, Value};
@@ -9193,9 +9192,7 @@ mod wasm_tests {
             .dyn_into()
             .expect("auto-compact minimum context is an input");
         let compact_delay: web_sys::HtmlInputElement = container
-            .query_selector(
-                "input[aria-label='Supervisor auto-compact inactivity delay seconds']",
-            )
+            .query_selector("input[aria-label='Supervisor auto-compact inactivity delay seconds']")
             .unwrap()
             .expect("auto-compact inactivity delay input renders")
             .dyn_into()
@@ -9211,7 +9208,10 @@ mod wasm_tests {
             .query_selector(".settings-supervisor-number-unit")
             .unwrap()
             .expect("auto-compact inactivity delay renders a visible unit");
-        assert_eq!(compact_delay_unit.text_content().as_deref(), Some("seconds"));
+        assert_eq!(
+            compact_delay_unit.text_content().as_deref(),
+            Some("seconds")
+        );
         compact_delay.set_value("15");
         dispatch_change(&compact_delay);
         compact_delay.set_value("not-a-number");
@@ -9365,17 +9365,13 @@ mod wasm_tests {
 
         let auto_compact = toggle_for_label(&container, "Auto-compact on success");
         let delay: web_sys::HtmlInputElement = container
-            .query_selector(
-                "input[aria-label='Supervisor auto-compact inactivity delay seconds']",
-            )
+            .query_selector("input[aria-label='Supervisor auto-compact inactivity delay seconds']")
             .unwrap()
             .expect("delay input")
             .dyn_into()
             .expect("delay input element");
         let threshold: web_sys::HtmlInputElement = container
-            .query_selector(
-                "input[aria-label='Supervisor auto-compact minimum context tokens']",
-            )
+            .query_selector("input[aria-label='Supervisor auto-compact minimum context tokens']")
             .unwrap()
             .expect("threshold input")
             .dyn_into()

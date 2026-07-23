@@ -183,11 +183,12 @@ pub(crate) async fn generate_supervision_verdict(
 
     let prompt = build_supervision_prompt(&request);
     let spawn_config = supervision_spawn_config(request.cost_hint);
-    let isolated_workspace = tempfile::tempdir()
-        .map_err(|err| SupervisionFailure::new(
+    let isolated_workspace = tempfile::tempdir().map_err(|err| {
+        SupervisionFailure::new(
             SupervisionFailureKind::BackendStart,
             format!("failed to create isolated supervision workspace: {err}"),
-        ))?;
+        )
+    })?;
     let workspace_roots = vec![isolated_workspace.path().to_string_lossy().into_owned()];
     let initial_input = SendMessagePayload {
         message: prompt,
@@ -297,27 +298,20 @@ async fn collect_supervision_events(
 
 pub(crate) const MOCK_SUPERVISOR_ERROR: &str = "__mock_supervisor_error__";
 pub(crate) const MOCK_SUPERVISOR_INVALID: &str = "__mock_supervisor_invalid__";
-pub(crate) const MOCK_SUPERVISOR_AWAITING_USER: &str =
-    "__mock_supervisor_awaiting_user__";
+pub(crate) const MOCK_SUPERVISOR_AWAITING_USER: &str = "__mock_supervisor_awaiting_user__";
 pub(crate) const MOCK_SUPERVISOR_DONE: &str = "__mock_supervisor_done__";
 pub(crate) const MOCK_SUPERVISOR_CONTINUE: &str = "__mock_supervisor_continue__";
 
 fn generate_mock_supervision_verdict(
     request: &GenerateSupervisionVerdictRequest,
 ) -> Result<SupervisionVerdict, SupervisionFailure> {
-    if request
-        .last_user_message
-        .contains(MOCK_SUPERVISOR_ERROR)
-    {
+    if request.last_user_message.contains(MOCK_SUPERVISOR_ERROR) {
         return Err(SupervisionFailure::new(
             SupervisionFailureKind::BackendStream,
             "mock supervision failure",
         ));
     }
-    if request
-        .last_user_message
-        .contains(MOCK_SUPERVISOR_INVALID)
-    {
+    if request.last_user_message.contains(MOCK_SUPERVISOR_INVALID) {
         return parse_supervision_verdict("this is not a verdict").map_err(|message| {
             SupervisionFailure::new(SupervisionFailureKind::InvalidVerdict, message)
         });
@@ -328,14 +322,10 @@ fn generate_mock_supervision_verdict(
     {
         return Ok(SupervisionVerdict::AwaitingUser);
     }
-    if request.last_user_message.contains(MOCK_SUPERVISOR_DONE)
-    {
+    if request.last_user_message.contains(MOCK_SUPERVISOR_DONE) {
         return Ok(SupervisionVerdict::Done);
     }
-    if request
-        .last_user_message
-        .contains(MOCK_SUPERVISOR_CONTINUE)
-        || request.last_error.is_some()
+    if request.last_user_message.contains(MOCK_SUPERVISOR_CONTINUE) || request.last_error.is_some()
     {
         return Ok(SupervisionVerdict::Continue {
             message: "Please continue working on the task until it is complete.".to_owned(),

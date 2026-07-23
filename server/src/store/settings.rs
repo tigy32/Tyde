@@ -6,8 +6,8 @@ use protocol::{
     BackendKind, BackgroundAgentFeature, BrokerUrl, CodeIntelSettings, HostLaunchProfileConfig,
     HostSettingValue, HostSettings, LaunchProfileId,
     SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX,
-    SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN,
-    SUPERVISOR_RETRY_ATTEMPTS_MAX, SUPERVISOR_RETRY_ATTEMPTS_MIN,
+    SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN, SUPERVISOR_RETRY_ATTEMPTS_MAX,
+    SUPERVISOR_RETRY_ATTEMPTS_MIN,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
