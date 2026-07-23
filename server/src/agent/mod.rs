@@ -8804,20 +8804,31 @@ mod tests {
             .message = crate::backend::mock::MOCK_SLOW_TURN_SENTINEL.to_owned();
         let (handle, startup_rx) =
             spawn_agent_actor(start.agent_id.clone(), start, request, runtime);
+        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+        assert!(handle.attach(replay_stream(output_tx)).await);
         startup_rx
             .await
             .expect("actor startup reply")
             .expect("mock actor startup");
+        let _ =
+            recv_agent_bootstrap_events(&mut output_rx, "busy supervisor warning bootstrap").await;
         timeout(Duration::from_secs(1), async {
             loop {
-                if status_handle.snapshot().await.is_active() {
+                let event = output_rx
+                    .recv()
+                    .await
+                    .expect("busy actor output stream should stay open");
+                if event.kind == FrameKind::ChatEvent
+                    && event
+                        .parse_payload::<ChatEvent>()
+                        .is_ok_and(|event| matches!(event, ChatEvent::TypingStatusChanged(true)))
+                {
                     break;
                 }
-                tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("slow mock turn becomes active");
+        .expect("slow mock turn becomes actor-owned");
 
         let settings = protocol::SupervisorSettings {
             enabled: true,
@@ -8855,19 +8866,17 @@ mod tests {
         );
         timeout(Duration::from_secs(1), async {
             loop {
-                let output = handle
-                    .read_output(None, 100)
+                let event = output_rx
+                    .recv()
                     .await
-                    .expect("actor output while queued");
-                if output.iter().any(|event| {
-                    event.kind == FrameKind::QueuedMessages
-                        && event
-                            .parse_payload::<QueuedMessagesPayload>()
-                            .is_ok_and(|payload| !payload.messages.is_empty())
-                }) {
+                    .expect("busy actor output stream should stay open");
+                if event.kind == FrameKind::QueuedMessages
+                    && event
+                        .parse_payload::<QueuedMessagesPayload>()
+                        .is_ok_and(|payload| !payload.messages.is_empty())
+                {
                     break;
                 }
-                tokio::task::yield_now().await;
             }
         })
         .await

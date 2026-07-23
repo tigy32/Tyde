@@ -576,7 +576,11 @@ mod wasm_tests {
             .query_selector(".chat-card-body")
             .unwrap()
             .expect("warning body");
-        assert_eq!(body.text_content().as_deref(), Some(copy));
+        let paragraph = body
+            .query_selector("p")
+            .unwrap()
+            .expect("warning body paragraph");
+        assert_eq!(paragraph.text_content().as_deref(), Some(copy));
     }
 
     fn input_stat(container: &HtmlElement) -> Option<String> {

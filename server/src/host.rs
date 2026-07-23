@@ -17511,10 +17511,11 @@ fn apply_agent_supervisor_setting(state: &mut HostState, settings: &protocol::Ho
         return;
     }
     state.supervisor_epoch = state.supervisor_epoch.saturating_add(1);
-    let _ = state.supervisor_settings_tx.send(SupervisorSettingsSignal {
+    let next = SupervisorSettingsSignal {
         settings: settings.supervisor,
         epoch: state.supervisor_epoch,
-    });
+    };
+    state.supervisor_settings_tx.send_replace(next);
 }
 
 fn initial_agent_activity_summary_state(
@@ -23840,8 +23841,14 @@ Rules: Record only what remains true and useful for future work; drop transient 
     #[tokio::test]
     async fn settings_commit_during_verdict_await_rearms_without_kick() {
         let fixture = compact_fixture().await;
-        let (agent_id, session_id) =
-            spawn_idle_user_agent(&fixture.host, "stale verdict settings race").await;
+        let (agent_id, session_id) = spawn_idle_user_agent(
+            &fixture.host,
+            &format!(
+                "stale verdict settings race {}",
+                crate::backend::mock::MOCK_USER_BUBBLES_SENTINEL,
+            ),
+        )
+        .await;
         let observation = fixture
             .host
             .activity_summary_observation(&agent_id)
@@ -24003,7 +24010,14 @@ Rules: Record only what remains true and useful for future work; drop transient 
     #[tokio::test]
     async fn deadline_launch_reads_live_epoch_without_rearm_churn() {
         let fixture = compact_fixture().await;
-        let (agent_id, _) = spawn_idle_user_agent(&fixture.host, "live deadline epoch").await;
+        let (agent_id, _) = spawn_idle_user_agent(
+            &fixture.host,
+            &format!(
+                "live deadline epoch {}",
+                crate::backend::mock::MOCK_USER_BUBBLES_SENTINEL,
+            ),
+        )
+        .await;
         fixture
             .host
             .set_setting(SetSettingPayload {
@@ -24223,8 +24237,14 @@ Rules: Record only what remains true and useful for future work; drop transient 
     #[tokio::test]
     async fn failed_verdict_retries_then_continue_delivers_one_kick() {
         let fixture = compact_fixture().await;
-        let (agent_id, session_id) =
-            spawn_idle_user_agent(&fixture.host, "retry then recover").await;
+        let (agent_id, session_id) = spawn_idle_user_agent(
+            &fixture.host,
+            &format!(
+                "retry then recover {}",
+                crate::backend::mock::MOCK_USER_BUBBLES_SENTINEL,
+            ),
+        )
+        .await;
         fixture
             .host
             .set_setting(SetSettingPayload {
@@ -24337,8 +24357,14 @@ Rules: Record only what remains true and useful for future work; drop transient 
     #[tokio::test]
     async fn failure_exhaustion_appends_once_and_only_then_becomes_dormant() {
         let fixture = compact_fixture().await;
-        let (agent_id, session_id) =
-            spawn_idle_user_agent(&fixture.host, "terminal supervisor failure").await;
+        let (agent_id, session_id) = spawn_idle_user_agent(
+            &fixture.host,
+            &format!(
+                "terminal supervisor failure {}",
+                crate::backend::mock::MOCK_USER_BUBBLES_SENTINEL,
+            ),
+        )
+        .await;
         fixture
             .host
             .set_setting(SetSettingPayload {
@@ -24448,8 +24474,14 @@ Rules: Record only what remains true and useful for future work; drop transient 
     #[tokio::test]
     async fn settings_change_at_warning_gate_rejects_stale_append_and_preserves_backoff() {
         let fixture = compact_fixture().await;
-        let (agent_id, session_id) =
-            spawn_idle_user_agent(&fixture.host, "warning settings race").await;
+        let (agent_id, session_id) = spawn_idle_user_agent(
+            &fixture.host,
+            &format!(
+                "warning settings race {}",
+                crate::backend::mock::MOCK_USER_BUBBLES_SENTINEL,
+            ),
+        )
+        .await;
         fixture
             .host
             .set_setting(SetSettingPayload {
@@ -24918,11 +24950,6 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .activity_summary_observation(&agent_id)
             .await
             .expect("idle observation");
-        let status_handle = fixture
-            .host
-            .agent_status_handle(&agent_id)
-            .await
-            .expect("agent status handle");
         let now = Instant::now();
         let mut entries = HashMap::from([(
             agent_id.clone(),
@@ -24974,13 +25001,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         ));
         assert!(verdict_task_state.is_active());
         assert!(starts.try_recv().is_err());
-        status_handle
-            .update(|status| {
-                status.activity_counter = status.activity_counter.saturating_add(1);
-                status.is_thinking = false;
-                status.turn_completed = true;
-            })
-            .await;
+        wait_for_agent_idle(&fixture.host, &agent_id).await;
         observe_supervised_agents(&fixture.host, &mut entries).await;
         let fresh_due = match entries.get(&agent_id).map(|entry| &entry.phase) {
             Some(SupervisorPhase::Debouncing { idle_since }) => {

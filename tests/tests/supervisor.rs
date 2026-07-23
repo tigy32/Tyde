@@ -516,6 +516,10 @@ async fn enabling_after_exact_codex_error_tail_emits_one_kick() {
     )
     .await;
     fixture
+        .host_for_test()
+        .set_session_schema_ready_for_test(BackendKind::Codex)
+        .await;
+    fixture
         .client
         .spawn_agent(SpawnAgentPayload {
             name: Some("codex-error-tail".to_owned()),

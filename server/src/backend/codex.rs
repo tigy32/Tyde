@@ -21041,7 +21041,20 @@ Do not describe the tool, and do not skip the tool call."#;
                 )
                 .await;
 
-            let events = drain_events(&mut rx);
+            let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+            let mut normalization_failures = HashMap::new();
+            while let Ok(event) = rx.try_recv() {
+                assert!(forward_codex_backend_event(
+                    event,
+                    &events_tx,
+                    &mut normalization_failures,
+                ));
+            }
+            drop(events_tx);
+            let mut events = Vec::new();
+            while let Some(event) = events_rx.recv().await {
+                events.push(serde_json::to_value(event).expect("serialize projected Codex event"));
+            }
             assert_eq!(
                 event_kinds(&events),
                 vec!["MessageAdded", "TypingStatusChanged", "MessageAdded"]
