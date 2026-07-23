@@ -846,6 +846,16 @@ preserves attempts and the existing due time. Auto-compaction settings do not
 reset classification retries. Failures are structured server logs and never
 messages in the supervised transcript.
 
+The scheduler tracks the one spawned verdict task independently from agent
+phases. Activity or disable/re-enable may replace that task's old phase, but
+verdict deadlines remain suppressed until the task releases its permit and its
+completion or abort event is dequeued. This prevents a fresh past-due phase
+from spinning while an older generation still owns the call slot. Attempt
+counting occurs only after the final activity observation and the immediately
+following authoritative verdict-settings check; pre-start settings changes
+therefore rearm for free, while settings changes after spawn retain the spent
+attempt.
+
 A failed Codex turn that emits a warning, authoritative idle status, and a
 nonfatal error remains eligible for supervision. Startup and disabled-to-
 enabled transitions observe already-idle eligible agents, so no active-to-idle

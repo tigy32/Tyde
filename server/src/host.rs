@@ -350,6 +350,9 @@ const SUPERVISION_RETRY_DELAYS: [Duration; 5] = [
     Duration::from_secs(240),
     Duration::from_secs(480),
 ];
+const _: () = assert!(
+    SUPERVISION_RETRY_DELAYS.len() == protocol::SUPERVISOR_RETRY_ATTEMPTS_MAX as usize
+);
 /// How long the supervisor waits for an auto-compaction it requested to
 /// reach a terminal notify before giving up on observing it (the compaction
 /// itself keeps running server-side either way).
@@ -438,6 +441,36 @@ enum SupervisorPhase {
     Compacting,
 }
 
+#[derive(Default)]
+struct SupervisorVerdictTaskState {
+    active_task_id: Option<u64>,
+    next_task_id: u64,
+}
+
+impl SupervisorVerdictTaskState {
+    fn reserve(&mut self) -> Option<u64> {
+        if self.active_task_id.is_some() {
+            return None;
+        }
+        let task_id = self.next_task_id;
+        self.next_task_id = self.next_task_id.wrapping_add(1);
+        self.active_task_id = Some(task_id);
+        Some(task_id)
+    }
+
+    fn finish(&mut self, task_id: u64) -> bool {
+        if self.active_task_id != Some(task_id) {
+            return false;
+        }
+        self.active_task_id = None;
+        true
+    }
+
+    fn is_active(&self) -> bool {
+        self.active_task_id.is_some()
+    }
+}
+
 struct SupervisorVerdictTaskResult {
     agent_id: AgentId,
     activity_counter: u64,
@@ -448,6 +481,42 @@ struct SupervisorVerdictTaskResult {
         crate::agent::supervisor::SupervisionVerdict,
         crate::agent::supervisor::SupervisionFailure,
     >,
+}
+
+struct SupervisorVerdictTaskEvent {
+    task_id: u64,
+    result: SupervisorVerdictTaskResult,
+}
+
+struct SupervisorVerdictTaskCompletion {
+    task_id: u64,
+    tx: mpsc::UnboundedSender<SupervisorVerdictTaskEvent>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    aborted: Option<SupervisorVerdictTaskResult>,
+}
+
+impl SupervisorVerdictTaskCompletion {
+    fn complete(mut self, result: SupervisorVerdictTaskResult) {
+        self.permit.take();
+        self.aborted = None;
+        let _ = self.tx.send(SupervisorVerdictTaskEvent {
+            task_id: self.task_id,
+            result,
+        });
+    }
+}
+
+impl Drop for SupervisorVerdictTaskCompletion {
+    fn drop(&mut self) {
+        self.permit.take();
+        let Some(result) = self.aborted.take() else {
+            return;
+        };
+        let _ = self.tx.send(SupervisorVerdictTaskEvent {
+            task_id: self.task_id,
+            result,
+        });
+    }
 }
 
 enum SupervisorCompactionTaskEvent {
@@ -515,6 +584,157 @@ async fn wait_for_supervisor_verdict_post_sample_test_gate(agent_id: &AgentId) {
 
 #[cfg(not(test))]
 async fn wait_for_supervisor_verdict_post_sample_test_gate(_agent_id: &AgentId) {}
+
+#[cfg(test)]
+struct SupervisorVerdictPreStartTestGate {
+    entered: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+fn supervisor_verdict_pre_start_test_gates(
+) -> &'static StdMutex<HashMap<AgentId, SupervisorVerdictPreStartTestGate>> {
+    static GATES: std::sync::OnceLock<
+        StdMutex<HashMap<AgentId, SupervisorVerdictPreStartTestGate>>,
+    > = std::sync::OnceLock::new();
+    GATES.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn install_supervisor_verdict_pre_start_test_gate(
+    agent_id: AgentId,
+) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let replaced = supervisor_verdict_pre_start_test_gates()
+        .lock()
+        .expect("supervisor verdict pre-start test gate mutex poisoned")
+        .insert(
+            agent_id,
+            SupervisorVerdictPreStartTestGate {
+                entered: entered_tx,
+                release: release_rx,
+            },
+        );
+    assert!(replaced.is_none(), "pre-start test gate already installed");
+    (entered_rx, release_tx)
+}
+
+#[cfg(test)]
+async fn wait_for_supervisor_verdict_pre_start_test_gate(agent_id: &AgentId) {
+    let gate = {
+        supervisor_verdict_pre_start_test_gates()
+            .lock()
+            .expect("supervisor verdict pre-start test gate mutex poisoned")
+            .remove(agent_id)
+    };
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(());
+        let _ = gate.release.await;
+    }
+}
+
+#[cfg(not(test))]
+async fn wait_for_supervisor_verdict_pre_start_test_gate(_agent_id: &AgentId) {}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SupervisorVerdictCallStart {
+    agent_id: AgentId,
+    activity_counter: u64,
+    attempts_started: u8,
+    cost_hint: Option<protocol::SpawnCostHint>,
+}
+
+#[cfg(test)]
+struct SupervisorVerdictCallTestGate {
+    agent_id: AgentId,
+    started: mpsc::UnboundedSender<SupervisorVerdictCallStart>,
+    releases: mpsc::UnboundedReceiver<()>,
+}
+
+#[cfg(test)]
+fn supervisor_verdict_call_test_gates(
+) -> &'static StdMutex<HashMap<AgentId, SupervisorVerdictCallTestGate>> {
+    static GATES: std::sync::OnceLock<
+        StdMutex<HashMap<AgentId, SupervisorVerdictCallTestGate>>,
+    > = std::sync::OnceLock::new();
+    GATES.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn install_supervisor_verdict_call_test_gate(
+    agent_id: AgentId,
+) -> (
+    mpsc::UnboundedReceiver<SupervisorVerdictCallStart>,
+    mpsc::UnboundedSender<()>,
+) {
+    let (started_tx, started_rx) = mpsc::unbounded_channel();
+    let (release_tx, release_rx) = mpsc::unbounded_channel();
+    let replaced = supervisor_verdict_call_test_gates()
+        .lock()
+        .expect("supervisor verdict call test gate mutex poisoned")
+        .insert(
+            agent_id.clone(),
+            SupervisorVerdictCallTestGate {
+                agent_id,
+                started: started_tx,
+                releases: release_rx,
+            },
+        );
+    assert!(replaced.is_none(), "call test gate already installed");
+    (started_rx, release_tx)
+}
+
+#[cfg(test)]
+fn remove_supervisor_verdict_call_test_gate(agent_id: &AgentId) {
+    let gate = supervisor_verdict_call_test_gates()
+        .lock()
+        .expect("supervisor verdict call test gate mutex poisoned")
+        .remove(agent_id);
+    assert!(
+        gate.as_ref().is_some_and(|gate| &gate.agent_id == agent_id),
+        "call test gate belonged to another agent"
+    );
+}
+
+#[cfg(test)]
+async fn wait_for_supervisor_verdict_call_test_gate(
+    agent_id: &AgentId,
+    activity_counter: u64,
+    attempts_started: u8,
+    cost_hint: Option<protocol::SpawnCostHint>,
+) {
+    let gate = {
+        supervisor_verdict_call_test_gates()
+            .lock()
+            .expect("supervisor verdict call test gate mutex poisoned")
+            .remove(agent_id)
+    };
+    let Some(mut gate) = gate else {
+        return;
+    };
+    let _ = gate.started.send(SupervisorVerdictCallStart {
+        agent_id: agent_id.clone(),
+        activity_counter,
+        attempts_started,
+        cost_hint,
+    });
+    let _ = gate.releases.recv().await;
+    supervisor_verdict_call_test_gates()
+        .lock()
+        .expect("supervisor verdict call test gate mutex poisoned")
+        .insert(agent_id.clone(), gate);
+}
+
+#[cfg(not(test))]
+async fn wait_for_supervisor_verdict_call_test_gate(
+    _agent_id: &AgentId,
+    _activity_counter: u64,
+    _attempts_started: u8,
+    _cost_hint: Option<protocol::SpawnCostHint>,
+) {
+}
 
 #[derive(Clone)]
 struct ActivitySummaryObservation {
@@ -13090,10 +13310,11 @@ fn spawn_agent_supervisor_task(host: HostHandle) {
         let mut status_rx = host.subscribe_agent_status_changes().await;
         let mut settings_rx = host.supervisor_settings_receiver().await;
         let (verdict_tx, mut verdict_rx) =
-            mpsc::unbounded_channel::<SupervisorVerdictTaskResult>();
+            mpsc::unbounded_channel::<SupervisorVerdictTaskEvent>();
         let (compaction_tx, mut compaction_rx) =
             mpsc::unbounded_channel::<SupervisorCompactionTaskEvent>();
         let semaphore = Arc::new(Semaphore::new(1));
+        let mut verdict_task_state = SupervisorVerdictTaskState::default();
         let mut entries = HashMap::<AgentId, SupervisorSchedulerEntry>::new();
         let mut last_seen_settings = *settings_rx.borrow();
 
@@ -13103,7 +13324,11 @@ fn spawn_agent_supervisor_task(host: HostHandle) {
 
         loop {
             let current_settings = *settings_rx.borrow();
-            let next_deadline = supervisor_next_deadline(&entries, current_settings);
+            let next_deadline = supervisor_next_deadline(
+                &entries,
+                current_settings,
+                verdict_task_state.is_active(),
+            );
             let sleep_until = next_deadline.unwrap_or_else(|| {
                 Instant::now()
                     .checked_add(Duration::from_secs(86_400))
@@ -13137,13 +13362,21 @@ fn spawn_agent_supervisor_task(host: HostHandle) {
                     )
                     .await;
                 }
-                Some(result) = verdict_rx.recv() => {
+                Some(event) = verdict_rx.recv() => {
+                    if !verdict_task_state.finish(event.task_id) {
+                        tracing::warn!(
+                            task_id = event.task_id,
+                            "dropping an unowned supervisor verdict task result"
+                        );
+                        continue;
+                    }
                     let current = *settings_rx.borrow();
                     accept_supervision_verdict_result(
                         &host,
                         &mut entries,
                         current,
-                        result,
+                        event.result,
+                        Instant::now(),
                     )
                     .await;
                 }
@@ -13202,6 +13435,7 @@ fn spawn_agent_supervisor_task(host: HostHandle) {
                         &verdict_tx,
                         &compaction_tx,
                         &semaphore,
+                        &mut verdict_task_state,
                     )
                     .await;
                 }
@@ -13238,9 +13472,10 @@ async fn process_supervisor_deadlines_from_signal(
     host: &HostHandle,
     entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
     settings_rx: &watch::Receiver<SupervisorSettingsSignal>,
-    verdict_tx: &mpsc::UnboundedSender<SupervisorVerdictTaskResult>,
+    verdict_tx: &mpsc::UnboundedSender<SupervisorVerdictTaskEvent>,
     compaction_tx: &mpsc::UnboundedSender<SupervisorCompactionTaskEvent>,
     semaphore: &Arc<Semaphore>,
+    verdict_task_state: &mut SupervisorVerdictTaskState,
 ) {
     let settings = *settings_rx.borrow();
     process_supervisor_deadlines(
@@ -13250,6 +13485,7 @@ async fn process_supervisor_deadlines_from_signal(
         verdict_tx,
         compaction_tx,
         semaphore,
+        verdict_task_state,
     )
     .await;
 }
@@ -13420,17 +13656,17 @@ async fn observe_supervised_agents(
 fn supervisor_next_deadline(
     entries: &HashMap<AgentId, SupervisorSchedulerEntry>,
     settings: SupervisorSettingsSignal,
+    verdict_task_in_flight: bool,
 ) -> Option<Instant> {
-    let verdict_in_flight = entries
-        .values()
-        .any(|entry| matches!(entry.phase, SupervisorPhase::VerdictInFlight { .. }));
     entries
         .values()
         .filter_map(|entry| match &entry.phase {
-            SupervisorPhase::Debouncing { idle_since } if !verdict_in_flight => {
+            SupervisorPhase::Debouncing { idle_since } if !verdict_task_in_flight => {
                 idle_since.checked_add(SUPERVISION_DEBOUNCE)
             }
-            SupervisorPhase::RetryPending { due_at, .. } if !verdict_in_flight => Some(*due_at),
+            SupervisorPhase::RetryPending { due_at, .. } if !verdict_task_in_flight => {
+                Some(*due_at)
+            }
             SupervisorPhase::DoneAuthorized {
                 idle_since,
                 last_gate_evaluation_epoch,
@@ -13453,40 +13689,68 @@ async fn process_supervisor_deadlines(
     host: &HostHandle,
     entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
     settings: SupervisorSettingsSignal,
-    verdict_tx: &mpsc::UnboundedSender<SupervisorVerdictTaskResult>,
+    verdict_tx: &mpsc::UnboundedSender<SupervisorVerdictTaskEvent>,
     compaction_tx: &mpsc::UnboundedSender<SupervisorCompactionTaskEvent>,
     semaphore: &Arc<Semaphore>,
+    verdict_task_state: &mut SupervisorVerdictTaskState,
 ) {
-    let now = Instant::now();
-    let due_debounces = entries
-        .iter()
-        .filter_map(|(agent_id, entry)| match &entry.phase {
-            SupervisorPhase::Debouncing { idle_since }
-                if idle_since
-                    .checked_add(SUPERVISION_DEBOUNCE)
-                    .is_some_and(|due| due <= now) =>
-            {
-                Some(agent_id.clone())
+    process_supervisor_deadlines_at(
+        host,
+        entries,
+        settings,
+        verdict_tx,
+        compaction_tx,
+        semaphore,
+        verdict_task_state,
+        Instant::now(),
+    )
+    .await;
+}
+
+async fn process_supervisor_deadlines_at(
+    host: &HostHandle,
+    entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
+    settings: SupervisorSettingsSignal,
+    verdict_tx: &mpsc::UnboundedSender<SupervisorVerdictTaskEvent>,
+    compaction_tx: &mpsc::UnboundedSender<SupervisorCompactionTaskEvent>,
+    semaphore: &Arc<Semaphore>,
+    verdict_task_state: &mut SupervisorVerdictTaskState,
+    now: Instant,
+) {
+    if !verdict_task_state.is_active() {
+        let due_debounces = entries
+            .iter()
+            .filter_map(|(agent_id, entry)| match &entry.phase {
+                SupervisorPhase::Debouncing { idle_since }
+                    if idle_since
+                        .checked_add(SUPERVISION_DEBOUNCE)
+                        .is_some_and(|due| due <= now) =>
+                {
+                    Some(agent_id.clone())
+                }
+                SupervisorPhase::RetryPending { due_at, .. } if *due_at <= now => {
+                    Some(agent_id.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for agent_id in due_debounces {
+            launch_supervision_verdict(
+                host,
+                entries,
+                agent_id,
+                settings,
+                verdict_tx,
+                semaphore,
+                verdict_task_state,
+            )
+            .await;
+            if verdict_task_state.is_active() {
+                break;
             }
-            SupervisorPhase::RetryPending { due_at, .. } if *due_at <= now => {
-                Some(agent_id.clone())
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    for agent_id in due_debounces {
-        launch_supervision_verdict(
-            host,
-            entries,
-            agent_id,
-            settings,
-            verdict_tx,
-            semaphore,
-        )
-        .await;
+        }
     }
 
-    let now = Instant::now();
     let due_compactions = entries
         .iter()
         .filter_map(|(agent_id, entry)| match &entry.phase {
@@ -13526,9 +13790,13 @@ async fn launch_supervision_verdict(
     entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
     agent_id: AgentId,
     settings: SupervisorSettingsSignal,
-    verdict_tx: &mpsc::UnboundedSender<SupervisorVerdictTaskResult>,
+    verdict_tx: &mpsc::UnboundedSender<SupervisorVerdictTaskEvent>,
     semaphore: &Arc<Semaphore>,
+    verdict_task_state: &mut SupervisorVerdictTaskState,
 ) {
+    if verdict_task_state.is_active() {
+        return;
+    }
     let Some(entry) = entries.get(&agent_id) else {
         return;
     };
@@ -13660,14 +13928,8 @@ async fn launch_supervision_verdict(
     let Ok(permit) = Arc::clone(semaphore).try_acquire_owned() else {
         return;
     };
-    let live_settings = host.supervisor_settings_signal().await;
     let verdict_settings = VerdictSettingsFingerprint::from(settings.settings);
-    if !live_settings.settings.enabled
-        || VerdictSettingsFingerprint::from(live_settings.settings) != verdict_settings
-    {
-        drop(permit);
-        return;
-    }
+    wait_for_supervisor_verdict_pre_start_test_gate(&agent_id).await;
     let Some(live_observation) = host.activity_summary_observation(&agent_id).await else {
         drop(permit);
         entries.remove(&agent_id);
@@ -13682,7 +13944,18 @@ async fn launch_supervision_verdict(
         observe_supervised_agents(host, entries).await;
         return;
     }
+    let live_settings = host.supervisor_settings_signal().await;
+    if !live_settings.settings.enabled
+        || VerdictSettingsFingerprint::from(live_settings.settings) != verdict_settings
+    {
+        drop(permit);
+        return;
+    }
     let attempts_started = attempts_started.saturating_add(1);
+    let Some(task_id) = verdict_task_state.reserve() else {
+        drop(permit);
+        return;
+    };
     entries.get_mut(&agent_id).expect("entry exists").phase =
         SupervisorPhase::VerdictInFlight {
             idle_since,
@@ -13698,7 +13971,31 @@ async fn launch_supervision_verdict(
         previous_verdict_settings = ?previous_verdict_settings,
         "starting agent supervision verdict attempt"
     );
+    let aborted_result = SupervisorVerdictTaskResult {
+        agent_id: agent_id.clone(),
+        activity_counter,
+        baseline: baseline.clone(),
+        attempts_started,
+        verdict_settings,
+        result: Err(crate::agent::supervisor::SupervisionFailure {
+            kind: crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+            message: "supervision verdict task aborted before completion".to_owned(),
+        }),
+    };
+    let completion = SupervisorVerdictTaskCompletion {
+        task_id,
+        tx,
+        permit: Some(permit),
+        aborted: Some(aborted_result),
+    };
     tokio::spawn(async move {
+        wait_for_supervisor_verdict_call_test_gate(
+            &agent_id,
+            activity_counter,
+            attempts_started,
+            cost_hint,
+        )
+        .await;
         let request = crate::agent::supervisor::GenerateSupervisionVerdictRequest {
             verdict_agent_id: AgentId(Uuid::new_v4().to_string()),
             backend_kind,
@@ -13727,8 +14024,7 @@ async fn launch_supervision_verdict(
                 ),
             }),
         };
-        drop(permit);
-        let _ = tx.send(SupervisorVerdictTaskResult {
+        completion.complete(SupervisorVerdictTaskResult {
             agent_id,
             activity_counter,
             baseline,
@@ -13737,29 +14033,6 @@ async fn launch_supervision_verdict(
             result,
         });
     });
-}
-
-fn schedule_supervision_retry(
-    entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
-    agent_id: &AgentId,
-    idle_since: Instant,
-    baseline: SupervisionBaseline,
-    attempts_started: u8,
-    settings: protocol::SupervisorSettings,
-    reason: SupervisionRetryReason,
-    message: Option<String>,
-) {
-    schedule_supervision_retry_at(
-        entries,
-        agent_id,
-        idle_since,
-        baseline,
-        attempts_started,
-        settings,
-        reason,
-        message,
-        Instant::now(),
-    );
 }
 
 fn schedule_supervision_retry_at(
@@ -13814,6 +14087,7 @@ async fn accept_supervision_verdict_result(
     entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
     settings: SupervisorSettingsSignal,
     result: SupervisorVerdictTaskResult,
+    result_dequeued_at: Instant,
 ) {
     let live_settings = host.supervisor_settings_signal().await;
     wait_for_supervisor_verdict_post_sample_test_gate(&result.agent_id).await;
@@ -13852,7 +14126,7 @@ async fn accept_supervision_verdict_result(
     if VerdictSettingsFingerprint::from(settings.settings) != result.verdict_settings
         || VerdictSettingsFingerprint::from(live_settings.settings) != result.verdict_settings
     {
-        schedule_supervision_retry(
+        schedule_supervision_retry_at(
             entries,
             &result.agent_id,
             idle_since,
@@ -13861,6 +14135,7 @@ async fn accept_supervision_verdict_result(
             live_settings.settings,
             SupervisionRetryReason::SettingsChanged,
             None,
+            result_dequeued_at,
         );
         return;
     }
@@ -13915,7 +14190,7 @@ async fn accept_supervision_verdict_result(
         return;
     }
     if VerdictSettingsFingerprint::from(final_settings.settings) != result.verdict_settings {
-        schedule_supervision_retry(
+        schedule_supervision_retry_at(
             entries,
             &result.agent_id,
             idle_since,
@@ -13924,6 +14199,7 @@ async fn accept_supervision_verdict_result(
             final_settings.settings,
             SupervisionRetryReason::SettingsChanged,
             None,
+            result_dequeued_at,
         );
         return;
     }
@@ -13931,7 +14207,7 @@ async fn accept_supervision_verdict_result(
     let verdict = match result.result {
         Ok(verdict) => verdict,
         Err(error) => {
-            schedule_supervision_retry(
+            schedule_supervision_retry_at(
                 entries,
                 &result.agent_id,
                 idle_since,
@@ -13940,6 +14216,7 @@ async fn accept_supervision_verdict_result(
                 final_settings.settings,
                 SupervisionRetryReason::Failure(error.kind),
                 Some(error.message),
+                result_dequeued_at,
             );
             return;
         }
@@ -23204,6 +23481,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                     settings: supervisor,
                     epoch: 1,
                 },
+                false,
             ),
             idle_since.checked_add(Duration::from_secs(600))
         );
@@ -23215,6 +23493,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                     settings: supervisor,
                     epoch: 2,
                 },
+                false,
             ),
             idle_since.checked_add(Duration::from_secs(30))
         );
@@ -23252,6 +23531,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                     settings: supervisor,
                     epoch: 4,
                 },
+                false,
             ),
             None
         );
@@ -23262,6 +23542,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                     settings: supervisor,
                     epoch: 5,
                 },
+                false,
             ),
             idle_since.checked_add(Duration::from_secs(1))
         );
@@ -23374,6 +23655,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                         message: "stale kick must not be sent".to_owned(),
                     }),
                 },
+                Instant::now(),
             )
             .await;
             entries
@@ -23442,6 +23724,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 verdict_settings: VerdictSettingsFingerprint::from(live_settings.settings),
                 result: Ok(crate::agent::supervisor::SupervisionVerdict::Done),
             },
+            Instant::now(),
         )
         .await;
         assert!(matches!(
@@ -23464,6 +23747,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 verdict_settings: VerdictSettingsFingerprint::from(live_settings.settings),
                 result: Ok(crate::agent::supervisor::SupervisionVerdict::AwaitingUser),
             },
+            Instant::now(),
         )
         .await;
         assert!(matches!(
@@ -23513,6 +23797,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         let (verdict_tx, _verdict_rx) = mpsc::unbounded_channel();
         let (compaction_tx, _compaction_rx) = mpsc::unbounded_channel();
         let semaphore = Arc::new(Semaphore::new(1));
+        let mut verdict_task_state = SupervisorVerdictTaskState::default();
 
         launch_supervision_verdict(
             &fixture.host,
@@ -23521,6 +23806,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             stale_settings,
             &verdict_tx,
             &semaphore,
+            &mut verdict_task_state,
         )
         .await;
         assert!(matches!(
@@ -23536,6 +23822,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             &verdict_tx,
             &compaction_tx,
             &semaphore,
+            &mut verdict_task_state,
         )
         .await;
 
@@ -23673,16 +23960,18 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .activity_summary_observation(&agent_id)
             .await
             .expect("agent observation");
-        assert!(observation
-            .handle
-            .send_input(AgentInput::SendMessage(SendMessagePayload {
-                message: crate::backend::mock::MOCK_SLOW_TURN_SENTINEL.to_owned(),
-                images: None,
-                origin: Some(MessageOrigin::User),
-                tool_response: None,
-            }))
-            .await);
-        wait_for_agent_active(&fixture.host, &agent_id).await;
+        let status_handle = fixture
+            .host
+            .agent_status_handle(&agent_id)
+            .await
+            .expect("agent status handle");
+        status_handle
+            .update(|status| {
+                status.activity_counter = status.activity_counter.saturating_add(1);
+                status.is_thinking = true;
+                status.turn_completed = false;
+            })
+            .await;
         observe_supervised_agents(&fixture.host, &mut entries).await;
 
         let entry = entries.get(&agent_id).expect("scheduler entry");
@@ -23749,6 +24038,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                     message: "temporary outage".to_owned(),
                 }),
             },
+            Instant::now(),
         )
         .await;
         assert!(matches!(
@@ -23780,6 +24070,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                     message: "continue after recovery".to_owned(),
                 }),
             },
+            Instant::now(),
         )
         .await;
         assert!(matches!(
@@ -23800,6 +24091,720 @@ Rules: Record only what remains true and useful for future work; drop transient 
             tokio::task::yield_now().await;
         }
         assert_eq!(kicks, 1);
+    }
+
+    async fn accept_next_supervisor_task_event(
+        host: &HostHandle,
+        entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
+        settings: SupervisorSettingsSignal,
+        verdict_task_state: &mut SupervisorVerdictTaskState,
+        verdict_rx: &mut mpsc::UnboundedReceiver<SupervisorVerdictTaskEvent>,
+        result_dequeued_at: Instant,
+    ) {
+        let event = verdict_rx.recv().await.expect("supervisor task result");
+        assert!(
+            verdict_task_state.finish(event.task_id),
+            "result must clear the actual scheduler-owned task"
+        );
+        accept_supervision_verdict_result(
+            host,
+            entries,
+            settings,
+            event.result,
+            result_dequeued_at,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn aborted_verdict_task_releases_permit_and_reports_completion() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&semaphore)
+            .try_acquire_owned()
+            .expect("test permit");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut task_state = SupervisorVerdictTaskState::default();
+        let task_id = task_state.reserve().expect("reserve task");
+        let completion = SupervisorVerdictTaskCompletion {
+            task_id,
+            tx,
+            permit: Some(permit),
+            aborted: Some(SupervisorVerdictTaskResult {
+                agent_id: AgentId("aborted-verdict".to_owned()),
+                activity_counter: 1,
+                baseline: SupervisionBaseline {
+                    last_user_message: "request".to_owned(),
+                    kicks_since_user_message: 0,
+                    session_id: None,
+                },
+                attempts_started: 1,
+                verdict_settings: VerdictSettingsFingerprint::from(
+                    protocol::SupervisorSettings::default(),
+                ),
+                result: Err(crate::agent::supervisor::SupervisionFailure {
+                    kind: crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+                    message: "task aborted".to_owned(),
+                }),
+            }),
+        };
+        let task = tokio::spawn(async move {
+            let _completion = completion;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+        let event = rx.recv().await.expect("abort completion event");
+        assert_eq!(semaphore.available_permits(), 1);
+        assert!(task_state.finish(event.task_id));
+        assert!(!task_state.is_active());
+        assert!(matches!(
+            event.result.result,
+            Err(crate::agent::supervisor::SupervisionFailure {
+                kind: crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn production_retry_scheduler_starts_exact_bounded_calls_at_due_deadlines() {
+        for (retry_attempts, expected_calls) in [(0, 1_u8), (1, 2), (5, 6)] {
+            let fixture = compact_fixture().await;
+            fixture
+                .host
+                .set_setting(SetSettingPayload {
+                    setting: HostSettingValue::SupervisorRetryAttempts {
+                        count: retry_attempts,
+                    },
+                })
+                .await
+                .expect("set retry budget");
+            let (agent_id, _) = spawn_idle_user_agent(
+                &fixture.host,
+                &format!(
+                    "{} {}",
+                    crate::backend::mock::MOCK_USER_BUBBLES_SENTINEL,
+                    crate::agent::supervisor::MOCK_SUPERVISOR_ERROR,
+                ),
+            )
+            .await;
+            fixture
+                .host
+                .set_setting(SetSettingPayload {
+                    setting: HostSettingValue::SupervisorEnabled { enabled: true },
+                })
+                .await
+                .expect("enable supervisor");
+            let settings = fixture.host.supervisor_settings_signal().await;
+            let observation = fixture
+                .host
+                .activity_summary_observation(&agent_id)
+                .await
+                .expect("idle observation");
+            let launch_at = Instant::now();
+            let mut entries = HashMap::from([(
+                agent_id.clone(),
+                SupervisorSchedulerEntry {
+                    last_activity_counter: observation.status.activity_counter,
+                    phase: SupervisorPhase::Debouncing {
+                        idle_since: launch_at.checked_sub(SUPERVISION_DEBOUNCE).unwrap(),
+                    },
+                },
+            )]);
+            let (verdict_tx, mut verdict_rx) = mpsc::unbounded_channel();
+            let (compaction_tx, _compaction_rx) = mpsc::unbounded_channel();
+            let semaphore = Arc::new(Semaphore::new(1));
+            let mut verdict_task_state = SupervisorVerdictTaskState::default();
+            let (mut starts, releases) =
+                install_supervisor_verdict_call_test_gate(agent_id.clone());
+
+            for expected_attempt in 1..=expected_calls {
+                let due_at = match entries.get(&agent_id).map(|entry| &entry.phase) {
+                    Some(SupervisorPhase::Debouncing { .. }) => launch_at,
+                    Some(SupervisorPhase::RetryPending { due_at, .. }) => *due_at,
+                    _ => panic!("attempt {expected_attempt} must have a due phase"),
+                };
+                if expected_attempt > 1 {
+                    process_supervisor_deadlines_at(
+                        &fixture.host,
+                        &mut entries,
+                        settings,
+                        &verdict_tx,
+                        &compaction_tx,
+                        &semaphore,
+                        &mut verdict_task_state,
+                        due_at.checked_sub(Duration::from_nanos(1)).unwrap(),
+                    )
+                    .await;
+                    assert!(!verdict_task_state.is_active());
+                    assert!(starts.try_recv().is_err(), "retry started before due");
+                }
+                process_supervisor_deadlines_at(
+                    &fixture.host,
+                    &mut entries,
+                    settings,
+                    &verdict_tx,
+                    &compaction_tx,
+                    &semaphore,
+                    &mut verdict_task_state,
+                    due_at,
+                )
+                .await;
+                let start = starts.recv().await.expect("recorded verdict call start");
+                assert_eq!(start.agent_id, agent_id);
+                assert_eq!(start.activity_counter, observation.status.activity_counter);
+                assert_eq!(start.attempts_started, expected_attempt);
+                assert_eq!(start.cost_hint, Some(protocol::SpawnCostHint::Low));
+                assert!(verdict_task_state.is_active());
+                releases.send(()).expect("release verdict call");
+                let result_at = due_at.checked_add(Duration::from_secs(1)).unwrap();
+                accept_next_supervisor_task_event(
+                    &fixture.host,
+                    &mut entries,
+                    settings,
+                    &mut verdict_task_state,
+                    &mut verdict_rx,
+                    result_at,
+                )
+                .await;
+                if expected_attempt < expected_calls {
+                    let expected_due = result_at
+                        .checked_add(
+                            SUPERVISION_RETRY_DELAYS[usize::from(expected_attempt - 1)],
+                        )
+                        .unwrap();
+                    assert!(matches!(
+                        entries.get(&agent_id).map(|entry| &entry.phase),
+                        Some(SupervisorPhase::RetryPending { due_at, .. })
+                            if *due_at == expected_due
+                    ));
+                }
+            }
+
+            assert!(matches!(
+                entries.get(&agent_id).map(|entry| &entry.phase),
+                Some(SupervisorPhase::Dormant { .. })
+            ));
+            assert_eq!(
+                supervisor_next_deadline(&entries, settings, verdict_task_state.is_active()),
+                None
+            );
+            assert!(starts.try_recv().is_err());
+            remove_supervisor_verdict_call_test_gate(&agent_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn production_scheduler_occupancy_survives_activity_and_disable_phase_resets() {
+        let fixture = compact_fixture().await;
+        let (agent_id, _) = spawn_idle_user_agent(
+            &fixture.host,
+            &format!(
+                "occupancy {}",
+                crate::backend::mock::MOCK_USER_BUBBLES_SENTINEL,
+            ),
+        )
+        .await;
+        fixture
+            .host
+            .set_setting(SetSettingPayload {
+                setting: HostSettingValue::SupervisorEnabled { enabled: true },
+            })
+            .await
+            .expect("enable supervisor");
+        let settings = fixture.host.supervisor_settings_signal().await;
+        let observation = fixture
+            .host
+            .activity_summary_observation(&agent_id)
+            .await
+            .expect("idle observation");
+        let now = Instant::now();
+        let mut entries = HashMap::from([(
+            agent_id.clone(),
+            SupervisorSchedulerEntry {
+                last_activity_counter: observation.status.activity_counter,
+                phase: SupervisorPhase::Debouncing {
+                    idle_since: now.checked_sub(SUPERVISION_DEBOUNCE).unwrap(),
+                },
+            },
+        )]);
+        let (verdict_tx, mut verdict_rx) = mpsc::unbounded_channel();
+        let (compaction_tx, _compaction_rx) = mpsc::unbounded_channel();
+        let semaphore = Arc::new(Semaphore::new(1));
+        let mut verdict_task_state = SupervisorVerdictTaskState::default();
+        let (mut starts, releases) =
+            install_supervisor_verdict_call_test_gate(agent_id.clone());
+
+        process_supervisor_deadlines_at(
+            &fixture.host,
+            &mut entries,
+            settings,
+            &verdict_tx,
+            &compaction_tx,
+            &semaphore,
+            &mut verdict_task_state,
+            now,
+        )
+        .await;
+        let first_start = starts.recv().await.expect("first held verdict call");
+        assert_eq!(first_start.attempts_started, 1);
+
+        assert!(observation
+            .handle
+            .send_input(AgentInput::SendMessage(SendMessagePayload {
+                message: crate::backend::mock::MOCK_SLOW_TURN_SENTINEL.to_owned(),
+                images: None,
+                origin: Some(MessageOrigin::User),
+                tool_response: None,
+            }))
+            .await);
+        wait_for_agent_active(&fixture.host, &agent_id).await;
+        observe_supervised_agents(&fixture.host, &mut entries).await;
+        assert!(matches!(
+            entries.get(&agent_id).map(|entry| &entry.phase),
+            Some(SupervisorPhase::Active)
+        ));
+        status_handle
+            .update(|status| {
+                status.activity_counter = status.activity_counter.saturating_add(1);
+                status.is_thinking = false;
+                status.turn_completed = true;
+            })
+            .await;
+        observe_supervised_agents(&fixture.host, &mut entries).await;
+        let fresh_due = match entries.get(&agent_id).map(|entry| &entry.phase) {
+            Some(SupervisorPhase::Debouncing { idle_since }) => {
+                idle_since.checked_add(SUPERVISION_DEBOUNCE).unwrap()
+            }
+            _ => panic!("new activity generation must debounce"),
+        };
+        for _ in 0..100 {
+            assert_eq!(
+                supervisor_next_deadline(&entries, settings, verdict_task_state.is_active()),
+                None
+            );
+            process_supervisor_deadlines_at(
+                &fixture.host,
+                &mut entries,
+                settings,
+                &verdict_tx,
+                &compaction_tx,
+                &semaphore,
+                &mut verdict_task_state,
+                fresh_due,
+            )
+            .await;
+        }
+        assert!(starts.try_recv().is_err());
+
+        releases.send(()).expect("release stale activity call");
+        accept_next_supervisor_task_event(
+            &fixture.host,
+            &mut entries,
+            settings,
+            &mut verdict_task_state,
+            &mut verdict_rx,
+            Instant::now(),
+        )
+        .await;
+        process_supervisor_deadlines_at(
+            &fixture.host,
+            &mut entries,
+            settings,
+            &verdict_tx,
+            &compaction_tx,
+            &semaphore,
+            &mut verdict_task_state,
+            fresh_due,
+        )
+        .await;
+        let second_start = starts.recv().await.expect("fresh activity call");
+        assert_ne!(second_start.activity_counter, first_start.activity_counter);
+
+        fixture
+            .host
+            .set_setting(SetSettingPayload {
+                setting: HostSettingValue::SupervisorEnabled { enabled: false },
+            })
+            .await
+            .expect("disable supervisor while call is held");
+        let disabled = fixture.host.supervisor_settings_signal().await;
+        apply_supervisor_settings_change(
+            &fixture.host,
+            &mut entries,
+            settings,
+            disabled,
+        )
+        .await;
+        assert!(entries.is_empty());
+        fixture
+            .host
+            .set_setting(SetSettingPayload {
+                setting: HostSettingValue::SupervisorEnabled { enabled: true },
+            })
+            .await
+            .expect("re-enable supervisor while old call is held");
+        let reenabled = fixture.host.supervisor_settings_signal().await;
+        apply_supervisor_settings_change(
+            &fixture.host,
+            &mut entries,
+            disabled,
+            reenabled,
+        )
+        .await;
+        let reenabled_due = match entries.get(&agent_id).map(|entry| &entry.phase) {
+            Some(SupervisorPhase::Debouncing { idle_since }) => {
+                idle_since.checked_add(SUPERVISION_DEBOUNCE).unwrap()
+            }
+            _ => panic!("re-enabled idle generation must debounce"),
+        };
+        assert_eq!(
+            supervisor_next_deadline(&entries, reenabled, verdict_task_state.is_active()),
+            None
+        );
+        process_supervisor_deadlines_at(
+            &fixture.host,
+            &mut entries,
+            reenabled,
+            &verdict_tx,
+            &compaction_tx,
+            &semaphore,
+            &mut verdict_task_state,
+            reenabled_due,
+        )
+        .await;
+        assert!(starts.try_recv().is_err());
+
+        releases.send(()).expect("release pre-disable call");
+        accept_next_supervisor_task_event(
+            &fixture.host,
+            &mut entries,
+            reenabled,
+            &mut verdict_task_state,
+            &mut verdict_rx,
+            Instant::now(),
+        )
+        .await;
+        process_supervisor_deadlines_at(
+            &fixture.host,
+            &mut entries,
+            reenabled,
+            &verdict_tx,
+            &compaction_tx,
+            &semaphore,
+            &mut verdict_task_state,
+            reenabled_due,
+        )
+        .await;
+        let third_start = starts.recv().await.expect("post-enable call");
+        assert_eq!(third_start.activity_counter, second_start.activity_counter);
+        releases.send(()).expect("release post-enable call");
+        accept_next_supervisor_task_event(
+            &fixture.host,
+            &mut entries,
+            reenabled,
+            &mut verdict_task_state,
+            &mut verdict_rx,
+            Instant::now(),
+        )
+        .await;
+        remove_supervisor_verdict_call_test_gate(&agent_id);
+    }
+
+    #[tokio::test]
+    async fn production_scheduler_rechecks_settings_after_pre_start_observation_window() {
+        let fixture = compact_fixture().await;
+        fixture
+            .host
+            .set_setting(SetSettingPayload {
+                setting: HostSettingValue::SupervisorRetryAttempts { count: 0 },
+            })
+            .await
+            .expect("set one-call budget");
+        let (agent_id, _) = spawn_idle_user_agent(
+            &fixture.host,
+            &format!(
+                "{} {}",
+                crate::backend::mock::MOCK_USER_BUBBLES_SENTINEL,
+                crate::agent::supervisor::MOCK_SUPERVISOR_CONTINUE,
+            ),
+        )
+        .await;
+        fixture
+            .host
+            .set_setting(SetSettingPayload {
+                setting: HostSettingValue::SupervisorEnabled { enabled: true },
+            })
+            .await
+            .expect("enable supervisor");
+        let stale_settings = fixture.host.supervisor_settings_signal().await;
+        assert_eq!(stale_settings.settings.retry_attempts, 0);
+        assert_eq!(
+            stale_settings.settings.cost_tier,
+            protocol::SupervisorCostTier::Low
+        );
+        let observation = fixture
+            .host
+            .activity_summary_observation(&agent_id)
+            .await
+            .expect("idle observation");
+        let now = Instant::now();
+        let entries = HashMap::from([(
+            agent_id.clone(),
+            SupervisorSchedulerEntry {
+                last_activity_counter: observation.status.activity_counter,
+                phase: SupervisorPhase::Debouncing {
+                    idle_since: now.checked_sub(SUPERVISION_DEBOUNCE).unwrap(),
+                },
+            },
+        )]);
+        let (verdict_tx, mut verdict_rx) = mpsc::unbounded_channel();
+        let (compaction_tx, _compaction_rx) = mpsc::unbounded_channel();
+        let semaphore = Arc::new(Semaphore::new(1));
+        let (pre_start_entered, pre_start_release) =
+            install_supervisor_verdict_pre_start_test_gate(agent_id.clone());
+        let (mut starts, releases) =
+            install_supervisor_verdict_call_test_gate(agent_id.clone());
+
+        let host = fixture.host.clone();
+        let task_verdict_tx = verdict_tx.clone();
+        let task_compaction_tx = compaction_tx.clone();
+        let task_semaphore = Arc::clone(&semaphore);
+        let launch = tokio::spawn(async move {
+            let mut entries = entries;
+            let mut verdict_task_state = SupervisorVerdictTaskState::default();
+            process_supervisor_deadlines_at(
+                &host,
+                &mut entries,
+                stale_settings,
+                &task_verdict_tx,
+                &task_compaction_tx,
+                &task_semaphore,
+                &mut verdict_task_state,
+                now,
+            )
+            .await;
+            (entries, verdict_task_state)
+        });
+        pre_start_entered
+            .await
+            .expect("launch reached pre-start observation window");
+        fixture
+            .host
+            .set_setting(SetSettingPayload {
+                setting: HostSettingValue::SupervisorCostTier {
+                    tier: protocol::SupervisorCostTier::High,
+                },
+            })
+            .await
+            .expect("change verdict settings before final pre-start sample");
+        let live_settings = fixture.host.supervisor_settings_signal().await;
+        pre_start_release.send(()).expect("release pre-start gate");
+        let (mut entries, mut verdict_task_state) = launch.await.expect("deadline task");
+
+        assert!(!verdict_task_state.is_active());
+        assert!(starts.try_recv().is_err(), "stale Low call must be free");
+        assert!(matches!(
+            entries.get(&agent_id).map(|entry| &entry.phase),
+            Some(SupervisorPhase::Debouncing { .. })
+        ));
+        process_supervisor_deadlines_at(
+            &fixture.host,
+            &mut entries,
+            live_settings,
+            &verdict_tx,
+            &compaction_tx,
+            &semaphore,
+            &mut verdict_task_state,
+            now,
+        )
+        .await;
+        let start = starts.recv().await.expect("live High call start");
+        assert_eq!(start.attempts_started, 1);
+        assert_eq!(start.cost_hint, Some(protocol::SpawnCostHint::High));
+        releases.send(()).expect("release live call");
+        accept_next_supervisor_task_event(
+            &fixture.host,
+            &mut entries,
+            live_settings,
+            &mut verdict_task_state,
+            &mut verdict_rx,
+            Instant::now(),
+        )
+        .await;
+        assert!(matches!(
+            entries.get(&agent_id).map(|entry| &entry.phase),
+            Some(SupervisorPhase::Active)
+        ));
+        let mut kicks = 0;
+        for _ in 0..100 {
+            kicks = observation
+                .handle
+                .read_supervision_context()
+                .await
+                .expect("context after live kick")
+                .kicks_since_user_message;
+            if kicks == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(kicks, 1);
+        remove_supervisor_verdict_call_test_gate(&agent_id);
+    }
+
+    #[tokio::test]
+    async fn production_scheduler_serializes_due_agents_through_one_task_owner() {
+        let fixture = compact_fixture().await;
+        let prompt = format!(
+            "{} {}",
+            crate::backend::mock::MOCK_USER_BUBBLES_SENTINEL,
+            crate::agent::supervisor::MOCK_SUPERVISOR_ERROR,
+        );
+        let (first_agent, _) = spawn_idle_user_agent(&fixture.host, &prompt).await;
+        let (second_agent, _) = spawn_idle_user_agent(&fixture.host, &prompt).await;
+        fixture
+            .host
+            .set_setting(SetSettingPayload {
+                setting: HostSettingValue::SupervisorEnabled { enabled: true },
+            })
+            .await
+            .expect("enable supervisor");
+        let settings = fixture.host.supervisor_settings_signal().await;
+        let first_observation = fixture
+            .host
+            .activity_summary_observation(&first_agent)
+            .await
+            .expect("first idle observation");
+        let second_observation = fixture
+            .host
+            .activity_summary_observation(&second_agent)
+            .await
+            .expect("second idle observation");
+        let now = Instant::now();
+        let idle_since = now.checked_sub(SUPERVISION_DEBOUNCE).unwrap();
+        let mut entries = HashMap::from([
+            (
+                first_agent.clone(),
+                SupervisorSchedulerEntry {
+                    last_activity_counter: first_observation.status.activity_counter,
+                    phase: SupervisorPhase::Debouncing { idle_since },
+                },
+            ),
+            (
+                second_agent.clone(),
+                SupervisorSchedulerEntry {
+                    last_activity_counter: second_observation.status.activity_counter,
+                    phase: SupervisorPhase::Debouncing { idle_since },
+                },
+            ),
+        ]);
+        let (verdict_tx, mut verdict_rx) = mpsc::unbounded_channel();
+        let (compaction_tx, _compaction_rx) = mpsc::unbounded_channel();
+        let semaphore = Arc::new(Semaphore::new(1));
+        let mut verdict_task_state = SupervisorVerdictTaskState::default();
+        let (mut first_starts, first_releases) =
+            install_supervisor_verdict_call_test_gate(first_agent.clone());
+        let (mut second_starts, second_releases) =
+            install_supervisor_verdict_call_test_gate(second_agent.clone());
+
+        process_supervisor_deadlines_at(
+            &fixture.host,
+            &mut entries,
+            settings,
+            &verdict_tx,
+            &compaction_tx,
+            &semaphore,
+            &mut verdict_task_state,
+            now,
+        )
+        .await;
+        let first_owner = tokio::select! {
+            start = first_starts.recv() => {
+                assert_eq!(start.expect("first call start").agent_id, first_agent);
+                1_u8
+            }
+            start = second_starts.recv() => {
+                assert_eq!(start.expect("second call start").agent_id, second_agent);
+                2_u8
+            }
+        };
+        assert!(verdict_task_state.is_active());
+        assert_eq!(
+            supervisor_next_deadline(&entries, settings, verdict_task_state.is_active()),
+            None
+        );
+        process_supervisor_deadlines_at(
+            &fixture.host,
+            &mut entries,
+            settings,
+            &verdict_tx,
+            &compaction_tx,
+            &semaphore,
+            &mut verdict_task_state,
+            now,
+        )
+        .await;
+        if first_owner == 1 {
+            assert!(second_starts.try_recv().is_err());
+            first_releases.send(()).expect("release first owner");
+        } else {
+            assert!(first_starts.try_recv().is_err());
+            second_releases.send(()).expect("release second owner");
+        }
+        accept_next_supervisor_task_event(
+            &fixture.host,
+            &mut entries,
+            settings,
+            &mut verdict_task_state,
+            &mut verdict_rx,
+            Instant::now(),
+        )
+        .await;
+        process_supervisor_deadlines_at(
+            &fixture.host,
+            &mut entries,
+            settings,
+            &verdict_tx,
+            &compaction_tx,
+            &semaphore,
+            &mut verdict_task_state,
+            now,
+        )
+        .await;
+        if first_owner == 1 {
+            assert_eq!(
+                second_starts
+                    .recv()
+                    .await
+                    .expect("second serialized call")
+                    .agent_id,
+                second_agent
+            );
+            second_releases.send(()).expect("release second call");
+        } else {
+            assert_eq!(
+                first_starts
+                    .recv()
+                    .await
+                    .expect("first serialized call")
+                    .agent_id,
+                first_agent
+            );
+            first_releases.send(()).expect("release first call");
+        }
+        accept_next_supervisor_task_event(
+            &fixture.host,
+            &mut entries,
+            settings,
+            &mut verdict_task_state,
+            &mut verdict_rx,
+            Instant::now(),
+        )
+        .await;
+        remove_supervisor_verdict_call_test_gate(&first_agent);
+        remove_supervisor_verdict_call_test_gate(&second_agent);
     }
 
     async fn assert_settings_edit_rejects_actor_pending_compaction(
@@ -24084,6 +25089,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                     supervisor_next_deadline(
                         &entries,
                         SupervisorSettingsSignal { settings, epoch: 1 },
+                        false,
                     ),
                     Some(expected_due),
                     "polling before a retry transition must not move its deadline"
@@ -24091,7 +25097,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             }
         }
 
-        schedule_supervision_retry(
+        schedule_supervision_retry_at(
             &mut entries,
             &agent_id,
             idle_since,
@@ -24102,6 +25108,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 crate::agent::supervisor::SupervisionFailureKind::BackendStream,
             ),
             Some("outage".to_owned()),
+            Instant::now(),
         );
         assert!(matches!(
             entries.get(&agent_id).map(|entry| &entry.phase),
@@ -24111,6 +25118,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             supervisor_next_deadline(
                 &entries,
                 SupervisorSettingsSignal { settings, epoch: 1 },
+                false,
             ),
             None
         );
@@ -24158,7 +25166,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
 
         settings.retry_attempts = 0;
         assert_eq!(settings.retry_attempts.saturating_add(1), 1);
-        schedule_supervision_retry(
+        schedule_supervision_retry_at(
             &mut entries,
             &agent_id,
             idle_since,
@@ -24169,6 +25177,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 crate::agent::supervisor::SupervisionFailureKind::InvalidVerdict,
             ),
             None,
+            Instant::now(),
         );
         assert!(matches!(
             entries.get(&agent_id).map(|entry| &entry.phase),
@@ -24224,6 +25233,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             supervisor_next_deadline(
                 &entries,
                 SupervisorSettingsSignal { settings, epoch: 1 },
+                true,
             ),
             None,
             "one in-flight call must suppress all due retry launches"
@@ -24233,6 +25243,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             supervisor_next_deadline(
                 &entries,
                 SupervisorSettingsSignal { settings, epoch: 1 },
+                false,
             ),
             Some(now)
         );
@@ -24260,6 +25271,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             supervisor_next_deadline(
                 &entries,
                 SupervisorSettingsSignal { settings, epoch: 1 },
+                false,
             ),
             None,
             "three failing agents must stop after the documented 2N calls"
