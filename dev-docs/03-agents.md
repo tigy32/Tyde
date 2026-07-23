@@ -843,8 +843,27 @@ with a fresh budget. Disabling clears retry state, re-enabling observes idle
 agents with a fresh interval and budget, and restart persists none of it.
 Lowering the limit can exhaust a pending retry immediately; raising it
 preserves attempts and the existing due time. Auto-compaction settings do not
-reset classification retries. Failures are structured server logs and never
-messages in the supervised transcript.
+reset classification retries. Transient failures remain structured server
+logs while another delayed attempt is pending. Once actual failure-backed
+attempts are exhausted, including when a live retry-limit reduction
+terminalizes a failure-backed pending retry, the affected agent's chat gets one
+warning for that activity generation:
+
+> Supervisor could not verify whether this task was complete after N attempts
+> and has stopped retrying. Send a follow-up message if you want the agent to
+> continue.
+
+The singular form says `1 attempt`. The count is the typed number of started
+attempts; neither raw backend errors nor coarse failure kinds enter chat.
+Settings-fingerprint invalidation and settings-only exhaustion remain silent.
+The agent actor checks the unchanged activity generation and complete live
+supervisor settings at its mailbox boundary, then owns the one-counter dedupe.
+New activity can therefore warn once for its new generation, while activity,
+disable, settings, queue, and close races reject stale appends. The warning is
+recorded before live broadcast and replays through actor-lifetime attachment
+and paged history. It is not injected into backend or supervisor context and
+does not advance the activity counter. It is not stored across host restart or
+saved-session reopen, and a close race has no global fallback notification.
 
 The scheduler tracks the one spawned verdict task independently from agent
 phases. Activity or disable/re-enable may replace that task's old phase, but
@@ -902,6 +921,11 @@ TTL, and the 300-second default cannot guarantee that compaction starts or
 finishes before an external five-minute cache expires. If cache preservation
 becomes a hard SLA, product must provide a documented backend TTL and measured
 headroom below it rather than inventing a margin here.
+
+Warning cards, including the supervisor-exhaustion warning, predate dedicated
+live-region semantics. Adding a polite `role="status"` and a Warning-specific
+accessible label remains a recommended cross-cutting accessibility follow-up;
+this behavior does not change markup for existing warning sources.
 
 ---
 

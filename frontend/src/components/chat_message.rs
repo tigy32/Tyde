@@ -541,6 +541,35 @@ mod wasm_tests {
         container
     }
 
+    #[wasm_bindgen_test]
+    async fn supervisor_failure_warning_uses_existing_warning_card() {
+        let copy = "Supervisor could not verify whether this task was complete after 2 attempts and has stopped retrying. Send a follow-up message if you want the agent to continue.";
+        let container = mount_message(ChatMessageEntry {
+            message: ChatMessage {
+                message_id: None,
+                timestamp: 0,
+                sender: MessageSender::Warning,
+                content: copy.to_owned(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            },
+            tool_requests: Vec::new(),
+        });
+        next_tick().await;
+
+        let card = container
+            .query_selector(".chat-card-warning")
+            .unwrap()
+            .expect("warning card");
+        let body = card.text_content().unwrap_or_default();
+        assert!(body.contains("Warning"));
+        assert!(body.contains(copy));
+    }
+
     fn input_stat(container: &HtmlElement) -> Option<String> {
         container
             .query_selector(".token-stat-input")

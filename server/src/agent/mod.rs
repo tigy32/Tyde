@@ -171,6 +171,13 @@ enum AgentCommand {
         supervisor_settings_rx: watch::Receiver<crate::host::SupervisorSettingsSignal>,
         reply: oneshot::Sender<SupervisorVerdictStart>,
     },
+    AppendSupervisorFailureWarningIfInactive {
+        expected_activity_counter: u64,
+        attempts_started: u8,
+        expected_settings: crate::host::SupervisorSettingsSignal,
+        supervisor_settings_rx: watch::Receiver<crate::host::SupervisorSettingsSignal>,
+        reply: oneshot::Sender<AppendSupervisorWarningOutcome>,
+    },
     Compact {
         summary_prompt: String,
         max_summary_bytes: usize,
@@ -251,6 +258,18 @@ pub(crate) enum SupervisorVerdictStart {
         reason: SupervisorVerdictStartRejection,
         live_settings: crate::host::SupervisorSettingsSignal,
     },
+    Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AppendSupervisorWarningOutcome {
+    Appended,
+    AlreadyAppended,
+    ActivityChanged,
+    SettingsChanged {
+        live: crate::host::SupervisorSettingsSignal,
+    },
+    Ineligible,
     Closed,
 }
 
@@ -1004,6 +1023,35 @@ impl AgentHandle {
             return SupervisorVerdictStart::Closed;
         }
         reply_rx.await.unwrap_or(SupervisorVerdictStart::Closed)
+    }
+
+    pub(crate) async fn append_supervisor_failure_warning_if_inactive(
+        &self,
+        expected_activity_counter: u64,
+        attempts_started: u8,
+        expected_settings: crate::host::SupervisorSettingsSignal,
+        supervisor_settings_rx: watch::Receiver<crate::host::SupervisorSettingsSignal>,
+    ) -> AppendSupervisorWarningOutcome {
+        if !self.accepting_input.load(Ordering::SeqCst) {
+            return AppendSupervisorWarningOutcome::Closed;
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(AgentCommand::AppendSupervisorFailureWarningIfInactive {
+                expected_activity_counter,
+                attempts_started,
+                expected_settings,
+                supervisor_settings_rx,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return AppendSupervisorWarningOutcome::Closed;
+        }
+        reply_rx
+            .await
+            .unwrap_or(AppendSupervisorWarningOutcome::Closed)
     }
 
     pub fn begin_compact(
@@ -2085,6 +2133,7 @@ pub(crate) fn spawn_agent_actor(
         let mut event_log: Vec<Envelope> = Vec::new();
         let mut latest_output = AgentControlLatestOutput::default();
         let mut replay_state = AgentReplayState::default();
+        let mut last_supervisor_failure_warning_activity_counter = None;
         let mut last_stream_identity_violation: Option<StreamIdentityViolation> = None;
         let mut subscribers: Vec<Stream> = Vec::new();
         let mut active_stream_text = String::new();
@@ -2328,6 +2377,12 @@ pub(crate) fn spawn_agent_actor(
                                 reason: SupervisorVerdictStartRejection::Ineligible,
                                 live_settings: *supervisor_settings_rx.borrow(),
                             });
+                        }
+                        AgentCommand::AppendSupervisorFailureWarningIfInactive {
+                            reply,
+                            ..
+                        } => {
+                            let _ = reply.send(AppendSupervisorWarningOutcome::Ineligible);
                         }
                         AgentCommand::CompactIfInactive {
                             accepted, reply, ..
@@ -3978,6 +4033,47 @@ pub(crate) fn spawn_agent_actor(
                             );
                             let _ = reply.send(verdict);
                         }
+                        AgentCommand::AppendSupervisorFailureWarningIfInactive {
+                            expected_activity_counter,
+                            attempts_started,
+                            expected_settings,
+                            supervisor_settings_rx,
+                            reply,
+                        } => {
+                            let live = *supervisor_settings_rx.borrow();
+                            let live_status = status_handle.snapshot().await;
+                            let outcome = if !live.settings.enabled || live != expected_settings {
+                                AppendSupervisorWarningOutcome::SettingsChanged { live }
+                            } else if live_status.activity_counter != expected_activity_counter {
+                                AppendSupervisorWarningOutcome::ActivityChanged
+                            } else if live_status.terminated {
+                                AppendSupervisorWarningOutcome::Closed
+                            } else if live_status.is_active()
+                                || live_status.is_plan_approval_pending()
+                                || matches!(lifecycle, ActorLifecycle::Closing)
+                                || in_turn
+                                || !queue.is_empty()
+                            {
+                                AppendSupervisorWarningOutcome::Ineligible
+                            } else if last_supervisor_failure_warning_activity_counter
+                                == Some(expected_activity_counter)
+                            {
+                                AppendSupervisorWarningOutcome::AlreadyAppended
+                            } else {
+                                append_chat_event(
+                                    &canonical_stream,
+                                    &mut event_log,
+                                    &mut subscribers,
+                                    &mut replay_state,
+                                    &supervisor_failure_warning_event(attempts_started),
+                                )
+                                .await;
+                                last_supervisor_failure_warning_activity_counter =
+                                    Some(expected_activity_counter);
+                                AppendSupervisorWarningOutcome::Appended
+                            };
+                            let _ = reply.send(outcome);
+                        }
                         AgentCommand::CompactIfInactive {
                             expected_activity_counter,
                             expected_supervisor_settings_epoch,
@@ -4886,6 +4982,9 @@ pub(crate) fn spawn_relay_agent_actor(
                                 live_settings: *supervisor_settings_rx.borrow(),
                             });
                         }
+                        AgentCommand::AppendSupervisorFailureWarningIfInactive { reply, .. } => {
+                            let _ = reply.send(AppendSupervisorWarningOutcome::Ineligible);
+                        }
                         AgentCommand::CompactIfInactive { accepted, reply, .. } => {
                             let error = "backend-native agents cannot be compacted".to_owned();
                             let _ = accepted.send(Err(error.clone()));
@@ -5045,6 +5144,28 @@ pub(crate) fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("system time is before UNIX_EPOCH")
         .as_millis() as u64
+}
+
+fn supervisor_failure_warning_event(attempts_started: u8) -> ChatEvent {
+    let attempt_label = if attempts_started == 1 {
+        "attempt"
+    } else {
+        "attempts"
+    };
+    ChatEvent::MessageAdded(ChatMessage {
+        message_id: None,
+        timestamp: now_ms(),
+        sender: MessageSender::Warning,
+        content: format!(
+            "Supervisor could not verify whether this task was complete after {attempts_started} {attempt_label} and has stopped retrying. Send a follow-up message if you want the agent to continue."
+        ),
+        reasoning: None,
+        tool_calls: Vec::new(),
+        model_info: None,
+        token_usage: None,
+        context_breakdown: None,
+        images: None,
+    })
 }
 
 async fn shutdown_backend_with_timeout(backend: BackendHandle, agent_id: &AgentId) {
@@ -5313,6 +5434,9 @@ async fn park_terminal_agent(
                     live_settings: *supervisor_settings_rx.borrow(),
                 });
             }
+            AgentCommand::AppendSupervisorFailureWarningIfInactive { reply, .. } => {
+                let _ = reply.send(AppendSupervisorWarningOutcome::Closed);
+            }
             AgentCommand::CompactIfInactive { accepted, reply, .. } => {
                 let error = "agent is not running".to_owned();
                 let _ = accepted.send(Err(error.clone()));
@@ -5459,6 +5583,9 @@ async fn park_relay_terminal_agent(
                     reason: SupervisorVerdictStartRejection::Ineligible,
                     live_settings: *supervisor_settings_rx.borrow(),
                 });
+            }
+            AgentCommand::AppendSupervisorFailureWarningIfInactive { reply, .. } => {
+                let _ = reply.send(AppendSupervisorWarningOutcome::Closed);
             }
             AgentCommand::CompactIfInactive { accepted, reply, .. } => {
                 let error = "backend-native agents cannot be compacted".to_owned();
@@ -8401,6 +8528,210 @@ mod tests {
         }
     }
 
+    #[test]
+    fn supervisor_failure_warning_copy_pluralizes_typed_attempt_count() {
+        let content = |attempts| match super::supervisor_failure_warning_event(attempts) {
+            ChatEvent::MessageAdded(message) => message.content,
+            _ => unreachable!(),
+        };
+        assert!(content(1).contains("after 1 attempt and"));
+        assert!(content(2).contains("after 2 attempts and"));
+        assert!(content(6).contains("after 6 attempts and"));
+    }
+
+    #[tokio::test]
+    async fn supervisor_failure_warning_actor_gate_dedupes_without_activity() {
+        let (_dir, start, request, runtime, status_handle) =
+            startup_actor_fixture("supervisor-warning-actor", None);
+        let (handle, startup_rx) =
+            spawn_agent_actor(start.agent_id.clone(), start, request, runtime);
+        startup_rx
+            .await
+            .expect("actor startup reply")
+            .expect("mock actor startup");
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let status = status_handle.snapshot().await;
+                if status.turn_completed && !status.is_active() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("mock actor becomes idle");
+
+        let mut settings = protocol::SupervisorSettings::default();
+        settings.enabled = true;
+        let signal = crate::host::SupervisorSettingsSignal { settings, epoch: 1 };
+        let (_settings_tx, settings_rx) = watch::channel(signal);
+        let before_status = status_handle.snapshot().await;
+        let before_context = handle
+            .read_supervision_context()
+            .await
+            .expect("supervision context before warning");
+        let before_history = handle
+            .fetch_session_history(None, 100)
+            .await
+            .expect("actor history before warning");
+        let before_assistant_messages = before_history
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                ChatEvent::MessageAdded(message) | ChatEvent::StreamEnd(StreamEndData { message })
+                    if matches!(message.sender, MessageSender::Assistant { .. })
+            ))
+            .count();
+
+        status_handle.update(|status| status.is_thinking = true).await;
+        assert_eq!(
+            handle
+                .append_supervisor_failure_warning_if_inactive(
+                    before_status.activity_counter,
+                    2,
+                    signal,
+                    settings_rx.clone(),
+                )
+                .await,
+            super::AppendSupervisorWarningOutcome::Ineligible
+        );
+        status_handle
+            .update(|status| {
+                status.is_thinking = false;
+                status.pending_user_response =
+                    Some(crate::agent::registry::PendingUserResponseKind::PlanApproval);
+            })
+            .await;
+        assert_eq!(
+            handle
+                .append_supervisor_failure_warning_if_inactive(
+                    before_status.activity_counter,
+                    2,
+                    signal,
+                    settings_rx.clone(),
+                )
+                .await,
+            super::AppendSupervisorWarningOutcome::Ineligible
+        );
+        status_handle
+            .update(|status| status.pending_user_response = None)
+            .await;
+
+        assert_eq!(
+            handle
+                .append_supervisor_failure_warning_if_inactive(
+                    before_status.activity_counter,
+                    2,
+                    signal,
+                    settings_rx.clone(),
+                )
+                .await,
+            super::AppendSupervisorWarningOutcome::Appended
+        );
+        assert_eq!(
+            handle
+                .append_supervisor_failure_warning_if_inactive(
+                    before_status.activity_counter,
+                    2,
+                    signal,
+                    settings_rx.clone(),
+                )
+                .await,
+            super::AppendSupervisorWarningOutcome::AlreadyAppended
+        );
+        let after_status = status_handle.snapshot().await;
+        assert_eq!(after_status.activity_counter, before_status.activity_counter);
+        assert_eq!(after_status.is_thinking, before_status.is_thinking);
+        assert_eq!(after_status.turn_completed, before_status.turn_completed);
+        assert_eq!(
+            after_status.pending_user_response.as_ref(),
+            before_status.pending_user_response.as_ref()
+        );
+        assert_eq!(
+            after_status.last_error.as_ref(),
+            before_status.last_error.as_ref()
+        );
+        assert_eq!(
+            handle
+                .read_supervision_context()
+                .await
+                .expect("supervision context after warning"),
+            before_context
+        );
+
+        let history = handle
+            .fetch_session_history(None, 100)
+            .await
+            .expect("actor history");
+        assert_eq!(
+            history
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ChatEvent::MessageAdded(message)
+                        if matches!(message.sender, MessageSender::Warning)
+                            && message.content.contains("after 2 attempts")
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            history
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ChatEvent::MessageAdded(message)
+                        | ChatEvent::StreamEnd(StreamEndData { message })
+                        if matches!(message.sender, MessageSender::Assistant { .. })
+                ))
+                .count(),
+            before_assistant_messages
+        );
+        assert_eq!(
+            handle
+                .append_supervisor_failure_warning_if_inactive(
+                    before_status.activity_counter.saturating_sub(1),
+                    2,
+                    signal,
+                    settings_rx.clone(),
+                )
+                .await,
+            super::AppendSupervisorWarningOutcome::ActivityChanged
+        );
+
+        let changed = crate::host::SupervisorSettingsSignal {
+            settings,
+            epoch: 2,
+        };
+        let (_changed_tx, changed_rx) = watch::channel(changed);
+        assert_eq!(
+            handle
+                .append_supervisor_failure_warning_if_inactive(
+                    before_status.activity_counter,
+                    2,
+                    signal,
+                    changed_rx,
+                )
+                .await,
+            super::AppendSupervisorWarningOutcome::SettingsChanged { live: changed }
+        );
+        assert!(handle.close().await);
+        assert_eq!(
+            handle
+                .append_supervisor_failure_warning_if_inactive(
+                    before_status.activity_counter,
+                    2,
+                    signal,
+                    settings_rx,
+                )
+                .await,
+            super::AppendSupervisorWarningOutcome::Closed
+        );
+    }
+
     #[tokio::test]
     async fn pending_startup_attachment_failure_receives_terminal_bootstrap() {
         let _startup_test_guard = AGENT_STARTUP_ACTOR_TEST_LOCK.lock().await;
@@ -8591,6 +8922,9 @@ mod tests {
                             reason: SupervisorVerdictStartRejection::Ineligible,
                             live_settings: *supervisor_settings_rx.borrow(),
                         });
+                    }
+                    AgentCommand::AppendSupervisorFailureWarningIfInactive { reply, .. } => {
+                        let _ = reply.send(AppendSupervisorWarningOutcome::Closed);
                     }
                     AgentCommand::CompactIfInactive { accepted, reply, .. } => {
                         let error = "agent is not running".to_owned();

@@ -9,8 +9,9 @@ mod fixture;
 use fixture::Fixture;
 use protocol::{
     AgentClosedPayload, BackendKind, ChatEvent, CommandErrorPayload, Envelope, FrameKind,
-    HostSettingErrorTarget, HostSettingValue, HostSettingsPayload, MessageSender, NewAgentPayload,
-    SUPERVISOR_MESSAGE_PREFIX, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
+    FetchSessionHistoryPayload, HostSettingErrorTarget, HostSettingValue, HostSettingsPayload,
+    MessageSender, NewAgentPayload, SUPERVISOR_MESSAGE_PREFIX, SetSettingPayload,
+    SpawnAgentParams, SpawnAgentPayload, StreamPath,
 };
 use std::time::Duration;
 
@@ -22,6 +23,7 @@ const MOCK_USER_BUBBLES_SENTINEL: &str = "__mock_user_bubbles__";
 const MOCK_CONTEXT_250K_SENTINEL: &str = "__mock_context_250k__";
 const MOCK_SUPERVISOR_DONE: &str = "__mock_supervisor_done__";
 const MOCK_SUPERVISOR_AWAITING_USER: &str = "__mock_supervisor_awaiting_user__";
+const MOCK_SUPERVISOR_ERROR: &str = "__mock_supervisor_error__";
 const MOCK_ACTIVE_IDLE_CYCLE: &str = "__mock_active_idle_cycle__";
 const MOCK_CODEX_INTERNAL_ERROR_TAIL: &str = "__mock_codex_internal_error_tail__";
 
@@ -94,6 +96,18 @@ fn is_supervisor_kick(env: &Envelope, stream: &StreamPath) -> bool {
             if matches!(message.sender, MessageSender::User)
                 && message.content.starts_with(SUPERVISOR_MESSAGE_PREFIX)
     )
+}
+
+fn supervisor_failure_warning(env: &Envelope) -> Option<(StreamPath, String)> {
+    match env.parse_payload::<ChatEvent>().ok() {
+        Some(ChatEvent::MessageAdded(message))
+            if env.kind == FrameKind::ChatEvent
+                && matches!(message.sender, MessageSender::Warning)
+                && message.content.starts_with(
+                    "Supervisor could not verify whether this task was complete after ",
+                ) => Some((env.stream.clone(), message.content)),
+        _ => None,
+    }
 }
 
 fn is_assistant_message_containing(env: &Envelope, stream: &StreamPath, needle: &str) -> bool {
@@ -223,6 +237,172 @@ async fn auto_compaction_fixture_with_delay(threshold: u64, delay_seconds: u32) 
     )
     .await;
     fixture
+}
+
+#[tokio::test]
+async fn exhausted_supervisor_failure_warns_once_per_activity_generation() {
+    fixture::init_tracing();
+    let mut fixture = Fixture::new().await;
+    apply_supervisor_setting(
+        &mut fixture,
+        HostSettingValue::SupervisorRetryAttempts { count: 0 },
+    )
+    .await;
+    apply_supervisor_setting(
+        &mut fixture,
+        HostSettingValue::SupervisorEnabled { enabled: true },
+    )
+    .await;
+
+    let other = spawn_supervised_agent(&mut fixture, "unaffected-supervisor-agent", false).await;
+    let affected = spawn_supervised_agent_with_verdict(
+        &mut fixture,
+        "supervisor-failure-warning",
+        false,
+        MOCK_SUPERVISOR_ERROR,
+    )
+    .await;
+    let singular = "Supervisor could not verify whether this task was complete after 1 attempt and has stopped retrying. Send a follow-up message if you want the agent to continue.";
+
+    let warning = wait_for_envelope(
+        &mut fixture.client,
+        SUPERVISION_WAIT,
+        "terminal supervisor failure warning",
+        |env| supervisor_failure_warning(env).is_some(),
+    )
+    .await;
+    let (warning_stream, warning_copy) =
+        supervisor_failure_warning(&warning).expect("supervisor failure warning payload");
+    assert_eq!(warning_stream, affected.instance_stream);
+    assert_ne!(warning_stream, other.instance_stream);
+    assert_eq!(warning_copy, singular);
+    assert!(!warning_copy.contains("mock supervision failure"));
+    assert!(!warning_copy.contains("BackendStream"));
+
+    fixture
+        .client
+        .fetch_session_history(
+            &affected.instance_stream,
+            FetchSessionHistoryPayload {
+                agent_id: affected.agent_id.clone(),
+                before_seq: None,
+                limit: 100,
+            },
+        )
+        .await
+        .expect("fetch affected actor history");
+    let history = wait_for_envelope(
+        &mut fixture.client,
+        Duration::from_secs(5),
+        "affected actor history",
+        |env| {
+            env.kind == FrameKind::SessionHistory && env.stream == affected.instance_stream
+        },
+    )
+    .await
+    .parse_payload::<protocol::SessionHistoryPayload>()
+    .expect("parse affected actor history");
+    assert_eq!(
+        history
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                ChatEvent::MessageAdded(message)
+                    if matches!(message.sender, MessageSender::Warning)
+                        && message.content == singular
+            ))
+            .count(),
+        1
+    );
+
+    assert_no_envelope(
+        &mut fixture.client,
+        QUIET_WAIT,
+        "duplicate or cross-stream supervisor failure warning",
+        |env| supervisor_failure_warning(env).is_some(),
+    )
+    .await;
+
+    fixture
+        .client
+        .send_message(
+            &affected.instance_stream,
+            format!("new generation {MOCK_SUPERVISOR_ERROR}"),
+        )
+        .await
+        .expect("send new failing supervision generation");
+    let affected_stream = affected.instance_stream.clone();
+    wait_for_envelope(
+        &mut fixture.client,
+        Duration::from_secs(5),
+        "new generation assistant turn",
+        |env| is_assistant_message_containing(env, &affected_stream, "new generation"),
+    )
+    .await;
+    let second = wait_for_envelope(
+        &mut fixture.client,
+        SUPERVISION_WAIT,
+        "new generation supervisor failure warning",
+        |env| supervisor_failure_warning(env).is_some(),
+    )
+    .await;
+    assert_eq!(
+        supervisor_failure_warning(&second)
+            .expect("second supervisor failure warning")
+            .0,
+        affected.instance_stream
+    );
+}
+
+#[tokio::test]
+async fn transient_supervisor_failure_and_closed_agent_remain_silent() {
+    fixture::init_tracing();
+    let mut fixture = Fixture::new().await;
+    apply_supervisor_setting(
+        &mut fixture,
+        HostSettingValue::SupervisorRetryAttempts { count: 1 },
+    )
+    .await;
+    apply_supervisor_setting(
+        &mut fixture,
+        HostSettingValue::SupervisorEnabled { enabled: true },
+    )
+    .await;
+    let transient = spawn_supervised_agent_with_verdict(
+        &mut fixture,
+        "transient-supervisor-failure",
+        false,
+        MOCK_SUPERVISOR_ERROR,
+    )
+    .await;
+    assert_no_envelope(
+        &mut fixture.client,
+        QUIET_WAIT,
+        "warning while a delayed retry remains",
+        |env| supervisor_failure_warning(env).is_some(),
+    )
+    .await;
+
+    fixture
+        .client
+        .close_agent(&transient.instance_stream)
+        .await
+        .expect("close agent with pending retry");
+    wait_for_envelope(
+        &mut fixture.client,
+        Duration::from_secs(5),
+        "closed supervised agent",
+        |env| env.kind == FrameKind::AgentClosed,
+    )
+    .await;
+    assert_no_envelope(
+        &mut fixture.client,
+        QUIET_WAIT,
+        "orphan or fallback warning after close",
+        |env| supervisor_failure_warning(env).is_some(),
+    )
+    .await;
 }
 
 /// Failure mode 1: a backend error card halts the turn. With the supervisor
