@@ -494,6 +494,21 @@ struct SupervisorVerdictTaskResult {
     >,
 }
 
+struct SupervisorVerdictExecution<'a> {
+    semaphore: &'a Arc<Semaphore>,
+    task_state: &'a mut SupervisorVerdictTaskState,
+}
+
+struct SupervisionRetryRequest {
+    idle_since: Instant,
+    baseline: SupervisionBaseline,
+    attempts_started: u8,
+    settings: protocol::SupervisorSettings,
+    reason: SupervisionRetryReason,
+    message: Option<String>,
+    scheduled_at: Instant,
+}
+
 struct SupervisorVerdictTaskEvent {
     task_id: u64,
     result: SupervisorVerdictTaskResult,
@@ -13774,8 +13789,10 @@ async fn process_supervisor_deadlines(
         settings,
         verdict_tx,
         compaction_tx,
-        semaphore,
-        verdict_task_state,
+        SupervisorVerdictExecution {
+            semaphore,
+            task_state: verdict_task_state,
+        },
         Instant::now(),
     )
     .await;
@@ -13787,11 +13804,10 @@ async fn process_supervisor_deadlines_at(
     settings: SupervisorSettingsSignal,
     verdict_tx: &mpsc::UnboundedSender<SupervisorVerdictTaskEvent>,
     compaction_tx: &mpsc::UnboundedSender<SupervisorCompactionTaskEvent>,
-    semaphore: &Arc<Semaphore>,
-    verdict_task_state: &mut SupervisorVerdictTaskState,
+    execution: SupervisorVerdictExecution<'_>,
     now: Instant,
 ) {
-    if !verdict_task_state.is_active() {
+    if !execution.task_state.is_active() {
         let due_debounces = entries
             .iter()
             .filter_map(|(agent_id, entry)| match &entry.phase {
@@ -13815,11 +13831,11 @@ async fn process_supervisor_deadlines_at(
                 agent_id,
                 settings,
                 verdict_tx,
-                semaphore,
-                verdict_task_state,
+                execution.semaphore,
+                execution.task_state,
             )
             .await;
-            if verdict_task_state.is_active() {
+            if execution.task_state.is_active() {
                 break;
             }
         }
@@ -14173,14 +14189,17 @@ async fn exhaust_supervision_by_failure(
 fn schedule_supervision_retry_at(
     entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
     agent_id: &AgentId,
-    idle_since: Instant,
-    baseline: SupervisionBaseline,
-    attempts_started: u8,
-    settings: protocol::SupervisorSettings,
-    reason: SupervisionRetryReason,
-    message: Option<String>,
-    scheduled_at: Instant,
+    request: SupervisionRetryRequest,
 ) -> SupervisionRetrySchedule {
+    let SupervisionRetryRequest {
+        idle_since,
+        baseline,
+        attempts_started,
+        settings,
+        reason,
+        message,
+        scheduled_at,
+    } = request;
     let maximum_attempts = settings.retry_attempts.saturating_add(1);
     if attempts_started >= maximum_attempts {
         entries.get_mut(agent_id).expect("entry exists").phase = match reason {
@@ -14270,13 +14289,15 @@ async fn accept_supervision_verdict_result(
         if schedule_supervision_retry_at(
             entries,
             &result.agent_id,
-            idle_since,
-            result.baseline.clone(),
-            result.attempts_started,
-            live_settings.settings,
-            SupervisionRetryReason::SettingsChanged,
-            None,
-            result_dequeued_at,
+            SupervisionRetryRequest {
+                idle_since,
+                baseline: result.baseline.clone(),
+                attempts_started: result.attempts_started,
+                settings: live_settings.settings,
+                reason: SupervisionRetryReason::SettingsChanged,
+                message: None,
+                scheduled_at: result_dequeued_at,
+            },
         ) == SupervisionRetrySchedule::Exhausted
         {
             entries
@@ -14345,13 +14366,15 @@ async fn accept_supervision_verdict_result(
         if schedule_supervision_retry_at(
             entries,
             &result.agent_id,
-            idle_since,
-            result.baseline.clone(),
-            result.attempts_started,
-            final_settings.settings,
-            SupervisionRetryReason::SettingsChanged,
-            None,
-            result_dequeued_at,
+            SupervisionRetryRequest {
+                idle_since,
+                baseline: result.baseline.clone(),
+                attempts_started: result.attempts_started,
+                settings: final_settings.settings,
+                reason: SupervisionRetryReason::SettingsChanged,
+                message: None,
+                scheduled_at: result_dequeued_at,
+            },
         ) == SupervisionRetrySchedule::Exhausted
         {
             entries
@@ -14370,13 +14393,15 @@ async fn accept_supervision_verdict_result(
             let schedule = schedule_supervision_retry_at(
                 entries,
                 &result.agent_id,
-                idle_since,
-                result.baseline,
-                result.attempts_started,
-                final_settings.settings,
-                SupervisionRetryReason::Failure(failure_kind),
-                Some(failure_message.clone()),
-                result_dequeued_at,
+                SupervisionRetryRequest {
+                    idle_since,
+                    baseline: result.baseline,
+                    attempts_started: result.attempts_started,
+                    settings: final_settings.settings,
+                    reason: SupervisionRetryReason::Failure(failure_kind),
+                    message: Some(failure_message.clone()),
+                    scheduled_at: result_dequeued_at,
+                },
             );
             if schedule == SupervisionRetrySchedule::Exhausted {
                 tracing::warn!(
@@ -23686,10 +23711,12 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 },
             },
         );
-        let mut supervisor = protocol::SupervisorSettings::default();
-        supervisor.enabled = true;
-        supervisor.auto_compact_on_success = true;
-        supervisor.auto_compact_inactivity_delay_seconds = 600;
+        let mut supervisor = protocol::SupervisorSettings {
+            enabled: true,
+            auto_compact_on_success: true,
+            auto_compact_inactivity_delay_seconds: 600,
+            ..Default::default()
+        };
         assert_eq!(
             supervisor_next_deadline(
                 &entries,
@@ -23736,10 +23763,12 @@ Rules: Record only what remains true and useful for future work; drop transient 
             },
         );
         mark_supervisor_gate_evaluated(&mut entries, &agent_id, 4);
-        let mut supervisor = protocol::SupervisorSettings::default();
-        supervisor.enabled = true;
-        supervisor.auto_compact_on_success = true;
-        supervisor.auto_compact_inactivity_delay_seconds = 1;
+        let supervisor = protocol::SupervisorSettings {
+            enabled: true,
+            auto_compact_on_success: true,
+            auto_compact_inactivity_delay_seconds: 1,
+            ..Default::default()
+        };
         assert_eq!(
             supervisor_next_deadline(
                 &entries,
@@ -24097,8 +24126,10 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 },
             },
         )]);
-        let mut enabled = protocol::SupervisorSettings::default();
-        enabled.enabled = true;
+        let enabled = protocol::SupervisorSettings {
+            enabled: true,
+            ..Default::default()
+        };
         let mut disabled = enabled;
         disabled.enabled = false;
 
@@ -24772,8 +24803,10 @@ Rules: Record only what remains true and useful for future work; drop transient 
                         settings,
                         &verdict_tx,
                         &compaction_tx,
-                        &semaphore,
-                        &mut verdict_task_state,
+                        SupervisorVerdictExecution {
+                            semaphore: &semaphore,
+                            task_state: &mut verdict_task_state,
+                        },
                         due_at.checked_sub(Duration::from_nanos(1)).unwrap(),
                     )
                     .await;
@@ -24786,8 +24819,10 @@ Rules: Record only what remains true and useful for future work; drop transient 
                     settings,
                     &verdict_tx,
                     &compaction_tx,
-                    &semaphore,
-                    &mut verdict_task_state,
+                    SupervisorVerdictExecution {
+                        semaphore: &semaphore,
+                        task_state: &mut verdict_task_state,
+                    },
                     due_at,
                 )
                 .await;
@@ -24910,8 +24945,10 @@ Rules: Record only what remains true and useful for future work; drop transient 
             settings,
             &verdict_tx,
             &compaction_tx,
-            &semaphore,
-            &mut verdict_task_state,
+            SupervisorVerdictExecution {
+                semaphore: &semaphore,
+                task_state: &mut verdict_task_state,
+            },
             now,
         )
         .await;
@@ -24962,8 +24999,10 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 settings,
                 &verdict_tx,
                 &compaction_tx,
-                &semaphore,
-                &mut verdict_task_state,
+                SupervisorVerdictExecution {
+                    semaphore: &semaphore,
+                    task_state: &mut verdict_task_state,
+                },
                 fresh_due,
             )
             .await;
@@ -24986,8 +25025,10 @@ Rules: Record only what remains true and useful for future work; drop transient 
             settings,
             &verdict_tx,
             &compaction_tx,
-            &semaphore,
-            &mut verdict_task_state,
+            SupervisorVerdictExecution {
+                semaphore: &semaphore,
+                task_state: &mut verdict_task_state,
+            },
             fresh_due,
         )
         .await;
@@ -25029,8 +25070,10 @@ Rules: Record only what remains true and useful for future work; drop transient 
             reenabled,
             &verdict_tx,
             &compaction_tx,
-            &semaphore,
-            &mut verdict_task_state,
+            SupervisorVerdictExecution {
+                semaphore: &semaphore,
+                task_state: &mut verdict_task_state,
+            },
             reenabled_due,
         )
         .await;
@@ -25052,8 +25095,10 @@ Rules: Record only what remains true and useful for future work; drop transient 
             reenabled,
             &verdict_tx,
             &compaction_tx,
-            &semaphore,
-            &mut verdict_task_state,
+            SupervisorVerdictExecution {
+                semaphore: &semaphore,
+                task_state: &mut verdict_task_state,
+            },
             reenabled_due,
         )
         .await;
@@ -25206,8 +25251,10 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 stale_settings,
                 &task_verdict_tx,
                 &task_compaction_tx,
-                &task_semaphore,
-                &mut verdict_task_state,
+                SupervisorVerdictExecution {
+                    semaphore: &task_semaphore,
+                    task_state: &mut verdict_task_state,
+                },
                 now,
             )
             .await;
@@ -25241,8 +25288,10 @@ Rules: Record only what remains true and useful for future work; drop transient 
             live_settings,
             &verdict_tx,
             &compaction_tx,
-            &semaphore,
-            &mut verdict_task_state,
+            SupervisorVerdictExecution {
+                semaphore: &semaphore,
+                task_state: &mut verdict_task_state,
+            },
             now,
         )
         .await;
@@ -25341,8 +25390,10 @@ Rules: Record only what remains true and useful for future work; drop transient 
             settings,
             &verdict_tx,
             &compaction_tx,
-            &semaphore,
-            &mut verdict_task_state,
+            SupervisorVerdictExecution {
+                semaphore: &semaphore,
+                task_state: &mut verdict_task_state,
+            },
             now,
         )
         .await;
@@ -25367,8 +25418,10 @@ Rules: Record only what remains true and useful for future work; drop transient 
             settings,
             &verdict_tx,
             &compaction_tx,
-            &semaphore,
-            &mut verdict_task_state,
+            SupervisorVerdictExecution {
+                semaphore: &semaphore,
+                task_state: &mut verdict_task_state,
+            },
             now,
         )
         .await;
@@ -25394,8 +25447,10 @@ Rules: Record only what remains true and useful for future work; drop transient 
             settings,
             &verdict_tx,
             &compaction_tx,
-            &semaphore,
-            &mut verdict_task_state,
+            SupervisorVerdictExecution {
+                semaphore: &semaphore,
+                task_state: &mut verdict_task_state,
+            },
             now,
         )
         .await;
@@ -25652,9 +25707,11 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 ),
             },
         };
-        let mut raised = protocol::SupervisorSettings::default();
-        raised.retry_attempts = 5;
-        raised.cost_tier = protocol::SupervisorCostTier::High;
+        let raised = protocol::SupervisorSettings {
+            retry_attempts: 5,
+            cost_tier: protocol::SupervisorCostTier::High,
+            ..Default::default()
+        };
         apply_live_retry_settings(&AgentId("retry-limit".to_owned()), &mut pending, raised);
         assert!(matches!(
             pending.phase,
@@ -25691,9 +25748,11 @@ Rules: Record only what remains true and useful for future work; drop transient 
             kicks_since_user_message: 0,
             session_id: None,
         };
-        let mut settings = protocol::SupervisorSettings::default();
-        settings.enabled = true;
-        settings.retry_attempts = 5;
+        let mut settings = protocol::SupervisorSettings {
+            enabled: true,
+            retry_attempts: 5,
+            ..Default::default()
+        };
         assert_eq!(settings.retry_attempts.saturating_add(1), 6);
         let mut entries = HashMap::from([(
             agent_id.clone(),
@@ -25711,15 +25770,17 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 schedule_supervision_retry_at(
                     &mut entries,
                     &agent_id,
-                    idle_since,
-                    baseline.clone(),
-                    attempts_started,
-                    settings,
-                    SupervisionRetryReason::Failure(
-                        crate::agent::supervisor::SupervisionFailureKind::BackendStream,
-                    ),
-                    Some("outage".to_owned()),
-                    scheduled_at,
+                    SupervisionRetryRequest {
+                        idle_since,
+                        baseline: baseline.clone(),
+                        attempts_started,
+                        settings,
+                        reason: SupervisionRetryReason::Failure(
+                            crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+                        ),
+                        message: Some("outage".to_owned()),
+                        scheduled_at,
+                    },
                 ),
                 SupervisionRetrySchedule::Pending
             );
@@ -25751,15 +25812,17 @@ Rules: Record only what remains true and useful for future work; drop transient 
             schedule_supervision_retry_at(
                 &mut entries,
                 &agent_id,
-                idle_since,
-                baseline.clone(),
-                6,
-                settings,
-                SupervisionRetryReason::Failure(
-                    crate::agent::supervisor::SupervisionFailureKind::BackendStream,
-                ),
-                Some("outage".to_owned()),
-                Instant::now(),
+                SupervisionRetryRequest {
+                    idle_since,
+                    baseline: baseline.clone(),
+                    attempts_started: 6,
+                    settings,
+                    reason: SupervisionRetryReason::Failure(
+                        crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+                    ),
+                    message: Some("outage".to_owned()),
+                    scheduled_at: Instant::now(),
+                },
             ),
             SupervisionRetrySchedule::Exhausted
         );
@@ -25785,15 +25848,17 @@ Rules: Record only what remains true and useful for future work; drop transient 
             schedule_supervision_retry_at(
                 &mut entries,
                 &agent_id,
-                idle_since,
-                baseline.clone(),
-                1,
-                settings,
-                SupervisionRetryReason::Failure(
-                    crate::agent::supervisor::SupervisionFailureKind::BackendStream,
-                ),
-                None,
-                idle_since,
+                SupervisionRetryRequest {
+                    idle_since,
+                    baseline: baseline.clone(),
+                    attempts_started: 1,
+                    settings,
+                    reason: SupervisionRetryReason::Failure(
+                        crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+                    ),
+                    message: None,
+                    scheduled_at: idle_since,
+                },
             ),
             SupervisionRetrySchedule::Pending
         );
@@ -25809,15 +25874,17 @@ Rules: Record only what remains true and useful for future work; drop transient 
             schedule_supervision_retry_at(
                 &mut entries,
                 &agent_id,
-                idle_since,
-                baseline.clone(),
-                2,
-                settings,
-                SupervisionRetryReason::Failure(
-                    crate::agent::supervisor::SupervisionFailureKind::BackendStream,
-                ),
-                None,
-                idle_since,
+                SupervisionRetryRequest {
+                    idle_since,
+                    baseline: baseline.clone(),
+                    attempts_started: 2,
+                    settings,
+                    reason: SupervisionRetryReason::Failure(
+                        crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+                    ),
+                    message: None,
+                    scheduled_at: idle_since,
+                },
             ),
             SupervisionRetrySchedule::Exhausted
         );
@@ -25843,15 +25910,17 @@ Rules: Record only what remains true and useful for future work; drop transient 
             schedule_supervision_retry_at(
                 &mut entries,
                 &agent_id,
-                idle_since,
-                baseline,
-                1,
-                settings,
-                SupervisionRetryReason::Failure(
-                    crate::agent::supervisor::SupervisionFailureKind::InvalidVerdict,
-                ),
-                None,
-                Instant::now(),
+                SupervisionRetryRequest {
+                    idle_since,
+                    baseline,
+                    attempts_started: 1,
+                    settings,
+                    reason: SupervisionRetryReason::Failure(
+                        crate::agent::supervisor::SupervisionFailureKind::InvalidVerdict,
+                    ),
+                    message: None,
+                    scheduled_at: Instant::now(),
+                },
             ),
             SupervisionRetrySchedule::Exhausted
         );
@@ -25860,8 +25929,10 @@ Rules: Record only what remains true and useful for future work; drop transient 
     #[test]
     fn supervisor_retry_deadlines_serialize_and_each_agent_stops_at_default_cap() {
         let now = Instant::now();
-        let mut settings = protocol::SupervisorSettings::default();
-        settings.enabled = true;
+        let settings = protocol::SupervisorSettings {
+            enabled: true,
+            ..Default::default()
+        };
         assert_eq!(settings.retry_attempts.saturating_add(1), 2);
         let fingerprint = VerdictSettingsFingerprint::from(settings);
         let baseline = || SupervisionBaseline {
@@ -25926,15 +25997,17 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 schedule_supervision_retry_at(
                     &mut entries,
                     &agent_id,
-                    now,
-                    baseline(),
-                    2,
-                    settings,
-                    SupervisionRetryReason::Failure(
-                        crate::agent::supervisor::SupervisionFailureKind::BackendStream,
-                    ),
-                    Some("outage".to_owned()),
-                    now,
+                    SupervisionRetryRequest {
+                        idle_since: now,
+                        baseline: baseline(),
+                        attempts_started: 2,
+                        settings,
+                        reason: SupervisionRetryReason::Failure(
+                            crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+                        ),
+                        message: Some("outage".to_owned()),
+                        scheduled_at: now,
+                    },
                 ),
                 SupervisionRetrySchedule::Exhausted
             );

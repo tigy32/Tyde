@@ -8618,8 +8618,10 @@ mod tests {
         .await
         .expect("mock actor becomes idle");
 
-        let mut settings = protocol::SupervisorSettings::default();
-        settings.enabled = true;
+        let settings = protocol::SupervisorSettings {
+            enabled: true,
+            ..Default::default()
+        };
         let signal = crate::host::SupervisorSettingsSignal { settings, epoch: 1 };
         let (_settings_tx, settings_rx) = watch::channel(signal);
         let before_status = status_handle.snapshot().await;
@@ -8817,8 +8819,10 @@ mod tests {
         .await
         .expect("slow mock turn becomes active");
 
-        let mut settings = protocol::SupervisorSettings::default();
-        settings.enabled = true;
+        let settings = protocol::SupervisorSettings {
+            enabled: true,
+            ..Default::default()
+        };
         let signal = crate::host::SupervisorSettingsSignal { settings, epoch: 1 };
         let (_settings_tx, settings_rx) = watch::channel(signal);
         let in_turn_status = status_handle.snapshot().await;
@@ -8920,8 +8924,10 @@ mod tests {
         .await
         .expect("mock actor becomes idle");
 
-        let mut settings = protocol::SupervisorSettings::default();
-        settings.enabled = true;
+        let settings = protocol::SupervisorSettings {
+            enabled: true,
+            ..Default::default()
+        };
         let expected = crate::host::SupervisorSettingsSignal { settings, epoch: 1 };
         let (settings_tx, settings_rx) = watch::channel(expected);
         let activity_counter = status_handle.snapshot().await.activity_counter;
