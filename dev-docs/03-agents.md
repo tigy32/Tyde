@@ -858,12 +858,25 @@ attempts; neither raw backend errors nor coarse failure kinds enter chat.
 Settings-fingerprint invalidation and settings-only exhaustion remain silent.
 The agent actor checks the unchanged activity generation and complete live
 supervisor settings at its mailbox boundary, then owns the one-counter dedupe.
+It awaits the status snapshot first and samples the settings watch last, with
+no intervening await before the canonical append begins; that final settings
+sample is the ordering boundary for concurrent settings commits.
 New activity can therefore warn once for its new generation, while activity,
 disable, settings, queue, and close races reject stale appends. The warning is
 recorded before live broadcast and replays through actor-lifetime attachment
 and paged history. It is not injected into backend or supervisor context and
 does not advance the activity counter. It is not stored across host restart or
 saved-session reopen, and a close race has no global fallback notification.
+
+Failure-backed exhaustion first enters a terminal scheduler phase with no
+deadline, so an actor eligibility or close race cannot spin an immediate retry
+while the warning gate is pending. If the retry limit is raised before the
+actor's final live-settings sample, the stale warning is rejected and the
+generation resumes `RetryPending` at the normal backoff deadline already
+computed from its last failure; the edit never creates an immediate retry. A
+settings edit ordered after that sample does not rewrite the warning that was
+true at the boundary or resurrect the now-Dormant generation. New real
+activity is the normal way to start another generation after a warning.
 
 The scheduler tracks the one spawned verdict task independently from agent
 phases. Activity or disable/re-enable may replace that task's old phase, but

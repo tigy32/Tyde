@@ -561,13 +561,22 @@ mod wasm_tests {
         });
         next_tick().await;
 
+        let cards = container.query_selector_all(".chat-card-warning").unwrap();
+        assert_eq!(cards.length(), 1);
         let card = container
             .query_selector(".chat-card-warning")
             .unwrap()
             .expect("warning card");
-        let body = card.text_content().unwrap_or_default();
-        assert!(body.contains("Warning"));
-        assert!(body.contains(copy));
+        let sender = card
+            .query_selector(".chat-card-sender")
+            .unwrap()
+            .expect("warning sender label");
+        assert_eq!(sender.text_content().as_deref(), Some("Warning"));
+        let body = card
+            .query_selector(".chat-card-body")
+            .unwrap()
+            .expect("warning body");
+        assert_eq!(body.text_content().as_deref(), Some(copy));
     }
 
     fn input_stat(container: &HtmlElement) -> Option<String> {

@@ -347,12 +347,53 @@ async fn exhausted_supervisor_failure_warns_once_per_activity_generation() {
         |env| supervisor_failure_warning(env).is_some(),
     )
     .await;
+    let (second_stream, second_copy) =
+        supervisor_failure_warning(&second).expect("second supervisor failure warning");
+    assert_eq!(second_stream, affected.instance_stream);
+    assert_eq!(second_copy, singular);
+    fixture
+        .client
+        .fetch_session_history(
+            &affected.instance_stream,
+            FetchSessionHistoryPayload {
+                agent_id: affected.agent_id.clone(),
+                before_seq: None,
+                limit: 100,
+            },
+        )
+        .await
+        .expect("fetch both warning generations");
+    let history = wait_for_envelope(
+        &mut fixture.client,
+        Duration::from_secs(5),
+        "history for both warning generations",
+        |env| {
+            env.kind == FrameKind::SessionHistory && env.stream == affected.instance_stream
+        },
+    )
+    .await
+    .parse_payload::<protocol::SessionHistoryPayload>()
+    .expect("parse history for both warning generations");
     assert_eq!(
-        supervisor_failure_warning(&second)
-            .expect("second supervisor failure warning")
-            .0,
-        affected.instance_stream
+        history
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                ChatEvent::MessageAdded(message)
+                    if matches!(message.sender, MessageSender::Warning)
+                        && message.content == singular
+            ))
+            .count(),
+        2
     );
+    assert_no_envelope(
+        &mut fixture.client,
+        QUIET_WAIT,
+        "duplicate warning for the second unchanged generation",
+        |env| supervisor_failure_warning(env).is_some(),
+    )
+    .await;
 }
 
 #[tokio::test]

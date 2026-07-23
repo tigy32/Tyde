@@ -4040,8 +4040,13 @@ pub(crate) fn spawn_agent_actor(
                             supervisor_settings_rx,
                             reply,
                         } => {
-                            let live = *supervisor_settings_rx.borrow();
                             let live_status = status_handle.snapshot().await;
+                            #[cfg(test)]
+                            wait_for_append_supervisor_warning_test_gate(
+                                &current_start.agent_id,
+                            )
+                            .await;
+                            let live = *supervisor_settings_rx.borrow();
                             let outcome = if !live.settings.enabled || live != expected_settings {
                                 AppendSupervisorWarningOutcome::SettingsChanged { live }
                             } else if live_status.activity_counter != expected_activity_counter {
@@ -4511,6 +4516,15 @@ fn begin_supervisor_verdict_test_gates(
 }
 
 #[cfg(test)]
+fn append_supervisor_warning_test_gates(
+) -> &'static std::sync::Mutex<HashMap<AgentId, AgentStartupTestGate>> {
+    static GATES: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<AgentId, AgentStartupTestGate>>,
+    > = std::sync::OnceLock::new();
+    GATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
 pub(crate) fn install_begin_supervisor_verdict_test_gate(
     agent_id: AgentId,
 ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
@@ -4535,10 +4549,46 @@ pub(crate) fn install_begin_supervisor_verdict_test_gate(
 }
 
 #[cfg(test)]
+pub(crate) fn install_append_supervisor_warning_test_gate(
+    agent_id: AgentId,
+) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let replaced = append_supervisor_warning_test_gates()
+        .lock()
+        .expect("append-supervisor-warning test gate mutex poisoned")
+        .insert(
+            agent_id.clone(),
+            AgentStartupTestGate {
+                agent_id,
+                entered: entered_tx,
+                release: release_rx,
+            },
+        );
+    assert!(
+        replaced.is_none(),
+        "append-supervisor-warning test gate already installed"
+    );
+    (entered_rx, release_tx)
+}
+
+#[cfg(test)]
 async fn wait_for_begin_supervisor_verdict_test_gate(agent_id: &AgentId) {
     let gate = begin_supervisor_verdict_test_gates()
         .lock()
         .expect("begin-supervisor-verdict test gate mutex poisoned")
+        .remove(agent_id);
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(());
+        let _ = gate.release.await;
+    }
+}
+
+#[cfg(test)]
+async fn wait_for_append_supervisor_warning_test_gate(agent_id: &AgentId) {
+    let gate = append_supervisor_warning_test_gates()
+        .lock()
+        .expect("append-supervisor-warning test gate mutex poisoned")
         .remove(agent_id);
     if let Some(gate) = gate {
         let _ = gate.entered.send(());
@@ -7883,7 +7933,8 @@ mod tests {
         AgentControlLatestOutput, AgentControlOutput, AgentControlStatus, AgentId, AgentInput,
         AgentStartPayload, BackendKind, ChatEvent, ChatMessage, ChatMessageId, FrameKind,
         MessageMetadataUpdateData, MessageSender, MessageTokenUsage, ModelInfo, ModelRequestId,
-        ModelRequestTokenUsage, ModelTurnId, ReasoningData, ServerGeneratedChatMessageIdOrigin,
+        ModelRequestTokenUsage, ModelTurnId, QueuedMessagesPayload, ReasoningData,
+        ServerGeneratedChatMessageIdOrigin,
         ServerGeneratedChatMessageIdentity, SessionId, StreamEndData, StreamPath, StreamStartData,
         StreamTextDeltaData, TaskList, TaskTokenUsageScope, TaskTokenUsageUnavailableReason,
         TokenUsage, TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData,
@@ -8730,6 +8781,182 @@ mod tests {
                 .await,
             super::AppendSupervisorWarningOutcome::Closed
         );
+    }
+
+    #[tokio::test]
+    async fn supervisor_failure_warning_rejects_in_turn_and_queued_work() {
+        let (_dir, start, mut request, runtime, status_handle) =
+            startup_actor_fixture("supervisor-warning-busy-actor", None);
+        request
+            .initial_input
+            .as_mut()
+            .expect("initial input")
+            .message = crate::backend::mock::MOCK_SLOW_TURN_SENTINEL.to_owned();
+        let (handle, startup_rx) =
+            spawn_agent_actor(start.agent_id.clone(), start, request, runtime);
+        startup_rx
+            .await
+            .expect("actor startup reply")
+            .expect("mock actor startup");
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if status_handle.snapshot().await.is_active() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("slow mock turn becomes active");
+
+        let mut settings = protocol::SupervisorSettings::default();
+        settings.enabled = true;
+        let signal = crate::host::SupervisorSettingsSignal { settings, epoch: 1 };
+        let (_settings_tx, settings_rx) = watch::channel(signal);
+        let in_turn_status = status_handle.snapshot().await;
+        let in_turn_counter = in_turn_status.activity_counter;
+        assert_eq!(
+            handle
+                .append_supervisor_failure_warning_if_inactive(
+                    in_turn_counter,
+                    1,
+                    signal,
+                    settings_rx.clone(),
+                )
+                .await,
+            super::AppendSupervisorWarningOutcome::Ineligible
+        );
+        assert_eq!(
+            status_handle.snapshot().await.activity_counter,
+            in_turn_status.activity_counter
+        );
+
+        assert!(
+            handle
+                .send_input(AgentInput::SendMessage(protocol::SendMessagePayload {
+                    message: "queued while slow turn is open".to_owned(),
+                    images: None,
+                    origin: Some(protocol::MessageOrigin::User),
+                    tool_response: None,
+                }))
+                .await
+        );
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let output = handle
+                    .read_output(None, 100)
+                    .await
+                    .expect("actor output while queued");
+                if output.iter().any(|event| {
+                    event.kind == FrameKind::QueuedMessages
+                        && event
+                            .parse_payload::<QueuedMessagesPayload>()
+                            .is_ok_and(|payload| !payload.messages.is_empty())
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued work becomes actor-owned");
+        let queued_status = status_handle.snapshot().await;
+        let queued_counter = queued_status.activity_counter;
+        assert_eq!(
+            handle
+                .append_supervisor_failure_warning_if_inactive(
+                    queued_counter,
+                    1,
+                    signal,
+                    settings_rx,
+                )
+                .await,
+            super::AppendSupervisorWarningOutcome::Ineligible
+        );
+        assert_eq!(
+            status_handle.snapshot().await.activity_counter,
+            queued_status.activity_counter
+        );
+        let history = handle
+            .fetch_session_history(None, 100)
+            .await
+            .expect("busy actor history");
+        assert!(!history.events.iter().any(|event| matches!(
+            event,
+            ChatEvent::MessageAdded(message)
+                if matches!(message.sender, MessageSender::Warning)
+                    && message.content.starts_with("Supervisor could not verify")
+        )));
+        assert!(handle.close().await);
+    }
+
+    #[tokio::test]
+    async fn supervisor_failure_warning_samples_settings_after_status_await() {
+        let (_dir, start, request, runtime, status_handle) =
+            startup_actor_fixture("supervisor-warning-settings-race", None);
+        let agent_id = start.agent_id.clone();
+        let (handle, startup_rx) = spawn_agent_actor(agent_id.clone(), start, request, runtime);
+        startup_rx
+            .await
+            .expect("actor startup reply")
+            .expect("mock actor startup");
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let status = status_handle.snapshot().await;
+                if status.turn_completed && !status.is_active() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("mock actor becomes idle");
+
+        let mut settings = protocol::SupervisorSettings::default();
+        settings.enabled = true;
+        let expected = crate::host::SupervisorSettingsSignal { settings, epoch: 1 };
+        let (settings_tx, settings_rx) = watch::channel(expected);
+        let activity_counter = status_handle.snapshot().await.activity_counter;
+        let (entered, release) =
+            super::install_append_supervisor_warning_test_gate(agent_id);
+        let warning_handle = handle.clone();
+        let append = tokio::spawn(async move {
+            warning_handle
+                .append_supervisor_failure_warning_if_inactive(
+                    activity_counter,
+                    1,
+                    expected,
+                    settings_rx,
+                )
+                .await
+        });
+        entered
+            .await
+            .expect("warning command sampled status before final settings gate");
+        let live = crate::host::SupervisorSettingsSignal {
+            settings: protocol::SupervisorSettings {
+                enabled: false,
+                ..settings
+            },
+            epoch: 2,
+        };
+        settings_tx.send(live).expect("publish disabled settings");
+        release.send(()).expect("release final settings gate");
+        assert_eq!(
+            append.await.expect("warning append task"),
+            super::AppendSupervisorWarningOutcome::SettingsChanged { live }
+        );
+        let history = handle
+            .fetch_session_history(None, 100)
+            .await
+            .expect("actor history after settings race");
+        assert!(!history.events.iter().any(|event| matches!(
+            event,
+            ChatEvent::MessageAdded(message)
+                if matches!(message.sender, MessageSender::Warning)
+                    && message.content.starts_with("Supervisor could not verify")
+        )));
+        assert!(handle.close().await);
     }
 
     #[tokio::test]

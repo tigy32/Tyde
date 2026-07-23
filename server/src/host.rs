@@ -430,6 +430,13 @@ enum SupervisorPhase {
         last_failure_kind: SupervisionRetryReason,
         verdict_settings: VerdictSettingsFingerprint,
     },
+    FailureExhausted {
+        idle_since: Instant,
+        baseline: SupervisionBaseline,
+        attempts_started: u8,
+        retry_due_at: Option<Instant>,
+        last_failure_kind: crate::agent::supervisor::SupervisionFailureKind,
+    },
     DoneAuthorized {
         idle_since: Instant,
         baseline: SupervisionBaseline,
@@ -13454,6 +13461,7 @@ fn supervisor_phase_idle_since(phase: &SupervisorPhase) -> Option<Instant> {
         SupervisorPhase::Debouncing { idle_since }
         | SupervisorPhase::VerdictInFlight { idle_since, .. }
         | SupervisorPhase::RetryPending { idle_since, .. }
+        | SupervisorPhase::FailureExhausted { idle_since, .. }
         | SupervisorPhase::DoneAuthorized { idle_since, .. }
         | SupervisorPhase::AwaitingUser { idle_since, .. }
         | SupervisorPhase::Dormant { idle_since }
@@ -13505,36 +13513,91 @@ fn apply_live_retry_settings(
     entry: &mut SupervisorSchedulerEntry,
     settings: protocol::SupervisorSettings,
 ) -> LiveRetrySettingsResult {
-    let (idle_since, attempts_started, failure_backed) = match &entry.phase {
+    let maximum_attempts = settings.retry_attempts.saturating_add(1);
+    let pending = match &entry.phase {
         SupervisorPhase::RetryPending {
             idle_since,
+            baseline,
             attempts_started,
+            due_at,
+            last_failure_kind,
+            verdict_settings: _,
+        } => Some((
+            *idle_since,
+            baseline.clone(),
+            *attempts_started,
+            *due_at,
+            last_failure_kind.clone(),
+        )),
+        SupervisorPhase::FailureExhausted {
+            idle_since,
+            baseline,
+            attempts_started,
+            retry_due_at,
             last_failure_kind,
             ..
-        } => (
-            *idle_since,
-            *attempts_started,
-            matches!(last_failure_kind, SupervisionRetryReason::Failure(_)),
-        ),
-        _ => return LiveRetrySettingsResult::Unchanged,
+        } => {
+            if *attempts_started >= maximum_attempts {
+                return LiveRetrySettingsResult::FailureExhausted {
+                    idle_since: *idle_since,
+                    attempts_started: *attempts_started,
+                };
+            }
+            let Some(due_at) = retry_due_at else {
+                return LiveRetrySettingsResult::Unchanged;
+            };
+            let idle_since = *idle_since;
+            let baseline = baseline.clone();
+            let attempts_started = *attempts_started;
+            let due_at = *due_at;
+            let last_failure_kind = *last_failure_kind;
+            entry.phase = SupervisorPhase::RetryPending {
+                idle_since,
+                baseline,
+                attempts_started,
+                due_at,
+                last_failure_kind: SupervisionRetryReason::Failure(last_failure_kind),
+                verdict_settings: VerdictSettingsFingerprint::from(settings),
+            };
+            tracing::info!(
+                agent_id = %agent_id,
+                attempts_started,
+                maximum_attempts,
+                next_due = ?due_at,
+                "raised retry limit resumed failure-exhausted supervision with its original backoff"
+            );
+            return LiveRetrySettingsResult::Unchanged;
+        }
+        _ => None,
     };
-    if attempts_started >= settings.retry_attempts.saturating_add(1) {
+    let Some((idle_since, baseline, attempts_started, due_at, reason)) = pending else {
+        return LiveRetrySettingsResult::Unchanged;
+    };
+    if attempts_started >= maximum_attempts {
         tracing::info!(
             agent_id = %agent_id,
             attempts_started,
-            maximum_attempts = settings.retry_attempts.saturating_add(1),
+            maximum_attempts,
             "live retry limit exhausted pending supervision attempts"
         );
-        if failure_backed {
-            LiveRetrySettingsResult::FailureExhausted {
+        match reason {
+            SupervisionRetryReason::Failure(last_failure_kind) => {
+                entry.phase = SupervisorPhase::FailureExhausted {
+                    idle_since,
+                    baseline,
+                    attempts_started,
+                    retry_due_at: Some(due_at),
+                    last_failure_kind,
+                };
+                LiveRetrySettingsResult::FailureExhausted {
+                    idle_since,
+                    attempts_started,
+                }
+            }
+            SupervisionRetryReason::SettingsChanged => LiveRetrySettingsResult::SettingsExhausted {
                 idle_since,
                 attempts_started,
-            }
-        } else {
-            LiveRetrySettingsResult::SettingsExhausted {
-                idle_since,
-                attempts_started,
-            }
+            },
         }
     } else if let SupervisorPhase::RetryPending {
         verdict_settings, ..
@@ -14149,13 +14212,20 @@ fn schedule_supervision_retry_at(
 ) -> SupervisionRetrySchedule {
     let maximum_attempts = settings.retry_attempts.saturating_add(1);
     if attempts_started >= maximum_attempts {
-        entries.get_mut(agent_id).expect("entry exists").phase = SupervisorPhase::RetryPending {
-            idle_since,
-            baseline,
-            attempts_started,
-            due_at: scheduled_at,
-            last_failure_kind: reason,
-            verdict_settings: VerdictSettingsFingerprint::from(settings),
+        entries.get_mut(agent_id).expect("entry exists").phase = match reason {
+            SupervisionRetryReason::Failure(last_failure_kind) => {
+                let retry_due_at = SUPERVISION_RETRY_DELAYS
+                    .get(usize::from(attempts_started.saturating_sub(1)))
+                    .and_then(|delay| scheduled_at.checked_add(*delay));
+                SupervisorPhase::FailureExhausted {
+                    idle_since,
+                    baseline,
+                    attempts_started,
+                    retry_due_at,
+                    last_failure_kind,
+                }
+            }
+            SupervisionRetryReason::SettingsChanged => SupervisorPhase::Dormant { idle_since },
         };
         return SupervisionRetrySchedule::Exhausted;
     }
@@ -24365,6 +24435,121 @@ Rules: Record only what remains true and useful for future work; drop transient 
     }
 
     #[tokio::test]
+    async fn settings_change_at_warning_gate_rejects_stale_append_and_preserves_backoff() {
+        let fixture = compact_fixture().await;
+        let (agent_id, session_id) =
+            spawn_idle_user_agent(&fixture.host, "warning settings race").await;
+        fixture
+            .host
+            .set_setting(SetSettingPayload {
+                setting: HostSettingValue::SupervisorEnabled { enabled: true },
+            })
+            .await
+            .expect("enable supervisor");
+        fixture
+            .host
+            .set_setting(SetSettingPayload {
+                setting: HostSettingValue::SupervisorRetryAttempts { count: 0 },
+            })
+            .await
+            .expect("set initial retry cap");
+        let expected_settings = fixture.host.supervisor_settings_signal().await;
+        let observation = fixture
+            .host
+            .activity_summary_observation(&agent_id)
+            .await
+            .expect("agent observation");
+        let context = observation
+            .handle
+            .read_supervision_context()
+            .await
+            .expect("supervision context");
+        let baseline = SupervisionBaseline {
+            last_user_message: context.last_user_message.expect("last user message"),
+            kicks_since_user_message: context.kicks_since_user_message,
+            session_id: Some(session_id),
+        };
+        let activity_counter = observation.status.activity_counter;
+        let idle_since = Instant::now();
+        let failed_at = Instant::now();
+        let fingerprint = VerdictSettingsFingerprint::from(expected_settings.settings);
+        let entries = HashMap::from([(
+            agent_id.clone(),
+            SupervisorSchedulerEntry {
+                last_activity_counter: activity_counter,
+                phase: SupervisorPhase::VerdictInFlight {
+                    idle_since,
+                    baseline: baseline.clone(),
+                    attempts_started: 1,
+                    verdict_settings: fingerprint,
+                },
+            },
+        )]);
+        let (entered, release) =
+            crate::agent::install_append_supervisor_warning_test_gate(agent_id.clone());
+        let host = fixture.host.clone();
+        let result_agent_id = agent_id.clone();
+        let acceptance = tokio::spawn(async move {
+            let mut entries = entries;
+            accept_supervision_verdict_result(
+                &host,
+                &mut entries,
+                expected_settings,
+                SupervisorVerdictTaskResult {
+                    agent_id: result_agent_id,
+                    activity_counter,
+                    baseline,
+                    attempts_started: 1,
+                    verdict_settings: fingerprint,
+                    result: Err(crate::agent::supervisor::SupervisionFailure {
+                        kind: crate::agent::supervisor::SupervisionFailureKind::BackendStream,
+                        message: "settings race failure".to_owned(),
+                    }),
+                },
+                failed_at,
+            )
+            .await;
+            entries
+        });
+
+        entered.await.expect("warning command reached final settings gate");
+        fixture
+            .host
+            .set_setting(SetSettingPayload {
+                setting: HostSettingValue::SupervisorRetryAttempts { count: 1 },
+            })
+            .await
+            .expect("raise retry cap at warning gate");
+        let raised_settings = fixture.host.supervisor_settings_signal().await;
+        release.send(()).expect("release warning settings gate");
+        let entries = acceptance.await.expect("verdict acceptance task");
+        let expected_due = failed_at
+            .checked_add(SUPERVISION_RETRY_DELAYS[0])
+            .expect("first retry due");
+        assert!(matches!(
+            entries.get(&agent_id).map(|entry| &entry.phase),
+            Some(SupervisorPhase::RetryPending {
+                attempts_started: 1,
+                due_at,
+                verdict_settings,
+                ..
+            }) if *due_at == expected_due
+                && *verdict_settings == VerdictSettingsFingerprint::from(raised_settings.settings)
+        ));
+        let history = observation
+            .handle
+            .fetch_session_history(None, 100)
+            .await
+            .expect("actor history after settings race");
+        assert!(!history.events.iter().any(|event| matches!(
+            event,
+            ChatEvent::MessageAdded(message)
+                if matches!(message.sender, MessageSender::Warning)
+                    && message.content.starts_with("Supervisor could not verify")
+        )));
+    }
+
+    #[tokio::test]
     async fn failure_backed_live_cap_reduction_warns_but_settings_only_does_not() {
         let fixture = compact_fixture().await;
         let (agent_id, _) =
@@ -25511,7 +25696,10 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 ..
             }
         ));
-        assert!(matches!(pending.phase, SupervisorPhase::RetryPending { .. }));
+        assert!(matches!(
+            pending.phase,
+            SupervisorPhase::FailureExhausted { .. }
+        ));
     }
 
     #[test]
@@ -25592,6 +25780,21 @@ Rules: Record only what remains true and useful for future work; drop transient 
             Some("outage".to_owned()),
             Instant::now(),
         ), SupervisionRetrySchedule::Exhausted);
+        assert!(matches!(
+            entries.get(&agent_id).map(|entry| &entry.phase),
+            Some(SupervisorPhase::FailureExhausted { .. })
+        ));
+        for _ in 0..100 {
+            assert_eq!(
+                supervisor_next_deadline(
+                    &entries,
+                    SupervisorSettingsSignal { settings, epoch: 1 },
+                    false,
+                ),
+                None,
+                "failure-exhausted warning gating must never create an immediate deadline"
+            );
+        }
 
         settings.retry_attempts = 1;
         assert_eq!(settings.retry_attempts.saturating_add(1), 2);
@@ -25629,6 +25832,21 @@ Rules: Record only what remains true and useful for future work; drop transient 
             None,
             idle_since,
         ), SupervisionRetrySchedule::Exhausted);
+        assert!(matches!(
+            entries.get(&agent_id).map(|entry| &entry.phase),
+            Some(SupervisorPhase::FailureExhausted {
+                retry_due_at: Some(_),
+                ..
+            })
+        ));
+        assert_eq!(
+            supervisor_next_deadline(
+                &entries,
+                SupervisorSettingsSignal { settings, epoch: 1 },
+                false,
+            ),
+            None
+        );
 
         settings.retry_attempts = 0;
         assert_eq!(settings.retry_attempts.saturating_add(1), 1);
