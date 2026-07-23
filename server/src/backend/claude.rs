@@ -4527,6 +4527,25 @@ fn refresh_background_task_owner(
     if let Some(parent_tool_use_id) = background_task_parent_tool_use_id(value) {
         entry.parent_tool_use_id = Some(parent_tool_use_id.to_owned());
     }
+    let frame_tool_name = collect_tool_use_blocks(value)
+        .into_iter()
+        .find_map(|block| {
+            (block.get("id").and_then(Value::as_str) == Some(entry.tool_use_id.as_str()))
+                .then(|| block.get("name").and_then(Value::as_str))
+                .flatten()
+                .and_then(normalize_nonempty)
+        });
+    if entry.owner.is_none() && frame_tool_name.is_some() {
+        entry.owner = match entry.parent_tool_use_id.as_deref() {
+            Some(parent_id) => subagent_streams
+                .get(parent_id)
+                .map(|stream| Arc::clone(&stream.inner.emitter)),
+            None => Some(Arc::clone(root_emitter)),
+        };
+    }
+    if entry.owner.is_some() && entry.tool_name.is_none() {
+        entry.tool_name = frame_tool_name;
+    }
     if entry.owner.is_none() {
         entry.owner = resolve_background_task_owner(
             &entry.tool_use_id,
@@ -16710,23 +16729,24 @@ for raw_line in sys.stdin:
                 }],
             },
         });
-        inner.emitter.tool_request(
-            "toolu_monitor",
-            "Monitor",
-            json!({
-                "kind": "Other",
-                "args": {
-                    "command": "until test -f /tmp/done; do sleep 1; done",
-                    "persistent": false,
-                },
-            }),
-        );
         refresh_unresolved_background_tasks(
             &assistant,
             &mut tasks,
             &inner.emitter,
             &HashMap::new(),
         );
+        assert!(handle_background_bash_task_frame_with_owners(
+            &json!({
+                "type": "system",
+                "subtype": "task_notification",
+                "task_id": "monitor-task",
+                "status": "stopped",
+                "summary": "Monitor stopped",
+            }),
+            &mut tasks,
+            &inner.emitter,
+            &HashMap::new(),
+        ));
 
         let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
         assert!(
@@ -16749,6 +16769,10 @@ for raw_line in sys.stdin:
                 .and_then(Value::as_str),
             Some("running")
         );
+        assert!(events.iter().any(|event| {
+            event_kind(event) == Some("ToolProgress")
+                && event.pointer("/data/update/status").and_then(Value::as_str) == Some("stopped")
+        }));
     }
 
     #[test]
