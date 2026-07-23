@@ -4461,6 +4461,7 @@ fn handle_workflow_task_frame(
 
 struct BackgroundTaskEntry {
     tool_use_id: String,
+    tool_name: Option<String>,
     owner: Option<Arc<TurnEmitter>>,
     parent_tool_use_id: Option<String>,
     state: BackgroundTaskState,
@@ -4533,6 +4534,12 @@ fn refresh_background_task_owner(
             subagent_streams,
         );
     }
+    if entry.tool_name.is_none() {
+        entry.tool_name = entry
+            .owner
+            .as_deref()
+            .and_then(|owner| owner.tool_request_name(&entry.tool_use_id));
+    }
 }
 
 const BACKGROUND_COMMAND_OUTPUT_LIMIT: u64 = 64 * 1024;
@@ -4600,21 +4607,27 @@ fn capture_background_command_output(
 }
 
 fn emit_background_task_snapshot(emitter: &TurnEmitter, entry: &BackgroundTaskEntry) {
+    let Some(tool_name) = entry.tool_name.as_ref() else {
+        return;
+    };
     emitter.tool_progress(&ToolProgressData {
         tool_call_id: entry.tool_use_id.clone(),
-        tool_name: "Bash".to_string(),
+        tool_name: tool_name.clone(),
         update: ToolProgressUpdate::BackgroundTask(entry.state.clone()),
     });
 }
 
 fn emit_background_task_completion(emitter: &TurnEmitter, entry: &BackgroundTaskEntry) {
+    let Some(tool_name) = entry.tool_name.as_deref() else {
+        return;
+    };
     let summary = entry.state.summary.as_deref().unwrap_or_default();
     if let Some(result) = entry.output.as_ref()
         && entry.state.status != BackgroundTaskStatus::Stopped
     {
         emitter.tool_completed(ToolCompletedPayload {
             tool_call_id: &entry.tool_use_id,
-            tool_name: "Bash",
+            tool_name,
             tool_result: result.as_tool_result(),
             success: result.exit_code == 0,
             error: (result.exit_code != 0).then_some("Background command exited non-zero"),
@@ -4657,7 +4670,7 @@ fn emit_background_task_completion(emitter: &TurnEmitter, entry: &BackgroundTask
     };
     emitter.tool_completed(ToolCompletedPayload {
         tool_call_id: &entry.tool_use_id,
-        tool_name: "Bash",
+        tool_name,
         tool_result,
         success,
         error: error.as_deref(),
@@ -4727,8 +4740,12 @@ fn handle_background_bash_task_frame_with_owners(
                 root_emitter,
                 subagent_streams,
             );
+            let tool_name = owner
+                .as_deref()
+                .and_then(|owner| owner.tool_request_name(&tool_use_id));
             let entry = BackgroundTaskEntry {
                 tool_use_id,
+                tool_name,
                 owner,
                 parent_tool_use_id,
                 state: BackgroundTaskState {
@@ -4748,7 +4765,9 @@ fn handle_background_bash_task_frame_with_owners(
                 owner_resolved = entry.owner.is_some(),
                 "registered background Bash task ownership"
             );
-            if let Some(owner) = entry.owner.as_deref() {
+            if let Some(owner) = entry.owner.as_deref()
+                && entry.tool_name.is_some()
+            {
                 emit_background_task_snapshot(owner, &entry);
             }
             background_tasks.insert(task_id, entry);
@@ -4802,7 +4821,9 @@ fn handle_background_bash_task_frame_with_owners(
                 Ok(output) => entry.output = Some(output),
                 Err(reason) => entry.state.output_unavailable = Some(reason.to_owned()),
             }
-            if let Some(owner) = entry.owner.as_deref() {
+            if let Some(owner) = entry.owner.as_deref()
+                && entry.tool_name.is_some()
+            {
                 emit_background_task_snapshot(owner, &entry);
                 emit_background_task_completion(owner, &entry);
             } else {
@@ -4810,7 +4831,7 @@ fn handle_background_bash_task_frame_with_owners(
                     task_id,
                     tool_use_id = entry.tool_use_id,
                     parent_tool_use_id = entry.parent_tool_use_id.as_deref().unwrap_or(""),
-                    "dropping terminal background Bash frame because ownership remained unresolved"
+                    "dropping terminal background task frame because ownership or tool identity remained unresolved"
                 );
             }
             true
@@ -16625,6 +16646,59 @@ for raw_line in sys.stdin:
             Some(
                 "Background command \"Sleep 10 seconds then echo marker\" completed (exit code 0)"
             )
+        );
+    }
+
+    #[test]
+    fn background_task_progress_preserves_monitor_tool_identity() {
+        let (inner, mut rx) = make_test_inner();
+        let mut tasks: HashMap<String, BackgroundTaskEntry> = HashMap::new();
+        inner.emitter.tool_request(
+            "toolu_monitor",
+            "Monitor",
+            json!({
+                "kind": "Other",
+                "args": {
+                    "command": "until test -f /tmp/done; do sleep 1; done",
+                    "persistent": false,
+                },
+            }),
+        );
+
+        assert!(handle_background_bash_task_frame_with_owners(
+            &json!({
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": "monitor-task",
+                "tool_use_id": "toolu_monitor",
+                "description": "wait for completion",
+                "task_type": "local_bash",
+            }),
+            &mut tasks,
+            &inner.emitter,
+            &HashMap::new(),
+        ));
+
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            events
+                .iter()
+                .all(|event| event_kind(event) != Some("Error")),
+            "background progress must not conflict with the originating Monitor request"
+        );
+        let progress = events
+            .iter()
+            .find(|event| event_kind(event) == Some("ToolProgress"))
+            .expect("background Monitor progress");
+        assert_eq!(
+            progress.pointer("/data/tool_name").and_then(Value::as_str),
+            Some("Monitor")
+        );
+        assert_eq!(
+            progress
+                .pointer("/data/update/status")
+                .and_then(Value::as_str),
+            Some("running")
         );
     }
 

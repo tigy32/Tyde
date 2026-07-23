@@ -374,6 +374,15 @@ impl TurnEmitter {
         self.lock().is_tool_pending(tool_call_id)
     }
 
+    pub(crate) fn tool_request_name(&self, tool_call_id: &str) -> Option<String> {
+        let state = self.lock();
+        state
+            .emitted_tool_requests
+            .get(tool_call_id)
+            .or_else(|| state.detached_tool_requests.get(tool_call_id))
+            .map(|request| request.name.clone())
+    }
+
     pub fn tool_completed_with_normalization_failure(
         &self,
         data: ToolCompletedPayload<'_>,
