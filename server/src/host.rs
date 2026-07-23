@@ -86,7 +86,8 @@ use crate::agent::registry::{
 use crate::agent::{
     AgentHandle, AgentUsageSnapshot, CompactionStart, CompactionSummary,
     DEFAULT_COMPACTION_SUMMARY_MAX_BYTES, GenerateAgentActivitySummaryRequest,
-    GenerateAgentNameRequest, InterruptOutcome, MAX_COMPACTION_SUMMARY_BYTES, derive_agent_name,
+    GenerateAgentNameRequest, InterruptOutcome, MAX_COMPACTION_SUMMARY_BYTES,
+    SupervisorVerdictStart, derive_agent_name,
     generate_agent_activity_summary, generate_agent_name,
 };
 use crate::agent_control_mcp::AgentControlMcpHandle;
@@ -288,6 +289,8 @@ pub struct HostRuntimeConfig {
     /// supplied. Defaults to `false` so production startup is unaffected.
     pub skip_real_backend_probe: bool,
     pub agents_view_preferences_primary: bool,
+    #[cfg(test)]
+    pub start_agent_supervisor_worker: bool,
 }
 
 impl Default for HostRuntimeConfig {
@@ -305,6 +308,8 @@ impl Default for HostRuntimeConfig {
             mobile_managed_service_base_url: None,
             skip_real_backend_probe: false,
             agents_view_preferences_primary: true,
+            #[cfg(test)]
+            start_agent_supervisor_worker: true,
         }
     }
 }
@@ -383,7 +388,7 @@ struct SupervisionBaseline {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct VerdictSettingsFingerprint {
+pub(crate) struct VerdictSettingsFingerprint {
     max_kicks_per_task: u8,
     retry_attempts: u8,
     cost_tier: protocol::SupervisorCostTier,
@@ -584,58 +589,6 @@ async fn wait_for_supervisor_verdict_post_sample_test_gate(agent_id: &AgentId) {
 
 #[cfg(not(test))]
 async fn wait_for_supervisor_verdict_post_sample_test_gate(_agent_id: &AgentId) {}
-
-#[cfg(test)]
-struct SupervisorVerdictPreStartTestGate {
-    entered: oneshot::Sender<()>,
-    release: oneshot::Receiver<()>,
-}
-
-#[cfg(test)]
-fn supervisor_verdict_pre_start_test_gates(
-) -> &'static StdMutex<HashMap<AgentId, SupervisorVerdictPreStartTestGate>> {
-    static GATES: std::sync::OnceLock<
-        StdMutex<HashMap<AgentId, SupervisorVerdictPreStartTestGate>>,
-    > = std::sync::OnceLock::new();
-    GATES.get_or_init(|| StdMutex::new(HashMap::new()))
-}
-
-#[cfg(test)]
-fn install_supervisor_verdict_pre_start_test_gate(
-    agent_id: AgentId,
-) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
-    let (entered_tx, entered_rx) = oneshot::channel();
-    let (release_tx, release_rx) = oneshot::channel();
-    let replaced = supervisor_verdict_pre_start_test_gates()
-        .lock()
-        .expect("supervisor verdict pre-start test gate mutex poisoned")
-        .insert(
-            agent_id,
-            SupervisorVerdictPreStartTestGate {
-                entered: entered_tx,
-                release: release_rx,
-            },
-        );
-    assert!(replaced.is_none(), "pre-start test gate already installed");
-    (entered_rx, release_tx)
-}
-
-#[cfg(test)]
-async fn wait_for_supervisor_verdict_pre_start_test_gate(agent_id: &AgentId) {
-    let gate = {
-        supervisor_verdict_pre_start_test_gates()
-            .lock()
-            .expect("supervisor verdict pre-start test gate mutex poisoned")
-            .remove(agent_id)
-    };
-    if let Some(gate) = gate {
-        let _ = gate.entered.send(());
-        let _ = gate.release.await;
-    }
-}
-
-#[cfg(not(test))]
-async fn wait_for_supervisor_verdict_pre_start_test_gate(_agent_id: &AgentId) {}
 
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13058,7 +13011,12 @@ fn spawn_host_inner(
     spawn_host_team_status_task(host.clone());
     spawn_task_token_usage_task(host.clone());
     spawn_agent_activity_summary_task(host.clone());
+    #[cfg(not(test))]
     spawn_agent_supervisor_task(host.clone());
+    #[cfg(test)]
+    if runtime_config.start_agent_supervisor_worker {
+        spawn_agent_supervisor_task(host.clone());
+    }
 
     Ok(host)
 }
@@ -13925,37 +13883,47 @@ async fn launch_supervision_verdict(
     let last_assistant_message = context.last_assistant_message;
     let last_error = context.last_error_since_user_message;
     let tx = verdict_tx.clone();
+    let verdict_settings = VerdictSettingsFingerprint::from(settings.settings);
+    let settings_rx = host.supervisor_settings_receiver().await;
+    match observation
+        .handle
+        .begin_supervisor_verdict_if_inactive(
+            activity_counter,
+            verdict_settings,
+            settings_rx,
+        )
+        .await
+    {
+        SupervisorVerdictStart::Accepted => {}
+        SupervisorVerdictStart::Rejected {
+            reason,
+            live_settings,
+        } => {
+            tracing::debug!(
+                agent_id = %agent_id,
+                ?reason,
+                "supervision verdict start rejected at agent activity/settings boundary"
+            );
+            if live_settings != settings {
+                apply_supervisor_settings_change(host, entries, settings, live_settings).await;
+            } else {
+                observe_supervised_agents(host, entries).await;
+            }
+            return;
+        }
+        SupervisorVerdictStart::Closed => {
+            entries.remove(&agent_id);
+            return;
+        }
+    }
     let Ok(permit) = Arc::clone(semaphore).try_acquire_owned() else {
         return;
     };
-    let verdict_settings = VerdictSettingsFingerprint::from(settings.settings);
-    wait_for_supervisor_verdict_pre_start_test_gate(&agent_id).await;
-    let Some(live_observation) = host.activity_summary_observation(&agent_id).await else {
-        drop(permit);
-        entries.remove(&agent_id);
-        return;
-    };
-    if live_observation.status.activity_counter != activity_counter
-        || live_observation.status.terminated
-        || live_observation.status.is_active()
-        || live_observation.status.is_plan_approval_pending()
-    {
-        drop(permit);
-        observe_supervised_agents(host, entries).await;
-        return;
-    }
-    let live_settings = host.supervisor_settings_signal().await;
-    if !live_settings.settings.enabled
-        || VerdictSettingsFingerprint::from(live_settings.settings) != verdict_settings
-    {
-        drop(permit);
-        return;
-    }
-    let attempts_started = attempts_started.saturating_add(1);
     let Some(task_id) = verdict_task_state.reserve() else {
         drop(permit);
         return;
     };
+    let attempts_started = attempts_started.saturating_add(1);
     entries.get_mut(&agent_id).expect("entry exists").phase =
         SupervisorPhase::VerdictInFlight {
             idle_since,
@@ -21503,6 +21471,36 @@ Rules: Record only what remains true and useful for future work; drop transient 
         CompactFixture { _dir: dir, host }
     }
 
+    async fn compact_fixture_without_supervisor_worker() -> CompactFixture {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = spawn_host_with_mock_backend_and_runtime_config(
+            dir.path().join("sessions.json"),
+            dir.path().join("projects.json"),
+            dir.path().join("settings.json"),
+            HostRuntimeConfig {
+                skip_real_backend_probe: true,
+                start_agent_supervisor_worker: false,
+                ..HostRuntimeConfig::default()
+            },
+        )
+        .expect("spawn mock host without supervisor worker");
+        host.set_setting(SetSettingPayload {
+            setting: HostSettingValue::EnabledBackends {
+                enabled_backends: vec![BackendKind::Claude],
+            },
+        })
+        .await
+        .expect("enable backend");
+        host.set_setting(SetSettingPayload {
+            setting: HostSettingValue::DefaultBackend {
+                default_backend: Some(BackendKind::Claude),
+            },
+        })
+        .await
+        .expect("set default backend");
+        CompactFixture { _dir: dir, host }
+    }
+
     fn task_usage_amount(input_tokens: u64, output_tokens: u64) -> TaskTokenUsageAmount {
         TaskTokenUsageAmount {
             total_tokens: input_tokens + output_tokens,
@@ -24170,7 +24168,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
     #[tokio::test]
     async fn production_retry_scheduler_starts_exact_bounded_calls_at_due_deadlines() {
         for (retry_attempts, expected_calls) in [(0, 1_u8), (1, 2), (5, 6)] {
-            let fixture = compact_fixture().await;
+            let fixture = compact_fixture_without_supervisor_worker().await;
             fixture
                 .host
                 .set_setting(SetSettingPayload {
@@ -24297,7 +24295,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
 
     #[tokio::test]
     async fn production_scheduler_occupancy_survives_activity_and_disable_phase_resets() {
-        let fixture = compact_fixture().await;
+        let fixture = compact_fixture_without_supervisor_worker().await;
         let (agent_id, _) = spawn_idle_user_agent(
             &fixture.host,
             &format!(
@@ -24319,6 +24317,11 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .activity_summary_observation(&agent_id)
             .await
             .expect("idle observation");
+        let status_handle = fixture
+            .host
+            .agent_status_handle(&agent_id)
+            .await
+            .expect("agent status handle");
         let now = Instant::now();
         let mut entries = HashMap::from([(
             agent_id.clone(),
@@ -24365,6 +24368,8 @@ Rules: Record only what remains true and useful for future work; drop transient 
             entries.get(&agent_id).map(|entry| &entry.phase),
             Some(SupervisorPhase::Active)
         ));
+        assert!(verdict_task_state.is_active());
+        assert!(starts.try_recv().is_err());
         status_handle
             .update(|status| {
                 status.activity_counter = status.activity_counter.saturating_add(1);
@@ -24513,8 +24518,72 @@ Rules: Record only what remains true and useful for future work; drop transient 
     }
 
     #[tokio::test]
-    async fn production_scheduler_rechecks_settings_after_pre_start_observation_window() {
-        let fixture = compact_fixture().await;
+    async fn actor_verdict_start_rejects_activity_ordered_before_authorization() {
+        let fixture = compact_fixture_without_supervisor_worker().await;
+        let (agent_id, _) = spawn_idle_user_agent(
+            &fixture.host,
+            &format!(
+                "actor ordering {}",
+                crate::backend::mock::MOCK_USER_BUBBLES_SENTINEL,
+            ),
+        )
+        .await;
+        fixture
+            .host
+            .set_setting(SetSettingPayload {
+                setting: HostSettingValue::SupervisorEnabled { enabled: true },
+            })
+            .await
+            .expect("enable supervisor");
+        let settings = fixture.host.supervisor_settings_signal().await;
+        let observation = fixture
+            .host
+            .activity_summary_observation(&agent_id)
+            .await
+            .expect("idle observation");
+
+        assert!(
+            observation
+                .handle
+                .send_input(AgentInput::SendMessage(SendMessagePayload {
+                    message: crate::backend::mock::MOCK_SLOW_TURN_SENTINEL.to_owned(),
+                    images: None,
+                    origin: Some(MessageOrigin::User),
+                    tool_response: None,
+                }))
+                .await
+        );
+        let result = observation
+            .handle
+            .begin_supervisor_verdict_if_inactive(
+                observation.status.activity_counter,
+                VerdictSettingsFingerprint::from(settings.settings),
+                fixture.host.supervisor_settings_receiver().await,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            SupervisorVerdictStart::Rejected {
+                reason: crate::agent::SupervisorVerdictStartRejection::ActivityChanged,
+                live_settings,
+            } if live_settings == settings
+        ));
+        assert!(
+            fixture
+                .host
+                .agent_status_snapshot(&agent_id)
+                .await
+                .expect("active status")
+                .activity_counter
+                > observation.status.activity_counter
+        );
+        assert_eq!(observation.handle.interrupt().await, InterruptOutcome::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn production_scheduler_actor_gate_rejects_stale_settings() {
+        let fixture = compact_fixture_without_supervisor_worker().await;
         fixture
             .host
             .set_setting(SetSettingPayload {
@@ -24563,7 +24632,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         let (compaction_tx, _compaction_rx) = mpsc::unbounded_channel();
         let semaphore = Arc::new(Semaphore::new(1));
         let (pre_start_entered, pre_start_release) =
-            install_supervisor_verdict_pre_start_test_gate(agent_id.clone());
+            crate::agent::install_begin_supervisor_verdict_test_gate(agent_id.clone());
         let (mut starts, releases) =
             install_supervisor_verdict_call_test_gate(agent_id.clone());
 
@@ -24589,7 +24658,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         });
         pre_start_entered
             .await
-            .expect("launch reached pre-start observation window");
+            .expect("actor reached verdict settings boundary");
         fixture
             .host
             .set_setting(SetSettingPayload {
@@ -24598,7 +24667,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 },
             })
             .await
-            .expect("change verdict settings before final pre-start sample");
+            .expect("change verdict settings before actor authorization");
         let live_settings = fixture.host.supervisor_settings_signal().await;
         pre_start_release.send(()).expect("release pre-start gate");
         let (mut entries, mut verdict_task_state) = launch.await.expect("deadline task");
@@ -24656,7 +24725,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
 
     #[tokio::test]
     async fn production_scheduler_serializes_due_agents_through_one_task_owner() {
-        let fixture = compact_fixture().await;
+        let fixture = compact_fixture_without_supervisor_worker().await;
         let prompt = format!(
             "{} {}",
             crate::backend::mock::MOCK_USER_BUBBLES_SENTINEL,

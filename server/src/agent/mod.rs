@@ -165,6 +165,12 @@ impl AgentActorRuntimeResources {
 
 enum AgentCommand {
     SendInput(AgentInput),
+    BeginSupervisorVerdictIfInactive {
+        expected_activity_counter: u64,
+        expected_verdict_settings: crate::host::VerdictSettingsFingerprint,
+        supervisor_settings_rx: watch::Receiver<crate::host::SupervisorSettingsSignal>,
+        reply: oneshot::Sender<SupervisorVerdictStart>,
+    },
     Compact {
         summary_prompt: String,
         max_summary_bytes: usize,
@@ -229,6 +235,23 @@ enum AgentCommand {
         stream: Stream,
         reply: oneshot::Sender<bool>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SupervisorVerdictStartRejection {
+    ActivityChanged,
+    SettingsChanged,
+    Ineligible,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SupervisorVerdictStart {
+    Accepted,
+    Rejected {
+        reason: SupervisorVerdictStartRejection,
+        live_settings: crate::host::SupervisorSettingsSignal,
+    },
+    Closed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -956,6 +979,31 @@ impl AgentHandle {
             return false;
         }
         self.tx.send(AgentCommand::SendInput(input)).is_ok()
+    }
+
+    pub(crate) async fn begin_supervisor_verdict_if_inactive(
+        &self,
+        expected_activity_counter: u64,
+        expected_verdict_settings: crate::host::VerdictSettingsFingerprint,
+        supervisor_settings_rx: watch::Receiver<crate::host::SupervisorSettingsSignal>,
+    ) -> SupervisorVerdictStart {
+        if !self.accepting_input.load(Ordering::SeqCst) {
+            return SupervisorVerdictStart::Closed;
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(AgentCommand::BeginSupervisorVerdictIfInactive {
+                expected_activity_counter,
+                expected_verdict_settings,
+                supervisor_settings_rx,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return SupervisorVerdictStart::Closed;
+        }
+        reply_rx.await.unwrap_or(SupervisorVerdictStart::Closed)
     }
 
     pub fn begin_compact(
@@ -2270,6 +2318,16 @@ pub(crate) fn spawn_agent_actor(
                         }
                         AgentCommand::Compact { reply, .. } => {
                             let _ = reply.send(Err("agent backend is starting".to_owned()));
+                        }
+                        AgentCommand::BeginSupervisorVerdictIfInactive {
+                            supervisor_settings_rx,
+                            reply,
+                            ..
+                        } => {
+                            let _ = reply.send(SupervisorVerdictStart::Rejected {
+                                reason: SupervisorVerdictStartRejection::Ineligible,
+                                live_settings: *supervisor_settings_rx.borrow(),
+                            });
                         }
                         AgentCommand::CompactIfInactive {
                             accepted, reply, ..
@@ -3878,6 +3936,48 @@ pub(crate) fn spawn_agent_actor(
                                 }
                             }
                         }
+                        AgentCommand::BeginSupervisorVerdictIfInactive {
+                            expected_activity_counter,
+                            expected_verdict_settings,
+                            supervisor_settings_rx,
+                            reply,
+                        } => {
+                            let live_status = status_handle.snapshot().await;
+                            wait_for_begin_supervisor_verdict_test_gate(
+                                &current_start.agent_id,
+                            )
+                            .await;
+                            let live_settings = *supervisor_settings_rx.borrow();
+                            let reason = if live_status.activity_counter
+                                != expected_activity_counter
+                            {
+                                Some(SupervisorVerdictStartRejection::ActivityChanged)
+                            } else if !live_settings.settings.enabled
+                                || crate::host::VerdictSettingsFingerprint::from(
+                                    live_settings.settings,
+                                ) != expected_verdict_settings
+                            {
+                                Some(SupervisorVerdictStartRejection::SettingsChanged)
+                            } else if live_status.terminated
+                                || live_status.is_active()
+                                || live_status.is_plan_approval_pending()
+                                || matches!(lifecycle, ActorLifecycle::Closing)
+                                || in_turn
+                                || !queue.is_empty()
+                            {
+                                Some(SupervisorVerdictStartRejection::Ineligible)
+                            } else {
+                                None
+                            };
+                            let verdict = reason.map_or(
+                                SupervisorVerdictStart::Accepted,
+                                |reason| SupervisorVerdictStart::Rejected {
+                                    reason,
+                                    live_settings,
+                                },
+                            );
+                            let _ = reply.send(verdict);
+                        }
                         AgentCommand::CompactIfInactive {
                             expected_activity_counter,
                             expected_supervisor_settings_epoch,
@@ -4306,6 +4406,54 @@ static COMPACT_IF_INACTIVE_TEST_GATE: std::sync::Mutex<Option<AgentStartupTestGa
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
+fn begin_supervisor_verdict_test_gates(
+) -> &'static std::sync::Mutex<HashMap<AgentId, AgentStartupTestGate>> {
+    static GATES: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<AgentId, AgentStartupTestGate>>,
+    > = std::sync::OnceLock::new();
+    GATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn install_begin_supervisor_verdict_test_gate(
+    agent_id: AgentId,
+) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let replaced = begin_supervisor_verdict_test_gates()
+        .lock()
+        .expect("begin-supervisor-verdict test gate mutex poisoned")
+        .insert(
+            agent_id.clone(),
+            AgentStartupTestGate {
+                agent_id,
+                entered: entered_tx,
+                release: release_rx,
+            },
+        );
+    assert!(
+        replaced.is_none(),
+        "begin-supervisor-verdict test gate already installed"
+    );
+    (entered_rx, release_tx)
+}
+
+#[cfg(test)]
+async fn wait_for_begin_supervisor_verdict_test_gate(agent_id: &AgentId) {
+    let gate = begin_supervisor_verdict_test_gates()
+        .lock()
+        .expect("begin-supervisor-verdict test gate mutex poisoned")
+        .remove(agent_id);
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(());
+        let _ = gate.release.await;
+    }
+}
+
+#[cfg(not(test))]
+async fn wait_for_begin_supervisor_verdict_test_gate(_agent_id: &AgentId) {}
+
+#[cfg(test)]
 pub(crate) fn install_compact_if_inactive_test_gate(
     agent_id: AgentId,
 ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
@@ -4728,6 +4876,16 @@ pub(crate) fn spawn_relay_agent_actor(
                         AgentCommand::Compact { reply, .. } => {
                             let _ = reply.send(Err("backend-native agents cannot be compacted".to_owned()));
                         }
+                        AgentCommand::BeginSupervisorVerdictIfInactive {
+                            supervisor_settings_rx,
+                            reply,
+                            ..
+                        } => {
+                            let _ = reply.send(SupervisorVerdictStart::Rejected {
+                                reason: SupervisorVerdictStartRejection::Ineligible,
+                                live_settings: *supervisor_settings_rx.borrow(),
+                            });
+                        }
                         AgentCommand::CompactIfInactive { accepted, reply, .. } => {
                             let error = "backend-native agents cannot be compacted".to_owned();
                             let _ = accepted.send(Err(error.clone()));
@@ -5145,6 +5303,16 @@ async fn park_terminal_agent(
             AgentCommand::Compact { reply, .. } => {
                 let _ = reply.send(Err("agent is not running".to_owned()));
             }
+            AgentCommand::BeginSupervisorVerdictIfInactive {
+                supervisor_settings_rx,
+                reply,
+                ..
+            } => {
+                let _ = reply.send(SupervisorVerdictStart::Rejected {
+                    reason: SupervisorVerdictStartRejection::Ineligible,
+                    live_settings: *supervisor_settings_rx.borrow(),
+                });
+            }
             AgentCommand::CompactIfInactive { accepted, reply, .. } => {
                 let error = "agent is not running".to_owned();
                 let _ = accepted.send(Err(error.clone()));
@@ -5281,6 +5449,16 @@ async fn park_relay_terminal_agent(
             }
             AgentCommand::Compact { reply, .. } => {
                 let _ = reply.send(Err("backend-native agents cannot be compacted".to_owned()));
+            }
+            AgentCommand::BeginSupervisorVerdictIfInactive {
+                supervisor_settings_rx,
+                reply,
+                ..
+            } => {
+                let _ = reply.send(SupervisorVerdictStart::Rejected {
+                    reason: SupervisorVerdictStartRejection::Ineligible,
+                    live_settings: *supervisor_settings_rx.borrow(),
+                });
             }
             AgentCommand::CompactIfInactive { accepted, reply, .. } => {
                 let error = "backend-native agents cannot be compacted".to_owned();
@@ -8403,6 +8581,16 @@ mod tests {
                     }
                     AgentCommand::Compact { reply, .. } => {
                         let _ = reply.send(Err("agent is not running".to_owned()));
+                    }
+                    AgentCommand::BeginSupervisorVerdictIfInactive {
+                        supervisor_settings_rx,
+                        reply,
+                        ..
+                    } => {
+                        let _ = reply.send(SupervisorVerdictStart::Rejected {
+                            reason: SupervisorVerdictStartRejection::Ineligible,
+                            live_settings: *supervisor_settings_rx.borrow(),
+                        });
                     }
                     AgentCommand::CompactIfInactive { accepted, reply, .. } => {
                         let error = "agent is not running".to_owned();
