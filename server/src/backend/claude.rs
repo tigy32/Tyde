@@ -3235,17 +3235,12 @@ async fn read_claude_stdout_persistent(
                 parent_id,
                 &value,
             );
-            for entry in background_tasks
-                .values_mut()
-                .filter(|entry| entry.owner.is_none())
-            {
-                entry.owner = resolve_background_task_owner(
-                    &entry.tool_use_id,
-                    entry.parent_tool_use_id.as_deref(),
-                    &inner.emitter,
-                    &subagent_streams,
-                );
-            }
+            refresh_unresolved_background_tasks(
+                &value,
+                &mut background_tasks,
+                &inner.emitter,
+                &subagent_streams,
+            );
             continue;
         }
 
@@ -3282,6 +3277,12 @@ async fn read_claude_stdout_persistent(
             &turn_state.base_message_id,
             &mut turn_state.current_message_id,
             interrupt_requested,
+        );
+        refresh_unresolved_background_tasks(
+            &value,
+            &mut background_tasks,
+            &inner.emitter,
+            &subagent_streams,
         );
 
         if subagent_emitter.is_some() {
@@ -4539,6 +4540,26 @@ fn refresh_background_task_owner(
             .owner
             .as_deref()
             .and_then(|owner| owner.tool_request_name(&entry.tool_use_id));
+    }
+}
+
+fn refresh_unresolved_background_tasks(
+    value: &Value,
+    background_tasks: &mut HashMap<String, BackgroundTaskEntry>,
+    root_emitter: &Arc<TurnEmitter>,
+    subagent_streams: &HashMap<String, SubAgentStream>,
+) {
+    for entry in background_tasks
+        .values_mut()
+        .filter(|entry| entry.owner.is_none() || entry.tool_name.is_none())
+    {
+        let was_ready = entry.owner.is_some() && entry.tool_name.is_some();
+        refresh_background_task_owner(value, entry, root_emitter, subagent_streams);
+        if !was_ready
+            && let (Some(owner), Some(_)) = (entry.owner.as_deref(), entry.tool_name.as_deref())
+        {
+            emit_background_task_snapshot(owner, entry);
+        }
     }
 }
 
@@ -16653,18 +16674,6 @@ for raw_line in sys.stdin:
     fn background_task_progress_preserves_monitor_tool_identity() {
         let (inner, mut rx) = make_test_inner();
         let mut tasks: HashMap<String, BackgroundTaskEntry> = HashMap::new();
-        inner.emitter.tool_request(
-            "toolu_monitor",
-            "Monitor",
-            json!({
-                "kind": "Other",
-                "args": {
-                    "command": "until test -f /tmp/done; do sleep 1; done",
-                    "persistent": false,
-                },
-            }),
-        );
-
         assert!(handle_background_bash_task_frame_with_owners(
             &json!({
                 "type": "system",
@@ -16678,6 +16687,46 @@ for raw_line in sys.stdin:
             &inner.emitter,
             &HashMap::new(),
         ));
+        assert!(
+            tasks
+                .get("monitor-task")
+                .expect("registered task")
+                .owner
+                .is_none(),
+            "Claude may announce the task before its tool request"
+        );
+
+        let assistant = json!({
+            "type": "assistant",
+            "message": {
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_monitor",
+                    "name": "Monitor",
+                    "input": {
+                        "command": "until test -f /tmp/done; do sleep 1; done",
+                        "persistent": false,
+                    },
+                }],
+            },
+        });
+        inner.emitter.tool_request(
+            "toolu_monitor",
+            "Monitor",
+            json!({
+                "kind": "Other",
+                "args": {
+                    "command": "until test -f /tmp/done; do sleep 1; done",
+                    "persistent": false,
+                },
+            }),
+        );
+        refresh_unresolved_background_tasks(
+            &assistant,
+            &mut tasks,
+            &inner.emitter,
+            &HashMap::new(),
+        );
 
         let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
         assert!(
