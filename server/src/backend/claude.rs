@@ -4495,7 +4495,11 @@ fn resolve_background_task_owner(
     let inferred_owners = subagent_streams
         .values()
         .filter(|stream| {
-            stream.inner.emitter.has_pending_tool_request(tool_use_id)
+            stream
+                .inner
+                .emitter
+                .tool_request_name(tool_use_id)
+                .is_some()
                 || stream.summary.tool_call_by_id.contains_key(tool_use_id)
                 || stream
                     .summary
@@ -4514,7 +4518,8 @@ fn resolve_background_task_owner(
         return Some(Arc::clone(&stream.inner.emitter));
     }
     root_emitter
-        .has_pending_tool_request(tool_use_id)
+        .tool_request_name(tool_use_id)
+        .is_some()
         .then(|| Arc::clone(root_emitter))
 }
 
@@ -16772,6 +16777,69 @@ for raw_line in sys.stdin:
         assert!(events.iter().any(|event| {
             event_kind(event) == Some("ToolProgress")
                 && event.pointer("/data/update/status").and_then(Value::as_str) == Some("stopped")
+        }));
+    }
+
+    #[test]
+    fn background_task_resolves_after_monitor_start_response() {
+        let (inner, mut rx) = make_test_inner();
+        let mut tasks: HashMap<String, BackgroundTaskEntry> = HashMap::new();
+        inner.emitter.tool_request(
+            "toolu_monitor",
+            "Monitor",
+            json!({
+                "kind": "Other",
+                "args": {
+                    "command": "until test -f /tmp/done; do sleep 1; done",
+                    "persistent": false,
+                },
+            }),
+        );
+        inner.emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id: "toolu_monitor",
+            tool_name: "Monitor",
+            tool_result: json!({
+                "kind": "Other",
+                "result": "Monitor started",
+            }),
+            success: true,
+            error: None,
+        });
+
+        assert!(handle_background_bash_task_frame_with_owners(
+            &json!({
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": "monitor-task",
+                "tool_use_id": "toolu_monitor",
+                "description": "wait for completion",
+                "task_type": "local_bash",
+            }),
+            &mut tasks,
+            &inner.emitter,
+            &HashMap::new(),
+        ));
+        let task = tasks.get("monitor-task").expect("registered task");
+        assert!(task.owner.is_some());
+        assert_eq!(task.tool_name.as_deref(), Some("Monitor"));
+
+        assert!(handle_background_bash_task_frame_with_owners(
+            &json!({
+                "type": "system",
+                "subtype": "task_notification",
+                "task_id": "monitor-task",
+                "status": "completed",
+                "summary": "Monitor completed",
+            }),
+            &mut tasks,
+            &inner.emitter,
+            &HashMap::new(),
+        ));
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            event_kind(event) == Some("ToolProgress")
+                && event.pointer("/data/tool_name").and_then(Value::as_str) == Some("Monitor")
+                && event.pointer("/data/update/status").and_then(Value::as_str) == Some("completed")
         }));
     }
 
