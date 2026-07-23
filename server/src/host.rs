@@ -24170,11 +24170,6 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 },
             },
         )]);
-        let observation = fixture
-            .host
-            .activity_summary_observation(&agent_id)
-            .await
-            .expect("agent observation");
         let status_handle = fixture
             .host
             .agent_status_handle(&agent_id)

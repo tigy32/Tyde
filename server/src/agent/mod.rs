@@ -7950,9 +7950,10 @@ mod tests {
     use super::{
         AGENT_STARTUP_SELECTION_TEST_GATE, AGENT_STARTUP_TEST_GATE, AgentActivityStatsTracker,
         AgentActorRuntimeContext, AgentCommand, AgentHandle, AgentNameChangeContext,
-        AgentReplayState, AgentStartupFailure, AgentStartupTestGate,
+        AgentReplayState, AgentStartupFailure, AgentStartupTestGate, AppendSupervisorWarningOutcome,
         GenerateAgentActivitySummaryRequest, InterruptOutcome, RelayEventReceivers,
-        ResolvedSpawnRequest, activity_history_snapshot, agent_name_generation_spawn_config,
+        ResolvedSpawnRequest, SupervisorVerdictStart, SupervisorVerdictStartRejection,
+        activity_history_snapshot, agent_name_generation_spawn_config,
         agent_usage_snapshot_from_log, append_chat_event, append_event, apply_generated_agent_name,
         attach_subscriber, attach_subscriber_with_latest_output,
         collect_agent_activity_summary_events, collect_agent_name_events, current_latest_output,
