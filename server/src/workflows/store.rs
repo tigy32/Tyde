@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use devtools_protocol::WORKFLOW_RUN_STORE_PATH_ENV;
-use protocol::{WorkflowRunId, WorkflowRunSnapshot, WorkflowRunSnapshotStatus};
+use protocol::{ProjectId, WorkflowRunId, WorkflowRunSnapshot, WorkflowRunSnapshotStatus};
 use serde::{Deserialize, Serialize};
 
 const STORE_VERSION: u32 = 1;
@@ -62,6 +62,27 @@ impl WorkflowRunStore {
     pub(crate) fn upsert(&mut self, run: WorkflowRunSnapshot) -> Result<(), String> {
         self.runs.insert(run.id.clone(), run);
         self.save_current()
+    }
+
+    pub(crate) fn delete_for_project(
+        &mut self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<WorkflowRunId>, String> {
+        let mut deleted = self
+            .runs
+            .values()
+            .filter(|run| run.project_id.as_ref() == Some(project_id))
+            .map(|run| run.id.clone())
+            .collect::<Vec<_>>();
+        if deleted.is_empty() {
+            return Ok(deleted);
+        }
+        for id in &deleted {
+            self.runs.remove(id);
+        }
+        self.save_current()?;
+        deleted.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(deleted)
     }
 
     fn save_current(&self) -> Result<(), String> {
@@ -205,6 +226,38 @@ mod tests {
                 .contains("restarted")
         );
         assert!(loaded.completed_at_ms.is_some());
+    }
+
+    #[test]
+    fn delete_for_project_removes_only_matching_runs_and_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("workflow_runs.json");
+        let mut store = WorkflowRunStore::load(path.clone()).unwrap();
+        let target_project = protocol::ProjectId("project-1".to_owned());
+        let mut kept = run(WorkflowRunSnapshotStatus::Completed);
+        kept.id = WorkflowRunId("run-2".to_owned());
+        kept.project_id = Some(protocol::ProjectId("project-2".to_owned()));
+        store
+            .upsert(run(WorkflowRunSnapshotStatus::Completed))
+            .unwrap();
+        store.upsert(kept.clone()).unwrap();
+
+        assert_eq!(
+            store.delete_for_project(&target_project).unwrap(),
+            vec![WorkflowRunId("run-1".to_owned())]
+        );
+        assert!(store.get(&WorkflowRunId("run-1".to_owned())).is_none());
+        assert_eq!(store.get(&kept.id), Some(kept.clone()));
+        assert!(
+            store
+                .delete_for_project(&target_project)
+                .unwrap()
+                .is_empty()
+        );
+
+        let reloaded = WorkflowRunStore::load(path).unwrap();
+        assert!(reloaded.get(&WorkflowRunId("run-1".to_owned())).is_none());
+        assert_eq!(reloaded.get(&kept.id), Some(kept));
     }
 
     #[test]

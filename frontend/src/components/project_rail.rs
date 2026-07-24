@@ -765,8 +765,9 @@ fn RailContextMenuView(
             })
             .unwrap_or_default();
         spawn_local(async move {
-            let message =
-                format!("Remove workbench '{workbench_name}'? This will remove the git worktree.");
+            let message = format!(
+                "Remove workbench '{workbench_name}'? This will remove its git worktree and all associated agents, terminals, sessions, steering, team references, reviews, and workflow runs."
+            );
             if !crate::bridge::confirm_dialog("Remove workbench", &message).await {
                 return;
             }

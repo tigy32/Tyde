@@ -442,6 +442,7 @@ impl AgentTeamsStore {
     pub fn remove_project_from_members(
         &mut self,
         project_id: &ProjectId,
+        deleted_session_ids: &HashSet<SessionId>,
         refs: &AgentTeamValidationRefs,
     ) -> Result<Vec<TeamMember>, String> {
         let now = now_ms()?;
@@ -451,7 +452,14 @@ impl AgentTeamsStore {
             member
                 .project_ids
                 .retain(|candidate| candidate != project_id);
-            if member.project_ids.len() != original_len {
+            let removed_session = member
+                .session_id
+                .as_ref()
+                .is_some_and(|session_id| deleted_session_ids.contains(session_id));
+            if removed_session {
+                member.session_id = None;
+            }
+            if member.project_ids.len() != original_len || removed_session {
                 member.updated_at_ms = now;
                 updated.push(member.clone());
             }
@@ -1800,5 +1808,46 @@ mod tests {
             )
             .expect("empty project_ids should be allowed");
         assert!(member.project_ids.is_empty());
+    }
+
+    #[test]
+    fn remove_project_clears_deleted_member_sessions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent_teams.json");
+        let refs = refs();
+        let mut store = AgentTeamsStore::load(path.clone(), &refs).expect("load empty store");
+        let (_team, manager) = store
+            .create_team(
+                TeamCreatePayload {
+                    name: "Product Team".to_owned(),
+                    manager: manager_spec(),
+                },
+                &refs,
+            )
+            .expect("create team");
+        let session_id = SessionId("deleted-session".to_owned());
+        store
+            .set_member_session_id(&manager.id, session_id.clone(), &refs)
+            .expect("set session");
+
+        let updated = store
+            .remove_project_from_members(
+                &ProjectId("project-1".to_owned()),
+                &[session_id].into_iter().collect(),
+                &refs,
+            )
+            .expect("remove project references");
+        assert_eq!(updated.len(), 1);
+        assert!(updated[0].project_ids.is_empty());
+        assert!(updated[0].session_id.is_none());
+
+        let reloaded = AgentTeamsStore::load(path, &refs).expect("reload store");
+        let persisted = reloaded
+            .members()
+            .into_iter()
+            .find(|member| member.id == manager.id)
+            .expect("persisted manager");
+        assert!(persisted.project_ids.is_empty());
+        assert!(persisted.session_id.is_none());
     }
 }

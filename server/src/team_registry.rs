@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use protocol::{
     AgentControlStatus, AgentId, CustomAgentId, ProjectId, SessionId, Team,
@@ -161,6 +161,7 @@ enum TeamRegistryCommand {
     },
     RemoveProjectRefs {
         project_id: ProjectId,
+        deleted_session_ids: HashSet<SessionId>,
         refs: AgentTeamValidationRefs,
         reply: oneshot::Sender<Result<TeamRegistryEvents, String>>,
     },
@@ -479,10 +480,12 @@ impl TeamRegistryHandle {
     pub(crate) async fn remove_project_refs(
         &self,
         project_id: ProjectId,
+        deleted_session_ids: HashSet<SessionId>,
         refs: AgentTeamValidationRefs,
     ) -> Result<TeamRegistryEvents, String> {
         self.mutate(|reply| TeamRegistryCommand::RemoveProjectRefs {
             project_id,
+            deleted_session_ids,
             refs,
             reply,
         })
@@ -710,10 +713,11 @@ impl TeamRegistryActor {
                 }
                 TeamRegistryCommand::RemoveProjectRefs {
                     project_id,
+                    deleted_session_ids,
                     refs,
                     reply,
                 } => {
-                    let result = self.remove_project_refs(&project_id, &refs);
+                    let result = self.remove_project_refs(&project_id, &deleted_session_ids, &refs);
                     let _ = reply.send(result);
                 }
                 TeamRegistryCommand::CreateDraft { payload, reply } => {
@@ -1197,9 +1201,12 @@ impl TeamRegistryActor {
     fn remove_project_refs(
         &mut self,
         project_id: &ProjectId,
+        deleted_session_ids: &HashSet<SessionId>,
         refs: &AgentTeamValidationRefs,
     ) -> Result<TeamRegistryEvents, String> {
-        let members = self.store.remove_project_from_members(project_id, refs)?;
+        let members =
+            self.store
+                .remove_project_from_members(project_id, deleted_session_ids, refs)?;
         for member in &members {
             if member.project_ids.is_empty() {
                 self.pending_activations.remove(&member.id);

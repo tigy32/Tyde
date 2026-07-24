@@ -83,10 +83,6 @@ impl TerminalHandle {
         self.start.project_id.as_ref()
     }
 
-    pub(crate) fn is_running(&self) -> bool {
-        self.state.exit_payload().is_none()
-    }
-
     pub(crate) async fn emit_bootstrap_and_start_io(&self) -> Result<(), StreamClosed> {
         let payload = serde_json::to_value(TerminalBootstrapPayload {
             terminal_id: self.id.clone(),

@@ -12,8 +12,8 @@ use protocol::{
     BackendAccessMode, BackendKind, CustomAgentId, GitBranchName, ImageData, LaunchProfileCatalog,
     LaunchProfileId, ProjectId, ProjectSource, SendMessagePayload, SessionSchemaEntry,
     SessionSettingsValues, SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, Team, TeamMember,
-    TeamMemberBindingPayload, TeamMemberId, WorkbenchCreatePayload, WorkflowSaveRequest,
-    WorkflowSaveResponse, WorkflowTargetsResponse, cap_agent_control_events,
+    TeamMemberBindingPayload, TeamMemberId, WorkbenchCreatePayload, WorkbenchRemovePayload,
+    WorkflowSaveRequest, WorkflowSaveResponse, WorkflowTargetsResponse, cap_agent_control_events,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
@@ -315,6 +315,12 @@ struct CreateWorkbenchToolInput {
     branch: String,
     name: Option<String>,
     base_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RemoveWorkbenchToolInput {
+    project_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -648,6 +654,35 @@ impl TydeAgentControlMcpServer {
         };
         match do_list_workbenches(&self.host, &caller).await {
             Ok(result) => ok_json(result),
+            Err(error) => Ok(err_text(error)),
+        }
+    }
+
+    #[tool(
+        description = "Remove a git workbench in the authenticated caller's canonical project. Cascades through its active agents, terminals, sessions, steering, team references, reviews, and workflow runs. Refuses dirty worktrees and cannot remove the caller's own active workbench."
+    )]
+    async fn tyde_remove_workbench(
+        &self,
+        Parameters(input): Parameters<RemoveWorkbenchToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = match require_authenticated_caller(self, &parts, "tyde_remove_workbench").await
+        {
+            Ok(caller) => caller,
+            Err(error) => return Ok(err_text(error)),
+        };
+        if let Err(error) = reject_mutating_tool_for_read_only_caller(
+            &self.host,
+            Some(&caller),
+            "tyde_remove_workbench",
+        )
+        .await
+        {
+            return Ok(err_text(error));
+        }
+        let project_id = input.project_id.clone();
+        match do_remove_workbench(&self.host, &caller, input).await {
+            Ok(()) => ok_json(json!({ "project_id": project_id, "removed": true })),
             Err(error) => Ok(err_text(error)),
         }
     }
@@ -1326,6 +1361,40 @@ async fn do_list_workbenches(
         caller_project_id: caller_project_id.0,
         projects,
     })
+}
+
+async fn do_remove_workbench(
+    host: &HostHandle,
+    caller: &AgentId,
+    input: RemoveWorkbenchToolInput,
+) -> Result<(), String> {
+    let project_id = parse_project_id(&input.project_id)?;
+    let caller_project_id = host
+        .project_id_for_agent(caller)
+        .await
+        .ok_or_else(|| "authenticated caller is not assigned to a project".to_owned())?;
+    if caller_project_id == project_id {
+        return Err(
+            "cannot remove the authenticated caller's active workbench; ask an agent in the parent project to remove it"
+                .to_owned(),
+        );
+    }
+    let (canonical_project_id, projects) = caller_project_scope(host, caller).await?;
+    let target = projects
+        .iter()
+        .find(|project| project.id == project_id)
+        .ok_or_else(|| {
+            format!(
+                "project_id {} is outside caller project scope {}",
+                project_id, canonical_project_id
+            )
+        })?;
+    if target.parent_project_id() != Some(&canonical_project_id) {
+        return Err(format!("project_id {project_id} is not a workbench"));
+    }
+    host.remove_workbench(WorkbenchRemovePayload { id: project_id })
+        .await
+        .map_err(|error| error.to_string())
 }
 
 async fn do_list_launch_options(host: &HostHandle) -> Result<ListLaunchOptionsResult, String> {

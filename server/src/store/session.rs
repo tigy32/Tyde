@@ -283,6 +283,35 @@ impl SessionStore {
         Ok(detached)
     }
 
+    pub fn delete_for_project(&self, project_id: &ProjectId) -> Result<Vec<SessionId>, String> {
+        let mut records = Self::read_from_disk(&self.path)?;
+        let mut deleted = records
+            .values()
+            .filter(|record| record.project_id.as_ref() == Some(project_id))
+            .map(|record| record.id.clone())
+            .collect::<Vec<_>>();
+        if deleted.is_empty() {
+            return Ok(deleted);
+        }
+        for id in &deleted {
+            records.remove(&id.0);
+        }
+        Self::save(&self.path, &records)?;
+
+        let mut task_state = self.read_task_state()?;
+        let original_task_count = task_state.records.len();
+        for id in &deleted {
+            task_state.records.remove(&id.0);
+        }
+        if task_state.records.len() != original_task_count {
+            let value = serde_json::to_value(task_state)
+                .map_err(|err| format!("Failed to serialize task state: {err}"))?;
+            write_json_value_atomically(&self.task_state_path(), &value)?;
+        }
+        deleted.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(deleted)
+    }
+
     pub fn delete(&self, session_id: &SessionId) -> Result<(), String> {
         self.read_modify_write(|records| {
             records.remove(&session_id.0);
@@ -903,6 +932,57 @@ mod tests {
 
         let task_list = store.get_task_list(&id).expect("stored task list");
         assert_eq!(task_list.tasks[0].description, "Alpha check");
+    }
+
+    #[test]
+    fn delete_for_project_removes_sessions_and_task_lists_only_for_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sessions.json");
+        let target_project = ProjectId("target-project".to_owned());
+        let kept_project = ProjectId("kept-project".to_owned());
+        let target_id = SessionId("target-session".to_owned());
+        let kept_id = SessionId("kept-session".to_owned());
+        let mut target = test_record(BackendKind::Codex, target_id.clone(), true);
+        target.project_id = Some(target_project.clone());
+        let mut kept = test_record(BackendKind::Codex, kept_id.clone(), true);
+        kept.project_id = Some(kept_project);
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&StoreFile {
+                records: HashMap::from([(target_id.0.clone(), target), (kept_id.0.clone(), kept)]),
+            })
+            .expect("serialize store"),
+        )
+        .expect("write store");
+        let store = SessionStore::load(path).expect("load store");
+        for id in [&target_id, &kept_id] {
+            store
+                .set_task_list(
+                    id,
+                    TaskList {
+                        title: id.0.clone(),
+                        tasks: Vec::new(),
+                    },
+                )
+                .expect("persist task list");
+        }
+
+        assert_eq!(
+            store
+                .delete_for_project(&target_project)
+                .expect("delete project sessions"),
+            vec![target_id.clone()]
+        );
+        assert!(store.get(&target_id).is_none());
+        assert!(store.get_task_list(&target_id).is_none());
+        assert!(store.get(&kept_id).is_some());
+        assert!(store.get_task_list(&kept_id).is_some());
+        assert!(
+            store
+                .delete_for_project(&target_project)
+                .expect("idempotent delete")
+                .is_empty()
+        );
     }
 
     fn test_record(backend_kind: BackendKind, id: SessionId, resumable: bool) -> SessionRecord {

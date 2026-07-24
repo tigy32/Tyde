@@ -836,7 +836,7 @@ async fn workbench_remove_succeeds_when_worktree_dir_was_deleted_out_of_band() {
 }
 
 #[tokio::test]
-async fn workbench_remove_rejects_team_member_reference() {
+async fn workbench_remove_cascades_team_member_reference() {
     let mut fixture = Fixture::new().await;
     let repo = init_git_repo("team-blocker");
     let parent = create_project(&mut fixture.client, vec![repo.path()]).await;
@@ -884,8 +884,6 @@ async fn workbench_remove_rejects_team_member_reference() {
         .await
         .expect("team_create failed");
 
-    // Removing a workbench referenced by a team member would persist a
-    // dangling ProjectId in agent_teams.json and brick the next boot.
     fixture
         .client
         .workbench_remove(WorkbenchRemovePayload {
@@ -893,25 +891,28 @@ async fn workbench_remove_rejects_team_member_reference() {
         })
         .await
         .expect("workbench_remove write failed");
-    let error: CommandErrorPayload = expect_kind(
+    let deleted: ProjectNotifyPayload = expect_kind(
         &mut fixture.client,
-        FrameKind::CommandError,
-        "team member blocker",
+        FrameKind::ProjectNotify,
+        "workbench delete",
     )
     .await
     .parse_payload()
-    .expect("parse CommandError");
-    assert_eq!(error.operation, "workbench_remove");
-    assert_eq!(error.code, CommandErrorCode::Conflict);
+    .expect("parse ProjectNotify");
     assert!(
-        error.message.contains("team member"),
-        "unexpected error message: {}",
-        error.message
+        matches!(deleted, ProjectNotifyPayload::Delete { project } if project.id == workbench.id)
+    );
+    let (_, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    assert!(
+        bootstrap
+            .team_members
+            .iter()
+            .all(|member| !member.project_ids.contains(&workbench.id))
     );
 }
 
 #[tokio::test]
-async fn workbench_remove_rejects_live_agent_live_terminal_session_and_steering_blockers() {
+async fn workbench_remove_cascades_agents_terminals_sessions_and_steering() {
     let mut fixture = Fixture::new().await;
 
     let agent_repo = init_git_repo("agent-blocker");
@@ -938,14 +939,18 @@ async fn workbench_remove_rejects_live_agent_live_terminal_session_and_steering_
         })
         .await
         .expect("spawn live workbench agent");
-    // No AgentStart wait is needed before attempting removal: the agent is
-    // inserted into the host registry (with its project_id) synchronously
-    // under the host state lock before the NewAgent frame is emitted, so
-    // receiving NewAgent guarantees the live-agent blocker sees it.
-    let _ = expect_kind(
+    let live_agent: NewAgentPayload = expect_kind(
         &mut fixture.client,
         FrameKind::NewAgent,
         "live agent NewAgent",
+    )
+    .await
+    .parse_payload()
+    .expect("parse live agent");
+    let _ = expect_kind(
+        &mut fixture.client,
+        FrameKind::ChatEvent,
+        "live agent persisted session",
     )
     .await;
     fixture
@@ -955,9 +960,34 @@ async fn workbench_remove_rejects_live_agent_live_terminal_session_and_steering_
         })
         .await
         .expect("workbench_remove write failed");
-    let error = expect_command_error(&mut fixture.client, "live agent blocker").await;
-    assert_eq!(error.code, CommandErrorCode::Conflict);
-    assert!(error.message.contains("agent"));
+    let _ = expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentClosed,
+        "cascaded agent close",
+    )
+    .await;
+    let deleted: ProjectNotifyPayload = expect_kind(
+        &mut fixture.client,
+        FrameKind::ProjectNotify,
+        "agent workbench delete",
+    )
+    .await
+    .parse_payload()
+    .expect("parse agent workbench delete");
+    assert!(
+        matches!(deleted, ProjectNotifyPayload::Delete { project } if project.id == agent_workbench.id)
+    );
+    assert!(
+        !fixture.agent_ids().await.contains(&live_agent.agent_id),
+        "cascaded agent remained live"
+    );
+    let (_, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    assert!(
+        bootstrap
+            .sessions
+            .iter()
+            .all(|session| session.project_id.as_ref() != Some(&agent_workbench.id))
+    );
 
     let terminal_repo = init_git_repo("terminal-blocker");
     let terminal_parent = create_project(&mut fixture.client, vec![terminal_repo.path()]).await;
@@ -991,9 +1021,17 @@ async fn workbench_remove_rejects_live_agent_live_terminal_session_and_steering_
         })
         .await
         .expect("workbench_remove write failed");
-    let error = expect_command_error(&mut fixture.client, "live terminal blocker").await;
-    assert_eq!(error.code, CommandErrorCode::Conflict);
-    assert!(error.message.contains("terminal"));
+    let deleted: ProjectNotifyPayload = expect_kind(
+        &mut fixture.client,
+        FrameKind::ProjectNotify,
+        "terminal workbench delete",
+    )
+    .await
+    .parse_payload()
+    .expect("parse terminal workbench delete");
+    assert!(
+        matches!(deleted, ProjectNotifyPayload::Delete { project } if project.id == terminal_workbench.id)
+    );
 
     let session_repo = init_git_repo("session-blocker");
     let session_parent = create_project(&mut fixture.client, vec![session_repo.path()]).await;
@@ -1019,10 +1057,6 @@ async fn workbench_remove_rejects_live_agent_live_terminal_session_and_steering_
         })
         .await
         .expect("spawn session agent");
-    // No AgentStart wait is needed here either (registration is synchronous
-    // before the NewAgent echo); the session blocker additionally relies on
-    // the ChatEvent + AgentClosed waits below, which guarantee the session
-    // record is persisted before removal is attempted.
     let new_agent: NewAgentPayload = expect_kind(
         &mut fixture.client,
         FrameKind::NewAgent,
@@ -1055,9 +1089,24 @@ async fn workbench_remove_rejects_live_agent_live_terminal_session_and_steering_
         })
         .await
         .expect("workbench_remove write failed");
-    let error = expect_command_error(&mut fixture.client, "persisted session blocker").await;
-    assert_eq!(error.code, CommandErrorCode::Conflict);
-    assert!(error.message.contains("session"));
+    let deleted: ProjectNotifyPayload = expect_kind(
+        &mut fixture.client,
+        FrameKind::ProjectNotify,
+        "session workbench delete",
+    )
+    .await
+    .parse_payload()
+    .expect("parse session workbench delete");
+    assert!(
+        matches!(deleted, ProjectNotifyPayload::Delete { project } if project.id == session_workbench.id)
+    );
+    let (_, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    assert!(
+        bootstrap
+            .sessions
+            .iter()
+            .all(|session| session.project_id.as_ref() != Some(&session_workbench.id))
+    );
 
     let steering_repo = init_git_repo("steering-blocker");
     let steering_parent = create_project(&mut fixture.client, vec![steering_repo.path()]).await;
@@ -1082,9 +1131,24 @@ async fn workbench_remove_rejects_live_agent_live_terminal_session_and_steering_
         })
         .await
         .expect("workbench_remove write failed");
-    let error = expect_command_error(&mut fixture.client, "steering blocker").await;
-    assert_eq!(error.code, CommandErrorCode::Conflict);
-    assert!(error.message.contains("steering"));
+    let deleted: ProjectNotifyPayload = expect_kind(
+        &mut fixture.client,
+        FrameKind::ProjectNotify,
+        "steering workbench delete",
+    )
+    .await
+    .parse_payload()
+    .expect("parse steering workbench delete");
+    assert!(
+        matches!(deleted, ProjectNotifyPayload::Delete { project } if project.id == steering_workbench.id)
+    );
+    let (_, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    assert!(
+        bootstrap
+            .steering
+            .iter()
+            .all(|steering| !matches!(&steering.scope, SteeringScope::Project(project_id) if project_id == &steering_workbench.id))
+    );
 }
 
 #[tokio::test]
@@ -1420,6 +1484,9 @@ async fn agent_control_workbenches_enforce_auth_access_and_scope() {
     let mut fixture = Fixture::new().await;
     let parent = create_project(&mut fixture.client, vec![repo.path()]).await;
     let other = create_project(&mut fixture.client, vec![other_repo.path()]).await;
+    let removable = create_workbench(&mut fixture.client, &parent, "feature/mcp-remove").await;
+    let other_workbench =
+        create_workbench(&mut fixture.client, &other, "feature/out-of-scope-remove").await;
 
     for (tool, arguments) in [
         ("tyde_list_workbenches", json!({})),
@@ -1428,6 +1495,10 @@ async fn agent_control_workbenches_enforce_auth_access_and_scope() {
             json!({
                 "parent_project_id": parent.id.0, "branch": "feature/no-auth"
             }),
+        ),
+        (
+            "tyde_remove_workbench",
+            json!({"project_id": removable.id.0}),
         ),
     ] {
         let (is_error, body) = call_agent_control_optional(&fixture, None, tool, arguments).await;
@@ -1460,6 +1531,15 @@ async fn agent_control_workbenches_enforce_auth_access_and_scope() {
     assert!(is_error, "read-only create succeeded: {body}");
     assert!(body.contains("ReadOnly"));
     assert!(!expected_worktree_path(repo.path(), "feature-read-only").exists());
+    let (is_error, body) = call_agent_control(
+        &fixture,
+        &read_only.agent_id,
+        "tyde_remove_workbench",
+        json!({"project_id": removable.id.0}),
+    )
+    .await;
+    assert!(is_error, "read-only remove succeeded: {body}");
+    assert!(body.contains("ReadOnly"));
 
     let caller = spawn_project_caller(
         &mut fixture.client,
@@ -1478,6 +1558,55 @@ async fn agent_control_workbenches_enforce_auth_access_and_scope() {
     assert!(is_error, "out-of-scope create succeeded: {body}");
     assert!(body.contains("outside caller project scope"));
     assert!(!expected_worktree_path(other_repo.path(), "feature-out-of-scope").exists());
+    let (is_error, body) = call_agent_control(
+        &fixture,
+        &caller.agent_id,
+        "tyde_remove_workbench",
+        json!({"project_id": other_workbench.id.0}),
+    )
+    .await;
+    assert!(is_error, "out-of-scope remove succeeded: {body}");
+    assert!(body.contains("outside caller project scope"));
+
+    let self_caller = spawn_project_caller(
+        &mut fixture.client,
+        &removable,
+        "self-removing-workbench-caller",
+        BackendAccessMode::Unrestricted,
+    )
+    .await;
+    let (is_error, body) = call_agent_control(
+        &fixture,
+        &self_caller.agent_id,
+        "tyde_remove_workbench",
+        json!({"project_id": removable.id.0}),
+    )
+    .await;
+    assert!(is_error, "self workbench remove succeeded: {body}");
+    assert!(body.contains("caller's active workbench"));
+
+    let (is_error, body) = call_agent_control(
+        &fixture,
+        &caller.agent_id,
+        "tyde_remove_workbench",
+        json!({"project_id": removable.id.0}),
+    )
+    .await;
+    assert!(!is_error, "scoped remove failed: {body}");
+    let removed: Value = serde_json::from_str(&body).expect("remove JSON");
+    assert_eq!(removed["project_id"], removable.id.0);
+    assert_eq!(removed["removed"], true);
+    let deleted: ProjectNotifyPayload = expect_kind(
+        &mut fixture.client,
+        FrameKind::ProjectNotify,
+        "MCP workbench delete",
+    )
+    .await
+    .parse_payload()
+    .expect("parse MCP workbench delete");
+    assert!(
+        matches!(deleted, ProjectNotifyPayload::Delete { project } if project.id == removable.id)
+    );
 }
 
 #[tokio::test]

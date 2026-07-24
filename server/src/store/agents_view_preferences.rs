@@ -11,7 +11,8 @@ use protocol::{
     AgentsSmartViewsUpdate, AgentsViewFilters, AgentsViewPreferences,
     AgentsViewPreferencesSnapshot, AgentsViewPreferencesStoreError,
     AgentsViewPreferencesStoreErrorKind, AgentsViewPreferencesUpdate, BackendKind,
-    BuiltInSmartViewId, HostFilterId, SessionId, SmartView, SmartViewId, UserSmartViewId,
+    BuiltInSmartViewId, HostFilterId, ProjectId, SessionId, SmartView, SmartViewId,
+    UserSmartViewId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -287,6 +288,35 @@ impl AgentsViewPreferencesStore {
             },
             None,
         )
+    }
+
+    pub fn remove_project(
+        &mut self,
+        host_id: HostFilterId,
+        project_id: ProjectId,
+    ) -> Result<bool, String> {
+        let mut state = self.read_current_state_or_default();
+        let mut changed = false;
+        state.preferences.filters.project_ids.retain(|filter| {
+            let keep = filter.host_id != host_id || filter.project_id != project_id;
+            changed |= !keep;
+            keep
+        });
+        for view in &mut state.user_smart_views {
+            view.filters.project_ids.retain(|filter| {
+                let keep = filter.host_id != host_id || filter.project_id != project_id;
+                changed |= !keep;
+                keep
+            });
+        }
+        if !changed {
+            return Ok(false);
+        }
+        let state = validate_state(state)?;
+        Self::save(&self.path, &state)?;
+        self.set_state(state);
+        self.load_error = None;
+        Ok(true)
     }
 
     fn replace_annotation_target(
@@ -1756,7 +1786,7 @@ fn ensure_non_empty(field: &str, value: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use protocol::{
-        AgentId, AgentListDensity, AgentOrderKey, AgentsSidebarPreferences,
+        AgentId, AgentListDensity, AgentOrderKey, AgentProjectFilter, AgentsSidebarPreferences,
         AgentsSidebarProjectVisibility, AgentsViewPreferencesUpdate, HostFilterId, SessionId,
     };
 
@@ -1838,6 +1868,60 @@ mod tests {
         assert!(
             err.contains("duplicate"),
             "duplicate rejection should be explicit: {err}"
+        );
+    }
+
+    #[test]
+    fn remove_project_prunes_current_and_saved_filters() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agents_view_preferences.json");
+        let mut store = AgentsViewPreferencesStore::load(path.clone());
+        let local = HostFilterId("local".to_owned());
+        let target = ProjectId("target".to_owned());
+        let kept = AgentProjectFilter {
+            host_id: local.clone(),
+            project_id: ProjectId("kept".to_owned()),
+        };
+        let remote_target = AgentProjectFilter {
+            host_id: HostFilterId("remote".to_owned()),
+            project_id: target.clone(),
+        };
+        store
+            .apply(AgentsViewPreferencesUpdate::SetFilters {
+                filters: AgentsViewFilters {
+                    project_ids: vec![
+                        AgentProjectFilter {
+                            host_id: local.clone(),
+                            project_id: target.clone(),
+                        },
+                        kept.clone(),
+                        remote_target.clone(),
+                    ],
+                    ..AgentsViewFilters::default()
+                },
+            })
+            .expect("set project filters");
+        store
+            .apply_smart_views(AgentsSmartViewsUpdate::SaveCurrent {
+                name: "Projects".to_owned(),
+            })
+            .expect("save project view");
+
+        assert!(store.remove_project(local, target).expect("remove project"));
+        let snapshot = store.snapshot();
+        assert_eq!(
+            snapshot.preferences.filters.project_ids,
+            vec![kept.clone(), remote_target.clone()]
+        );
+        assert_eq!(
+            snapshot.smart_views.user[0].filters.project_ids,
+            vec![kept.clone(), remote_target.clone()]
+        );
+
+        let reloaded = AgentsViewPreferencesStore::load(path).snapshot();
+        assert_eq!(
+            reloaded.preferences.filters.project_ids,
+            vec![kept, remote_target]
         );
     }
 

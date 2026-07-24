@@ -505,32 +505,43 @@ changes only `Project.name`. The git branch and on-disk path do not change.
 `InvalidInput`. The user must use `WorkbenchRemove`. This ensures the
 on-disk worktree is always cleaned up alongside the record.
 
-`WorkbenchRemove` blockers — any of the following rejects with `Conflict`:
+`WorkbenchRemove` rejects when any worktree root is dirty
+(`git status --porcelain=v1 --untracked-files=all` produces output). The error
+message includes the dirty root paths verbatim. This is the one retained safety
+blocker because cascading removal must never discard uncommitted source work.
 
-- An agent whose `AgentStartPayload.project_id == workbench.id` is currently
-  live.
-- A terminal launched in this project is currently live.
-- A persisted session (`SessionRecord.project_id`) references this id.
-- A project-scoped steering record (`Steering { scope: Project(id) }`)
-  references this id.
-- A persisted team member binding references this project.
-- Any worktree root is dirty (`git status --porcelain=v1 --untracked-files=all`
-  produces output). The error message includes the dirty root paths verbatim.
+All project-owned runtime and persisted state is removed as one explicit
+cascade: live agents and terminals are closed; sessions and their task lists,
+project steering, team-member project references and deleted-session bindings,
+reviews, and workflow runs are deleted; and the workflow catalog is reloaded
+after the worktree is gone. Records shared with other projects, such as teams
+and team members, survive with only the deleted references removed.
+
+The authenticated agent-control MCP exposes `tyde_remove_workbench` for
+unrestricted callers. It is scoped to workbenches under the caller's canonical
+project and refuses to remove the caller's own active workbench because doing
+so would terminate the MCP request before a result could be delivered.
+
+Additional structural blockers:
+
 - The parent project record is missing — surfaces as `Internal` (this means
   the store is corrupt; see §8).
 - An absent worktree path is pruned from git bookkeeping and does not block
   deletion of the authoritative record.
 
-No automatic cleanup of any blocker. The user resolves each explicitly.
+Dirty roots require explicit user cleanup. A missing parent requires repairing
+the corrupt project store.
 
 Successful flow:
 
-1. Validate the target is a workbench.
-2. Validate every blocker above.
+1. Validate the target, parent relationship, and clean roots.
+2. Close associated agents and terminals.
 3. Run `git worktree remove <worktree_root>` for every root (no `--force`).
-4. Call `ProjectStore::delete_workbench`.
-5. Abort the project actor and drop its stream.
-6. Fan out `ProjectNotify::Delete { project }`.
+4. Delete or detach every persisted project reference in the cascade above.
+5. Call `ProjectStore::delete_workbench`.
+6. Abort the project actor and drop its stream.
+7. Fan out the state-deletion notifications and
+   `ProjectNotify::Delete { project }`.
 
 `ProjectNotify::Delete` is only emitted after both git removal and store
 deletion succeed. If git removal succeeds but store delete fails, surface

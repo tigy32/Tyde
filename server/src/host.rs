@@ -5768,7 +5768,7 @@ impl HostHandle {
         let team_refs = agent_team_validation_refs(&state, OPERATION).await?;
         let team_events = state
             .team_registry
-            .remove_project_refs(payload.id.clone(), team_refs)
+            .remove_project_refs(payload.id.clone(), HashSet::new(), team_refs)
             .await
             .map_err(|error| team_registry_error(OPERATION, error))?;
         let project = {
@@ -6022,7 +6022,34 @@ impl HostHandle {
         project_store: &Arc<Mutex<ProjectStore>>,
     ) -> AppResult<()> {
         const OPERATION: &str = "workbench_remove";
-        self.validate_workbench_remove_blockers(project).await?;
+        self.validate_workbench_remove_roots(project).await?;
+
+        let (agent_ids, terminals) = {
+            let state = self.state.lock().await;
+            let agent_ids = state
+                .registry
+                .agent_ids()
+                .into_iter()
+                .filter(|agent_id| {
+                    state.registry.agent_handle(agent_id).is_some_and(|agent| {
+                        agent.snapshot().project_id.as_ref() == Some(&project.id)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let terminals = state
+                .terminal_streams
+                .values()
+                .filter(|terminal| terminal.project_id() == Some(&project.id))
+                .cloned()
+                .collect::<Vec<_>>();
+            (agent_ids, terminals)
+        };
+        for agent_id in agent_ids {
+            self.close_agent(&agent_id).await;
+        }
+        for terminal in terminals {
+            terminal.close().await;
+        }
 
         {
             let mut state = self.state.lock().await;
@@ -6066,6 +6093,50 @@ impl HostHandle {
             }
         }
 
+        let (deleted_session_ids, annotations_store) = {
+            let state = self.state.lock().await;
+            let deleted_session_ids = state
+                .session_store
+                .lock()
+                .await
+                .delete_for_project(&payload.id)
+                .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+            (
+                deleted_session_ids,
+                state.agents_view_preferences_store.clone(),
+            )
+        };
+        if let Some(store) = annotations_store {
+            let mut store = store.lock().await;
+            for session_id in &deleted_session_ids {
+                store
+                    .remove_session(HostFilterId(LOCAL_HOST_ID.to_owned()), session_id.clone())
+                    .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+            }
+            store
+                .remove_project(HostFilterId(LOCAL_HOST_ID.to_owned()), payload.id.clone())
+                .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+        }
+
+        let mut state = self.state.lock().await;
+        let deleted_steering_ids = state
+            .steering_store
+            .lock()
+            .await
+            .delete_for_project(&payload.id)
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+        let team_refs = agent_team_validation_refs(&state, OPERATION).await?;
+        let deleted_sessions = !deleted_session_ids.is_empty();
+        let deleted_session_ids = deleted_session_ids.into_iter().collect();
+        let team_events = state
+            .team_registry
+            .remove_project_refs(payload.id.clone(), deleted_session_ids, team_refs)
+            .await
+            .map_err(|error| team_registry_error(OPERATION, error))?;
+        state
+            .workflow_run_store
+            .delete_for_project(&payload.id)
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
         let deleted = {
             let mut project_store = project_store.lock().await;
             project_store
@@ -6073,7 +6144,6 @@ impl HostHandle {
                 .map_err(|error| project_store_error(OPERATION, error))?
         };
 
-        let mut state = self.state.lock().await;
         cleanup_reviews_for_deleted_project(&state.review_registry, &payload.id).await;
         if let Some(mut router) = state.code_intel_routers.remove(&payload.id) {
             router.shutdown_all();
@@ -6081,18 +6151,29 @@ impl HostHandle {
         if let Some(subscription) = state.project_streams.remove(&payload.id) {
             subscription.task.abort();
         }
+        state
+            .terminal_streams
+            .retain(|_, terminal| terminal.project_id() != Some(&payload.id));
+        for id in deleted_steering_ids {
+            fan_out_steering_notify(&mut state, SteeringNotifyPayload::Delete { id }).await;
+        }
+        fan_out_team_registry_events(&mut state, team_events).await;
         fan_out_project_notify(
             &mut state,
             ProjectNotifyPayload::Delete { project: deleted },
         )
         .await;
+        fan_out_current_agents_view_preferences(&mut state).await;
+        if deleted_sessions {
+            fan_out_session_lists(&mut state).await;
+        }
         drop(state);
         self.update_workflow_watcher_targets_and_reload("workbench_remove")
             .await?;
         Ok(())
     }
 
-    async fn validate_workbench_remove_blockers(&self, project: &Project) -> AppResult<()> {
+    async fn validate_workbench_remove_roots(&self, project: &Project) -> AppResult<()> {
         const OPERATION: &str = "workbench_remove";
         let ProjectSource::GitWorkbench {
             parent_project_id,
@@ -6109,113 +6190,10 @@ impl HostHandle {
             ));
         };
 
-        let (
-            agent_handles,
-            terminal_handles,
-            session_store,
-            steering_store,
-            project_store,
-            team_registry,
-        ) = {
+        let project_store = {
             let state = self.state.lock().await;
-            let agent_handles = state
-                .registry
-                .agent_ids()
-                .into_iter()
-                .filter_map(|agent_id| state.registry.agent_handle(&agent_id))
-                .collect::<Vec<_>>();
-            let terminal_handles = state.terminal_streams.values().cloned().collect::<Vec<_>>();
-            (
-                agent_handles,
-                terminal_handles,
-                Arc::clone(&state.session_store),
-                Arc::clone(&state.steering_store),
-                Arc::clone(&state.project_store),
-                state.team_registry.clone(),
-            )
+            Arc::clone(&state.project_store)
         };
-
-        for agent in agent_handles {
-            let start = agent.snapshot();
-            if start.project_id.as_ref() == Some(&project.id) {
-                return Err(AppError::conflict(
-                    OPERATION,
-                    format!(
-                        "cannot remove workbench {} while agent {} is live",
-                        project.id, start.agent_id
-                    ),
-                ));
-            }
-        }
-
-        for terminal in terminal_handles {
-            if terminal.project_id() == Some(&project.id) && terminal.is_running() {
-                return Err(AppError::conflict(
-                    OPERATION,
-                    format!(
-                        "cannot remove workbench {} while a terminal is live",
-                        project.id
-                    ),
-                ));
-            }
-        }
-
-        let referenced_session = session_store
-            .lock()
-            .await
-            .list()
-            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
-            .into_iter()
-            .find(|session| session.project_id.as_ref() == Some(&project.id));
-        if let Some(session) = referenced_session {
-            return Err(AppError::conflict(
-                OPERATION,
-                format!(
-                    "cannot remove workbench {} while referenced by session {}",
-                    project.id, session.id
-                ),
-            ));
-        }
-
-        let referenced_steering = steering_store
-            .lock()
-            .await
-            .list()
-            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
-            .into_iter()
-            .find(|steering| matches!(&steering.scope, SteeringScope::Project(project_id) if project_id == &project.id));
-        if let Some(steering) = referenced_steering {
-            return Err(AppError::conflict(
-                OPERATION,
-                format!(
-                    "cannot remove workbench {} while referenced by steering {}",
-                    project.id, steering.id
-                ),
-            ));
-        }
-
-        let snapshot = team_registry
-            .snapshot()
-            .await
-            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
-        let referenced_team_members = snapshot
-            .members
-            .iter()
-            .filter(|member| member.project_ids.contains(&project.id))
-            .map(|member| member.id.clone())
-            .collect::<Vec<_>>();
-        if !referenced_team_members.is_empty() {
-            return Err(AppError::conflict(
-                OPERATION,
-                referenced_team_member_delete_message(
-                    "workbench",
-                    &project.id,
-                    Some(project.name.as_str()),
-                    &snapshot,
-                    &referenced_team_members,
-                ),
-            ));
-        }
 
         let parent = {
             let project_store = project_store.lock().await;
@@ -21270,7 +21248,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         };
 
         let error = host
-            .validate_workbench_remove_blockers(&workbench)
+            .validate_workbench_remove_roots(&workbench)
             .await
             .expect_err("missing parent should block removal");
         assert_eq!(error.code(), protocol::CommandErrorCode::Internal);
