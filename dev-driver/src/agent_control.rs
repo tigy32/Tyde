@@ -2310,6 +2310,7 @@ mod tests {
             latest_output: AgentControlOutput::Error {
                 error: error.clone(),
             },
+            turn_active: false,
         };
         let envelope = Envelope::from_payload(
             StreamPath(format!(

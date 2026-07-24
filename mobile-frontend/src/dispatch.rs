@@ -2401,6 +2401,18 @@ fn apply_agent_bootstrap(
             AgentBootstrapEvent::AgentActivityStats(_) => {}
         }
     }
+    state.agent_turn_active.update(|map| {
+        if payload.turn_active {
+            map.insert(agent_ref.clone(), true);
+        } else {
+            map.remove(&agent_ref);
+        }
+    });
+    if !payload.turn_active {
+        state.streaming_text.update(|map| {
+            map.remove(&agent_ref);
+        });
+    }
 }
 
 fn apply_project_bootstrap(
@@ -2595,6 +2607,7 @@ mod tests {
                 AgentBootstrapPayload {
                     events,
                     latest_output: Default::default(),
+                    turn_active: true,
                 },
             );
 
@@ -2834,6 +2847,7 @@ mod wasm_tests {
         let bootstrap = protocol::AgentBootstrapPayload {
             events: Vec::new(),
             latest_output: Default::default(),
+            turn_active: false,
         };
         let env = Envelope::from_payload(stream.clone(), FrameKind::AgentBootstrap, 0, &bootstrap)
             .expect("synthetic AgentBootstrap");
@@ -3691,6 +3705,7 @@ mod wasm_tests {
                 protocol::AgentBootstrapEvent::ChatEvent(chat_event),
             ],
             latest_output: Default::default(),
+            turn_active: false,
         };
         dispatch_envelope(
             &state,
@@ -3724,6 +3739,12 @@ mod wasm_tests {
             .unwrap_or_default();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].message.content, "Hello");
+        assert!(
+            !state
+                .agent_turn_active
+                .with_untracked(|map| map.contains_key(&agent_ref)),
+            "idle bootstrap should remain idle after replay"
+        );
     }
 
     /// Register an agent on `host` whose `LoadAgent` instance stream is

@@ -754,6 +754,7 @@ fn bootstrap_payloads_round_trip() {
             ChatEvent::TypingStatusChanged(true),
         )],
         latest_output: Default::default(),
+        turn_active: true,
     });
     round_trip_json(&ProjectBootstrapPayload {
         project: Project {

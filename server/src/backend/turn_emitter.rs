@@ -1892,6 +1892,7 @@ mod tests {
                     created_at_ms: new_agent.created_at_ms,
                 })],
                 latest_output: Default::default(),
+                turn_active: false,
             },
         )
         .expect("serialize AgentBootstrap");

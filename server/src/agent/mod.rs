@@ -2438,7 +2438,9 @@ pub(crate) fn spawn_agent_actor(
                     &mut latest_output,
                     &mut subscribers,
                     &mut pending_startup_attaches,
-                );
+                    &status_handle,
+                )
+                .await;
                 park_terminal_agent(
                     &session_store,
                     current_session_id.as_ref(),
@@ -2573,7 +2575,9 @@ pub(crate) fn spawn_agent_actor(
                 &mut latest_output,
                 &mut subscribers,
                 &mut pending_startup_attaches,
-            );
+                &status_handle,
+            )
+            .await;
         }
 
         let mut initial_follow_up = initial_follow_up.filter(|input| {
@@ -2652,7 +2656,9 @@ pub(crate) fn spawn_agent_actor(
                                 &mut latest_output,
                                 &mut subscribers,
                                 &mut pending_resume_attaches,
-                            );
+                                &status_handle,
+                            )
+                            .await;
                             abort_resume_replay_barrier_task(&mut resume_replay_barrier_task);
                             if let Some(backend) = backend.take() {
                                 shutdown_backend_with_timeout(backend, &current_start.agent_id)
@@ -3301,7 +3307,9 @@ pub(crate) fn spawn_agent_actor(
                                         &mut latest_output,
                                         &mut subscribers,
                                         &mut pending_resume_attaches,
-                                    );
+                                        &status_handle,
+                                    )
+                                    .await;
                                     if let Some(input) = initial_follow_up.take()
                                         && !send_initial_follow_up_or_park(
                                             input,
@@ -3363,7 +3371,9 @@ pub(crate) fn spawn_agent_actor(
                                         &mut latest_output,
                                         &mut subscribers,
                                         &mut pending_resume_attaches,
-                                    );
+                                        &status_handle,
+                                    )
+                                    .await;
                                     if let Some(backend) = backend.take() {
                                         shutdown_backend_with_timeout(
                                             backend,
@@ -4437,6 +4447,7 @@ pub(crate) fn spawn_agent_actor(
                                 &event_log,
                                 Some(&replay_state),
                                 latest_output.output(),
+                                status_handle.snapshot().await.is_active(),
                                 &mut subscribers,
                                 stream,
                             );
@@ -5157,6 +5168,7 @@ pub(crate) fn spawn_relay_agent_actor(
                                 &event_log,
                                 Some(&replay_state),
                                 latest_output.output(),
+                                status_handle.snapshot().await.is_active(),
                                 &mut subscribers,
                                 stream,
                             );
@@ -5449,6 +5461,7 @@ async fn park_terminal_agent(
                     event_log,
                     None,
                     latest_output.output(),
+                    false,
                     subscribers,
                     stream,
                 );
@@ -5601,6 +5614,7 @@ async fn park_relay_terminal_agent(
                     event_log,
                     None,
                     latest_output.output(),
+                    status_handle.snapshot().await.is_active(),
                     subscribers,
                     stream,
                 );
@@ -6113,20 +6127,23 @@ fn abort_resume_replay_barrier_task(task: &mut Option<tokio::task::JoinHandle<()
     }
 }
 
-fn flush_pending_agent_attaches(
+async fn flush_pending_agent_attaches(
     event_log: &[Envelope],
     replay_state: Option<&AgentReplayState>,
     latest_output: &mut AgentControlLatestOutput,
     subscribers: &mut Vec<Stream>,
     pending_attaches: &mut Vec<(Stream, oneshot::Sender<bool>)>,
+    status_handle: &registry::AgentStatusHandle,
 ) {
     let output = current_latest_output(latest_output, event_log)
         .expect("typed agent replay log must project latest output");
+    let turn_active = status_handle.snapshot().await.is_active();
     for (stream, reply) in std::mem::take(pending_attaches) {
         let attached = attach_subscriber_with_latest_output(
             event_log,
             replay_state,
             &output,
+            turn_active,
             subscribers,
             stream,
         );
@@ -7280,6 +7297,7 @@ fn attach_subscriber(
         event_log,
         replay_state,
         latest_output.output(),
+        replay_state.is_some_and(|state| state.typing),
         subscribers,
         stream,
     )
@@ -7289,6 +7307,7 @@ fn attach_subscriber_with_latest_output(
     event_log: &[Envelope],
     replay_state: Option<&AgentReplayState>,
     latest_output: &AgentControlOutput,
+    turn_active: bool,
     subscribers: &mut Vec<Stream>,
     stream: Stream,
 ) -> bool {
@@ -7328,6 +7347,7 @@ fn attach_subscriber_with_latest_output(
     let payload = serde_json::to_value(AgentBootstrapPayload {
         events,
         latest_output: latest_output.clone(),
+        turn_active,
     })
     .expect("failed to serialize AgentBootstrap payload");
     if stream
@@ -8538,6 +8558,7 @@ mod tests {
         let bootstrap: AgentBootstrapPayload = first
             .parse_payload()
             .expect("startup AgentBootstrap payload");
+        assert!(bootstrap.turn_active);
         assert_eq!(bootstrap.events.len(), 4);
         let expected_start = handle.snapshot();
         let AgentBootstrapEvent::AgentStart(bootstrap_start) = &bootstrap.events[0] else {
@@ -9010,6 +9031,7 @@ mod tests {
         let bootstrap: AgentBootstrapPayload = first
             .parse_payload()
             .expect("terminal startup AgentBootstrap payload");
+        assert!(!bootstrap.turn_active);
         let AgentBootstrapEvent::AgentStart(bootstrap_start) = &bootstrap.events[0] else {
             panic!("terminal bootstrap must begin with AgentStart");
         };
@@ -9131,6 +9153,7 @@ mod tests {
                             &event_log,
                             None,
                             latest_output.output(),
+                            status_handle.snapshot().await.is_active(),
                             &mut subscribers,
                             stream,
                         );
@@ -10494,6 +10517,94 @@ mod tests {
                 AgentBootstrapEvent::ChatEvent(ChatEvent::TypingStatusChanged(false)),
             ]
         ));
+    }
+
+    #[tokio::test]
+    async fn completed_bootstrap_carries_authoritative_idle_state() {
+        let canonical_stream = "/agent/completed-agent";
+        let mut event_log = Vec::new();
+        let mut subscribers = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::MessageAdded(ChatMessage {
+                message_id: None,
+                timestamp: 1,
+                sender: MessageSender::User,
+                content: "run the task".to_owned(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            }),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::TypingStatusChanged(true),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::MessageAdded(ChatMessage {
+                message_id: None,
+                timestamp: 2,
+                sender: MessageSender::Assistant {
+                    agent: "claude".to_owned(),
+                },
+                content: "CHILD_DONE".to_owned(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            }),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::TypingStatusChanged(false),
+        )
+        .await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert!(attach_subscriber(
+            &event_log,
+            Some(&replay_state),
+            &mut subscribers,
+            replay_stream(tx),
+        ));
+        let envelope = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for completed bootstrap")
+            .expect("completed bootstrap stream closed");
+        let bootstrap = envelope
+            .parse_payload::<AgentBootstrapPayload>()
+            .expect("parse completed bootstrap");
+
+        assert!(!bootstrap.turn_active);
+        assert!(bootstrap.events.iter().any(|event| {
+            matches!(
+                event,
+                AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message))
+                    if matches!(message.sender, MessageSender::User)
+            )
+        }));
     }
 
     #[tokio::test]

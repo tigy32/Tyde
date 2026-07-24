@@ -227,6 +227,7 @@ pub fn prime_agent_stream_for_tests(
         &BootstrapPayload {
             events: vec![BootstrapEvent::AgentStart(agent_payload.clone())],
             latest_output: Default::default(),
+            turn_active: false,
         },
     )
     .expect("synthetic AgentBootstrap");
@@ -5443,6 +5444,18 @@ fn apply_agent_bootstrap(
             }
         }
     }
+    state.agent_turn_active.update(|map| {
+        if payload.turn_active {
+            map.insert(agent_id.clone(), true);
+        } else {
+            map.remove(&agent_id);
+        }
+    });
+    if !payload.turn_active {
+        state.streaming_text.update(|map| {
+            map.remove(&agent_id);
+        });
+    }
 }
 
 fn apply_project_bootstrap(
@@ -6596,9 +6609,16 @@ mod tests {
                 AgentBootstrapPayload {
                     events,
                     latest_output: Default::default(),
+                    turn_active: true,
                 },
             );
 
+            assert!(
+                state
+                    .agent_turn_active
+                    .with_untracked(|map| map.get(&agent_id).copied().unwrap_or(false)),
+                "authoritative bootstrap liveness should keep the agent active"
+            );
             assert!(
                 state
                     .session_history
@@ -6637,6 +6657,78 @@ mod tests {
                     .with_untracked(|map| map.get(&agent_id).map(Vec::len)),
                 Some(1),
                 "live StreamEnd should append while prior history remains unloaded"
+            );
+        });
+    }
+
+    #[test]
+    fn idle_bootstrap_overrides_replayed_user_message_activity() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host_id = "idle-host";
+            let agent_id = AgentId("idle-agent".to_owned());
+            let stream = StreamPath("/agent/idle-agent/instance".to_owned());
+            state.agents.update(|agents| {
+                agents.push(AgentInfo {
+                    host_id: host_id.to_owned(),
+                    agent_id: agent_id.clone(),
+                    name: "Idle Agent".to_owned(),
+                    origin: protocol::AgentOrigin::AgentControl,
+                    backend_kind: protocol::BackendKind::Claude,
+                    workspace_roots: Vec::new(),
+                    project_id: None,
+                    parent_agent_id: Some(AgentId("parent".to_owned())),
+                    session_id: None,
+                    custom_agent_id: None,
+                    workflow: None,
+                    created_at_ms: 0,
+                    instance_stream: stream.clone(),
+                    started: true,
+                    fatal_error: None,
+                    activity_summary: Default::default(),
+                });
+            });
+            let message = |sender, content: &str| protocol::ChatMessage {
+                message_id: None,
+                timestamp: 1,
+                sender,
+                content: content.to_owned(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            };
+
+            apply_agent_bootstrap(
+                &state,
+                host_id,
+                &stream,
+                AgentBootstrapPayload {
+                    events: vec![
+                        AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message(
+                            protocol::MessageSender::User,
+                            "run the bounded task",
+                        ))),
+                        AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message(
+                            protocol::MessageSender::Assistant {
+                                agent: "claude".to_owned(),
+                            },
+                            "CHILD_DONE",
+                        ))),
+                    ],
+                    latest_output: Default::default(),
+                    turn_active: false,
+                },
+            );
+
+            assert!(
+                !state
+                    .agent_turn_active
+                    .with_untracked(|map| map.contains_key(&agent_id)),
+                "completed replay must not resurrect the child as active"
             );
         });
     }

@@ -2166,6 +2166,8 @@ pub struct AgentsViewPreferencesNotifyPayload {
 pub struct AgentBootstrapPayload {
     pub events: Vec<AgentBootstrapEvent>,
     pub latest_output: AgentControlOutput,
+    /// Authoritative liveness after replaying `events`.
+    pub turn_active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7878,6 +7880,7 @@ mod search_serde_tests {
         let bootstrap = AgentBootstrapPayload {
             events: vec![AgentBootstrapEvent::AgentActivityStats(payload.clone())],
             latest_output: AgentControlOutput::Empty,
+            turn_active: false,
         };
         assert!(matches!(
             round_trip(&bootstrap).events.as_slice(),
@@ -8984,6 +8987,16 @@ mod agent_control_output_tests {
         let error = serde_json::from_value::<AgentBootstrapPayload>(json!({ "events": [] }))
             .expect_err("bootstrap without latest_output must be rejected");
         assert!(error.to_string().contains("latest_output"));
+    }
+
+    #[test]
+    fn bootstrap_requires_explicit_turn_active() {
+        let error = serde_json::from_value::<AgentBootstrapPayload>(json!({
+            "events": [],
+            "latest_output": { "kind": "empty" }
+        }))
+        .expect_err("bootstrap without turn_active must be rejected");
+        assert!(error.to_string().contains("turn_active"));
     }
 }
 

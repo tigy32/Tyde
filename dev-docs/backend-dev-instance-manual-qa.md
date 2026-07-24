@@ -547,6 +547,14 @@ unique name, prompt marker, command marker, and final-answer marker.
    Also confirm the selected project and conversation restore consistently:
    project rail, editor, chat, footer, and agent panel must not disagree or
    require clicking an agent merely to repair bootstrap state.
+   This is a mandatory terminal-bootstrap regression case: complete one
+   backend-native child, one awaited Tyde-managed child, and two detached
+   Tyde-managed children, then record the empty in-flight tray and Idle parent
+   and child cards. Reload the frontend, reopen the parent, and confirm the
+   tray remains empty and every card remains Idle even though replayed history
+   contains the user prompts and each child's final-answer marker. Any
+   completed transcript reconstructed as Thinking or any final-answer row
+   listed as running is `FAIL`.
 4. From the rendered **History** panel, locate completed, cancelled, and failed
    sessions and exercise **Resume** on each supported state. Record the source
    session identity, backend, model, project, terminal state, and last unique

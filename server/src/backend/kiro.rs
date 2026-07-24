@@ -4797,6 +4797,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"sessionId":"kiro-real-legacy-s
                     },
                 )],
                 latest_output: Default::default(),
+                turn_active: false,
             },
         )
         .expect("serialize AgentBootstrap");
