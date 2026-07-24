@@ -306,6 +306,16 @@ attempts at the summary layer, rely on read-only access mode plus no MCP to make
 them harmless, continue reading streamed text, and emit `Error` only if no usable
 summary text is produced.
 
+Codex inference helpers inherit the native `CODEX_HOME` so keyring-backed
+authentication uses the same canonical home as ordinary Codex sessions. This
+does not import the native tool surface: before starting the thread, the shared
+inference path reads Codex's effective MCP inventory and disables every named
+server through `thread/start.config`. It also clears the native `notify`
+command, disables built-in tool features, uses an ephemeral thread with the
+read-only sandbox and network disabled, applies the untrusted approval policy,
+ignores session settings, and rejects any tool request that still reaches the
+app-server boundary.
+
 Workspace roots: prefer `workspace_roots = Vec::new()` because the task needs no
 repo context. If a backend cannot spawn without at least one valid root, pass the
 target agent's first/root set as the minimum spawn requirement, still with

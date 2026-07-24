@@ -452,19 +452,18 @@ impl CodexSession {
             pick_workspace_root(workspace_roots)?
         };
 
-        let thread_started = rpc
-            .request(
-                "thread/start",
-                json!({
-                    "cwd": cwd,
-                    "sandbox": codex_sandbox_mode(access_mode, execution_mode),
-                    "approvalPolicy": codex_approval_policy(execution_mode),
-                    "ephemeral": ephemeral || execution_mode == BackendExecutionMode::InferenceOnly,
-                    "experimentalRawEvents": CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS,
-                    "persistExtendedHistory": false
-                }),
-            )
-            .await?;
+        let mut thread_start_params = json!({
+            "cwd": cwd,
+            "sandbox": codex_sandbox_mode(access_mode, execution_mode),
+            "approvalPolicy": codex_approval_policy(execution_mode),
+            "ephemeral": ephemeral || execution_mode == BackendExecutionMode::InferenceOnly,
+            "experimentalRawEvents": CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS,
+            "persistExtendedHistory": false
+        });
+        if execution_mode == BackendExecutionMode::InferenceOnly {
+            thread_start_params["config"] = codex_inference_thread_config(&rpc, &cwd).await?;
+        }
+        let thread_started = rpc.request("thread/start", thread_start_params).await?;
 
         Self::from_thread_response(
             rpc,
@@ -9105,92 +9104,28 @@ fn codex_inference_config_overrides() -> Vec<String> {
     .collect()
 }
 
-fn codex_native_home() -> Result<std::path::PathBuf, String> {
-    #[cfg(test)]
-    if let Some(path) = codex_test_native_home_override()
-        .lock()
-        .expect("codex test native home mutex poisoned")
-        .clone()
-    {
-        return Ok(path);
-    }
-
-    if let Some(path) = std::env::var_os("CODEX_HOME")
-        && !path.is_empty()
-    {
-        return Ok(path.into());
-    }
-    Ok(crate::paths::home_dir()?.join(".codex"))
-}
-
-fn create_codex_inference_home() -> Result<tempfile::TempDir, String> {
-    let isolated_home = tempfile::Builder::new()
-        .prefix("tyde-codex-inference-")
-        .tempdir()
-        .map_err(|err| format!("Failed to create isolated Codex inference home: {err}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(isolated_home.path(), std::fs::Permissions::from_mode(0o700))
-            .map_err(|err| format!("Failed to secure isolated Codex inference home: {err}"))?;
-    }
-
-    let source_auth = codex_native_home()?.join("auth.json");
-    let mut copied_file_auth = false;
-    match std::fs::metadata(&source_auth) {
-        Ok(metadata) => {
-            if !metadata.is_file() {
-                return Err("Codex authentication source is not a regular file".to_owned());
-            }
-            let mut source = std::fs::File::open(&source_auth)
-                .map_err(|err| format!("Failed to open Codex authentication source: {err}"))?;
-            let destination = isolated_home.path().join("auth.json");
-            let mut options = std::fs::OpenOptions::new();
-            options.create_new(true).write(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut isolated = options
-                .open(destination)
-                .map_err(|err| format!("Failed to create isolated Codex authentication: {err}"))?;
-            std::io::copy(&mut source, &mut isolated)
-                .map_err(|err| format!("Failed to copy Codex authentication securely: {err}"))?;
-            isolated
-                .sync_all()
-                .map_err(|err| format!("Failed to persist isolated Codex authentication: {err}"))?;
-            copied_file_auth = true;
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(format!(
-                "Failed to inspect Codex authentication source: {err}"
-            ));
-        }
-    }
-
-    let config_path = isolated_home.path().join("config.toml");
-    let mut options = std::fs::OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut config = options
-        .open(config_path)
-        .map_err(|err| format!("Failed to create isolated Codex configuration: {err}"))?;
-    use std::io::Write as _;
-    let credential_store = if copied_file_auth { "file" } else { "auto" };
-    config
-        .write_all(format!("cli_auth_credentials_store = \"{credential_store}\"\n").as_bytes())
-        .map_err(|err| format!("Failed to write isolated Codex configuration: {err}"))?;
-    config
-        .sync_all()
-        .map_err(|err| format!("Failed to persist isolated Codex configuration: {err}"))?;
-
-    Ok(isolated_home)
+async fn codex_inference_thread_config(rpc: &CodexRpc, cwd: &str) -> Result<Value, String> {
+    let effective_config = rpc
+        .request(
+            "config/read",
+            json!({
+                "includeLayers": false,
+                "cwd": cwd,
+            }),
+        )
+        .await?;
+    let mcp_servers = effective_config
+        .pointer("/config/mcp_servers")
+        .and_then(Value::as_object)
+        .ok_or("Codex config/read response missing config.mcp_servers")?;
+    let disabled_mcp_servers = mcp_servers
+        .keys()
+        .map(|name| (name.clone(), json!({ "enabled": false })))
+        .collect::<serde_json::Map<_, _>>();
+    Ok(json!({
+        "mcp_servers": disabled_mcp_servers,
+        "notify": [],
+    }))
 }
 
 fn codex_app_server_args(
@@ -9466,7 +9401,6 @@ struct CodexRpc {
     child: Arc<Mutex<Option<AsyncGroupChild>>>,
     stdout_task: JoinHandle<()>,
     stderr_task: JoinHandle<()>,
-    _isolated_codex_home: Option<tempfile::TempDir>,
 }
 
 impl CodexRpc {
@@ -9497,15 +9431,8 @@ impl CodexRpc {
         local_program: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<CodexInbound>), String> {
         if execution_mode == BackendExecutionMode::InferenceOnly && ssh_host.is_some() {
-            return Err(
-                "Codex transient inference requires a local isolated configuration".to_owned(),
-            );
+            return Err("Codex transient inference requires a local Codex process".to_owned());
         }
-        let isolated_codex_home = if execution_mode == BackendExecutionMode::InferenceOnly {
-            Some(create_codex_inference_home()?)
-        } else {
-            None
-        };
         let mut config_overrides = codex_mcp_config_overrides(startup_mcp_servers);
         if execution_mode == BackendExecutionMode::InferenceOnly {
             config_overrides.extend(codex_inference_config_overrides());
@@ -9530,15 +9457,11 @@ impl CodexRpc {
             if let Some(path) = process_env::resolved_child_process_path() {
                 cmd.env("PATH", path);
             }
-            if let Some(home) = isolated_codex_home.as_ref() {
-                cmd.env("CODEX_HOME", home.path());
-            }
             #[cfg(test)]
-            if execution_mode == BackendExecutionMode::Agent
-                && let Some(home) = codex_test_native_home_override()
-                    .lock()
-                    .expect("codex test native home mutex poisoned")
-                    .clone()
+            if let Some(home) = codex_test_native_home_override()
+                .lock()
+                .expect("codex test native home mutex poisoned")
+                .clone()
             {
                 cmd.env("CODEX_HOME", home);
             }
@@ -9652,7 +9575,6 @@ impl CodexRpc {
                 child: child_ref,
                 stdout_task,
                 stderr_task,
-                _isolated_codex_home: isolated_codex_home,
             },
             inbound_rx,
         ))
@@ -11361,22 +11283,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_inference_home_uses_native_auth_store_when_file_auth_is_absent() {
-        let native_home = tempfile::tempdir().expect("native Codex home fixture");
-        let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
-            std::path::PathBuf::from("/bin/true"),
-            Some(native_home.path().to_path_buf()),
-        );
-
-        let isolated = create_codex_inference_home().expect("create isolated inference home");
-        let config = std::fs::read_to_string(isolated.path().join("config.toml"))
-            .expect("read isolated inference config");
-
-        assert_eq!(config, "cli_auth_credentials_store = \"auto\"\n");
-        assert!(!isolated.path().join("auth.json").exists());
-    }
-
-    #[test]
     fn codex_pick_workspace_root_keeps_ssh_only_roots_invalid() {
         let err = pick_workspace_root(&["ssh://devbox.example.com/workspace".to_string()])
             .expect_err("ssh-only local roots should remain invalid");
@@ -11463,9 +11369,6 @@ if codex_home:
             native_mcp_configured = "[mcp_servers.native-fixture]" in native_config.read()
     except FileNotFoundError:
         pass
-if native_mcp_configured:
-    with open(NATIVE_MCP_CONTACTS, "a", encoding="utf-8") as contacts:
-        contacts.write(json.dumps({"pid": os.getpid()}, separators=(",", ":")) + "\n")
 with open(ARGV_CAPTURE, "a", encoding="utf-8") as argv_capture:
     argv_capture.write(json.dumps({"pid": os.getpid(), "argv": sys.argv[1:], "codex_home": codex_home, "auth_present": auth_present, "native_mcp_configured": native_mcp_configured}, separators=(",", ":")) + "\n")
 
@@ -11492,7 +11395,29 @@ for line in sys.stdin:
                 "platformOs": "test"
             }
         })
+    elif method == "config/read":
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "config": {
+                    "mcp_servers": ({
+                        "native-fixture": {
+                            "url": "https://native.invalid/mcp",
+                            "enabled": True
+                        }
+                    } if native_mcp_configured else {})
+                },
+                "origins": {}
+            }
+        })
     elif method == "thread/start":
+        thread_config = params.get("config") or {}
+        mcp_overrides = thread_config.get("mcp_servers") or {}
+        native_mcp_override = mcp_overrides.get("native-fixture") or {}
+        if native_mcp_configured and native_mcp_override.get("enabled") is not False:
+            with open(NATIVE_MCP_CONTACTS, "a", encoding="utf-8") as contacts:
+                contacts.write(json.dumps({"pid": os.getpid()}, separators=(",", ":")) + "\n")
         send({
             "jsonrpc": "2.0",
             "id": request_id,
@@ -12417,12 +12342,12 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn codex_naming_mode_isolates_config_and_rejects_commands() {
+    async fn codex_inference_mode_inherits_auth_and_rejects_tools() {
         let fake = CodexFakeAppServer::new("inference_reject_command", "unused");
         let native_home = tempfile::tempdir().expect("native Codex home fixture");
         std::fs::write(
             native_home.path().join("config.toml"),
-            "[mcp_servers.native-fixture]\nurl = \"https://native.invalid/mcp\"\n",
+            "notify = [\"/tmp/native-notify\"]\n\n[mcp_servers.native-fixture]\nurl = \"https://native.invalid/mcp\"\n",
         )
         .expect("write native Codex MCP fixture");
         std::fs::write(
@@ -12456,6 +12381,10 @@ for line in sys.stdin:
         let task = "Investigate the configured MCP endpoint";
         let naming_prompt = crate::agent::build_name_generation_prompt(task);
         let mut naming_config = crate::agent::agent_name_generation_spawn_config();
+        assert_eq!(
+            naming_config.resolved_spawn_config.tool_policy,
+            protocol::ToolPolicy::AllowList { tools: Vec::new() }
+        );
         naming_config.startup_mcp_servers = vec![configured_mcp.clone()];
         naming_config.session_settings = Some(configured_settings.clone());
         naming_config.resolved_spawn_config.instructions =
@@ -12502,6 +12431,37 @@ for line in sys.stdin:
             .iter()
             .find(|request| request.get("method").and_then(Value::as_str) == Some("thread/start"))
             .expect("naming thread/start");
+        let config_read_index = naming_requests
+            .iter()
+            .position(|request| {
+                request.get("method").and_then(Value::as_str) == Some("config/read")
+            })
+            .expect("naming config/read");
+        let thread_start_index = naming_requests
+            .iter()
+            .position(|request| {
+                request.get("method").and_then(Value::as_str) == Some("thread/start")
+            })
+            .expect("naming thread/start index");
+        assert!(config_read_index < thread_start_index);
+        assert_eq!(
+            naming_requests[config_read_index]
+                .pointer("/params/cwd")
+                .and_then(Value::as_str),
+            Some(isolated_root.as_str())
+        );
+        assert_eq!(
+            naming_thread
+                .pointer("/params/config/mcp_servers/native-fixture/enabled")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(
+            naming_thread
+                .pointer("/params/config/notify")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+        );
         assert_eq!(
             naming_thread.pointer("/params/cwd").and_then(Value::as_str),
             Some(isolated_root.as_str())
@@ -12565,6 +12525,11 @@ for line in sys.stdin:
             Some("decline")
         );
         let naming_argv = fake.argv_for_pid(naming_pid);
+        assert!(
+            naming_argv.windows(2).any(|args| {
+                args == ["--sandbox".to_owned(), CODEX_INFERENCE_SANDBOX.to_owned()]
+            })
+        );
         for disabled in codex_inference_config_overrides() {
             assert!(naming_argv.contains(&disabled), "missing {disabled}");
         }
@@ -12579,12 +12544,12 @@ for line in sys.stdin:
                 .any(|arg| arg.starts_with("model_instructions_file="))
         );
         let naming_environment = fake.environment_for_pid(naming_pid);
-        assert_ne!(
+        assert_eq!(
             naming_environment.codex_home.as_deref(),
             Some(native_home.path())
         );
         assert!(naming_environment.auth_present);
-        assert!(!naming_environment.native_mcp_configured);
+        assert!(naming_environment.native_mcp_configured);
         assert!(!fake.native_mcp_contact_pids().contains(&naming_pid));
         assert!(!fake.command_execution_marker.exists());
 
@@ -12638,6 +12603,7 @@ for line in sys.stdin:
             .iter()
             .find(|request| request.get("method").and_then(Value::as_str) == Some("thread/start"))
             .expect("real agent thread/start");
+        assert!(real_thread.pointer("/params/config").is_none());
         assert_eq!(
             real_thread.pointer("/params/cwd").and_then(Value::as_str),
             Some(real_root.as_str())
@@ -13651,7 +13617,6 @@ for line in sys.stdin:
             child: Arc::new(Mutex::new(Some(child))),
             stdout_task,
             stderr_task,
-            _isolated_codex_home: None,
         };
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(CodexInner {
