@@ -50,6 +50,7 @@ pub fn resume_session(
         project_id: pid,
     });
     state.switch_active_project(target_project);
+    state.open_tab(TabContent::empty_chat(), "New Chat".to_owned(), true);
     let state = state.clone();
     spawn_local(async move {
         let Some(host_stream) = state.host_stream_untracked(&host_id) else {
@@ -1588,6 +1589,38 @@ mod wasm_tests {
                     agent_id,
                 })
             );
+        });
+    }
+
+    #[wasm_bindgen_test]
+    fn resume_session_opens_focused_draft_for_spawn_echo() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            state.open_tab(TabContent::AgentMonitor, "Agents".to_owned(), true);
+
+            resume_session(
+                &state,
+                "host-a".to_owned(),
+                BackendKind::Codex,
+                SessionId("historical-session".to_owned()),
+                Some(ProjectId("project-a".to_owned())),
+            );
+
+            assert_eq!(
+                state.active_project.get_untracked(),
+                Some(ActiveProjectRef {
+                    host_id: "host-a".to_owned(),
+                    project_id: ProjectId("project-a".to_owned()),
+                })
+            );
+            state.center_zone.with_untracked(|center_zone| {
+                assert_eq!(
+                    center_zone.active_tab().map(|tab| tab.content.clone()),
+                    Some(TabContent::empty_chat()),
+                    "the resume echo needs an active draft to upgrade into the restored agent"
+                );
+            });
         });
     }
 
