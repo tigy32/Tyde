@@ -605,43 +605,58 @@ unique name, prompt marker, command marker, and final-answer marker.
 
 ## 14. Exercise settings and supported media
 
-1. Change every exposed per-session setting before the first turn and verify
+1. Before the first turn, use the New Chat agent/profile selector to switch
+   between at least two available backends. After every selection, confirm the
+   **Session Settings (<backend>)** heading and complete settings schema change
+   immediately to the selected backend. Send a uniquely marked turn and
+   confirm its agent card, message metadata, model, and actual response backend
+   all match the final selection. A selector that changes visually while the
+   old backend or schema launches is a failure.
+2. Switch the draft agent/profile repeatedly and confirm unrelated review
+   backend, target, and cost controls do not change. After a session starts,
+   confirm its backend identity remains immutable while documented
+   per-session settings remain editable.
+3. Change every exposed per-session setting before the first turn and verify
    the response metadata reflects the selected value.
    Capture the bootstrap interval as well: a chosen model, effort, access mode,
    or profile must not temporarily render as `Auto` or another default while
    the backend initializes and then silently correct itself later.
-2. Change settings between turns where allowed. Confirm the new value applies
+4. Change settings between turns where allowed. Confirm the new value applies
    only at the documented boundary and old messages retain their metadata.
-3. Attempt a setting change while busy. Confirm it is queued, rejected, or
+5. Attempt a setting change while busy. Confirm it is queued, rejected, or
    applied according to the UI contract without silently changing the active
    turn.
-4. Switch model where supported and verify message metadata and usage identify
+6. Switch model where supported and verify message metadata and usage identify
    the actual model used for each turn.
-5. When a capability-specific model is needed, switch from the default cheap
+7. Attempt a model or setting update that the backend rejects. Confirm the
+   visible control reverts to the last applied value, the rejected value is
+   not persisted, and the next turn uses the displayed value. Reload and
+   reopen the session to verify the same authoritative setting remains.
+8. When a capability-specific model is needed, switch from the default cheap
    model, exercise the capability and its lifecycle/replay regressions, then
    switch back. Confirm history keeps the actual model on every old message and
    new turns use the newly selected model only.
-6. Attach a small image when supported. Confirm preview, send, backend receipt,
+9. Attach a small image when supported. Confirm preview, send, backend receipt,
    final rendering, replay, and fork behavior. Unsupported media must be
    rejected before backend spend.
-7. Request image output when supported. Confirm the image and associated typed
+10. Request image output when supported. Confirm the image and associated typed
    event both survive replay and neither replaces the other.
-8. Change the host default backend. Confirm new chats use the new default while
+11. Change the host default backend. Confirm new chats use the new default while
    existing chats retain their original backend, model, settings, and session.
-9. Run bounded turns concurrently on two different backends using their cheap
+12. Run bounded turns concurrently on two different backends using their cheap
    QA models. Confirm status, output, tools, usage, capacity, settings, and
    errors remain isolated and every backend label identifies the actual
    producer.
-10. Enable agent activity summaries and hold a normal turn long enough for a
-    summary attempt. Confirm the summary reaches a non-error state, the hidden
-    helper never appears as an agent or tool user, and backend logs contain no
-    authentication or tool-policy failure. Repeat after reloading the client.
-11. Enable the supervisor and run one bounded case that produces `done`, one
-    that requires `awaiting_user`, and one safe interrupted case that requires
-    `continue`. Confirm the hidden verdict call authenticates on this backend,
-    no retry-exhaustion warning appears for helper failure, and the visible
-    agent status remains authoritative while the verdict runs.
-12. After a completed supervised turn, reload and reconnect while the terminal
+13. Enable agent activity summaries and hold a normal turn long enough for a
+   summary attempt. Confirm the summary reaches a non-error state, the hidden
+   helper never appears as an agent or tool user, and backend logs contain no
+   authentication or tool-policy failure. Repeat after reloading the client.
+14. Enable the supervisor and run one bounded case that produces `done`, one
+   that requires `awaiting_user`, and one safe interrupted case that requires
+   `continue`. Confirm the hidden verdict call authenticates on this backend,
+   no retry-exhaustion warning appears for helper failure, and the visible
+   agent status remains authoritative while the verdict runs.
+15. After a completed supervised turn, reload and reconnect while the terminal
     warning or final assistant card is visible. Confirm the agent remains idle,
     the composer sends normally rather than queueing, and no stale stream makes
     any surface return to Thinking.

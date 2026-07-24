@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -8,13 +8,13 @@ use std::{fs, io};
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use protocol::{
     AgentInput, BackendConfigSnapshotStatus, BackendKind, BackendNativeSettingsSnapshot,
-    BackendSetupDiagnosticCode, ChatEvent, ChatMessage, ContextBreakdown, MessageSender,
-    MessageTokenUsage, ModelInfo, OperationCancelledData, SelectOption, SendMessageToolResponse,
-    SessionId, SessionSettingField, SessionSettingFieldType, SessionSettingValue,
-    SessionSettingsSchema, SessionSettingsValues, StreamEndData, StreamStartData,
-    StreamTextDeltaData, TokenUsage, TokenUsageUnavailableReason, ToolExecutionCompletedData,
-    ToolExecutionResult, ToolProgressData, ToolProgressUpdate, ToolRequest, ToolRequestType,
-    ToolUseData,
+    BackendSetupDiagnosticCode, BackgroundTaskState, BackgroundTaskStatus, ChatEvent, ChatMessage,
+    ContextBreakdown, MessageSender, MessageTokenUsage, ModelInfo, OperationCancelledData,
+    SelectOption, SendMessageToolResponse, SessionId, SessionSettingField, SessionSettingFieldType,
+    SessionSettingValue, SessionSettingsSchema, SessionSettingsValues, StreamEndData,
+    StreamStartData, StreamTextDeltaData, TokenUsage, TokenUsageUnavailableReason,
+    ToolExecutionCompletedData, ToolExecutionResult, ToolProgressData, ToolProgressUpdate,
+    ToolRequest, ToolRequestType, ToolUseData,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -189,6 +189,10 @@ pub struct HermesBackend {
 
 enum HermesBackendCommand {
     Input(AgentInput),
+    UpdateSessionSettings(
+        protocol::SetSessionSettingsPayload,
+        oneshot::Sender<Result<(), String>>,
+    ),
     SetSubagentEmitter(Arc<dyn SubAgentEmitter>, oneshot::Sender<()>),
     Interrupt(oneshot::Sender<bool>),
     Shutdown,
@@ -321,7 +325,10 @@ struct HermesEventMapper {
     model: Option<String>,
     provider: Option<String>,
     pending_tools: HashMap<String, String>,
+    pending_tool_arguments: HashMap<String, Value>,
     turn_tools: HashMap<String, String>,
+    cancelled_tools: HashSet<String>,
+    background_tasks: HashMap<String, HermesBackgroundTask>,
     pending_approval_tool_id: Option<String>,
     cumulative_usage: Option<TokenUsage>,
     awaiting_interrupted_complete: bool,
@@ -337,6 +344,12 @@ struct HermesEventMapper {
 struct HermesDelegationTool {
     tool_call_id: String,
     goals: Vec<String>,
+}
+
+#[derive(Clone)]
+struct HermesBackgroundTask {
+    tool_call_id: String,
+    command: Option<String>,
 }
 
 pub(crate) fn resolve_session_settings(config: &BackendSpawnConfig) -> SessionSettingsValues {
@@ -579,6 +592,21 @@ impl Backend for HermesBackend {
                 false
             }
         }
+    }
+
+    async fn update_session_settings(
+        &mut self,
+        payload: protocol::SetSessionSettingsPayload,
+    ) -> Result<(), String> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(HermesBackendCommand::UpdateSessionSettings(
+                payload, reply_tx,
+            ))
+            .map_err(|_| "Hermes terminated before applying session settings".to_owned())?;
+        reply_rx
+            .await
+            .map_err(|_| "Hermes terminated while applying session settings".to_owned())?
     }
 
     async fn interrupt(&self) -> bool {
@@ -1145,6 +1173,10 @@ impl HermesSessionActor {
                     let Some(command) = maybe_command else { break; };
                     match command {
                         HermesBackendCommand::Input(input) => self.handle_input(input).await,
+                        HermesBackendCommand::UpdateSessionSettings(payload, reply) => {
+                            let result = self.handle_settings_update(payload.values).await;
+                            let _ = reply.send(result);
+                        }
                         HermesBackendCommand::SetSubagentEmitter(emitter, reply) => {
                             self.subagent_emitter = Some(emitter);
                             let _ = reply.send(());
@@ -1172,7 +1204,9 @@ impl HermesSessionActor {
                 }
             }
             AgentInput::UpdateSessionSettings(payload) => {
-                self.handle_settings_update(payload.values).await;
+                if let Err(error) = self.handle_settings_update(payload.values).await {
+                    self.emit_error(error);
+                }
             }
             AgentInput::EditQueuedMessage(_)
             | AgentInput::CancelQueuedMessage(_)
@@ -1263,6 +1297,7 @@ impl HermesSessionActor {
                     Ok(result) => {
                         self.mapper.pending_approval_tool_id = None;
                         self.mapper.pending_tools.remove(&tool_call_id);
+                        self.mapper.pending_tool_arguments.remove(&tool_call_id);
                         self.emit(ChatEvent::ToolExecutionCompleted(
                             ToolExecutionCompletedData {
                                 tool_call_id,
@@ -1281,13 +1316,15 @@ impl HermesSessionActor {
         }
     }
 
-    async fn handle_settings_update(&mut self, values: SessionSettingsValues) {
+    async fn handle_settings_update(
+        &mut self,
+        values: SessionSettingsValues,
+    ) -> Result<(), String> {
         for (key, value) in values.0 {
             match (key.as_str(), value) {
                 ("model", SessionSettingValue::String(model)) if !model.trim().is_empty() => {
                     let Some(selection) = parse_hermes_model_setting(&model) else {
-                        self.emit_error(format!("invalid Hermes model setting '{model}'"));
-                        continue;
+                        return Err(format!("invalid Hermes model setting '{model}'"));
                     };
                     let switch_value =
                         hermes_model_switch_value(&selection.model, selection.provider.as_deref());
@@ -1311,9 +1348,7 @@ impl HermesSessionActor {
                             }
                             self.refresh_provider_info().await;
                         }
-                        Err(err) => {
-                            self.emit_error(format!("Hermes config.set model failed: {err}"))
-                        }
+                        Err(err) => return Err(format!("Hermes config.set model failed: {err}")),
                     }
                 }
                 ("model", SessionSettingValue::Null) => {}
@@ -1332,7 +1367,7 @@ impl HermesSessionActor {
                         )
                         .await
                     {
-                        self.emit_error(format!("Hermes config.set reasoning failed: {err}"));
+                        return Err(format!("Hermes config.set reasoning failed: {err}"));
                     }
                 }
                 ("reasoning_effort", SessionSettingValue::Null) => {}
@@ -1350,14 +1385,15 @@ impl HermesSessionActor {
                         )
                         .await
                     {
-                        self.emit_error(format!("Hermes config.set fast failed: {err}"));
+                        return Err(format!("Hermes config.set fast failed: {err}"));
                     }
                 }
                 (unknown, _) => {
-                    self.emit_error(format!("unsupported Hermes session setting '{unknown}'"))
+                    return Err(format!("unsupported Hermes session setting '{unknown}'"));
                 }
             }
         }
+        Ok(())
     }
 
     async fn refresh_provider_info(&mut self) {
@@ -2602,6 +2638,8 @@ impl HermesEventMapper {
             "tool.start" => self.map_tool_start(payload),
             "tool.progress" => self.map_tool_progress(payload),
             "tool.complete" => self.map_tool_complete(payload),
+            "agent.terminal.output" => self.map_agent_terminal_output(payload),
+            "terminal.close" => Ok(Vec::new()),
             "approval.request" => self.map_approval_request(payload),
             "error" => self.map_error(payload),
             event if event.starts_with("subagent.") => Ok(Vec::new()),
@@ -2662,7 +2700,7 @@ impl HermesEventMapper {
         let payload = required_payload(payload, "status.update")?;
         let text = required_string(&payload, &["text"], "status.update")?;
         let kind = optional_string(&payload, &["kind"]).unwrap_or_else(|| "status".to_string());
-        if text == "ready" || text.trim().is_empty() {
+        if text == "ready" || text.trim().is_empty() || kind == "process" {
             return Ok(Vec::new());
         }
         Ok(vec![ChatEvent::MessageAdded(system_message(format!(
@@ -2880,9 +2918,12 @@ impl HermesEventMapper {
         }
         self.pending_tools
             .insert(tool_call_id.clone(), tool_name.clone());
+        self.cancelled_tools.remove(&tool_call_id);
         self.turn_tools
             .insert(tool_call_id.clone(), tool_name.clone());
         let arguments = payload.get("args").cloned().unwrap_or(payload);
+        self.pending_tool_arguments
+            .insert(tool_call_id.clone(), arguments.clone());
         let tool_type =
             hermes_native_tool_request_type(&tool_name, &arguments).unwrap_or_else(|| {
                 ToolRequestType::Other {
@@ -2933,6 +2974,9 @@ impl HermesEventMapper {
             required_string_any(&payload, &["tool_id", "tool_call_id"], "tool.complete")?;
         let tool_name = required_string_any(&payload, &["name", "tool_name"], "tool.complete")?;
         let Some(expected_name) = self.pending_tools.get(&tool_call_id).cloned() else {
+            if self.cancelled_tools.remove(&tool_call_id) {
+                return Ok(Vec::new());
+            }
             return Err(format!(
                 "Hermes emitted tool.complete for tool_id {tool_call_id} with no pending tool.start"
             ));
@@ -2943,18 +2987,17 @@ impl HermesEventMapper {
             ));
         }
         self.pending_tools.remove(&tool_call_id);
-        let error = optional_string(&payload, &["error"]).or_else(|| {
-            payload
-                .get("error")
-                .filter(|value| !value.is_null())
-                .map(ToString::to_string)
-        });
-        let success = error.is_none();
+        let arguments = self
+            .pending_tool_arguments
+            .remove(&tool_call_id)
+            .unwrap_or(Value::Null);
         let result = payload
             .get("result")
             .cloned()
             .or_else(|| payload.get("summary").cloned())
             .unwrap_or(Value::Null);
+        let error = hermes_tool_error(&payload, &result);
+        let success = error.is_none();
         let completion_tool_call_id = tool_call_id.clone();
         let mut events = vec![ChatEvent::ToolExecutionCompleted(
             ToolExecutionCompletedData {
@@ -2968,6 +3011,53 @@ impl HermesEventMapper {
                 normalization_failure: None,
             },
         )];
+        if success
+            && normalized_hermes_tool_name(&tool_name) == "terminal"
+            && arguments
+                .get("background")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            && let Some(task_id) = non_empty_value_string(&result, &["session_id", "process_id"])
+        {
+            let command = arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            self.background_tasks.insert(
+                task_id.clone(),
+                HermesBackgroundTask {
+                    tool_call_id: completion_tool_call_id.clone(),
+                    command: command.clone(),
+                },
+            );
+            events.push(hermes_background_progress(
+                &completion_tool_call_id,
+                &task_id,
+                command,
+                BackgroundTaskStatus::Running,
+                None,
+            ));
+        }
+        if normalized_hermes_tool_name(&tool_name) == "process"
+            && arguments.get("action").and_then(Value::as_str) == Some("wait")
+            && let Some(task_id) = non_empty_value_string(&arguments, &["session_id", "process_id"])
+            && let Some(background) = self.background_tasks.remove(&task_id)
+        {
+            let exit_code = result.get("exit_code").and_then(Value::as_i64);
+            let status = if success && exit_code == Some(0) {
+                BackgroundTaskStatus::Completed
+            } else {
+                BackgroundTaskStatus::Failed
+            };
+            let summary = exit_code.map(|code| format!("Exited with code {code}"));
+            events.push(hermes_background_progress(
+                &background.tool_call_id,
+                &task_id,
+                background.command,
+                status,
+                summary,
+            ));
+        }
         if success
             && is_hermes_todo_tool(&tool_name)
             && let Some(tasks) =
@@ -2987,6 +3077,28 @@ impl HermesEventMapper {
             events.push(ChatEvent::ToolProgress(progress));
         }
         Ok(events)
+    }
+
+    fn map_agent_terminal_output(
+        &mut self,
+        payload: Option<Value>,
+    ) -> Result<Vec<ChatEvent>, String> {
+        let payload = required_payload(payload, "agent.terminal.output")?;
+        let task_id = required_string_any(
+            &payload,
+            &["process_id", "session_id"],
+            "agent.terminal.output",
+        )?;
+        let Some(background) = self.background_tasks.get(&task_id) else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![hermes_background_progress(
+            &background.tool_call_id,
+            &task_id,
+            background.command.clone(),
+            BackgroundTaskStatus::Running,
+            None,
+        )])
     }
 
     fn map_approval_request(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
@@ -3104,6 +3216,11 @@ impl HermesEventMapper {
         let mut events = Vec::new();
         for (tool_call_id, tool_name) in pending {
             self.pending_tools.remove(&tool_call_id);
+            self.pending_tool_arguments.remove(&tool_call_id);
+            if self.cancelled_tools.len() >= 256 {
+                self.cancelled_tools.clear();
+            }
+            self.cancelled_tools.insert(tool_call_id.clone());
             events.push(ChatEvent::ToolExecutionCompleted(
                 ToolExecutionCompletedData {
                     tool_call_id,
@@ -3148,6 +3265,9 @@ impl HermesEventMapper {
     }
 
     fn clear_turn_tool_state(&mut self) {
+        for tool_call_id in self.pending_tools.keys() {
+            self.pending_tool_arguments.remove(tool_call_id);
+        }
         self.pending_tools.clear();
         self.turn_tools.clear();
         self.pending_approval_tool_id = None;
@@ -3241,13 +3361,133 @@ fn hermes_delegation_goals(arguments: &Value) -> Vec<String> {
 }
 
 fn hermes_native_tool_request_type(tool_name: &str, arguments: &Value) -> Option<ToolRequestType> {
-    if !is_hermes_delegate_tool(tool_name) {
-        return None;
+    let normalized = normalized_hermes_tool_name(tool_name);
+    if normalized == "terminal" {
+        let command = arguments.get("command")?.as_str()?.to_owned();
+        return Some(ToolRequestType::RunCommand {
+            command,
+            working_directory: arguments
+                .get("cwd")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+        });
     }
-    let goals = hermes_delegation_goals(arguments);
-    Some(ToolRequestType::AgentSpawn {
-        prompt: (!goals.is_empty()).then(|| goals.join("\n\n")),
-        name: None,
+    if is_hermes_delegate_tool(tool_name) {
+        let goals = hermes_delegation_goals(arguments);
+        return Some(ToolRequestType::AgentSpawn {
+            prompt: (!goals.is_empty()).then(|| goals.join("\n\n")),
+            name: None,
+        });
+    }
+    None
+}
+
+fn normalized_hermes_tool_name(tool_name: &str) -> String {
+    tool_name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn non_empty_value_string(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        let value = value.get(*key)?;
+        if let Some(text) = value.as_str() {
+            return non_empty_trimmed(text);
+        }
+        value
+            .as_i64()
+            .map(|number| number.to_string())
+            .or_else(|| value.as_u64().map(|number| number.to_string()))
+    })
+}
+
+fn hermes_tool_error(payload: &Value, result: &Value) -> Option<String> {
+    let direct = payload
+        .get("error")
+        .filter(|value| !value.is_null())
+        .and_then(hermes_error_text);
+    if direct.is_some() {
+        return direct;
+    }
+    let nested = result
+        .get("error")
+        .filter(|value| !value.is_null())
+        .and_then(hermes_error_text);
+    if nested.is_some() {
+        return nested;
+    }
+    let is_error = result
+        .get("isError")
+        .or_else(|| result.get("is_error"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if is_error {
+        return hermes_mcp_error_text(result)
+            .or_else(|| optional_string_any(result, &["message", "summary"]))
+            .or_else(|| Some("Hermes tool reported an error".to_owned()));
+    }
+    let status = optional_string(result, &["status"]);
+    if status.as_deref().is_some_and(|status| {
+        matches!(
+            status.to_ascii_lowercase().as_str(),
+            "blocked" | "cancelled" | "error" | "failed"
+        )
+    }) {
+        return optional_string_any(result, &["message", "summary"])
+            .or_else(|| status.map(|status| format!("Hermes tool status: {status}")));
+    }
+    let exit_code = result.get("exit_code").and_then(Value::as_i64);
+    if exit_code.is_some_and(|code| code != 0) {
+        return Some(format!(
+            "Hermes tool exited with code {}",
+            exit_code.expect("nonzero exit code must be present")
+        ));
+    }
+    None
+}
+
+fn hermes_error_text(value: &Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return non_empty_trimmed(text);
+    }
+    optional_string_any(value, &["message", "detail", "summary"]).or_else(|| {
+        let serialized = value.to_string();
+        (serialized != "{}" && serialized != "null").then_some(serialized)
+    })
+}
+
+fn hermes_mcp_error_text(result: &Value) -> Option<String> {
+    result
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .filter_map(|item| optional_string(item, &["text"]))
+                .next()
+        })
+}
+
+fn hermes_background_progress(
+    tool_call_id: &str,
+    task_id: &str,
+    command: Option<String>,
+    status: BackgroundTaskStatus,
+    summary: Option<String>,
+) -> ChatEvent {
+    ChatEvent::ToolProgress(ToolProgressData {
+        tool_call_id: tool_call_id.to_owned(),
+        tool_name: "terminal".to_owned(),
+        update: ToolProgressUpdate::BackgroundTask(BackgroundTaskState {
+            task_id: task_id.to_owned(),
+            description: command,
+            status,
+            summary,
+            output_unavailable: None,
+        }),
     })
 }
 
@@ -6581,6 +6821,183 @@ for line in sys.stdin:
             }),
             "second turn must not report stale unresolved/cancelled tool state: {second_complete:?}"
         );
+    }
+
+    #[test]
+    fn hermes_nested_tool_errors_are_failed_completions() {
+        let mut mapper = HermesEventMapper::default();
+        let _ = mapper.map_event(
+            "tool.start",
+            Some(json!({
+                "tool_id": "terminal-1",
+                "name": "terminal",
+                "args": { "command": "exit 7" }
+            })),
+        );
+        let terminal = mapper.map_event(
+            "tool.complete",
+            Some(json!({
+                "tool_id": "terminal-1",
+                "name": "terminal",
+                "result": {
+                    "error": "command denied",
+                    "exit_code": -1,
+                    "status": "blocked"
+                }
+            })),
+        );
+        assert!(terminal.iter().any(|event| matches!(
+            event,
+            ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
+                success: false,
+                error: Some(error),
+                ..
+            }) if error == "command denied"
+        )));
+
+        let _ = mapper.map_event(
+            "tool.start",
+            Some(json!({
+                "tool_id": "mcp-1",
+                "name": "mcp_tyde_tyde_spawn_agent",
+                "args": {
+                    "name": "Hermes Child",
+                    "prompt": "Inspect the failure path"
+                }
+            })),
+        );
+        let mcp = mapper.map_event(
+            "tool.complete",
+            Some(json!({
+                "tool_id": "mcp-1",
+                "name": "mcp_tyde_tyde_spawn_agent",
+                "result": {
+                    "isError": true,
+                    "content": [{ "type": "text", "text": "missing prompt" }]
+                }
+            })),
+        );
+        assert!(
+            mcp.iter().any(|event| matches!(
+                event,
+                ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
+                    success: false,
+                    error: Some(error),
+                    ..
+                }) if error == "missing prompt"
+            )),
+            "MCP tool failure must use its text content: {mcp:?}"
+        );
+    }
+
+    #[test]
+    fn hermes_late_completion_after_cancel_is_ignored() {
+        let mut mapper = HermesEventMapper::default();
+        let _ = mapper.map_event("message.start", None);
+        let _ = mapper.map_event(
+            "tool.start",
+            Some(json!({
+                "tool_id": "terminal-1",
+                "name": "terminal",
+                "args": { "command": "sleep 20" }
+            })),
+        );
+        let cancelled = mapper.cancel_events("Operation cancelled");
+        assert!(cancelled.iter().any(|event| matches!(
+            event,
+            ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData { success: false, .. })
+        )));
+        assert!(
+            mapper
+                .map_event(
+                    "tool.complete",
+                    Some(json!({
+                        "tool_id": "terminal-1",
+                        "name": "terminal",
+                        "result": { "exit_code": -15 }
+                    })),
+                )
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn hermes_background_terminal_emits_typed_lifecycle() {
+        let mut mapper = HermesEventMapper::default();
+        let request = mapper.map_event(
+            "tool.start",
+            Some(json!({
+                "tool_id": "terminal-1",
+                "name": "terminal",
+                "args": {
+                    "command": "sleep 8",
+                    "background": true
+                }
+            })),
+        );
+        assert!(request.iter().any(|event| matches!(
+            event,
+            ChatEvent::ToolRequest(ToolRequest {
+                tool_type: ToolRequestType::RunCommand { command, .. },
+                ..
+            }) if command == "sleep 8"
+        )));
+
+        let launched = mapper.map_event(
+            "tool.complete",
+            Some(json!({
+                "tool_id": "terminal-1",
+                "name": "terminal",
+                "result": {
+                    "session_id": "proc-1",
+                    "exit_code": 0
+                }
+            })),
+        );
+        assert!(launched.iter().any(|event| matches!(
+            event,
+            ChatEvent::ToolProgress(ToolProgressData {
+                tool_call_id,
+                update: ToolProgressUpdate::BackgroundTask(BackgroundTaskState {
+                    task_id,
+                    status: BackgroundTaskStatus::Running,
+                    ..
+                }),
+                ..
+            }) if tool_call_id == "terminal-1" && task_id == "proc-1"
+        )));
+
+        let _ = mapper.map_event(
+            "tool.start",
+            Some(json!({
+                "tool_id": "process-1",
+                "name": "process",
+                "args": {
+                    "action": "wait",
+                    "session_id": "proc-1"
+                }
+            })),
+        );
+        let completed = mapper.map_event(
+            "tool.complete",
+            Some(json!({
+                "tool_id": "process-1",
+                "name": "process",
+                "result": { "exit_code": 0 }
+            })),
+        );
+        assert!(completed.iter().any(|event| matches!(
+            event,
+            ChatEvent::ToolProgress(ToolProgressData {
+                tool_call_id,
+                update: ToolProgressUpdate::BackgroundTask(BackgroundTaskState {
+                    task_id,
+                    status: BackgroundTaskStatus::Completed,
+                    ..
+                }),
+                ..
+            }) if tool_call_id == "terminal-1" && task_id == "proc-1"
+        )));
     }
 
     #[test]

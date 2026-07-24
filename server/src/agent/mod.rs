@@ -3909,6 +3909,16 @@ pub(crate) fn spawn_agent_actor(
                                             &payload,
                                         )
                                         .await;
+                                        append_event(
+                                            &canonical_stream,
+                                            &mut event_log,
+                                            &mut subscribers,
+                                            FrameKind::SessionSettings,
+                                            &SessionSettingsPayload {
+                                                values: current_session_settings.clone(),
+                                            },
+                                        )
+                                        .await;
                                         continue;
                                     }
                                     if let Err(err) = validate_runtime_session_settings_update(
@@ -3927,6 +3937,16 @@ pub(crate) fn spawn_agent_actor(
                                             &mut subscribers,
                                             FrameKind::AgentError,
                                             &payload,
+                                        )
+                                        .await;
+                                        append_event(
+                                            &canonical_stream,
+                                            &mut event_log,
+                                            &mut subscribers,
+                                            FrameKind::SessionSettings,
+                                            &SessionSettingsPayload {
+                                                values: current_session_settings.clone(),
+                                            },
                                         )
                                         .await;
                                         continue;
@@ -3951,6 +3971,16 @@ pub(crate) fn spawn_agent_actor(
                                             &mut subscribers,
                                             FrameKind::AgentError,
                                             &payload,
+                                        )
+                                        .await;
+                                        append_event(
+                                            &canonical_stream,
+                                            &mut event_log,
+                                            &mut subscribers,
+                                            FrameKind::SessionSettings,
+                                            &SessionSettingsPayload {
+                                                values: current_session_settings.clone(),
+                                            },
                                         )
                                         .await;
                                         continue;
