@@ -1393,6 +1393,10 @@ pub(crate) struct GenerateAgentActivitySummaryRequest {
     pub capacity_tx: HostCapacityTx,
 }
 
+/// Starts one Tyde naming-helper turn. A backend may satisfy that turn with
+/// one or more provider calls; Hermes, for example, continues internally after
+/// `finish_reason=length`. Tyde does not add a naming retry on top of that
+/// backend-owned 1..N call sequence.
 pub(crate) async fn generate_agent_name(
     request: GenerateAgentNameRequest,
 ) -> Result<String, String> {
@@ -11519,6 +11523,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_replays_positioned_tool_between_pre_and_post_text() {
+        let canonical_stream = "/agent/replay-positioned-tool";
+        let mut event_log = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+        let mut subscribers = Vec::new();
+
+        for event in [
+            ChatEvent::StreamStart(StreamStartData {
+                message_id: Some("message-1".to_owned()),
+                agent: "hermes".to_owned(),
+                model: Some("minimax/minimax-m3".to_owned()),
+            }),
+            ChatEvent::StreamDelta(StreamTextDeltaData {
+                message_id: Some("message-1".to_owned()),
+                text: "PRE".to_owned(),
+            }),
+            tool_request("tool-1"),
+            tool_completed("tool-1"),
+            ChatEvent::StreamDelta(StreamTextDeltaData {
+                message_id: Some("message-1".to_owned()),
+                text: "POST".to_owned(),
+            }),
+        ] {
+            append_chat_event(
+                canonical_stream,
+                &mut event_log,
+                &mut subscribers,
+                &mut replay_state,
+                &event,
+            )
+            .await;
+        }
+        let mut message = assistant_message_with_id("message-1", "PREPOST");
+        message.tool_calls = vec![ToolUseData {
+            id: "tool-1".to_owned(),
+            name: "tool".to_owned(),
+            arguments: Value::Null,
+            content_offset: Some(3),
+        }];
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamEnd(StreamEndData { message }),
+        )
+        .await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        attach_subscriber(
+            &event_log,
+            Some(&replay_state),
+            &mut subscribers,
+            replay_stream(tx),
+        );
+        let replay = recv_agent_bootstrap_events(&mut rx, "positioned tool bootstrap").await;
+        let message = replay
+            .iter()
+            .find_map(|event| match event {
+                AgentBootstrapEvent::ChatEvent(ChatEvent::StreamEnd(data)) => {
+                    Some(&data.message)
+                }
+                _ => None,
+            })
+            .expect("replayed positioned StreamEnd");
+        let offset = usize::try_from(
+            message.tool_calls[0]
+                .content_offset
+                .expect("replayed content offset"),
+        )
+        .expect("content offset fits usize");
+        let chars = message.content.chars().collect::<Vec<_>>();
+        assert_eq!(chars[..offset].iter().collect::<String>(), "PRE");
+        assert_eq!(chars[offset..].iter().collect::<String>(), "POST");
+        assert!(replay.iter().any(|event| matches!(
+            event,
+            AgentBootstrapEvent::ChatEvent(ChatEvent::ToolRequest(request))
+                if request.tool_call_id == "tool-1"
+        )));
+        assert!(replay.iter().any(|event| matches!(
+            event,
+            AgentBootstrapEvent::ChatEvent(ChatEvent::ToolExecutionCompleted(completion))
+                if completion.tool_call_id == "tool-1"
+        )));
+    }
+
+    #[tokio::test]
     async fn reconnect_persists_prior_tool_completion_outside_later_active_stream() {
         let canonical_stream = "/agent/replay-agent";
         let mut event_log = Vec::new();
@@ -13031,6 +13122,7 @@ mod tests {
                 "command": "echo hi",
                 "working_directory": "/tmp"
             }),
+            content_offset: None,
         }];
         append_chat_event(
             canonical_stream,

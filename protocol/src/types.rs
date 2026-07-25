@@ -6636,6 +6636,45 @@ pub struct ToolUseData {
     pub id: String,
     pub name: String,
     pub arguments: Value,
+    /// Unicode scalar-value offset into the owning message's `content` at
+    /// which the tool call was observed. Rust can reproduce it with
+    /// `content.chars()` and JavaScript with `Array.from(content)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_offset: Option<u32>,
+}
+
+#[cfg(test)]
+mod tool_use_data_serde_tests {
+    use super::*;
+
+    #[test]
+    fn content_offset_round_trips_and_legacy_payloads_default_to_none() {
+        let positioned = ToolUseData {
+            id: "tool-1".to_owned(),
+            name: "terminal".to_owned(),
+            arguments: serde_json::json!({ "command": "pwd" }),
+            content_offset: Some(4),
+        };
+        let encoded = serde_json::to_value(&positioned).expect("serialize positioned tool call");
+        assert_eq!(encoded["content_offset"], 4);
+        let decoded: ToolUseData =
+            serde_json::from_value(encoded).expect("deserialize positioned tool call");
+        assert_eq!(decoded.content_offset, Some(4));
+
+        let legacy: ToolUseData = serde_json::from_value(serde_json::json!({
+            "id": "tool-2",
+            "name": "terminal",
+            "arguments": null
+        }))
+        .expect("legacy tool call remains decodable");
+        assert_eq!(legacy.content_offset, None);
+        assert!(
+            serde_json::to_value(legacy)
+                .expect("serialize unpositioned tool call")
+                .get("content_offset")
+                .is_none()
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

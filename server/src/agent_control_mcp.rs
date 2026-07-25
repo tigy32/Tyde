@@ -2088,6 +2088,7 @@ mod tests {
                 id: "tool-1".to_owned(),
                 name: "private_tool".to_owned(),
                 arguments: json!({"private": true}),
+                content_offset: None,
             }],
             model_info: None,
             token_usage: None,

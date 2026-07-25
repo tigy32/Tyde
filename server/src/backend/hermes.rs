@@ -336,6 +336,13 @@ struct HermesNativeSubagent {
     tool_calls: u64,
 }
 
+#[derive(Clone)]
+struct HermesTurnTool {
+    name: String,
+    content_offset: Option<u32>,
+    observed_order: u64,
+}
+
 #[derive(Default)]
 struct HermesEventMapper {
     current_message_id: Option<String>,
@@ -345,7 +352,8 @@ struct HermesEventMapper {
     provider: Option<String>,
     pending_tools: HashMap<String, String>,
     pending_tool_arguments: HashMap<String, Value>,
-    turn_tools: HashMap<String, String>,
+    turn_tools: HashMap<String, HermesTurnTool>,
+    next_turn_tool_order: u64,
     cancelled_tools: HashSet<String>,
     background_tasks: HashMap<String, HermesBackgroundTask>,
     pending_approval_tool_id: Option<String>,
@@ -3143,8 +3151,17 @@ impl HermesEventMapper {
         self.pending_tools
             .insert(tool_call_id.clone(), tool_name.clone());
         self.cancelled_tools.remove(&tool_call_id);
-        self.turn_tools
-            .insert(tool_call_id.clone(), tool_name.clone());
+        let content_offset = u32::try_from(self.current_text.chars().count()).ok();
+        let observed_order = self.next_turn_tool_order;
+        self.next_turn_tool_order = self.next_turn_tool_order.saturating_add(1);
+        self.turn_tools.insert(
+            tool_call_id.clone(),
+            HermesTurnTool {
+                name: tool_name.clone(),
+                content_offset,
+                observed_order,
+            },
+        );
         let arguments = payload.get("args").cloned().unwrap_or(payload);
         self.pending_tool_arguments
             .insert(tool_call_id.clone(), arguments.clone());
@@ -3181,7 +3198,11 @@ impl HermesEventMapper {
             required_string_any(&payload, &["tool_id", "tool_call_id"], "tool.progress")?;
         let tool_name = optional_string_any(&payload, &["name", "tool_name"])
             .or_else(|| self.pending_tools.get(&tool_call_id).cloned())
-            .or_else(|| self.turn_tools.get(&tool_call_id).cloned())
+            .or_else(|| {
+                self.turn_tools
+                    .get(&tool_call_id)
+                    .map(|tool| tool.name.clone())
+            })
             .ok_or_else(|| {
                 format!("Hermes tool.progress missing name for unknown tool_id {tool_call_id}")
             })?;
@@ -3385,6 +3406,7 @@ impl HermesEventMapper {
         context_breakdown: Option<ContextBreakdown>,
     ) -> Vec<ChatEvent> {
         let content = reconcile_hermes_stream_text(&self.current_text, final_text.as_deref());
+        let tool_calls = self.tool_uses_for_message(&self.current_text, &content);
         let message_id = self.current_message_id.take().map(protocol::ChatMessageId);
         let reasoning = None;
         self.current_text.clear();
@@ -3421,7 +3443,7 @@ impl HermesEventMapper {
                 },
                 content,
                 reasoning,
-                tool_calls: self.tool_uses_for_message(),
+                tool_calls,
                 model_info: self.model.clone().map(|model| ModelInfo { model }),
                 token_usage,
                 context_breakdown,
@@ -3488,13 +3510,23 @@ impl HermesEventMapper {
         self.pending_tools.keys().cloned().collect()
     }
 
-    fn tool_uses_for_message(&self) -> Vec<ToolUseData> {
-        self.turn_tools
-            .iter()
-            .map(|(id, name)| ToolUseData {
+    fn tool_uses_for_message(&self, streamed_text: &str, content: &str) -> Vec<ToolUseData> {
+        let mut tools = self.turn_tools.iter().collect::<Vec<_>>();
+        tools.sort_by_key(|(_, tool)| {
+            (
+                tool.content_offset.unwrap_or(u32::MAX),
+                tool.observed_order,
+            )
+        });
+        tools
+            .into_iter()
+            .map(|(id, tool)| ToolUseData {
                 id: id.clone(),
-                name: name.clone(),
+                name: tool.name.clone(),
                 arguments: Value::Null,
+                content_offset: tool.content_offset.and_then(|offset| {
+                    reanchor_hermes_content_offset(streamed_text, content, offset)
+                }),
             })
             .collect()
     }
@@ -3513,6 +3545,7 @@ impl HermesEventMapper {
         }
         self.pending_tools.clear();
         self.turn_tools.clear();
+        self.next_turn_tool_order = 0;
         self.pending_approval_tool_id = None;
     }
 }
@@ -4350,6 +4383,7 @@ fn hermes_history_tool_calls(message: &Value) -> Result<Vec<ToolUseData>, String
                 id,
                 name,
                 arguments,
+                content_offset: None,
             })
         })
         .collect()
@@ -5257,6 +5291,46 @@ fn reconcile_hermes_stream_text(streamed: &str, final_text: Option<&str>) -> Str
         return final_text.to_string();
     }
     format!("{}\n\n{}", streamed.trim_end(), final_text.trim_start())
+}
+
+fn reanchor_hermes_content_offset(
+    streamed_text: &str,
+    content: &str,
+    observed_offset: u32,
+) -> Option<u32> {
+    let observed_offset = usize::try_from(observed_offset).ok()?;
+    let prefix_end = byte_index_after_chars(streamed_text, observed_offset)?;
+    let observed_prefix = &streamed_text[..prefix_end];
+    if content.starts_with(observed_prefix) {
+        return u32::try_from(observed_offset).ok();
+    }
+    if observed_prefix.is_empty() {
+        return Some(0);
+    }
+
+    let mut matches = content
+        .char_indices()
+        .filter_map(|(byte_index, _)| {
+            content[byte_index..]
+                .starts_with(observed_prefix)
+                .then_some(byte_index)
+        });
+    let byte_index = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    let anchor = content[..byte_index].chars().count();
+    u32::try_from(anchor.checked_add(observed_offset)?).ok()
+}
+
+fn byte_index_after_chars(text: &str, char_count: usize) -> Option<usize> {
+    if char_count == 0 {
+        return Some(0);
+    }
+    text.char_indices()
+        .nth(char_count)
+        .map(|(byte_index, _)| byte_index)
+        .or_else(|| (text.chars().count() == char_count).then_some(text.len()))
 }
 
 fn token_usage_from_value(value: &Value) -> Option<TokenUsage> {
@@ -8122,6 +8196,197 @@ for line in sys.stdin:
         assert!(
             content.ends_with("Final recommendation not present in the deltas."),
             "{content}"
+        );
+    }
+
+    #[test]
+    fn hermes_tool_offsets_preserve_pre_tool_post_interleaving() {
+        let mut mapper = HermesEventMapper::default();
+        let mut events = mapper.map_event("message.start", None);
+        events.extend(mapper.map_event(
+            "message.delta",
+            Some(json!({ "text": "Pré🙂 " })),
+        ));
+        events.extend(mapper.map_event(
+            "tool.start",
+            Some(json!({
+                "tool_id": "terminal-1",
+                "name": "terminal",
+                "args": { "command": "printf LIVE_TOOL_OK" }
+            })),
+        ));
+        events.extend(mapper.map_event(
+            "tool.complete",
+            Some(json!({
+                "tool_id": "terminal-1",
+                "name": "terminal",
+                "result": { "exit_code": 0, "stdout": "LIVE_TOOL_OK" }
+            })),
+        ));
+        events.extend(mapper.map_event(
+            "message.delta",
+            Some(json!({ "text": "POST" })),
+        ));
+        events.extend(mapper.map_event(
+            "message.complete",
+            Some(json!({ "text": "POST", "status": "complete" })),
+        ));
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ChatEvent::StreamStart(_)))
+                .count(),
+            1,
+            "one Hermes turn must remain one Tyde stream"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ChatEvent::StreamEnd(_)))
+                .count(),
+            1,
+            "tool boundaries must not synthesize intermediate StreamEnd events"
+        );
+        let tool_request_index = events
+            .iter()
+            .position(|event| matches!(event, ChatEvent::ToolRequest(_)))
+            .expect("tool request");
+        let post_delta_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ChatEvent::StreamDelta(StreamTextDeltaData { text, .. }) if text == "POST"
+                )
+            })
+            .expect("post-tool delta");
+        assert!(tool_request_index < post_delta_index);
+
+        let end = events
+            .iter()
+            .find_map(|event| match event {
+                ChatEvent::StreamEnd(data) => Some(data),
+                _ => None,
+            })
+            .expect("StreamEnd");
+        assert_eq!(end.message.content, "Pré🙂 POST");
+        assert_eq!(end.message.tool_calls.len(), 1);
+        assert_eq!(end.message.tool_calls[0].id, "terminal-1");
+        assert_eq!(
+            end.message.tool_calls[0].content_offset,
+            Some(5),
+            "offsets count Unicode scalar values, not UTF-8 bytes"
+        );
+        assert_ne!("Pré🙂 ".len(), 5);
+    }
+
+    #[test]
+    fn hermes_same_offset_tools_keep_observed_order() {
+        let mut mapper = HermesEventMapper::default();
+        let _ = mapper.map_event("message.start", None);
+        let _ = mapper.map_event("message.delta", Some(json!({ "text": "PRE" })));
+        for tool_id in ["tool-b", "tool-a"] {
+            let _ = mapper.map_event(
+                "tool.start",
+                Some(json!({ "tool_id": tool_id, "name": "terminal" })),
+            );
+            let _ = mapper.map_event(
+                "tool.complete",
+                Some(json!({
+                    "tool_id": tool_id,
+                    "name": "terminal",
+                    "result": { "exit_code": 0 }
+                })),
+            );
+        }
+
+        let events = mapper.map_event(
+            "message.complete",
+            Some(json!({ "text": "POST", "status": "complete" })),
+        );
+        let tools = events
+            .iter()
+            .find_map(|event| match event {
+                ChatEvent::StreamEnd(data) => Some(&data.message.tool_calls),
+                _ => None,
+            })
+            .expect("StreamEnd tools");
+        assert_eq!(
+            tools.iter().map(|tool| tool.id.as_str()).collect::<Vec<_>>(),
+            vec!["tool-b", "tool-a"]
+        );
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.content_offset)
+                .collect::<Vec<_>>(),
+            vec![Some(3), Some(3)]
+        );
+    }
+
+    #[test]
+    fn hermes_reconciliation_reanchors_or_invalidates_tool_offsets() {
+        let mut reanchored = HermesEventMapper::default();
+        let _ = reanchored.map_event("message.start", None);
+        let _ = reanchored.map_event("message.delta", Some(json!({ "text": "PRE" })));
+        let _ = reanchored.map_event(
+            "tool.start",
+            Some(json!({ "tool_id": "tool-1", "name": "terminal" })),
+        );
+        let _ = reanchored.map_event(
+            "tool.complete",
+            Some(json!({
+                "tool_id": "tool-1",
+                "name": "terminal",
+                "result": { "exit_code": 0 }
+            })),
+        );
+        let events = reanchored.map_event(
+            "message.complete",
+            Some(json!({ "text": "  PRE extended", "status": "complete" })),
+        );
+        let message = events
+            .iter()
+            .find_map(|event| match event {
+                ChatEvent::StreamEnd(data) => Some(&data.message),
+                _ => None,
+            })
+            .expect("reanchored StreamEnd");
+        assert_eq!(message.content, "  PRE extended");
+        assert_eq!(message.tool_calls[0].content_offset, Some(5));
+
+        let mut invalidated = HermesEventMapper::default();
+        let _ = invalidated.map_event("message.start", None);
+        let _ =
+            invalidated.map_event("message.delta", Some(json!({ "text": "PRE   " })));
+        let _ = invalidated.map_event(
+            "tool.start",
+            Some(json!({ "tool_id": "tool-2", "name": "terminal" })),
+        );
+        let _ = invalidated.map_event(
+            "tool.complete",
+            Some(json!({
+                "tool_id": "tool-2",
+                "name": "terminal",
+                "result": { "exit_code": 0 }
+            })),
+        );
+        let events = invalidated.map_event(
+            "message.complete",
+            Some(json!({ "text": "unequal final text", "status": "complete" })),
+        );
+        let message = events
+            .iter()
+            .find_map(|event| match event {
+                ChatEvent::StreamEnd(data) => Some(&data.message),
+                _ => None,
+            })
+            .expect("invalidated StreamEnd");
+        assert_eq!(message.content, "PRE\n\nunequal final text");
+        assert_eq!(
+            message.tool_calls[0].content_offset, None,
+            "removed streamed prefix text must invalidate the observed position"
         );
     }
 
