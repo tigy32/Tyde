@@ -8031,6 +8031,7 @@ mod tests {
         spawn_agent_actor, spawn_relay_agent_actor, terminal_input_rejected_payload,
         upsert_activity_stats_snapshot,
     };
+    use crate::agent::backend_turn_visibly_busy;
     use crate::agent::customization::ResolvedSpawnConfig;
     use crate::agent::registry::AgentStatusHandle;
     use crate::backend::{BackendExecutionMode, BackendSpawnConfig, EventStream};

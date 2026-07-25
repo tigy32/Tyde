@@ -18941,6 +18941,7 @@ mod tests {
         ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewStatus, TeamMemberCreateSpec,
         ToolPolicy,
     };
+    use tokio::time::timeout;
 
     static STARTUP_FAILURE_FANOUT_RACE_TEST_LOCK: tokio::sync::Mutex<()> =
         tokio::sync::Mutex::const_new(());
