@@ -6959,7 +6959,7 @@ for line in sys.stdin:
             &dir,
             &format!(
                 r#"
-import json, sys, time
+import json, sys
 print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"gateway.ready","payload":{{}}}}}}), flush=True)
 for line in sys.stdin:
     req = json.loads(line)
@@ -6974,7 +6974,7 @@ for line in sys.stdin:
     if method == "prompt.submit":
         print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"message.start","session_id":"live"}}}}), flush=True)
         print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"message.complete","session_id":"live","payload":{{"text":"done","status":"complete","usage":{{"input":1,"output":1,"total":2}}}}}}}}), flush=True)
-time.sleep(0.05)
+# Reaching here proves stdin EOF without racing the test-only force-kill grace.
 print("final shutdown diagnostic", file=sys.stderr, flush=True)
 with open({exited:?}, "w") as output:
     output.write("exited")

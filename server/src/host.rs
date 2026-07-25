@@ -24552,8 +24552,14 @@ Rules: Record only what remains true and useful for future work; drop transient 
     #[tokio::test]
     async fn non_retryable_supervisor_backend_failure_stops_without_warning() {
         let fixture = compact_fixture().await;
-        let (agent_id, session_id) =
-            spawn_idle_user_agent(&fixture.host, "non-retryable supervisor failure").await;
+        let (agent_id, session_id) = spawn_idle_user_agent(
+            &fixture.host,
+            &format!(
+                "non-retryable supervisor failure {}",
+                crate::backend::mock::MOCK_USER_BUBBLES_SENTINEL,
+            ),
+        )
+        .await;
         fixture
             .host
             .set_setting(SetSettingPayload {
