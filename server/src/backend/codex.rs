@@ -2941,6 +2941,9 @@ impl CodexInner {
             if !retired {
                 let same_owner =
                     notification_thread_id.is_none_or(|thread_id| thread_id == stream_key);
+                // Child turn boundaries clear current_message_id, so any live
+                // child item is owned by active_turn_id without a second item
+                // turn field to compare as the root path does.
                 let same_turn = stream.active_turn_id.as_ref().is_some_and(|turn_id| {
                     notification_turn_id.is_none_or(|incoming| incoming == turn_id)
                 });
@@ -3115,6 +3118,7 @@ impl CodexInner {
             state.pending_request = None;
             state.file_change_call_ids.clear();
             state.pending_user_input_bytes = 0;
+            state.pending_message_metadata = None;
             (
                 state.thread_id.clone(),
                 turn_id,
@@ -3175,6 +3179,35 @@ impl CodexInner {
                 }),
             );
         }
+    }
+
+    async fn reject_impossible_delta_supersession(
+        &self,
+        previous: ActiveStreamState,
+        method: &str,
+        provider_item_id: Option<&str>,
+    ) {
+        let previous_item_id = previous.message_id.clone();
+        let displaced_item_id = {
+            let mut state = self.state.lock().await;
+            let displaced = state.active_stream.replace(previous);
+            state.provider_supersessions_this_turn =
+                state.provider_supersessions_this_turn.saturating_sub(1);
+            displaced.map(|stream| stream.message_id)
+        };
+        tracing::error!(
+            codex_method = method,
+            ?provider_item_id,
+            previous_item_id = previous_item_id.0.as_str(),
+            ?displaced_item_id,
+            "Restored accepted Codex stream after impossible delta supersession"
+        );
+        self.reject_agent_message_identity(
+            StreamIdentityViolation::ForeignActiveMessageId,
+            method,
+            provider_item_id,
+        )
+        .await;
     }
 
     async fn append_reasoning_to_active_stream(&self, reasoning: &str) {
@@ -4113,11 +4146,18 @@ impl CodexInner {
                         .await;
                         return;
                     }
-                    CodexAgentMessageOpen::Retired
-                    | CodexAgentMessageOpen::Foreign
-                    | CodexAgentMessageOpen::Superseded(_) => {
+                    CodexAgentMessageOpen::Retired | CodexAgentMessageOpen::Foreign => {
                         self.reject_agent_message_identity(
                             StreamIdentityViolation::ForeignActiveMessageId,
+                            method,
+                            Some(&message_id.0),
+                        )
+                        .await;
+                        return;
+                    }
+                    CodexAgentMessageOpen::Superseded(previous) => {
+                        self.reject_impossible_delta_supersession(
+                            *previous,
                             method,
                             Some(&message_id.0),
                         )
@@ -4186,13 +4226,22 @@ impl CodexInner {
                         .await;
                         return;
                     }
-                    CodexAgentMessageOpen::Retired
-                    | CodexAgentMessageOpen::Foreign
-                    | CodexAgentMessageOpen::Superseded(_) => {
+                    CodexAgentMessageOpen::Retired | CodexAgentMessageOpen::Foreign => {
                         self.reject_agent_message_identity(
                             StreamIdentityViolation::ForeignActiveMessageId,
                             method,
                             provider_item_id.as_ref().map(|item_id| item_id.0.as_str()),
+                        )
+                        .await;
+                        return;
+                    }
+                    CodexAgentMessageOpen::Superseded(previous) => {
+                        self.reject_impossible_delta_supersession(
+                            *previous,
+                            method,
+                            provider_item_id
+                                .as_ref()
+                                .map(|item_id| item_id.0.as_str()),
                         )
                         .await;
                         return;
@@ -6630,9 +6679,18 @@ impl CodexInner {
                 .await;
                 return;
             }
-            CodexAgentMessageOpen::Foreign | CodexAgentMessageOpen::Superseded(_) => {
+            CodexAgentMessageOpen::Foreign => {
                 self.reject_agent_message_identity(
                     StreamIdentityViolation::ForeignActiveMessageId,
+                    "codex/event/reasoning",
+                    None,
+                )
+                .await;
+                return;
+            }
+            CodexAgentMessageOpen::Superseded(previous) => {
+                self.reject_impossible_delta_supersession(
+                    *previous,
                     "codex/event/reasoning",
                     None,
                 )
@@ -12851,7 +12909,11 @@ for line in sys.stdin:
                     marker.write("sent")
     elif method == "turn/start":
         turn_count += 1
-        if MODE == "inference_reject_command" and inference_only:
+        if MODE == "strict_termination_interrupt_held":
+            send({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"fresh-thread-id","turn":{"id":"turn-strict-termination"}}})
+            send({"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"fresh-thread-id","itemId":"strict-open-item","delta":"accepted before violation"}})
+            send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"fresh-thread-id","item":{"id":"strict-wrong-item","type":"agentMessage","text":"wrong identity"}}})
+        elif MODE == "inference_reject_command" and inference_only:
             send({
                 "jsonrpc": "2.0",
                 "id": 900,
@@ -13071,7 +13133,16 @@ for line in sys.stdin:
             "result": {"turn": {"id": "turn-fake"}}
         })
     elif method == "turn/interrupt":
-        if MODE == "fresh_native_child_before_initial_response":
+        if MODE == "strict_termination_interrupt_held":
+            send({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"fresh-thread-id","item":{"id":"strict-wrong-item","type":"agentMessage","text":"repeat wrong identity"}}})
+            def delayed_interrupt_failure(response_id):
+                while not os.path.exists(INITIAL_TURN_GATE):
+                    time.sleep(0.005)
+                send({"jsonrpc":"2.0","id":response_id,"error":{"code":-32000,"message":"held interrupt rejected"}})
+                send({"jsonrpc":"2.0","id":991,"method":"mcpServer/elicitation/request","params":{}})
+            threading.Thread(target=delayed_interrupt_failure, args=(request_id,), daemon=True).start()
+            continue
+        elif MODE == "fresh_native_child_before_initial_response":
             send({"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"fresh-thread-id","turn":{"id":"turn-parent-live-order","status":"interrupted"}}})
         send({"jsonrpc": "2.0", "id": request_id, "result": {}})
     elif method == "thread/settings/update":
@@ -13093,6 +13164,8 @@ for line in sys.stdin:
             })
         else:
             send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method is None and request_id == 991 and MODE == "strict_termination_interrupt_held":
+        continue
     elif method is None and request_id == 900 and MODE == "inference_reject_command":
         if (request.get("result") or {}).get("decision") != "decline":
             with open(COMMAND_EXECUTION_MARKER, "w", encoding="utf-8") as marker:
@@ -13728,6 +13801,141 @@ for line in sys.stdin:
         })
         .await
         .expect("fake Codex typed error timeout")
+    }
+
+    #[tokio::test]
+    async fn strict_termination_interrupts_once_without_waiting() {
+        let fake = CodexFakeAppServer::new("strict_termination_interrupt_held", "unused");
+        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (backend, mut events) = <CodexBackend as Backend>::spawn(
+            vec![workspace.path().to_string_lossy().to_string()],
+            BackendSpawnConfig::default(),
+            protocol::SendMessagePayload {
+                message: "trigger strict termination".to_owned(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+        )
+        .await
+        .expect("spawn fake Codex backend");
+
+        let terminal = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut terminal = Vec::new();
+            while let Some(event) = events.recv().await {
+                let idle = matches!(event, ChatEvent::TypingStatusChanged(false));
+                terminal.push(event);
+                if idle {
+                    return terminal;
+                }
+            }
+            panic!("strict termination ended before its idle tail");
+        })
+        .await
+        .expect("strict termination tail must not await turn/interrupt");
+
+        let stream_end = terminal
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ChatEvent::StreamEnd(data)
+                        if data.message.message_id.as_ref().is_some_and(
+                            |message_id| message_id.0 == "strict-open-item"
+                        )
+                            && data.message.content == "accepted before violation"
+                )
+            })
+            .expect("accepted provider content must finalize before termination");
+        let error = terminal
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ChatEvent::MessageAdded(message)
+                        if matches!(&message.sender, MessageSender::Error)
+                            && message.content
+                                == "Stream identity violation: foreign active message id"
+                )
+            })
+            .expect("strict termination must emit its identity error");
+        let cancelled = terminal
+            .iter()
+            .position(|event| matches!(event, ChatEvent::OperationCancelled(_)))
+            .expect("strict termination must emit cancellation");
+        let idle = terminal
+            .iter()
+            .position(|event| matches!(event, ChatEvent::TypingStatusChanged(false)))
+            .expect("strict termination must emit idle");
+        assert!(stream_end < error && error < cancelled && cancelled < idle);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if fake.requests().iter().any(|request| {
+                    request.get("method").and_then(Value::as_str) == Some("turn/interrupt")
+                }) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("strict termination must spawn turn/interrupt");
+        let interrupts = fake
+            .requests()
+            .into_iter()
+            .filter(|request| {
+                request.get("method").and_then(Value::as_str) == Some("turn/interrupt")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(interrupts.len(), 1);
+        assert_eq!(
+            interrupts[0]
+                .pointer("/params/threadId")
+                .and_then(Value::as_str),
+            Some("fresh-thread-id")
+        );
+        assert_eq!(
+            interrupts[0]
+                .pointer("/params/turnId")
+                .and_then(Value::as_str),
+            Some("turn-strict-termination")
+        );
+        assert!(
+            fake.requests().iter().all(|request| {
+                request.get("id").and_then(Value::as_u64) != Some(991)
+                    || request.get("result").is_none()
+            }),
+            "the terminal tail must arrive while the fake still holds the interrupt response"
+        );
+
+        fake.release_initial_turn();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if fake.requests().iter().any(|request| {
+                    request.get("id").and_then(Value::as_u64) == Some(991)
+                        && request.get("result").is_some()
+                }) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fake interrupt failure and repeated violation must be observed");
+        assert_eq!(
+            fake.requests()
+                .iter()
+                .filter(|request| {
+                    request.get("method").and_then(Value::as_str) == Some("turn/interrupt")
+                })
+                .count(),
+            1,
+            "a repeated violation and a definitive interrupt failure must not retry"
+        );
+
+        backend.shutdown().await;
     }
 
     #[tokio::test]
@@ -19686,6 +19894,10 @@ Do not describe the tool, and do not skip the tool call."#;
                 )
                 .await;
             let terminal = drain_events(&mut rx);
+            // The provider never completed open-item, but its "partial" delta
+            // was already accepted and published. Ending that exact identity
+            // and content preserves the anti-fabrication contract without
+            // discarding accepted output during strict termination.
             assert_eq!(
                 event_kinds(&terminal),
                 vec![
@@ -20901,7 +21113,10 @@ Do not describe the tool, and do not skip the tool call."#;
                 assert!(state.active_stream.is_none());
                 assert!(state
                     .completed_agent_messages
-                    .contains_key(&ChatMessageId(first_id)));
+                    .contains_key(&ChatMessageId(first_id.clone())));
+                assert!(!state
+                    .retired_unpublished_message_ids
+                    .contains(&ChatMessageId(first_id)));
                 assert!(state
                     .provider_item_tombstones
                     .iter()
@@ -21055,6 +21270,25 @@ Do not describe the tool, and do not skip the tool call."#;
                         .and_then(Value::as_str)
                         == Some("turn survived")
             }));
+            let metadata_updates = events
+                .iter()
+                .filter(|event| {
+                    event.get("kind").and_then(Value::as_str)
+                        == Some("MessageMetadataUpdated")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                metadata_updates.len(),
+                1,
+                "the surviving final segment must own the turn metadata: {events:?}"
+            );
+            assert_eq!(
+                metadata_updates[0]
+                    .pointer("/data/message_id")
+                    .and_then(Value::as_str),
+                Some("final-answer"),
+                "superseded reasoning must not retain the metadata target"
+            );
             assert_eq!(
                 events
                     .iter()
@@ -23019,6 +23253,10 @@ Do not describe the tool, and do not skip the tool call."#;
                 )
                 .await;
             let terminal = drain_events(&mut child_rx);
+            // The child provider never completed child-open, but its "partial"
+            // delta was already accepted and published. Ending that exact
+            // identity and content preserves the anti-fabrication contract
+            // without discarding accepted output during strict termination.
             assert_eq!(
                 event_kinds(&terminal),
                 vec![
@@ -23135,6 +23373,10 @@ Do not describe the tool, and do not skip the tool call."#;
                     .and_then(Value::as_str),
                 Some("first")
             );
+            assert!(
+                inner.state.lock().await.pending_message_metadata.is_some(),
+                "the first completion must establish the stale-target regression fixture"
+            );
 
             let conflicting = json!({
                 "threadId": "thread-test",
@@ -23152,6 +23394,10 @@ Do not describe the tool, and do not skip the tool call."#;
                 terminal.iter().all(|event| {
                     event.get("kind").and_then(Value::as_str) != Some("StreamEnd")
                 })
+            );
+            assert!(
+                inner.state.lock().await.pending_message_metadata.is_none(),
+                "strict termination must clear metadata even without an active stream"
             );
 
             inner
@@ -23196,6 +23442,10 @@ Do not describe the tool, and do not skip the tool call."#;
                 )
                 .await;
             let terminal = drain_events(&mut rx);
+            // turn/completed did not complete open-item, but the "partial"
+            // delta was already accepted and published. Ending that exact
+            // identity and content preserves the anti-fabrication contract
+            // without inventing provider-supplied completion bytes.
             assert_eq!(
                 event_kinds(&terminal),
                 vec![
