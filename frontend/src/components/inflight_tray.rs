@@ -676,7 +676,7 @@ fn background_status_label(status: BackgroundTaskStatus) -> &'static str {
 }
 
 /// One backgrounded shell command, shown only while it runs (the tray is
-/// active-only); the row carries the command's description.
+/// active-only); the row carries the actual command.
 #[component]
 fn CommandRow(
     parent_ref: Signal<Option<ActiveAgentRef>>,
@@ -701,14 +701,7 @@ fn CommandRow(
     let title = move || {
         task.get().map(|task| {
             let fallback = || format!("Background command {}", task.task_id);
-            if task.status == BackgroundTaskStatus::Running {
-                task.description.clone().unwrap_or_else(fallback)
-            } else {
-                task.summary
-                    .clone()
-                    .or_else(|| task.description.clone())
-                    .unwrap_or_else(fallback)
-            }
+            task.description.clone().unwrap_or_else(fallback)
         })
     };
 
@@ -1358,7 +1351,7 @@ mod wasm_tests {
             tool_name: "Bash".to_owned(),
             update: ToolProgressUpdate::BackgroundTask(BackgroundTaskState {
                 task_id: "task-bg".to_owned(),
-                description: Some("Run repository validation".to_owned()),
+                description: Some("./dev.sh check --locked".to_owned()),
                 status,
                 summary: summary.map(str::to_owned),
                 output_unavailable: None,
@@ -1388,8 +1381,8 @@ mod wasm_tests {
         expand(&container).await;
         let body = text(&container);
         assert!(
-            body.contains("Run repository validation") && body.contains("Running"),
-            "the command row shows its description and live status: {body}"
+            body.contains("./dev.sh check --locked") && body.contains("Running"),
+            "the command row shows the actual command and live status: {body}"
         );
     }
 

@@ -4565,6 +4565,13 @@ fn refresh_background_task_owner(
             .as_deref()
             .and_then(|owner| owner.tool_request_name(&entry.tool_use_id));
     }
+    if let Some(command) = entry
+        .owner
+        .as_deref()
+        .and_then(|owner| owner.tool_request_command(&entry.tool_use_id))
+    {
+        entry.state.description = Some(command);
+    }
 }
 
 fn refresh_unresolved_background_tasks(
@@ -4788,6 +4795,9 @@ fn handle_background_bash_task_frame_with_owners(
             let tool_name = owner
                 .as_deref()
                 .and_then(|owner| owner.tool_request_name(&tool_use_id));
+            let command = owner
+                .as_deref()
+                .and_then(|owner| owner.tool_request_command(&tool_use_id));
             let entry = BackgroundTaskEntry {
                 tool_use_id,
                 tool_name,
@@ -4795,7 +4805,7 @@ fn handle_background_bash_task_frame_with_owners(
                 parent_tool_use_id,
                 state: BackgroundTaskState {
                     task_id: task_id.clone(),
-                    description: system.description.as_deref().and_then(normalize_nonempty),
+                    description: command,
                     status: BackgroundTaskStatus::Running,
                     summary: None,
                     output_unavailable: None,
@@ -16681,7 +16691,7 @@ for raw_line in sys.stdin:
         assert_eq!(snapshots[0].status, BackgroundTaskStatus::Running);
         assert_eq!(
             snapshots[0].description.as_deref(),
-            Some("Sleep 10 seconds then echo marker")
+            Some("test background command")
         );
         assert_eq!(snapshots[1].status, BackgroundTaskStatus::Completed);
         let last = snapshots.last().unwrap();
@@ -16734,11 +16744,26 @@ for raw_line in sys.stdin:
                 }],
             },
         });
+        inner.emitter.tool_request(
+            "toolu_monitor",
+            "Monitor",
+            claude_tool_request_type(
+                "Monitor",
+                assistant.pointer("/message/content/0/input").unwrap(),
+            ),
+        );
         refresh_unresolved_background_tasks(
             &assistant,
             &mut tasks,
             &inner.emitter,
             &HashMap::new(),
+        );
+        assert_eq!(
+            tasks
+                .get("monitor-task")
+                .and_then(|entry| entry.state.description.as_deref()),
+            Some("until test -f /tmp/done; do sleep 1; done"),
+            "the task title comes from the normalized request, not model prose"
         );
         assert!(handle_background_bash_task_frame_with_owners(
             &json!({
@@ -16822,6 +16847,10 @@ for raw_line in sys.stdin:
         let task = tasks.get("monitor-task").expect("registered task");
         assert!(task.owner.is_some());
         assert_eq!(task.tool_name.as_deref(), Some("Monitor"));
+        assert_eq!(
+            task.state.description.as_deref(),
+            Some("until test -f /tmp/done; do sleep 1; done")
+        );
 
         assert!(handle_background_bash_task_frame_with_owners(
             &json!({

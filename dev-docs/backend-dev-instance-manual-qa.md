@@ -345,10 +345,12 @@ and after replay.
    occurs.
 5. **Background command:** start a bounded background process, continue the
    turn, then check or wait for it. Confirm the original card and in-flight row
-   remain running until the process ends and transition once without acquiring
-   a new identity. If the agent turn itself has authoritatively ended, the
-   agent may be idle while the separate background row remains running; the two
-   surfaces must clearly communicate that distinction.
+   show the exact command that was executed, not a model-written description or
+   completion summary. They must remain running until the process ends and
+   transition once without acquiring a new identity. If the agent turn itself
+   has authoritatively ended, the agent may be idle while the separate
+   background row remains running; the two surfaces must clearly communicate
+   that distinction.
    The launch acknowledgement must not be rendered as process `Done` or
    `exit 0`. After the in-flight row disappears, the original card must retain
    the real final stdout, stderr, exit status, and terminal state through

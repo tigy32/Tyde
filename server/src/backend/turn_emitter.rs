@@ -384,6 +384,27 @@ impl TurnEmitter {
             .map(|request| request.name.clone())
     }
 
+    pub(crate) fn tool_request_command(&self, tool_call_id: &str) -> Option<String> {
+        let state = self.lock();
+        let request = state
+            .emitted_tool_requests
+            .get(tool_call_id)
+            .or_else(|| state.detached_tool_requests.get(tool_call_id))?;
+        let command = match request.arguments.get("kind").and_then(Value::as_str) {
+            Some("RunCommand") => request.arguments.get("command"),
+            Some("Other") => request
+                .arguments
+                .pointer("/args/arguments/command")
+                .or_else(|| request.arguments.pointer("/args/command")),
+            _ => None,
+        };
+        command
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+            .map(str::to_owned)
+    }
+
     pub fn tool_completed_with_normalization_failure(
         &self,
         data: ToolCompletedPayload<'_>,
@@ -2839,6 +2860,26 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true)
         );
+    }
+
+    #[test]
+    fn run_command_identity_survives_detachment() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new_for_agent(tx, AgentName("claude"));
+        emitter.tool_request("tool-background", "Bash", run_command_request());
+
+        assert_eq!(
+            emitter.tool_request_command("tool-background").as_deref(),
+            Some("echo ok")
+        );
+        assert!(emitter.detach_tool("tool-background"));
+        assert_eq!(
+            emitter.tool_request_command("tool-background").as_deref(),
+            Some("echo ok")
+        );
+
+        emitter.tool_request("tool-read", "Read", read_files_request());
+        assert_eq!(emitter.tool_request_command("tool-read"), None);
     }
 
     #[test]

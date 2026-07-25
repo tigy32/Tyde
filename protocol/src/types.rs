@@ -6992,14 +6992,13 @@ pub enum ToolProgressUpdate {
 /// Live status of a backgrounded shell command, reduced server-side from
 /// backend-native process/task lifecycle frames.
 /// Keyed to the launching tool call by `tool_call_id`, like a workflow.
-/// Backends may include a display description; consumers can otherwise join
-/// with the originating tool request by `tool_call_id`.
+/// Backends may include the backend-verified command; consumers can otherwise
+/// join with the originating tool request by `tool_call_id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackgroundTaskState {
     /// The CLI's task id (distinct from the tool_use id).
     pub task_id: String,
-    /// Human description from the `task_started` frame — the model's
-    /// `description` argument to the Bash tool.
+    /// Actual command from the originating normalized tool request.
     #[serde(default)]
     pub description: Option<String>,
     pub status: BackgroundTaskStatus,

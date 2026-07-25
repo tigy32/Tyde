@@ -475,11 +475,7 @@ pub fn ToolCardView(
                     .get()
                     .map(|progress| agent_control_header_detail(&progress))
             })
-            .or_else(|| {
-                background_task
-                    .get()
-                    .and_then(|task| task.summary.or(task.description))
-            })
+            .or_else(|| background_task.get().and_then(|task| task.description))
             .or_else(|| recipient_detail.get())
             .or_else(|| header_detail.clone())
     };
@@ -1589,8 +1585,8 @@ mod live_card_wasm_tests {
     use protocol::{
         AgentActivitySummary, AgentActivitySummaryState, AgentControlAgentRef,
         AgentControlProgress, AgentControlProgressKind, AgentId, AgentOrigin, BackendKind,
-        StreamPath, ToolExecutionCompletedData, ToolProgressData, ToolRequest, WorkflowAgentState,
-        WorkflowAgentStatus,
+        BackgroundTaskState, BackgroundTaskStatus, StreamPath, ToolExecutionCompletedData,
+        ToolProgressData, ToolRequest, WorkflowAgentState, WorkflowAgentStatus,
     };
     use serde_json::json;
     use wasm_bindgen_test::*;
@@ -1654,6 +1650,44 @@ mod live_card_wasm_tests {
                 normalization_failure: None,
             }),
         }
+    }
+
+    #[wasm_bindgen_test]
+    async fn background_command_header_uses_actual_command_not_summary() {
+        let tool_call_id = "tool-background";
+        let entry = ToolRequestEntry {
+            request: ToolRequest {
+                tool_call_id: tool_call_id.to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_type: ToolRequestType::RunCommand {
+                    command: "sleep 60".to_owned(),
+                    working_directory: "/tmp".to_owned(),
+                },
+            },
+            result: None,
+        };
+        let progress = ToolProgressData {
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: "Bash".to_owned(),
+            update: ToolProgressUpdate::BackgroundTask(BackgroundTaskState {
+                task_id: "task-background".to_owned(),
+                description: Some("sleep 60".to_owned()),
+                status: BackgroundTaskStatus::Completed,
+                summary: Some("Slept for 60 seconds in background".to_owned()),
+                output_unavailable: None,
+            }),
+        };
+
+        let (container, _state) = mount_card(entry, Some(progress));
+        next_tick().await;
+
+        let header = container
+            .query_selector(".tool-card-detail")
+            .expect("query header detail")
+            .expect("background command detail")
+            .text_content()
+            .unwrap_or_default();
+        assert_eq!(header, "sleep 60");
     }
 
     fn workflow_progress(status: WorkflowRunStatus) -> ToolProgressData {
