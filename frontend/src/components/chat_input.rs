@@ -464,7 +464,13 @@ fn interrupt_target_turn(state: &AppState, agent_ref: Signal<Option<ActiveAgentR
             // claimed would strand the card in Cancelling with both Cancel
             // controls disabled for the rest of the turn, with no interrupt
             // ever having reached the backend.
-            pending.update(|pending| {
+            //
+            // `try_update`, not `update`: this runs after an await, so the
+            // owner that created the signal may already be disposed — closing
+            // the chat tab while an interrupt is in flight is enough. A plain
+            // `update` panics on a disposed signal, which would turn a routine
+            // teardown into a crash. There is nothing to release in that case.
+            let _ = pending.try_update(|pending| {
                 pending.remove(&agent_id);
             });
         }
@@ -1347,6 +1353,7 @@ mod wasm_tests {
     use crate::state::{ActiveAgentRef, AgentInfo, AppState, ConnectionStatus, TabContent};
     use leptos::mount::mount_to;
     use protocol::{AgentId, AgentOrigin, BackendKind, SessionId, StreamPath};
+    use serde_json::Value as JsonValue;
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
     use web_sys::HtmlElement;
@@ -1476,6 +1483,13 @@ mod wasm_tests {
 
     /// A stub whose `send_host_line` always rejects, for the transport-failure
     /// path.
+    ///
+    /// `window.__TAURI__` is a genuine global shared by every test on the wasm
+    /// test thread, so a rejecting stub left installed would leak into whatever
+    /// runs next — and a send that fails where the test expected it to succeed
+    /// produces exactly the async error paths `stub_send_host_line` documents
+    /// as racy. Callers must restore a resolving stub with
+    /// [`stub_send_host_line`] before returning.
     fn stub_send_failing() {
         js_sys::eval(
             r#"
@@ -1491,11 +1505,26 @@ mod wasm_tests {
         .expect("install failing stub");
     }
 
+    /// Count recorded `send_host_line` calls carrying an Interrupt frame.
+    ///
+    /// The envelope is nested as a JSON *string* inside the invoke args, so a
+    /// substring search over the stringified args never matches: the inner
+    /// quotes are escaped (`\\"interrupt\\"`), and looking for `"interrupt"`
+    /// silently finds nothing and reports zero frames for a frame that was in
+    /// fact sent. Parse both layers, exactly as the agents_panel harness does.
     fn interrupt_frames(calls: &js_sys::Array) -> usize {
         calls
             .iter()
             .filter_map(|entry| entry.as_string())
-            .filter(|args| args.contains("\"interrupt\""))
+            .filter_map(|args| serde_json::from_str::<JsonValue>(&args).ok())
+            .filter_map(|args| {
+                args.get("line")
+                    .and_then(|line| line.as_str())
+                    .and_then(|line| serde_json::from_str::<JsonValue>(line).ok())
+            })
+            .filter(|envelope| {
+                envelope.get("kind").and_then(|kind| kind.as_str()) == Some("interrupt")
+            })
             .count()
     }
 
@@ -1588,6 +1617,11 @@ mod wasm_tests {
             "Cancel",
             "and must stop claiming an interrupt is in flight"
         );
+
+        // Hand the shared global back in a benign state. Leaving the rejecting
+        // stub installed makes every later test's sends fail, which is how a
+        // local failure fixture turns into unrelated cross-test breakage.
+        stub_send_host_line();
     }
 
     fn query(container: &HtmlElement, sel: &str) -> Option<web_sys::Element> {
