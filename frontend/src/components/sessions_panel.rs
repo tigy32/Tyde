@@ -342,12 +342,9 @@ fn load_more_buttons(state: AppState, hosts: Memo<Vec<String>>) -> impl IntoView
                         .iter()
                         .find(|((page_host, _), _)| page_host == host_id)
                         .and_then(|((_, _), page)| match page.status {
-                            SessionListPageStatus::More { next_cursor } => Some((
-                                host_id.clone(),
-                                page.scope,
-                                next_cursor,
-                                page.limit,
-                            )),
+                            SessionListPageStatus::More { next_cursor } => {
+                                Some((host_id.clone(), page.scope, next_cursor, page.limit))
+                            }
                             SessionListPageStatus::Complete => None,
                         })
                 })

@@ -3266,10 +3266,7 @@ impl AppState {
                     launch_profile: draft_launch_profile,
                 })
                 .filter(|draft| !draft.is_empty());
-            persist_workspace_selection(&PersistedWorkspaceSelection {
-                active_chat,
-                draft,
-            });
+            persist_workspace_selection(&PersistedWorkspaceSelection { active_chat, draft });
         });
 
         // Drop a live draft selection when the chat context moves to another

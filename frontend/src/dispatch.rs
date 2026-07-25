@@ -25,12 +25,12 @@ use protocol::{
     QueuedMessagesPayload, RejectCode, RejectPayload, ReviewBootstrapPayload, ReviewCommentSource,
     ReviewErrorContext, ReviewEventPayload, ReviewId, ReviewSuggestionState, SessionHistoryPayload,
     SessionId, SessionListPayload, SessionSchemasPayload, SessionSettingsPayload,
-    SessionSummaryCountUpdatedPayload,
-    SkillNotifyPayload, SteeringNotifyPayload, StreamPath, TaskTokenUsagePayload,
-    TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberId, TeamMemberNotifyPayload,
-    TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
-    TerminalBootstrapPayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
-    TerminalStartPayload, WelcomePayload, WorkflowNotifyPayload, WorkflowRunNotifyPayload,
+    SessionSummaryCountUpdatedPayload, SkillNotifyPayload, SteeringNotifyPayload, StreamPath,
+    TaskTokenUsagePayload, TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberId,
+    TeamMemberNotifyPayload, TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload,
+    TeamPresetCatalogNotifyPayload, TerminalBootstrapPayload, TerminalErrorPayload,
+    TerminalExitPayload, TerminalOutputPayload, TerminalStartPayload, WelcomePayload,
+    WorkflowNotifyPayload, WorkflowRunNotifyPayload,
 };
 
 use crate::line_source::FileLines;
@@ -1350,8 +1350,9 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         // question, answered by the refresh below; it is not a
                         // reason to leave a row the client can see is newer
                         // sitting beneath an older one.
-                        sessions
-                            .sort_by_key(|session| std::cmp::Reverse(session.summary.updated_at_ms));
+                        sessions.sort_by_key(|session| {
+                            std::cmp::Reverse(session.summary.updated_at_ms)
+                        });
                         true
                     });
 
@@ -5568,13 +5569,8 @@ fn request_first_session_page(state: &AppState, host_id: &str) {
         // let a burst of updates open overlapping refresh generations. It is
         // released here only when the request could not be sent at all, so a
         // transport failure cannot wedge every later refresh.
-        if let Err(error) = crate::send::send_frame(
-            &host_id,
-            host_stream,
-            FrameKind::ListSessions,
-            &payload,
-        )
-        .await
+        if let Err(error) =
+            crate::send::send_frame(&host_id, host_stream, FrameKind::ListSessions, &payload).await
         {
             log::error!("failed to refresh session list for {host_id}: {error}");
             let _ = refresh_flag.try_update(|hosts| {
@@ -6645,11 +6641,7 @@ mod tests {
                 "nor its custom agent, which is host-scoped in exactly the same way"
             );
             assert!(
-                state
-                    .draft_session_settings
-                    .get_untracked()
-                    .0
-                    .is_empty(),
+                state.draft_session_settings.get_untracked().0.is_empty(),
                 "nor its profile-derived session settings"
             );
             assert!(!state.draft_session_settings_dirty.get_untracked());
@@ -8807,7 +8799,11 @@ mod wasm_tests {
         );
 
         // Newest activity of the three, so it must also become the first row.
-        dispatch_envelope(&state, "host-a", count_update_envelope("session-1", 4, 400, 1));
+        dispatch_envelope(
+            &state,
+            "host-a",
+            count_update_envelope("session-1", 4, 400, 1),
+        );
 
         let sessions = state.sessions.get_untracked();
         let patched = sessions
@@ -9176,10 +9172,7 @@ mod wasm_tests {
 
         // Precondition: the project-scoped view really is empty.
         assert!(
-            container
-                .query_selector(".session-card")
-                .unwrap()
-                .is_none(),
+            container.query_selector(".session-card").unwrap().is_none(),
             "precondition: no session card matches the active project"
         );
 
@@ -9257,9 +9250,12 @@ mod wasm_tests {
         state.session_list_pages.update(|pages| {
             for host in ["host-a", "host-b"] {
                 pages.insert(
-                    (host.to_owned(), crate::state::session_list_scope_key(
-                        protocol::SessionListScope::AllSessions,
-                    )),
+                    (
+                        host.to_owned(),
+                        crate::state::session_list_scope_key(
+                            protocol::SessionListScope::AllSessions,
+                        ),
+                    ),
                     protocol::SessionListPageInfo {
                         scope: protocol::SessionListScope::AllSessions,
                         cursor: protocol::SessionListCursor {
