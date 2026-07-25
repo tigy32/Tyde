@@ -116,7 +116,7 @@ pub(crate) fn interleave_message(
     }
 
     let mut segments = Vec::new();
-    let mut push_content = |segments: &mut Vec<MessageSegment>, slice: &str| {
+    let push_content = |segments: &mut Vec<MessageSegment>, slice: &str| {
         if !slice.is_empty() {
             segments.push(MessageSegment::Content(slice.to_owned()));
         }
@@ -370,7 +370,7 @@ pub fn ChatMessageView(
                 let mut phase: Vec<AnyView> = Vec::new();
                 let mut phase_index = 1usize;
                 let mut body_ref_taken = false;
-                let mut flush = |phase: &mut Vec<AnyView>, rendered: &mut Vec<AnyView>, index: usize| {
+                let flush = |phase: &mut Vec<AnyView>, rendered: &mut Vec<AnyView>, index: usize| {
                     if phase.is_empty() {
                         return;
                     }
