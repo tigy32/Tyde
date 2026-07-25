@@ -715,6 +715,21 @@ fn checked_executable_path(path: &Path, source: &str) -> Result<PathBuf, String>
 }
 
 #[cfg(feature = "launcher")]
+fn resolved_executable_invocation(path: &Path, source: &str) -> Result<PathBuf, String> {
+    let executable = checked_executable_path(path, source)?;
+    let metadata = fs::symlink_metadata(&executable).map_err(|error| {
+        format!(
+            "failed to inspect {source} {}: {error}",
+            executable.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Ok(executable);
+    }
+    canonical_executable(&executable, source)
+}
+
+#[cfg(feature = "launcher")]
 fn resolve_home_dependent_launcher(
     path: &Path,
     parent_home: Option<&OsStr>,
@@ -733,7 +748,7 @@ fn resolve_home_dependent_launcher_at_depth(
     if depth > 6 {
         return Err(format!("{source} launcher indirection exceeded six levels"));
     }
-    let executable = checked_executable_path(path, source)?;
+    let executable = resolved_executable_invocation(path, source)?;
     let Ok(contents) = fs::read_to_string(&executable) else {
         return Ok(ResolvedLauncher {
             program: executable.clone(),
@@ -799,7 +814,7 @@ fn home_dependent_exec_targets(line: &str, home: &OsStr) -> Option<Vec<PathBuf>>
 
 #[cfg(feature = "launcher")]
 fn argument_passthrough_launcher(path: &Path, source: &str) -> Result<Option<PathBuf>, String> {
-    let executable = checked_executable_path(path, source)?;
+    let executable = resolved_executable_invocation(path, source)?;
     let Ok(contents) = fs::read_to_string(&executable) else {
         return Ok(None);
     };
