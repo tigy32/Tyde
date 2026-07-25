@@ -317,6 +317,7 @@ impl AgentRegistry {
         model_usage: mpsc::UnboundedReceiver<protocol::ModelRequestTokenUsage>,
         total_usage: mpsc::UnboundedReceiver<u64>,
         session_store: Arc<Mutex<SessionStore>>,
+        session_summary_count_tx: crate::host::HostSessionSummaryCountTx,
     ) -> SpawnedRelayAgent {
         let agent_id = AgentId(Uuid::new_v4().to_string());
         let start = AgentStartPayload {
@@ -347,6 +348,7 @@ impl AgentRegistry {
             },
             session_store,
             request.session_id,
+            session_summary_count_tx,
             status_handle.clone(),
         );
 

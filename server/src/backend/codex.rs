@@ -13995,7 +13995,7 @@ for line in sys.stdin:
         );
         let task = "Investigate the configured MCP endpoint";
         let naming_prompt = crate::agent::build_name_generation_prompt(task);
-        let mut naming_config = crate::agent::agent_name_generation_spawn_config();
+        let mut naming_config = crate::agent::agent_name_generation_spawn_config(None);
         assert_eq!(
             naming_config.resolved_spawn_config.tool_policy,
             protocol::ToolPolicy::AllowList { tools: Vec::new() }

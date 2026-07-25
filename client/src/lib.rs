@@ -31,15 +31,16 @@ use protocol::{
     ReviewActionPayload, ReviewBootstrapPayload, ReviewCreatePayload, ReviewEventPayload, ReviewId,
     ReviewSubscribePayload, SendMessagePayload, SendQueuedMessageNowPayload, SeqValidator,
     SessionHistoryPayload, SessionListPayload, SessionSchemasPayload, SessionSettingsPayload,
-    SetAgentNamePayload, SetSessionSettingsPayload, SetSettingPayload, SkillNotifyPayload,
-    SkillRefreshPayload, SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload,
-    SteeringUpsertPayload, StreamPath, TYDE_VERSION, TaskTokenUsagePayload, TeamCreatePayload,
-    TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
-    TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftNotifyPayload,
-    TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamMemberActivatePayload,
-    TeamMemberBindingNotifyPayload, TeamMemberCreatePayload, TeamMemberDeletePayload,
-    TeamMemberNotifyPayload, TeamMemberShufflePayload, TeamMemberUpdatePayload, TeamNotifyPayload,
-    TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
+    SessionSummaryCountUpdatedPayload, SetAgentNamePayload, SetSessionSettingsPayload,
+    SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentPayload,
+    SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload, StreamPath, TYDE_VERSION,
+    TaskTokenUsagePayload, TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload,
+    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload,
+    TeamDraftNotifyPayload, TeamDraftShufflePayload, TeamDraftUpdatePayload,
+    TeamMemberActivatePayload, TeamMemberBindingNotifyPayload, TeamMemberCreatePayload,
+    TeamMemberDeletePayload, TeamMemberNotifyPayload, TeamMemberShufflePayload,
+    TeamMemberUpdatePayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
+    TeamRenamePayload, TeamSetManagerPayload,
     TerminalBootstrapPayload, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
     TerminalExitPayload, TerminalId, TerminalOutputPayload, TerminalResizePayload,
     TerminalSendPayload, TerminalStartPayload, TriggerWorkflowPayload, Version, WelcomePayload,
@@ -865,6 +866,10 @@ impl Connection {
                 }
                 FrameKind::SessionList => {
                     let _: SessionListPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::SessionSummaryCountUpdated => {
+                    let _: SessionSummaryCountUpdatedPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 FrameKind::ProjectNotify => {

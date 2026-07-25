@@ -20,15 +20,15 @@ use protocol::{
     ProjectNotifyPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
     ProjectReorderPayload, ProjectStageFilePayload, ProjectStageHunkPayload, QueuedMessagesPayload,
     SendMessagePayload, SessionHistoryPayload, SessionListPayload, SessionSchemasPayload,
-    SessionSettingsPayload, SetAgentNamePayload, SetSessionSettingsPayload, SkillNotifyPayload,
-    SpawnAgentPayload, SteeringNotifyPayload, StreamPath, TaskTokenUsagePayload,
-    TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
-    TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
-    TerminalBootstrapPayload, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
-    TerminalExitPayload, TerminalOutputPayload, TerminalResizePayload, TerminalSendPayload,
-    TerminalStartPayload, TriggerWorkflowPayload, WorkbenchCreatePayload, WorkbenchRemovePayload,
-    WorkflowNotifyPayload, WorkflowRefreshPayload, WorkflowRunNotifyPayload, read_envelope,
-    write_envelope,
+    SessionSettingsPayload, SessionSummaryCountUpdatedPayload, SetAgentNamePayload,
+    SetSessionSettingsPayload, SkillNotifyPayload, SpawnAgentPayload, SteeringNotifyPayload,
+    StreamPath, TaskTokenUsagePayload, TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload,
+    TeamMemberNotifyPayload, TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload,
+    TeamPresetCatalogNotifyPayload, TerminalBootstrapPayload, TerminalClosePayload,
+    TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
+    TerminalResizePayload, TerminalSendPayload, TerminalStartPayload, TriggerWorkflowPayload,
+    WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowNotifyPayload, WorkflowRefreshPayload,
+    WorkflowRunNotifyPayload, read_envelope, write_envelope,
 };
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -140,6 +140,7 @@ pub enum HostEvent {
     LaunchProfileCatalogNotify(LaunchProfileCatalogPayload),
     SessionSchemas(SessionSchemasPayload),
     SessionList(SessionListPayload),
+    SessionSummaryCountUpdated(SessionSummaryCountUpdatedPayload),
     CommandError(CommandErrorPayload),
     ProjectNotify(ProjectNotifyPayload),
     CustomAgentNotify(CustomAgentNotifyPayload),
@@ -937,6 +938,16 @@ async fn handle_host_envelope(
                 Err(_) => return false,
             };
             let _ = host_tx.send(HostEvent::SessionList(payload)).await;
+            true
+        }
+        FrameKind::SessionSummaryCountUpdated => {
+            let payload: SessionSummaryCountUpdatedPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx
+                .send(HostEvent::SessionSummaryCountUpdated(payload))
+                .await;
             true
         }
         FrameKind::ProjectNotify => {

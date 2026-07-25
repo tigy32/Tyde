@@ -48,13 +48,14 @@ use protocol::{
     SUPERVISOR_MESSAGE_PREFIX, SendMessagePayload, SessionHistoryPayload, SessionId,
     SessionListCursor, SessionListGeneration, SessionListPageInfo, SessionListPageStatus,
     SessionListPayload, SessionListScope, SessionSchemaEntry, SessionSchemasPayload,
-    SessionSettingsSchema, SessionSummary, SetAgentGroupsPayload, SetAgentPinsPayload,
-    SetAgentTagsPayload, SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload,
-    SetSettingPayload, Skill, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams,
-    SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringScope,
-    SteeringUpsertPayload, StreamPath, TaskTokenUsageAggregate, TaskTokenUsageAmount,
-    TaskTokenUsageEntry, TaskTokenUsagePayload, TaskTokenUsageScope, TaskTokenUsageStatus,
-    TaskTokenUsageUnavailableReason, TeamCreatePayload, TeamDeletePayload,
+    SessionSettingsSchema, SessionSummary, SessionSummaryCountUpdatedPayload,
+    SetAgentGroupsPayload, SetAgentPinsPayload, SetAgentTagsPayload, SetAgentsSmartViewsPayload,
+    SetAgentsViewPreferencesPayload, SetSettingPayload, Skill, SkillNotifyPayload,
+    SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
+    SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath,
+    TaskTokenUsageAggregate, TaskTokenUsageAmount, TaskTokenUsageEntry, TaskTokenUsagePayload,
+    TaskTokenUsageScope, TaskTokenUsageStatus, TaskTokenUsageUnavailableReason,
+    TeamCreatePayload, TeamDeletePayload,
     TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
     TeamDraftDiscardPayload, TeamDraftNotifyPayload, TeamDraftShufflePayload,
     TeamDraftUpdatePayload, TeamId, TeamMember, TeamMemberBindingNotifyPayload,
@@ -157,6 +158,9 @@ use crate::sub_agent::{
 
 pub(crate) type HostCapacityTx = mpsc::UnboundedSender<HostCapacityUpdate>;
 type HostCapacityRx = mpsc::UnboundedReceiver<HostCapacityUpdate>;
+pub(crate) type HostSessionSummaryCountTx =
+    mpsc::UnboundedSender<SessionSummaryCountUpdatedPayload>;
+type HostSessionSummaryCountRx = mpsc::UnboundedReceiver<SessionSummaryCountUpdatedPayload>;
 
 pub(crate) enum HostCapacityUpdate {
     Report {
@@ -836,6 +840,7 @@ pub(crate) struct HostState {
     supervisor_settings_tx: watch::Sender<SupervisorSettingsSignal>,
     pub sub_agent_spawn_tx: HostSubAgentSpawnTx,
     pub capacity_tx: HostCapacityTx,
+    pub session_summary_count_tx: HostSessionSummaryCountTx,
     pub use_mock_backend: bool,
     pub debug_mcp: DebugMcpHandle,
     pub agent_control_mcp: AgentControlMcpHandle,
@@ -4328,6 +4333,10 @@ impl HostHandle {
                             generated_name_request = Some(GenerateAgentNameRequest {
                                 backend_kind,
                                 prompt: prompt.clone(),
+                                session_settings: hidden_helper_session_settings(
+                                    backend_kind,
+                                    session_settings.as_ref(),
+                                ),
                                 use_mock_backend,
                                 capacity_tx: capacity_tx.clone(),
                             });
@@ -5026,6 +5035,7 @@ impl HostHandle {
             let mut state = self.state.lock().await;
             let sub_agent_spawn_tx = state.sub_agent_spawn_tx.clone();
             let capacity_tx = state.capacity_tx.clone();
+            let session_summary_count_tx = state.session_summary_count_tx.clone();
             let review_registry = state.review_registry.clone();
             let agent_control_mcp = state.agent_control_mcp.clone();
             let antigravity_conversations_dir = state.antigravity_conversations_dir.clone();
@@ -5036,6 +5046,7 @@ impl HostHandle {
                     session_store: Arc::clone(&session_store),
                     host_sub_agent_spawn_tx: sub_agent_spawn_tx,
                     capacity_tx,
+                    session_summary_count_tx,
                     review_registry,
                     antigravity_conversations_dir,
                 },
@@ -5410,6 +5421,7 @@ impl HostHandle {
             let mut state = self.state.lock().await;
             let sub_agent_spawn_tx = state.sub_agent_spawn_tx.clone();
             let capacity_tx = state.capacity_tx.clone();
+            let session_summary_count_tx = state.session_summary_count_tx.clone();
             let review_registry = state.review_registry.clone();
             let agent_control_mcp = state.agent_control_mcp.clone();
             let antigravity_conversations_dir = state.antigravity_conversations_dir.clone();
@@ -5420,6 +5432,7 @@ impl HostHandle {
                     session_store,
                     host_sub_agent_spawn_tx: sub_agent_spawn_tx,
                     capacity_tx,
+                    session_summary_count_tx,
                     review_registry,
                     antigravity_conversations_dir,
                 },
@@ -10187,12 +10200,14 @@ impl HostHandle {
 
         let (start, agent_handle, agent_visibility) = {
             let mut state = self.state.lock().await;
+            let session_summary_count_tx = state.session_summary_count_tx.clone();
             let spawned = state.registry.spawn_relay(
                 relay_request,
                 event_rx,
                 model_usage_rx,
                 total_usage_rx,
                 Arc::clone(&session_store),
+                session_summary_count_tx,
             );
             state
                 .agent_sessions
@@ -12770,6 +12785,10 @@ fn spawn_host_inner(
     let (sub_agent_spawn_tx, sub_agent_spawn_rx) =
         mpsc::unbounded_channel::<HostSubAgentSpawnRequest>();
     let (capacity_tx, capacity_rx): (HostCapacityTx, HostCapacityRx) = mpsc::unbounded_channel();
+    let (session_summary_count_tx, session_summary_count_rx): (
+        HostSessionSummaryCountTx,
+        HostSessionSummaryCountRx,
+    ) = mpsc::unbounded_channel();
     let (mobile_access_tx, mobile_access_rx) = mpsc::unbounded_channel::<MobileAccessCommand>();
     let mobile_access = MobileAccessHandle::new(mobile_access_tx.clone());
     let (review_delivery_tx, review_delivery_rx) = mpsc::channel::<ReviewDeliveryRequest>(64);
@@ -12860,6 +12879,7 @@ fn spawn_host_inner(
             activity_summary_settings_tx,
             sub_agent_spawn_tx,
             capacity_tx: capacity_tx.clone(),
+            session_summary_count_tx,
             use_mock_backend,
             debug_mcp,
             agent_control_mcp: agent_control_mcp_placeholder,
@@ -12942,6 +12962,7 @@ fn spawn_host_inner(
     )?;
 
     spawn_host_capacity_task(host.clone(), capacity_rx);
+    spawn_host_session_summary_count_task(host.clone(), session_summary_count_rx);
 
     let agent_control_mcp = match crate::agent_control_mcp::start_server(
         runtime_config.agent_control_mcp_bind_addr,
@@ -13996,27 +14017,12 @@ async fn launch_supervision_verdict(
     let use_mock_backend = host.use_mock_backend().await;
     let capacity_tx = { host.state.lock().await.capacity_tx.clone() };
     let backend_kind = observation.start.backend_kind;
-    let supervisor_session_settings = if backend_kind == BackendKind::Hermes {
+    let supervisor_session_settings = hidden_helper_session_settings(
+        backend_kind,
         session_record
             .as_ref()
-            .and_then(|record| record.session_settings.as_ref())
-            .and_then(|settings| {
-                settings
-                    .0
-                    .get(crate::backend::hermes::HERMES_PROFILE_SETTING)
-                    .cloned()
-            })
-            .map(|profile| {
-                let mut settings = protocol::SessionSettingsValues::default();
-                settings.0.insert(
-                    crate::backend::hermes::HERMES_PROFILE_SETTING.to_owned(),
-                    profile,
-                );
-                settings
-            })
-    } else {
-        None
-    };
+            .and_then(|record| record.session_settings.as_ref()),
+    );
     let cost_hint = settings.settings.cost_tier.as_cost_hint();
     let last_assistant_message = context.last_assistant_message;
     let last_error = context.last_error_since_user_message;
@@ -14894,6 +14900,18 @@ async fn start_due_activity_summary_calls(
         let previous_text = previous_summary
             .as_ref()
             .map(|summary| summary.text.clone());
+        let source_session_settings = if context.start.backend_kind == BackendKind::Hermes {
+            match context.start.session_id.as_ref() {
+                Some(session_id) => {
+                    let session_store = { Arc::clone(&host.state.lock().await.session_store) };
+                    let record = session_store.lock().await.get(session_id);
+                    record.and_then(|record| record.session_settings)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         let transient_agent_id = AgentId(Uuid::new_v4().to_string());
         debug_assert!(
             !host.is_agent_registered(&transient_agent_id).await,
@@ -14913,6 +14931,10 @@ async fn start_due_activity_summary_calls(
             previous_summary: previous_text,
             source_from_seq: history.from_seq,
             source_through_seq: history.through_seq,
+            session_settings: hidden_helper_session_settings(
+                context.start.backend_kind,
+                source_session_settings.as_ref(),
+            ),
             use_mock_backend: host.use_mock_backend().await,
             capacity_tx: host.state.lock().await.capacity_tx.clone(),
         };
@@ -15115,6 +15137,31 @@ fn spawn_host_capacity_task(host: HostHandle, mut rx: HostCapacityRx) {
             runtime.block_on(worker);
         })
         .expect("failed to spawn host capacity task");
+}
+
+fn spawn_host_session_summary_count_task(host: HostHandle, mut rx: HostSessionSummaryCountRx) {
+    let worker = async move {
+        while let Some(update) = rx.recv().await {
+            let mut state = host.state.lock().await;
+            fan_out_session_summary_count_update(&mut state, &update);
+        }
+    };
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(worker);
+        return;
+    }
+
+    std::thread::Builder::new()
+        .name("tyde-host-session-summary-count".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build host session-summary-count runtime");
+            runtime.block_on(worker);
+        })
+        .expect("failed to spawn host session-summary-count task");
 }
 
 fn spawn_host_spawn_operation_task(
@@ -16702,6 +16749,43 @@ async fn fan_out_session_lists(state: &mut HostState) {
         })
         .expect("failed to serialize SessionList payload for host stream fanout");
         if emit_or_queue_host_frame(subscriber, FrameKind::SessionList, payload.clone()).is_err() {
+            dead_paths.push(path);
+        }
+    }
+
+    for path in dead_paths {
+        state.host_streams.remove(&path);
+    }
+}
+
+fn fan_out_session_summary_count_update(
+    state: &mut HostState,
+    update: &SessionSummaryCountUpdatedPayload,
+) {
+    let payload = serde_json::to_value(update)
+        .expect("failed to serialize SessionSummaryCountUpdated payload for host stream fanout");
+    let paths = state.host_streams.keys().cloned().collect::<Vec<_>>();
+    let mut dead_paths = Vec::new();
+
+    for path in paths {
+        let Some(subscriber) = state.host_streams.get_mut(&path) else {
+            continue;
+        };
+        if let Some(snapshot) = subscriber.session_list_snapshot.as_mut()
+            && let Some(summary) = snapshot
+                .sessions
+                .iter_mut()
+                .find(|summary| summary.id == update.session_id)
+        {
+            summary.message_count = update.assistant_turn_count;
+        }
+        if emit_or_queue_host_frame(
+            subscriber,
+            FrameKind::SessionSummaryCountUpdated,
+            payload.clone(),
+        )
+        .is_err()
+        {
             dead_paths.push(path);
         }
     }
@@ -18334,6 +18418,17 @@ fn backend_has_dynamic_session_schema(backend_kind: protocol::BackendKind) -> bo
     )
 }
 
+fn hidden_helper_session_settings(
+    backend_kind: BackendKind,
+    session_settings: Option<&SessionSettingsValues>,
+) -> Option<SessionSettingsValues> {
+    if backend_kind == BackendKind::Hermes {
+        session_settings.cloned()
+    } else {
+        None
+    }
+}
+
 fn session_schema_entry_for_backend(
     state: &HostState,
     backend_kind: protocol::BackendKind,
@@ -18967,6 +19062,52 @@ Otherwise use these sections; omit any that are empty rather than padding them:
 Rules: Record only what remains true and useful for future work; drop transient chatter, resolved dead-ends, and step-by-step narration. Preserve specifics — exact names, paths, commands, values, and error signatures — over vague description. Mark anything unverified as an assumption; never invent facts, decisions, or outcomes you cannot support from this session, and say plainly when something important is unknown. **Never include secrets, tokens, keys, or credentials.** Be concise: prefer the shortest form a replacement could act on without re-deriving it. Output only the note (or the `No durable context.` sentinel)."#;
 
         assert_eq!(default_compaction_summary_prompt(), expected);
+    }
+
+    #[test]
+    fn hidden_helpers_copy_all_hermes_session_settings_and_no_others() {
+        let mut settings = SessionSettingsValues::default();
+        settings.0.insert(
+            crate::backend::hermes::HERMES_PROFILE_SETTING.to_owned(),
+            protocol::SessionSettingValue::String("qa-minimax".to_owned()),
+        );
+        settings.0.insert(
+            "model".to_owned(),
+            protocol::SessionSettingValue::String(
+                "minimax/minimax-m3 --provider openrouter".to_owned(),
+            ),
+        );
+        settings.0.insert(
+            "reasoning_effort".to_owned(),
+            protocol::SessionSettingValue::String("low".to_owned()),
+        );
+        settings.0.insert(
+            "fast".to_owned(),
+            protocol::SessionSettingValue::Bool(true),
+        );
+
+        assert_eq!(
+            hidden_helper_session_settings(BackendKind::Hermes, Some(&settings)),
+            Some(settings.clone())
+        );
+        assert_eq!(
+            hidden_helper_session_settings(BackendKind::Hermes, None),
+            None,
+            "a default Hermes session must keep using the default profile"
+        );
+        for backend_kind in [
+            BackendKind::Tycode,
+            BackendKind::Kiro,
+            BackendKind::Claude,
+            BackendKind::Codex,
+            BackendKind::Antigravity,
+        ] {
+            assert_eq!(
+                hidden_helper_session_settings(backend_kind, Some(&settings)),
+                None,
+                "{backend_kind:?} helper semantics must remain unchanged"
+            );
+        }
     }
 
     #[test]
@@ -21914,6 +22055,84 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .expect("mock user bubble must reach supervision context");
         }
         (agent_id, session_id)
+    }
+
+    #[tokio::test]
+    async fn completed_turn_fans_out_targeted_assistant_turn_count() {
+        let fixture = compact_fixture().await;
+        let (agent_id, session_id) =
+            spawn_idle_user_agent(&fixture.host, "count completed assistant turns").await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let host_path = StreamPath(format!("/host/session-count-{}", Uuid::new_v4()));
+        let host_stream = Stream::new(host_path, tx);
+        assert!(
+            fixture
+                .host
+                .register_host_stream(host_stream, AgentReplayMode::Lazy)
+                .await
+                .is_empty()
+        );
+        let bootstrap = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("host bootstrap")
+            .expect("host stream remains open");
+        assert_eq!(bootstrap.kind, FrameKind::HostBootstrap);
+        while rx.try_recv().is_ok() {}
+
+        let observation = fixture
+            .host
+            .activity_summary_observation(&agent_id)
+            .await
+            .expect("agent observation");
+        assert!(
+            observation
+                .handle
+                .send_input(AgentInput::SendMessage(SendMessagePayload {
+                    message: format!("second turn {MOCK_SLOW_TURN_SENTINEL}"),
+                    images: None,
+                    origin: Some(MessageOrigin::User),
+                    tool_response: None,
+                }))
+                .await
+        );
+        wait_for_agent_active(&fixture.host, &agent_id).await;
+        wait_for_agent_idle(&fixture.host, &agent_id).await;
+
+        let mut rebuilt_session_lists = 0;
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let envelope = rx.recv().await.expect("host stream remains open");
+                match envelope.kind {
+                    FrameKind::SessionList => rebuilt_session_lists += 1,
+                    FrameKind::SessionSummaryCountUpdated => {
+                        let payload: SessionSummaryCountUpdatedPayload = envelope
+                            .parse_payload()
+                            .expect("session count update payload");
+                        if payload.session_id == session_id && payload.assistant_turn_count == 2 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("second turn count update");
+
+        assert_eq!(
+            rebuilt_session_lists, 0,
+            "turn completion must not rebuild the full session list"
+        );
+        let session_store = { Arc::clone(&fixture.host.state.lock().await.session_store) };
+        assert_eq!(
+            session_store
+                .lock()
+                .await
+                .get(&session_id)
+                .expect("persisted session")
+                .message_count,
+            2
+        );
     }
 
     #[tokio::test]

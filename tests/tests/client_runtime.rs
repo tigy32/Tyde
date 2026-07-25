@@ -363,10 +363,12 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
 
     let (session_list_tx, session_list_rx) = oneshot::channel();
     let (new_agent_tx, new_agent_rx) = oneshot::channel();
+    let (session_count_tx, mut session_count_rx) = mpsc::channel(2);
 
     tokio::spawn(async move {
         let mut session_list_tx = Some(session_list_tx);
         let mut new_agent_tx = Some(new_agent_tx);
+        let mut saw_second_count = false;
 
         while let Some(event) = events.recv().await {
             match event {
@@ -379,6 +381,10 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                     if let Some(tx) = new_agent_tx.take() {
                         let _ = tx.send(agent);
                     }
+                }
+                HostEvent::SessionSummaryCountUpdated(payload) => {
+                    saw_second_count = payload.assistant_turn_count >= 2;
+                    let _ = session_count_tx.send(payload).await;
                 }
                 HostEvent::HostSettings(_)
                 | HostEvent::AgentActivitySummary(_)
@@ -411,7 +417,7 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                 | HostEvent::TeamMemberShuffleSuggestionNotify(_) => {}
             }
 
-            if session_list_tx.is_none() && new_agent_tx.is_none() {
+            if session_list_tx.is_none() && new_agent_tx.is_none() && saw_second_count {
                 break;
             }
         }
@@ -456,6 +462,7 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
         .expect("timed out waiting for NewAgent")
         .expect("host event loop dropped before NewAgent");
     assert_eq!(agent.info.name, "split-runtime");
+    let session_id = agent.info.session_id.clone().expect("agent session id");
 
     let AgentEndpoint {
         mut events,
@@ -529,6 +536,12 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
         }
         other => panic!("expected initial final response, got {other:?}"),
     }
+    let first_count = timeout(Duration::from_secs(5), session_count_rx.recv())
+        .await
+        .expect("timed out waiting for initial session count")
+        .expect("host event loop dropped before initial session count");
+    assert_eq!(first_count.session_id, session_id);
+    assert_eq!(first_count.assistant_turn_count, 1);
 
     let follow_up = "follow-up after background event loop";
     commands
@@ -550,6 +563,12 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
         }
         other => panic!("expected follow-up final response, got {other:?}"),
     }
+    let second_count = timeout(Duration::from_secs(5), session_count_rx.recv())
+        .await
+        .expect("timed out waiting for follow-up session count")
+        .expect("host event loop dropped before follow-up session count");
+    assert_eq!(second_count.session_id, session_id);
+    assert_eq!(second_count.assistant_turn_count, 2);
 }
 
 #[tokio::test]

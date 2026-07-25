@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 39;
+pub const PROTOCOL_VERSION: u32 = 40;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -1133,6 +1133,7 @@ pub enum FrameKind {
     AgentError,
     QueuedMessages,
     SessionList,
+    SessionSummaryCountUpdated,
     ProjectNotify,
     CustomAgentNotify,
     SteeringNotify,
@@ -1301,6 +1302,7 @@ impl fmt::Display for FrameKind {
             Self::AgentError => f.write_str("agent_error"),
             Self::QueuedMessages => f.write_str("queued_messages"),
             Self::SessionList => f.write_str("session_list"),
+            Self::SessionSummaryCountUpdated => f.write_str("session_summary_count_updated"),
             Self::ProjectNotify => f.write_str("project_notify"),
             Self::CustomAgentNotify => f.write_str("custom_agent_notify"),
             Self::SteeringNotify => f.write_str("steering_notify"),
@@ -3603,6 +3605,13 @@ pub struct SessionSummary {
 pub struct SessionListPayload {
     pub sessions: Vec<SessionSummary>,
     pub page: SessionListPageInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummaryCountUpdatedPayload {
+    pub session_id: SessionId,
+    /// Number of completed assistant turns persisted for this session.
+    pub assistant_turn_count: u32,
 }
 
 /// Input events that can be sent to a running agent.
@@ -7528,8 +7537,31 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_thirty_nine() {
-        assert_eq!(PROTOCOL_VERSION, 39);
+    fn protocol_version_is_forty() {
+        assert_eq!(PROTOCOL_VERSION, 40);
+    }
+
+    #[test]
+    fn session_summary_count_update_names_assistant_turn_semantics() {
+        let payload = SessionSummaryCountUpdatedPayload {
+            session_id: SessionId("session-1".to_owned()),
+            assistant_turn_count: 3,
+        };
+
+        let encoded =
+            serde_json::to_value(&payload).expect("serialize SessionSummaryCountUpdatedPayload");
+        assert_eq!(encoded["session_id"], "session-1");
+        assert_eq!(encoded["assistant_turn_count"], 3);
+        assert!(encoded.get("message_count").is_none());
+        assert_eq!(
+            FrameKind::SessionSummaryCountUpdated.to_string(),
+            "session_summary_count_updated"
+        );
+        assert_eq!(
+            serde_json::from_value::<SessionSummaryCountUpdatedPayload>(encoded)
+                .expect("deserialize SessionSummaryCountUpdatedPayload"),
+            payload
+        );
     }
 
     #[test]

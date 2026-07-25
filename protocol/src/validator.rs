@@ -29,10 +29,11 @@ use crate::{
     ProjectGitStatusPayload, ProjectNotifyPayload, ProjectRenamePayload, ProjectReorderPayload,
     ProjectSearchCompletePayload, ProjectSearchResultsPayload, ReviewEventPayload,
     RunBackendSetupPayload, SessionHistoryPayload, SessionListPayload, SessionSchemasPayload,
-    SetAgentGroupsPayload, SetAgentPinsPayload, SetAgentTagsPayload, SetAgentsSmartViewsPayload,
-    SetAgentsViewPreferencesPayload, SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload,
-    SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload,
-    StreamPath, TaskTokenUsagePayload, TeamCreatePayload, TeamDeletePayload,
+    SessionSummaryCountUpdatedPayload, SetAgentGroupsPayload, SetAgentPinsPayload,
+    SetAgentTagsPayload, SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload,
+    SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentPayload,
+    SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload, StreamPath,
+    TaskTokenUsagePayload, TeamCreatePayload, TeamDeletePayload,
     TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
     TeamDraftDiscardPayload, TeamDraftNotifyPayload, TeamDraftShufflePayload,
     TeamDraftUpdatePayload, TeamMemberActivatePayload, TeamMemberBindingNotifyPayload,
@@ -329,6 +330,13 @@ impl ProtocolValidator {
             ),
             FrameKind::SessionList => {
                 parse_host_payload::<SessionListPayload>(self, envelope, "SessionList")
+            }
+            FrameKind::SessionSummaryCountUpdated => {
+                parse_host_payload::<SessionSummaryCountUpdatedPayload>(
+                    self,
+                    envelope,
+                    "SessionSummaryCountUpdated",
+                )
             }
             FrameKind::CommandError => {
                 parse_host_payload::<CommandErrorPayload>(self, envelope, "CommandError")
@@ -2040,6 +2048,35 @@ mod tests {
 
         assert!(err.message.contains("failed to parse SessionList payload"));
         assert!(err.message.contains("page"));
+    }
+
+    #[test]
+    fn session_summary_count_update_requires_typed_assistant_turn_count() {
+        let mut validator = ProtocolValidator::new();
+        validator
+            .validate_envelope(&host_bootstrap_with_agents(vec![]))
+            .expect("bootstrap should be valid");
+
+        let envelope = Envelope::from_payload(
+            host_stream(),
+            FrameKind::SessionSummaryCountUpdated,
+            1,
+            &serde_json::json!({
+                "session_id": "session-1",
+                "message_count": 3,
+            }),
+        )
+        .expect("serialize malformed session count update");
+
+        let err = validator
+            .validate_envelope(&envelope)
+            .expect_err("legacy message_count field must not satisfy typed payload");
+
+        assert!(
+            err.message
+                .contains("failed to parse SessionSummaryCountUpdated payload")
+        );
+        assert!(err.message.contains("assistant_turn_count"));
     }
 
     fn agent_start_payload() -> crate::AgentStartPayload {

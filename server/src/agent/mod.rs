@@ -14,8 +14,9 @@ use protocol::{
     MessageMetadataUpdateData, MessageOrigin, MessageSender, MessageTokenUsage, ModelInfo,
     ModelRequestId, ModelRequestTokenUsage, QueuedMessageEntry, QueuedMessageId,
     QueuedMessagesPayload, ReasoningData, ReviewErrorContext, SendMessagePayload, SessionId,
-    SessionSettingsPayload, SessionSettingsValues, SpawnCostHint, StreamEndData, StreamStartData,
-    StreamTextDeltaData, TaskTokenUsageAmount, TaskTokenUsageScope,
+    SessionSettingsPayload, SessionSettingsValues, SessionSummaryCountUpdatedPayload,
+    SpawnCostHint, StreamEndData, StreamStartData, StreamTextDeltaData, TaskTokenUsageAmount,
+    TaskTokenUsageScope,
     TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
     ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy, ToolRequestType,
 };
@@ -36,7 +37,7 @@ use crate::backend::{
     resolve_backend_session_settings, validate_runtime_session_settings_update,
     validate_session_settings_values,
 };
-use crate::host::{HostCapacityTx, HostSubAgentEmitter};
+use crate::host::{HostCapacityTx, HostSessionSummaryCountTx, HostSubAgentEmitter};
 use crate::review::ReviewRegistryHandle;
 use crate::store::session::SessionStore;
 use crate::stream::Stream;
@@ -134,6 +135,7 @@ pub(crate) struct AgentActorRuntimeContext {
     pub(crate) session_store: Arc<Mutex<SessionStore>>,
     pub(crate) host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
     pub(crate) capacity_tx: HostCapacityTx,
+    pub(crate) session_summary_count_tx: HostSessionSummaryCountTx,
     pub(crate) review_registry: ReviewRegistryHandle,
     pub(crate) status_handle: registry::AgentStatusHandle,
     pub(crate) antigravity_conversations_dir: PathBuf,
@@ -143,6 +145,7 @@ pub(crate) struct AgentActorRuntimeResources {
     pub(crate) session_store: Arc<Mutex<SessionStore>>,
     pub(crate) host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
     pub(crate) capacity_tx: HostCapacityTx,
+    pub(crate) session_summary_count_tx: HostSessionSummaryCountTx,
     pub(crate) review_registry: ReviewRegistryHandle,
     pub(crate) antigravity_conversations_dir: PathBuf,
 }
@@ -156,6 +159,7 @@ impl AgentActorRuntimeResources {
             session_store: self.session_store,
             host_sub_agent_spawn_tx: self.host_sub_agent_spawn_tx,
             capacity_tx: self.capacity_tx,
+            session_summary_count_tx: self.session_summary_count_tx,
             review_registry: self.review_registry,
             status_handle,
             antigravity_conversations_dir: self.antigravity_conversations_dir,
@@ -1368,6 +1372,7 @@ enum ActorLifecycle {
 pub(crate) struct GenerateAgentNameRequest {
     pub backend_kind: BackendKind,
     pub prompt: String,
+    pub session_settings: Option<SessionSettingsValues>,
     pub use_mock_backend: bool,
     pub capacity_tx: HostCapacityTx,
 }
@@ -1380,6 +1385,7 @@ pub(crate) struct GenerateAgentActivitySummaryRequest {
     pub previous_summary: Option<String>,
     pub source_from_seq: Option<u64>,
     pub source_through_seq: Option<u64>,
+    pub session_settings: Option<SessionSettingsValues>,
     pub use_mock_backend: bool,
     pub capacity_tx: HostCapacityTx,
 }
@@ -1401,7 +1407,7 @@ pub(crate) async fn generate_agent_name(
 
     let name_prompt = build_name_generation_prompt(prompt);
     let logged_name_prompt = name_prompt.clone();
-    let spawn_config = agent_name_generation_spawn_config();
+    let spawn_config = agent_name_generation_spawn_config(request.session_settings.clone());
     let isolated_workspace = tempfile::tempdir()
         .map_err(|err| format!("failed to create isolated agent naming workspace: {err}"))?;
     let workspace_roots = vec![isolated_workspace.path().to_string_lossy().into_owned()];
@@ -1450,13 +1456,15 @@ pub(crate) async fn generate_agent_name(
     result
 }
 
-pub(crate) fn agent_name_generation_spawn_config() -> BackendSpawnConfig {
+pub(crate) fn agent_name_generation_spawn_config(
+    session_settings: Option<SessionSettingsValues>,
+) -> BackendSpawnConfig {
     BackendSpawnConfig {
         execution_mode: BackendExecutionMode::InferenceOnly,
         cost_hint: Some(SpawnCostHint::Low),
         custom_agent_id: None,
         startup_mcp_servers: Vec::new(),
-        session_settings: None,
+        session_settings,
         backend_config: Default::default(),
         resolved_spawn_config: customization::ResolvedSpawnConfig {
             tool_policy: ToolPolicy::AllowList { tools: Vec::new() },
@@ -1531,7 +1539,7 @@ pub(crate) async fn generate_agent_activity_summary(
         build_activity_summary_prompt(rendered_history, request.previous_summary.as_deref());
     let logged_prompt_len = prompt.len();
     let target_workspace_root_count = request.workspace_roots.len();
-    let spawn_config = agent_name_generation_spawn_config();
+    let spawn_config = agent_name_generation_spawn_config(request.session_settings.clone());
     let initial_input = SendMessagePayload {
         message: prompt,
         images: None,
@@ -2068,6 +2076,7 @@ pub(crate) fn spawn_agent_actor(
         session_store,
         host_sub_agent_spawn_tx,
         capacity_tx,
+        session_summary_count_tx,
         review_registry,
         status_handle,
         antigravity_conversations_dir,
@@ -3004,14 +3013,17 @@ pub(crate) fn spawn_agent_actor(
                             }).await;
                         }
                     }
-                    apply_runtime_session_updates(
+                    if let Some(update) = apply_runtime_session_updates(
                         &session_store,
                         current_session_id
                             .as_ref()
                             .expect("live agent must have session_id"),
                         &event,
                     )
-                    .await;
+                    .await
+                    {
+                        let _ = session_summary_count_tx.send(update);
+                    }
                     let source_seq = activity_event_seq;
                     activity_event_seq = activity_event_seq.saturating_add(1);
                     if activity_stats.observe_chat_event(
@@ -4723,6 +4735,7 @@ pub(crate) fn spawn_relay_agent_actor(
     receivers: RelayEventReceivers,
     session_store: Arc<Mutex<SessionStore>>,
     session_id: SessionId,
+    session_summary_count_tx: HostSessionSummaryCountTx,
     status_handle: registry::AgentStatusHandle,
 ) -> AgentHandle {
     let RelayEventReceivers {
@@ -5019,7 +5032,11 @@ pub(crate) fn spawn_relay_agent_actor(
                         }
                     }
 
-                    apply_runtime_session_updates(&session_store, &session_id, &event).await;
+                    if let Some(update) =
+                        apply_runtime_session_updates(&session_store, &session_id, &event).await
+                    {
+                        let _ = session_summary_count_tx.send(update);
+                    }
                     let source_seq = activity_event_seq;
                     activity_event_seq = activity_event_seq.saturating_add(1);
                     if activity_stats.observe_chat_event(
@@ -7764,13 +7781,18 @@ async fn apply_runtime_session_updates(
     session_store: &Arc<Mutex<SessionStore>>,
     session_id: &SessionId,
     event: &ChatEvent,
-) {
+) -> Option<SessionSummaryCountUpdatedPayload> {
+    let mut count_update = None;
     let result = {
         let store = session_store.lock().await;
         match event {
             ChatEvent::StreamEnd(data) => store.update(session_id, |record| {
                 record.updated_at_ms = now_ms();
                 record.message_count += 1;
+                count_update = Some(SessionSummaryCountUpdatedPayload {
+                    session_id: session_id.clone(),
+                    assistant_turn_count: record.message_count,
+                });
                 if let Some(delta) =
                     known_turn_usage(&data.message.token_usage).map(|usage| usage.total_tokens)
                 {
@@ -7813,7 +7835,9 @@ async fn apply_runtime_session_updates(
 
     if let Err(err) = result {
         tracing::error!("failed to update session store for {}: {}", session_id, err);
+        return None;
     }
+    count_update
 }
 
 pub(crate) fn build_name_generation_prompt(prompt: &str) -> String {
@@ -8005,10 +8029,10 @@ mod tests {
         MessageMetadataUpdateData, MessageSender, MessageTokenUsage, ModelInfo, ModelRequestId,
         ModelRequestTokenUsage, ModelTurnId, QueuedMessagesPayload, ReasoningData,
         ServerGeneratedChatMessageIdOrigin, ServerGeneratedChatMessageIdentity, SessionId,
-        StreamEndData, StreamPath, StreamStartData, StreamTextDeltaData, TaskList,
-        TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope,
-        TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult, ToolRequest,
-        ToolRequestType, ToolUseData,
+        SessionSettingValue, SessionSettingsValues, StreamEndData, StreamPath, StreamStartData,
+        StreamTextDeltaData, TaskList, TaskTokenUsageScope, TaskTokenUsageUnavailableReason,
+        TokenUsage, TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData,
+        ToolExecutionResult, ToolRequest, ToolRequestType, ToolUseData,
     };
     use tokio::sync::{Mutex, mpsc, watch};
     use tokio::time::timeout;
@@ -8021,7 +8045,7 @@ mod tests {
         RelayEventReceivers, ResolvedSpawnRequest, SupervisorVerdictStart,
         SupervisorVerdictStartRejection, activity_history_snapshot,
         agent_name_generation_spawn_config, agent_usage_snapshot_from_log, append_chat_event,
-        append_event, apply_generated_agent_name, attach_subscriber,
+        append_event, apply_generated_agent_name, apply_runtime_session_updates, attach_subscriber,
         attach_subscriber_with_latest_output, collect_agent_activity_summary_events,
         collect_agent_name_events, current_latest_output, generate_mock_name,
         ingest_gated_replay_event, known_turn_usage, mark_agent_turn_active, output_events_since,
@@ -8034,7 +8058,7 @@ mod tests {
     use crate::agent::backend_turn_visibly_busy;
     use crate::agent::customization::ResolvedSpawnConfig;
     use crate::agent::registry::AgentStatusHandle;
-    use crate::backend::{BackendExecutionMode, BackendSpawnConfig, EventStream};
+    use crate::backend::{BackendExecutionMode, BackendSession, BackendSpawnConfig, EventStream};
     use crate::review::ReviewRegistry;
     use crate::store::project::ProjectStore;
     use crate::store::review::ReviewStore;
@@ -8258,6 +8282,8 @@ mod tests {
         .expect("spawn review registry");
         let (host_sub_agent_spawn_tx, _host_sub_agent_spawn_rx) = mpsc::unbounded_channel();
         let (capacity_tx, _capacity_rx) = mpsc::unbounded_channel();
+        let (session_summary_count_tx, _session_summary_count_rx) =
+            mpsc::unbounded_channel();
         let (status_handle, _status_rx) = AgentStatusHandle::new();
         let start = AgentStartPayload {
             backend_kind: protocol::BackendKind::Claude,
@@ -8299,6 +8325,7 @@ mod tests {
             session_store,
             host_sub_agent_spawn_tx,
             capacity_tx,
+            session_summary_count_tx,
             review_registry,
             status_handle: status_handle.clone(),
             antigravity_conversations_dir: dir.path().join("antigravity"),
@@ -8419,6 +8446,7 @@ mod tests {
                     session_store: Arc::clone(&session_store),
                     host_sub_agent_spawn_tx,
                     capacity_tx,
+                    session_summary_count_tx: mpsc::unbounded_channel().0,
                     review_registry,
                     status_handle: status_handle.clone(),
                     antigravity_conversations_dir: dir.path().join("antigravity"),
@@ -9380,6 +9408,92 @@ mod tests {
         ChatEvent::StreamEnd(StreamEndData { message })
     }
 
+    #[tokio::test]
+    async fn runtime_session_updates_publish_completed_assistant_turn_counts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(Mutex::new(
+            SessionStore::load(dir.path().join("sessions.json")).expect("session store"),
+        ));
+        let session_id = SessionId("counted-session".to_owned());
+        store
+            .lock()
+            .await
+            .upsert_backend_session(
+                &BackendSession {
+                    id: session_id.clone(),
+                    backend_kind: BackendKind::Hermes,
+                    workspace_roots: Vec::new(),
+                    title: None,
+                    token_count: None,
+                    created_at_ms: Some(1),
+                    updated_at_ms: Some(1),
+                    resumable: true,
+                },
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("seed session");
+
+        for event in [
+            ChatEvent::TypingStatusChanged(true),
+            stream_start("turn-1"),
+            metadata_update("turn-1", 3),
+            tool_request("tool-1"),
+            tool_completed("tool-1"),
+        ] {
+            assert_eq!(
+                apply_runtime_session_updates(&store, &session_id, &event).await,
+                None,
+                "{event:?} must not advance the assistant-turn count"
+            );
+        }
+        assert_eq!(
+            apply_runtime_session_updates(
+                &store,
+                &SessionId("missing-session".to_owned()),
+                &stream_end_with_usage("missing-turn", "not persisted", 2),
+            )
+            .await,
+            None,
+            "a missing authoritative session must not publish a count"
+        );
+        assert_eq!(
+            apply_runtime_session_updates(
+                &store,
+                &session_id,
+                &stream_end_with_usage("turn-1", "first", 5),
+            )
+            .await,
+            Some(protocol::SessionSummaryCountUpdatedPayload {
+                session_id: session_id.clone(),
+                assistant_turn_count: 1,
+            })
+        );
+        assert_eq!(
+            apply_runtime_session_updates(
+                &store,
+                &session_id,
+                &stream_end_with_usage("turn-2", "second", 7),
+            )
+            .await,
+            Some(protocol::SessionSummaryCountUpdatedPayload {
+                session_id: session_id.clone(),
+                assistant_turn_count: 2,
+            })
+        );
+        assert_eq!(
+            store
+                .lock()
+                .await
+                .get(&session_id)
+                .expect("persisted session")
+                .message_count,
+            2
+        );
+    }
+
     fn observe_stats(
         stats: &mut AgentActivityStatsTracker,
         mut event: ChatEvent,
@@ -9417,6 +9531,7 @@ mod tests {
             previous_summary: None,
             source_from_seq: Some(1),
             source_through_seq: Some(2),
+            session_settings: None,
             use_mock_backend: false,
             capacity_tx: tokio::sync::mpsc::unbounded_channel().0,
         }
@@ -10234,6 +10349,7 @@ mod tests {
             },
             session_store,
             SessionId("relay-session".to_owned()),
+            mpsc::unbounded_channel().0,
             status_handle,
         );
         let (output_tx, mut output_rx) = mpsc::unbounded_channel();
@@ -10320,6 +10436,7 @@ mod tests {
             },
             session_store,
             SessionId("relay-codex-session".to_owned()),
+            mpsc::unbounded_channel().0,
             status_handle,
         );
         let (live_tx, mut live_rx) = mpsc::unbounded_channel();
@@ -10715,6 +10832,7 @@ mod tests {
             },
             session_store,
             SessionId("relay-idle-session".to_owned()),
+            mpsc::unbounded_channel().0,
             status_handle,
         );
 
@@ -10881,12 +10999,28 @@ mod tests {
     }
 
     #[test]
-    fn generated_name_setup_selects_backend_inference_mode() {
-        let config = agent_name_generation_spawn_config();
+    fn hidden_inference_setup_preserves_scoped_hermes_session_settings() {
+        let mut settings = SessionSettingsValues::default();
+        settings.0.insert(
+            crate::backend::hermes::HERMES_PROFILE_SETTING.to_owned(),
+            SessionSettingValue::String("qa-minimax".to_owned()),
+        );
+        settings.0.insert(
+            "model".to_owned(),
+            SessionSettingValue::String("minimax/minimax-m3 --provider openrouter".to_owned()),
+        );
+        settings.0.insert(
+            "reasoning_effort".to_owned(),
+            SessionSettingValue::String("low".to_owned()),
+        );
+        settings
+            .0
+            .insert("fast".to_owned(), SessionSettingValue::Bool(true));
+        let config = agent_name_generation_spawn_config(Some(settings.clone()));
 
         assert!(config.startup_mcp_servers.is_empty());
         assert_eq!(config.execution_mode, BackendExecutionMode::InferenceOnly);
-        assert!(config.session_settings.is_none());
+        assert_eq!(config.session_settings, Some(settings));
         assert!(config.backend_config.0.is_empty());
         assert_eq!(
             config.resolved_spawn_config.access_mode,

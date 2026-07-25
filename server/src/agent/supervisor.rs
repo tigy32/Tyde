@@ -929,11 +929,25 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_spawn_preserves_scoped_hermes_profile() {
+    fn supervisor_spawn_preserves_scoped_hermes_session_settings() {
         let mut settings = SessionSettingsValues::default();
         settings.0.insert(
             crate::backend::hermes::HERMES_PROFILE_SETTING.to_string(),
             protocol::SessionSettingValue::String("work".to_string()),
+        );
+        settings.0.insert(
+            "model".to_owned(),
+            protocol::SessionSettingValue::String(
+                "minimax/minimax-m3 --provider openrouter".to_owned(),
+            ),
+        );
+        settings.0.insert(
+            "reasoning_effort".to_owned(),
+            protocol::SessionSettingValue::String("low".to_owned()),
+        );
+        settings.0.insert(
+            "fast".to_owned(),
+            protocol::SessionSettingValue::Bool(true),
         );
 
         let config = supervision_spawn_config(Some(SpawnCostHint::Low), Some(settings.clone()));
