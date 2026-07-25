@@ -299,6 +299,25 @@ pub fn spawn_new_chat(
         },
     };
 
+    // Enforce the draft's host binding here, where the target host and the
+    // payload are both known. The reactive guard that clears a foreign draft
+    // runs on a context change; relying on it alone leaves a window in which a
+    // synchronous submit right after a host switch could carry host A's
+    // backend override or profile id into a spawn against B. A profile id is
+    // meaningless in another host's catalog, and an override can name a backend
+    // B has disabled.
+    let draft_host = state.draft_selection_host.get_untracked();
+    let draft_matches_target = draft_host.as_deref().is_none_or(|bound| bound == host_id);
+    if !draft_matches_target {
+        log::warn!(
+            "spawn_new_chat: discarding a draft selection bound to {:?} for a spawn against {host_id}",
+            draft_host
+        );
+        state.draft_backend_override.set(None);
+        state.draft_launch_profile_id.set(None);
+        state.draft_selection_host.set(None);
+    }
+
     let backend_kind = match resolve_backend(state, &host_id) {
         Some(kind) => kind,
         None => {

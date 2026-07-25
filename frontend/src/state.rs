@@ -4130,6 +4130,70 @@ impl AppState {
         }
     }
 
+    /// The selection as it should currently be stored.
+    ///
+    /// Each half falls back to its *pending* form when it has not been applied
+    /// yet, so writing storage for one reason never discards the other's intent
+    /// — a chat that fails to restore must not take a still-valid profile
+    /// choice with it.
+    fn current_selection_snapshot(&self) -> PersistedWorkspaceSelection {
+        let live_chat = self.active_agent.get_untracked().and_then(|agent_ref| {
+            self.agents.with_untracked(|agents| {
+                agents
+                    .iter()
+                    .find(|agent| {
+                        agent.host_id == agent_ref.host_id && agent.agent_id == agent_ref.agent_id
+                    })
+                    .map(|agent| PersistedChatRef {
+                        host_id: agent_ref.host_id.clone(),
+                        agent_id: agent_ref.agent_id.clone(),
+                        project_id: agent.project_id.clone(),
+                        session_id: agent.session_id.clone(),
+                    })
+            })
+        });
+        let live_draft = self
+            .draft_selection_host
+            .get_untracked()
+            .map(|host_id| PersistedDraftSelection {
+                host_id,
+                backend: self.draft_backend_override.get_untracked(),
+                launch_profile: self.draft_launch_profile_id.get_untracked(),
+            })
+            .filter(|draft| !draft.is_empty());
+        PersistedWorkspaceSelection {
+            active_chat: live_chat.or_else(|| self.pending_active_chat_restore.get_untracked()),
+            draft: live_draft.or_else(|| self.pending_draft_restore.get_untracked()),
+        }
+    }
+
+    /// Write the current selection to storage immediately.
+    ///
+    /// The persistence effect only fires on a reactive change, and a restore
+    /// that *fails* changes nothing — so without this an unresolvable pointer
+    /// would be retried on every reload forever.
+    pub(crate) fn persist_selection_snapshot(&self) {
+        persist_workspace_selection(&self.current_selection_snapshot());
+    }
+
+    /// Forget a chat pointer that could not be restored, leaving any draft
+    /// intent alone.
+    pub(crate) fn retire_pending_chat_restore(&self) {
+        self.pending_active_chat_restore.set(None);
+        let mut snapshot = self.current_selection_snapshot();
+        snapshot.active_chat = None;
+        persist_workspace_selection(&snapshot);
+    }
+
+    /// Forget a draft selection that could not be restored, leaving any chat
+    /// intent alone.
+    pub(crate) fn retire_pending_draft_restore(&self) {
+        self.pending_draft_restore.set(None);
+        let mut snapshot = self.current_selection_snapshot();
+        snapshot.draft = None;
+        persist_workspace_selection(&snapshot);
+    }
+
     /// Abandon any pending restore because the user has just chosen what the
     /// center should show.
     ///
@@ -4139,9 +4203,6 @@ impl AppState {
     /// from `active_agent: Some` alone would let a late bootstrap insert the
     /// old chat over a choice the user had already made, which is both a focus
     /// steal and a project/backend identity contradiction.
-    ///
-    /// Retiring also unblocks the persistence effect, so the new selection is
-    /// what survives the next reload.
     pub fn retire_pending_restores(&self) {
         let had_chat = self
             .pending_active_chat_restore
@@ -4158,18 +4219,8 @@ impl AppState {
         }
         // The effect only writes once nothing is pending, and it may not re-run
         // for a change that happened before this call. Write the retirement
-        // through immediately so the abandoned pointer cannot come back.
-        persist_workspace_selection(&PersistedWorkspaceSelection {
-            active_chat: None,
-            draft: self
-                .chat_context_host_id_untracked()
-                .map(|host_id| PersistedDraftSelection {
-                    host_id,
-                    backend: self.draft_backend_override.get_untracked(),
-                    launch_profile: self.draft_launch_profile_id.get_untracked(),
-                })
-                .filter(|draft| !draft.is_empty()),
-        });
+        // through immediately so the abandoned intent cannot come back.
+        self.persist_selection_snapshot();
     }
 
     /// Whether the project at `(host_id, project_id)` accepts ProjectAddRoot /
@@ -4355,6 +4406,14 @@ impl AppState {
     }
 
     pub fn clear_host_runtime(&self, host_id: &str) {
+        // Paging metadata describes one subscriber snapshot. Carrying it across
+        // a disconnect would leave History offering a continuation cursor from
+        // a generation the new connection knows nothing about.
+        self.session_list_pages
+            .update(|pages| pages.retain(|(page_host, _), _| page_host != host_id));
+        self.session_list_refresh_in_flight.update(|hosts| {
+            hosts.remove(host_id);
+        });
         self.pending_agent_session_settings
             .update(|pending| pending.retain(|(pending_host, _), _| pending_host != host_id));
         let host_project_ids: HashSet<ProjectId> = self.projects.with_untracked(|projects| {

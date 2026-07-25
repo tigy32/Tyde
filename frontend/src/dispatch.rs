@@ -1245,12 +1245,20 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 let is_continuation = payload.page.cursor.offset > 0
                     && expected_continuation == Some(payload.page.cursor);
                 if payload.page.cursor.offset > 0 && !is_continuation {
+                    // A non-zero offset is never an authoritative first page, so
+                    // taking the replacement branch here would delete every
+                    // accumulated row and leave only a mid-list fragment. A
+                    // duplicate response, a double-clicked Load More, or a page
+                    // from a superseded generation all land here; the safe
+                    // answer to all three is to ignore the frame and keep the
+                    // list already held.
                     log::warn!(
-                        "session_list: replacing rather than appending an unexpected \
-                         continuation host={host_id} offset={} generation={:?}",
+                        "session_list: dropping an unexpected continuation \
+                         host={host_id} offset={} generation={:?}",
                         payload.page.cursor.offset,
                         payload.page.cursor.generation
                     );
+                    return;
                 }
                 let arriving: Vec<SessionInfo> = payload
                     .sessions
@@ -1281,6 +1289,14 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     sessions
                         .sort_by_key(|session| std::cmp::Reverse(session.summary.updated_at_ms));
                 });
+                if !is_continuation {
+                    // The refresh this client asked for has arrived; reopen the
+                    // gate. Keyed on the first page rather than on the socket
+                    // write, which completes long before the response.
+                    state.session_list_refresh_in_flight.update(|hosts| {
+                        hosts.remove(host_id);
+                    });
+                }
                 state.session_list_pages.update(|pages| {
                     // A first page for one scope invalidates any accumulated
                     // paging for the *other* scopes on this host: their rows
@@ -1307,12 +1323,6 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     // ordered by last activity, and a per-turn reshuffle would
                     // move rows under the reader's cursor. Only the count the
                     // server just recomputed changes here.
-                    // Whether this client holds the host's list in full. The
-                    // prefix argument for reordering only holds when it does:
-                    // with pages outstanding, an *unfetched* session can have
-                    // become the newest, so the rows on screen are no longer a
-                    // most-recent-first prefix and sorting them would assert an
-                    // order the server never published.
                     let list_is_complete = state.session_list_pages.with_untracked(|pages| {
                         let host_pages: Vec<_> = pages
                             .iter()
@@ -1335,24 +1345,24 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         // displayed date true instead of leaving it behind the
                         // count beside it.
                         session.summary.updated_at_ms = payload.updated_at_ms;
-                        if list_is_complete {
-                            sessions.sort_by_key(|session| {
-                                std::cmp::Reverse(session.summary.updated_at_ms)
-                            });
-                        }
+                        // Order the rows actually held, always. Whether an
+                        // *unfetched* session outranks them is a separate
+                        // question, answered by the refresh below; it is not a
+                        // reason to leave a row the client can see is newer
+                        // sitting beneath an older one.
+                        sessions
+                            .sort_by_key(|session| std::cmp::Reverse(session.summary.updated_at_ms));
                         true
                     });
 
-                    // The update named a session this client does not hold. With
-                    // the list complete that is simply another host's or a
-                    // deleted session and there is nothing to do. With pages
-                    // outstanding it means an unfetched session just became more
-                    // recent than rows currently on screen, so the visible page
-                    // is no longer authoritative. The frame carries only a count
-                    // and a timestamp — not enough to insert the row — so ask
-                    // the server to restate the first page rather than render an
-                    // order known to be wrong.
-                    if patched != Some(true) && !list_is_complete {
+                    // With pages outstanding the visible set is no longer a
+                    // most-recent-first prefix — an unfetched session may now
+                    // outrank everything on screen, and this frame carries only
+                    // a count and a timestamp, not enough to insert it. Ask the
+                    // server to restate the first page. This applies whether or
+                    // not the row itself was held: either way the *set* on
+                    // screen may no longer be the newest one.
+                    if !list_is_complete {
                         request_first_session_page(state, host_id);
                     }
                 }
@@ -5341,6 +5351,23 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
     state.native_settings_save_state.update(|states_by_host| {
         states_by_host.remove(host_id);
     });
+    // Bootstrap carries an authoritative first page *and* its paging metadata.
+    // Installing the rows without the metadata left History unable to offer a
+    // continuation the server had already advertised, and left a reconnect
+    // holding the previous subscriber's generation. Both are replaced together,
+    // and any stale refresh gate for this host is reopened.
+    let bootstrap_page_key = (
+        host_id.to_string(),
+        crate::state::session_list_scope_key(payload.session_list.scope),
+    );
+    let bootstrap_page = payload.session_list.clone();
+    state.session_list_pages.update(|pages| {
+        pages.retain(|(page_host, _), _| page_host != host_id);
+        pages.insert(bootstrap_page_key, bootstrap_page);
+    });
+    state.session_list_refresh_in_flight.update(|hosts| {
+        hosts.remove(host_id);
+    });
     state.sessions.update(|sessions| {
         sessions.retain(|session| session.host_id != host_id);
         sessions.extend(payload.sessions.into_iter().map(|summary| SessionInfo {
@@ -5510,30 +5537,50 @@ fn request_first_session_page(state: &AppState, host_id: &str) {
     if already_requested {
         return;
     }
+    // Refresh the result the user is actually looking at. Sending the default
+    // payload would answer a RootSessions or custom-limit view with the
+    // subscriber default and silently change what History shows.
+    let active_page = state.session_list_pages.with_untracked(|pages| {
+        pages
+            .iter()
+            .find(|((page_host, _), _)| page_host == host_id)
+            .map(|((_, _), page)| (page.scope, page.limit))
+    });
     let Some(host_stream) = state.host_stream_untracked(host_id) else {
         state.session_list_refresh_in_flight.update(|hosts| {
             hosts.remove(host_id);
         });
         return;
     };
+    let payload = match active_page {
+        Some((scope, limit)) => protocol::ListSessionsPayload {
+            scope: Some(scope),
+            cursor: None,
+            limit: Some(limit),
+        },
+        None => protocol::ListSessionsPayload::default(),
+    };
     let host_id = host_id.to_owned();
     let refresh_flag = state.session_list_refresh_in_flight;
     spawn_local(async move {
+        // The gate is released by the arriving first page, not here: a socket
+        // write completes long before the response, and clearing it now would
+        // let a burst of updates open overlapping refresh generations. It is
+        // released here only when the request could not be sent at all, so a
+        // transport failure cannot wedge every later refresh.
         if let Err(error) = crate::send::send_frame(
             &host_id,
             host_stream,
             FrameKind::ListSessions,
-            &protocol::ListSessionsPayload::default(),
+            &payload,
         )
         .await
         {
             log::error!("failed to refresh session list for {host_id}: {error}");
+            let _ = refresh_flag.try_update(|hosts| {
+                hosts.remove(&host_id);
+            });
         }
-        // Cleared on completion either way: a failed request must not wedge
-        // the marker and suppress every later refresh.
-        let _ = refresh_flag.try_update(|hosts| {
-            hosts.remove(&host_id);
-        });
     });
 }
 
@@ -5558,8 +5605,6 @@ fn restore_active_chat_after_host_bootstrap(state: &AppState, host_id: &str) {
     else {
         return;
     };
-    state.pending_active_chat_restore.set(None);
-
     let live = state.agents.with_untracked(|agents| {
         agents
             .iter()
@@ -5600,13 +5645,14 @@ fn restore_active_chat_after_host_bootstrap(state: &AppState, host_id: &str) {
         None => false,
     };
     if !restores_cleanly {
-        // Retire the stale pointer explicitly. The persist effect keys off
-        // `active_agent`, which does not change here, so nothing else would
-        // clear it and the same unresolvable chat would be retried every
-        // reload.
-        state.retire_pending_restores();
+        // Retire only this field. The persist effect keys off `active_agent`,
+        // which does not change here, so nothing else would clear it and the
+        // same unresolvable chat would be retried every reload — but a draft
+        // that is still pending is independent intent and must survive.
+        state.retire_pending_chat_restore();
         return;
     }
+    state.pending_active_chat_restore.set(None);
     let (name, _, _) = live.expect("checked above");
 
     let agent_ref = ActiveAgentRef {
@@ -5642,8 +5688,6 @@ fn restore_draft_selection_after_host_bootstrap(state: &AppState, host_id: &str)
     else {
         return;
     };
-    state.pending_draft_restore.set(None);
-
     let backend_enabled = pending.backend.is_none_or(|backend| {
         state
             .host_settings_untracked(host_id)
@@ -5673,15 +5717,19 @@ fn restore_draft_selection_after_host_bootstrap(state: &AppState, host_id: &str)
             "dropping restored draft selection for host={host_id}: \
              backend_enabled={backend_enabled} profile_ready={profile_ready}"
         );
-        state.retire_pending_restores();
+        state.retire_pending_draft_restore();
         return;
     }
 
+    state.pending_draft_restore.set(None);
     state.draft_backend_override.set(pending.backend);
     state.draft_launch_profile_id.set(pending.launch_profile);
     // Keep the binding alive past the restore: a later switch to another host
     // must drop this selection rather than carry it across.
     state.draft_selection_host.set(Some(host_id.to_owned()));
+    // The applied selection is now the live one; write it through so storage
+    // reflects reality even though the effect may not observe a change.
+    state.persist_selection_snapshot();
 }
 
 fn agent_info_from_payload(host_id: &str, payload: NewAgentPayload) -> AgentInfo {
@@ -6522,6 +6570,62 @@ mod tests {
                 None,
                 "a live agent attached to a different session is not the chat \
                  the user left"
+            );
+        });
+    }
+
+    /// R7701-07: the reactive guard clears a foreign draft on a context change,
+    /// but a submit in the same turn can beat it. The binding is therefore
+    /// enforced where the host and the payload are both known.
+    #[test]
+    fn spawning_after_a_host_switch_cannot_carry_the_old_hosts_selection() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            state.projects.update(|projects| {
+                projects.push(ProjectInfo {
+                    host_id: "host-b".to_owned(),
+                    project: restore_project("project-b"),
+                });
+            });
+            state.host_streams.update(|streams| {
+                streams.insert("host-b".to_owned(), StreamPath("/host".to_owned()));
+            });
+            // Real settings for host-b: Hermes is not among its enabled
+            // backends, so host-a's override would also bypass that setting.
+            let mut settings = restore_bootstrap(
+                vec![BackendKind::Claude],
+                Default::default(),
+                vec![restore_project("project-b")],
+                Vec::new(),
+            );
+            settings.settings.default_backend = Some(BackendKind::Claude);
+            apply_host_bootstrap(&state, "host-b", settings);
+
+            // A selection bound to host-a, still live in the global signals.
+            state.draft_backend_override.set(Some(BackendKind::Hermes));
+            state
+                .draft_launch_profile_id
+                .set(Some(LaunchProfileId("hermes:profile:qa".to_owned())));
+            state.draft_selection_host.set(Some("host-a".to_owned()));
+
+            // Target host-b without letting the reactive guard run.
+            state.active_project.set(Some(ActiveProjectRef {
+                host_id: "host-b".to_owned(),
+                project_id: ProjectId("project-b".to_owned()),
+            }));
+
+            crate::actions::spawn_new_chat(&state, "hello".to_owned(), None, |_| {});
+
+            assert_eq!(
+                state.draft_launch_profile_id.get_untracked(),
+                None,
+                "host-a's profile must not reach a spawn against host-b"
+            );
+            assert_eq!(
+                state.draft_selection_host.get_untracked(),
+                None,
+                "and its binding must not survive the spawn"
             );
         });
     }
@@ -8769,7 +8873,9 @@ mod wasm_tests {
             ),
         );
 
-        // A stale-generation page at the right offset must NOT be appended.
+        // A stale-generation page at the right offset must be dropped. A
+        // non-zero offset is never an authoritative first page, so replacing
+        // on it would delete page 1 and leave a mid-list fragment.
         dispatch_envelope(
             &state,
             "host-a",
@@ -8791,27 +8897,12 @@ mod wasm_tests {
             .collect();
         assert_eq!(
             host_a,
-            vec!["ghost"],
-            "a page from another generation replaces rather than merging into \
-             a list it does not continue"
+            vec!["s1", "s2"],
+            "a page from a superseded generation is ignored, and the list it \
+             does not continue survives intact"
         );
 
-        // Re-establish page 1, then deliver the advertised continuation.
-        dispatch_envelope(
-            &state,
-            "host-a",
-            session_list_envelope(
-                vec![
-                    listed_session("host-a", "s1", 1, 300).summary,
-                    listed_session("host-a", "s2", 2, 200).summary,
-                ],
-                2,
-                0,
-                4,
-                Some(2),
-                2,
-            ),
-        );
+        // The advertised continuation appends.
         dispatch_envelope(
             &state,
             "host-a",
@@ -8820,7 +8911,25 @@ mod wasm_tests {
                     listed_session("host-a", "s3", 3, 150).summary,
                     listed_session("host-a", "s4", 4, 100).summary,
                 ],
+                1,
                 2,
+                4,
+                None,
+                2,
+            ),
+        );
+
+        // A duplicate of that same continuation — a double-clicked Load More or
+        // a redelivered frame — must not be replayed as a first page.
+        dispatch_envelope(
+            &state,
+            "host-a",
+            session_list_envelope(
+                vec![
+                    listed_session("host-a", "s3", 3, 150).summary,
+                    listed_session("host-a", "s4", 4, 100).summary,
+                ],
+                1,
                 2,
                 4,
                 None,
@@ -8837,7 +8946,8 @@ mod wasm_tests {
         assert_eq!(
             host_a,
             vec!["s1", "s2", "s3", "s4"],
-            "the advertised continuation appends to page 1"
+            "the advertised continuation appends to page 1, and a duplicate of \
+             it neither replaces the list nor doubles its rows"
         );
         assert!(
             sessions.iter().any(|s| s.host_id == "host-b"),
@@ -8845,12 +8955,12 @@ mod wasm_tests {
         );
     }
 
-    /// RF-04: while pages are outstanding the visible rows are not a
-    /// most-recent-first prefix, because an *unfetched* session can have become
-    /// the newest. Reordering on that assumption would assert an order the
-    /// server never published, so it is withheld until the list is complete.
+    /// R7701-04: order the rows actually held, always — a row the client can
+    /// see is newer must not sit beneath an older one. Whether an *unfetched*
+    /// session outranks them is a separate question, answered by requesting a
+    /// fresh first page while pages remain outstanding.
     #[wasm_bindgen_test]
-    fn ordering_is_only_asserted_once_the_list_is_complete() {
+    fn known_rows_are_ordered_and_an_incomplete_list_is_refreshed() {
         reset_inbound_state_for_host("host-a");
         let state = AppState::new();
 
@@ -8880,9 +8990,10 @@ mod wasm_tests {
             .collect();
         assert_eq!(
             order,
-            vec!["s1", "s2"],
-            "with pages outstanding the client must not claim an order it \
-             cannot know is correct"
+            vec!["s2", "s1"],
+            "a row the client can see is newer must move ahead immediately; \
+             uncertainty about unfetched rows is no reason to render an order \
+             known to be wrong"
         );
         assert_eq!(
             state
@@ -8893,9 +9004,15 @@ mod wasm_tests {
                 .expect("s2 listed")
                 .summary
                 .updated_at_ms,
-            900,
-            "the row's own facts are still updated — only the ordering claim \
-             is withheld"
+            900
+        );
+        assert!(
+            state
+                .session_list_refresh_in_flight
+                .get_untracked()
+                .contains("host-a"),
+            "and with pages outstanding a first-page refresh is requested, \
+             because an unfetched row may outrank everything on screen"
         );
 
         // Complete list: ordering becomes the client's to maintain.
@@ -8927,6 +9044,203 @@ mod wasm_tests {
             order,
             vec!["c2", "c1"],
             "with the whole list held, the refreshed row takes its place"
+        );
+    }
+
+    /// R7701-01: a chat that cannot be restored must forget itself, and must
+    /// not take an independent, still-valid draft choice with it.
+    #[wasm_bindgen_test]
+    async fn a_failed_chat_restore_retires_only_itself() {
+        clear_workspace_storage();
+        reset_inbound_state_for_host("host-a");
+
+        crate::state::persist_workspace_selection_for_tests(
+            &crate::state::PersistedWorkspaceSelection {
+                active_chat: Some(crate::state::PersistedChatRef {
+                    host_id: "host-a".to_owned(),
+                    agent_id: AgentId("agent-dead".to_owned()),
+                    project_id: None,
+                    session_id: Some(protocol::SessionId("session-dead".to_owned())),
+                }),
+                draft: Some(crate::state::PersistedDraftSelection {
+                    host_id: "host-a".to_owned(),
+                    backend: Some(BackendKind::Hermes),
+                    launch_profile: None,
+                }),
+            },
+        );
+
+        let state = AppState::new();
+        // The host bootstraps without that agent.
+        apply_host_bootstrap(
+            &state,
+            "host-a",
+            restore_bootstrap(
+                vec![BackendKind::Hermes],
+                Default::default(),
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        next_tick().await;
+
+        let stored = crate::state::load_workspace_selection_for_tests();
+        assert!(
+            stored.active_chat.is_none(),
+            "a dead pointer must be forgotten, not retried on every reload"
+        );
+        assert_eq!(
+            state.draft_backend_override.get_untracked(),
+            Some(BackendKind::Hermes),
+            "the draft is independent intent and must still be applied"
+        );
+        assert_eq!(
+            stored.draft.and_then(|draft| draft.backend),
+            Some(BackendKind::Hermes),
+            "and must survive in storage"
+        );
+
+        clear_workspace_storage();
+    }
+
+    /// R7701-01, mirrored: a draft the host will not honour must forget itself
+    /// without disturbing a chat that restored perfectly well.
+    #[wasm_bindgen_test]
+    async fn a_failed_draft_restore_retires_only_itself() {
+        clear_workspace_storage();
+        reset_inbound_state_for_host("host-a");
+
+        crate::state::persist_workspace_selection_for_tests(
+            &crate::state::PersistedWorkspaceSelection {
+                active_chat: Some(crate::state::PersistedChatRef {
+                    host_id: "host-a".to_owned(),
+                    agent_id: AgentId("agent-a".to_owned()),
+                    project_id: None,
+                    session_id: Some(protocol::SessionId("session-a".to_owned())),
+                }),
+                draft: Some(crate::state::PersistedDraftSelection {
+                    host_id: "host-a".to_owned(),
+                    // Disabled on the host below.
+                    backend: Some(BackendKind::Hermes),
+                    launch_profile: None,
+                }),
+            },
+        );
+
+        let state = AppState::new();
+        apply_host_bootstrap(
+            &state,
+            "host-a",
+            restore_bootstrap(
+                vec![BackendKind::Claude],
+                Default::default(),
+                Vec::new(),
+                vec![restore_agent_payload_with_session(
+                    "agent-a",
+                    None,
+                    Some("session-a"),
+                )],
+            ),
+        );
+        next_tick().await;
+
+        assert_eq!(
+            state.active_agent.get_untracked(),
+            Some(ActiveAgentRef {
+                host_id: "host-a".to_owned(),
+                agent_id: AgentId("agent-a".to_owned()),
+            }),
+            "the chat restored and must not be collateral damage"
+        );
+        let stored = crate::state::load_workspace_selection_for_tests();
+        assert!(
+            stored.draft.is_none(),
+            "a selection the host has disabled must be forgotten"
+        );
+        assert!(
+            stored.active_chat.is_some(),
+            "while the restored chat stays stored for the next reload"
+        );
+
+        clear_workspace_storage();
+    }
+
+    /// R7701-02: bootstrap carries the authoritative first page *and* its
+    /// paging metadata, so History can offer the continuation from a cold
+    /// start — and a reconnect must not keep the previous generation's cursor.
+    #[wasm_bindgen_test]
+    fn bootstrap_installs_its_own_paging_metadata() {
+        reset_inbound_state_for_host("host-a");
+        let state = AppState::new();
+
+        let mut payload = restore_bootstrap(
+            vec![BackendKind::Hermes],
+            Default::default(),
+            Vec::new(),
+            Vec::new(),
+        );
+        payload.sessions = vec![listed_session("host-a", "s1", 1, 300).summary];
+        payload.session_list = protocol::SessionListPageInfo {
+            scope: Default::default(),
+            cursor: protocol::SessionListCursor {
+                generation: protocol::SessionListGeneration(1),
+                offset: 0,
+            },
+            limit: 1,
+            total_count: 3,
+            status: protocol::SessionListPageStatus::More {
+                next_cursor: protocol::SessionListCursor {
+                    generation: protocol::SessionListGeneration(1),
+                    offset: 1,
+                },
+            },
+        };
+        apply_host_bootstrap(&state, "host-a", payload);
+
+        let page = state
+            .session_list_pages
+            .get_untracked()
+            .into_iter()
+            .find(|((host, _), _)| host == "host-a")
+            .map(|(_, page)| page)
+            .expect("bootstrap must publish its paging metadata");
+        assert!(
+            matches!(page.status, protocol::SessionListPageStatus::More { .. }),
+            "a cold start with more history must expose its continuation"
+        );
+
+        // Reconnect with a new generation: only the new cursor may remain.
+        let mut payload = restore_bootstrap(
+            vec![BackendKind::Hermes],
+            Default::default(),
+            Vec::new(),
+            Vec::new(),
+        );
+        payload.sessions = vec![listed_session("host-a", "s1", 1, 300).summary];
+        payload.session_list = protocol::SessionListPageInfo {
+            scope: Default::default(),
+            cursor: protocol::SessionListCursor {
+                generation: protocol::SessionListGeneration(9),
+                offset: 0,
+            },
+            limit: 1,
+            total_count: 1,
+            status: protocol::SessionListPageStatus::Complete,
+        };
+        apply_host_bootstrap(&state, "host-a", payload);
+
+        let pages = state.session_list_pages.get_untracked();
+        let host_pages: Vec<_> = pages
+            .iter()
+            .filter(|((host, _), _)| host == "host-a")
+            .collect();
+        assert_eq!(host_pages.len(), 1, "no stale generation may linger");
+        assert!(
+            matches!(
+                host_pages[0].1.status,
+                protocol::SessionListPageStatus::Complete
+            ),
+            "the reconnect's own metadata replaces the previous subscriber's"
         );
     }
 

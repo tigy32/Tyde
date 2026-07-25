@@ -230,8 +230,12 @@ pub fn SessionsPanel() -> impl IntoView {
                         } else {
                             "No matching sessions"
                         };
+                        // Still offer the continuation: a filter that matches
+                        // nothing on the pages fetched so far says nothing
+                        // about the pages that have not been.
                         view! {
                             <div class="panel-empty">{msg}</div>
+                            {load_more_button(state.clone())}
                         }.into_any()
                     } else {
                         view! {
@@ -260,7 +264,15 @@ fn load_more_button(state: AppState) -> impl IntoView {
     let next_page = {
         let state = state.clone();
         Memo::new(move |_| {
-            let host_id = state.selected_host_id.get()?;
+            // The host whose rows this panel is showing, which is the active
+            // project's host — not `selected_host_id`, an independent Settings
+            // choice. Reading the latter could hide host A's continuation while
+            // offering (and sending) host B's cursor.
+            let host_id = state
+                .active_project
+                .get()
+                .map(|project| project.host_id)
+                .or_else(|| state.selected_host_id.get())?;
             state.session_list_pages.with(|pages| {
                 pages
                     .iter()
