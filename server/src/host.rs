@@ -5244,10 +5244,7 @@ impl HostHandle {
         }
         {
             let mut state = self.state.lock().await;
-            dead_paths.extend(release_new_agent_fanout_holds(
-                &mut state,
-                &fanout_paths,
-            ));
+            dead_paths.extend(release_new_agent_fanout_holds(&mut state, &fanout_paths));
         }
         if let Some(request) = generated_name_request {
             self.schedule_generated_agent_name(agent_handle.clone(), request);
@@ -5603,10 +5600,7 @@ impl HostHandle {
         }
         {
             let mut state = self.state.lock().await;
-            dead_paths.extend(release_new_agent_fanout_holds(
-                &mut state,
-                &fanout_paths,
-            ));
+            dead_paths.extend(release_new_agent_fanout_holds(&mut state, &fanout_paths));
         }
         for attachment in deferred_attachments {
             self.attach_deferred_agent_stream(attachment).await;
@@ -10410,10 +10404,7 @@ impl HostHandle {
         }
         {
             let mut state = self.state.lock().await;
-            dead_paths.extend(release_new_agent_fanout_holds(
-                &mut state,
-                &fanout_paths,
-            ));
+            dead_paths.extend(release_new_agent_fanout_holds(&mut state, &fanout_paths));
         }
         for attachment in deferred_attachments {
             self.attach_deferred_agent_stream(attachment).await;
@@ -16527,9 +16518,7 @@ fn emit_or_queue_host_frame(
     kind: FrameKind,
     payload: serde_json::Value,
 ) -> Result<(), StreamClosed> {
-    if kind == FrameKind::SessionSummaryCountUpdated
-        && subscriber.new_agent_fanouts_in_flight > 0
-    {
+    if kind == FrameKind::SessionSummaryCountUpdated && subscriber.new_agent_fanouts_in_flight > 0 {
         subscriber.held_summary_count_frames.push(payload);
         return Ok(());
     }
@@ -16608,11 +16597,7 @@ fn release_new_agent_fanout_hold(subscriber: &mut HostSubscriber) -> Result<(), 
         return Ok(());
     }
     for payload in std::mem::take(&mut subscriber.held_summary_count_frames) {
-        emit_or_queue_host_frame(
-            subscriber,
-            FrameKind::SessionSummaryCountUpdated,
-            payload,
-        )?;
+        emit_or_queue_host_frame(subscriber, FrameKind::SessionSummaryCountUpdated, payload)?;
     }
     Ok(())
 }
@@ -21482,8 +21467,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
     #[test]
     fn cancelled_fanout_still_authorizes_and_signals_publication() {
         let agent_id = AgentId(Uuid::new_v4().to_string());
-        let visibility =
-            SpawnVisibility::new(agent_id.clone(), AgentVisibilityRegistry::default());
+        let visibility = SpawnVisibility::new(agent_id.clone(), AgentVisibilityRegistry::default());
         assert!(visibility.begin_fanout());
         visibility.cancel_outer_spawn();
         let (publish_tx, mut publish_rx) = mpsc::unbounded_channel();
@@ -22866,10 +22850,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         let (agent_id, session_id) =
             spawn_idle_user_agent(&fixture.host, "persist a response before subscribing").await;
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let host_path = StreamPath(format!(
-            "/host/session-count-snapshot-{}",
-            Uuid::new_v4()
-        ));
+        let host_path = StreamPath(format!("/host/session-count-snapshot-{}", Uuid::new_v4()));
         let host_stream = Stream::new(host_path.clone(), tx);
         assert!(
             fixture
