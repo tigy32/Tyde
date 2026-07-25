@@ -20,7 +20,16 @@ use crate::state::{ActiveAgentRef, ChatRowHandle, ToolRequestEntry};
 /// `content_offset` comes from `tool.start`, which is an authoritative
 /// **provider-response boundary**: the text before it and the text after it
 /// were produced by different provider calls.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Deliberately not `PartialEq`. Comparing segments by value would require
+/// `ToolRequestEntry: PartialEq`, and neither `ToolRequest` nor
+/// `ToolExecutionCompletedData` derives it — so satisfying that would mean
+/// adding derives to two protocol types to serve a frontend convenience. It
+/// would also be a poor comparison: both carry `serde_json::Value` payloads,
+/// where `==` is structural JSON equality and says nothing about whether two
+/// entries are the same tool card. A tool entry's identity is its
+/// `tool_call_id`, which is what the tests compare.
+#[derive(Debug, Clone)]
 pub(crate) enum MessageSegment {
     Content(String),
     Tools {
