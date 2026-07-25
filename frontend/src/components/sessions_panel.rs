@@ -222,6 +222,33 @@ pub fn SessionsPanel() -> impl IntoView {
         })
     };
 
+    // The hosts this panel is responsible for, each paired with the connection
+    // it is currently reachable on.
+    //
+    // Pairing with the live `StreamPath` — rather than tracking host IDs alone
+    // — is what makes the request effect below correct on the real startup
+    // order. `app.rs` awaits `refresh_configured_hosts`, which publishes
+    // `selected_host_id`, and only *afterwards* loops into `connect_one_host`,
+    // which inserts the stream. A host-ID-only dependency therefore settles
+    // while the host is still unreachable, and — `rendered_hosts` being a memo
+    // whose value does not change when the stream appears — is never woken
+    // again. Reading `host_streams` here makes connecting a host an observable
+    // event, and makes reconnecting one a *different* observable event.
+    let connected_hosts = {
+        let state = state.clone();
+        Memo::new(move |_| {
+            let hosts = rendered_hosts.get();
+            state.host_streams.with(|streams| {
+                hosts
+                    .into_iter()
+                    .filter_map(|host_id| {
+                        streams.get(&host_id).map(|stream| (host_id, stream.clone()))
+                    })
+                    .collect::<Vec<(String, StreamPath)>>()
+            })
+        })
+    };
+
     // Ask every host this panel is showing for its authoritative first page.
     //
     // Sending only to `selected_host_id` refreshed whichever host Settings
@@ -232,10 +259,15 @@ pub fn SessionsPanel() -> impl IntoView {
     // Everything the send needs is resolved *before* spawning: reading a signal
     // after an await means reading it after the panel may have unmounted, and a
     // disposed signal panics rather than returning `None`.
-    fn request_authoritative_pages(state: &AppState, hosts: &[String], force: bool) {
-        let requests: Vec<(String, StreamPath, ListSessionsPayload)> = hosts
+    fn request_authoritative_pages(
+        state: &AppState,
+        targets: &[(String, StreamPath)],
+        force: bool,
+        requested: RwSignal<HashSet<(String, StreamPath)>>,
+    ) {
+        let requests: Vec<(String, StreamPath, ListSessionsPayload)> = targets
             .iter()
-            .filter_map(|host_id| {
+            .filter_map(|(host_id, host_stream)| {
                 // Automatic requests take one slot per host, so a burst of
                 // reasons to refresh cannot become a burst of requests. An
                 // explicit Refresh always sends: a user who presses it and gets
@@ -247,12 +279,6 @@ pub fn SessionsPanel() -> impl IntoView {
                 if !claimed && !force {
                     return None;
                 }
-                let Some(host_stream) = state.host_stream_untracked(host_id) else {
-                    state.session_list_refresh_in_flight.update(|hosts| {
-                        hosts.remove(host_id);
-                    });
-                    return None;
-                };
                 // Ask for the scope/limit this host's view is actually using.
                 let payload = state.session_list_pages.with_untracked(|pages| {
                     pages
@@ -265,58 +291,85 @@ pub fn SessionsPanel() -> impl IntoView {
                         })
                         .unwrap_or_default()
                 });
-                Some((host_id.clone(), host_stream, payload))
+                Some((host_id.clone(), host_stream.clone(), payload))
             })
             .collect();
         for (host_id, host_stream, payload) in requests {
             let refresh_flag = state.session_list_refresh_in_flight;
+            // Claim the connection only now that a frame is genuinely going
+            // out. Recording it earlier — while merely *considering* a host —
+            // burns the one-shot on a host that turned out to be unreachable,
+            // and nothing can hand it back.
+            let claim = (host_id.clone(), host_stream.clone());
+            let _ = requested.try_update(|seen| {
+                seen.insert(claim.clone());
+            });
             spawn_local(async move {
                 if let Err(e) =
                     send_frame(&host_id, host_stream, FrameKind::ListSessions, &payload).await
                 {
                     log::error!("failed to send ListSessions to {host_id}: {e}");
-                    // Nothing is in flight after a failed send; releasing here
-                    // stops one failure suppressing every later refresh.
+                    // Nothing reached the host after a failed send, so neither
+                    // the in-flight slot nor the connection claim describes
+                    // anything real; holding either would suppress every later
+                    // attempt on this connection.
                     let _ = refresh_flag.try_update(|hosts| {
                         hosts.remove(&host_id);
+                    });
+                    let _ = requested.try_update(|seen| {
+                        seen.remove(&claim);
                     });
                 }
             });
         }
     }
 
-    // Opening History must not show whatever the bootstrap happened to leave
-    // behind. Bootstrap counts are a snapshot from connect time, and the live
-    // run showed a session sitting at `0 responses` after four completed turns
+    // History must not show whatever the bootstrap happened to leave behind.
+    // Bootstrap counts are a snapshot from connect time, and the live run
+    // showed a session sitting at `0 responses` after four completed turns
     // because nothing on this path ever asked for anything newer. This request
     // is also what establishes the server-side session-summary subscription,
     // so subsequent turn updates arrive without a manual Refresh.
     //
-    // Requested once per host per open. The effect tracks `rendered_hosts`,
-    // which the arriving page itself mutates, so without this it would re-fire
-    // on its own response and request forever. A host entering the set later —
-    // a project switch, a host connecting — is new and does get its request.
-    let requested_hosts: RwSignal<HashSet<String>> = RwSignal::new(HashSet::new());
-    let state_for_mount = state.clone();
+    // Not gated on the panel being visible, and deliberately so: `RightDock`
+    // mounts every panel permanently and hides them with `display: none`, and
+    // the subscription this request establishes has to exist *before* the
+    // turns whose counts it carries. Waiting for the user to look at History
+    // would drop every update sent before they did.
+    //
+    // Requested once per host connection. The one-shot is keyed by
+    // `(host_id, StreamPath)` so that a reconnect — a genuinely new server-side
+    // stream with no subscription on it — is asked again, while the page this
+    // request itself produces is not mistaken for a reason to ask twice.
+    let requested_connections: RwSignal<HashSet<(String, StreamPath)>> =
+        RwSignal::new(HashSet::new());
+    let state_for_request = state.clone();
     Effect::new(move |_| {
-        let hosts = rendered_hosts.get();
-        let fresh: Vec<String> = requested_hosts
-            .try_update(|requested| {
-                hosts
+        let targets = connected_hosts.get();
+        // Untracked: the claims recorded by the dispatch below must not be a
+        // dependency of the effect that records them.
+        let fresh: Vec<(String, StreamPath)> = requested_connections
+            .try_with_untracked(|requested| {
+                targets
                     .into_iter()
-                    .filter(|host_id| requested.insert(host_id.clone()))
+                    .filter(|target| !requested.contains(target))
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
         if fresh.is_empty() {
             return;
         }
-        request_authoritative_pages(&state_for_mount, &fresh, false);
+        request_authoritative_pages(&state_for_request, &fresh, false, requested_connections);
     });
 
     let state_for_refresh = state.clone();
     let on_refresh = move |_| {
-        request_authoritative_pages(&state_for_refresh, &rendered_hosts.get_untracked(), true);
+        request_authoritative_pages(
+            &state_for_refresh,
+            &connected_hosts.get_untracked(),
+            true,
+            requested_connections,
+        );
     };
 
     view! {
@@ -887,5 +940,278 @@ mod tests {
         assert!(!session_passes_filters(&s, &filters, None, "nope"));
         // Empty query passes all (subject to other filters).
         assert!(session_passes_filters(&s, &filters, None, ""));
+    }
+}
+
+/// Lifecycle coverage for the authoritative first-page request.
+///
+/// These mount the panel **before** the host connects, which is the order
+/// production actually produces: `app.rs` awaits `refresh_configured_hosts`
+/// (publishing `selected_host_id`) and only then loops into `connect_one_host`
+/// (inserting the stream). The pre-existing tests in `dispatch.rs` seed
+/// `host_streams` before mounting — the inverse order — so they could not
+/// observe a host that becomes reachable late. They still hold; this module
+/// covers the ordering they cannot express.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use leptos::mount::mount_to;
+    use protocol::{SessionId, SessionSummary};
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::*;
+    use web_sys::HtmlElement;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    async fn next_tick() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
+                .unwrap();
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    /// Let the reactive graph and any spawned send settle.
+    async fn settle() {
+        for _ in 0..4 {
+            next_tick().await;
+        }
+    }
+
+    fn listed_session(host: &str, id: &str, count: u32, updated: u64) -> SessionInfo {
+        SessionInfo {
+            host_id: host.to_owned(),
+            summary: SessionSummary {
+                id: SessionId(id.to_owned()),
+                backend_kind: BackendKind::Hermes,
+                launch_profile_id: None,
+                workspace_roots: vec![],
+                project_id: None,
+                alias: None,
+                user_alias: None,
+                parent_id: None,
+                created_at_ms: 0,
+                updated_at_ms: updated,
+                message_count: count,
+                token_count: None,
+                resumable: true,
+                compacted_from_session_id: None,
+                compacted_to_session_id: None,
+                compacted_at_ms: None,
+                compaction_summary_preview: None,
+            },
+        }
+    }
+
+    fn install_send_stub() {
+        js_sys::eval(
+            r#"
+            (function() {
+                window.__test_send_calls = [];
+                window.__TAURI__ = window.__TAURI__ || {};
+                window.__TAURI__.core = window.__TAURI__.core || {};
+                window.__TAURI__.core.invoke = function(cmd, args) {
+                    window.__test_send_calls.push([cmd, JSON.stringify(args || {})]);
+                    return Promise.resolve();
+                };
+                window.__TAURI__.event = window.__TAURI__.event || {};
+                window.__TAURI__.event.listen = function() { return Promise.resolve(null); };
+            })();
+            "#,
+        )
+        .expect("install send stub");
+    }
+
+    /// Every `list_sessions` frame that actually went out, as
+    /// `(host_id, stream)`, in order. Both halves are read back off the
+    /// outbound envelope rather than from what the UI intended, so a request
+    /// aimed at a connection that no longer exists is visible as one.
+    fn list_sessions_targets() -> Vec<(String, String)> {
+        let raw = js_sys::eval(
+            r#"
+            (function() {
+                const out = [];
+                for (const [cmd, args] of (window.__test_send_calls || [])) {
+                    if (cmd !== "send_host_line") continue;
+                    const parsed = JSON.parse(args);
+                    const env = JSON.parse(parsed.line);
+                    if (env.kind !== "list_sessions") continue;
+                    out.push([parsed.hostId || parsed.host_id, env.stream]);
+                }
+                return JSON.stringify(out);
+            })()
+            "#,
+        )
+        .expect("probe list_sessions frames")
+        .as_string()
+        .unwrap_or_else(|| "[]".to_owned());
+        serde_json::from_str(&raw).expect("probe returns [host, stream] pairs")
+    }
+
+    /// Takes the state by value so the returned mount handle borrows nothing:
+    /// the handle must outlive the call, and every test mutates the same state
+    /// afterwards to drive connects and disconnects.
+    fn mount_panel(state: AppState) -> (HtmlElement, impl Sized) {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document
+            .create_element("div")
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(state.clone());
+            view! { <SessionsPanel /> }
+        });
+        (container, handle)
+    }
+
+    fn connect(state: &AppState, host_id: &str, stream: &str) {
+        state.host_streams.update(|streams| {
+            streams.insert(host_id.to_owned(), StreamPath(stream.to_owned()));
+        });
+    }
+
+    /// The run-27 defect. On the real startup order the panel is already
+    /// mounted when the host connects, so a request keyed to the host alone is
+    /// decided while nothing is reachable and never reconsidered: no
+    /// `ListSessions` is sent for the lifetime of the page, the server-side
+    /// summary subscription is never established, and History sits on the
+    /// bootstrap snapshot until a reload — exactly the live M7 symptom.
+    #[wasm_bindgen_test]
+    async fn a_host_connecting_after_mount_is_still_asked_for_its_first_page() {
+        install_send_stub();
+        let state = AppState::new();
+        state.active_project.set(None);
+        state.selected_host_id.set(Some("host-a".to_owned()));
+        // Bootstrap left a stale row: the session existed at connect time with
+        // no completed turns.
+        state
+            .sessions
+            .set(vec![listed_session("host-a", "session-1", 0, 100)]);
+
+        let (container, _handle) = mount_panel(state.clone());
+        settle().await;
+
+        assert_eq!(
+            list_sessions_targets(),
+            Vec::<(String, String)>::new(),
+            "nothing is reachable yet, so nothing may be claimed as requested"
+        );
+        assert!(
+            container
+                .text_content()
+                .unwrap_or_default()
+                .contains("0 responses"),
+            "precondition: the bootstrap snapshot is what is on screen"
+        );
+
+        // `connect_one_host` inserts the stream — after the panel mounted.
+        connect(&state, "host-a", "/host-1");
+        settle().await;
+
+        assert_eq!(
+            list_sessions_targets(),
+            vec![("host-a".to_owned(), "/host-1".to_owned())],
+            "a host that becomes reachable after mount must still be asked for \
+             its authoritative page on the connection it is reachable on"
+        );
+
+        settle().await;
+        assert_eq!(
+            list_sessions_targets().len(),
+            1,
+            "and asked exactly once — the request must not repeat while the \
+             connection is unchanged"
+        );
+    }
+
+    /// A reconnect is a new server-side stream with no subscription on it.
+    /// Keying the one-shot by host ID alone left the client permanently silent
+    /// after any reconnect; keying it by connection asks the live stream and
+    /// never the dead one.
+    #[wasm_bindgen_test]
+    async fn reconnecting_a_host_asks_the_new_connection_and_not_the_dead_one() {
+        install_send_stub();
+        let state = AppState::new();
+        state.active_project.set(None);
+        state.selected_host_id.set(Some("host-a".to_owned()));
+        state
+            .sessions
+            .set(vec![listed_session("host-a", "session-1", 0, 100)]);
+
+        let (_container, _handle) = mount_panel(state.clone());
+        settle().await;
+        connect(&state, "host-a", "/host-1");
+        settle().await;
+        assert_eq!(
+            list_sessions_targets(),
+            vec![("host-a".to_owned(), "/host-1".to_owned())],
+            "precondition: the first connection was asked"
+        );
+
+        // Disconnect exactly as `app.rs` does: drop the stream and clear the
+        // host's runtime state, which is what releases the in-flight slot the
+        // first request took and whose answer will now never arrive.
+        state.host_streams.update(|streams| {
+            streams.remove("host-a");
+        });
+        state.clear_host_runtime("host-a");
+        settle().await;
+
+        // `connect_one_host` generates a fresh stream path per connection.
+        connect(&state, "host-a", "/host-2");
+        settle().await;
+
+        assert_eq!(
+            list_sessions_targets(),
+            vec![
+                ("host-a".to_owned(), "/host-1".to_owned()),
+                ("host-a".to_owned(), "/host-2".to_owned()),
+            ],
+            "the reconnected stream must be asked in its own right, and the \
+             request must go to the new stream rather than the dead one"
+        );
+    }
+
+    /// Multi-host, staggered connects: hosts are asked independently, each on
+    /// its own connection, and one host's request neither covers nor suppresses
+    /// another's.
+    #[wasm_bindgen_test]
+    async fn each_host_is_asked_once_as_it_connects() {
+        install_send_stub();
+        let state = AppState::new();
+        state.active_project.set(None);
+        state.selected_host_id.set(Some("host-a".to_owned()));
+        state.sessions.set(vec![
+            listed_session("host-a", "a1", 0, 300),
+            listed_session("host-b", "b1", 2, 200),
+        ]);
+
+        let (_container, _handle) = mount_panel(state.clone());
+        settle().await;
+        connect(&state, "host-a", "/host-a-1");
+        settle().await;
+
+        assert_eq!(
+            list_sessions_targets(),
+            vec![("host-a".to_owned(), "/host-a-1".to_owned())],
+            "only the connected host is asked; the other is not yet reachable"
+        );
+
+        connect(&state, "host-b", "/host-b-1");
+        settle().await;
+
+        assert_eq!(
+            list_sessions_targets(),
+            vec![
+                ("host-a".to_owned(), "/host-a-1".to_owned()),
+                ("host-b".to_owned(), "/host-b-1".to_owned()),
+            ],
+            "a host connecting later gets its own request, and the host that \
+             already had one is not asked again"
+        );
     }
 }
