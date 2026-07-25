@@ -1266,11 +1266,6 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 state.session_list_pages.update(|pages| {
                     pages.insert(host_id.to_string(), payload.page);
                 });
-                // An authoritative list supersedes any per-turn count patches,
-                // including the activity ordering they could not update.
-                state.sessions_with_newer_activity.update(|stale| {
-                    stale.retain(|(stale_host, _)| stale_host != host_id);
-                });
             }
             Err(error) => report_dispatch_error(
                 state,
@@ -1288,32 +1283,33 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     // ordered by last activity, and a per-turn reshuffle would
                     // move rows under the reader's cursor. Only the count the
                     // server just recomputed changes here.
-                    let patched = state.sessions.try_update(|sessions| {
+                    state.sessions.update(|sessions| {
                         // A session this client has not listed yet needs no
                         // action: the next SessionList/HostBootstrap carries the
-                        // authoritative count, so inventing a row here would
+                        // authoritative row, so inventing one here would
                         // fabricate a summary we do not have.
                         let Some(session) = sessions.iter_mut().find(|session| {
                             session.host_id == host_id && session.summary.id == payload.session_id
                         }) else {
-                            return false;
+                            return;
                         };
                         session.summary.message_count = payload.assistant_turn_count;
-                        true
-                    });
-                    if patched == Some(true) {
-                        // The turn also advanced the session's last activity,
-                        // but this frame carries only the count, so the
-                        // displayed date is now older than the truth. Mark it
-                        // rather than render a stale date as current or invent
-                        // a client-side timestamp. Ordering is deliberately
-                        // left alone for the same reason: without the
-                        // authoritative timestamp any reorder would be a guess,
-                        // and it would move rows under the reader mid-scroll.
-                        state.sessions_with_newer_activity.update(|stale| {
-                            stale.insert((host_id.to_string(), payload.session_id.clone()));
+                        // The turn advanced last-activity too, and the frame now
+                        // carries the server's own value. Taking it keeps the
+                        // displayed date true instead of leaving it behind the
+                        // count beside it.
+                        session.summary.updated_at_ms = payload.updated_at_ms;
+                        // Re-sort on the same key the list is defined by. The
+                        // client holds a most-recent-first *prefix* of the
+                        // server's order, so a row whose activity advanced can
+                        // only need to move earlier — never past rows it has
+                        // not fetched, which are all older. Leaving it in place
+                        // would show a fresh date sitting below stale ones, and
+                        // the next list frame would jump it anyway.
+                        sessions.sort_by_key(|session| {
+                            std::cmp::Reverse(session.summary.updated_at_ms)
                         });
-                    }
+                    });
                 }
                 Err(error) => report_dispatch_error(
                     state,
@@ -8301,13 +8297,19 @@ mod wasm_tests {
             .expect("payload serializes")
     }
 
-    fn count_update_envelope(session_id: &str, turns: u32, seq: u64) -> Envelope {
+    fn count_update_envelope(
+        session_id: &str,
+        turns: u32,
+        updated_at_ms: u64,
+        seq: u64,
+    ) -> Envelope {
         host_frame(
             FrameKind::SessionSummaryCountUpdated,
             seq,
             &SessionSummaryCountUpdatedPayload {
                 session_id: protocol::SessionId(session_id.to_owned()),
                 assistant_turn_count: turns,
+                updated_at_ms,
             },
         )
     }
@@ -8351,21 +8353,50 @@ mod wasm_tests {
             listed_session("host-b", "session-1", 3, 300),
         ]);
 
-        dispatch_envelope(&state, "host-a", count_update_envelope("session-1", 4, 0));
+        // Newest activity of the three, so it must also become the first row.
+        dispatch_envelope(&state, "host-a", count_update_envelope("session-1", 4, 400, 0));
 
         let sessions = state.sessions.get_untracked();
+        let patched = sessions
+            .iter()
+            .find(|s| s.host_id == "host-a" && s.summary.id.0 == "session-1")
+            .expect("the named session stays listed");
         assert_eq!(
-            sessions[0].summary.message_count, 4,
+            patched.summary.message_count, 4,
             "the named session's count must advance with no refresh"
         );
         assert_eq!(
-            sessions[1].summary.message_count, 7,
+            patched.summary.updated_at_ms, 400,
+            "and must adopt the server's authoritative last-activity time \
+             rather than keeping a date older than the count beside it"
+        );
+
+        let untouched = |host: &str, id: &str| {
+            sessions
+                .iter()
+                .find(|s| s.host_id == host && s.summary.id.0 == id)
+                .expect("session listed")
+        };
+        assert_eq!(
+            untouched("host-a", "session-2").summary.message_count,
+            7,
             "an unrelated session on the same host must be untouched"
         );
         assert_eq!(
-            sessions[2].summary.message_count, 3,
+            untouched("host-a", "session-2").summary.updated_at_ms,
+            100,
+            "including its date"
+        );
+        assert_eq!(
+            untouched("host-b", "session-1").summary.message_count,
+            3,
             "a same-id session on a different host must be untouched"
         );
+
+        // The list is defined as most-recent-first, and the client holds a
+        // prefix of that order, so a row whose activity advanced moves earlier
+        // within what is fetched. Leaving it put would show a fresh date below
+        // stale ones until the next list frame jumped it anyway.
         assert_eq!(
             sessions
                 .iter()
@@ -8373,10 +8404,10 @@ mod wasm_tests {
                 .collect::<Vec<_>>(),
             vec![
                 ("host-a".to_owned(), "session-1".to_owned()),
-                ("host-a".to_owned(), "session-2".to_owned()),
                 ("host-b".to_owned(), "session-1".to_owned()),
+                ("host-a".to_owned(), "session-2".to_owned()),
             ],
-            "order must not shift under the reader"
+            "the refreshed row takes its place in activity order"
         );
     }
 
@@ -8391,7 +8422,11 @@ mod wasm_tests {
             .sessions
             .set(vec![listed_session("host-a", "session-1", 1, 100)]);
 
-        dispatch_envelope(&state, "host-a", count_update_envelope("session-unknown", 9, 0));
+        dispatch_envelope(
+            &state,
+            "host-a",
+            count_update_envelope("session-unknown", 9, 999, 0),
+        );
 
         let sessions = state.sessions.get_untracked();
         assert_eq!(sessions.len(), 1, "no row may be invented");
@@ -8476,7 +8511,20 @@ mod wasm_tests {
             1,
             "a fresh first page replaces the accumulated list"
         );
-        assert_eq!(sessions[0].summary.message_count, 9);
+        assert_eq!(
+            sessions
+                .iter()
+                .find(|s| s.host_id == "host-a" && s.summary.id.0 == "s1")
+                .expect("s1 survives the replacement")
+                .summary
+                .message_count,
+            9,
+            "and carries the replacing page's values"
+        );
+        assert!(
+            sessions.iter().any(|s| s.host_id == "host-b"),
+            "replacing one host's first page must not drop another host"
+        );
     }
 
     /// FE-08: the visible badge must actually rerender. Inspecting `state`
@@ -8510,7 +8558,24 @@ mod wasm_tests {
             "precondition: the badge starts at zero, got: {before}"
         );
 
-        dispatch_envelope(&state, "host-a", count_update_envelope("session-1", 1, 0));
+        let before_date = crate::components::sessions_panel::format_date(200);
+        assert!(
+            before.contains(&before_date),
+            "precondition: the row shows its original date, got: {before}"
+        );
+
+        // A turn lands, carrying both the new count and the server's own
+        // last-activity time. A day later, so the absolute date string differs.
+        let fresh_ms = 200 + 86_400_000;
+        assert!(
+            !before.contains(&crate::components::sessions_panel::format_date(fresh_ms)),
+            "precondition: the new date is not already on screen, got: {before}"
+        );
+        dispatch_envelope(
+            &state,
+            "host-a",
+            count_update_envelope("session-1", 1, fresh_ms, 0),
+        );
         next_tick().await;
 
         let after = container.text_content().unwrap_or_default();
@@ -8522,11 +8587,15 @@ mod wasm_tests {
             after.contains("5 responses"),
             "the same-id session on another host must be untouched, got: {after}"
         );
-        // FE-06: the date cannot be corrected from this frame, so it must not
-        // be presented as if it were current.
+        // The date is authoritative now, so it must move with the count — a
+        // fresh count beside a stale date was the whole defect.
         assert!(
-            after.contains("newer activity"),
-            "a stale last-active date must be marked, got: {after}"
+            after.contains(&crate::components::sessions_panel::format_date(fresh_ms)),
+            "the rendered date must advance with the count, got: {after}"
+        );
+        assert!(
+            !after.contains("newer activity"),
+            "the provisional staleness marker is obsolete and must not render, got: {after}"
         );
     }
 

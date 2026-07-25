@@ -2532,12 +2532,6 @@ pub struct AppState {
     /// and recognised. Keyed by host because cursors are host- and
     /// scope-local.
     pub session_list_pages: RwSignal<HashMap<String, protocol::SessionListPageInfo>>,
-    /// Sessions whose turn count has advanced since the last authoritative
-    /// list, and whose displayed `updated_at_ms` is therefore older than their
-    /// real last activity. The targeted count frame carries no timestamp, so
-    /// the date cannot be corrected here — it is marked instead of silently
-    /// shown as if current. Cleared by the next authoritative list.
-    pub sessions_with_newer_activity: RwSignal<HashSet<(String, SessionId)>>,
     /// Derived from `center_zone.composer_owner()`. The focused pane's active
     /// chat wins; when a file pane is focused, the other pane's active chat
     /// remains the singleton composer owner. Read-only by design.
@@ -3035,7 +3029,6 @@ impl AppState {
             pending_active_chat_restore: RwSignal::new(restored_selection.active_chat.clone()),
             pending_draft_restore: RwSignal::new(restored_selection.draft.clone()),
             session_list_pages: RwSignal::new(HashMap::new()),
-            sessions_with_newer_activity: RwSignal::new(HashSet::new()),
             active_agent,
             chat_rows: RwSignal::new(HashMap::new()),
             chat_tool_rows: RwSignal::new(HashMap::new()),
