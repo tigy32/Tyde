@@ -432,8 +432,8 @@ async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
         orchestrator
             .instructions
             .as_deref()
-            .is_some_and(|instructions| instructions.contains("Multi-backend orchestration")),
-        "Orchestrator should describe multi-backend workflows: {orchestrator:?}"
+            .is_some_and(|instructions| instructions.contains("backend × domain grid")),
+        "Orchestrator should describe backend-domain workflows: {orchestrator:?}"
     );
     let help = builtins
         .get(&CustomAgentId("tyde-help".to_owned()))
