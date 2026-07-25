@@ -231,6 +231,51 @@ struct PendingNewAgentFanout {
     activity_summary: AgentActivitySummaryState,
 }
 
+struct NewAgentFanoutBatchGuard {
+    state: Arc<Mutex<HostState>>,
+    fanout_paths: Option<Vec<StreamPath>>,
+}
+
+impl NewAgentFanoutBatchGuard {
+    fn new(state: Arc<Mutex<HostState>>, fanout_paths: Vec<StreamPath>) -> Self {
+        Self {
+            state,
+            fanout_paths: Some(fanout_paths),
+        }
+    }
+
+    async fn release(mut self) -> Vec<StreamPath> {
+        let state = Arc::clone(&self.state);
+        let mut state = state.lock().await;
+        let fanout_paths = self
+            .fanout_paths
+            .take()
+            .expect("NewAgent fanout batch released more than once");
+        release_new_agent_fanout_holds(&mut state, &fanout_paths)
+    }
+}
+
+impl Drop for NewAgentFanoutBatchGuard {
+    fn drop(&mut self) {
+        let Some(fanout_paths) = self.fanout_paths.take() else {
+            return;
+        };
+        let state = Arc::clone(&self.state);
+        tracing::warn!(
+            subscriber_count = fanout_paths.len(),
+            "releasing NewAgent ordering holds after a fanout batch was dropped"
+        );
+        tokio::spawn(async move {
+            let mut state = state.lock().await;
+            let dead_paths = release_new_agent_fanout_holds(&mut state, &fanout_paths);
+            for path in dead_paths {
+                state.host_streams.remove(&path);
+                state.agent_visibility.remove_host_stream(&path);
+            }
+        });
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackendSetupRefreshStep {
     Setup,
@@ -1458,18 +1503,15 @@ impl PendingAgentSessionPublication {
     }
 }
 
-fn finish_agent_publication(
-    visibility: &SpawnVisibility,
+fn authorize_agent_session_publication(
     session_registration_publish: PendingAgentSessionPublication,
     session_summary_count_tx: &HostSessionSummaryCountTx,
     agent_id: &AgentId,
-) -> bool {
-    let cleanup_requested = visibility.finish_new_agent_fanout();
+) {
     session_registration_publish.publish();
     let _ = session_summary_count_tx.send(HostSessionSummaryCountEvent::AgentPublished(
         agent_id.clone(),
     ));
-    cleanup_requested
 }
 
 impl Drop for PendingAgentSessionPublication {
@@ -5178,6 +5220,7 @@ impl HostHandle {
             .iter()
             .map(|(path, _, _, _, _)| path.clone())
             .collect::<Vec<_>>();
+        let fanout_guard = NewAgentFanoutBatchGuard::new(Arc::clone(&self.state), fanout_paths);
 
         let mut dead_paths = Vec::new();
         let mut deferred_attachments = Vec::new();
@@ -5242,10 +5285,7 @@ impl HostHandle {
                 }
             }
         }
-        {
-            let mut state = self.state.lock().await;
-            dead_paths.extend(release_new_agent_fanout_holds(&mut state, &fanout_paths));
-        }
+        dead_paths.extend(fanout_guard.release().await);
         if let Some(request) = generated_name_request {
             self.schedule_generated_agent_name(agent_handle.clone(), request);
         }
@@ -5268,16 +5308,17 @@ impl HostHandle {
                 state.agent_visibility.remove_host_stream(&path);
             }
         }
-        if finish_agent_publication(
-            &visibility,
+        let cleanup_requested = visibility.finish_new_agent_fanout();
+        #[cfg(test)]
+        wait_for_spawn_visible_before_publication_test_hook(self).await;
+        authorize_agent_session_publication(
             session_registration_publish,
             &session_summary_count_tx,
             &agent_id,
-        ) {
+        );
+        if cleanup_requested {
             return Ok(agent_id);
         }
-        #[cfg(test)]
-        wait_for_spawn_visible_before_publication_test_hook(self).await;
         {
             let mut state = self.state.lock().await;
             fan_out_current_agents_view_preferences(&mut state).await;
@@ -5565,6 +5606,7 @@ impl HostHandle {
             .iter()
             .map(|(path, _, _, _, _)| path.clone())
             .collect::<Vec<_>>();
+        let fanout_guard = NewAgentFanoutBatchGuard::new(Arc::clone(&self.state), fanout_paths);
 
         let mut dead_paths = Vec::new();
         let mut deferred_attachments = Vec::new();
@@ -5598,10 +5640,7 @@ impl HostHandle {
                 Err(_) => dead_paths.push(path),
             }
         }
-        {
-            let mut state = self.state.lock().await;
-            dead_paths.extend(release_new_agent_fanout_holds(&mut state, &fanout_paths));
-        }
+        dead_paths.extend(fanout_guard.release().await);
         for attachment in deferred_attachments {
             self.attach_deferred_agent_stream(attachment).await;
         }
@@ -5616,16 +5655,17 @@ impl HostHandle {
                 state.agent_visibility.remove_host_stream(&path);
             }
         }
-        if finish_agent_publication(
-            &visibility,
+        let cleanup_requested = visibility.finish_new_agent_fanout();
+        #[cfg(test)]
+        wait_for_spawn_visible_before_publication_test_hook(self).await;
+        authorize_agent_session_publication(
             session_registration_publish,
             &session_summary_count_tx,
             &agent_id,
-        ) {
+        );
+        if cleanup_requested {
             return agent_id;
         }
-        #[cfg(test)]
-        wait_for_spawn_visible_before_publication_test_hook(self).await;
 
         if let Some(project_id) = start.project_id.clone()
             && let Err(error) = self
@@ -10346,6 +10386,11 @@ impl HostHandle {
                 })
                 .collect::<Vec<_>>()
         };
+        let fanout_paths = host_streams
+            .iter()
+            .map(|(path, _, _, _, _)| path.clone())
+            .collect::<Vec<_>>();
+        let fanout_guard = NewAgentFanoutBatchGuard::new(Arc::clone(&self.state), fanout_paths);
 
         if let Err(err) = session_store.lock().await.upsert_backend_session(
             &BackendSession {
@@ -10372,6 +10417,14 @@ impl HostHandle {
                 child_session_id = %session_id,
                 "{message}"
             );
+            let dead_paths = fanout_guard.release().await;
+            if !dead_paths.is_empty() {
+                let mut state = self.state.lock().await;
+                for path in dead_paths {
+                    state.host_streams.remove(&path);
+                    state.agent_visibility.remove_host_stream(&path);
+                }
+            }
             let _ = self
                 .close_agent_for_recorded_visibility(&start.agent_id)
                 .await;
@@ -10380,10 +10433,6 @@ impl HostHandle {
 
         let mut dead_paths = Vec::new();
         let mut deferred_attachments = Vec::new();
-        let fanout_paths = host_streams
-            .iter()
-            .map(|(path, _, _, _, _)| path.clone())
-            .collect::<Vec<_>>();
         for (path, stream, attach_eagerly, instance_stream, activity_summary) in host_streams {
             match emit_new_agent_for_stream(
                 &start,
@@ -10402,10 +10451,7 @@ impl HostHandle {
                 Err(_) => dead_paths.push(path),
             }
         }
-        {
-            let mut state = self.state.lock().await;
-            dead_paths.extend(release_new_agent_fanout_holds(&mut state, &fanout_paths));
-        }
+        dead_paths.extend(fanout_guard.release().await);
         for attachment in deferred_attachments {
             self.attach_deferred_agent_stream(attachment).await;
         }
@@ -16946,9 +16992,17 @@ fn fan_out_session_summary_count_update_inner(
         .values()
         .any(|subscriber| subscriber.session_summary_updates_subscribed)
     {
-        state
-            .pending_session_summary_count_updates
-            .remove(&update.agent_id);
+        if queue_if_missing
+            && state
+                .agent_visibility
+                .tracks_publishable_agent(&update.agent_id)
+        {
+            queue_session_summary_count_update(state, update);
+        } else {
+            state
+                .pending_session_summary_count_updates
+                .remove(&update.agent_id);
+        }
         return;
     }
 
@@ -16985,9 +17039,17 @@ fn fan_out_session_summary_count_update_inner(
         .agent_visibility
         .visible_host_streams(&update.agent_id);
     if visible_host_streams.is_empty() {
-        state
-            .pending_session_summary_count_updates
-            .remove(&update.agent_id);
+        if queue_if_missing
+            && state
+                .agent_visibility
+                .tracks_publishable_agent(&update.agent_id)
+        {
+            queue_session_summary_count_update(state, update);
+        } else {
+            state
+                .pending_session_summary_count_updates
+                .remove(&update.agent_id);
+        }
         return;
     }
     let payload = serde_json::to_value(payload_update)
@@ -21477,12 +21539,8 @@ Rules: Record only what remains true and useful for future work; drop transient 
         };
         let (summary_tx, mut summary_rx) = mpsc::unbounded_channel();
 
-        assert!(finish_agent_publication(
-            &visibility,
-            publication,
-            &summary_tx,
-            &agent_id,
-        ));
+        assert!(visibility.finish_new_agent_fanout());
+        authorize_agent_session_publication(publication, &summary_tx, &agent_id);
         publish_rx
             .try_recv()
             .expect("cancelled fanout must still authorize session publication");
@@ -21599,6 +21657,73 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 .parse_payload::<SessionSummaryCountUpdatedPayload>()
                 .expect("count payload"),
             count_payload
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_fanout_batch_releases_subscriber_count_hold() {
+        let fixture = compact_fixture().await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let host_path = StreamPath(format!("/host/dropped-fanout-{}", Uuid::new_v4()));
+        assert!(
+            fixture
+                .host
+                .register_host_stream(Stream::new(host_path.clone(), tx), AgentReplayMode::Lazy)
+                .await
+                .is_empty()
+        );
+        let bootstrap = rx.recv().await.expect("HostBootstrap frame");
+        assert_eq!(bootstrap.kind, FrameKind::HostBootstrap);
+        let count_payload = SessionSummaryCountUpdatedPayload {
+            session_id: SessionId("cancelled-fanout-session".to_owned()),
+            assistant_turn_count: 2,
+            updated_at_ms: 20,
+        };
+        {
+            let mut state = fixture.host.state.lock().await;
+            let subscriber = state
+                .host_streams
+                .get_mut(&host_path)
+                .expect("registered host subscriber");
+            subscriber.new_agent_fanouts_in_flight = 1;
+            emit_or_queue_host_frame(
+                subscriber,
+                FrameKind::SessionSummaryCountUpdated,
+                serde_json::to_value(&count_payload).expect("serialize count payload"),
+            )
+            .expect("hold count during fanout");
+        }
+
+        drop(NewAgentFanoutBatchGuard::new(
+            Arc::clone(&fixture.host.state),
+            vec![host_path.clone()],
+        ));
+
+        let count = timeout(Duration::from_secs(1), async {
+            loop {
+                let envelope = rx.recv().await.expect("host stream remains open");
+                if envelope.kind == FrameKind::SessionSummaryCountUpdated {
+                    break envelope;
+                }
+            }
+        })
+        .await
+        .expect("dropped batch count drain");
+        assert_eq!(count.kind, FrameKind::SessionSummaryCountUpdated);
+        assert_eq!(
+            count
+                .parse_payload::<SessionSummaryCountUpdatedPayload>()
+                .expect("count payload"),
+            count_payload
+        );
+        let state = fixture.host.state.lock().await;
+        assert_eq!(
+            state
+                .host_streams
+                .get(&host_path)
+                .expect("registered host subscriber")
+                .new_agent_fanouts_in_flight,
+            0
         );
     }
 
