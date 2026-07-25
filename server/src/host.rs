@@ -23136,9 +23136,9 @@ Rules: Record only what remains true and useful for future work; drop transient 
     }
 
     #[tokio::test]
-    async fn session_list_snapshot_creation_flushes_matching_pending_count() {
+    async fn explicit_session_list_precedes_pending_count_drain() {
         let fixture = compact_fixture().await;
-        let (agent_id, session_id) =
+        let (_, session_id) =
             spawn_idle_user_agent(&fixture.host, "persist a response before subscribing").await;
         let (tx, mut rx) = mpsc::unbounded_channel();
         let host_path = StreamPath(format!("/host/session-count-snapshot-{}", Uuid::new_v4()));
@@ -23157,6 +23157,49 @@ Rules: Record only what remains true and useful for future work; drop transient 
         assert_eq!(bootstrap.kind, FrameKind::HostBootstrap);
         while rx.try_recv().is_ok() {}
 
+        let (observer_tx, mut observer_rx) = mpsc::unbounded_channel();
+        let observer_path =
+            StreamPath(format!("/host/session-count-observer-{}", Uuid::new_v4()));
+        let observer_stream = Stream::new(observer_path.clone(), observer_tx);
+        assert!(
+            fixture
+                .host
+                .register_host_stream(observer_stream.clone(), AgentReplayMode::Lazy)
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            observer_rx
+                .recv()
+                .await
+                .expect("observer HostBootstrap")
+                .kind,
+            FrameKind::HostBootstrap
+        );
+        while observer_rx.try_recv().is_ok() {}
+        fixture
+            .host
+            .list_sessions(&observer_stream, ListSessionsPayload::default())
+            .await
+            .expect("subscribe observer");
+        loop {
+            if observer_rx
+                .recv()
+                .await
+                .expect("observer SessionList")
+                .kind
+                == FrameKind::SessionList
+            {
+                break;
+            }
+        }
+
+        let pending_agent_id = AgentId("pending-count-during-enrollment".to_owned());
+        let visibility = {
+            let state = fixture.host.state.lock().await;
+            state.agent_visibility.clone()
+        };
+        let pending_visibility = SpawnVisibility::new(pending_agent_id.clone(), visibility);
         let expected = {
             let mut state = fixture.host.state.lock().await;
             let summary = state
@@ -23171,16 +23214,44 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 })
                 .expect("bootstrap snapshot contains persisted session");
             let update = HostSessionSummaryCountUpdate {
-                agent_id: agent_id.clone(),
+                agent_id: pending_agent_id.clone(),
                 payload: SessionSummaryCountUpdatedPayload {
                     session_id: session_id.clone(),
                     assistant_turn_count: summary.message_count,
                     updated_at_ms: summary.updated_at_ms,
                 },
             };
-            queue_session_summary_count_update(&mut state, &update);
+            assert!(
+                !state
+                    .host_streams
+                    .get(&host_path)
+                    .expect("passive subscriber")
+                    .session_summary_updates_subscribed
+            );
+            assert!(
+                state
+                    .host_streams
+                    .get(&observer_path)
+                    .expect("subscribed observer")
+                    .session_summary_updates_subscribed
+            );
+            fan_out_session_summary_count_update(&mut state, &update);
+            assert_eq!(
+                state
+                    .pending_session_summary_count_updates
+                    .get(&pending_agent_id)
+                    .expect("publication-pending count")
+                    .front()
+                    .expect("queued count")
+                    .payload,
+                update.payload
+            );
             update.payload
         };
+        assert_no_session_summary_count(&mut rx, "passive subscriber before enrollment").await;
+        assert_no_session_summary_count(&mut observer_rx, "publication-pending observer").await;
+        assert!(pending_visibility.begin_fanout());
+        assert!(!pending_visibility.finish_new_agent_fanout());
 
         fixture
             .host
@@ -23213,6 +23284,13 @@ Rules: Record only what remains true and useful for future work; drop transient 
         .await
         .expect("matching pending count flush");
         assert_eq!(count, expected);
+        assert_eq!(
+            recv_session_summary_count(&mut observer_rx, "existing subscribed observer").await,
+            expected,
+            "the global pending item was deferred for every subscriber, so \
+             enrollment must deliver it once to the existing observer"
+        );
+        assert_no_session_summary_count(&mut observer_rx, "existing observer duplicate").await;
         assert!(
             !fixture
                 .host
@@ -23220,7 +23298,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 .lock()
                 .await
                 .pending_session_summary_count_updates
-                .contains_key(&agent_id),
+                .contains_key(&pending_agent_id),
             "matching pending count must be consumed when the snapshot is created"
         );
     }
