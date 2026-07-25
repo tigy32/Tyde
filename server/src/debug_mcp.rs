@@ -15,8 +15,7 @@ use devtools_protocol::{
     DevInstanceHermesEnvironmentAttestation, DevInstanceStartupCleanup,
     DisposableHermesEnvironment, PreparedDisposableHermesEnvironment, UiDebugRequest,
     UiDebugResponse, dev_instance_mutable_paths, is_provider_environment_key,
-    is_valid_disposable_hermes_profile_name, prepare_disposable_hermes_environment,
-    resolve_parent_hermes_runtime,
+    prepare_disposable_hermes_environment, resolve_parent_hermes_runtime,
 };
 use protocol::{Project, ProjectId, ProjectRootPath, ProjectSource};
 use rmcp::{
@@ -1435,20 +1434,22 @@ mod tests {
     fn disposable_profile_grammar_matches_hermes_discovery() {
         for profile in ["qa", "qaverify_2", "gpt-5"] {
             assert_eq!(
-                is_valid_disposable_hermes_profile_name(profile),
+                devtools_protocol::is_valid_disposable_hermes_profile_name(profile),
                 crate::backend::hermes_config::is_valid_profile_name(profile)
             );
         }
         for profile in ["_qa", "-qa", "QA"] {
             assert_eq!(
-                is_valid_disposable_hermes_profile_name(profile),
+                devtools_protocol::is_valid_disposable_hermes_profile_name(profile),
                 crate::backend::hermes_config::is_valid_profile_name(profile)
             );
         }
         assert!(crate::backend::hermes_config::is_valid_profile_name(
             "default"
         ));
-        assert!(!is_valid_disposable_hermes_profile_name("default"));
+        assert!(!devtools_protocol::is_valid_disposable_hermes_profile_name(
+            "default"
+        ));
     }
 
     #[test]
