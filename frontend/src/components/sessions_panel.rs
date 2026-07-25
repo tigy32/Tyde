@@ -178,11 +178,27 @@ pub fn SessionsPanel() -> impl IntoView {
     let rendered_hosts = {
         let state = state.clone();
         Memo::new(move |_| {
-            let mut hosts: Vec<String> = filtered_sessions
-                .get()
-                .iter()
-                .map(|session| session.host_id.clone())
-                .collect();
+            let active_project = state.active_project.get();
+            let filters = current_filters.get();
+
+            // Scope first. A project-scoped view can only ever show sessions on
+            // that project's host, so that host *is* the responsible set —
+            // whatever other hosts happen to have unfetched pages. Deriving the
+            // set from page state first let an unrelated host displace the
+            // project the user is looking at whenever no local row matched.
+            if !filters.show_other_projects
+                && let Some(project) = active_project.as_ref()
+            {
+                return vec![project.host_id.clone()];
+            }
+
+            // Unscoped (Home, or "show all projects"): every host that holds
+            // rows or still has history to fetch. Derived from the held rows
+            // rather than the filtered ones, so a search matching nothing does
+            // not silently drop a host from its own view.
+            let mut hosts: Vec<String> = state
+                .sessions
+                .with(|sessions| sessions.iter().map(|s| s.host_id.clone()).collect());
             state.session_list_pages.with(|pages| {
                 for ((host_id, _), page) in pages.iter() {
                     if matches!(page.status, SessionListPageStatus::More { .. }) {
@@ -191,9 +207,7 @@ pub fn SessionsPanel() -> impl IntoView {
                 }
             });
             if hosts.is_empty()
-                && let Some(host_id) = state
-                    .active_project
-                    .get()
+                && let Some(host_id) = active_project
                     .map(|project| project.host_id)
                     .or_else(|| state.selected_host_id.get())
             {

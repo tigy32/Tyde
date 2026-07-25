@@ -9089,6 +9089,143 @@ mod wasm_tests {
         );
     }
 
+    /// RD748-01: a project-scoped History view belongs to its project's host,
+    /// and nothing another host does may displace it. With project A active,
+    /// no A row currently matching, A complete, and host B advertising more
+    /// pages, the panel must still refresh A and must offer no B continuation.
+    #[wasm_bindgen_test]
+    async fn an_empty_project_view_is_not_displaced_by_another_hosts_pages() {
+        reset_inbound_state_for_host("host-a");
+        reset_inbound_state_for_host("host-b");
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document
+            .create_element("div")
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+
+        let state = AppState::new();
+        state.host_streams.update(|streams| {
+            streams.insert("host-a".to_owned(), StreamPath("/host".to_owned()));
+            streams.insert("host-b".to_owned(), StreamPath("/host".to_owned()));
+        });
+        // Settings points elsewhere, as it independently may.
+        state.selected_host_id.set(Some("host-b".to_owned()));
+        state.projects.update(|projects| {
+            projects.push(ProjectInfo {
+                host_id: "host-a".to_owned(),
+                project: restore_project("project-a"),
+            });
+        });
+        state.active_project.set(Some(ActiveProjectRef {
+            host_id: "host-a".to_owned(),
+            project_id: ProjectId("project-a".to_owned()),
+        }));
+
+        // Host A holds only a row from *another* project, so nothing matches
+        // the project-scoped filter. Host B holds a row and has more pages.
+        let mut a_row = listed_session("host-a", "a-other", 1, 300);
+        a_row.summary.project_id = Some(ProjectId("project-other".to_owned()));
+        state
+            .sessions
+            .set(vec![a_row, listed_session("host-b", "b1", 1, 200)]);
+        state.session_list_pages.update(|pages| {
+            let all = crate::state::session_list_scope_key(protocol::SessionListScope::AllSessions);
+            // A: complete.
+            pages.insert(
+                ("host-a".to_owned(), all),
+                protocol::SessionListPageInfo {
+                    scope: protocol::SessionListScope::AllSessions,
+                    cursor: protocol::SessionListCursor {
+                        generation: protocol::SessionListGeneration(1),
+                        offset: 0,
+                    },
+                    limit: 1,
+                    total_count: 1,
+                    status: protocol::SessionListPageStatus::Complete,
+                },
+            );
+            // B: more to fetch.
+            pages.insert(
+                ("host-b".to_owned(), all),
+                protocol::SessionListPageInfo {
+                    scope: protocol::SessionListScope::AllSessions,
+                    cursor: protocol::SessionListCursor {
+                        generation: protocol::SessionListGeneration(1),
+                        offset: 0,
+                    },
+                    limit: 1,
+                    total_count: 4,
+                    status: protocol::SessionListPageStatus::More {
+                        next_cursor: protocol::SessionListCursor {
+                            generation: protocol::SessionListGeneration(1),
+                            offset: 1,
+                        },
+                    },
+                },
+            );
+        });
+
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <crate::components::sessions_panel::SessionsPanel /> }
+        });
+        next_tick().await;
+
+        // Precondition: the project-scoped view really is empty.
+        assert!(
+            container
+                .query_selector(".session-card")
+                .unwrap()
+                .is_none(),
+            "precondition: no session card matches the active project"
+        );
+
+        let controls = container
+            .query_selector_all("[data-test='session-load-more']")
+            .unwrap();
+        let control_hosts: Vec<String> = (0..controls.length())
+            .filter_map(|i| controls.item(i))
+            .filter_map(|node| {
+                node.dyn_into::<web_sys::Element>()
+                    .ok()
+                    .and_then(|el| el.get_attribute("data-host"))
+            })
+            .collect();
+        assert!(
+            !control_hosts.contains(&"host-b".to_owned()),
+            "an unrelated host's continuation must not appear in a project-scoped \
+             view, got: {control_hosts:?}"
+        );
+        assert!(
+            control_hosts.is_empty(),
+            "host A is complete, so this view has nothing more to fetch, got: \
+             {control_hosts:?}"
+        );
+
+        install_send_stub();
+        let refresh: HtmlElement = container
+            .query_selector("[data-test='sessions-refresh']")
+            .unwrap()
+            .expect("the panel renders a refresh control")
+            .dyn_into()
+            .unwrap();
+        refresh.click();
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let refreshed = list_sessions_hosts();
+        assert_eq!(
+            refreshed,
+            vec!["host-a".to_owned()],
+            "refresh must target the project's own host and nothing else, got: \
+             {refreshed:?}"
+        );
+    }
+
     /// R48-02: History is a multi-host view. Refresh must reach the hosts on
     /// screen — not whichever host Settings happens to have selected — and
     /// every rendered host with unfetched history needs its own reachable
