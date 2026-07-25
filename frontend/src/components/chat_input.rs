@@ -439,13 +439,16 @@ fn interrupt_target_turn(state: &AppState, agent_ref: Signal<Option<ActiveAgentR
         None => return,
     };
 
-    // Record the request before it goes out. Cancelling is a phase the user has
-    // to be able to see; without this the control stays armed and a second
-    // click sends a second Interrupt frame for the same turn. The dispatcher
-    // clears this on the backend's terminal answer.
-    state.interrupt_pending.update(|pending| {
-        pending.insert(active_agent.agent_id);
-    });
+    // Claim the interrupt slot before the frame goes out. The disabled markup
+    // is reactive and may not have been applied when a second click arrives, so
+    // single-submit has to be enforced here rather than in the view — otherwise
+    // two rapid clicks send two Interrupt frames for one turn. The dispatcher
+    // clears the slot on the backend's terminal answer.
+    let agent_id = active_agent.agent_id;
+    if !claim_interrupt_slot(state, &agent_id) {
+        return;
+    }
+    let pending = state.interrupt_pending;
 
     spawn_local(async move {
         if let Err(e) = send_frame(
@@ -457,8 +460,26 @@ fn interrupt_target_turn(state: &AppState, agent_ref: Signal<Option<ActiveAgentR
         .await
         {
             log::error!("failed to interrupt conversation: {e}");
+            // Nothing is in flight after a transport failure. Leaving the slot
+            // claimed would strand the card in Cancelling with both Cancel
+            // controls disabled for the rest of the turn, with no interrupt
+            // ever having reached the backend.
+            pending.update(|pending| {
+                pending.remove(&agent_id);
+            });
         }
     });
+}
+
+/// Claim the single in-flight interrupt slot for `agent_id`. Returns `false`
+/// when one is already claimed, in which case the caller must not send another
+/// frame. Released by [`crate::dispatch`] on the backend's terminal answer, or
+/// by the sender itself when the frame could not be sent.
+fn claim_interrupt_slot(state: &AppState, agent_id: &protocol::AgentId) -> bool {
+    state
+        .interrupt_pending
+        .try_update(|pending| pending.insert(agent_id.clone()))
+        .unwrap_or(false)
 }
 
 fn steer_chat_input(
@@ -1425,6 +1446,150 @@ mod wasm_tests {
             }),
             "Chat".to_owned(),
             true,
+        );
+    }
+
+    /// Like [`stub_send_host_line`] but records every `send_host_line` call into
+    /// `window.__test_interrupt_calls`, so a test can count the frames actually
+    /// sent rather than infer them from UI state.
+    fn stub_send_recording() -> js_sys::Array {
+        let calls = js_sys::eval(
+            r#"
+            (function() {
+                window.__test_interrupt_calls = [];
+                window.__TAURI__ = window.__TAURI__ || {};
+                window.__TAURI__.core = window.__TAURI__.core || {};
+                window.__TAURI__.core.invoke = function(cmd, args) {
+                    if (cmd === 'send_host_line') {
+                        window.__test_interrupt_calls.push(JSON.stringify(args || {}));
+                        return Promise.resolve(null);
+                    }
+                    return Promise.reject('no tauri host in test');
+                };
+                return window.__test_interrupt_calls;
+            })();
+            "#,
+        )
+        .expect("install recording stub");
+        calls.dyn_into::<js_sys::Array>().expect("array")
+    }
+
+    /// A stub whose `send_host_line` always rejects, for the transport-failure
+    /// path.
+    fn stub_send_failing() {
+        js_sys::eval(
+            r#"
+            (function() {
+                window.__TAURI__ = window.__TAURI__ || {};
+                window.__TAURI__.core = window.__TAURI__.core || {};
+                window.__TAURI__.core.invoke = function() {
+                    return Promise.reject('send failed');
+                };
+            })();
+            "#,
+        )
+        .expect("install failing stub");
+    }
+
+    fn interrupt_frames(calls: &js_sys::Array) -> usize {
+        calls
+            .iter()
+            .filter_map(|entry| entry.as_string())
+            .filter(|args| args.contains("\"interrupt\""))
+            .count()
+    }
+
+    /// R-03: the disabled attribute is reactive and may not be applied when a
+    /// second click arrives, so single-submit has to hold in the commit path.
+    /// Two clicks must produce one Interrupt frame.
+    #[wasm_bindgen_test]
+    async fn repeated_cancel_clicks_send_one_interrupt() {
+        let container = make_container();
+        let state = AppState::new();
+        configure(&state, false, true, "");
+        let calls = stub_send_recording();
+        let state_for_mount = state.clone();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        let primary_btn: HtmlElement = primary(&container).dyn_into().unwrap();
+        assert_eq!(
+            primary_btn.text_content().unwrap_or_default().trim(),
+            "Cancel",
+            "precondition: thinking with an empty composer offers Cancel"
+        );
+
+        // Two clicks back to back, before any reactive re-render can intervene.
+        primary_btn.click();
+        primary_btn.click();
+        next_tick().await;
+        next_tick().await;
+
+        assert_eq!(
+            interrupt_frames(&calls),
+            1,
+            "one turn must produce exactly one Interrupt frame"
+        );
+
+        // And the control now reports the phase rather than staying armed.
+        let primary_btn = primary(&container);
+        assert!(
+            primary_btn
+                .text_content()
+                .unwrap_or_default()
+                .contains("Cancelling"),
+            "the in-flight interrupt must be visible on the control, got: {:?}",
+            primary_btn.text_content()
+        );
+        assert!(
+            primary_btn.has_attribute("disabled"),
+            "Cancel must be disabled while its interrupt is unanswered"
+        );
+    }
+
+    /// R-03: a transport failure means nothing is in flight. Leaving the slot
+    /// claimed would strand the control disabled and the card in Cancelling for
+    /// the rest of the turn, with no interrupt ever having reached the backend.
+    #[wasm_bindgen_test]
+    async fn failed_interrupt_releases_the_cancel_control() {
+        let container = make_container();
+        let state = AppState::new();
+        configure(&state, false, true, "");
+        stub_send_failing();
+        let state_for_mount = state.clone();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        let primary_btn: HtmlElement = primary(&container).dyn_into().unwrap();
+        primary_btn.click();
+        // Let the rejected send settle.
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let agent_id = AgentId(AGENT.to_owned());
+        assert!(
+            !state
+                .interrupt_pending
+                .get_untracked()
+                .contains(&agent_id),
+            "a failed send must release the interrupt slot"
+        );
+        let primary_btn = primary(&container);
+        assert!(
+            !primary_btn.has_attribute("disabled"),
+            "Cancel must be usable again after a failed interrupt"
+        );
+        assert_eq!(
+            primary_btn.text_content().unwrap_or_default().trim(),
+            "Cancel",
+            "and must stop claiming an interrupt is in flight"
         );
     }
 

@@ -126,19 +126,30 @@ fn render_context_view(
                         .as_ref()
                         .map(|m| format!("{}", m.utilization_pct.round() as i32))
                         .unwrap_or_else(|| "0".to_owned())
+                    aria-valuetext=metrics
+                        .as_ref()
+                        .map(|m| format!(
+                            "{} of {} tokens ({:.1}%)",
+                            format_token_count(m.total_used),
+                            format_token_count(m.context_window),
+                            m.utilization_pct,
+                        ))
+                        .unwrap_or_else(|| "Context usage unknown".to_owned())
                 >
                     {metrics.as_ref().map(|m| {
                         m.categories.iter().filter(|cat| cat.percent > 0.0).map(|cat| {
-                            // Each slice names itself. A bare coloured span
-                            // conveys nothing without sight, and the parent
-                            // progressbar only reports the overall percentage.
+                            // Explicitly presentational. A progressbar's
+                            // descendants are presentational per ARIA, so a
+                            // role/name here would not reach the accessibility
+                            // tree however it were written. The readable
+                            // breakdown lives in the sibling legend below;
+                            // `title` still serves a sighted pointer user.
                             let name = format!("{}: {:.0}% of context", cat.label, cat.percent);
                             view! {
                                 <span
                                     class=format!("summary-context-segment {}", cat.css_class)
                                     data-testid="context-segment"
-                                    role="img"
-                                    aria-label=name.clone()
+                                    aria-hidden="true"
                                     title=name
                                     style=format!("width: {:.2}%", cat.percent)
                                 ></span>
@@ -150,7 +161,7 @@ fn render_context_view(
                     match (metrics.as_ref(), task_list.as_ref()) {
                         (Some(m), Some(tl)) => view! {
                             <div class="summary-context-meta">
-                                {has_detailed_breakdown.then(|| render_context_legend(&m.categories))}
+                                {render_breakdown_or_note(&m.categories, has_detailed_breakdown)}
                                 <button
                                     type="button"
                                     class="context-task-hint"
@@ -160,9 +171,9 @@ fn render_context_view(
                                 </button>
                             </div>
                         }.into_any(),
-                        (Some(m), None) if has_detailed_breakdown => view! {
+                        (Some(m), None) => view! {
                             <div class="summary-context-meta">
-                                {render_context_legend(&m.categories)}
+                                {render_breakdown_or_note(&m.categories, has_detailed_breakdown)}
                             </div>
                         }.into_any(),
                         (None, Some(tl)) => view! {
@@ -338,6 +349,29 @@ fn build_task_hint_text(tasks: &[protocol::Task]) -> String {
     } else {
         format!("{completed}/{total} tasks done →")
     }
+}
+
+/// The legend when the backend attributed anything, and an explicit note when
+/// it did not. Rendering nothing in the second case left a real, non-zero
+/// occupancy with no explanation at all — for sighted and assistive-technology
+/// users alike — which reads as "no context in use" rather than "attribution
+/// was not reported".
+fn render_breakdown_or_note(categories: &[ContextCategory], has_detail: bool) -> AnyView {
+    if has_detail {
+        return render_context_legend(categories).into_any();
+    }
+    view! {
+        <div
+            class="summary-context-breakdown summary-context-breakdown-empty"
+            role="note"
+            data-testid="context-breakdown-unavailable"
+        >
+            <span class="context-breakdown-row">
+                "Breakdown unavailable \u{2014} this backend reported no context categories"
+            </span>
+        </div>
+    }
+    .into_any()
 }
 
 fn render_context_legend(categories: &[ContextCategory]) -> impl IntoView {
@@ -717,38 +751,54 @@ mod wasm_tests {
 
         let drawn = segments(&container);
         assert_eq!(drawn.len(), 2, "two reported categories draw two segments");
+        // Segments are descendants of a progressbar, whose children ARIA
+        // defines as presentational. Claiming a role/name on them would not
+        // reach the accessibility tree, so they must not pretend to.
         for segment in &drawn {
-            let name = segment.get_attribute("aria-label").unwrap_or_default();
-            assert!(
-                !name.is_empty(),
-                "each segment must expose an accessible name"
+            assert_eq!(
+                segment.get_attribute("aria-hidden").as_deref(),
+                Some("true"),
+                "a presentational segment must be hidden from assistive technology"
             );
             assert!(
-                name.contains('%'),
-                "a segment's name must state its share, got: {name}"
+                segment.get_attribute("role").is_none(),
+                "a progressbar descendant must not claim a role it cannot expose"
             );
         }
-        let names: Vec<String> = drawn
-            .iter()
-            .map(|s| s.get_attribute("aria-label").unwrap_or_default())
-            .collect();
-        assert!(
-            names.iter().any(|n| n.starts_with("System"))
-                && names.iter().any(|n| n.starts_with("Tools")),
-            "segments must name their category, got: {names:?}"
-        );
 
-        // The legend says what its percentages are a share *of*.
+        // The readable breakdown therefore lives outside the progressbar.
+        let bar = container
+            .query_selector("[data-testid='context-bar']")
+            .unwrap()
+            .expect("the utilization bar renders");
+        assert!(
+            bar.query_selector(".summary-context-breakdown")
+                .unwrap()
+                .is_none(),
+            "the legend must be a sibling of the progressbar, not a descendant"
+        );
         let legend = container
             .query_selector(".summary-context-breakdown")
             .unwrap()
             .expect("a reported breakdown renders a legend");
+        let legend_text = legend.text_content().unwrap_or_default();
+        assert!(
+            legend_text.contains("System") && legend_text.contains("Tools"),
+            "the legend must name each reported category in text, got: {legend_text}"
+        );
         assert!(
             legend
                 .get_attribute("aria-label")
                 .unwrap_or_default()
                 .contains("reported"),
             "the legend must scope its shares to what the backend reported"
+        );
+
+        // The bar itself carries the readable figure, since its children cannot.
+        let value_text = bar.get_attribute("aria-valuetext").unwrap_or_default();
+        assert!(
+            value_text.contains("tokens"),
+            "the progressbar must expose a human-readable value, got: {value_text}"
         );
     }
 
@@ -775,14 +825,32 @@ mod wasm_tests {
             segments(&container).is_empty(),
             "nothing was attributed, so no slice may be drawn"
         );
+
+        // Rendering nothing here left a real occupancy wholly unexplained. The
+        // absence of attribution is itself information and must be stated.
+        let note = container
+            .query_selector("[data-testid='context-breakdown-unavailable']")
+            .unwrap()
+            .expect("the missing-attribution state must be named, not blank");
+        let note_text = note.text_content().unwrap_or_default();
+        assert!(
+            note_text.contains("Breakdown unavailable"),
+            "the note must say attribution is missing, got: {note_text}"
+        );
+        assert_eq!(
+            note.get_attribute("role").as_deref(),
+            Some("note"),
+            "the explanation must reach the accessibility tree"
+        );
         assert!(
             container
-                .query_selector(".summary-context-breakdown")
+                .query_selector(".context-breakdown-dot")
                 .unwrap()
                 .is_none(),
-            "no legend may claim to explain an unattributed prompt"
+            "no category legend row may appear when nothing was attributed"
         );
-        // The occupancy itself is still reported.
+
+        // The occupancy itself is still reported, in both forms.
         let bar = container
             .query_selector("[data-testid='context-bar']")
             .unwrap()
@@ -791,6 +859,12 @@ mod wasm_tests {
             bar.get_attribute("aria-valuenow").as_deref(),
             Some("50"),
             "real occupancy is still exposed even with no attribution"
+        );
+        assert!(
+            bar.get_attribute("aria-valuetext")
+                .unwrap_or_default()
+                .contains("tokens"),
+            "the readable occupancy must survive the missing breakdown"
         );
     }
 }

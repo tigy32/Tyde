@@ -43,6 +43,18 @@ pub(crate) fn clear_invalid_dependent_select_values(
 /// Suffix marking a value the session carries but the schema no longer offers.
 pub(crate) const UNAVAILABLE_OPTION_SUFFIX: &str = " (unavailable)";
 
+/// Marker a backend puts in an option's **label** for a choice it deliberately
+/// retained but cannot currently serve — the Hermes profile schema emits
+/// `"<name> — Unavailable: <error>"` for a profile whose gateway probe failed,
+/// so the option stays visible with its reason instead of vanishing.
+///
+/// Matching on the label is not a preference. [`SelectOption`] carries only
+/// `value` and `label`, so this is the sole channel the protocol offers; a
+/// typed availability field on `SelectOption` is the durable fix and is tracked
+/// as a protocol dependency. Retaining an option the backend has already said
+/// it cannot serve, while leaving it selectable, would be worse than either.
+pub(crate) const SCHEMA_UNAVAILABLE_MARKER: &str = "Unavailable:";
+
 /// One entry of a select-like control.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ControlOption {
@@ -77,8 +89,12 @@ pub(crate) fn options_including_current(
         .iter()
         .map(|option| ControlOption {
             value: option.value.clone(),
+            // A schema option can itself be unavailable: the backend retains a
+            // failed choice so its reason stays visible. Such an option must
+            // read as non-actionable for exactly the same reason the synthetic
+            // one below does.
+            unavailable: option.label.contains(SCHEMA_UNAVAILABLE_MARKER),
             label: option.label.clone(),
-            unavailable: false,
         })
         .collect();
     if current.is_empty() || entries.iter().any(|entry| entry.value == current) {
@@ -1120,6 +1136,47 @@ mod wasm_tests {
         );
     }
 
+    /// R-02: a backend can retain an option it cannot serve so its reason stays
+    /// visible — the Hermes profile schema emits `"<name> — Unavailable:
+    /// <error>"` for a profile whose gateway probe failed. Such an option is
+    /// schema-provided, so it is not the synthetic entry, and it must still be
+    /// non-actionable.
+    #[wasm_bindgen_test]
+    fn schema_provided_unavailable_option_is_flagged() {
+        let options = vec![
+            SelectOption {
+                value: "default".to_owned(),
+                label: "Default".to_owned(),
+            },
+            SelectOption {
+                value: "gpt".to_owned(),
+                label: "gpt \u{2014} Unavailable: gateway exploded".to_owned(),
+            },
+        ];
+
+        let entries = options_including_current(&options, "default");
+        assert_eq!(entries.len(), 2, "both schema options are kept");
+        assert!(
+            !entries[0].unavailable,
+            "a healthy schema option stays actionable"
+        );
+        assert!(
+            entries[1].unavailable,
+            "an option the backend marked unavailable must not be actionable: {:?}",
+            entries[1]
+        );
+        assert!(
+            entries[1].label.contains("gateway exploded"),
+            "the backend's reason must survive to the user"
+        );
+
+        // The same option selected as the current value is still unavailable,
+        // and must not be duplicated by the synthetic-entry path.
+        let entries = options_including_current(&options, "gpt");
+        assert_eq!(entries.len(), 2, "a present value must not be re-injected");
+        assert!(entries[1].unavailable);
+    }
+
     /// End-to-end for M5: a session carrying `profile=qatest` against a schema
     /// that only knows `default` must render `qatest`, not `Default`. Asserts
     /// on what the user sees and on the control's effective value.
@@ -1267,6 +1324,107 @@ mod wasm_tests {
             commits.get_untracked(),
             0,
             "selecting an unavailable value must never be submitted as an edit"
+        );
+    }
+
+    /// R-02 end-to-end: the retained-unavailable *schema* option (the shape M4
+    /// actually produces) renders disabled and cannot be committed. The
+    /// previous coverage fixtured only a synthetic value absent from the
+    /// schema, which is a different shape and left this path unguarded.
+    #[wasm_bindgen_test]
+    async fn schema_unavailable_profile_renders_disabled_and_is_not_committable() {
+        let container = make_container();
+        let schema = SessionSettingsSchema {
+            backend_kind: BackendKind::Hermes,
+            fields: vec![SessionSettingField {
+                key: "profile".to_owned(),
+                label: "Profile".to_owned(),
+                description: None,
+                use_slider: false,
+                select_options_by_setting: None,
+                field_type: SessionSettingFieldType::Select {
+                    options: vec![
+                        SelectOption {
+                            value: "default".to_owned(),
+                            label: "Default".to_owned(),
+                        },
+                        SelectOption {
+                            value: "gpt".to_owned(),
+                            label: "gpt \u{2014} Unavailable: gateway exploded".to_owned(),
+                        },
+                    ],
+                    default: Some("default".to_owned()),
+                    nullable: false,
+                },
+            }],
+        };
+        let mut values = SessionSettingsValues::default();
+        values.0.insert(
+            "profile".to_owned(),
+            SessionSettingValue::String("default".to_owned()),
+        );
+        let values = RwSignal::new(values);
+        let commits = RwSignal::new(0_usize);
+
+        let _handle = mount_to(container.clone(), move || {
+            view! {
+                <SessionSettingsControls
+                    schema=schema.clone()
+                    values=values.into()
+                    on_change=Callback::new(move |_| commits.update(|n| *n += 1))
+                />
+            }
+        });
+        next_tick().await;
+
+        let options = container.query_selector_all("option").unwrap();
+        let mut checked = 0;
+        for index in 0..options.length() {
+            let option: web_sys::HtmlOptionElement =
+                options.item(index).unwrap().dyn_into().unwrap();
+            if option.value() == "gpt" {
+                assert!(
+                    option.disabled(),
+                    "a backend-marked unavailable profile must not be selectable"
+                );
+                assert!(
+                    option.text().contains("gateway exploded"),
+                    "its reason must remain visible, got: {}",
+                    option.text()
+                );
+                checked += 1;
+            } else if option.value() == "default" {
+                assert!(!option.disabled(), "the healthy profile stays selectable");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 2, "both schema options must render");
+
+        let select: web_sys::HtmlSelectElement = query(&container, ".session-setting-select")
+            .expect("the profile select should render")
+            .dyn_into()
+            .unwrap();
+        select.set_value("gpt");
+        select
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert_eq!(
+            commits.get_untracked(),
+            0,
+            "a profile the backend cannot serve must never be committed"
+        );
+
+        // The healthy option still commits, so the guard is not a blanket block.
+        select.set_value("default");
+        select
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert_eq!(
+            commits.get_untracked(),
+            1,
+            "an available profile must still be committable"
         );
     }
 

@@ -4668,6 +4668,13 @@ kbd {
     flex-wrap: nowrap;
 }
 
+/* The no-attribution note sits where the legend would be, and reads as an
+   absence rather than as a category. */
+.summary-context-breakdown-empty {
+    color: var(--text-tertiary);
+    font-style: italic;
+}
+
 .context-breakdown-row {
     display: flex;
     align-items: center;
