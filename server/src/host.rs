@@ -18431,13 +18431,13 @@ fn backend_has_dynamic_session_schema(backend_kind: protocol::BackendKind) -> bo
 
 fn hidden_helper_session_settings(
     backend_kind: BackendKind,
-    session_settings: Option<&SessionSettingsValues>,
-) -> Option<SessionSettingsValues> {
+    session_settings: Option<&protocol::SessionSettingsValues>,
+) -> Option<protocol::SessionSettingsValues> {
     if backend_kind != BackendKind::Hermes {
         return None;
     }
 
-    let mut helper_settings = SessionSettingsValues::default();
+    let mut helper_settings = protocol::SessionSettingsValues::default();
     if let Some(session_settings) = session_settings {
         for key in [crate::backend::hermes::HERMES_PROFILE_SETTING, "model"] {
             if let Some(value) = session_settings.0.get(key) {
@@ -18458,7 +18458,7 @@ fn hidden_helper_session_settings(
 }
 
 fn hidden_helper_reasoning_effort(
-    session_settings: Option<&SessionSettingsValues>,
+    session_settings: Option<&protocol::SessionSettingsValues>,
 ) -> &'static str {
     match session_settings
         .and_then(|settings| settings.0.get("reasoning_effort"))
@@ -19110,7 +19110,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
 
     #[test]
     fn hidden_helpers_keep_hermes_scope_with_non_increasing_effort() {
-        let mut settings = SessionSettingsValues::default();
+        let mut settings = protocol::SessionSettingsValues::default();
         settings.0.insert(
             crate::backend::hermes::HERMES_PROFILE_SETTING.to_owned(),
             protocol::SessionSettingValue::String("qa-minimax".to_owned()),
