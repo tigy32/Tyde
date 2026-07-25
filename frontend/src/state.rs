@@ -123,6 +123,11 @@ pub const TAB_LRU_CAPACITY: usize = 2;
 pub const CENTER_SPLIT_RATIO_STORAGE_KEY: &str = "tyde-center-split-ratio";
 #[cfg(target_arch = "wasm32")]
 const ACTIVE_PROJECT_STORAGE_KEY: &str = "tyde-active-project";
+/// Deliberately a second key rather than an extension of the project record:
+/// the project format already ships and is covered by tests, and a separate
+/// key means an old or corrupt selection degrades to today's behaviour instead
+/// of taking project restoration down with it.
+const WORKSPACE_SELECTION_STORAGE_KEY: &str = "tyde-workspace-selection";
 
 /// Id of the builtin "Default" custom agent. It backs every spawn that picks
 /// no explicit agent, so pickers that already offer a "Default agent" row
@@ -191,6 +196,85 @@ fn persist_active_project(project: Option<&ActiveProjectRef>) {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn persist_active_project(_project: Option<&ActiveProjectRef>) {}
+
+/// The user's explicit selection, as it must survive a reload.
+///
+/// Identifiers only. The center zone also holds open files, diffs, terminals
+/// and scroll positions; those are caches and view state, not intent, and
+/// persisting them would bloat storage and go stale. Everything here is a
+/// pointer the app re-resolves against live server state on the way back in —
+/// and drops when it no longer resolves.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedWorkspaceSelection {
+    /// The chat that was open. Restored only if that agent is still live.
+    #[serde(default)]
+    pub active_agent: Option<ActiveAgentRef>,
+    /// Backend chosen for the next chat, when the user overrode the default.
+    #[serde(default)]
+    pub draft_backend: Option<BackendKind>,
+    /// Launch profile chosen for the next chat.
+    #[serde(default)]
+    pub draft_launch_profile: Option<LaunchProfileId>,
+}
+
+impl PersistedWorkspaceSelection {
+    fn is_empty(&self) -> bool {
+        self.active_agent.is_none()
+            && self.draft_backend.is_none()
+            && self.draft_launch_profile.is_none()
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn load_workspace_selection() -> PersistedWorkspaceSelection {
+    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    else {
+        return PersistedWorkspaceSelection::default();
+    };
+    let Some(encoded) = storage
+        .get_item(WORKSPACE_SELECTION_STORAGE_KEY)
+        .ok()
+        .flatten()
+    else {
+        return PersistedWorkspaceSelection::default();
+    };
+    match serde_json::from_str(&encoded) {
+        Ok(selection) => selection,
+        Err(error) => {
+            log::warn!("invalid persisted workspace selection: {error}");
+            let _ = storage.remove_item(WORKSPACE_SELECTION_STORAGE_KEY);
+            PersistedWorkspaceSelection::default()
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_workspace_selection() -> PersistedWorkspaceSelection {
+    PersistedWorkspaceSelection::default()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn persist_workspace_selection(selection: &PersistedWorkspaceSelection) {
+    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    else {
+        return;
+    };
+    if selection.is_empty() {
+        let _ = storage.remove_item(WORKSPACE_SELECTION_STORAGE_KEY);
+        return;
+    }
+    match serde_json::to_string(selection) {
+        Ok(encoded) => {
+            if let Err(error) = storage.set_item(WORKSPACE_SELECTION_STORAGE_KEY, &encoded) {
+                log::warn!("failed to persist workspace selection: {error:?}");
+            }
+        }
+        Err(error) => log::warn!("failed to encode workspace selection: {error}"),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn persist_workspace_selection(_selection: &PersistedWorkspaceSelection) {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TabId(pub u64);
@@ -2288,7 +2372,7 @@ impl SessionsPanelFilters {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ActiveAgentRef {
     pub host_id: String,
     pub agent_id: AgentId,
@@ -2402,6 +2486,10 @@ pub struct AppState {
     /// the project catalog. Catalog ownership and UI navigation are distinct;
     /// bootstrap must not guess the latter from whichever agent arrives first.
     pub pending_active_project_restore: RwSignal<Option<ActiveProjectRef>>,
+    /// The chat to reopen after its owning host's bootstrap arrives, loaded
+    /// from storage at construction. Held pending rather than applied eagerly
+    /// because the agent it names only exists once that bootstrap lands.
+    pub pending_active_chat_restore: RwSignal<Option<ActiveAgentRef>>,
     /// Derived from `center_zone.composer_owner()`. The focused pane's active
     /// chat wins; when a file pane is focused, the other pane's active chat
     /// remains the singleton composer owner. Read-only by design.
@@ -2872,6 +2960,7 @@ impl AppState {
             .filter_map(|(_, pane)| pane.active_tab_id)
             .collect();
         let center_zone: RwSignal<CenterZoneState> = RwSignal::new(initial_center_zone);
+        let restored_selection = load_workspace_selection();
         let active_agent: Memo<Option<ActiveAgentRef>> = Memo::new(move |_| {
             center_zone.with(|cz| {
                 cz.composer_owner()
@@ -2883,7 +2972,7 @@ impl AppState {
             })
         });
 
-        Self {
+        let state = Self {
             configured_hosts: RwSignal::new(Vec::new()),
             selected_host_id: RwSignal::new(None),
             host_streams: RwSignal::new(HashMap::new()),
@@ -2895,6 +2984,7 @@ impl AppState {
             sessions: RwSignal::new(Vec::new()),
             active_project: RwSignal::new(None),
             pending_active_project_restore: RwSignal::new(load_active_project()),
+            pending_active_chat_restore: RwSignal::new(restored_selection.active_agent.clone()),
             active_agent,
             chat_rows: RwSignal::new(HashMap::new()),
             chat_tool_rows: RwSignal::new(HashMap::new()),
@@ -2952,10 +3042,10 @@ impl AppState {
             backend_setup_by_host: RwSignal::new(HashMap::new()),
             agent_message_queue: RwSignal::new(HashMap::new()),
             agent_turn_active: RwSignal::new(HashMap::new()),
-            draft_backend_override: RwSignal::new(None),
+            draft_backend_override: RwSignal::new(restored_selection.draft_backend),
             draft_custom_agent_id: RwSignal::new(None),
             launch_profile_catalog: RwSignal::new(HashMap::new()),
-            draft_launch_profile_id: RwSignal::new(None),
+            draft_launch_profile_id: RwSignal::new(restored_selection.draft_launch_profile.clone()),
             session_schemas: RwSignal::new(HashMap::new()),
             schemas_loaded_for_host: RwSignal::new(HashMap::new()),
             backend_config_schemas: RwSignal::new(HashMap::new()),
@@ -3021,7 +3111,38 @@ impl AppState {
             pending_workbench_removes: RwSignal::new(Vec::new()),
             workbench_remove_prompt: RwSignal::new(None),
             upgrade_attempted: RwSignal::new(HashSet::new()),
-        }
+        };
+
+        // Persist the user's explicit selection whenever it changes.
+        //
+        // The gate matters: at cold start `active_agent` is `None` because no
+        // tab has been restored yet, and writing that would erase the very
+        // pointer the restore is about to read. So while a chat restore is
+        // pending, only a *real* selection (`Some`) is written — and that also
+        // settles the pending restore, so a user who acts before their host
+        // finishes connecting is not overruled by the late bootstrap.
+        let selection_state = state.clone();
+        Effect::new(move |_| {
+            let active_agent = selection_state.active_agent.get();
+            let draft_backend = selection_state.draft_backend_override.get();
+            let draft_launch_profile = selection_state.draft_launch_profile_id.get();
+            let restore_pending = selection_state
+                .pending_active_chat_restore
+                .with_untracked(|pending| pending.is_some());
+            if restore_pending {
+                if active_agent.is_none() {
+                    return;
+                }
+                selection_state.pending_active_chat_restore.set(None);
+            }
+            persist_workspace_selection(&PersistedWorkspaceSelection {
+                active_agent,
+                draft_backend,
+                draft_launch_profile,
+            });
+        });
+
+        state
     }
 
     /// Whether the Phase 2 safety net has already fired its one forced
@@ -3854,6 +3975,56 @@ impl AppState {
         } else {
             persist_active_project(None);
         }
+    }
+
+    /// Reopen the chat that was active before a reload, once its owning host's
+    /// bootstrap has installed the agents it names.
+    ///
+    /// Restoration is deliberately conservative:
+    ///
+    /// - It resolves against **live** agents only. A pointer whose agent is
+    ///   gone is retired and the user gets a coherent New Chat. Resuming the
+    ///   underlying session instead would be an implicit, possibly paid,
+    ///   backend action on page load — an explicit history click owns that.
+    /// - A selection the user has already made wins. Arriving late must never
+    ///   steal the center zone out from under them.
+    /// - Bootstraps from other hosts leave the pointer pending, so a slow host
+    ///   does not lose its chat to a fast one.
+    pub fn restore_active_chat_after_host_bootstrap(&self, host_id: &str) {
+        let Some(pending) = self
+            .pending_active_chat_restore
+            .get_untracked()
+            .filter(|pending| pending.host_id == host_id)
+        else {
+            return;
+        };
+        self.pending_active_chat_restore.set(None);
+
+        if self.active_agent.get_untracked().is_some() {
+            return;
+        }
+
+        let live = self.agents.with_untracked(|agents| {
+            agents
+                .iter()
+                .find(|agent| {
+                    agent.host_id == pending.host_id && agent.agent_id == pending.agent_id
+                })
+                .map(|agent| agent.name.clone())
+        });
+        let Some(name) = live else {
+            // Retire the stale pointer explicitly. The persist effect keys off
+            // `active_agent`, which does not change here, so nothing else would
+            // clear it and the same dead chat would be retried every reload.
+            persist_workspace_selection(&PersistedWorkspaceSelection {
+                active_agent: None,
+                draft_backend: self.draft_backend_override.get_untracked(),
+                draft_launch_profile: self.draft_launch_profile_id.get_untracked(),
+            });
+            return;
+        };
+
+        self.open_tab(TabContent::chat_with_agent(pending), name, true);
     }
 
     /// Whether the project at `(host_id, project_id)` accepts ProjectAddRoot /
@@ -9049,6 +9220,141 @@ mod tests {
         });
     }
 
+    fn restore_agent(host: &str, agent: &str) -> AgentInfo {
+        AgentInfo {
+            host_id: host.to_owned(),
+            agent_id: AgentId(agent.to_owned()),
+            name: format!("Agent {agent}"),
+            origin: protocol::AgentOrigin::User,
+            backend_kind: BackendKind::Hermes,
+            workspace_roots: Vec::new(),
+            project_id: None,
+            parent_agent_id: None,
+            session_id: None,
+            custom_agent_id: None,
+            workflow: None,
+            created_at_ms: 0,
+            instance_stream: StreamPath("/agent/a/inst".to_owned()),
+            started: true,
+            fatal_error: None,
+            activity_summary: Default::default(),
+        }
+    }
+
+    /// The chat that was open before a reload comes back, and comes back only
+    /// once its own host has advertised the agent. A different host's bootstrap
+    /// must not consume the pointer, or a fast host would cost a slow host its
+    /// chat.
+    #[test]
+    fn active_chat_restore_waits_for_its_owning_host_and_reopens_the_chat() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let pending = ActiveAgentRef {
+                host_id: "restored-host".to_owned(),
+                agent_id: AgentId("agent-1".to_owned()),
+            };
+            state
+                .pending_active_chat_restore
+                .set(Some(pending.clone()));
+            state.agents.update(|agents| {
+                agents.push(restore_agent("restored-host", "agent-1"));
+            });
+
+            state.restore_active_chat_after_host_bootstrap("other-host");
+            assert_eq!(
+                state.pending_active_chat_restore.get_untracked(),
+                Some(pending.clone()),
+                "an unrelated host must leave the pointer pending"
+            );
+            assert_eq!(
+                state.active_agent.get_untracked(),
+                None,
+                "and must not open anything"
+            );
+
+            state.restore_active_chat_after_host_bootstrap("restored-host");
+            assert_eq!(
+                state.active_agent.get_untracked(),
+                Some(pending),
+                "the owning host's bootstrap reopens the persisted chat"
+            );
+            assert_eq!(state.pending_active_chat_restore.get_untracked(), None);
+        });
+    }
+
+    /// A pointer whose agent no longer exists is retired, not resurrected. The
+    /// user gets a coherent New Chat; nothing implicitly resumes the session,
+    /// which would be a backend action — possibly a paid one — on page load.
+    #[test]
+    fn active_chat_restore_retires_a_pointer_whose_agent_is_gone() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            state
+                .pending_active_chat_restore
+                .set(Some(ActiveAgentRef {
+                    host_id: "restored-host".to_owned(),
+                    agent_id: AgentId("agent-gone".to_owned()),
+                }));
+            // The host bootstraps, but without that agent.
+            state.agents.update(|agents| {
+                agents.push(restore_agent("restored-host", "agent-other"));
+            });
+
+            state.restore_active_chat_after_host_bootstrap("restored-host");
+
+            assert_eq!(
+                state.active_agent.get_untracked(),
+                None,
+                "a dead chat must not be reopened"
+            );
+            assert_eq!(
+                state.pending_active_chat_restore.get_untracked(),
+                None,
+                "and the stale pointer must be retired, not retried every reload"
+            );
+        });
+    }
+
+    /// A selection the user has already made outranks a late bootstrap. The
+    /// restore must never steal the center zone back.
+    #[test]
+    fn active_chat_restore_yields_to_a_newer_user_selection() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            state.agents.update(|agents| {
+                agents.push(restore_agent("restored-host", "agent-1"));
+                agents.push(restore_agent("restored-host", "agent-chosen"));
+            });
+            let chosen = ActiveAgentRef {
+                host_id: "restored-host".to_owned(),
+                agent_id: AgentId("agent-chosen".to_owned()),
+            };
+            state.open_tab(
+                TabContent::chat_with_agent(chosen.clone()),
+                "Chosen".to_owned(),
+                true,
+            );
+            state
+                .pending_active_chat_restore
+                .set(Some(ActiveAgentRef {
+                    host_id: "restored-host".to_owned(),
+                    agent_id: AgentId("agent-1".to_owned()),
+                }));
+
+            state.restore_active_chat_after_host_bootstrap("restored-host");
+
+            assert_eq!(
+                state.active_agent.get_untracked(),
+                Some(chosen),
+                "the user's own selection must survive the restore"
+            );
+            assert_eq!(state.pending_active_chat_restore.get_untracked(), None);
+        });
+    }
+
     #[test]
     fn active_project_restore_waits_for_owning_host_and_respects_new_selection() {
         let owner = leptos::reactive::owner::Owner::new();
@@ -9112,5 +9418,72 @@ mod tests {
             );
             assert_eq!(missing_state.active_project.get_untracked(), None);
         });
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// M2-b: the persisted record round-trips, so a reload restores the backend
+    /// and launch profile the user chose instead of silently falling back to
+    /// the host default — which is how a Hermes-scoped session came back armed
+    /// with Claude.
+    #[wasm_bindgen_test]
+    fn workspace_selection_round_trips_through_storage() {
+        let selection = PersistedWorkspaceSelection {
+            active_agent: Some(ActiveAgentRef {
+                host_id: "h".to_owned(),
+                agent_id: AgentId("a".to_owned()),
+            }),
+            draft_backend: Some(BackendKind::Hermes),
+            draft_launch_profile: Some(LaunchProfileId("hermes:profile:qa".to_owned())),
+        };
+        persist_workspace_selection(&selection);
+        assert_eq!(
+            load_workspace_selection(),
+            selection,
+            "an explicit selection must survive a reload intact"
+        );
+
+        // An empty selection clears the key rather than persisting a record
+        // that says "the user chose nothing".
+        persist_workspace_selection(&PersistedWorkspaceSelection::default());
+        assert_eq!(
+            load_workspace_selection(),
+            PersistedWorkspaceSelection::default()
+        );
+    }
+
+    /// A stored selection must reach the signals the composer actually reads.
+    /// Without this the launch menu and session-settings footer fall through to
+    /// `default_backend`, which is the observed silent switch to Claude.
+    #[wasm_bindgen_test]
+    fn app_state_seeds_draft_selection_from_storage() {
+        persist_workspace_selection(&PersistedWorkspaceSelection {
+            active_agent: None,
+            draft_backend: Some(BackendKind::Hermes),
+            draft_launch_profile: Some(LaunchProfileId("hermes:profile:qa".to_owned())),
+        });
+
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            assert_eq!(
+                state.draft_backend_override.get_untracked(),
+                Some(BackendKind::Hermes),
+                "the chosen backend must survive the reload"
+            );
+            assert_eq!(
+                state.draft_launch_profile_id.get_untracked(),
+                Some(LaunchProfileId("hermes:profile:qa".to_owned())),
+                "and so must the chosen launch profile"
+            );
+        });
+
+        persist_workspace_selection(&PersistedWorkspaceSelection::default());
     }
 }

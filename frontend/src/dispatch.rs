@@ -25,6 +25,7 @@ use protocol::{
     QueuedMessagesPayload, RejectCode, RejectPayload, ReviewBootstrapPayload, ReviewCommentSource,
     ReviewErrorContext, ReviewEventPayload, ReviewId, ReviewSuggestionState, SessionHistoryPayload,
     SessionId, SessionListPayload, SessionSchemasPayload, SessionSettingsPayload,
+    SessionSummaryCountUpdatedPayload,
     SkillNotifyPayload, SteeringNotifyPayload, StreamPath, TaskTokenUsagePayload,
     TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberId, TeamMemberNotifyPayload,
     TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
@@ -1242,6 +1243,35 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 format!("failed to parse session_list payload: {error}"),
             ),
         },
+        FrameKind::SessionSummaryCountUpdated => {
+            match envelope.parse_payload::<SessionSummaryCountUpdatedPayload>() {
+                Ok(payload) => {
+                    // Patch one summary in place. Deliberately not a re-sort and
+                    // not a list replacement: the session list is paged and
+                    // ordered by last activity, and a per-turn reshuffle would
+                    // move rows under the reader's cursor. Only the count the
+                    // server just recomputed changes here.
+                    state.sessions.update(|sessions| {
+                        if let Some(session) = sessions.iter_mut().find(|session| {
+                            session.host_id == host_id && session.summary.id == payload.session_id
+                        }) {
+                            session.summary.message_count = payload.assistant_turn_count;
+                        }
+                        // A session this client has not listed yet needs no
+                        // action: the next SessionList/HostBootstrap carries the
+                        // authoritative count, so inventing a row here would
+                        // fabricate a summary we do not have.
+                    });
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse session_summary_count_updated payload: {error}"),
+                ),
+            }
+        }
         FrameKind::ProjectEvent => {
             let Some(project_id) = resolve_project_id(&envelope.stream) else {
                 log::warn!(
@@ -5365,6 +5395,10 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
             }
         }
     });
+    // Only now can a persisted chat pointer be resolved: it names an agent, and
+    // the agents it names exist as of this line. The project restore above runs
+    // earlier because it only needs `state.projects`.
+    state.restore_active_chat_after_host_bootstrap(host_id);
 }
 
 fn agent_info_from_payload(host_id: &str, payload: NewAgentPayload) -> AgentInfo {
@@ -7739,6 +7773,103 @@ mod wasm_tests {
                 .unwrap();
         });
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    fn listed_session(host: &str, id: &str, count: u32, updated: u64) -> crate::state::SessionInfo {
+        crate::state::SessionInfo {
+            host_id: host.to_owned(),
+            summary: protocol::SessionSummary {
+                id: protocol::SessionId(id.to_owned()),
+                backend_kind: protocol::BackendKind::Hermes,
+                launch_profile_id: None,
+                workspace_roots: vec![],
+                project_id: None,
+                alias: None,
+                user_alias: None,
+                parent_id: None,
+                created_at_ms: 0,
+                updated_at_ms: updated,
+                message_count: count,
+                token_count: None,
+                resumable: true,
+                compacted_from_session_id: None,
+                compacted_to_session_id: None,
+                compacted_at_ms: None,
+                compaction_summary_preview: None,
+            },
+        }
+    }
+
+    fn count_update_envelope(session_id: &str, turns: u32) -> Envelope {
+        Envelope::from_payload(
+            StreamPath("/host".to_owned()),
+            FrameKind::SessionSummaryCountUpdated,
+            1,
+            &SessionSummaryCountUpdatedPayload {
+                session_id: protocol::SessionId(session_id.to_owned()),
+                assistant_turn_count: turns,
+            },
+        )
+        .expect("payload serializes")
+    }
+
+    /// M7: a completed turn updates the listed count without a refresh, and
+    /// without disturbing anything else. The whole point of a targeted frame is
+    /// that it is *not* a list replacement — so the other rows, and the order
+    /// the user is reading, must be untouched.
+    #[wasm_bindgen_test]
+    fn session_summary_count_update_patches_one_row_in_place() {
+        let state = AppState::new();
+        state.sessions.set(vec![
+            listed_session("host-a", "session-1", 0, 200),
+            listed_session("host-a", "session-2", 7, 100),
+            listed_session("host-b", "session-1", 3, 300),
+        ]);
+
+        dispatch_envelope(&state, "host-a", count_update_envelope("session-1", 4));
+
+        let sessions = state.sessions.get_untracked();
+        assert_eq!(
+            sessions[0].summary.message_count, 4,
+            "the named session's count must advance with no refresh"
+        );
+        assert_eq!(
+            sessions[1].summary.message_count, 7,
+            "an unrelated session on the same host must be untouched"
+        );
+        assert_eq!(
+            sessions[2].summary.message_count, 3,
+            "a same-id session on a different host must be untouched"
+        );
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|s| (s.host_id.clone(), s.summary.id.0.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("host-a".to_owned(), "session-1".to_owned()),
+                ("host-a".to_owned(), "session-2".to_owned()),
+                ("host-b".to_owned(), "session-1".to_owned()),
+            ],
+            "order must not shift under the reader"
+        );
+    }
+
+    /// An update for a session this client has never listed must not fabricate
+    /// a row: the summary's other fields are unknown, and the next authoritative
+    /// list carries the real one.
+    #[wasm_bindgen_test]
+    fn session_summary_count_update_for_unknown_session_adds_nothing() {
+        let state = AppState::new();
+        state
+            .sessions
+            .set(vec![listed_session("host-a", "session-1", 1, 100)]);
+
+        dispatch_envelope(&state, "host-a", count_update_envelope("session-unknown", 9));
+
+        let sessions = state.sessions.get_untracked();
+        assert_eq!(sessions.len(), 1, "no row may be invented");
+        assert_eq!(sessions[0].summary.message_count, 1);
     }
 
     #[wasm_bindgen_test]

@@ -244,6 +244,15 @@ pub fn SessionsPanel() -> impl IntoView {
     }
 }
 
+/// Singular/plural label for the per-session turn counter.
+fn format_turn_count(turns: u32) -> String {
+    if turns == 1 {
+        "1 turn".to_owned()
+    } else {
+        format!("{turns} turns")
+    }
+}
+
 fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
     let title = session_title(&session);
     let short_id = session_id_short(&session);
@@ -256,7 +265,10 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
         .first()
         .map(|w| last_path_component(w).to_string())
         .unwrap_or_default();
-    let msg_count = session.summary.message_count;
+    // The store increments this once per completed assistant turn (a StreamEnd),
+    // never for the user's own message, so it counts turns and not messages.
+    // Labelled for what it is rather than inheriting a name that overstates it.
+    let turn_count = session.summary.message_count;
     let session_id = session.summary.id.clone();
     let resumable = session.summary.resumable;
     let session_host_id = session.host_id.clone();
@@ -394,7 +406,10 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
                 {(!workspace.is_empty()).then(|| view! {
                     <span class="session-card-workspace">{workspace}</span>
                 })}
-                <span class="session-card-msgs">{format!("{msg_count} msgs")}</span>
+                <span
+                    class="session-card-msgs"
+                    title="Completed assistant turns in this session"
+                >{format_turn_count(turn_count)}</span>
             </div>
             <div class="session-card-id">{short_id}</div>
         </div>
@@ -406,6 +421,24 @@ mod tests {
     use super::*;
     use crate::state::SessionInfo;
     use protocol::{BackendKind, ProjectId, SessionId, SessionSummary};
+
+    /// The store bumps this counter once per completed assistant turn, never
+    /// for the user's own message, so the badge must not claim to count
+    /// messages. Pins the label to the semantics rather than the other way
+    /// round: if the server ever starts counting user messages too, this test
+    /// should fail and be revisited deliberately.
+    #[test]
+    fn count_badge_is_labelled_in_turns_not_messages() {
+        assert_eq!(format_turn_count(0), "0 turns");
+        assert_eq!(format_turn_count(1), "1 turn", "singular reads naturally");
+        assert_eq!(format_turn_count(4), "4 turns");
+        for count in [0_u32, 1, 4] {
+            assert!(
+                !format_turn_count(count).contains("msg"),
+                "the badge must not describe assistant turns as messages"
+            );
+        }
+    }
 
     fn mk_session(
         id: &str,
