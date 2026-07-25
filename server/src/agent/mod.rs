@@ -11559,7 +11559,7 @@ mod tests {
         message.tool_calls = vec![ToolUseData {
             id: "tool-1".to_owned(),
             name: "tool".to_owned(),
-            arguments: Value::Null,
+            arguments: serde_json::Value::Null,
             content_offset: Some(3),
         }];
         append_chat_event(
