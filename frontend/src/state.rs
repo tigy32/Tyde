@@ -4094,9 +4094,15 @@ impl AppState {
     }
 
     /// Every queued pending session-settings value, for tests that need to
-    /// inspect what a spawn actually carries rather than trusting the draft
+    /// inspect what a spawn actually queues rather than trusting the draft
     /// signals it was built from.
-    #[cfg(test)]
+    ///
+    /// The queue is a separate channel from the `SpawnAgent` payload: settings
+    /// are stored under the target host and project whether or not they also
+    /// travel in the frame, and they do not when a launch profile is deferred
+    /// to. Gated to wasm because only a test that drives the real
+    /// `spawn_new_chat` populates it, and that spawn ends in `spawn_local`.
+    #[cfg(all(test, target_arch = "wasm32"))]
     pub(crate) fn pending_settings_values_for_tests(&self) -> Vec<SessionSettingsValues> {
         self.pending_agent_session_settings
             .get_untracked()

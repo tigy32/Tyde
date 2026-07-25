@@ -10272,6 +10272,13 @@ mod wasm_tests {
         state
             .draft_custom_agent_id
             .set(Some(protocol::CustomAgentId("agent-a-custom".to_owned())));
+        let mut settings = protocol::SessionSettingsValues::default();
+        settings.0.insert(
+            "profile".to_owned(),
+            protocol::SessionSettingValue::String("hermes-qa".to_owned()),
+        );
+        state.draft_session_settings.set(settings);
+        state.draft_session_settings_dirty.set(true);
         state.draft_selection_host.set(Some("host-a".to_owned()));
         // Target host-b directly, without letting the reactive guard run.
         state.active_project.set(Some(ActiveProjectRef {
@@ -10299,6 +10306,19 @@ mod wasm_tests {
         assert!(
             !payload.contains("hermes"),
             "nor its backend, which host-b has not enabled, got: {payload}"
+        );
+
+        // The queue is a second, independent channel: `spawn_new_chat` stores
+        // the draft settings under the target host and project whether or not
+        // they also travel in the payload, and they do not when a profile is
+        // deferred to. Asserting the frame alone would miss host A's settings
+        // being applied to host B's agent at startup.
+        let queued = state.pending_settings_values_for_tests();
+        assert!(
+            !queued
+                .iter()
+                .any(|values| values.0.contains_key("profile")),
+            "host-A settings must not be queued under the host-B spawn, got: {queued:?}"
         );
     }
 
