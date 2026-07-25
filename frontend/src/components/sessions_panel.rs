@@ -8,7 +8,7 @@ use protocol::{
 
 use crate::actions::resume_session;
 use crate::send::send_frame;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::state::{
     ActiveProjectRef, AppState, ConnectionStatus, SessionInfo, SessionsPanelFilters,
@@ -110,98 +110,6 @@ pub fn session_passes_filters(
         }
     }
     true
-}
-
-/// How many times one connection may be asked for its first page before the
-/// panel stops trying on its own.
-///
-/// The bound *is* the loop guard. Nothing here is timer-driven, so an unbounded
-/// retry would be a tight loop between the effect and its own failure handler;
-/// a fixed budget costs a persistently failing connection three sends and then
-/// stops. A reconnect issues a new `StreamPath` and therefore a fresh budget,
-/// and manual Refresh is never subject to it.
-///
-/// How much the retry can buy is bounded by what a failed send means on this
-/// transport, which is worth stating because it is not "a transient blip":
-/// `tauri-shell/src/router.rs` `send_line` fails only when the host is absent
-/// from the router registry or its writer task has already exited — the
-/// outbound channel is unbounded, so there is no backpressure failure — and
-/// `send.rs` has by then consumed a sequence number for a frame the server
-/// never saw, which the server's strict `SeqValidator` will not forgive on the
-/// next frame. So in practice the connection is already gone, and the recovery
-/// that works is the reconnect, which arrives as a new `StreamPath` and is
-/// therefore a new target. The retry covers the window before that lands.
-const MAX_REQUEST_ATTEMPTS: u32 = 3;
-
-/// The bookkeeping behind "ask each connection once": which connections have a
-/// request outstanding or delivered, how many sends have failed on each, and
-/// the generation counter that wakes the request effect for a bounded retry.
-#[derive(Clone, Copy)]
-struct RequestLedger {
-    claimed: RwSignal<HashSet<(String, StreamPath)>>,
-    failures: RwSignal<HashMap<(String, StreamPath), u32>>,
-    retry_tick: RwSignal<u32>,
-}
-
-impl RequestLedger {
-    fn new() -> Self {
-        Self {
-            claimed: RwSignal::new(HashSet::new()),
-            failures: RwSignal::new(HashMap::new()),
-            retry_tick: RwSignal::new(0),
-        }
-    }
-
-    /// Reads are untracked on purpose: the request effect is what writes this
-    /// bookkeeping, so tracking it would make the effect its own trigger. The
-    /// one intended wake-up is `retry_tick`, which the effect tracks
-    /// explicitly. A disposed signal answers "no request", which is the safe
-    /// direction — the panel is gone.
-    fn needs_request(&self, target: &(String, StreamPath)) -> bool {
-        let unclaimed = self
-            .claimed
-            .try_with_untracked(|claimed| !claimed.contains(target))
-            .unwrap_or(false);
-        let under_budget = self
-            .failures
-            .try_with_untracked(|failures| {
-                failures.get(target).copied().unwrap_or(0) < MAX_REQUEST_ATTEMPTS
-            })
-            .unwrap_or(false);
-        unclaimed && under_budget
-    }
-
-    fn claim(&self, target: &(String, StreamPath)) {
-        let _ = self.claimed.try_update(|claimed| {
-            claimed.insert(target.clone());
-        });
-    }
-
-    /// Release the claim a failed send took and count the attempt against this
-    /// connection's budget. Returns whether another attempt is allowed, in
-    /// which case `retry_tick` is bumped so the effect runs again — releasing
-    /// the claim alone cannot do that, because the connected set has not
-    /// changed.
-    fn record_failure(&self, target: &(String, StreamPath)) -> bool {
-        let _ = self.claimed.try_update(|claimed| {
-            claimed.remove(target);
-        });
-        let attempts = self
-            .failures
-            .try_update(|failures| {
-                let attempts = failures.entry(target.clone()).or_insert(0);
-                *attempts += 1;
-                *attempts
-            })
-            .unwrap_or(MAX_REQUEST_ATTEMPTS);
-        if attempts >= MAX_REQUEST_ATTEMPTS {
-            return false;
-        }
-        let _ = self.retry_tick.try_update(|tick| {
-            *tick += 1;
-        });
-        true
-    }
 }
 
 #[component]
@@ -355,7 +263,7 @@ pub fn SessionsPanel() -> impl IntoView {
         state: &AppState,
         targets: &[(String, StreamPath)],
         force: bool,
-        ledger: RequestLedger,
+        requested: RwSignal<HashSet<(String, StreamPath)>>,
     ) {
         let requests: Vec<(String, StreamPath, ListSessionsPayload)> = targets
             .iter()
@@ -388,32 +296,42 @@ pub fn SessionsPanel() -> impl IntoView {
             .collect();
         for (host_id, host_stream, payload) in requests {
             let refresh_flag = state.session_list_refresh_in_flight;
-            // Claim the connection only now that a frame is genuinely going
-            // out. Recording it earlier — while merely *considering* a host —
-            // burns the one-shot on a host that turned out to be unreachable,
-            // and nothing can hand it back.
+            // Claim the connection now that a frame is genuinely going out.
+            // Claiming earlier — while merely *considering* a host — burned the
+            // one-shot on hosts that were then never asked at all.
             let claim = (host_id.clone(), host_stream.clone());
-            ledger.claim(&claim);
+            let _ = requested.try_update(|seen| {
+                seen.insert(claim);
+            });
             spawn_local(async move {
                 if let Err(e) =
                     send_frame(&host_id, host_stream, FrameKind::ListSessions, &payload).await
                 {
-                    // Nothing reached the host after a failed send, so neither
-                    // the in-flight slot nor the connection claim describes
-                    // anything real. Releasing them is necessary but not
-                    // sufficient: the connected set has not changed, so only
-                    // the retry tick can actually produce another attempt.
+                    log::error!(
+                        "failed to send ListSessions to {host_id}: {e}; waiting for reconnect"
+                    );
+                    // Release the *host-level* gate so teardown and an explicit
+                    // Refresh are not wedged behind a request that will never
+                    // be answered.
+                    //
+                    // The connection claim deliberately stays. A failed send
+                    // here means this stream is already dead — `router.rs`
+                    // `send_line` fails only when the host is absent from the
+                    // registry or its writer task has exited, and there is no
+                    // backpressure path on its unbounded channel. `send.rs`
+                    // has by then consumed a sequence number the server never
+                    // saw, so any later frame on this stream trips the server's
+                    // `SeqValidator`. Worse, the router routes by `host_id`: a
+                    // frame carrying the dead `StreamPath` could land on a
+                    // replacement transport and tear down the very connection
+                    // that would have recovered. Making the tuple eligible
+                    // again buys nothing and risks that. The recovery is the
+                    // disconnect this failure implies, which drops the stream
+                    // and reconnects with a new `StreamPath` — a new target,
+                    // which gets its own single request.
                     let _ = refresh_flag.try_update(|hosts| {
                         hosts.remove(&host_id);
                     });
-                    if ledger.record_failure(&claim) {
-                        log::error!("failed to send ListSessions to {host_id}: {e}; retrying");
-                    } else {
-                        log::error!(
-                            "failed to send ListSessions to {host_id}: {e}; no attempts left \
-                             on this connection, use Refresh or reconnect"
-                        );
-                    }
                 }
             });
         }
@@ -432,42 +350,44 @@ pub fn SessionsPanel() -> impl IntoView {
     // turns whose counts it carries. Waiting for the user to look at History
     // would drop every update sent before they did.
     //
-    // Requested once per host connection. The one-shot is keyed by
-    // `(host_id, StreamPath)` so that a reconnect — a genuinely new server-side
-    // stream with no subscription on it — is asked again, while the page this
-    // request itself produces is not mistaken for a reason to ask twice.
-    let ledger = RequestLedger::new();
+    // Requested once per host connection, whatever the outcome. The one-shot is
+    // keyed by `(host_id, StreamPath)` so that a reconnect — a genuinely new
+    // server-side stream with no subscription on it — is asked in its own
+    // right, while neither the page this request produces nor a failed send is
+    // a reason to ask the same connection twice. The next automatic request
+    // happens when the connection identity changes; see the failure branch
+    // above for why the transport cannot answer a second attempt on a dead one.
+    let requested_connections: RwSignal<HashSet<(String, StreamPath)>> =
+        RwSignal::new(HashSet::new());
     let state_for_request = state.clone();
     Effect::new(move |_| {
-        // The only tracked inputs are the connected set and the retry
-        // generation. A failed send bumps the generation, which is what turns
-        // "the claim was released" into an actual second attempt; nothing else
-        // writes it, so it cannot spin on its own.
-        let generation = ledger.retry_tick.get();
-        let fresh: Vec<(String, StreamPath)> = connected_hosts
-            .get()
-            .into_iter()
-            .filter(|target| ledger.needs_request(target))
-            .collect();
+        let targets = connected_hosts.get();
+        // Untracked: the claims recorded by the dispatch below must not be a
+        // dependency of the effect that records them, or the panel would
+        // request itself in a loop.
+        let fresh: Vec<(String, StreamPath)> = requested_connections
+            .try_with_untracked(|requested| {
+                targets
+                    .into_iter()
+                    .filter(|target| !requested.contains(target))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         if fresh.is_empty() {
             return;
         }
-        log::debug!(
-            "history.first_page.request generation={generation} connections={}",
-            fresh.len()
-        );
-        request_authoritative_pages(&state_for_request, &fresh, false, ledger);
+        request_authoritative_pages(&state_for_request, &fresh, false, requested_connections);
     });
 
     let state_for_refresh = state.clone();
     let on_refresh = move |_| {
-        // Explicit Refresh consults neither the claim nor the retry budget: a
-        // user who presses it and gets nothing has been silently ignored.
+        // Explicit Refresh consults no claim: a user who presses it and gets
+        // nothing has been silently ignored.
         request_authoritative_pages(
             &state_for_refresh,
             &connected_hosts.get_untracked(),
             true,
-            ledger,
+            requested_connections,
         );
     };
 
@@ -1356,67 +1276,21 @@ mod wasm_tests {
         );
     }
 
-    /// A send that never leaves the process must not leave the connection
-    /// claimed with nothing able to wake the effect: the connected set has not
-    /// changed, so releasing the claim alone produces no second attempt and
-    /// the connection stays unenrolled for summary updates — the M7 failure
-    /// mode reached from a different direction.
+    /// The failure path, end to end, on the only recovery the transport
+    /// actually offers.
     ///
-    /// **Faithfulness caveat, recorded here rather than left to be assumed.**
-    /// This test lets the *second* send succeed on the same connection. On the
-    /// real transport that is not reachable: `tauri-shell/src/router.rs`
+    /// A failed automatic send means this stream is already dead: `router.rs`
     /// `send_line` fails only when the host is gone from the registry or its
-    /// writer task has exited, and `send.rs` has already consumed a sequence
-    /// number the server never saw, so a later frame on that stream would trip
-    /// `SeqValidator`. What this pins is the component contract — a failed send
-    /// releases its claim and the panel asks again, once, with no Refresh click
-    /// and no reconnect. The recovery production actually takes is covered by
-    /// `reconnecting_a_host_asks_the_new_connection_and_not_the_dead_one`.
+    /// writer task has exited, and `send.rs` has by then consumed a sequence
+    /// number the server never saw. So the panel must *not* try the same
+    /// `StreamPath` again — a second frame there would trip the server's
+    /// `SeqValidator`, and since the router routes by `host_id` it could land
+    /// on a replacement transport and tear down the connection that was about
+    /// to recover. It must wait for the disconnect this failure implies, and
+    /// ask the new connection exactly once.
     #[wasm_bindgen_test]
-    async fn a_failed_send_is_retried_once_without_a_manual_refresh() {
+    async fn a_failed_send_waits_for_the_reconnect_rather_than_retrying() {
         install_send_stub_failing(1);
-        let state = AppState::new();
-        state.active_project.set(None);
-        state.selected_host_id.set(Some("host-a".to_owned()));
-        state
-            .sessions
-            .set(vec![listed_session("host-a", "session-1", 0, 100)]);
-
-        let (_container, _handle) = mount_panel(state.clone());
-        settle().await;
-        connect(&state, "host-a", "/host-1");
-        settle().await;
-
-        assert_eq!(
-            list_sessions_outcomes(),
-            vec!["err".to_owned(), "ok".to_owned()],
-            "the first send failed, and the panel asked again on its own — no \
-             Refresh click and no reconnect"
-        );
-        assert_eq!(
-            list_sessions_targets(),
-            vec![
-                ("host-a".to_owned(), "/host-1".to_owned()),
-                ("host-a".to_owned(), "/host-1".to_owned()),
-            ],
-            "both attempts addressed the same connection"
-        );
-
-        settle().await;
-        settle().await;
-        assert_eq!(
-            list_sessions_outcomes().len(),
-            2,
-            "and exactly once: a retry that succeeded must not keep retrying"
-        );
-    }
-
-    /// The retry is bounded. Nothing here is timer-driven, so an unbounded
-    /// retry would be a tight loop between the effect and its own failure
-    /// handler. Manual Refresh is deliberately outside the budget.
-    #[wasm_bindgen_test]
-    async fn a_persistently_failing_connection_stops_and_leaves_refresh_working() {
-        install_send_stub_failing(99);
         let state = AppState::new();
         state.active_project.set(None);
         state.selected_host_id.set(Some("host-a".to_owned()));
@@ -1427,15 +1301,107 @@ mod wasm_tests {
         let (container, _handle) = mount_panel(state.clone());
         settle().await;
         connect(&state, "host-a", "/host-1");
-        for _ in 0..8 {
+        for _ in 0..6 {
             settle().await;
         }
 
         assert_eq!(
             list_sessions_outcomes(),
-            vec!["err".to_owned(); MAX_REQUEST_ATTEMPTS as usize],
-            "a connection that keeps failing costs a fixed number of attempts \
-             and then stops trying"
+            vec!["err".to_owned()],
+            "the send failed, and the dead connection must not be asked again \
+             — no retry burst on a stream the transport has given up on"
+        );
+        assert!(
+            !state
+                .session_list_refresh_in_flight
+                .get_untracked()
+                .contains("host-a"),
+            "but the host-level gate must be released, or teardown and an \
+             explicit Refresh stay wedged behind an answer that never comes"
+        );
+
+        // The disconnect that this send failure implies, exactly as
+        // `app.rs:1010` handles it: the stream is dropped and the inbound and
+        // outbound sequence state is reset (`state.rs:4711-4719`).
+        state.clear_host_runtime("host-a");
+        settle().await;
+        state
+            .sessions
+            .set(vec![listed_session("host-a", "session-1", 0, 100)]);
+        connect(&state, "host-a", "/host-2");
+        settle().await;
+
+        assert_eq!(
+            list_sessions_targets(),
+            vec![
+                ("host-a".to_owned(), "/host-1".to_owned()),
+                ("host-a".to_owned(), "/host-2".to_owned()),
+            ],
+            "the reconnected stream is enrolled exactly once, and nothing was \
+             ever sent to the dead path again"
+        );
+        assert_eq!(
+            list_sessions_outcomes(),
+            vec!["err".to_owned(), "ok".to_owned()],
+            "and that second request is the one that actually reached a host"
+        );
+
+        // The authoritative answer for the new connection must not look like a
+        // reason to ask again.
+        let page = protocol::SessionListPayload {
+            sessions: vec![listed_session("host-a", "session-1", 4, 500).summary],
+            page: protocol::SessionListPageInfo {
+                total_count: 1,
+                ..Default::default()
+            },
+        };
+        let envelope = protocol::Envelope::from_payload(
+            StreamPath("/host-2".to_owned()),
+            FrameKind::SessionList,
+            0,
+            &page,
+        )
+        .expect("build SessionList envelope");
+        crate::dispatch::dispatch_envelope(&state, "host-a", envelope);
+        for _ in 0..4 {
+            settle().await;
+        }
+
+        assert_eq!(
+            list_sessions_targets().len(),
+            2,
+            "the response must not retrigger the request that produced it"
+        );
+        assert!(
+            container
+                .text_content()
+                .unwrap_or_default()
+                .contains("4 responses"),
+            "and the recovered connection's page is what History shows"
+        );
+    }
+
+    /// Refresh is a user action and consults no claim: a live connection that
+    /// has already been enrolled must still answer an explicit press, on the
+    /// connection it is actually reachable on.
+    #[wasm_bindgen_test]
+    async fn refresh_asks_the_live_connection_again() {
+        install_send_stub();
+        let state = AppState::new();
+        state.active_project.set(None);
+        state.selected_host_id.set(Some("host-a".to_owned()));
+        state
+            .sessions
+            .set(vec![listed_session("host-a", "session-1", 0, 100)]);
+
+        let (container, _handle) = mount_panel(state.clone());
+        settle().await;
+        connect(&state, "host-a", "/host-1");
+        settle().await;
+        assert_eq!(
+            list_sessions_targets(),
+            vec![("host-a".to_owned(), "/host-1".to_owned())],
+            "precondition: the connection was claimed by a successful send"
         );
 
         let refresh = container
@@ -1448,9 +1414,17 @@ mod wasm_tests {
         settle().await;
 
         assert_eq!(
-            list_sessions_outcomes().len(),
-            MAX_REQUEST_ATTEMPTS as usize + 1,
-            "an exhausted budget must not silently swallow an explicit Refresh"
+            list_sessions_targets(),
+            vec![
+                ("host-a".to_owned(), "/host-1".to_owned()),
+                ("host-a".to_owned(), "/host-1".to_owned()),
+            ],
+            "an already-claimed connection must not swallow an explicit Refresh"
+        );
+        assert_eq!(
+            list_sessions_outcomes(),
+            vec!["ok".to_owned(), "ok".to_owned()],
+            "and both reached the host"
         );
     }
 }
