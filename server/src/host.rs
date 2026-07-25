@@ -163,8 +163,13 @@ pub(crate) struct HostSessionSummaryCountUpdate {
     pub payload: SessionSummaryCountUpdatedPayload,
 }
 
-pub(crate) type HostSessionSummaryCountTx = mpsc::UnboundedSender<HostSessionSummaryCountUpdate>;
-type HostSessionSummaryCountRx = mpsc::UnboundedReceiver<HostSessionSummaryCountUpdate>;
+pub(crate) enum HostSessionSummaryCountEvent {
+    Update(HostSessionSummaryCountUpdate),
+    AgentPublished(AgentId),
+}
+
+pub(crate) type HostSessionSummaryCountTx = mpsc::UnboundedSender<HostSessionSummaryCountEvent>;
+type HostSessionSummaryCountRx = mpsc::UnboundedReceiver<HostSessionSummaryCountEvent>;
 
 pub(crate) enum HostCapacityUpdate {
     Report {
@@ -848,9 +853,9 @@ pub(crate) struct HostState {
     pub sub_agent_spawn_tx: HostSubAgentSpawnTx,
     pub capacity_tx: HostCapacityTx,
     pub session_summary_count_tx: HostSessionSummaryCountTx,
-    // A first response can finish before its NewAgent publication. Hold that
-    // targeted update until the publication fanout refreshes session snapshots.
-    pending_session_summary_count_updates: HashMap<SessionId, HostSessionSummaryCountUpdate>,
+    // A response can finish while its NewAgent is still being published.
+    // Coalesce by agent so resumed instances sharing a session stay isolated.
+    pending_session_summary_count_updates: HashMap<AgentId, HostSessionSummaryCountUpdate>,
     pub use_mock_backend: bool,
     pub debug_mcp: DebugMcpHandle,
     pub agent_control_mcp: AgentControlMcpHandle,
@@ -1302,6 +1307,27 @@ impl AgentVisibilityRegistry {
             .get(agent_id)
             .map(|entry| entry.host_streams.clone())
             .unwrap_or_default()
+    }
+
+    fn tracks_publishable_agent(&self, agent_id: &AgentId) -> bool {
+        self.inner
+            .lock()
+            .expect("agent visibility mutex poisoned")
+            .get(agent_id)
+            .is_some_and(|entry| entry.phase != AgentVisibilityPhase::Cancelled)
+    }
+
+    fn publication_pending(&self, agent_id: &AgentId) -> bool {
+        self.inner
+            .lock()
+            .expect("agent visibility mutex poisoned")
+            .get(agent_id)
+            .is_some_and(|entry| {
+                matches!(
+                    entry.phase,
+                    AgentVisibilityPhase::Pending | AgentVisibilityPhase::Fanout
+                )
+            })
     }
 
     fn remove_agent(&self, agent_id: &AgentId) {
@@ -5042,7 +5068,13 @@ impl HostHandle {
             "host spawn_agent resolved request"
         );
 
-        let (start, agent_handle, startup_rx, agent_visibility) = {
+        let (
+            start,
+            agent_handle,
+            startup_rx,
+            agent_visibility,
+            session_summary_count_tx,
+        ) = {
             let mut state = self.state.lock().await;
             let sub_agent_spawn_tx = state.sub_agent_spawn_tx.clone();
             let capacity_tx = state.capacity_tx.clone();
@@ -5057,7 +5089,7 @@ impl HostHandle {
                     session_store: Arc::clone(&session_store),
                     host_sub_agent_spawn_tx: sub_agent_spawn_tx,
                     capacity_tx,
-                    session_summary_count_tx,
+                    session_summary_count_tx: session_summary_count_tx.clone(),
                     review_registry,
                     antigravity_conversations_dir,
                 },
@@ -5067,6 +5099,7 @@ impl HostHandle {
                 spawned.handle,
                 spawned.startup_rx,
                 state.agent_visibility.clone(),
+                session_summary_count_tx,
             )
         };
 
@@ -5218,6 +5251,9 @@ impl HostHandle {
         if visibility.finish_new_agent_fanout() {
             return Ok(agent_id);
         }
+        let _ = session_summary_count_tx.send(
+            HostSessionSummaryCountEvent::AgentPublished(agent_id.clone()),
+        );
         #[cfg(test)]
         wait_for_spawn_visible_before_publication_test_hook(self).await;
         {
@@ -5428,7 +5464,13 @@ impl HostHandle {
             let state = self.state.lock().await;
             Arc::clone(&state.session_store)
         };
-        let (start, agent_handle, startup_rx, agent_visibility) = {
+        let (
+            start,
+            agent_handle,
+            startup_rx,
+            agent_visibility,
+            session_summary_count_tx,
+        ) = {
             let mut state = self.state.lock().await;
             let sub_agent_spawn_tx = state.sub_agent_spawn_tx.clone();
             let capacity_tx = state.capacity_tx.clone();
@@ -5443,7 +5485,7 @@ impl HostHandle {
                     session_store,
                     host_sub_agent_spawn_tx: sub_agent_spawn_tx,
                     capacity_tx,
-                    session_summary_count_tx,
+                    session_summary_count_tx: session_summary_count_tx.clone(),
                     review_registry,
                     antigravity_conversations_dir,
                 },
@@ -5453,6 +5495,7 @@ impl HostHandle {
                 spawned.handle,
                 spawned.startup_rx,
                 state.agent_visibility.clone(),
+                session_summary_count_tx,
             )
         };
 
@@ -5554,6 +5597,9 @@ impl HostHandle {
         if visibility.finish_new_agent_fanout() {
             return agent_id;
         }
+        let _ = session_summary_count_tx.send(
+            HostSessionSummaryCountEvent::AgentPublished(agent_id.clone()),
+        );
         #[cfg(test)]
         wait_for_spawn_visible_before_publication_test_hook(self).await;
 
@@ -15165,9 +15211,16 @@ fn spawn_host_capacity_task(host: HostHandle, mut rx: HostCapacityRx) {
 
 fn spawn_host_session_summary_count_task(host: HostHandle, mut rx: HostSessionSummaryCountRx) {
     let worker = async move {
-        while let Some(update) = rx.recv().await {
+        while let Some(event) = rx.recv().await {
             let mut state = host.state.lock().await;
-            fan_out_session_summary_count_update(&mut state, &update);
+            match event {
+                HostSessionSummaryCountEvent::Update(update) => {
+                    fan_out_session_summary_count_update(&mut state, &update);
+                }
+                HostSessionSummaryCountEvent::AgentPublished(agent_id) => {
+                    flush_pending_session_summary_count_update(&mut state, &agent_id);
+                }
+            }
         }
     };
 
@@ -16782,8 +16835,20 @@ async fn fan_out_session_lists(state: &mut HostState) {
     }
 
     let pending_updates = std::mem::take(&mut state.pending_session_summary_count_updates);
-    for update in pending_updates.into_values() {
-        fan_out_session_summary_count_update_inner(state, &update, false);
+    for mut update in pending_updates.into_values() {
+        if let Some(summary) = sessions
+            .iter()
+            .find(|summary| summary.id == update.payload.session_id)
+            && (summary.message_count, summary.updated_at_ms)
+                >= (
+                    update.payload.assistant_turn_count,
+                    update.payload.updated_at_ms,
+                )
+        {
+            update.payload.assistant_turn_count = summary.message_count;
+            update.payload.updated_at_ms = summary.updated_at_ms;
+        }
+        fan_out_session_summary_count_update_inner(state, &update, true);
     }
 }
 
@@ -16807,31 +16872,51 @@ fn fan_out_session_summary_count_update_inner(
     {
         state
             .pending_session_summary_count_updates
-            .remove(&payload_update.session_id);
+            .remove(&update.agent_id);
         return;
     }
 
-    let pending_publication = if state
+    let pending_session_binding = state
         .pending_agent_sessions
         .get(&update.agent_id)
-        .is_some_and(|session_id| session_id == &payload_update.session_id)
-    {
-        true
-    } else if state
+        .is_some_and(|session_id| session_id == &payload_update.session_id);
+    let published_session_binding = state
         .agent_sessions
         .get(&update.agent_id)
-        .is_some_and(|session_id| session_id == &payload_update.session_id)
-    {
-        false
-    } else {
-        state
-            .pending_session_summary_count_updates
-            .remove(&payload_update.session_id);
+        .is_some_and(|session_id| session_id == &payload_update.session_id);
+    if !pending_session_binding && !published_session_binding {
+        if queue_if_missing
+            && state
+                .agent_visibility
+                .tracks_publishable_agent(&update.agent_id)
+        {
+            queue_session_summary_count_update(state, update);
+        } else {
+            state
+                .pending_session_summary_count_updates
+                .remove(&update.agent_id);
+        }
         return;
-    };
+    }
+    if state
+        .agent_visibility
+        .publication_pending(&update.agent_id)
+    {
+        if queue_if_missing {
+            queue_session_summary_count_update(state, update);
+        }
+        return;
+    }
+
     let visible_host_streams = state
         .agent_visibility
         .visible_host_streams(&update.agent_id);
+    if visible_host_streams.is_empty() {
+        state
+            .pending_session_summary_count_updates
+            .remove(&update.agent_id);
+        return;
+    }
     let payload = serde_json::to_value(payload_update)
         .expect("failed to serialize SessionSummaryCountUpdated payload for host stream fanout");
     let paths = state.host_streams.keys().cloned().collect::<Vec<_>>();
@@ -16895,10 +16980,21 @@ fn fan_out_session_summary_count_update_inner(
     if matched_snapshot {
         state
             .pending_session_summary_count_updates
-            .remove(&payload_update.session_id);
-    } else if queue_if_missing && (pending_publication || visible_subscriber) {
+            .remove(&update.agent_id);
+    } else if queue_if_missing && (pending_session_binding || visible_subscriber) {
         queue_session_summary_count_update(state, update);
     }
+}
+
+fn flush_pending_session_summary_count_update(state: &mut HostState, agent_id: &AgentId) {
+    let Some(update) = state
+        .pending_session_summary_count_updates
+        .get(agent_id)
+        .cloned()
+    else {
+        return;
+    };
+    fan_out_session_summary_count_update_inner(state, &update, true);
 }
 
 fn queue_session_summary_count_update(
@@ -16907,7 +17003,7 @@ fn queue_session_summary_count_update(
 ) {
     let pending = state
         .pending_session_summary_count_updates
-        .entry(update.payload.session_id.clone())
+        .entry(update.agent_id.clone())
         .or_insert_with(|| update.clone());
     if (
         update.payload.assistant_turn_count,

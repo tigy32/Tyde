@@ -38,7 +38,8 @@ use crate::backend::{
     validate_session_settings_values,
 };
 use crate::host::{
-    HostCapacityTx, HostSessionSummaryCountTx, HostSessionSummaryCountUpdate, HostSubAgentEmitter,
+    HostCapacityTx, HostSessionSummaryCountEvent, HostSessionSummaryCountTx,
+    HostSessionSummaryCountUpdate, HostSubAgentEmitter,
 };
 use crate::review::ReviewRegistryHandle;
 use crate::store::session::SessionStore;
@@ -3024,10 +3025,14 @@ pub(crate) fn spawn_agent_actor(
                     )
                     .await
                     {
-                        let _ = session_summary_count_tx.send(HostSessionSummaryCountUpdate {
-                            agent_id: agent_id.clone(),
-                            payload: update,
-                        });
+                        let _ = session_summary_count_tx.send(
+                            HostSessionSummaryCountEvent::Update(
+                                HostSessionSummaryCountUpdate {
+                                    agent_id: agent_id.clone(),
+                                    payload: update,
+                                },
+                            ),
+                        );
                     }
                     let source_seq = activity_event_seq;
                     activity_event_seq = activity_event_seq.saturating_add(1);
@@ -5040,10 +5045,14 @@ pub(crate) fn spawn_relay_agent_actor(
                     if let Some(update) =
                         apply_runtime_session_updates(&session_store, &session_id, &event).await
                     {
-                        let _ = session_summary_count_tx.send(HostSessionSummaryCountUpdate {
-                            agent_id: agent_id.clone(),
-                            payload: update,
-                        });
+                        let _ = session_summary_count_tx.send(
+                            HostSessionSummaryCountEvent::Update(
+                                HostSessionSummaryCountUpdate {
+                                    agent_id: agent_id.clone(),
+                                    payload: update,
+                                },
+                            ),
+                        );
                     }
                     let source_seq = activity_event_seq;
                     activity_event_seq = activity_event_seq.saturating_add(1);

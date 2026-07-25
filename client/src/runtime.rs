@@ -538,10 +538,17 @@ impl Drop for TerminalEvents {
 
 struct Shared {
     routes: Mutex<HashMap<StreamPath, Route>>,
+    pending_agent_endpoints: Mutex<HashMap<StreamPath, PendingAgentEndpoint>>,
     pending_project_events: Mutex<HashMap<ProjectId, mpsc::Receiver<ProjectEvent>>>,
     write_tx: mpsc::Sender<WriteRequest>,
     _read_task: JoinHandle<()>,
     _write_task: JoinHandle<()>,
+}
+
+struct PendingAgentEndpoint {
+    payload: NewAgentPayload,
+    events: mpsc::Receiver<AgentEvent>,
+    host_tx: mpsc::Sender<HostEvent>,
 }
 
 enum Route {
@@ -583,6 +590,7 @@ fn spawn_runtime(parts: ConnectedParts) -> HostEndpoint {
 
         Shared {
             routes: Mutex::new(routes),
+            pending_agent_endpoints: Mutex::new(HashMap::new()),
             pending_project_events: Mutex::new(HashMap::new()),
             write_tx,
             _read_task: read_task,
@@ -614,8 +622,51 @@ impl Shared {
     }
 
     fn unregister_route(&self, stream: &StreamPath) {
-        let mut routes = self.routes.lock().expect("route registry poisoned");
-        routes.remove(stream);
+        {
+            let mut routes = self.routes.lock().expect("route registry poisoned");
+            routes.remove(stream);
+        }
+        self.pending_agent_endpoints
+            .lock()
+            .expect("pending agent endpoint registry poisoned")
+            .remove(stream);
+    }
+
+    async fn resolve_pending_agent_endpoint(
+        self: &Arc<Self>,
+        stream: &StreamPath,
+        session_id: Option<protocol::SessionId>,
+    ) {
+        let pending = {
+            self.pending_agent_endpoints
+                .lock()
+                .expect("pending agent endpoint registry poisoned")
+                .remove(stream)
+        };
+        let Some(mut pending) = pending else {
+            return;
+        };
+        pending.payload.session_id = session_id;
+        let endpoint = AgentEndpoint {
+            info: pending.payload,
+            events: AgentEvents {
+                stream: stream.clone(),
+                shared: self.clone(),
+                rx: pending.events,
+            },
+            commands: AgentCommands {
+                stream: stream.clone(),
+                shared: self.clone(),
+            },
+        };
+        if pending
+            .host_tx
+            .send(HostEvent::NewAgent(endpoint))
+            .await
+            .is_err()
+        {
+            self.unregister_route(stream);
+        }
     }
 
     async fn pre_register_project_endpoint(
@@ -1204,11 +1255,18 @@ async fn emit_new_agent_endpoint(
     if payload.session_id.is_none() {
         // Keep wire-level NewAgent early while exposing the authoritative
         // session id on the higher-level endpoint once its bootstrap arrives.
-        let host_tx = host_tx.clone();
-        let shared = Arc::downgrade(shared);
-        tokio::spawn(async move {
-            emit_new_agent_after_bootstrap(payload, agent_rx, host_tx, shared).await;
-        });
+        shared
+            .pending_agent_endpoints
+            .lock()
+            .expect("pending agent endpoint registry poisoned")
+            .insert(
+                stream,
+                PendingAgentEndpoint {
+                    payload,
+                    events: agent_rx,
+                    host_tx: host_tx.clone(),
+                },
+            );
         return true;
     }
 
@@ -1228,48 +1286,6 @@ async fn emit_new_agent_endpoint(
         shared.unregister_route(&stream);
     }
     true
-}
-
-async fn emit_new_agent_after_bootstrap(
-    mut payload: NewAgentPayload,
-    mut source_rx: mpsc::Receiver<AgentEvent>,
-    host_tx: mpsc::Sender<HostEvent>,
-    shared: std::sync::Weak<Shared>,
-) {
-    let Some(first_event) = source_rx.recv().await else {
-        return;
-    };
-    payload.session_id = agent_event_session_id(&first_event);
-
-    let Some(shared) = shared.upgrade() else {
-        return;
-    };
-    let stream = payload.instance_stream.clone();
-    let (agent_tx, agent_rx) = mpsc::channel(CHANNEL_CAPACITY);
-    let endpoint = AgentEndpoint {
-        info: payload,
-        events: AgentEvents {
-            stream: stream.clone(),
-            shared: shared.clone(),
-            rx: agent_rx,
-        },
-        commands: AgentCommands {
-            stream: stream.clone(),
-            shared: shared.clone(),
-        },
-    };
-    if host_tx.send(HostEvent::NewAgent(endpoint)).await.is_err() {
-        shared.unregister_route(&stream);
-        return;
-    }
-    if agent_tx.send(first_event).await.is_err() {
-        return;
-    }
-    while let Some(event) = source_rx.recv().await {
-        if agent_tx.send(event).await.is_err() {
-            return;
-        }
-    }
 }
 
 fn agent_event_session_id(event: &AgentEvent) -> Option<protocol::SessionId> {
@@ -1382,6 +1398,9 @@ async fn handle_agent_envelope(envelope: Envelope, shared: &Arc<Shared>) {
         ),
     };
 
+    shared
+        .resolve_pending_agent_endpoint(&envelope.stream, agent_event_session_id(&event))
+        .await;
     let _ = tx.send(event).await;
 }
 
