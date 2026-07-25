@@ -3225,37 +3225,6 @@ impl AppState {
             upgrade_attempted: RwSignal::new(HashSet::new()),
         };
 
-        // Reactive wiring is browser-only. Both effects below exist to react to
-        // *user* interaction in a running app; a native unit test constructs
-        // `AppState` with no executor, so registering them there panics before
-        // the test body runs. Neither is load-bearing off the browser:
-        // persistence is `localStorage`, which does not exist, and the draft
-        // host guard has a synchronous counterpart on every path a native test
-        // can reach (`switch_active_project`, and the spawn boundary itself).
-        #[cfg(target_arch = "wasm32")]
-        {
-            let selection_state = state.clone();
-            Effect::new(move |_| {
-                // Tracked reads: the stored identity must follow a session
-                // assignment that arrives after the tab is already open.
-                let _ = selection_state.active_agent.get();
-                let _ = selection_state.draft_backend_override.get();
-                let _ = selection_state.draft_launch_profile_id.get();
-                let _ = selection_state.draft_selection_host.get();
-                let _ = selection_state.agents.get();
-                selection_state.persist_selection_snapshot_if_settled();
-            });
-
-            let draft_host_state = state.clone();
-            Effect::new(move |_| {
-                // Tracked so a context change through *any* route — including
-                // selecting a chat tab on another host, which no synchronous
-                // call site covers — drops a foreign draft.
-                let _ = draft_host_state.chat_context_host_id();
-                draft_host_state.drop_draft_bound_to_another_host();
-            });
-        }
-
         state
     }
 
@@ -4169,6 +4138,43 @@ impl AppState {
         }
     }
 
+    /// Register the reactive wiring that keeps the persisted selection and the
+    /// draft host binding in step with what the user does.
+    ///
+    /// Deliberately **not** in `AppState::new`. A constructor that registers
+    /// effects can only be called where a reactive executor is already running:
+    /// native tests have none at all, and a wasm test that builds an
+    /// `AppState` without mounting does not either. Effects belong to the app
+    /// root, which mounts and therefore has one; construction stays inert and
+    /// callable from anywhere.
+    ///
+    /// Browser-only in substance — persistence writes `localStorage`, and the
+    /// host guard reacts to navigation. Both have synchronous counterparts on
+    /// the paths that matter off the browser.
+    #[cfg(target_arch = "wasm32")]
+    pub fn install_browser_effects(&self) {
+        let selection_state = self.clone();
+        Effect::new(move |_| {
+            // Tracked reads: the stored identity must follow a session
+            // assignment that arrives after the tab is already open.
+            let _ = selection_state.active_agent.get();
+            let _ = selection_state.draft_backend_override.get();
+            let _ = selection_state.draft_launch_profile_id.get();
+            let _ = selection_state.draft_selection_host.get();
+            let _ = selection_state.agents.get();
+            selection_state.persist_selection_snapshot_if_settled();
+        });
+
+        let draft_host_state = self.clone();
+        Effect::new(move |_| {
+            // Tracked so a context change through *any* route — including
+            // selecting a chat tab on another host, which no synchronous call
+            // site covers — drops a foreign draft.
+            let _ = draft_host_state.chat_context_host_id();
+            draft_host_state.drop_draft_bound_to_another_host();
+        });
+    }
+
     /// Persist the current selection, unless a restore has not yet resolved.
     ///
     /// At cold start `active_agent` is `None` because no tab has been restored
@@ -4211,7 +4217,14 @@ impl AppState {
         let Some(bound_host) = self.draft_selection_host.get_untracked() else {
             return;
         };
-        if self.chat_context_host_id_untracked().as_deref() == Some(bound_host.as_str()) {
+        // No chat context at all is not a *different* host. On a cold start
+        // with no project selected and no chat open there is nothing to
+        // contradict the binding, and clearing here wiped a draft the restore
+        // had just legitimately applied.
+        let Some(context_host) = self.chat_context_host_id_untracked() else {
+            return;
+        };
+        if context_host == bound_host {
             return;
         }
         self.clear_draft_selection();

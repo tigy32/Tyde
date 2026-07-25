@@ -9032,6 +9032,14 @@ mod wasm_tests {
     fn known_rows_are_ordered_and_an_incomplete_list_is_refreshed() {
         reset_inbound_state_for_host("host-a");
         let state = AppState::new();
+        // A host that is emitting frames has a stream. Without one the refresh
+        // cannot be sent and releases its own gate immediately, so the contract
+        // under test — that an incomplete list asks for a fresh first page —
+        // would be unobservable.
+        state.host_streams.update(|streams| {
+            streams.insert("host-a".to_owned(), StreamPath("/host".to_owned()));
+        });
+        install_send_stub();
 
         // Incomplete: page 1 of 4.
         dispatch_envelope(
@@ -9667,6 +9675,24 @@ mod wasm_tests {
     async fn stored_identity_gains_the_session_when_it_is_assigned() {
         clear_workspace_storage();
         let state = AppState::new();
+        // This test is *about* the persistence effect, which now lives in the
+        // app root rather than the constructor. Mounting is what initialises the
+        // reactive executor an effect needs, so the effect is installed inside a
+        // mount exactly as `App` does it.
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document
+            .create_element("div")
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            state_for_mount.install_browser_effects();
+            view! { <span></span> }
+        });
+        next_tick().await;
+
         let agent_ref = ActiveAgentRef {
             host_id: "host-a".to_owned(),
             agent_id: AgentId("agent-a".to_owned()),

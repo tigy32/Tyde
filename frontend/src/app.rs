@@ -762,6 +762,10 @@ mod tests {
 pub fn App() -> impl IntoView {
     let state = AppState::new();
     restore_appearance(&state);
+    // Reactive wiring is installed here, at the one place that mounts and
+    // therefore has an executor, rather than inside the constructor.
+    #[cfg(target_arch = "wasm32")]
+    state.install_browser_effects();
     provide_context(state.clone());
     // One measurement of the center workspace, shared by the center zone (which
     // measures it), the command palette, and the global shortcuts (which gate

@@ -3,6 +3,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use protocol::{
     BackendKind, DeleteSessionPayload, FrameKind, ListSessionsPayload, SessionListPageStatus,
+    StreamPath,
 };
 
 use crate::actions::resume_session;
@@ -227,13 +228,14 @@ pub fn SessionsPanel() -> impl IntoView {
         // selected, which in project A with host B selected updated B while the
         // user watched A — and made History look stale or current depending on
         // an unrelated choice.
-        let hosts = rendered_hosts.get_untracked();
-        for host_id in hosts {
-            let state = state.clone();
-            spawn_local(async move {
-                let Some(host_stream) = state.host_stream_untracked(&host_id) else {
-                    return;
-                };
+        // Everything the send needs is resolved *before* spawning. Reading a
+        // signal after an await means reading it after the panel may have
+        // unmounted, and a disposed signal panics rather than returning None.
+        let requests: Vec<(String, StreamPath, ListSessionsPayload)> = rendered_hosts
+            .get_untracked()
+            .into_iter()
+            .filter_map(|host_id| {
+                let host_stream = state.host_stream_untracked(&host_id)?;
                 // Ask for the scope/limit this host's view is actually using.
                 let payload = state.session_list_pages.with_untracked(|pages| {
                     pages
@@ -246,6 +248,11 @@ pub fn SessionsPanel() -> impl IntoView {
                         })
                         .unwrap_or_default()
                 });
+                Some((host_id, host_stream, payload))
+            })
+            .collect();
+        for (host_id, host_stream, payload) in requests {
+            spawn_local(async move {
                 if let Err(e) =
                     send_frame(&host_id, host_stream, FrameKind::ListSessions, &payload).await
                 {
@@ -373,12 +380,13 @@ fn load_more_buttons(state: AppState, hosts: Memo<Vec<String>>) -> impl IntoView
                 let state = state.clone();
                 let click_host = host_id.clone();
                 let on_click = move |_| {
-                    let state = state.clone();
                     let host_id = click_host.clone();
+                    // Resolved before the spawn: after an await the panel may be
+                    // gone, and reading a disposed signal panics.
+                    let Some(host_stream) = state.host_stream_untracked(&host_id) else {
+                        return;
+                    };
                     spawn_local(async move {
-                        let Some(host_stream) = state.host_stream_untracked(&host_id) else {
-                            return;
-                        };
                         if let Err(error) = send_frame(
                             &host_id,
                             host_stream,
