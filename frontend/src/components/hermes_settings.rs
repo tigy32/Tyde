@@ -63,15 +63,18 @@ pub fn hermes_settings_page_body(host_id: &str) -> AnyView {
 fn HermesSettingsBody(host_id: String) -> impl IntoView {
     let state = expect_context::<AppState>();
 
-    // View state that must survive snapshot republishes (which rebuild the
-    // body closure below): the selected profile chip, the per-profile config
-    // drafts, and which provider row has its API-key editor open. The key text
-    // itself is deliberately NOT a signal — it lives only in the uncontrolled
-    // password input and is read out once when the user confirms.
-    let selected_profile = RwSignal::new(Option::<String>::None);
-    let drafts = RwSignal::new(HashMap::<String, HermesProfileConfig>::new());
-    // (profile name, provider slug) of the open inline key editor.
-    let key_editor = RwSignal::new(Option::<(String, String)>::None);
+    // Declared here so it survives snapshot republishes, which rebuild the body
+    // closure below. No API key is among these: the key text is deliberately
+    // never a signal — it lives only in the uncontrolled password input and is
+    // read out once when the user confirms.
+    let view_state = HermesViewState {
+        selected_profile: RwSignal::new(None),
+        drafts: RwSignal::new(HashMap::new()),
+        tab: RwSignal::new(HermesTab::Providers),
+        key_dialog: RwSignal::new(None),
+        provider_query: RwSignal::new(String::new()),
+    };
+    let drafts = view_state.drafts;
 
     // Prune drafts that no longer carry an edit against the live snapshot:
     // after a successful save the republished config equals the draft, and
@@ -225,11 +228,23 @@ fn HermesSettingsBody(host_id: String) -> impl IntoView {
             saving,
             save_error,
             enabled,
-            selected_profile,
-            drafts,
-            key_editor,
+            view_state,
         )
     }
+}
+
+/// Page view state that outlives snapshot republishes. Grouped so the pieces
+/// that need it take one parameter instead of five.
+#[derive(Clone, Copy)]
+struct HermesViewState {
+    selected_profile: RwSignal<Option<String>>,
+    drafts: RwSignal<HashMap<String, HermesProfileConfig>>,
+    tab: RwSignal<HermesTab>,
+    /// Open credential dialog, as (profile, preselected provider). `None` for
+    /// the provider means the searchable catalogue; `Some` opens straight to
+    /// that provider's key field or sign-in instructions.
+    key_dialog: RwSignal<Option<(String, Option<String>)>>,
+    provider_query: RwSignal<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -521,7 +536,44 @@ fn ensure_current_option(options: &mut Vec<(String, String)>, current: Option<St
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The page's sections. Hermes exposes far more configuration than reads well
+/// in one column, so each tab owns a coherent question: *who* can serve models,
+/// *what* model to use, and *how* the agent loop behaves.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HermesTab {
+    Providers,
+    Model,
+    Agent,
+}
+
+impl HermesTab {
+    const ALL: [HermesTab; 3] = [HermesTab::Providers, HermesTab::Model, HermesTab::Agent];
+
+    fn label(self) -> &'static str {
+        match self {
+            HermesTab::Providers => "Providers",
+            HermesTab::Model => "Model",
+            HermesTab::Agent => "Agent",
+        }
+    }
+
+    /// Whether this tab holds an unsaved edit, so the strip can point at the
+    /// tab a pending save belongs to rather than leaving the user to hunt for
+    /// it. Credentials are not draftable — they save immediately — so the
+    /// Providers tab is never dirty.
+    fn is_dirty(self, base: &HermesProfileConfig, draft: &HermesProfileConfig) -> bool {
+        match self {
+            HermesTab::Providers => false,
+            HermesTab::Model => {
+                base.model != draft.model
+                    || base.fallback_providers != draft.fallback_providers
+                    || base.provider_routing != draft.provider_routing
+            }
+            HermesTab::Agent => base.agent != draft.agent || base.tool_search != draft.tool_search,
+        }
+    }
+}
+
 fn editor_view(
     state: &AppState,
     host_id: &str,
@@ -529,10 +581,16 @@ fn editor_view(
     saving: bool,
     save_error: Option<String>,
     enabled: bool,
-    selected_profile: RwSignal<Option<String>>,
-    drafts: RwSignal<HashMap<String, HermesProfileConfig>>,
-    key_editor: RwSignal<Option<(String, String)>>,
+    view_state: HermesViewState,
 ) -> AnyView {
+    let HermesViewState {
+        selected_profile,
+        drafts,
+        tab,
+        key_dialog,
+        provider_query,
+    } = view_state;
+
     let disabled_banner = (!enabled).then(|| {
         view! {
             <div class="settings-hermes-banner" role="note">
@@ -555,6 +613,9 @@ fn editor_view(
         })
     };
 
+    // Profiles are a radiogroup, not a tablist: they scope the whole page,
+    // including the tab strip below them. Two stacked tablists would be
+    // ambiguous both visually and to a screen reader.
     let chips = doc
         .profiles
         .iter()
@@ -571,7 +632,7 @@ fn editor_view(
             view! {
                 <button
                     type="button"
-                    role="tab"
+                    role="radio"
                     class=move || {
                         if is_active.get() {
                             "settings-hermes-profile-chip settings-hermes-profile-chip-active"
@@ -579,7 +640,7 @@ fn editor_view(
                             "settings-hermes-profile-chip"
                         }
                     }
-                    aria-selected=move || is_active.get().to_string()
+                    aria-checked=move || is_active.get().to_string()
                     on:click=on_click
                 >
                     <span class="settings-hermes-profile-name">
@@ -591,7 +652,85 @@ fn editor_view(
         })
         .collect::<Vec<_>>();
 
-    let cards = {
+    let dirty_tabs = {
+        let doc = doc.clone();
+        Memo::new(move |_| {
+            let name = effective_profile.get();
+            let map = drafts.get();
+            let (Some(profile), Some(draft)) =
+                (doc.profiles.iter().find(|p| p.name == name), map.get(&name))
+            else {
+                return Vec::new();
+            };
+            HermesTab::ALL
+                .into_iter()
+                .filter(|t| t.is_dirty(&profile.config, draft))
+                .collect::<Vec<_>>()
+        })
+    };
+
+    let tab_refs: [NodeRef<leptos::html::Button>; 3] =
+        [NodeRef::new(), NodeRef::new(), NodeRef::new()];
+    let on_tab_keydown = move |ev: web_sys::KeyboardEvent| {
+        let delta = match ev.key().as_str() {
+            "ArrowRight" | "ArrowDown" => 1_i32,
+            "ArrowLeft" | "ArrowUp" => -1,
+            _ => return,
+        };
+        ev.prevent_default();
+        let len = HermesTab::ALL.len() as i32;
+        let current = HermesTab::ALL
+            .iter()
+            .position(|t| *t == tab.get_untracked())
+            .unwrap_or(0) as i32;
+        let next = ((current + delta) % len + len) % len;
+        tab.set(HermesTab::ALL[next as usize]);
+        if let Some(button) = tab_refs[next as usize].get_untracked() {
+            let _ = button.focus();
+        }
+    };
+
+    let tabs = HermesTab::ALL
+        .into_iter()
+        .enumerate()
+        .map(|(idx, this)| {
+            let is_active = Signal::derive(move || tab.get() == this);
+            let is_dirty = Signal::derive(move || dirty_tabs.get().contains(&this));
+            view! {
+                <button
+                    type="button"
+                    role="tab"
+                    node_ref=tab_refs[idx]
+                    class=move || {
+                        if is_active.get() {
+                            "settings-hermes-tab settings-hermes-tab-active"
+                        } else {
+                            "settings-hermes-tab"
+                        }
+                    }
+                    aria-selected=move || is_active.get().to_string()
+                    tabindex=move || if is_active.get() { "0" } else { "-1" }
+                    on:click=move |_| tab.set(this)
+                >
+                    {this.label()}
+                    {move || {
+                        is_dirty
+                            .get()
+                            .then(|| {
+                                view! {
+                                    <span
+                                        class="settings-hermes-tab-dot"
+                                        aria-label="has unsaved changes"
+                                    ></span>
+                                }
+                            })
+                    }}
+                </button>
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let panel = {
         let state = state.clone();
         let host_id = host_id.to_owned();
         let doc = doc.clone();
@@ -600,25 +739,62 @@ fn editor_view(
             let Some(profile) = doc.profiles.iter().find(|p| p.name == active) else {
                 return ().into_any();
             };
-            view! {
-                {providers_card(&state, &host_id, profile, key_editor, saving)}
-                {model_card(doc.clone(), drafts, profile)}
-                {routing_card(doc.clone(), drafts, &profile.name)}
-                {fallback_card(doc.clone(), drafts, &profile.name)}
-                {agent_card(doc.clone(), drafts, &profile.name)}
-                {tool_search_card(doc.clone(), drafts, &profile.name)}
+            match tab.get() {
+                HermesTab::Providers => {
+                    providers_panel(&state, &host_id, profile, key_dialog, saving)
+                }
+                HermesTab::Model => view! {
+                    {model_card(doc.clone(), drafts, profile)}
+                    {fallback_card(doc.clone(), drafts, &profile.name)}
+                    {routing_card(doc.clone(), drafts, &profile.name)}
+                }
+                .into_any(),
+                HermesTab::Agent => view! {
+                    {agent_card(doc.clone(), drafts, &profile.name)}
+                    {tool_search_card(doc.clone(), drafts, &profile.name)}
+                }
+                .into_any(),
             }
-            .into_any()
         }
     };
 
+    // Rendered at page level, not inside the panel, so it survives tab
+    // switches and can be opened from a provider row or the Add button alike.
+    let dialog = provider_dialog(
+        state,
+        host_id,
+        doc.clone(),
+        key_dialog,
+        provider_query,
+        saving,
+    );
     let save_bar = save_bar(state, host_id, doc, drafts, saving, save_error);
 
     view! {
         <div class="settings-hermes-page">
             {disabled_banner}
-            <div class="settings-hermes-profiles" role="tablist">{chips}</div>
-            {cards}
+            <div class="settings-hermes-profilebar">
+                <span class="settings-hermes-profilebar-label" id="hermes-profile-label">
+                    "Profile"
+                </span>
+                <div
+                    class="settings-hermes-profiles"
+                    role="radiogroup"
+                    aria-labelledby="hermes-profile-label"
+                >
+                    {chips}
+                </div>
+            </div>
+            <div
+                class="settings-hermes-tabs"
+                role="tablist"
+                aria-label="Hermes settings sections"
+                on:keydown=on_tab_keydown
+            >
+                {tabs}
+            </div>
+            <div class="settings-hermes-panel" role="tabpanel">{panel}</div>
+            {dialog}
             {save_bar}
         </div>
     }
@@ -642,14 +818,35 @@ fn card(title: &str, description: Option<&str>, body: AnyView) -> AnyView {
 }
 
 // ---------------------------------------------------------------------------
-// Providers card (credentials)
+// Providers tab + credential dialog
 // ---------------------------------------------------------------------------
+//
+// A Hermes host reports its whole provider catalogue — fifty-odd entries — of
+// which a couple are actually configured. The tab therefore shows only what
+// this profile can use right now; the catalogue lives behind "Add a provider…",
+// where a search box is the right tool for fifty items. Everything a provider
+// row can offer (add a key, replace a key, read the sign-in instructions) goes
+// through that one dialog, so there is exactly one place an API key is ever
+// typed and exactly one code path that queues one.
 
-fn providers_card(
+/// Human-readable name for a Hermes auth mechanism. The raw slug is kept when
+/// Hermes reports one this build doesn't know — inventing a friendly label for
+/// an unknown mechanism would misdescribe what the user has to do.
+fn auth_label(auth_type: Option<&str>) -> String {
+    match auth_type {
+        Some("api_key") => "API key".to_owned(),
+        Some("oauth_device_code") => "Device code".to_owned(),
+        Some("oauth_external") | Some("external_process") => "Hermes sign-in".to_owned(),
+        Some(other) => other.to_owned(),
+        None => "Managed by Hermes".to_owned(),
+    }
+}
+
+fn providers_panel(
     state: &AppState,
     host_id: &str,
     profile: &HermesProfileSettings,
-    key_editor: RwSignal<Option<(String, String)>>,
+    key_dialog: RwSignal<Option<(String, Option<String>)>>,
     saving: bool,
 ) -> AnyView {
     let error = profile.providers_error.clone().map(|message| {
@@ -660,123 +857,146 @@ fn providers_card(
         }
     });
 
-    let body = match &profile.providers {
-        Some(providers) if !providers.is_empty() => providers
+    let Some(providers) = profile.providers.clone() else {
+        let body = profile
+            .providers_error
+            .is_none()
+            .then(|| {
+                view! {
+                    <p class="settings-description">
+                        "Provider status is unavailable for this profile."
+                    </p>
+                }
+            })
+            .into_any();
+        return card(
+            "Providers",
+            Some(PROVIDERS_DESCRIPTION),
+            view! { {error} {body} }.into_any(),
+        );
+    };
+
+    let connected: Vec<HermesProviderState> = providers
+        .iter()
+        .filter(|p| p.authenticated)
+        .cloned()
+        .collect();
+    let available = providers.len() - connected.len();
+    let profile_name = profile.name.clone();
+
+    let open_catalogue = {
+        let profile_name = profile_name.clone();
+        move |_| key_dialog.set(Some((profile_name.clone(), None)))
+    };
+    let add_button = (available > 0).then(|| {
+        view! {
+            <button
+                type="button"
+                class="settings-btn settings-btn-primary"
+                disabled=saving
+                on:click=open_catalogue
+            >
+                "Add a provider…"
+            </button>
+        }
+    });
+
+    let summary = match (connected.len(), available) {
+        (0, _) => "Nothing connected yet".to_owned(),
+        (1, 0) => "1 provider connected".to_owned(),
+        (n, 0) => format!("{n} providers connected"),
+        (1, more) => format!("1 provider connected · {more} more available"),
+        (n, more) => format!("{n} providers connected · {more} more available"),
+    };
+
+    let body = if connected.is_empty() {
+        let open_empty = {
+            let profile_name = profile_name.clone();
+            move |_| key_dialog.set(Some((profile_name.clone(), None)))
+        };
+        view! {
+            <div class="settings-hermes-empty">
+                <p class="settings-hermes-empty-title">"No providers are connected"</p>
+                <p class="settings-hermes-empty-body">
+                    "This profile can't serve models until one provider has credentials. "
+                    {format!("Hermes offers {available} on this host.")}
+                </p>
+                <button
+                    type="button"
+                    class="settings-btn settings-btn-primary"
+                    disabled=saving
+                    on:click=open_empty
+                >
+                    "Add a provider…"
+                </button>
+            </div>
+        }
+        .into_any()
+    } else {
+        let rows = connected
             .iter()
             .map(|provider| {
-                provider_row(state, host_id, &profile.name, provider, key_editor, saving)
+                connected_provider_row(state, host_id, &profile_name, provider, key_dialog, saving)
             })
-            .collect::<Vec<_>>()
-            .into_any(),
-        Some(_) => view! {
-            <p class="settings-description">"Hermes reported no providers for this profile."</p>
-        }
-        .into_any(),
-        None if profile.providers_error.is_some() => ().into_any(),
-        None => view! {
-            <p class="settings-description">"Provider status is unavailable for this profile."</p>
-        }
-        .into_any(),
+            .collect::<Vec<_>>();
+        view! { <div class="settings-hermes-provider-list">{rows}</div> }.into_any()
     };
 
     card(
         "Providers",
-        Some(
-            "Model providers available to this profile. Credentials are stored by Hermes \
-             inside the profile's own home directory.",
-        ),
+        Some(PROVIDERS_DESCRIPTION),
         view! {
             {error}
-            <div class="settings-hermes-provider-list">{body}</div>
+            <div class="settings-hermes-provider-toolbar">
+                <span class="settings-hermes-provider-summary">{summary}</span>
+                {add_button}
+            </div>
+            {body}
         }
         .into_any(),
     )
 }
 
-fn provider_row(
+const PROVIDERS_DESCRIPTION: &str = "Model providers this profile can use. Credentials are stored by Hermes inside the \
+     profile's own home directory.";
+
+/// One configured provider. Every row reaching here is authenticated, so there
+/// is no not-connected branch to render.
+fn connected_provider_row(
     state: &AppState,
     host_id: &str,
     profile_name: &str,
     provider: &HermesProviderState,
-    key_editor: RwSignal<Option<(String, String)>>,
+    key_dialog: RwSignal<Option<(String, Option<String>)>>,
     saving: bool,
 ) -> AnyView {
     let slug = provider.slug.clone();
-    let name = provider.name.clone();
-    let authenticated = provider.authenticated;
-    let is_api_key = provider.auth_type.as_deref() == Some("api_key");
-
-    let badge = if authenticated {
-        view! {
-            <span class="settings-hermes-badge settings-hermes-badge-connected">"Connected"</span>
-        }
-        .into_any()
-    } else {
-        view! {
-            <span class="settings-hermes-badge settings-hermes-badge-muted">"Not connected"</span>
-        }
-        .into_any()
-    };
-
     let show_slug = provider.slug != provider.name;
-    let model_count = (authenticated || provider.model_count > 0).then(|| {
-        let label = if provider.model_count == 1 {
-            "1 model".to_owned()
-        } else {
-            format!("{} models", provider.model_count)
-        };
-        view! { <span class="settings-hermes-provider-meta">{label}</span> }
-    });
-    let warning = provider.warning.clone().map(|warning| {
-        view! { <p class="settings-hermes-provider-warning">{warning}</p> }
-    });
+    let model_count = if provider.model_count == 1 {
+        "1 model".to_owned()
+    } else {
+        format!("{} models", provider.model_count)
+    };
+    let auth = auth_label(provider.auth_type.as_deref());
 
-    // Non-API-key providers authenticate through Hermes's own flows.
-    let auth_hint = (!authenticated && !is_api_key).then(|| {
-        provider.auth_type.clone().map(|auth_type| {
-            view! {
-                <span class="settings-hermes-auth-hint">
-                    "Sign in via " <code>"hermes model"</code>
-                    {format!(" ({auth_type})")}
-                </span>
-            }
-        })
-    });
-
-    let key_button = is_api_key.then(|| {
-        let label = if authenticated {
-            "Replace key…"
-        } else {
-            "Add API key…"
-        };
-        let target = (profile_name.to_owned(), slug.clone());
-        let on_click = move |_| {
-            // Toggle: pressing the button again closes the editor, dropping
-            // whatever was typed (the input node is discarded outright).
-            if key_editor.get_untracked().as_ref() == Some(&target) {
-                key_editor.set(None);
-            } else {
-                key_editor.set(Some(target.clone()));
-            }
-        };
+    // Replacing a key opens the same dialog, pre-selected — one credential
+    // surface, one code path that can carry a key.
+    let replace_button = (provider.auth_type.as_deref() == Some("api_key")).then(|| {
+        let target = (profile_name.to_owned(), Some(slug.clone()));
+        let on_click = move |_| key_dialog.set(Some(target.clone()));
         view! {
-            <button
-                type="button"
-                class="settings-btn"
-                disabled=saving
-                on:click=on_click
-            >
-                {label}
+            <button type="button" class="settings-btn" disabled=saving on:click=on_click>
+                "Replace key…"
             </button>
         }
     });
 
-    let disconnect_button = authenticated.then(|| {
-        let state = state.clone();
-        let host_id = host_id.to_owned();
+    let disconnect_button = {
         let profile_name = profile_name.to_owned();
         let slug = slug.clone();
-        let name = name.clone();
+        let name = provider.name.clone();
+        let state = state.clone();
+        let host_id = host_id.to_owned();
         let on_click = move |_| {
             if saving {
                 return;
@@ -816,86 +1036,6 @@ fn provider_row(
                 "Disconnect"
             </button>
         }
-    });
-
-    // Inline key editor, revealed under the row. The password input is
-    // uncontrolled: its value never touches a signal, is read once on confirm,
-    // and is cleared before the action is queued. Never prefilled, never
-    // logged.
-    let input_ref = NodeRef::<leptos::html::Input>::new();
-    let editor = {
-        let state = state.clone();
-        let host_id = host_id.to_owned();
-        let profile_name = profile_name.to_owned();
-        let slug = slug.clone();
-        let key_env_hint = provider.key_env.clone();
-        move || {
-            let open = key_editor.get().as_ref() == Some(&(profile_name.clone(), slug.clone()));
-            open.then(|| {
-                let state = state.clone();
-                let host_id = host_id.clone();
-                let profile_name = profile_name.clone();
-                let slug = slug.clone();
-                let on_confirm = move |_| {
-                    if saving {
-                        return;
-                    }
-                    let Some(input) = input_ref.get_untracked() else {
-                        return;
-                    };
-                    let key = input.value().trim().to_owned();
-                    if key.is_empty() {
-                        return;
-                    }
-                    input.set_value("");
-                    key_editor.set(None);
-                    queue_credential_action(
-                        &state,
-                        &host_id,
-                        HermesCredentialAction::SaveApiKey {
-                            profile: profile_name.clone(),
-                            provider: slug.clone(),
-                            api_key: key,
-                        },
-                    );
-                };
-                let on_cancel = move |_| {
-                    if let Some(input) = input_ref.get_untracked() {
-                        input.set_value("");
-                    }
-                    key_editor.set(None);
-                };
-                view! {
-                    <div class="settings-hermes-key-editor">
-                        <input
-                            type="password"
-                            class="settings-input settings-hermes-key-input"
-                            placeholder="API key"
-                            autocomplete="off"
-                            node_ref=input_ref
-                        />
-                        <button
-                            type="button"
-                            class="settings-btn settings-btn-primary"
-                            disabled=saving
-                            on:click=on_confirm
-                        >
-                            "Save key"
-                        </button>
-                        <button type="button" class="settings-btn" on:click=on_cancel>
-                            "Cancel"
-                        </button>
-                        {key_env_hint.clone().map(|env| {
-                            view! {
-                                <span class="settings-hermes-auth-hint">
-                                    {format!("Stored as {env} in the profile's .env")}
-                                </span>
-                            }
-                        })}
-                    </div>
-                }
-            })
-        }
     };
 
     view! {
@@ -903,7 +1043,7 @@ fn provider_row(
             <div class="settings-hermes-provider-line">
                 <div class="settings-hermes-provider-info">
                     <span class="settings-hermes-provider-name">
-                        {name.clone()}
+                        {provider.name.clone()}
                         {show_slug.then(|| {
                             view! {
                                 <span class="settings-hermes-provider-slug">
@@ -912,18 +1052,411 @@ fn provider_row(
                             }
                         })}
                     </span>
-                    {model_count}
-                    {warning}
+                    <span class="settings-hermes-provider-meta">
+                        <span class="settings-hermes-provider-models">{model_count}</span>
+                        <span class="settings-hermes-provider-hint">{auth}</span>
+                    </span>
                 </div>
                 <div class="settings-hermes-provider-actions">
-                    {auth_hint}
-                    {badge}
-                    {key_button}
-                    {disconnect_button}
+                    <span class="settings-hermes-badge settings-hermes-badge-connected">
+                        "Connected"
+                    </span>
+                    <span class="settings-hermes-provider-action-slot">
+                        {replace_button}
+                        {disconnect_button}
+                    </span>
                 </div>
             </div>
-            {editor}
         </div>
+    }
+    .into_any()
+}
+
+// ---------------------------------------------------------------------------
+// Add-a-provider dialog
+// ---------------------------------------------------------------------------
+
+/// What the dialog's steps need from their shell. Grouped so each step takes
+/// one parameter rather than the shell's whole set of handles.
+#[derive(Clone, Copy)]
+struct DialogCtx {
+    key_dialog: RwSignal<Option<(String, Option<String>)>>,
+    provider_query: RwSignal<String>,
+    search_ref: NodeRef<leptos::html::Input>,
+    key_ref: NodeRef<leptos::html::Input>,
+    on_close: Callback<()>,
+    saving: bool,
+}
+
+/// Modal over the whole page: pick a provider from the catalogue, then either
+/// paste its API key or read how to complete Hermes's own sign-in flow.
+///
+/// The key input is uncontrolled exactly as the old inline editor was — its
+/// value never touches a signal, is read once on confirm, and is cleared before
+/// the action is queued. Never prefilled, never logged, never rendered back.
+fn provider_dialog(
+    state: &AppState,
+    host_id: &str,
+    doc: Arc<HermesNativeSettingsDoc>,
+    key_dialog: RwSignal<Option<(String, Option<String>)>>,
+    provider_query: RwSignal<String>,
+    saving: bool,
+) -> AnyView {
+    let state = state.clone();
+    let host_id = host_id.to_owned();
+    // Keyed on open/closed only, so moving between the catalogue and a
+    // provider's detail view swaps the contents without rebuilding the shell
+    // (and without the focus bookkeeping below firing on every step).
+    let is_open = Memo::new(move |_| key_dialog.get().is_some());
+
+    let shell = move || {
+        if !is_open.get() {
+            return ().into_any();
+        }
+        let state = state.clone();
+        let host_id = host_id.clone();
+        let doc = doc.clone();
+
+        let search_ref = NodeRef::<leptos::html::Input>::new();
+        let key_ref = NodeRef::<leptos::html::Input>::new();
+        // Re-runs when either node mounts, so focus follows the step.
+        Effect::new(move |_| {
+            if let Some(input) = key_ref.get() {
+                let _ = input.focus();
+            } else if let Some(input) = search_ref.get() {
+                let _ = input.focus();
+            }
+        });
+
+        let close = move || {
+            if let Some(input) = key_ref.get_untracked() {
+                input.set_value("");
+            }
+            provider_query.set(String::new());
+            key_dialog.set(None);
+        };
+        let on_backdrop = move |_| close();
+        // Each step owns its own footer, so the dismiss action sits beside that
+        // step's primary action rather than on a second row below it.
+        let ctx = DialogCtx {
+            key_dialog,
+            provider_query,
+            search_ref,
+            key_ref,
+            on_close: Callback::new(move |()| close()),
+            saving,
+        };
+        let on_keydown = move |ev: web_sys::KeyboardEvent| {
+            if ev.key() == "Escape" {
+                // A modal owns Escape outright; without this the app's global
+                // handler would also tear down the settings overlay behind it.
+                ev.prevent_default();
+                ev.stop_propagation();
+                close();
+            }
+        };
+
+        let contents = move || {
+            let Some((profile_name, selected)) = key_dialog.get() else {
+                return ().into_any();
+            };
+            let Some(profile) = doc.profiles.iter().find(|p| p.name == profile_name) else {
+                return ().into_any();
+            };
+            let providers = profile.providers.clone().unwrap_or_default();
+
+            match selected.and_then(|slug| providers.iter().find(|p| p.slug == slug).cloned()) {
+                Some(provider) => {
+                    provider_detail_view(&state, &host_id, &profile_name, &provider, ctx)
+                }
+                None => {
+                    let candidates: Vec<HermesProviderState> =
+                        providers.into_iter().filter(|p| !p.authenticated).collect();
+                    provider_catalogue_view(&profile_name, candidates, ctx)
+                }
+            }
+        };
+
+        view! {
+            <div class="settings-confirm-overlay" on:click=on_backdrop>
+                <div
+                    class="settings-confirm-modal settings-hermes-dialog"
+                    role="dialog"
+                    aria-modal="true"
+                    aria-label="Add a provider"
+                    tabindex="-1"
+                    on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()
+                    on:keydown=on_keydown
+                >
+                    {contents}
+                </div>
+            </div>
+        }
+        .into_any()
+    };
+    view! { {shell} }.into_any()
+}
+
+fn provider_catalogue_view(
+    profile_name: &str,
+    candidates: Vec<HermesProviderState>,
+    ctx: DialogCtx,
+) -> AnyView {
+    let DialogCtx {
+        key_dialog,
+        provider_query,
+        search_ref,
+        on_close,
+        ..
+    } = ctx;
+    let total = candidates.len();
+    let profile_name = profile_name.to_owned();
+    let heading_profile = profile_name.clone();
+
+    let rows = move || {
+        let needle = provider_query.get().trim().to_lowercase();
+        let hits = candidates
+            .iter()
+            .filter(|p| {
+                needle.is_empty()
+                    || p.name.to_lowercase().contains(&needle)
+                    || p.slug.to_lowercase().contains(&needle)
+            })
+            .collect::<Vec<_>>();
+        if hits.is_empty() {
+            return view! {
+                <p class="settings-description">"No provider matches that search."</p>
+            }
+            .into_any();
+        }
+        hits.into_iter()
+            .map(|provider| {
+                let target = (profile_name.clone(), Some(provider.slug.clone()));
+                let on_click = move |_| key_dialog.set(Some(target.clone()));
+                let show_slug = provider.slug != provider.name;
+                view! {
+                    <button
+                        type="button"
+                        class="settings-hermes-dialog-row"
+                        on:click=on_click
+                    >
+                        // Hermes's setup hint is deliberately not here: at
+                        // fifty rows it is a wall of near-identical text. The
+                        // next step shows it in full.
+                        <span class="settings-hermes-dialog-row-main">
+                            <span class="settings-hermes-provider-name">
+                                {provider.name.clone()}
+                                {show_slug.then(|| {
+                                    view! {
+                                        <span class="settings-hermes-provider-slug">
+                                            {provider.slug.clone()}
+                                        </span>
+                                    }
+                                })}
+                            </span>
+                        </span>
+                        <span class="settings-hermes-dialog-row-auth">
+                            {auth_label(provider.auth_type.as_deref())}
+                        </span>
+                    </button>
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_any()
+    };
+
+    view! {
+        <h3 class="settings-confirm-title">"Add a provider"</h3>
+        <p class="settings-confirm-description">
+            {format!(
+                "{total} providers are available to the \"{}\" profile. Pick one to add its \
+                 credentials.",
+                profile_display_name(&heading_profile),
+            )}
+        </p>
+        <input
+            type="search"
+            class="settings-input"
+            placeholder="Search providers…"
+            aria-label="Search providers"
+            autocomplete="off"
+            node_ref=search_ref
+            prop:value=move || provider_query.get()
+            on:input=move |ev| provider_query.set(event_target_value(&ev))
+        />
+        <div class="settings-hermes-dialog-list">{rows}</div>
+        <div class="settings-hermes-dialog-footer">
+            <button type="button" class="settings-btn" on:click=move |_| on_close.run(())>
+                "Close"
+            </button>
+        </div>
+    }
+    .into_any()
+}
+
+/// Everything that is not an API-key provider gets instructions rather than a
+/// field, because Tyde cannot drive Hermes's own sign-in flows from here and
+/// must not pretend otherwise.
+fn provider_detail_view(
+    state: &AppState,
+    host_id: &str,
+    profile_name: &str,
+    provider: &HermesProviderState,
+    ctx: DialogCtx,
+) -> AnyView {
+    let DialogCtx {
+        key_dialog,
+        key_ref,
+        on_close,
+        saving,
+        ..
+    } = ctx;
+    let name = provider.name.clone();
+    let slug = provider.slug.clone();
+    let is_api_key = provider.auth_type.as_deref() == Some("api_key");
+    let auth = auth_label(provider.auth_type.as_deref());
+
+    let back_target = (profile_name.to_owned(), None);
+    let on_back = move |_| key_dialog.set(Some(back_target.clone()));
+    let back = view! {
+        <button type="button" class="settings-hermes-dialog-back" on:click=on_back>
+            "← All providers"
+        </button>
+    };
+
+    // Hermes's own setup hint, shown only where it isn't a restatement of what
+    // this view already says. An API-key provider that reports its env var is
+    // fully described by the "Stored as …" line under the field.
+    let show_hint = !is_api_key || provider.key_env.is_none();
+    let hint = provider
+        .warning
+        .clone()
+        .filter(|_| show_hint)
+        .map(|hint| view! { <p class="settings-hermes-dialog-hint">{hint}</p> });
+    let has_hint = hint.is_some();
+
+    let body = if is_api_key {
+        let state = state.clone();
+        let host_id = host_id.to_owned();
+        let profile_name = profile_name.to_owned();
+        let slug = slug.clone();
+        // One save path, shared by the button and by Enter in the field. The
+        // key is read from the uncontrolled input, cleared, and handed straight
+        // to the credential action — it is never stored anywhere in between.
+        let save = move || {
+            if saving {
+                return;
+            }
+            let Some(input) = key_ref.get_untracked() else {
+                return;
+            };
+            let key = input.value().trim().to_owned();
+            if key.is_empty() {
+                return;
+            }
+            input.set_value("");
+            key_dialog.set(None);
+            queue_credential_action(
+                &state,
+                &host_id,
+                HermesCredentialAction::SaveApiKey {
+                    profile: profile_name.clone(),
+                    provider: slug.clone(),
+                    api_key: key,
+                },
+            );
+        };
+        let save_on_key = save.clone();
+        let on_key = move |ev: web_sys::KeyboardEvent| {
+            if ev.key() == "Enter" {
+                ev.prevent_default();
+                save_on_key();
+            }
+        };
+        let on_save = move |_| save();
+        view! {
+            <div class="settings-native-field">
+                <span class="settings-form-label">"API key"</span>
+                <input
+                    type="password"
+                    class="settings-input"
+                    placeholder="Paste the key"
+                    autocomplete="off"
+                    node_ref=key_ref
+                    on:keydown=on_key
+                />
+                {provider.key_env.clone().map(|env| {
+                    view! {
+                        <p class="settings-description">
+                            {format!("Stored as {env} in this profile's .env")}
+                        </p>
+                    }
+                })}
+            </div>
+            <div class="settings-hermes-dialog-footer">
+                <button type="button" class="settings-btn" on:click=move |_| on_close.run(())>
+                    "Cancel"
+                </button>
+                <button
+                    type="button"
+                    class="settings-btn settings-btn-primary"
+                    disabled=saving
+                    on:click=on_save
+                >
+                    "Save key"
+                </button>
+            </div>
+        }
+        .into_any()
+    } else if has_hint {
+        // Hermes told us exactly what to do; the only thing this view adds is
+        // which profile to do it in. Repeating the instruction in our own
+        // words underneath it would be the same sentence twice.
+        view! {
+            <p class="settings-confirm-description">
+                {format!(
+                    "{name} connects through Hermes itself ({auth}). Complete it in the \"{}\" \
+                     profile:",
+                    profile_display_name(profile_name),
+                )}
+            </p>
+        }
+        .into_any()
+    } else {
+        view! {
+            <p class="settings-confirm-description">
+                {format!("{name} connects through Hermes itself ({auth}). Run ")}
+                <code>"hermes model"</code>
+                {format!(
+                    " in the \"{}\" profile and choose {name} to finish connecting it.",
+                    profile_display_name(profile_name),
+                )}
+            </p>
+        }
+        .into_any()
+    };
+
+    // The hint sits after the lead-in for non-key providers so it reads as the
+    // step to take, and before the field for key providers.
+    view! {
+        {back}
+        <h3 class="settings-confirm-title">{name}</h3>
+        {is_api_key.then_some(hint.clone())}
+        {body}
+        {(!is_api_key).then_some(hint)}
+        {(!is_api_key).then(|| {
+            view! {
+                <div class="settings-hermes-dialog-footer">
+                    <button
+                        type="button"
+                        class="settings-btn"
+                        on:click=move |_| on_close.run(())
+                    >
+                        "Close"
+                    </button>
+                </div>
+            }
+        })}
     }
     .into_any()
 }
@@ -1055,6 +1588,7 @@ fn routing_card(
             .sort,
     );
     let body = view! {
+        <div class="settings-hermes-grid">
         {select_field(
             "Sort upstream providers by",
             None,
@@ -1089,6 +1623,7 @@ fn routing_card(
                 c.provider_routing.ignore = list;
             }),
         )}
+        </div>
     }
     .into_any();
 
@@ -1806,11 +2341,48 @@ mod wasm_tests {
         }
     }
 
-    fn install_fixture(state: &AppState) {
+    /// One provider row, spelled out so each test can compose the exact mix of
+    /// row shapes (connected/not, key/OAuth) whose alignment it cares about.
+    fn provider(
+        slug: &str,
+        name: &str,
+        authenticated: bool,
+        auth_type: &str,
+        warning: Option<&str>,
+    ) -> HermesProviderState {
+        HermesProviderState {
+            slug: slug.to_owned(),
+            name: name.to_owned(),
+            authenticated,
+            auth_type: Some(auth_type.to_owned()),
+            key_env: (auth_type == "api_key").then(|| format!("{}_API_KEY", slug.to_uppercase())),
+            warning: warning.map(str::to_owned),
+            model_count: if authenticated { 7 } else { 0 },
+        }
+    }
+
+    fn doc_with_providers(providers: Vec<HermesProviderState>) -> HermesNativeSettingsDoc {
+        HermesNativeSettingsDoc {
+            version: HERMES_NATIVE_SETTINGS_VERSION,
+            profiles: vec![HermesProfileSettings {
+                name: HERMES_DEFAULT_PROFILE.to_owned(),
+                home_dir: "/home/u/.hermes".to_owned(),
+                base_config: None,
+                config: HermesProfileConfig::default(),
+                providers: Some(providers),
+                providers_error: None,
+                active_model: None,
+                active_provider: None,
+            }],
+            actions: Vec::new(),
+        }
+    }
+
+    fn install_doc(state: &AppState, doc: HermesNativeSettingsDoc) {
         let snapshot = BackendNativeSettingsSnapshot {
             backend_kind: BackendKind::Hermes,
             status: BackendConfigSnapshotStatus::Ready,
-            settings: Some(serde_json::to_value(fixture_doc()).unwrap()),
+            settings: Some(serde_json::to_value(doc).unwrap()),
             groups: Vec::new(),
             message: None,
             advisories: Vec::new(),
@@ -1844,23 +2416,51 @@ mod wasm_tests {
             .unwrap_or_else(|| panic!("no button containing {needle:?}"))
     }
 
-    #[wasm_bindgen_test]
-    async fn renders_profiles_and_provider_status() {
-        ensure_styles_loaded();
-        let container = make_container();
-        let _handle = mount_to(container.clone(), move || {
+    fn elements(container: &HtmlElement, selector: &str) -> Vec<HtmlElement> {
+        let nodes = container.query_selector_all(selector).unwrap();
+        (0..nodes.length())
+            .filter_map(|i| nodes.item(i)?.dyn_into::<HtmlElement>().ok())
+            .collect()
+    }
+
+    /// Type into an input the way the component's `on:input` handler sees it.
+    fn type_into(input: &HtmlInputElement, value: &str) {
+        input.set_value(value);
+        input
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+    }
+
+    /// Commit a value the way the config fields see it — they listen for
+    /// `change` (blur/Enter), not for every keystroke.
+    fn commit_input(input: &HtmlInputElement, value: &str) {
+        input.set_value(value);
+        input
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
+    }
+
+    fn mount_doc(container: &HtmlElement, doc: HermesNativeSettingsDoc) -> impl Sized {
+        let container = container.clone();
+        mount_to(container, move || {
             let state = AppState::new();
-            install_fixture(&state);
+            install_doc(&state, doc.clone());
             provide_context(state);
             hermes_settings_page_body("h")
-        });
+        })
+    }
+
+    #[wasm_bindgen_test]
+    async fn renders_profiles_and_connected_providers() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let _handle = mount_doc(&container, fixture_doc());
         next_tick().await;
 
         let text = container_text(&container);
         // Profile chips: clickable, the default profile labelled "Default",
-        // the named one by its name, each with its model as a subtitle.
-        // (Located as buttons so the "Default model" field label can't satisfy
-        // the assertion.)
+        // the named one by its name, each with its model as a subtitle — so a
+        // profile can be identified without selecting it first.
         let default_chip = button_with_text(&container, "Default");
         assert!(
             default_chip
@@ -1877,29 +2477,95 @@ mod wasm_tests {
                 .contains("openai/gpt-5"),
             "work chip should show the profile's configured model as a subtitle"
         );
-        // Provider rows render both provider names.
+
+        // The Providers tab lists what this profile can actually use, with its
+        // status and model count. Providers still needing a credential are not
+        // rows here — they live in the Add-a-provider dialog, which
+        // `unconfigured_providers_are_offered_in_the_add_dialog` covers.
         assert!(text.contains("OpenRouter"), "provider name missing: {text}");
+        assert_eq!(
+            elements(&container, ".settings-hermes-badge-connected").len(),
+            1,
+            "expected one Connected badge, one per authenticated provider: {text}"
+        );
+        assert_eq!(
+            elements(&container, ".settings-hermes-badge-muted").len(),
+            0,
+            "the Providers tab lists only connected providers: {text}"
+        );
         assert!(
-            text.contains("GitHub Copilot"),
-            "provider name missing: {text}"
+            !text.contains("GitHub Copilot"),
+            "an unconfigured provider belongs in the add dialog, not the tab: {text}"
         );
-        // Exactly one authenticated badge and one not-authenticated badge.
-        // ("Not connected" cannot match "Connected": the capital C differs.)
-        assert_eq!(
-            text.matches("Connected").count(),
-            1,
-            "expected exactly one Connected badge: {text}"
-        );
-        assert_eq!(
-            text.matches("Not connected").count(),
-            1,
-            "expected exactly one Not connected badge: {text}"
-        );
-        // Model count and the unconfigured provider's warning are visible.
         assert!(text.contains("42 models"), "model count missing: {text}");
         assert!(
+            text.contains("1 provider connected"),
+            "the tab should say how many providers are connected: {text}"
+        );
+    }
+
+    /// The other half of the old single-list contract: every provider Hermes
+    /// reports is still reachable, still shows its connection state (by being
+    /// offered as an addition), and still carries Hermes's own setup hint —
+    /// now in the dialog that replaced the fifty-row list.
+    #[wasm_bindgen_test]
+    async fn unconfigured_providers_are_offered_in_the_add_dialog() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let _handle = mount_doc(&container, fixture_doc());
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector("[role='dialog']")
+                .unwrap()
+                .is_none(),
+            "the dialog must not be open until asked for"
+        );
+        button_with_text(&container, "Add a provider").click();
+        next_tick().await;
+
+        let dialog_text = |container: &HtmlElement| {
+            container
+                .query_selector("[role='dialog']")
+                .unwrap()
+                .expect("add-provider dialog")
+                .text_content()
+                .unwrap_or_default()
+        };
+        let text = dialog_text(&container);
+        assert!(
+            text.contains("GitHub Copilot"),
+            "the unconfigured provider must be offered: {text}"
+        );
+        assert!(
+            text.contains("Device code"),
+            "the row must say how this provider authenticates: {text}"
+        );
+        assert!(
+            !text.contains("OpenRouter"),
+            "an already-connected provider is not something to add: {text}"
+        );
+
+        // Picking it explains what to do — including Hermes's own hint, which
+        // carries information the auth mechanism alone does not.
+        button_with_text(&container, "GitHub Copilot").click();
+        next_tick().await;
+        let text = dialog_text(&container);
+        assert!(
             text.contains("Run gh auth login to enable Copilot"),
-            "provider warning missing: {text}"
+            "Hermes's own setup hint must still reach the user: {text}"
+        );
+        assert!(
+            text.contains("Default"),
+            "the instruction must name the profile it applies to: {text}"
+        );
+        assert!(
+            container
+                .query_selector("[role='dialog'] input[type='password']")
+                .unwrap()
+                .is_none(),
+            "a provider Tyde cannot key from here must not offer a key field"
         );
     }
 
@@ -1907,12 +2573,11 @@ mod wasm_tests {
     async fn switching_profiles_swaps_model_defaults() {
         ensure_styles_loaded();
         let container = make_container();
-        let _handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            install_fixture(&state);
-            provide_context(state);
-            hermes_settings_page_body("h")
-        });
+        let _handle = mount_doc(&container, fixture_doc());
+        next_tick().await;
+
+        // Model defaults live on their own tab now.
+        button_with_text(&container, "Model").click();
         next_tick().await;
 
         // The default profile's configured model is shown as an editable value.
@@ -1944,12 +2609,7 @@ mod wasm_tests {
     async fn queued_api_key_is_never_rendered() {
         ensure_styles_loaded();
         let container = make_container();
-        let _handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            install_fixture(&state);
-            provide_context(state);
-            hermes_settings_page_body("h")
-        });
+        let _handle = mount_doc(&container, fixture_doc());
         next_tick().await;
 
         // The authenticated api_key provider offers a key replacement flow.
@@ -1984,6 +2644,189 @@ mod wasm_tests {
                 .unwrap()
                 .is_none(),
             "key editor should close after queueing"
+        );
+    }
+
+    /// Provider rows carry different controls (two buttons or one), and their
+    /// connection status must still read as one scannable column rather than
+    /// drifting left and right with each row's own button widths.
+    #[wasm_bindgen_test]
+    async fn provider_status_badges_share_one_column() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let _handle = mount_doc(
+            &container,
+            doc_with_providers(vec![
+                // api_key: "Replace key…" and "Disconnect".
+                provider("openrouter", "OpenRouter", true, "api_key", None),
+                // OAuth: "Disconnect" only.
+                provider("copilot", "GitHub Copilot", true, "oauth_device_code", None),
+                provider("bedrock", "AWS Bedrock", true, "aws", None),
+            ]),
+        );
+        next_tick().await;
+
+        let badges = elements(&container, ".settings-hermes-badge");
+        assert_eq!(badges.len(), 3, "one status badge per provider row");
+        let rights: Vec<f64> = badges
+            .iter()
+            .map(|badge| badge.get_bounding_client_rect().right())
+            .collect();
+        let first = rights[0];
+        assert!(
+            rights.iter().all(|right| (right - first).abs() < 1.0),
+            "status badges must line up in one column regardless of how many \
+             action buttons their row has; right edges were {rights:?}"
+        );
+
+        let buttons: Vec<f64> = elements(&container, ".settings-hermes-provider-action-slot")
+            .iter()
+            .map(|slot| slot.get_bounding_client_rect().right())
+            .collect();
+        assert_eq!(buttons.len(), 3, "expected one action slot per row");
+        let first_button = buttons[0];
+        assert!(
+            buttons
+                .iter()
+                .all(|right| (right - first_button).abs() < 1.0),
+            "provider action buttons must share a right edge; got {buttons:?}"
+        );
+
+        // A fixed action column must still fit its widest pairing. The row that
+        // offers both "Replace key…" and "Disconnect" is the tight one, and a
+        // column sized for a single button silently ellipsised both labels.
+        for button in elements(
+            &container,
+            ".settings-hermes-provider-action-slot .settings-btn",
+        ) {
+            let label = button.text_content().unwrap_or_default();
+            assert!(
+                button.scroll_width() <= button.client_width(),
+                "action button label {label:?} is clipped ({}px of content in {}px of box)",
+                button.scroll_width(),
+                button.client_width(),
+            );
+        }
+    }
+
+    /// A host reporting dozens of providers must not bury the page: the tab
+    /// stays short, and the catalogue is searchable in the dialog.
+    #[wasm_bindgen_test]
+    async fn add_dialog_searches_the_whole_catalogue() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let mut providers = vec![provider("bedrock", "AWS Bedrock", true, "aws", None)];
+        for idx in 0..12 {
+            providers.push(provider(
+                &format!("vendor{idx}"),
+                &format!("Vendor {idx}"),
+                false,
+                "api_key",
+                None,
+            ));
+        }
+        let _handle = mount_doc(&container, doc_with_providers(providers));
+        next_tick().await;
+
+        assert_eq!(
+            elements(&container, ".settings-hermes-provider-row").len(),
+            1,
+            "only connected providers belong on the tab"
+        );
+        assert!(
+            container_text(&container).contains("12 more available"),
+            "the tab should say how many more providers exist: {}",
+            container_text(&container)
+        );
+
+        button_with_text(&container, "Add a provider").click();
+        next_tick().await;
+        let rows = |container: &HtmlElement| {
+            elements(container, ".settings-hermes-dialog-row")
+                .iter()
+                .map(|row| row.text_content().unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(&container).len(), 12, "every candidate is offered");
+
+        let search: HtmlInputElement = container
+            .query_selector("[role='dialog'] input[type='search']")
+            .unwrap()
+            .expect("catalogue search input")
+            .dyn_into()
+            .unwrap();
+        type_into(&search, "vendor7");
+        next_tick().await;
+        let hits = rows(&container);
+        assert_eq!(
+            hits.len(),
+            1,
+            "search should narrow the catalogue: {hits:?}"
+        );
+        assert!(
+            hits[0].contains("Vendor 7"),
+            "search matched the wrong provider: {hits:?}"
+        );
+
+        type_into(&search, "");
+        next_tick().await;
+        assert_eq!(
+            rows(&container).len(),
+            12,
+            "clearing the search restores the full catalogue"
+        );
+    }
+
+    /// The save bar says "Unsaved changes"; the tab strip says *where*.
+    #[wasm_bindgen_test]
+    async fn tab_strip_marks_the_section_holding_unsaved_edits() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let _handle = mount_doc(&container, fixture_doc());
+        next_tick().await;
+
+        assert_eq!(
+            elements(&container, ".settings-hermes-tab-dot").len(),
+            0,
+            "no tab should be marked before an edit"
+        );
+
+        button_with_text(&container, "Agent").click();
+        next_tick().await;
+        let max_turns: HtmlInputElement = container
+            .query_selector("input[type='number']")
+            .unwrap()
+            .expect("max turns input")
+            .dyn_into()
+            .unwrap();
+        commit_input(&max_turns, "42");
+        next_tick().await;
+
+        // Leave the tab entirely: the mark has to survive, or it is useless.
+        button_with_text(&container, "Providers").click();
+        next_tick().await;
+
+        let marked: Vec<String> = elements(&container, ".settings-hermes-tab")
+            .iter()
+            .filter(|tab| {
+                tab.query_selector(".settings-hermes-tab-dot")
+                    .unwrap()
+                    .is_some()
+            })
+            .map(|tab| tab.text_content().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            marked.len(),
+            1,
+            "exactly the edited section should be marked, got {marked:?}"
+        );
+        assert!(
+            marked[0].contains("Agent"),
+            "the Agent tab holds the edit, but {marked:?} was marked"
+        );
+        assert!(
+            container_text(&container).contains("Unsaved changes"),
+            "the save bar should agree that there is an edit"
         );
     }
 }

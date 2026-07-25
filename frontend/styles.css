@@ -8660,22 +8660,91 @@ kbd {
     font-size: 0.85rem;
 }
 
+/* Profile switcher. Deliberately boxed chips, because the section tabs below
+   are underlined text — two stacked strips that looked alike would read as one
+   confused two-row tab bar. */
+.settings-hermes-profilebar {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-3);
+}
+
+.settings-hermes-profilebar-label {
+    flex-shrink: 0;
+    padding-top: 6px;
+    font-size: 0.68rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-tertiary);
+}
+
 .settings-hermes-profiles {
     display: flex;
     flex-wrap: wrap;
     gap: var(--space-2);
 }
 
+/* Section tabs. Underline style, so they read as navigation rather than as
+   another set of selectable cards. */
+.settings-hermes-tabs {
+    display: flex;
+    gap: var(--space-4);
+    border-bottom: 1px solid var(--border-primary);
+}
+
+.settings-hermes-tab {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) 2px;
+    font-size: 0.95rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    cursor: pointer;
+    transition: color 0.12s ease, border-color 0.12s ease;
+}
+
+.settings-hermes-tab:hover {
+    color: var(--text-primary);
+}
+
+.settings-hermes-tab-active {
+    color: var(--text-primary);
+    border-bottom-color: var(--accent-primary);
+}
+
+/* Marks the tab an unsaved edit belongs to, so the save bar's "Unsaved
+   changes" is never a claim the user has to go hunting to verify. */
+.settings-hermes-tab-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--warning, #e8c56a);
+}
+
+.settings-hermes-panel {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+}
+
 .settings-hermes-profile-chip {
     display: inline-flex;
     flex-direction: column;
     align-items: flex-start;
-    gap: 2px;
-    padding: var(--space-1) var(--space-3);
+    gap: 1px;
+    max-width: 20rem;
+    padding: 5px var(--space-3);
     color: var(--text-secondary);
     background: var(--surface-1);
     border: 1px solid var(--border-primary);
-    border-radius: 10px;
+    border-radius: 8px;
     cursor: pointer;
     text-align: left;
     transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
@@ -8699,9 +8768,30 @@ kbd {
 }
 
 .settings-hermes-profile-sub {
+    max-width: 100%;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
     font-size: 0.72rem;
     color: var(--text-tertiary);
     font-family: var(--font-mono, monospace);
+}
+
+/* Providers tab. Only providers this profile can actually use are listed; the
+   rest of the (fifty-odd) catalogue lives in the Add-a-provider dialog, where a
+   search box is the right tool. Rows keep their status and action controls in
+   fixed-width columns so those read as columns down the card. */
+
+.settings-hermes-provider-toolbar {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+}
+
+.settings-hermes-provider-summary {
+    margin-right: auto;
+    font-size: 0.78rem;
+    color: var(--text-tertiary);
 }
 
 .settings-hermes-provider-list {
@@ -8709,11 +8799,38 @@ kbd {
     flex-direction: column;
 }
 
+/* Nothing connected: the one thing to do is the one thing on offer. */
+.settings-hermes-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-5) var(--space-3);
+    text-align: center;
+    background: var(--surface-2);
+    border: 1px dashed var(--border-primary);
+    border-radius: 8px;
+}
+
+.settings-hermes-empty-title {
+    margin: 0;
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.settings-hermes-empty-body {
+    margin: 0 0 var(--space-2);
+    max-width: 34rem;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
 .settings-hermes-provider-row {
     display: flex;
     flex-direction: column;
     gap: var(--space-2);
-    padding: var(--space-2) 0;
+    padding: 5px 0;
 }
 
 .settings-hermes-provider-row + .settings-hermes-provider-row {
@@ -8721,7 +8838,8 @@ kbd {
 }
 
 .settings-hermes-provider-line {
-    display: flex;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
     align-items: center;
     gap: var(--space-3);
 }
@@ -8729,8 +8847,7 @@ kbd {
 .settings-hermes-provider-info {
     display: flex;
     flex-direction: column;
-    gap: 2px;
-    flex: 1;
+    gap: 1px;
     min-width: 0;
 }
 
@@ -8749,31 +8866,86 @@ kbd {
     font-family: var(--font-mono, monospace);
 }
 
+/* Secondary line under the provider name: model count and Hermes's own setup
+   hint. Hints are guidance, not alerts — fifty orange lines read as fifty
+   problems, so they sit at tertiary weight alongside everything else quiet. */
 .settings-hermes-provider-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--space-2);
+    min-width: 0;
     font-size: 0.78rem;
+    color: var(--text-tertiary);
+}
+
+.settings-hermes-provider-meta:empty {
+    display: none;
+}
+
+.settings-hermes-provider-models {
     color: var(--text-secondary);
 }
 
-.settings-hermes-provider-warning {
-    margin: 0;
-    font-size: 0.78rem;
-    color: var(--warning, #e8a032);
+.settings-hermes-provider-hint {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    color: var(--text-tertiary);
 }
 
+.settings-hermes-provider-hint code {
+    font-family: var(--font-mono, monospace);
+    font-size: 0.75rem;
+    background: var(--surface-2);
+    border-radius: 4px;
+    padding: 0 4px;
+}
+
+/* Status column is wide enough for "Not connected"; the action column is wide
+   enough for the widest pairing a row can carry (Replace key… + Disconnect), so
+   no row has to shrink its buttons and clip their labels. */
 .settings-hermes-provider-actions {
-    display: flex;
+    display: grid;
+    /* Note the root font size is 13px, so 1rem is 13px, not 16px. The action
+       column grows past its floor rather than clipping a label, and the row
+       grid right-aligns this block either way, so badges stay in one column. */
+    grid-template-columns: 8rem minmax(16rem, max-content);
     align-items: center;
     gap: var(--space-2);
-    flex-shrink: 0;
+    justify-items: end;
+}
+
+.settings-hermes-provider-action-slot {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-2);
+    width: 100%;
+}
+
+.settings-hermes-provider-action-slot:empty {
+    display: none;
+}
+
+/* Grow to fill the slot (so a lone button matches its neighbours row to row)
+   but never below the label's own width. */
+.settings-hermes-provider-action-slot .settings-btn {
+    flex: 1 1 auto;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
 }
 
 .settings-hermes-badge {
+    justify-self: end;
     font-size: 0.68rem;
     text-transform: uppercase;
     letter-spacing: 0.04em;
     border-radius: 999px;
     padding: 1px var(--space-2);
     border: 1px solid transparent;
+    white-space: nowrap;
 }
 
 .settings-hermes-badge-connected {
@@ -8788,35 +8960,111 @@ kbd {
     border-color: var(--border-primary);
 }
 
-.settings-hermes-auth-hint {
+/* --- Add-a-provider dialog ---
+   Reuses the shared settings modal shell. Wider than the confirm dialog because
+   it holds a scrolling catalogue rather than a sentence, and it is the only
+   place in this page where an API key is ever typed. */
+
+.settings-hermes-dialog {
+    width: min(600px, calc(100vw - 32px));
+    max-height: min(640px, calc(100vh - 48px));
+}
+
+.settings-hermes-dialog-list {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    max-height: 22rem;
+    overflow-y: auto;
+    border: 1px solid var(--border-primary);
+    border-radius: 6px;
+}
+
+.settings-hermes-dialog-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-2) var(--space-3);
+    text-align: left;
+    color: inherit;
+    background: none;
+    border: none;
+    border-bottom: 1px solid var(--border-primary);
+    cursor: pointer;
+}
+
+.settings-hermes-dialog-row:last-child {
+    border-bottom: none;
+}
+
+.settings-hermes-dialog-row:hover,
+.settings-hermes-dialog-row:focus-visible {
+    background: var(--surface-hover);
+}
+
+.settings-hermes-dialog-row-main {
+    display: flex;
+    flex: 1;
+    min-width: 0;
+}
+
+.settings-hermes-dialog-row-main .settings-hermes-provider-name {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+/* The auth mechanism is what tells the user whether picking this row leads to
+   a key field or to a terminal command, so it sits on the row itself. */
+.settings-hermes-dialog-row-auth {
+    flex-shrink: 0;
     font-size: 0.78rem;
     color: var(--text-tertiary);
 }
 
-.settings-hermes-auth-hint code {
+.settings-hermes-dialog-back {
+    align-self: flex-start;
+    padding: 0;
+    font-size: 0.82rem;
+    color: var(--text-secondary);
+    background: none;
+    border: none;
+    cursor: pointer;
+}
+
+.settings-hermes-dialog-back:hover {
+    color: var(--text-primary);
+}
+
+.settings-hermes-dialog-hint {
+    margin: 0;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+/* Dismiss and primary action share one row, so the dialog never stacks two
+   footers (a "Save key" bar with a "Close" bar underneath it). */
+.settings-hermes-dialog-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-2);
+    margin-top: var(--space-1);
+}
+
+.settings-hermes-dialog code {
     font-family: var(--font-mono, monospace);
-    font-size: 0.75rem;
+    font-size: 0.85em;
     background: var(--surface-2);
     border-radius: 4px;
     padding: 0 4px;
 }
 
-.settings-hermes-key-editor {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: var(--space-2);
-}
-
-.settings-hermes-key-input {
-    width: 18rem;
-    max-width: 100%;
-}
-
 .settings-hermes-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
     gap: var(--space-3);
+    align-items: start;
 }
 
 .settings-hermes-chips {
@@ -8879,15 +9127,20 @@ kbd {
     align-items: center;
 }
 
+/* Sticky save bar. It floats over the (long) provider list, so it needs an
+   opaque backdrop and a lift shadow — without them the buttons read as loose
+   controls sitting in the middle of the rows they are covering. */
 .settings-hermes-savebar-wrap {
     position: sticky;
     bottom: 0;
+    z-index: 2;
     display: flex;
     flex-direction: column;
     gap: var(--space-2);
     padding-top: var(--space-2);
     background: var(--surface-0, var(--surface-1));
     border-top: 1px solid var(--border-primary);
+    box-shadow: 0 -10px 18px -10px rgba(0, 0, 0, 0.5);
 }
 
 .settings-hermes-savebar {
