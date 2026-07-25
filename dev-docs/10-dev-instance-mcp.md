@@ -461,22 +461,26 @@ The restart rule is important:
 
 The Hermes option is deliberately opt in. With no `hermes` field, the launcher
 does not set `HOME` or `HERMES_HOME`; existing behavior is unchanged. With the
-field present, it creates both paths beneath the instance's ephemeral
-`storeDir`, resolves them on disk before launch, exports them to the child, and
+field present, `loopbackStub` is required. The launcher resolves the Hermes
+executable (and an explicit `HERMES_PYTHON`) against the parent environment
+before redirecting `HOME`, creates both homes beneath the instance's ephemeral
+`storeDir`, and exports only canonicalized paths to the child. Start fails
+before creating the store when no usable Hermes runtime can be resolved. It
 returns:
 
 ```json
 {
   "hermesEnvironment": {
-    "home": "<storeDir>/hermes-home",
-    "resolvedHome": "<resolved path>",
-    "hermesHome": "<storeDir>/hermes-home/.hermes",
-    "resolvedHermesHome": "<resolved path>",
+    "home": "<canonical storeDir>/hermes-home",
+    "resolvedHome": "<same canonical path>",
+    "hermesHome": "<canonical storeDir>/hermes-home/.hermes",
+    "resolvedHermesHome": "<same canonical path>",
     "homeEphemeral": true,
     "hermesHomeEphemeral": true,
     "profiles": ["qa"],
     "loopbackStubUrl": "http://127.0.0.1:43123/v1",
-    "networkPolicy": "loopback_stub_only"
+    "networkPolicy": "loopback_stub_only",
+    "hermesExecutable": "<canonical parent-resolved executable>"
   }
 }
 ```
@@ -496,12 +500,24 @@ Contained Hermes invocation:
 }
 ```
 
-The stub URL must use numeric `127.0.0.1` or `::1`, plain HTTP, and an explicit
-port. The launcher writes only synthetic credentials, removes inherited
-provider credential variables, and installs a deny-by-default proxy
-environment with loopback exclusions. This confines the supported provider
-path; it is not an OS sandbox for arbitrary commands that open their own
-sockets.
+The stub URL must use numeric `127.0.0.1`, plain HTTP, and an explicit port.
+There is no contained no-stub or inherited-network mode. The launcher writes
+only synthetic credentials, disables Bedrock discovery, removes inherited
+provider credentials and endpoint/base-URL overrides, redirects Tyde's
+configured-host store, and installs a deny-by-default proxy environment whose
+only exemption is `127.0.0.1`. This confines the supported provider path; it is
+not an OS sandbox for arbitrary commands that open their own sockets.
+
+The stub must implement `GET /v1/models` and `POST /v1/chat/completions` for
+the configured model. It must return ordinary completion JSON when
+`stream: false` and valid `text/event-stream` chunks ending in `[DONE]` when
+`stream: true`. Agent creation performs an automatic naming completion before
+the new agent is visible and before its scripted QA turn. The first chat
+completion must therefore return a non-empty, short assistant name (plus a
+syntactically valid usage object); subsequent completions can return the
+scripted QA responses. A fixture that assumes the first completion is the
+user's visible turn will give false failures. Keep supervisor helpers disabled
+unless the fixture also scripts every helper completion.
 
 #### `tyde_debug_events_since`
 

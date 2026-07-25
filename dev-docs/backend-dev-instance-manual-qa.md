@@ -138,8 +138,13 @@ test plan.
    `hermesEnvironment.homeEphemeral: true`,
    `hermesEnvironment.hermesHomeEphemeral: true`,
    `hermesEnvironment.networkPolicy: "loopback_stub_only"`, and both resolved
-   home paths beneath `storeDir`. Without that attestation, Hermes QA is
-   `BLOCKED`; do not open Hermes settings or start a Hermes agent.
+   home paths beneath the canonical `storeDir`. Require
+   `hermesEnvironment.home == hermesEnvironment.resolvedHome`,
+   `hermesEnvironment.hermesHome ==
+   hermesEnvironment.resolvedHermesHome`, and a canonical
+   `hermesExecutable` or `hermesPython` path that exists outside the disposable
+   home. Without that attestation, Hermes QA is `BLOCKED`; do not open Hermes
+   settings or start a Hermes agent.
 9. Confirm the available driver can capture screenshots, rendered DOM,
    console/backend events, and a separately controlled second client. Treat a
    missing required observation channel as `BLOCKED`, not as permission to
@@ -163,6 +168,9 @@ test plan.
      }
    }
    ```
+   The `hermes` object without `loopbackStub` is rejected. Only numeric
+   `127.0.0.1` is accepted; do not substitute `localhost`, IPv6, or a
+   non-loopback HTTP URL.
 2. Before any backend call, require `storesEphemeral: true`, confirm the
    returned `sessionStorePath` is beneath the returned `storeDir`, and record
    both paths. This is a hard preflight gate, not optional evidence collected
@@ -184,6 +192,22 @@ test plan.
    project root, or global error inherited from another store fails setup.
 9. If code changes during the test, stop the instance and start a new one.
    Dev instances intentionally do not hot-reload.
+
+### Loopback-stub request contract
+
+The stub must provide OpenAI-compatible `GET /v1/models` and
+`POST /v1/chat/completions` responses for `tyde-stub`, with JSON for
+`stream: false` and valid SSE ending in `[DONE]` for `stream: true`. The first
+chat completion is not the first visible QA turn: Tyde requests a short
+automatic agent name before registering the agent. Return a non-empty short
+assistant name and a valid usage object for that request, then advance to the
+scripted turn responses. A stub that consumes the first scripted response as
+the name will manufacture an agent-creation failure.
+
+Keep supervisor disabled for baseline cases. Enable it only when the stub has
+separate deterministic responses for each helper completion and the case is
+explicitly testing supervisor behavior. Record every request sequence; an
+unexpected provider or non-loopback request is a containment failure.
 
 Use `tyde_debug_evaluate` for DOM inspection and ordinary browser input for
 clicks, typing, scrolling, and screenshots. Assertions must be based on the

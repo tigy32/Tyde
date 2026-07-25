@@ -2,11 +2,15 @@
 name = "devtools-protocol"
 edition.workspace = true
 
+[features]
+default = ["launcher"]
+launcher = ["dep:schemars", "dep:url"]
+
 [dependencies]
-schemars = "1.2.1"
+schemars = { version = "1.2.1", optional = true }
 serde.workspace = true
 serde_json.workspace = true
-url = "2"
+url = { version = "2", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

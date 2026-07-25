@@ -9,10 +9,13 @@ use client::ClientConfig;
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use devtools_protocol::{
     BoundedDebugOutput, DEV_INSTANCE_DENY_PROXY_URL, DEV_INSTANCE_HERMES_HOME_ENV,
-    DEV_INSTANCE_HOME_ENV, DEV_INSTANCE_PROVIDER_CREDENTIAL_ENVS, DebugOutputSlice,
-    DevInstanceHermesEnvironmentAttestation, DevInstanceHermesNetworkPolicy,
+    DEV_INSTANCE_HERMES_EXECUTABLE_ENV, DEV_INSTANCE_HERMES_PYTHON_ENV,
+    DEV_INSTANCE_HOME_ENV, DEV_INSTANCE_PROVIDER_ENV_EXACT_KEYS, DebugOutputSlice,
+    DevInstanceHermesEnvironmentAttestation, DevInstanceStartupCleanup,
     DisposableHermesEnvironment, PreparedDisposableHermesEnvironment, UiDebugRequest,
-    UiDebugResponse, dev_instance_mutable_paths, prepare_disposable_hermes_environment,
+    UiDebugResponse, dev_instance_mutable_paths, disposable_hermes_environment_json_schema,
+    is_provider_environment_key, prepare_disposable_hermes_environment,
+    resolve_parent_hermes_runtime,
 };
 use protocol::{Project, ProjectId, ProjectRootPath, ProjectSource};
 use serde::{Deserialize, Serialize};
@@ -329,31 +332,12 @@ fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "tyde_dev_instance_start",
-            description: "Launch a Tyde desktop dev instance with isolated ephemeral stores and wait until its typed host and UI-debug loopback endpoints are ready. An optional typed hermes input creates a disposable HOME and HERMES_HOME; its optional loopback stub rejects non-loopback provider URLs. Returns store and Hermes isolation attestations.",
+            description: "Launch a Tyde desktop dev instance with isolated ephemeral stores and wait until its typed host and UI-debug loopback endpoints are ready. An optional typed hermes input requires an IPv4 loopback stub, creates a disposable HOME and HERMES_HOME, strips inherited provider credentials and endpoint overrides, and denies provider proxy egress. Returns canonical store, Hermes runtime, and isolation attestations.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "project_dir": { "type": "string" },
-                    "hermes": {
-                        "type": "object",
-                        "properties": {
-                            "profiles": {
-                                "type": "array",
-                                "maxItems": 64,
-                                "items": { "type": "string" }
-                            },
-                            "loopbackStub": {
-                                "type": "object",
-                                "properties": {
-                                    "baseUrl": { "type": "string" },
-                                    "model": { "type": "string" }
-                                },
-                                "required": ["baseUrl", "model"],
-                                "additionalProperties": false
-                            }
-                        },
-                        "additionalProperties": false
-                    }
+                    "hermes": disposable_hermes_environment_json_schema()
                 },
                 "required": ["project_dir"],
                 "additionalProperties": false
@@ -520,25 +504,36 @@ async fn start_instance(
     let ui_debug_addr = loopback_addr(ui_debug_port);
     let frontend_url = format!("http://127.0.0.1:{frontend_port}");
     let instance_id = Uuid::new_v4().simple().to_string();
+    let resolved_hermes_runtime = input
+        .hermes
+        .as_ref()
+        .map(|_| resolve_parent_hermes_runtime_for_dev_instance())
+        .transpose()?;
     let store_dir = dev_instance_store_dir(&instance_id);
+    let mut startup_cleanup = DevInstanceStartupCleanup::new(store_dir.clone());
     std::fs::create_dir_all(&store_dir).map_err(|err| {
         format!(
             "failed to create dev instance store dir {}: {err}",
             store_dir.display()
         )
     })?;
+    let store_dir = std::fs::canonicalize(&store_dir).map_err(|err| {
+        format!(
+            "failed to resolve dev instance store dir {}: {err}",
+            store_dir.display()
+        )
+    })?;
     seed_dev_project_store(&store_dir, &project_dir, &instance_id)?;
-    let prepared_hermes = match input.hermes.as_ref() {
-        Some(hermes) => match prepare_disposable_hermes_environment(&store_dir, hermes) {
-            Ok(prepared) => Some(prepared),
-            Err(error) => {
-                let _ = std::fs::remove_dir_all(&store_dir);
-                return Err(error);
-            }
-        },
-        None => None,
-    };
+    let prepared_hermes = input
+        .hermes
+        .as_ref()
+        .zip(resolved_hermes_runtime.as_ref())
+        .map(|(hermes, runtime)| {
+            prepare_disposable_hermes_environment(&store_dir, hermes, runtime)
+        })
+        .transpose()?;
 
+    startup_cleanup.track_config(dev_instance_config_path(&instance_id));
     let config_path = write_dev_config(&project_dir, frontend_port, &instance_id)?;
     let mut command = tauri_dev_command(&config_path)?;
     command
@@ -590,8 +585,6 @@ async fn start_instance(
 
     if let Err(err) = wait_for_instance_ready(&mut record).await {
         let _ = record.child.kill().await;
-        let _ = tokio::fs::remove_file(&record.config_path).await;
-        let _ = tokio::fs::remove_dir_all(&record.store_dir).await;
         return Err(err);
     }
 
@@ -610,6 +603,7 @@ async fn start_instance(
 
     let previous = state.instances.lock().await.insert(instance_id, record);
     assert!(previous.is_none(), "duplicate dev instance id inserted");
+    startup_cleanup.disarm();
 
     Ok(result)
 }
@@ -630,36 +624,79 @@ fn configure_dev_instance_environment(
     command
         .env(DEV_INSTANCE_HOME_ENV, &hermes.home)
         .env(DEV_INSTANCE_HERMES_HOME_ENV, &hermes.hermes_home);
-    if hermes.attestation.network_policy == DevInstanceHermesNetworkPolicy::LoopbackStubOnly {
-        for env in DEV_INSTANCE_PROVIDER_CREDENTIAL_ENVS {
+    for env in DEV_INSTANCE_PROVIDER_ENV_EXACT_KEYS {
+        command.env_remove(env);
+    }
+    for (env, _) in std::env::vars_os() {
+        if is_provider_environment_key(&env) {
             command.env_remove(env);
         }
-        for env in [
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
-        ] {
-            command.env(env, DEV_INSTANCE_DENY_PROXY_URL);
-        }
-        command
-            .env("NO_PROXY", "127.0.0.1,::1")
-            .env("no_proxy", "127.0.0.1,::1");
     }
+    if let Some(executable) = &hermes.runtime.executable {
+        command.env(DEV_INSTANCE_HERMES_EXECUTABLE_ENV, executable);
+    }
+    if let Some(python) = &hermes.runtime.python {
+        command.env(DEV_INSTANCE_HERMES_PYTHON_ENV, python);
+    }
+    for env in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        command.env(env, DEV_INSTANCE_DENY_PROXY_URL);
+    }
+    command
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .env("GOOGLE_CLOUD_DISABLE_GCE_CHECK", "true")
+        .env("NO_PROXY", "127.0.0.1")
+        .env("no_proxy", "127.0.0.1");
 }
 
 fn preserve_toolchain_homes(command: &mut Command) {
-    let Some(home) = std::env::var_os(DEV_INSTANCE_HOME_ENV) else {
-        return;
-    };
-    if std::env::var_os("CARGO_HOME").is_none() {
-        command.env("CARGO_HOME", PathBuf::from(&home).join(".cargo"));
+    let home = std::env::var_os(DEV_INSTANCE_HOME_ENV);
+    let cargo_home = std::env::var_os("CARGO_HOME");
+    let rustup_home = std::env::var_os("RUSTUP_HOME");
+    preserve_toolchain_homes_from(
+        command,
+        home.as_deref(),
+        cargo_home.as_deref(),
+        rustup_home.as_deref(),
+    );
+}
+
+fn preserve_toolchain_homes_from(
+    command: &mut Command,
+    home: Option<&std::ffi::OsStr>,
+    cargo_home: Option<&std::ffi::OsStr>,
+    rustup_home: Option<&std::ffi::OsStr>,
+) {
+    if let Some(cargo_home) = cargo_home {
+        command.env("CARGO_HOME", cargo_home);
+    } else if let Some(home) = home {
+        command.env("CARGO_HOME", PathBuf::from(home).join(".cargo"));
     }
-    if std::env::var_os("RUSTUP_HOME").is_none() {
+    if let Some(rustup_home) = rustup_home {
+        command.env("RUSTUP_HOME", rustup_home);
+    } else if let Some(home) = home {
         command.env("RUSTUP_HOME", PathBuf::from(home).join(".rustup"));
     }
+}
+
+fn resolve_parent_hermes_runtime_for_dev_instance(
+) -> Result<devtools_protocol::ResolvedHermesRuntime, String> {
+    let home = std::env::var_os(DEV_INSTANCE_HOME_ENV);
+    let path = std::env::var_os("PATH");
+    let executable = std::env::var_os(DEV_INSTANCE_HERMES_EXECUTABLE_ENV);
+    let python = std::env::var_os(DEV_INSTANCE_HERMES_PYTHON_ENV);
+    resolve_parent_hermes_runtime(
+        home.as_deref(),
+        path.as_deref(),
+        executable.as_deref(),
+        python.as_deref(),
+    )
 }
 
 fn seed_dev_project_store(
@@ -1001,7 +1038,7 @@ fn write_dev_config(
     ));
     json["build"]["devUrl"] = Value::String(format!("http://127.0.0.1:{frontend_port}"));
 
-    let output_path = std::env::temp_dir().join(format!("tyde-dev-instance-{instance_id}.json"));
+    let output_path = dev_instance_config_path(instance_id);
     std::fs::write(
         &output_path,
         serde_json::to_vec_pretty(&json)
@@ -1009,6 +1046,10 @@ fn write_dev_config(
     )
     .map_err(|err| format!("failed to write {}: {err}", output_path.display()))?;
     Ok(output_path)
+}
+
+fn dev_instance_config_path(instance_id: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("tyde-dev-instance-{instance_id}.json"))
 }
 
 fn tauri_dev_command(config_path: &Path) -> Result<Command, String> {
@@ -1450,15 +1491,20 @@ mod tests {
     #[test]
     fn disposable_hermes_environment_is_attested_and_denies_provider_egress() {
         let store = tempfile::tempdir().expect("store dir");
+        let runtime = devtools_protocol::ResolvedHermesRuntime {
+            executable: Some(std::env::current_exe().expect("current executable")),
+            python: None,
+        };
         let prepared = prepare_disposable_hermes_environment(
             store.path(),
             &DisposableHermesEnvironment {
                 profiles: vec!["qa".to_owned()],
-                loopback_stub: Some(devtools_protocol::HermesLoopbackStub {
+                loopback_stub: devtools_protocol::HermesLoopbackStub {
                     base_url: "http://127.0.0.1:43123/v1".to_owned(),
                     model: "tyde-stub".to_owned(),
-                }),
+                },
             },
+            &runtime,
         )
         .expect("prepare Hermes environment");
         let mut command = Command::new("tyde");
@@ -1486,11 +1532,51 @@ mod tests {
                 .flatten(),
             Some(std::ffi::OsStr::new(DEV_INSTANCE_DENY_PROXY_URL))
         );
+        for key in [
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "GH_TOKEN",
+            "ANTHROPIC_AUTH_TOKEN",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "AZURE_OPENAI_ENDPOINT",
+        ] {
+            assert_eq!(
+                configured.get(std::ffi::OsStr::new(key)).copied(),
+                Some(None),
+                "{key} must not reach the contained process"
+            );
+        }
         assert_eq!(
             configured
-                .get(std::ffi::OsStr::new("OPENAI_API_KEY"))
-                .copied(),
-            Some(None)
+                .get(std::ffi::OsStr::new("NO_PROXY"))
+                .copied()
+                .flatten(),
+            Some(std::ffi::OsStr::new("127.0.0.1"))
+        );
+        assert_eq!(
+            configured
+                .get(std::ffi::OsStr::new("no_proxy"))
+                .copied()
+                .flatten(),
+            Some(std::ffi::OsStr::new("127.0.0.1"))
+        );
+        assert_eq!(
+            configured
+                .get(std::ffi::OsStr::new("AWS_EC2_METADATA_DISABLED"))
+                .copied()
+                .flatten(),
+            Some(std::ffi::OsStr::new("true"))
+        );
+        assert_eq!(
+            configured
+                .get(std::ffi::OsStr::new(
+                    DEV_INSTANCE_HERMES_EXECUTABLE_ENV
+                ))
+                .copied()
+                .flatten(),
+            prepared.runtime.executable.as_deref().map(Path::as_os_str)
         );
         assert_eq!(
             prepared.attestation.resolved_hermes_home,
@@ -1505,14 +1591,62 @@ mod tests {
             .find(|tool| tool.name == "tyde_dev_instance_start")
             .expect("start tool");
         assert_eq!(
-            start.input_schema["properties"]["hermes"]["properties"]["loopbackStub"]
-                ["required"],
-            json!(["baseUrl", "model"])
+            start.input_schema["properties"]["hermes"]["required"],
+            json!(["loopbackStub"])
         );
         assert_eq!(
             start.input_schema["required"],
             json!(["project_dir"]),
             "Hermes containment must remain opt in"
+        );
+    }
+
+    #[test]
+    fn toolchain_homes_survive_disposable_home_redirection() {
+        let mut derived = Command::new("tyde");
+        preserve_toolchain_homes_from(
+            &mut derived,
+            Some(std::ffi::OsStr::new("/parent")),
+            None,
+            None,
+        );
+        let derived = derived.as_std().get_envs().collect::<HashMap<_, _>>();
+        assert_eq!(
+            derived
+                .get(std::ffi::OsStr::new("CARGO_HOME"))
+                .copied()
+                .flatten(),
+            Some(std::ffi::OsStr::new("/parent/.cargo"))
+        );
+        assert_eq!(
+            derived
+                .get(std::ffi::OsStr::new("RUSTUP_HOME"))
+                .copied()
+                .flatten(),
+            Some(std::ffi::OsStr::new("/parent/.rustup"))
+        );
+
+        let mut explicit = Command::new("tyde");
+        preserve_toolchain_homes_from(
+            &mut explicit,
+            Some(std::ffi::OsStr::new("/parent")),
+            Some(std::ffi::OsStr::new("/toolchain/cargo")),
+            Some(std::ffi::OsStr::new("/toolchain/rustup")),
+        );
+        let explicit = explicit.as_std().get_envs().collect::<HashMap<_, _>>();
+        assert_eq!(
+            explicit
+                .get(std::ffi::OsStr::new("CARGO_HOME"))
+                .copied()
+                .flatten(),
+            Some(std::ffi::OsStr::new("/toolchain/cargo"))
+        );
+        assert_eq!(
+            explicit
+                .get(std::ffi::OsStr::new("RUSTUP_HOME"))
+                .copied()
+                .flatten(),
+            Some(std::ffi::OsStr::new("/toolchain/rustup"))
         );
     }
 

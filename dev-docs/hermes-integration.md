@@ -224,30 +224,47 @@ read contract for that value here.
 `HOME` and `HERMES_HOME` and is **not** safe for destructive Hermes QA merely
 because its Tyde stores are ephemeral.
 
-The typed opt-in creates a fresh home inside the instance store, exports both
-`HOME` and `HERMES_HOME`, seeds requested named profiles, and returns
-`hermesEnvironment` with the configured and filesystem-resolved paths plus
-`homeEphemeral: true` and `hermesHomeEphemeral: true`. Stop removes the entire
+The typed opt-in requires `loopbackStub`. Before redirecting `HOME`, the parent
+launcher resolves and canonicalizes the Hermes executable and an explicitly
+configured `HERMES_PYTHON`; start fails closed if neither is usable. It then
+creates a fresh home inside the instance store, exports canonical `HOME`,
+`HERMES_HOME`, and runtime paths, seeds requested named profiles, and returns
+those same canonical values in `hermesEnvironment` with derived
+`homeEphemeral` and `hermesHomeEphemeral` facts. Stop removes the entire
 instance store.
 
-For a no-paid-call run, `loopbackStub` additionally:
+The contained no-paid-call mode:
 
-- accepts only `http://127.0.0.1:<port>` or `http://[::1]:<port>` with an
-  explicit port and no URL credentials, query, or fragment;
+- accepts only `http://127.0.0.1:<port>` with an explicit port and no URL
+  credentials, query, or fragment;
 - writes a synthetic OpenAI-compatible model configuration and fake local key
-  into the disposable default and named profiles;
-- removes inherited provider credential environment variables; and
+  into the disposable default and named profiles and disables Bedrock
+  discovery;
+- removes inherited provider credential, token, credential-file, endpoint,
+  base-URL, organization, project, and cloud-profile environment surfaces;
+- redirects Tyde's configured-host store with the other mutable stores; and
 - routes HTTP(S) proxy traffic to a closed loopback endpoint while exempting
-  only `127.0.0.1` and `::1`.
+  only `127.0.0.1`.
 
 The returned network policy is `loopback_stub_only`. This is a fail-closed
 provider-testing configuration, not a general OS network sandbox for arbitrary
 tools or subprocesses. The stub must already be listening on the supplied
-loopback URL and must implement the OpenAI-compatible endpoints exercised by
-the selected Hermes flow. It proves Tyde/Hermes request structure and lifecycle
-without provider spend; it does not verify a production provider's exact tool
-event order, cache/context accounting, reasoning fields, error body, latency,
-or billing. Those claims require a separately approved live call.
+loopback URL. There is no contained no-stub or inherited-network escape hatch.
+It proves Tyde/Hermes request structure and lifecycle without provider spend;
+it does not verify a production provider's exact tool event order,
+cache/context accounting, reasoning fields, error body, latency, or billing.
+Those claims require a separately approved live call.
+
+The reference contract is OpenAI-compatible `GET /v1/models` and
+`POST /v1/chat/completions`, including normal JSON for `stream: false` and
+valid SSE chunks ending in `[DONE]` for `stream: true`. Agent creation always
+sends an automatic naming completion before the agent exists and before the
+user's visible turn. The stub's first completion must return a non-empty short
+assistant name and a valid usage object; only later completions should consume
+the scripted turn responses. Keep supervisor helpers off unless the stub also
+scripts all helper completions. This request ordering is part of the fixture
+contract, not proof that a paid provider emits identical streaming or usage
+metadata.
 
 Example:
 
