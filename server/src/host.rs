@@ -7355,7 +7355,7 @@ impl HostHandle {
                 BackendKind::Hermes => {
                     let workspace_root = hermes_probe_workspace_root()
                         .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
-                    crate::backend::hermes::persist_native_settings(
+                    let outcome = crate::backend::hermes::persist_native_settings(
                         settings.clone(),
                         &[workspace_root],
                     )
@@ -7367,6 +7367,9 @@ impl HostHandle {
                     self.refresh_backend_config_snapshots_after_native_save()
                         .await;
                     self.refresh_session_schemas_with_fanout(true).await;
+                    if let Some(error) = outcome.partial_error_message() {
+                        return Err(AppError::invalid(OPERATION, error));
+                    }
                 }
                 _ => {
                     return Err(AppError::invalid(
@@ -24607,8 +24610,9 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 attempts_started: 1,
                 verdict_settings: fingerprint,
                 result: Err(crate::agent::supervisor::SupervisionFailure {
-                    kind: crate::agent::supervisor::SupervisionFailureKind::BackendStart,
-                    message: "profile authentication unavailable".to_owned(),
+                    kind: crate::agent::supervisor::SupervisionFailureKind::BackendTerminal,
+                    message: "No allowed providers are available for the selected model."
+                        .to_owned(),
                 }),
             },
             Instant::now(),

@@ -39,6 +39,7 @@ pub(crate) enum SupervisionVerdict {
 pub(crate) enum SupervisionFailureKind {
     BackendStart,
     BackendStream,
+    BackendTerminal,
     Timeout,
     InvalidVerdict,
 }
@@ -58,7 +59,10 @@ impl SupervisionFailure {
     }
 
     pub(crate) fn is_retryable(&self) -> bool {
-        !matches!(self.kind, SupervisionFailureKind::BackendStart)
+        !matches!(
+            self.kind,
+            SupervisionFailureKind::BackendStart | SupervisionFailureKind::BackendTerminal
+        )
     }
 }
 
@@ -229,7 +233,7 @@ pub(crate) async fn generate_supervision_verdict(
         }
     };
 
-    let result = collect_supervision_events(&mut events).await;
+    let result = collect_supervision_events(&mut events, request.backend_kind).await;
     if let Err(err) = &result {
         tracing::warn!(
             backend_kind = ?request.backend_kind,
@@ -262,13 +266,14 @@ fn supervision_spawn_config(
 
 async fn collect_supervision_events(
     events: &mut EventStream,
+    backend_kind: BackendKind,
 ) -> Result<SupervisionVerdict, SupervisionFailure> {
     let mut streamed_text = String::new();
     while let Some(event) = events.recv().await {
         match event {
             ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::Error) => {
                 return Err(SupervisionFailure::new(
-                    SupervisionFailureKind::BackendStream,
+                    supervision_backend_error_kind(backend_kind),
                     message.content,
                 ));
             }
@@ -303,6 +308,14 @@ async fn collect_supervision_events(
         SupervisionFailureKind::BackendStream,
         "agent supervisor ended before producing a verdict",
     ))
+}
+
+fn supervision_backend_error_kind(backend_kind: BackendKind) -> SupervisionFailureKind {
+    if backend_kind == BackendKind::Hermes {
+        SupervisionFailureKind::BackendTerminal
+    } else {
+        SupervisionFailureKind::BackendStream
+    }
 }
 
 pub(crate) const MOCK_SUPERVISOR_ERROR: &str = "__mock_supervisor_error__";
@@ -869,7 +882,7 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_backend_start_failure_is_not_retried() {
+    fn supervisor_classifies_non_retryable_backend_failures() {
         let start = SupervisionFailure::new(
             SupervisionFailureKind::BackendStart,
             "profile authentication is unavailable",
@@ -878,9 +891,22 @@ mod tests {
             SupervisionFailureKind::BackendStream,
             "transient stream ended",
         );
+        let terminal = SupervisionFailure::new(
+            SupervisionFailureKind::BackendTerminal,
+            "Hermes exhausted provider routing",
+        );
 
         assert!(!start.is_retryable());
+        assert!(!terminal.is_retryable());
         assert!(stream.is_retryable());
+        assert_eq!(
+            supervision_backend_error_kind(BackendKind::Hermes),
+            SupervisionFailureKind::BackendTerminal
+        );
+        assert_eq!(
+            supervision_backend_error_kind(BackendKind::Claude),
+            SupervisionFailureKind::BackendStream
+        );
     }
 
     #[test]

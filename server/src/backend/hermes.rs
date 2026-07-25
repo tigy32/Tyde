@@ -62,6 +62,7 @@ const HERMES_MODEL_PROVIDER_FLAG: &str = " --provider ";
 const HERMES_TOOLSETS_ENV: &str = "HERMES_TUI_TOOLSETS";
 const HERMES_TOOL_PROGRESS_ENV: &str = "HERMES_TUI_TOOL_PROGRESS";
 const HERMES_MANAGED_DIR_ENV: &str = "HERMES_MANAGED_DIR";
+const TYDE_HERMES_SYSTEM_PROMPT_ENV: &str = "TYDE_HERMES_SYSTEM_PROMPT";
 const HERMES_MANAGED_MCP_TOOLSET: &str = "mcp-tyde";
 /// Hermes's Tool Search bridge tool. When deferral is active the
 /// model-visible tool list carries this (plus tool_describe/tool_call)
@@ -80,6 +81,7 @@ from tui_gateway import server as _tyde_gateway_server
 
 _tyde_original_emit = _tyde_gateway_server._emit
 _tyde_original_get_usage = _tyde_gateway_server._get_usage
+_tyde_original_make_agent = _tyde_gateway_server._make_agent
 _tyde_tool_start_args = {}
 _tyde_message_condition = threading.Condition()
 _tyde_open_messages = set()
@@ -91,6 +93,16 @@ def _tyde_get_usage(agent):
         usage["cache_creation_input_tokens"] = int(getattr(agent, "session_cache_write_tokens", 0) or 0)
         usage["reasoning_tokens"] = int(getattr(agent, "session_reasoning_tokens", 0) or 0)
     return usage
+
+def _tyde_make_agent(*args, **kwargs):
+    agent = _tyde_original_make_agent(*args, **kwargs)
+    tyde_prompt = os.environ.get("TYDE_HERMES_SYSTEM_PROMPT", "").strip()
+    if tyde_prompt:
+        existing = str(getattr(agent, "ephemeral_system_prompt", "") or "").strip()
+        agent.ephemeral_system_prompt = "\n\n".join(
+            part for part in (existing, tyde_prompt) if part
+        )
+    return agent
 
 def _tyde_emit(event_type, session_id, payload=None):
     if event_type == "message.start":
@@ -121,6 +133,7 @@ def _tyde_on_tool_start(session_id, tool_call_id, name, args):
 
 _tyde_gateway_server._emit = _tyde_emit
 _tyde_gateway_server._get_usage = _tyde_get_usage
+_tyde_gateway_server._make_agent = _tyde_make_agent
 _tyde_gateway_server._on_tool_start = _tyde_on_tool_start
 from tui_gateway.entry import main
 
@@ -208,6 +221,7 @@ enum HermesBackendCommand {
 struct HermesGatewayHandle {
     tx: mpsc::UnboundedSender<HermesGatewayCommand>,
     request_timeout: Duration,
+    system_overlay_installed: bool,
 }
 
 enum HermesGatewayCommand {
@@ -441,17 +455,22 @@ impl Backend for HermesBackend {
         let resolved_settings = resolve_session_settings(&config);
         let profile = resolve_session_profile(&resolved_settings)?;
         let expects_mcp_tools = !config.startup_mcp_servers.is_empty();
+        let spawn_instructions = render_hermes_spawn_instructions(&config.resolved_spawn_config);
         let (gateway, mut gateway_events_rx) = HermesGatewayHandle::spawn(
             &workspace_roots,
             &config.startup_mcp_servers,
             &config.resolved_spawn_config.tool_policy,
             &profile,
+            spawn_instructions.as_deref(),
         )
         .await?;
+        let history_instructions = (!gateway.system_overlay_installed)
+            .then_some(spawn_instructions.as_deref())
+            .flatten();
         let create_params = build_session_create_params(
             &workspace_roots,
-            &config.resolved_spawn_config,
             &resolved_settings,
+            history_instructions,
         )?;
         let create = gateway.request("session.create", create_params).await?;
         let ids = parse_session_create_ids(&create)?;
@@ -498,22 +517,25 @@ impl Backend for HermesBackend {
         session_id: SessionId,
     ) -> Result<(Self, EventStream), String> {
         reject_unverified_resume_capabilities(&config)?;
-        if render_hermes_spawn_instructions(&config.resolved_spawn_config).is_some() {
-            return Err(
-                "Hermes cannot safely resume this session because the gateway does not persist \
-                 Tyde access, steering, custom-agent, or skill instructions; start a new session"
-                    .to_string(),
-            );
-        }
         let resolved_settings = resolve_session_settings(&config);
         let profile = resolve_session_profile(&resolved_settings)?;
+        let spawn_instructions = render_hermes_spawn_instructions(&config.resolved_spawn_config);
         let (gateway, gateway_events_rx) = HermesGatewayHandle::spawn(
             &workspace_roots,
             &config.startup_mcp_servers,
             &config.resolved_spawn_config.tool_policy,
             &profile,
+            spawn_instructions.as_deref(),
         )
         .await?;
+        if spawn_instructions.is_some() && !gateway.system_overlay_installed {
+            gateway.shutdown().await;
+            return Err(
+                "Hermes cannot safely resume this remote session because the remote gateway \
+                 cannot restore Tyde system instructions"
+                    .to_string(),
+            );
+        }
         let resume = gateway
             .request(
                 "session.resume",
@@ -582,9 +604,14 @@ impl Backend for HermesBackend {
 
     async fn list_sessions() -> Result<Vec<BackendSession>, String> {
         let profile = hermes_config::resolve_profile_ref(None)?;
-        let (gateway, _gateway_events_rx) =
-            HermesGatewayHandle::spawn(&[], &[], &protocol::ToolPolicy::Unrestricted, &profile)
-                .await?;
+        let (gateway, _gateway_events_rx) = HermesGatewayHandle::spawn(
+            &[],
+            &[],
+            &protocol::ToolPolicy::Unrestricted,
+            &profile,
+            None,
+        )
+        .await?;
         let result = gateway
             .request("session.list", json!({ "limit": 200 }))
             .await;
@@ -722,6 +749,7 @@ pub(crate) async fn probe_model_options(
         &[],
         &protocol::ToolPolicy::Unrestricted,
         profile,
+        None,
     )
     .await?;
     let options = gateway.request("model.options", json!({})).await;
@@ -851,10 +879,31 @@ fn provider_states_from_payload(
 /// credential actions against each profile's gateway, then write changed
 /// per-profile config projections back to disk. The document (which may
 /// carry an API key inside an action) is never logged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HermesNativeSettingsSaveOutcome {
+    Complete,
+    Partial {
+        credential_errors: Vec<String>,
+    },
+}
+
+impl HermesNativeSettingsSaveOutcome {
+    pub(crate) fn partial_error_message(&self) -> Option<String> {
+        match self {
+            Self::Complete => None,
+            Self::Partial { credential_errors } => Some(format!(
+                "Hermes saved the unrelated configuration changes, but credential actions \
+                 failed: {}",
+                credential_errors.join("; ")
+            )),
+        }
+    }
+}
+
 pub(crate) async fn persist_native_settings(
     settings: Value,
     workspace_roots: &[String],
-) -> Result<(), String> {
+) -> Result<HermesNativeSettingsSaveOutcome, String> {
     use protocol::hermes_config::{
         HERMES_NATIVE_SETTINGS_VERSION, HermesCredentialAction, HermesNativeSettingsDoc,
     };
@@ -956,12 +1005,9 @@ pub(crate) async fn persist_native_settings(
         hermes_config::apply_profile_config(&profile.home_dir, config)?;
     }
     if credential_errors.is_empty() {
-        Ok(())
+        Ok(HermesNativeSettingsSaveOutcome::Complete)
     } else {
-        Err(format!(
-            "Hermes saved the unrelated configuration changes, but credential actions failed: {}",
-            credential_errors.join("; ")
-        ))
+        Ok(HermesNativeSettingsSaveOutcome::Partial { credential_errors })
     }
 }
 
@@ -972,15 +1018,37 @@ async fn run_credential_actions_for_profile(
 ) -> Result<(), String> {
     use protocol::hermes_config::HermesCredentialAction;
 
+    let mut errors = Vec::new();
+    let mut gateway_actions = Vec::new();
+    for action in actions {
+        match action {
+            HermesCredentialAction::Disconnect { provider, .. } if !profile.is_default() => {
+                errors.push(format!(
+                    "disconnect for provider '{provider}' is disabled because Hermes cannot \
+                     prove that credential deletion is scoped to named profile '{}'",
+                    profile.name
+                ));
+            }
+            _ => gateway_actions.push(action),
+        }
+    }
+    if gateway_actions.is_empty() {
+        return Err(format!(
+            "profile '{}': {}",
+            profile.name,
+            errors.join("; ")
+        ));
+    }
+
     let (gateway, _events) = HermesGatewayHandle::spawn(
         workspace_roots,
         &[],
         &protocol::ToolPolicy::Unrestricted,
         profile,
+        None,
     )
     .await?;
-    let mut errors = Vec::new();
-    for action in actions {
+    for action in gateway_actions {
         let outcome = match action {
             HermesCredentialAction::SaveApiKey {
                 provider, api_key, ..
@@ -997,13 +1065,6 @@ async fn run_credential_actions_for_profile(
                         .map(|_| ())
                 }
             }
-            HermesCredentialAction::Disconnect { provider, .. } if !profile.is_default() => Err(
-                format!(
-                    "disconnect for provider '{provider}' is disabled because Hermes cannot \
-                     prove that credential deletion is scoped to named profile '{}'",
-                    profile.name
-                ),
-            ),
             HermesCredentialAction::Disconnect { provider, .. } => gateway
                 .request("model.disconnect", json!({ "slug": provider }))
                 .await
@@ -1828,6 +1889,7 @@ impl HermesGatewayHandle {
         startup_mcp_servers: &[StartupMcpServer],
         tool_policy: &protocol::ToolPolicy,
         profile: &HermesProfileRef,
+        spawn_instructions: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<HermesGatewayEvent>), String> {
         let mut target = resolve_gateway_spawn_target(workspace_roots).await?;
         // A named profile is selected by pointing HERMES_HOME at its
@@ -1846,6 +1908,13 @@ impl HermesGatewayHandle {
             target.env.insert(
                 crate::backend::hermes_config::HERMES_HOME_ENV.to_string(),
                 profile.home_dir.to_string_lossy().to_string(),
+            );
+        }
+        let system_overlay_installed = target.remote_host.is_none();
+        if system_overlay_installed && let Some(spawn_instructions) = spawn_instructions {
+            target.env.insert(
+                TYDE_HERMES_SYSTEM_PROMPT_ENV.to_string(),
+                spawn_instructions.to_string(),
             );
         }
         let mcp_runtime =
@@ -1897,6 +1966,7 @@ impl HermesGatewayHandle {
         let handle = Self {
             tx: command_tx,
             request_timeout,
+            system_overlay_installed,
         };
 
         match tokio::time::timeout(startup_timeout, ready_rx).await {
@@ -2406,18 +2476,24 @@ fn spawn_child_waiter(
     mut force_shutdown_rx: mpsc::UnboundedReceiver<()>,
 ) {
     tokio::spawn(async move {
-        let code = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status.code(),
-                Ok(None) => {}
-                Err(_) => break None,
-            }
-            tokio::select! {
-                _ = force_shutdown_rx.recv() => {
-                    let _ = child.kill().await;
-                    break child.try_wait().ok().flatten().and_then(|status| status.code());
-                }
-                _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+        enum WaitOutcome {
+            Exited(std::io::Result<std::process::ExitStatus>),
+            ForceShutdown,
+        }
+
+        let outcome = tokio::select! {
+            status = child.wait() => WaitOutcome::Exited(status),
+            _ = force_shutdown_rx.recv() => WaitOutcome::ForceShutdown,
+        };
+        let code = match outcome {
+            WaitOutcome::Exited(status) => status.ok().and_then(|status| status.code()),
+            WaitOutcome::ForceShutdown => {
+                let _ = child.start_kill();
+                child
+                    .wait()
+                    .await
+                    .ok()
+                    .and_then(|status| status.code())
             }
         };
         let _ = inbound_tx.send(HermesGatewayInbound::Closed(code));
@@ -2716,6 +2792,7 @@ async fn spawn_gateway_child(target: &HermesSpawnTarget) -> Result<AsyncGroupChi
 
     let mut command = Command::new(&target.program);
     command.args(&target.args);
+    command.env_remove(TYDE_HERMES_SYSTEM_PROMPT_ENV);
     command.envs(&target.env);
     if let Some(path) = process_env::resolved_child_process_path() {
         command.env("PATH", path);
@@ -2819,21 +2896,37 @@ impl HermesEventMapper {
             return Ok(Vec::new());
         }
         if matches!(kind.as_str(), "retry" | "lifecycle") {
-            return Ok(vec![ChatEvent::RetryAttempt(RetryAttemptData {
-                attempt: payload
-                    .get("attempt")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-                max_retries: payload
-                    .get("max_retries")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-                error: text,
-                backoff_ms: payload
-                    .get("backoff_ms")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-            })]);
+            let retry = payload
+                .get("attempt")
+                .and_then(Value::as_u64)
+                .zip(payload.get("max_retries").and_then(Value::as_u64))
+                .zip(payload.get("backoff_ms").and_then(Value::as_u64))
+                .filter(|((attempt, max_retries), _)| {
+                    *attempt > 0 && *max_retries > 0 && *attempt <= *max_retries
+                })
+                .map(
+                    |((attempt, max_retries), backoff_ms)| RetryAttemptData {
+                        attempt,
+                        max_retries,
+                        error: text.clone(),
+                        backoff_ms,
+                    },
+                );
+            return Ok(retry.map_or_else(
+                || {
+                    tracing::debug!(
+                        status_kind = %kind,
+                        status = %text,
+                        "Hermes lifecycle status omitted structured retry telemetry"
+                    );
+                    vec![ChatEvent::TypingStatusChanged(true)]
+                },
+                |retry| vec![ChatEvent::RetryAttempt(retry)],
+            ));
+        }
+        if kind == "compacting" {
+            tracing::debug!(status = %text, "Hermes is compacting the active context");
+            return Ok(vec![ChatEvent::TypingStatusChanged(true)]);
         }
         tracing::debug!(status_kind = %kind, status = %text, "Hermes transient status");
         Ok(Vec::new())
@@ -3275,21 +3368,7 @@ impl HermesEventMapper {
         let message = optional_string(&payload, &["message"])
             .or_else(|| optional_string(&payload, &["error"]))
             .unwrap_or_else(|| payload.to_string());
-        Ok(vec![ChatEvent::RetryAttempt(RetryAttemptData {
-            attempt: payload
-                .get("attempt")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            max_retries: payload
-                .get("max_retries")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            error: message,
-            backoff_ms: payload
-                .get("backoff_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        })])
+        Ok(self.fail_active_turn(message))
     }
 
     fn record_session_usage(
@@ -3787,8 +3866,8 @@ fn hermes_mcp_bridge_descriptor(
 
 fn build_session_create_params(
     workspace_roots: &[String],
-    resolved: &ResolvedSpawnConfig,
     settings: &SessionSettingsValues,
+    history_instructions: Option<&str>,
 ) -> Result<Value, String> {
     let cwd = session_cwd(workspace_roots)?;
     let mut params = json!({
@@ -3797,8 +3876,7 @@ fn build_session_create_params(
         "cwd": cwd,
         "close_on_disconnect": false,
     });
-
-    if let Some(instructions) = render_hermes_spawn_instructions(resolved) {
+    if let Some(instructions) = history_instructions {
         params["messages"] = json!([{ "role": "system", "content": instructions }]);
     }
 
@@ -5317,30 +5395,28 @@ fn context_breakdown_from_hermes(value: &Value) -> Option<ContextBreakdown> {
     let tool_tokens = category_tokens(&["tool_definitions", "mcp", "subagent_definitions"]);
     let conversation_tokens = category_tokens(&["conversation"]);
     let context_injection_tokens = category_tokens(&["rules", "skills", "memory"]);
-    let reasoning_tokens = value
-        .get("reasoning_tokens")
-        .or_else(|| value.get("reasoning"))
-        .and_then(Value::as_u64)
-        .unwrap_or_else(|| category_tokens(&["reasoning"]));
     let accounted_tokens = system_prompt_tokens
         .saturating_add(tool_tokens)
         .saturating_add(conversation_tokens)
-        .saturating_add(context_injection_tokens)
-        .saturating_add(reasoning_tokens);
-    if accounted_tokens != input_tokens {
+        .saturating_add(context_injection_tokens);
+    let estimated_total = value
+        .get("estimated_total")
+        .and_then(Value::as_u64)
+        .unwrap_or(accounted_tokens);
+    if accounted_tokens != estimated_total {
         tracing::debug!(
             input_tokens,
             accounted_tokens,
-            "Hermes context breakdown is incomplete"
+            estimated_total,
+            "Hermes context category estimates do not cover the estimated total"
         );
-        return None;
     }
 
     Some(ContextBreakdown {
         system_prompt_bytes: bytes(system_prompt_tokens),
         tool_io_bytes: bytes(tool_tokens),
         conversation_history_bytes: bytes(conversation_tokens),
-        reasoning_bytes: bytes(reasoning_tokens),
+        reasoning_bytes: 0,
         context_injection_bytes: bytes(context_injection_tokens),
         input_tokens,
         context_window,
@@ -5885,7 +5961,7 @@ for line in sys.stdin:
     elif method == "session.usage":
         print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"input":1,"output":2,"total":3}}), flush=True)
     elif method == "session.context_breakdown":
-        print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"context_used":12000,"context_max":200000,"categories":[{"id":"system_prompt","tokens":1000},{"id":"tool_definitions","tokens":2000},{"id":"conversation","tokens":9000}]}}), flush=True)
+        print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"context_used":12000,"context_max":200000,"estimated_total":12000,"categories":[{"id":"system_prompt","tokens":1000},{"id":"tool_definitions","tokens":2000},{"id":"conversation","tokens":9000}]}}), flush=True)
     elif method == "session.history":
         print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"count":0,"messages":[]}}), flush=True)
     elif method == "session.list":
@@ -6625,11 +6701,14 @@ for line in sys.stdin:
         let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
         let dir = TempDir::new().expect("tempdir");
         let rpc_log = dir.path().join("rpc.jsonl");
+        let spawn_log = dir.path().join("spawned");
         let fake = write_fake_gateway(
             &dir,
             &format!(
                 r#"
 import json, sys
+with open({spawn_log:?}, "w") as output:
+    output.write("spawned")
 print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"gateway.ready","payload":{{}}}}}}), flush=True)
 for line in sys.stdin:
     req = json.loads(line)
@@ -6674,12 +6753,15 @@ for line in sys.stdin:
             }],
         };
 
-        let error = persist_native_settings(
+        let outcome = persist_native_settings(
             serde_json::to_value(doc).expect("settings"),
             &[dir.path().to_string_lossy().to_string()],
         )
         .await
-        .expect_err("blocked credential action must be reported");
+        .expect("unrelated configuration writes must complete");
+        let error = outcome
+            .partial_error_message()
+            .expect("blocked credential action must be reported");
 
         assert!(error.contains("saved the unrelated configuration"), "{error}");
         assert!(error.contains("cannot prove"), "{error}");
@@ -6698,6 +6780,10 @@ for line in sys.stdin:
         assert!(
             !rpc.contains("model.disconnect"),
             "unsafe disconnect RPC must not be sent: {rpc}"
+        );
+        assert!(
+            !spawn_log.exists(),
+            "a named-profile disconnect rejected locally must not spawn Hermes"
         );
     }
 
@@ -6976,14 +7062,40 @@ with open({survived:?}, "w") as output:
         );
     }
 
+    #[tokio::test]
+    async fn hermes_child_waiter_awaits_and_reports_the_real_exit_code() {
+        let dir = TempDir::new().expect("tempdir");
+        let fake = write_fake_gateway(&dir, "raise SystemExit(23)\n");
+        let mut command = Command::new(fake);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = command.group_spawn().expect("spawn child");
+        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+        let (_force_tx, force_rx) = mpsc::unbounded_channel();
+
+        spawn_child_waiter(child, inbound_tx, force_rx);
+
+        let event = timeout(Duration::from_secs(2), inbound_rx.recv())
+            .await
+            .expect("child wait")
+            .expect("closed event");
+        assert!(matches!(event, HermesGatewayInbound::Closed(Some(23))));
+    }
+
     #[test]
-    fn hermes_read_only_instructions_are_seeded_as_system_history() {
+    fn hermes_read_only_instructions_use_the_gateway_system_overlay() {
         let resolved = ResolvedSpawnConfig {
             access_mode: BackendAccessMode::ReadOnly,
             ..ResolvedSpawnConfig::default()
         };
-        let params = build_session_create_params(&[], &resolved, &SessionSettingsValues::default())
-            .expect("params");
+        let params = build_session_create_params(
+            &[],
+            &SessionSettingsValues::default(),
+            None,
+        )
+        .expect("params");
         let cwd = params["cwd"].as_str().expect("cwd");
         assert!(
             cwd.ends_with(".tyde/hermes/no-root"),
@@ -6997,10 +7109,24 @@ with open({survived:?}, "w") as output:
             ambient_cwd.as_deref(),
             "empty-root Hermes sessions must not fall back to ambient cwd"
         );
-        let message = params["messages"][0]["content"]
-            .as_str()
-            .expect("system seed");
-        assert!(message.contains("Backend access mode is read-only"));
+        assert!(
+            params.get("messages").is_none(),
+            "Tyde instructions must not be persisted as ordinary history"
+        );
+        let instructions = render_hermes_spawn_instructions(&resolved).expect("instructions");
+        assert!(instructions.contains("Backend access mode is read-only"));
+        assert!(HERMES_MCP_GATEWAY_ENTRY.contains("ephemeral_system_prompt"));
+        assert!(HERMES_MCP_GATEWAY_ENTRY.contains(TYDE_HERMES_SYSTEM_PROMPT_ENV));
+        let fallback = build_session_create_params(
+            &[],
+            &SessionSettingsValues::default(),
+            Some(&instructions),
+        )
+        .expect("remote fallback params");
+        assert_eq!(
+            fallback["messages"][0]["content"].as_str(),
+            Some(instructions.as_str())
+        );
     }
 
     #[test]
@@ -7020,11 +7146,7 @@ with open({survived:?}, "w") as output:
             ..ResolvedSpawnConfig::default()
         };
 
-        let params = build_session_create_params(&[], &resolved, &SessionSettingsValues::default())
-            .expect("params");
-        let seed = params["messages"][0]["content"]
-            .as_str()
-            .expect("system seed");
+        let seed = render_hermes_spawn_instructions(&resolved).expect("system overlay");
 
         assert!(seed.contains("Review changes"));
         assert!(seed.contains("Trace failures"));
@@ -7038,23 +7160,54 @@ with open({survived:?}, "w") as output:
     }
 
     #[tokio::test]
-    async fn hermes_resume_fails_closed_when_tyde_seed_is_required() {
+    async fn hermes_resume_reseeds_tyde_instructions_outside_history() {
+        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
+        let dir = TempDir::new().expect("tempdir");
+        let prompt_log = dir.path().join("prompt.txt");
+        let fake = write_fake_gateway(
+            &dir,
+            &format!(
+                r#"
+import json, os, sys
+with open({prompt_log:?}, "w") as output:
+    output.write(os.environ.get("TYDE_HERMES_SYSTEM_PROMPT", ""))
+print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"gateway.ready","payload":{{}}}}}}), flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    method = req["method"]
+    if method == "session.resume":
+        result = {{"session_id":"live","resumed":"stored"}}
+    elif method == "session.history":
+        result = {{"messages":[]}}
+    else:
+        result = {{}}
+    print(json.dumps({{"jsonrpc":"2.0","id":req["id"],"result":result}}), flush=True)
+"#
+            ),
+        );
+        let _guard = TestHermesPythonGuard::set(&fake);
         let mut config = BackendSpawnConfig::default();
         config.resolved_spawn_config.access_mode = BackendAccessMode::ReadOnly;
+        config.resolved_spawn_config.skills = vec![
+            crate::agent::customization::ResolvedSkill {
+                name: "Review changes".to_string(),
+                body: "PRIVATE_SKILL_BODY".to_string(),
+            },
+        ];
 
-        let error = match HermesBackend::resume(
+        let (backend, _events) = HermesBackend::resume(
             Vec::new(),
             config,
             SessionId("stored".to_string()),
         )
         .await
-        {
-            Ok(_) => panic!("resume must not silently drop read-only instructions"),
-            Err(error) => error,
-        };
+        .expect("resume with a Tyde system overlay");
+        backend.shutdown().await;
 
-        assert!(error.contains("cannot safely resume"), "{error}");
-        assert!(error.contains("start a new session"), "{error}");
+        let prompt = fs::read_to_string(prompt_log).expect("resume prompt");
+        assert!(prompt.contains("Backend access mode is read-only"), "{prompt}");
+        assert!(prompt.contains("Review changes"), "{prompt}");
+        assert!(!prompt.contains("PRIVATE_SKILL_BODY"), "{prompt}");
     }
 
     #[test]
@@ -7097,6 +7250,21 @@ with open({survived:?}, "w") as output:
     }
 
     #[test]
+    fn hermes_session_catalog_advertises_reseeded_resume_support() {
+        let sessions = parse_session_list(&json!({
+            "sessions": [{
+                "id": "stored",
+                "title": "Resumable Hermes session",
+                "started_at": 1_700_000_000.0
+            }]
+        }))
+        .expect("session catalog");
+
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].resumable);
+    }
+
+    #[test]
     fn hermes_session_create_params_include_model_provider_reasoning_and_fast() {
         let mut settings = SessionSettingsValues::default();
         settings.0.insert(
@@ -7114,8 +7282,7 @@ with open({survived:?}, "w") as output:
             .0
             .insert("fast".to_string(), SessionSettingValue::Bool(true));
 
-        let params = build_session_create_params(&[], &ResolvedSpawnConfig::default(), &settings)
-            .expect("params");
+        let params = build_session_create_params(&[], &settings, None).expect("params");
 
         assert_eq!(params["model"], "minimax/minimax-m2.7");
         assert_eq!(params["provider"], "openrouter");
@@ -7981,6 +8148,48 @@ with open({survived:?}, "w") as output:
     }
 
     #[test]
+    fn hermes_lifecycle_status_does_not_fabricate_retry_numbers() {
+        let mut mapper = HermesEventMapper::default();
+        let events = mapper.map_event(
+            "status.update",
+            Some(json!({
+                "kind": "lifecycle",
+                "text": "Retrying provider after an internal backoff"
+            })),
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [ChatEvent::TypingStatusChanged(true)]
+        ));
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            ChatEvent::RetryAttempt(_)
+        )));
+    }
+
+    #[test]
+    fn hermes_compacting_status_keeps_the_turn_visibly_active() {
+        let mut mapper = HermesEventMapper::default();
+        let events = mapper.map_event(
+            "status.update",
+            Some(json!({
+                "kind": "compacting",
+                "text": "Compacting context — summarizing earlier conversation"
+            })),
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [ChatEvent::TypingStatusChanged(true)]
+        ));
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            ChatEvent::MessageAdded(_) | ChatEvent::RetryAttempt(_)
+        )));
+    }
+
+    #[test]
     fn hermes_approval_request_keeps_turn_busy() {
         let mut mapper = HermesEventMapper::default();
         let _ = mapper.map_event("message.start", None);
@@ -8037,36 +8246,53 @@ with open({survived:?}, "w") as output:
     }
 
     #[test]
-    fn hermes_error_event_is_diagnostic_not_terminal() {
+    fn hermes_error_event_terminalizes_the_crashed_turn_once() {
         let mut mapper = HermesEventMapper::default();
         let _ = mapper.map_event("message.start", None);
-        let diagnostic = mapper.map_event(
+        let _ = mapper.map_event(
+            "tool.start",
+            Some(json!({ "tool_id": "tool-1", "name": "terminal" })),
+        );
+        let failure = "No allowed providers are available";
+        let events = mapper.map_event(
             "error",
-            Some(json!({ "message": "provider retry failed once" })),
+            Some(json!({ "message": failure })),
         );
 
-        assert!(mapper.current_message_id.is_some());
-        assert!(matches!(
-            diagnostic.as_slice(),
-            [ChatEvent::RetryAttempt(RetryAttemptData { error, .. })]
-                if error == "provider retry failed once"
+        assert!(mapper.current_message_id.is_none());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ChatEvent::StreamEnd(_)
         ));
-        assert!(diagnostic.iter().all(|event| !matches!(
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
+                tool_result: ToolExecutionResult::Cancelled { .. },
+                success: false,
+                ..
+            })
+        )));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ChatEvent::MessageAdded(ChatMessage {
+                        sender: MessageSender::Error,
+                        content,
+                        ..
+                    }) if content == failure
+                ))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| matches!(
             event,
             ChatEvent::TypingStatusChanged(false)
-                | ChatEvent::StreamEnd(_)
-                | ChatEvent::OperationCancelled(_)
         )));
-
-        let _ = mapper.map_event("message.delta", Some(json!({ "text": "recovered" })));
-        let completed = mapper.map_event(
-            "message.complete",
-            Some(json!({ "text": "recovered", "status": "complete" })),
-        );
-        assert!(completed.iter().any(|event| matches!(
+        assert!(events.iter().all(|event| !matches!(
             event,
-            ChatEvent::StreamEnd(StreamEndData { message })
-                if message.content == "recovered"
+            ChatEvent::RetryAttempt(_)
         )));
     }
 
@@ -8282,6 +8508,7 @@ with open({survived:?}, "w") as output:
         let breakdown = context_breakdown_from_hermes(&json!({
             "context_used": 12_000,
             "context_max": 200_000,
+            "estimated_total": 12_000,
             "categories": [
                 { "id": "system_prompt", "tokens": 1_000 },
                 { "id": "tool_definitions", "tokens": 2_000 },
@@ -8304,33 +8531,40 @@ with open({survived:?}, "w") as output:
     }
 
     #[test]
-    fn hermes_incomplete_context_breakdown_is_not_presented_as_complete() {
-        assert!(
-            context_breakdown_from_hermes(&json!({
-                "context_used": 61_000,
-                "context_max": 1_048_000,
-                "categories": [
-                    { "id": "tool_definitions", "tokens": 8_100 }
-                ]
-            }))
-            .is_none(),
-            "an unexplained coverage gap must remain unavailable"
-        );
+    fn hermes_context_breakdown_preserves_measured_total_with_estimated_categories() {
+        let breakdown = context_breakdown_from_hermes(&json!({
+            "context_used": 8_100,
+            "context_max": 1_048_000,
+            "estimated_total": 8_037,
+            "categories": [
+                { "id": "system_prompt", "tokens": 3_000 },
+                { "id": "tool_definitions", "tokens": 2_000 },
+                { "id": "conversation", "tokens": 3_037 }
+            ]
+        }))
+        .expect("measured utilization with estimated categories");
+
+        assert_eq!(breakdown.input_tokens, 8_100);
+        assert_eq!(breakdown.system_prompt_bytes, 12_000);
+        assert_eq!(breakdown.tool_io_bytes, 8_000);
+        assert_eq!(breakdown.conversation_history_bytes, 12_148);
     }
 
     #[test]
-    fn hermes_context_breakdown_attributes_reasoning_tokens() {
+    fn hermes_context_breakdown_keeps_large_unattributed_measured_remainder() {
         let breakdown = context_breakdown_from_hermes(&json!({
-            "context_used": 10,
-            "context_max": 1_000,
-            "reasoning_tokens": 2,
+            "context_used": 61_000,
+            "context_max": 1_048_000,
+            "estimated_total": 8_100,
             "categories": [
-                { "id": "system_prompt", "tokens": 8 }
+                { "id": "tool_definitions", "tokens": 8_100 }
             ]
         }))
-        .expect("complete context breakdown");
+        .expect("measured utilization must survive incomplete attribution");
 
-        assert_eq!(breakdown.reasoning_bytes, 8);
+        assert_eq!(breakdown.input_tokens, 61_000);
+        assert_eq!(breakdown.tool_io_bytes, 32_400);
+        assert_eq!(breakdown.reasoning_bytes, 0);
     }
 
     #[test]
