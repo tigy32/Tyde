@@ -13,9 +13,8 @@ use protocol::{
     RetryAttemptData, SelectOption, SendMessageToolResponse, SessionId, SessionSettingField,
     SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SessionSettingsValues,
     StreamEndData, StreamStartData, StreamTextDeltaData, TokenUsage, TokenUsageScope,
-    TokenUsageUnavailableReason,
-    ToolExecutionCompletedData, ToolExecutionResult, ToolProgressData, ToolProgressUpdate,
-    ToolRequest, ToolRequestType, ToolUseData,
+    TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult, ToolProgressData,
+    ToolProgressUpdate, ToolRequest, ToolRequestType, ToolUseData,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -883,9 +882,7 @@ fn provider_states_from_payload(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HermesNativeSettingsSaveOutcome {
     Complete,
-    Partial {
-        credential_errors: Vec<String>,
-    },
+    Partial { credential_errors: Vec<String> },
 }
 
 impl HermesNativeSettingsSaveOutcome {
@@ -1034,11 +1031,7 @@ async fn run_credential_actions_for_profile(
         }
     }
     if gateway_actions.is_empty() {
-        return Err(format!(
-            "profile '{}': {}",
-            profile.name,
-            errors.join("; ")
-        ));
+        return Err(format!("profile '{}': {}", profile.name, errors.join("; ")));
     }
 
     let (gateway, _events) = HermesGatewayHandle::spawn(
@@ -1079,11 +1072,7 @@ async fn run_credential_actions_for_profile(
     if errors.is_empty() {
         Ok(())
     } else {
-        Err(format!(
-            "profile '{}': {}",
-            profile.name,
-            errors.join("; ")
-        ))
+        Err(format!("profile '{}': {}", profile.name, errors.join("; ")))
     }
 }
 
@@ -1211,17 +1200,15 @@ fn session_schema_probe_from_model_options(
             "Hermes model from authenticated providers reported by model.options.".to_string(),
         ),
         use_slider: false,
-        select_options_by_setting: (infos.len() > 1).then(|| {
-            protocol::SelectOptionsBySetting {
-                setting_key: HERMES_PROFILE_SETTING.to_string(),
-                values: per_profile
-                    .iter()
-                    .map(|models| protocol::SelectOptionsForValue {
-                        setting_value: models.name.clone(),
-                        options: models.options.clone(),
-                    })
-                    .collect(),
-            }
+        select_options_by_setting: (infos.len() > 1).then(|| protocol::SelectOptionsBySetting {
+            setting_key: HERMES_PROFILE_SETTING.to_string(),
+            values: per_profile
+                .iter()
+                .map(|models| protocol::SelectOptionsForValue {
+                    setting_value: models.name.clone(),
+                    options: models.options.clone(),
+                })
+                .collect(),
         }),
         field_type: SessionSettingFieldType::Select {
             options: default_profile.options.clone(),
@@ -2490,11 +2477,7 @@ fn spawn_child_waiter(
             WaitOutcome::Exited(status) => status.ok().and_then(|status| status.code()),
             WaitOutcome::ForceShutdown => {
                 let _ = child.start_kill();
-                child
-                    .wait()
-                    .await
-                    .ok()
-                    .and_then(|status| status.code())
+                child.wait().await.ok().and_then(|status| status.code())
             }
         };
         let _ = inbound_tx.send(HermesGatewayInbound::Closed(code));
@@ -2905,14 +2888,12 @@ impl HermesEventMapper {
                 .filter(|((attempt, max_retries), _)| {
                     *attempt > 0 && *max_retries > 0 && *attempt <= *max_retries
                 })
-                .map(
-                    |((attempt, max_retries), backoff_ms)| RetryAttemptData {
-                        attempt,
-                        max_retries,
-                        error: text.clone(),
-                        backoff_ms,
-                    },
-                );
+                .map(|((attempt, max_retries), backoff_ms)| RetryAttemptData {
+                    attempt,
+                    max_retries,
+                    error: text.clone(),
+                    backoff_ms,
+                });
             return Ok(retry.map_or_else(
                 || {
                     tracing::debug!(
@@ -3072,8 +3053,7 @@ impl HermesEventMapper {
                 let error_text =
                     optional_string(&payload, &["error"]).or_else(|| stream_final_text.clone());
                 if error_text.as_ref().is_some_and(|error| {
-                    !self.current_text.trim().is_empty()
-                        && self.current_text.trim() == error.trim()
+                    !self.current_text.trim().is_empty() && self.current_text.trim() == error.trim()
                 }) {
                     self.current_text.clear();
                 }
@@ -6761,10 +6741,12 @@ for line in sys.stdin:
                 active_model: None,
                 active_provider: None,
             }],
-            actions: vec![protocol::hermes_config::HermesCredentialAction::Disconnect {
-                profile: "work".to_string(),
-                provider: "copilot".to_string(),
-            }],
+            actions: vec![
+                protocol::hermes_config::HermesCredentialAction::Disconnect {
+                    profile: "work".to_string(),
+                    provider: "copilot".to_string(),
+                },
+            ],
         };
 
         let outcome = persist_native_settings(
@@ -6777,7 +6759,10 @@ for line in sys.stdin:
             .partial_error_message()
             .expect("blocked credential action must be reported");
 
-        assert!(error.contains("saved the unrelated configuration"), "{error}");
+        assert!(
+            error.contains("saved the unrelated configuration"),
+            "{error}"
+        );
         assert!(error.contains("cannot prove"), "{error}");
         assert_eq!(
             fs::read(&root_auth).expect("root auth"),
@@ -7104,12 +7089,8 @@ with open({survived:?}, "w") as output:
             access_mode: BackendAccessMode::ReadOnly,
             ..ResolvedSpawnConfig::default()
         };
-        let params = build_session_create_params(
-            &[],
-            &SessionSettingsValues::default(),
-            None,
-        )
-        .expect("params");
+        let params = build_session_create_params(&[], &SessionSettingsValues::default(), None)
+            .expect("params");
         let cwd = params["cwd"].as_str().expect("cwd");
         assert!(
             cwd.ends_with(".tyde/hermes/no-root"),
@@ -7202,24 +7183,22 @@ for line in sys.stdin:
         let _guard = TestHermesPythonGuard::set(&fake);
         let mut config = BackendSpawnConfig::default();
         config.resolved_spawn_config.access_mode = BackendAccessMode::ReadOnly;
-        config.resolved_spawn_config.skills = vec![
-            crate::agent::customization::ResolvedSkill {
-                name: "Review changes".to_string(),
-                body: "PRIVATE_SKILL_BODY".to_string(),
-            },
-        ];
+        config.resolved_spawn_config.skills = vec![crate::agent::customization::ResolvedSkill {
+            name: "Review changes".to_string(),
+            body: "PRIVATE_SKILL_BODY".to_string(),
+        }];
 
-        let (backend, _events) = HermesBackend::resume(
-            Vec::new(),
-            config,
-            SessionId("stored".to_string()),
-        )
-        .await
-        .expect("resume with a Tyde system overlay");
+        let (backend, _events) =
+            HermesBackend::resume(Vec::new(), config, SessionId("stored".to_string()))
+                .await
+                .expect("resume with a Tyde system overlay");
         backend.shutdown().await;
 
         let prompt = fs::read_to_string(prompt_log).expect("resume prompt");
-        assert!(prompt.contains("Backend access mode is read-only"), "{prompt}");
+        assert!(
+            prompt.contains("Backend access mode is read-only"),
+            "{prompt}"
+        );
         assert!(prompt.contains("Review changes"), "{prompt}");
         assert!(!prompt.contains("PRIVATE_SKILL_BODY"), "{prompt}");
     }
@@ -7290,9 +7269,18 @@ for line in sys.stdin:
             ..ResolvedSpawnConfig::default()
         };
 
-        assert!(session_is_resumable_for_workspace_roots(&remote_roots, &plain));
-        assert!(!session_is_resumable_for_workspace_roots(&remote_roots, &protected));
-        assert!(session_is_resumable_for_workspace_roots(&local_roots, &protected));
+        assert!(session_is_resumable_for_workspace_roots(
+            &remote_roots,
+            &plain
+        ));
+        assert!(!session_is_resumable_for_workspace_roots(
+            &remote_roots,
+            &protected
+        ));
+        assert!(session_is_resumable_for_workspace_roots(
+            &local_roots,
+            &protected
+        ));
     }
 
     #[test]
@@ -8183,10 +8171,11 @@ for line in sys.stdin:
         let mut mapper = HermesEventMapper::default();
         let _ = mapper.map_event("message.start", None);
         let cancel_events = mapper.cancel_events("cancelled");
-        assert!(cancel_events.iter().any(|event| matches!(
-            event,
-            ChatEvent::TypingStatusChanged(false)
-        )));
+        assert!(
+            cancel_events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::TypingStatusChanged(false)))
+        );
 
         let events = mapper.map_event(
             "status.update",
@@ -8234,10 +8223,11 @@ for line in sys.stdin:
                 .iter()
                 .any(|event| matches!(event, ChatEvent::ToolRequest(_)))
         );
-        assert!(events.iter().all(|event| !matches!(
-            event,
-            ChatEvent::TypingStatusChanged(false)
-        )));
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, ChatEvent::TypingStatusChanged(false)))
+        );
     }
 
     #[test]
@@ -8281,16 +8271,14 @@ for line in sys.stdin:
             Some(json!({ "tool_id": "tool-1", "name": "terminal" })),
         );
         let failure = "No allowed providers are available";
-        let events = mapper.map_event(
-            "error",
-            Some(json!({ "message": failure })),
-        );
+        let events = mapper.map_event("error", Some(json!({ "message": failure })));
 
         assert!(mapper.current_message_id.is_none());
-        assert!(events.iter().any(|event| matches!(
-            event,
-            ChatEvent::StreamEnd(_)
-        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::StreamEnd(_)))
+        );
         assert!(events.iter().any(|event| matches!(
             event,
             ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
@@ -8313,14 +8301,16 @@ for line in sys.stdin:
                 .count(),
             1
         );
-        assert!(events.iter().any(|event| matches!(
-            event,
-            ChatEvent::TypingStatusChanged(false)
-        )));
-        assert!(events.iter().all(|event| !matches!(
-            event,
-            ChatEvent::RetryAttempt(_)
-        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::TypingStatusChanged(false)))
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, ChatEvent::RetryAttempt(_)))
+        );
     }
 
     #[test]

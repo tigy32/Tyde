@@ -663,9 +663,7 @@ pub(crate) fn validate_runtime_session_settings_update(
 ) -> Result<(), String> {
     match backend_kind {
         BackendKind::Tycode => tycode::validate_runtime_session_settings_update(update),
-        BackendKind::Hermes => {
-            hermes::validate_runtime_session_settings_update(current, update)
-        }
+        BackendKind::Hermes => hermes::validate_runtime_session_settings_update(current, update),
         BackendKind::Kiro | BackendKind::Claude | BackendKind::Codex | BackendKind::Antigravity => {
             Ok(())
         }
