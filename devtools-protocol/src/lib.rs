@@ -632,9 +632,7 @@ struct ResolvedLauncher {
 }
 
 #[cfg(feature = "launcher")]
-fn resolved_launcher_evidence(
-    resolved: Option<ResolvedLauncher>,
-) -> RuntimeProgramEvidence {
+fn resolved_launcher_evidence(resolved: Option<ResolvedLauncher>) -> RuntimeProgramEvidence {
     let Some(resolved) = resolved else {
         return RuntimeProgramEvidence::default();
     };
