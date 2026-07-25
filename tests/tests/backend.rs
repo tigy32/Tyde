@@ -1297,6 +1297,756 @@ async fn fake_codex_provider_items_keep_identity_live_late_and_same_host_reconne
     assert!(child_replay.unexpected_post_cancel_events.is_empty());
 }
 
+/// Byte-for-byte copy of the private `CODEX_SUPERSESSION_WARNING` in
+/// `server/src/backend/codex.rs`. The constant is not exported, so the user-visible
+/// recovery string is pinned here by value: changing the adapter's wording must
+/// consciously update this expectation rather than silently drop the guarantee.
+const CODEX_SUPERSESSION_WARNING_TEXT: &str = "Codex restarted part of its response mid-turn. \
+The partial output above was kept and the turn continued.";
+
+/// Deterministic fake Codex app-server for provider-item lifecycle scenarios.
+///
+/// Deliberately a sibling of `CodexIdentityFake` rather than an extension of it: that
+/// fixture's adversarial child assertions (`identity_errors == 1`) must keep failing
+/// closed, and appending turns to its script would force that test to drive extra
+/// sends. Both fakes are local Python stdio programs — no API calls, no cost, and not
+/// gated by `TYDE_RUN_REAL_AI_TESTS`.
+struct CodexLifecycleFake {
+    _dir: tempfile::TempDir,
+    binary: PathBuf,
+}
+
+impl CodexLifecycleFake {
+    fn new(scenario: &str) -> Self {
+        let dir = tempfile::tempdir().expect("create Codex lifecycle fake tempdir");
+        let binary = dir.path().join("codex-lifecycle-app-server.py");
+        let program = r#"#!/usr/bin/env python3
+import json
+import sys
+
+SCENARIO = "__SCENARIO__"
+THREAD = "lifecycle-thread"
+
+def send(value):
+    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+def note(method, params):
+    send({"jsonrpc":"2.0","method":method,"params":params})
+
+def turn_started(turn_id):
+    note("turn/started", {"threadId":THREAD,"turn":{"id":turn_id}})
+
+def turn_completed(turn_id):
+    note("turn/completed", {"threadId":THREAD,"turn":{"id":turn_id,"status":"completed"}})
+
+def item_started(item_id, item_kind):
+    note("item/started", {"threadId":THREAD,"item":{"id":item_id,"type":item_kind}})
+
+def item_delta(item_id, item_kind, text):
+    if item_kind == "agentMessage":
+        method = "item/agentMessage/delta"
+    else:
+        method = "item/reasoning/delta"
+    note(method, {"threadId":THREAD,"itemId":item_id,"delta":text})
+
+def item_completed(item_id, item_kind, text):
+    body = {"id":item_id,"type":item_kind}
+    if item_kind == "agentMessage":
+        body["text"] = text
+    else:
+        body["summary"] = text
+    note("item/completed", {"threadId":THREAD,"item":body})
+
+def command(item_id):
+    note("item/started", {"threadId":THREAD,"item":{"id":item_id,"type":"commandExecution","command":"pwd","cwd":"/tmp"}})
+    note("item/completed", {"threadId":THREAD,"item":{"id":item_id,"type":"commandExecution","exitCode":0,"aggregatedOutput":"/tmp"}})
+
+def publish_then_roll_over(first_id, first_kind, second_id, second_kind):
+    # A publishes real content and the provider then abandons it without ever
+    # sending item/completed(A) -- the captured production shape.
+    item_started(first_id, first_kind)
+    item_delta(first_id, first_kind, "accepted " + first_id)
+    item_started(second_id, second_kind)
+    item_delta(second_id, second_kind, "continued " + second_id)
+    item_completed(second_id, second_kind, "continued " + second_id)
+
+def rollover_turn(turn_id, first_id, first_kind, second_id, second_kind):
+    turn_started(turn_id)
+    publish_then_roll_over(first_id, first_kind, second_id, second_kind)
+    turn_completed(turn_id)
+
+def supersession_turn(turn_count):
+    if turn_count == 1:
+        # Production ordering: the command completes BEFORE the abandoned item
+        # starts, matching the rollout. Never place a tool between A and B.
+        turn_started("rollover-turn-one")
+        command("tool-before-rollover")
+        publish_then_roll_over("reason-a", "reasoning", "reason-b", "reasoning")
+        command("tool-after-rollover")
+        item_started("final-answer", "agentMessage")
+        item_delta("final-answer", "agentMessage", "turn survived")
+        item_completed("final-answer", "agentMessage", "turn survived")
+        turn_completed("rollover-turn-one")
+    elif turn_count == 2:
+        rollover_turn("rollover-turn-two", "agent-a", "agentMessage", "agent-b", "agentMessage")
+    elif turn_count == 3:
+        rollover_turn("rollover-turn-three", "reason-c", "reasoning", "agent-c", "agentMessage")
+    else:
+        rollover_turn("rollover-turn-four", "agent-d", "agentMessage", "reason-d", "reasoning")
+
+def termination_turn(turn_count):
+    if turn_count == 1:
+        turn_started("termination-turn-one")
+        item_started("open-item", "agentMessage")
+        item_delta("open-item", "agentMessage", "partial work")
+        # A foreign completion while open-item is still live. The turn must end
+        # visibly and finitely; the provider deliberately never sends
+        # turn/completed for it, so local state cannot depend on that arriving.
+        item_completed("foreign-item", "agentMessage", "must not be attributed")
+    else:
+        turn_started("termination-turn-two")
+        item_started("recovered-item", "agentMessage")
+        item_delta("recovered-item", "agentMessage", "next turn works")
+        item_completed("recovered-item", "agentMessage", "next turn works")
+        turn_completed("termination-turn-two")
+
+turn_count = 0
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    request_id = request.get("id")
+    method = request.get("method")
+    params = request.get("params", {})
+    if method == "initialize":
+        send({"jsonrpc":"2.0","id":request_id,"result":{"userAgent":"fake-codex/lifecycle","codexHome":"/tmp/fake-codex-home","platformFamily":"unix","platformOs":"test"}})
+    elif method == "model/list":
+        send({"jsonrpc":"2.0","id":request_id,"result":{"data":[{"model":"fake-codex-model","isDefault":True,"supportedReasoningEfforts":[{"reasoningEffort":"high"}]}]}})
+    elif method == "thread/start":
+        send({"jsonrpc":"2.0","id":request_id,"result":{"thread":{"id":THREAD,"sessionId":THREAD,"turns":[]},"model":"fake-codex-model"}})
+    elif method == "turn/start":
+        turn_count += 1
+        if SCENARIO == "supersession":
+            supersession_turn(turn_count)
+        else:
+            termination_turn(turn_count)
+        send({"jsonrpc":"2.0","id":request_id,"result":{"turn":{"id":"lifecycle-turn"}}})
+    elif method == "turn/interrupt":
+        send({"jsonrpc":"2.0","id":request_id,"result":{}})
+    elif method == "thread/settings/update":
+        send({"jsonrpc":"2.0","id":request_id,"result":{}})
+"#
+        .replace("__SCENARIO__", scenario);
+        std::fs::write(&binary, program).expect("write Codex lifecycle fake");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&binary)
+                .expect("Codex lifecycle fake metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&binary, permissions).expect("chmod Codex lifecycle fake");
+        }
+        Self { _dir: dir, binary }
+    }
+}
+
+/// Ordered projection of the client-visible event stream.
+///
+/// `CodexIdentityObservation` keeps one vector per event kind, which cannot express
+/// ordering *between* kinds — and `End(A) -> Warning -> Start(B)` is exactly a
+/// cross-kind ordering contract. This type records a single ordered log instead, and
+/// captures stream-end reasoning, which a superseded reasoning item carries in place
+/// of content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexLifecycleEvent {
+    StreamStart(String),
+    StreamDelta(String),
+    StreamReasoningDelta(String),
+    StreamEnd(String),
+    Warning(String),
+    Error(String),
+    ToolRequest(String),
+    ToolCompleted(String),
+    Cancelled,
+    Typing(bool),
+}
+
+#[derive(Debug, Default)]
+struct CodexLifecycleObservation {
+    ordered: Vec<CodexLifecycleEvent>,
+    stream_end_content: HashMap<String, String>,
+    stream_end_reasoning: HashMap<String, Option<String>>,
+}
+
+impl CodexLifecycleObservation {
+    fn observe(&mut self, event: ChatEvent) {
+        let observed = match event {
+            ChatEvent::StreamStart(start) => {
+                let id = start.message_id.expect("StreamStart needs identity");
+                Some(CodexLifecycleEvent::StreamStart(id))
+            }
+            ChatEvent::StreamDelta(delta) => {
+                let id = delta.message_id.expect("StreamDelta needs identity");
+                Some(CodexLifecycleEvent::StreamDelta(id))
+            }
+            ChatEvent::StreamReasoningDelta(delta) => {
+                let id = delta.message_id.expect("ReasoningDelta needs identity");
+                Some(CodexLifecycleEvent::StreamReasoningDelta(id))
+            }
+            ChatEvent::StreamEnd(end) => {
+                let message = end.message;
+                let id = message.message_id.expect("StreamEnd needs identity").0;
+                self.stream_end_content.insert(id.clone(), message.content);
+                let reasoning = message.reasoning.map(|reasoning| reasoning.text);
+                self.stream_end_reasoning.insert(id.clone(), reasoning);
+                Some(CodexLifecycleEvent::StreamEnd(id))
+            }
+            ChatEvent::MessageAdded(message) => match message.sender {
+                MessageSender::Warning => Some(CodexLifecycleEvent::Warning(message.content)),
+                MessageSender::Error => Some(CodexLifecycleEvent::Error(message.content)),
+                _ => None,
+            },
+            ChatEvent::ToolRequest(request) => {
+                Some(CodexLifecycleEvent::ToolRequest(request.tool_call_id))
+            }
+            ChatEvent::ToolExecutionCompleted(done) => {
+                Some(CodexLifecycleEvent::ToolCompleted(done.tool_call_id))
+            }
+            ChatEvent::OperationCancelled(_) => Some(CodexLifecycleEvent::Cancelled),
+            ChatEvent::TypingStatusChanged(active) => Some(CodexLifecycleEvent::Typing(active)),
+            _ => None,
+        };
+        if let Some(observed) = observed {
+            self.ordered.push(observed);
+        }
+    }
+
+    fn observe_bootstrap(&mut self, bootstrap: AgentBootstrapPayload) {
+        for event in bootstrap.events {
+            if let AgentBootstrapEvent::ChatEvent(event) = event {
+                self.observe(event);
+            }
+        }
+    }
+
+    fn position(&self, expected: &CodexLifecycleEvent) -> usize {
+        self.ordered
+            .iter()
+            .position(|event| event == expected)
+            .unwrap_or_else(|| panic!("missing {expected:?} in observed order: {:?}", self.ordered))
+    }
+
+    fn count(&self, mut predicate: impl FnMut(&CodexLifecycleEvent) -> bool) -> usize {
+        self.ordered.iter().filter(|event| predicate(event)).count()
+    }
+
+    /// Stream ids that were opened but never terminalized.
+    fn unterminated_streams(&self) -> Vec<&str> {
+        self.ordered
+            .iter()
+            .filter_map(|event| match event {
+                CodexLifecycleEvent::StreamStart(id) => Some(id.as_str()),
+                _ => None,
+            })
+            .filter(|id| !self.stream_end_content.contains_key(*id))
+            .collect()
+    }
+
+    fn warnings(&self) -> Vec<&str> {
+        self.ordered
+            .iter()
+            .filter_map(|event| match event {
+                CodexLifecycleEvent::Warning(content) => Some(content.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The recovery contract: A is terminalized at its own id, the user is told once
+    /// in plain language, B then opens — and none of it looks like a failed turn.
+    fn assert_recovered_rollover(
+        &self,
+        superseded_id: &str,
+        replacement_id: &str,
+        accepted: &str,
+        superseded_is_reasoning: bool,
+        context: &str,
+    ) {
+        let end_a = CodexLifecycleEvent::StreamEnd(superseded_id.to_owned());
+        let warning_text = CODEX_SUPERSESSION_WARNING_TEXT.to_owned();
+        let start_b = CodexLifecycleEvent::StreamStart(replacement_id.to_owned());
+        let superseded_end = self.position(&end_a);
+        let warning = self.position(&CodexLifecycleEvent::Warning(warning_text));
+        let replacement_start = self.position(&start_b);
+        assert!(
+            superseded_end < warning && warning < replacement_start,
+            "{context} must observe End(A) -> Warning -> Start(B): {:?}",
+            self.ordered
+        );
+        assert_eq!(
+            self.warnings(),
+            vec![CODEX_SUPERSESSION_WARNING_TEXT],
+            "{context} must surface exactly one recovery warning, verbatim"
+        );
+        if superseded_is_reasoning {
+            assert_eq!(
+                self.stream_end_reasoning.get(superseded_id),
+                Some(&Some(accepted.to_owned())),
+                "{context} must preserve the superseded item's accepted reasoning"
+            );
+            assert_eq!(
+                self.stream_end_content.get(superseded_id),
+                Some(&String::new()),
+                "{context} reasoning terminal carries no assistant content"
+            );
+        } else {
+            assert_eq!(
+                self.stream_end_content.get(superseded_id),
+                Some(&accepted.to_owned()),
+                "{context} must preserve the superseded item's accepted text"
+            );
+        }
+        assert_eq!(
+            self.count(|event| matches!(event, CodexLifecycleEvent::Error(_))),
+            0,
+            "{context} recovery must not report an error: {:?}",
+            self.ordered
+        );
+        assert_eq!(
+            self.count(|event| matches!(event, CodexLifecycleEvent::Cancelled)),
+            0,
+            "{context} recovery must not cancel the turn: {:?}",
+            self.ordered
+        );
+        // The driver stops at the first idle, so an idle emitted mid-recovery would
+        // already have surfaced as a missing End(A)/Start(B) above. This pins the
+        // remaining case: idle must land after the replacement stream is open.
+        let idle = self.position(&CodexLifecycleEvent::Typing(false));
+        assert!(
+            idle > replacement_start,
+            "{context} must not go idle mid-recovery: {:?}",
+            self.ordered
+        );
+    }
+}
+
+async fn drive_codex_agent_to_idle(
+    fixture: &mut Fixture,
+    stream: &StreamPath,
+    observation: &mut CodexLifecycleObservation,
+    context: &str,
+) {
+    loop {
+        let env = expect_fixture_event(&mut fixture.client, context).await;
+        if env.kind == FrameKind::CommandError {
+            let error: CommandErrorPayload = env.parse_payload().expect("parse CommandError");
+            panic!("command error during {context}: {error:?}");
+        }
+        if env.stream != *stream {
+            continue;
+        }
+        let reached_idle = match env.kind {
+            FrameKind::AgentBootstrap => {
+                let bootstrap: AgentBootstrapPayload =
+                    env.parse_payload().expect("parse AgentBootstrap");
+                let mut reached_idle = false;
+                for event in bootstrap.events {
+                    if let AgentBootstrapEvent::ChatEvent(event) = event {
+                        reached_idle = matches!(&event, ChatEvent::TypingStatusChanged(false));
+                        observation.observe(event);
+                        if reached_idle {
+                            break;
+                        }
+                    }
+                }
+                reached_idle
+            }
+            FrameKind::ChatEvent => {
+                let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+                let reached_idle = matches!(&event, ChatEvent::TypingStatusChanged(false));
+                observation.observe(event);
+                reached_idle
+            }
+            _ => false,
+        };
+        if reached_idle {
+            return;
+        }
+    }
+}
+
+async fn spawn_fake_codex_lifecycle_agent(
+    fixture: &mut Fixture,
+    workspace: &Path,
+    name: &str,
+) -> NewAgentPayload {
+    let mut session_settings = SessionSettingsValues::default();
+    session_settings.0.insert(
+        "model".to_owned(),
+        SessionSettingValue::String("fake-codex-model".to_owned()),
+    );
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some(name.to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec![workspace.to_string_lossy().into_owned()],
+                prompt: "drive the first provider turn".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Codex,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: Some(session_settings),
+            },
+        })
+        .await
+        .expect("spawn fake Codex lifecycle agent");
+
+    loop {
+        let env = expect_fixture_event(&mut fixture.client, "fake Codex lifecycle NewAgent").await;
+        if env.kind == FrameKind::CommandError {
+            let error: CommandErrorPayload = env.parse_payload().expect("parse CommandError");
+            panic!("fake Codex lifecycle spawn failed: {error:?}");
+        }
+        if env.kind == FrameKind::NewAgent {
+            let agent: NewAgentPayload = env.parse_payload().expect("parse NewAgent");
+            if agent.backend_kind == BackendKind::Codex {
+                return agent;
+            }
+        }
+    }
+}
+
+/// Regression guard for the captured incident: a provider-owned item that publishes
+/// real output and is then abandoned mid-turn without `item/completed` must be
+/// terminalized and superseded rather than destroying the turn.
+///
+/// The incident lost an applied patch, a commit, and the final answer because the
+/// adapter rejected the replacement item. The load-bearing assertion here is not the
+/// warning ordering — it is that the tool call *after* the rollover and the final
+/// assistant message still reach the client, live and on replay.
+#[tokio::test]
+async fn fake_codex_provider_item_supersession_recovers_live_and_on_replay() {
+    init_tracing();
+
+    let fake = CodexLifecycleFake::new("supersession");
+    let _fake_guard = server::backend::codex::install_test_app_server_binary(fake.binary.clone());
+    let workspace = tempfile::tempdir().expect("create Codex supersession workspace");
+    std::fs::write(
+        workspace.path().join("README.txt"),
+        "Codex supersession test workspace",
+    )
+    .expect("seed Codex supersession workspace");
+    let mut fixture = Fixture::new_with_real_codex_backend_and_probe_program(
+        fake.binary.to_string_lossy().into_owned(),
+    )
+    .await;
+    let agent =
+        spawn_fake_codex_lifecycle_agent(&mut fixture, workspace.path(), "Codex supersession")
+            .await;
+
+    // Turn one: the production shape -- tool, published reasoning A abandoned without
+    // completion, reasoning B, then a further tool and the real answer.
+    let mut first_turn = CodexLifecycleObservation::default();
+    drive_codex_agent_to_idle(
+        &mut fixture,
+        &agent.instance_stream,
+        &mut first_turn,
+        "fake Codex reasoning rollover turn",
+    )
+    .await;
+    first_turn.assert_recovered_rollover(
+        "reason-a",
+        "reason-b",
+        "accepted reason-a",
+        true,
+        "reasoning rollover",
+    );
+    for tool_call_id in ["tool-before-rollover", "tool-after-rollover"] {
+        let completed = CodexLifecycleEvent::ToolCompleted(tool_call_id.to_owned());
+        assert!(
+            first_turn.ordered.contains(&completed),
+            "the turn must keep reporting {tool_call_id}: {:?}",
+            first_turn.ordered
+        );
+    }
+    assert_eq!(
+        first_turn.stream_end_content.get("final-answer"),
+        Some(&"turn survived".to_owned()),
+        "the answer the provider produced after the rollover must reach the client"
+    );
+    assert_eq!(
+        first_turn.stream_end_reasoning.get("reason-b"),
+        Some(&Some("continued reason-b".to_owned())),
+        "the replacement item must complete normally"
+    );
+    let end_a = CodexLifecycleEvent::StreamEnd("reason-a".to_owned());
+    let tool_after = CodexLifecycleEvent::ToolCompleted("tool-after-rollover".to_owned());
+    let end_final = CodexLifecycleEvent::StreamEnd("final-answer".to_owned());
+    let rollover_end = first_turn.position(&end_a);
+    let later_tool = first_turn.position(&tool_after);
+    let final_end = first_turn.position(&end_final);
+    assert!(
+        rollover_end < later_tool && later_tool < final_end,
+        "the remainder of the turn must follow the recovery in order: {:?}",
+        first_turn.ordered
+    );
+
+    // A client attaching afterwards must see the same recovered history, in the same
+    // order, with no stream left open. This is asserted here, while the recovered turn
+    // is still the whole history: `INITIAL_HISTORY_TAIL_LIMIT` bounds bootstrap replay
+    // to the last 15 terminal messages, so deferring it until after the kind-pair
+    // turns below would silently drop this turn out of the tail.
+    let (_replay_client, replayed_agent, bootstrap) =
+        connect_and_replay_agent(&fixture, &agent.agent_id, "Codex supersession replay").await;
+    assert_ne!(replayed_agent.instance_stream, agent.instance_stream);
+    let replay_turn_active = bootstrap.turn_active;
+    let mut replay = CodexLifecycleObservation::default();
+    replay.observe_bootstrap(bootstrap);
+    assert!(
+        !replay_turn_active,
+        "a fully recovered turn must not replay as still active"
+    );
+    assert_eq!(
+        replay.count(|event| matches!(event, CodexLifecycleEvent::Error(_))),
+        0,
+        "replayed supersession history must contain no error: {:?}",
+        replay.ordered
+    );
+    assert_eq!(
+        replay.count(|event| matches!(event, CodexLifecycleEvent::Cancelled)),
+        0,
+        "replayed supersession history must contain no cancellation: {:?}",
+        replay.ordered
+    );
+    assert_eq!(
+        replay.warnings(),
+        vec![CODEX_SUPERSESSION_WARNING_TEXT],
+        "replay must retain the recovery warning verbatim, exactly once"
+    );
+    let replay_end_a = replay.position(&end_a);
+    let replay_warning = replay.position(&CodexLifecycleEvent::Warning(
+        CODEX_SUPERSESSION_WARNING_TEXT.to_owned(),
+    ));
+    let replay_end_b = replay.position(&CodexLifecycleEvent::StreamEnd("reason-b".to_owned()));
+    let replay_final = replay.position(&end_final);
+    assert!(
+        replay_end_a < replay_warning && replay_warning < replay_end_b,
+        "replay must preserve the recovery order: {:?}",
+        replay.ordered
+    );
+    assert!(
+        replay_end_b < replay_final,
+        "replay must keep the post-rollover answer last: {:?}",
+        replay.ordered
+    );
+    assert_eq!(
+        replay.stream_end_reasoning.get("reason-a"),
+        Some(&Some("accepted reason-a".to_owned())),
+        "replay must retain the superseded item's accepted reasoning"
+    );
+    assert_eq!(
+        replay.stream_end_content.get("final-answer"),
+        Some(&"turn survived".to_owned()),
+        "replay must retain the post-rollover answer"
+    );
+    let unterminated = replay.unterminated_streams();
+    assert!(
+        unterminated.is_empty(),
+        "replay must leave no stream open, found {unterminated:?}: {:?}",
+        replay.ordered
+    );
+
+    // Remaining provider-owned kind pairs. Each rollover gets its own turn because
+    // recovery allowance and the warning latch both reset only on turn/started.
+    let kind_pairs = [
+        ("agent-a", "agent-b", false, false, "agentMessage rollover"),
+        (
+            "reason-c",
+            "agent-c",
+            true,
+            false,
+            "reasoning to agentMessage rollover",
+        ),
+        (
+            "agent-d",
+            "reason-d",
+            false,
+            true,
+            "agentMessage to reasoning rollover",
+        ),
+    ];
+    for (first_id, second_id, first_is_reasoning, second_is_reasoning, context) in kind_pairs {
+        fixture
+            .client
+            .send_message(&agent.instance_stream, format!("drive {context}"))
+            .await
+            .unwrap_or_else(|error| panic!("queue follow-up for {context}: {error:?}"));
+        let mut turn = CodexLifecycleObservation::default();
+        let stream = &agent.instance_stream;
+        drive_codex_agent_to_idle(&mut fixture, stream, &mut turn, context).await;
+        turn.assert_recovered_rollover(
+            first_id,
+            second_id,
+            &format!("accepted {first_id}"),
+            first_is_reasoning,
+            context,
+        );
+        let continued = format!("continued {second_id}");
+        if second_is_reasoning {
+            assert_eq!(
+                turn.stream_end_reasoning.get(second_id),
+                Some(&Some(continued)),
+                "{context} replacement must complete normally"
+            );
+        } else {
+            assert_eq!(
+                turn.stream_end_content.get(second_id),
+                Some(&continued),
+                "{context} replacement must complete normally"
+            );
+        }
+    }
+}
+
+/// The second half of the incident: when a conflict is genuinely unrecoverable the
+/// turn must end *visibly and finitely*, without waiting on the provider.
+///
+/// The fake deliberately never sends `turn/completed` for the terminated turn, so a
+/// bound that depended on it would hang here.
+///
+/// Scoped to what only an integration test can show: that the preserved content and
+/// the single terminal tail reach a real client through the agent layer, and that a
+/// follow-up message is still delivered afterwards. Interrupt dispatch itself is
+/// pinned inline by `strict_termination_interrupts_once_without_waiting`, so it is
+/// deliberately not re-asserted here.
+#[tokio::test]
+async fn fake_codex_identity_termination_is_finite_and_visible_to_clients() {
+    init_tracing();
+
+    let fake = CodexLifecycleFake::new("termination");
+    let _fake_guard = server::backend::codex::install_test_app_server_binary(fake.binary.clone());
+    let workspace = tempfile::tempdir().expect("create Codex termination workspace");
+    std::fs::write(
+        workspace.path().join("README.txt"),
+        "Codex termination test workspace",
+    )
+    .expect("seed Codex termination workspace");
+    let mut fixture = Fixture::new_with_real_codex_backend_and_probe_program(
+        fake.binary.to_string_lossy().into_owned(),
+    )
+    .await;
+    let agent =
+        spawn_fake_codex_lifecycle_agent(&mut fixture, workspace.path(), "Codex termination").await;
+
+    let mut terminated = CodexLifecycleObservation::default();
+    drive_codex_agent_to_idle(
+        &mut fixture,
+        &agent.instance_stream,
+        &mut terminated,
+        "fake Codex identity termination turn",
+    )
+    .await;
+
+    let end_open = CodexLifecycleEvent::StreamEnd("open-item".to_owned());
+    let accepted_end = terminated.position(&end_open);
+    let error = terminated
+        .ordered
+        .iter()
+        .position(|event| matches!(event, CodexLifecycleEvent::Error(_)))
+        .unwrap_or_else(|| {
+            panic!(
+                "termination must be visible to the user: {:?}",
+                terminated.ordered
+            )
+        });
+    let cancelled = terminated.position(&CodexLifecycleEvent::Cancelled);
+    let idle = terminated.position(&CodexLifecycleEvent::Typing(false));
+    assert!(
+        accepted_end < error && error < cancelled && cancelled < idle,
+        "accepted content must be terminalized before the single terminal tail: {:?}",
+        terminated.ordered
+    );
+    assert_eq!(
+        terminated.stream_end_content.get("open-item"),
+        Some(&"partial work".to_owned()),
+        "termination must preserve the accepted bytes rather than dropping them"
+    );
+    assert_eq!(
+        terminated.count(|event| matches!(event, CodexLifecycleEvent::Error(_))),
+        1,
+        "termination must report exactly one error: {:?}",
+        terminated.ordered
+    );
+    assert_eq!(
+        terminated.count(|event| matches!(event, CodexLifecycleEvent::Cancelled)),
+        1,
+        "termination must cancel exactly once: {:?}",
+        terminated.ordered
+    );
+    assert!(
+        terminated.warnings().is_empty(),
+        "an unrecoverable conflict is not a recovery: {:?}",
+        terminated.ordered
+    );
+    assert!(
+        terminated
+            .stream_end_content
+            .keys()
+            .all(|message_id| message_id != "foreign-item"),
+        "the foreign item must never be attributed to a stream: {:?}",
+        terminated.ordered
+    );
+
+    // Finiteness: the terminated turn never received turn/completed, yet the session
+    // must still accept a new turn and render it in full. This also exercises the
+    // message-delivery contract -- a follow-up after termination must be delivered,
+    // not rejected or silently dropped.
+    fixture
+        .client
+        .send_message(&agent.instance_stream, "drive the next turn".to_owned())
+        .await
+        .expect("queue follow-up after terminated Codex turn");
+    let mut recovered = CodexLifecycleObservation::default();
+    drive_codex_agent_to_idle(
+        &mut fixture,
+        &agent.instance_stream,
+        &mut recovered,
+        "fake Codex turn after termination",
+    )
+    .await;
+    assert_eq!(
+        recovered.stream_end_content.get("recovered-item"),
+        Some(&"next turn works".to_owned()),
+        "a terminated turn must not poison the next one: {:?}",
+        recovered.ordered
+    );
+    assert_eq!(
+        recovered.count(|event| matches!(event, CodexLifecycleEvent::Error(_))),
+        0,
+        "the next turn must not inherit the terminated turn's error: {:?}",
+        recovered.ordered
+    );
+    assert_eq!(
+        recovered.count(|event| matches!(event, CodexLifecycleEvent::Cancelled)),
+        0,
+        "the next turn must not inherit the terminated turn's cancellation: {:?}",
+        recovered.ordered
+    );
+    let unterminated = recovered.unterminated_streams();
+    assert!(
+        unterminated.is_empty(),
+        "the recovering turn must leave no stream open, found {unterminated:?}"
+    );
+}
+
 #[tokio::test]
 async fn startup_mcp_servers_follow_debug_host_setting_for_new_agents() {
     init_tracing();
