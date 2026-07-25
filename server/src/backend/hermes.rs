@@ -2185,7 +2185,7 @@ fn summarize_hermes_toolsets(toolsets: Option<&Vec<Value>>) -> String {
 }
 
 async fn run_gateway_actor(
-    mut stdin: tokio::process::ChildStdin,
+    stdin: tokio::process::ChildStdin,
     mut command_rx: mpsc::UnboundedReceiver<HermesGatewayCommand>,
     mut inbound_rx: mpsc::UnboundedReceiver<HermesGatewayInbound>,
     event_tx: mpsc::UnboundedSender<HermesGatewayEvent>,
@@ -2197,6 +2197,7 @@ async fn run_gateway_actor(
     let mut pending: HashMap<u64, oneshot::Sender<Result<Value, String>>> = HashMap::new();
     let mut startup_stderr = VecDeque::new();
     let mut shutdown_reply = None;
+    let mut stdin = Some(stdin);
 
     loop {
         tokio::select! {
@@ -2219,6 +2220,12 @@ async fn run_gateway_actor(
                             "params": params,
                         });
                         let line = format!("{}\n", frame);
+                        let Some(stdin) = stdin.as_mut() else {
+                            let _ = reply.send(Err(
+                                "Hermes gateway is shutting down".to_string()
+                            ));
+                            continue;
+                        };
                         match stdin.write_all(line.as_bytes()).await {
                             Ok(()) => match stdin.flush().await {
                                 Ok(()) => {
@@ -2236,7 +2243,9 @@ async fn run_gateway_actor(
                     HermesGatewayCommand::Shutdown(reply) => {
                         if shutdown_reply.is_none() {
                             shutdown_reply = Some(reply);
-                            let _ = stdin.shutdown().await;
+                            // On Unix, ChildStdin's AsyncWrite shutdown does not
+                            // close the process pipe; dropping it delivers EOF.
+                            drop(stdin.take());
                             let force_shutdown_tx = force_shutdown_tx.clone();
                             tokio::spawn(async move {
                                 tokio::time::sleep(HERMES_SHUTDOWN_GRACE).await;

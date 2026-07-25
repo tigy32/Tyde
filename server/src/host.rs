@@ -21892,6 +21892,27 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .await
             .expect("agent session id");
         wait_for_agent_idle(host, &agent_id).await;
+        if prompt.contains(crate::backend::mock::MOCK_USER_BUBBLES_SENTINEL) {
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    let observation = host
+                        .activity_summary_observation(&agent_id)
+                        .await
+                        .expect("agent observation");
+                    let context = observation
+                        .handle
+                        .read_supervision_context()
+                        .await
+                        .expect("supervision context");
+                    if context.last_user_message.is_some() {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("mock user bubble must reach supervision context");
+        }
         (agent_id, session_id)
     }
 
