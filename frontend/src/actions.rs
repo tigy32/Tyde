@@ -244,6 +244,34 @@ pub fn resolve_backend(state: &AppState, host_id: &str) -> Option<BackendKind> {
     })
 }
 
+/// Discard a draft selection bound to a host other than the spawn target.
+///
+/// Returns whether anything was discarded.
+///
+/// Extracted from `spawn_new_chat` so the binding rule is reachable without the
+/// browser send path: the spawn itself ends in `spawn_local`, which panics off
+/// wasm, so an end-to-end native test cannot get far enough to observe this.
+/// The rule is the security-relevant half — a profile id is meaningless in
+/// another host's catalog, and a backend override can name one the target host
+/// has disabled — so it is tested directly, and the payload it protects is
+/// covered in the browser.
+///
+/// The *whole* draft goes, not just the backend and profile: the custom agent
+/// and the profile-derived session settings were chosen against the same host
+/// and would otherwise be read further down and sent to this one.
+pub(crate) fn discard_foreign_draft_for_spawn(state: &AppState, host_id: &str) -> bool {
+    let draft_host = state.draft_selection_host.get_untracked();
+    if draft_host.as_deref().is_none_or(|bound| bound == host_id) {
+        return false;
+    }
+    log::warn!(
+        "spawn_new_chat: discarding a draft selection bound to {draft_host:?} \
+         for a spawn against {host_id}"
+    );
+    state.clear_draft_selection();
+    true
+}
+
 pub fn spawn_new_chat(
     state: &AppState,
     initial_message: String,
@@ -299,18 +327,7 @@ pub fn spawn_new_chat(
     // backend override or profile id into a spawn against B. A profile id is
     // meaningless in another host's catalog, and an override can name a backend
     // B has disabled.
-    let draft_host = state.draft_selection_host.get_untracked();
-    let draft_matches_target = draft_host.as_deref().is_none_or(|bound| bound == host_id);
-    if !draft_matches_target {
-        log::warn!(
-            "spawn_new_chat: discarding a draft selection bound to {:?} for a spawn against {host_id}",
-            draft_host
-        );
-        // The whole draft goes, not just the backend and profile: the custom
-        // agent and the profile-derived session settings were chosen against
-        // the same host and would otherwise be read below and sent to this one.
-        state.clear_draft_selection();
-    }
+    discard_foreign_draft_for_spawn(state, &host_id);
 
     let backend_kind = match resolve_backend(state, &host_id) {
         Some(kind) => kind,

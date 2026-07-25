@@ -595,20 +595,38 @@ mod tests {
     use crate::state::SessionInfo;
     use protocol::{BackendKind, ProjectId, SessionId, SessionSummary};
 
-    /// The store bumps this counter once per completed assistant turn, never
-    /// for the user's own message, so the badge must not claim to count
-    /// messages. Pins the label to the semantics rather than the other way
-    /// round: if the server ever starts counting user messages too, this test
-    /// should fail and be revisited deliberately.
+    /// The badge must describe the counter it renders, and the counter is not
+    /// "messages" and not "completed turns".
+    ///
+    /// Evidence for both halves: `apply_runtime_session_updates` bumps the
+    /// stored count once per `ChatEvent::StreamEnd` and never for the user's
+    /// own message — so "messages" overcounts nothing and undercounts the
+    /// user's side. And Hermes reaches `finish_stream_events`, which emits a
+    /// `StreamEnd`, on its cancellation and protocol-failure paths too — so a
+    /// cancelled or part-way-failed response is counted, and calling those
+    /// "completed" presents an abandoned answer as a finished one.
+    ///
+    /// This assertion previously read "turns", from before that second point
+    /// was established; the label was corrected in the same change that
+    /// documented it, and the test is corrected here to match. The contract it
+    /// was reaching for is preserved and widened: the label must not overstate
+    /// the counter in *either* direction.
     #[test]
-    fn count_badge_is_labelled_in_turns_not_messages() {
-        assert_eq!(format_turn_count(0), "0 turns");
-        assert_eq!(format_turn_count(1), "1 turn", "singular reads naturally");
-        assert_eq!(format_turn_count(4), "4 turns");
+    fn count_badge_does_not_overstate_the_counter() {
+        assert_eq!(format_turn_count(0), "0 responses");
+        assert_eq!(format_turn_count(1), "1 response", "singular reads naturally");
+        assert_eq!(format_turn_count(4), "4 responses");
         for count in [0_u32, 1, 4] {
+            let label = format_turn_count(count);
             assert!(
-                !format_turn_count(count).contains("msg"),
-                "the badge must not describe assistant turns as messages"
+                !label.contains("msg") && !label.contains("message"),
+                "the counter never counts the user's message, so the badge must \
+                 not call these messages: {label}"
+            );
+            assert!(
+                !label.contains("turn"),
+                "a cancelled or failed stream is counted too, so the badge must \
+                 not claim completed turns: {label}"
             );
         }
     }

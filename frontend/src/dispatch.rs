@@ -6600,46 +6600,25 @@ mod tests {
 
     /// R7701-07: the reactive guard clears a foreign draft on a context change,
     /// but a submit in the same turn can beat it. The binding is therefore
-    /// enforced where the host and the payload are both known.
+    /// enforced synchronously where the host and the payload are both known.
+    ///
+    /// Exercises `discard_foreign_draft_for_spawn` rather than `spawn_new_chat`
+    /// itself: the spawn ends in `spawn_local`, which panics off wasm, so an
+    /// end-to-end native call cannot reach past the send. The rule under test
+    /// runs before that point and is the part that must not regress; the
+    /// payload it protects is asserted in the browser test of the same name.
     #[test]
     fn spawning_after_a_host_switch_cannot_carry_the_old_hosts_selection() {
         let owner = leptos::reactive::owner::Owner::new();
         owner.with(|| {
             let state = AppState::new();
-            state.projects.update(|projects| {
-                projects.push(ProjectInfo {
-                    host_id: "host-b".to_owned(),
-                    project: restore_project("project-b"),
-                });
-            });
-            state.host_streams.update(|streams| {
-                streams.insert("host-b".to_owned(), StreamPath("/host".to_owned()));
-            });
-            // Real settings for host-b: Hermes is not among its enabled
-            // backends, so host-a's override would also bypass that setting.
-            let mut settings = restore_bootstrap(
-                vec![BackendKind::Claude],
-                Default::default(),
-                vec![restore_project("project-b")],
-                Vec::new(),
-            );
-            settings.settings.default_backend = Some(BackendKind::Claude);
-            apply_host_bootstrap(&state, "host-b", settings);
 
-            // A selection bound to host-a, still live in the global signals.
+            // A whole draft bound to host-a: backend, profile, custom agent and
+            // the profile-derived settings.
             state.draft_backend_override.set(Some(BackendKind::Hermes));
             state
                 .draft_launch_profile_id
                 .set(Some(LaunchProfileId("hermes:profile:qa".to_owned())));
-            state.draft_selection_host.set(Some("host-a".to_owned()));
-
-            // Target host-b without letting the reactive guard run.
-            state.active_project.set(Some(ActiveProjectRef {
-                host_id: "host-b".to_owned(),
-                project_id: ProjectId("project-b".to_owned()),
-            }));
-
-            // A whole host-A draft, not just the backend and profile.
             state
                 .draft_custom_agent_id
                 .set(Some(protocol::CustomAgentId("agent-a-custom".to_owned())));
@@ -6650,9 +6629,12 @@ mod tests {
             );
             state.draft_session_settings.set(settings);
             state.draft_session_settings_dirty.set(true);
+            state.draft_selection_host.set(Some("host-a".to_owned()));
 
-            crate::actions::spawn_new_chat(&state, "hello".to_owned(), None, |_| {});
+            // Spawning against host-b, in the same turn, with no yield.
+            let discarded = crate::actions::discard_foreign_draft_for_spawn(&state, "host-b");
 
+            assert!(discarded, "a draft bound to another host must be discarded");
             assert_eq!(
                 state.draft_launch_profile_id.get_untracked(),
                 None,
@@ -6661,7 +6643,7 @@ mod tests {
             assert_eq!(
                 state.draft_backend_override.get_untracked(),
                 None,
-                "nor its backend override, which host-b has disabled"
+                "nor its backend override, which host-b may have disabled"
             );
             assert_eq!(
                 state.draft_custom_agent_id.get_untracked(),
@@ -6676,18 +6658,35 @@ mod tests {
             assert_eq!(
                 state.draft_selection_host.get_untracked(),
                 None,
-                "and its binding must not survive the spawn"
+                "and the binding itself must not survive"
             );
+        });
+    }
 
-            // The queued settings that ride along to the target host must be
-            // empty too — this is the payload the spawn actually carries.
-            let queued_has_host_a_settings = state
-                .pending_settings_values_for_tests()
-                .iter()
-                .any(|values| values.0.contains_key("profile"));
-            assert!(
-                !queued_has_host_a_settings,
-                "host-A settings must not be queued under the host-B spawn"
+    /// The same rule must not fire on the host it was bound to — otherwise the
+    /// guard would discard every legitimate selection.
+    #[test]
+    fn a_draft_bound_to_the_spawn_target_is_left_alone() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            state.draft_backend_override.set(Some(BackendKind::Hermes));
+            state
+                .draft_launch_profile_id
+                .set(Some(LaunchProfileId("hermes:profile:qa".to_owned())));
+            state.draft_selection_host.set(Some("host-a".to_owned()));
+
+            let discarded = crate::actions::discard_foreign_draft_for_spawn(&state, "host-a");
+
+            assert!(!discarded, "a matching binding is not a mismatch");
+            assert_eq!(
+                state.draft_launch_profile_id.get_untracked(),
+                Some(LaunchProfileId("hermes:profile:qa".to_owned())),
+                "the user's own selection for this host must survive"
+            );
+            assert_eq!(
+                state.draft_backend_override.get_untracked(),
+                Some(BackendKind::Hermes)
             );
         });
     }
@@ -10216,6 +10215,91 @@ mod wasm_tests {
         .as_string()
         .unwrap_or_else(|| "[]".to_owned());
         serde_json::from_str(&raw).unwrap_or_default()
+    }
+
+    /// The `spawn_agent` frames captured by the send stub, as raw JSON.
+    fn spawn_agent_payloads() -> Vec<String> {
+        let raw = js_sys::eval(
+            r#"
+            (function() {
+                const out = [];
+                for (const [cmd, args] of (window.__test_send_calls || [])) {
+                    if (cmd !== "send_host_line") continue;
+                    const env = JSON.parse(JSON.parse(args).line);
+                    if (env.kind !== "spawn_agent") continue;
+                    out.push(JSON.stringify(env.payload));
+                }
+                return JSON.stringify(out);
+            })()
+            "#,
+        )
+        .expect("probe spawn_agent frames")
+        .as_string()
+        .unwrap_or_else(|| "[]".to_owned());
+        serde_json::from_str(&raw).unwrap_or_default()
+    }
+
+    /// R7701-07, browser half: the frame that actually goes out after an A→B
+    /// switch must carry none of host A's selection. The native test pins the
+    /// rule; this pins the payload the rule exists to protect.
+    #[wasm_bindgen_test]
+    async fn spawn_after_host_switch_sends_no_foreign_selection() {
+        reset_inbound_state_for_host("host-b");
+        let state = AppState::new();
+        state.host_streams.update(|streams| {
+            streams.insert("host-b".to_owned(), StreamPath("/host".to_owned()));
+        });
+        state.projects.update(|projects| {
+            projects.push(ProjectInfo {
+                host_id: "host-b".to_owned(),
+                project: restore_project("project-b"),
+            });
+        });
+        let mut bootstrap = restore_bootstrap(
+            vec![BackendKind::Claude],
+            Default::default(),
+            vec![restore_project("project-b")],
+            Vec::new(),
+        );
+        bootstrap.settings.default_backend = Some(BackendKind::Claude);
+        apply_host_bootstrap(&state, "host-b", bootstrap);
+
+        // A whole draft bound to host-a, still live at submit time.
+        state.draft_backend_override.set(Some(BackendKind::Hermes));
+        state
+            .draft_launch_profile_id
+            .set(Some(LaunchProfileId("hermes:profile:qa".to_owned())));
+        state
+            .draft_custom_agent_id
+            .set(Some(protocol::CustomAgentId("agent-a-custom".to_owned())));
+        state.draft_selection_host.set(Some("host-a".to_owned()));
+        // Target host-b directly, without letting the reactive guard run.
+        state.active_project.set(Some(ActiveProjectRef {
+            host_id: "host-b".to_owned(),
+            project_id: ProjectId("project-b".to_owned()),
+        }));
+
+        install_send_stub();
+        crate::actions::spawn_new_chat(&state, "hello".to_owned(), None, |_| {});
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let payloads = spawn_agent_payloads();
+        assert_eq!(payloads.len(), 1, "one spawn was requested");
+        let payload = &payloads[0];
+        assert!(
+            !payload.contains("agent-a-custom"),
+            "host-a's custom agent must not reach host-b, got: {payload}"
+        );
+        assert!(
+            !payload.contains("hermes:profile:qa"),
+            "nor its launch profile, meaningless in host-b's catalog, got: {payload}"
+        );
+        assert!(
+            !payload.contains("hermes"),
+            "nor its backend, which host-b has not enabled, got: {payload}"
+        );
     }
 
     /// Count `code_intel_subscribe_file` frames captured by the send stub.
