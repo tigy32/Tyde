@@ -3,7 +3,7 @@ use protocol::MessageSender;
 use wasm_bindgen::JsCast;
 
 use crate::components::tool_card::ToolCardListView;
-use crate::markdown::{render_markdown, top_level_block_boundaries};
+use crate::markdown::render_markdown;
 use crate::state::{ActiveAgentRef, ChatRowHandle, ToolRequestEntry};
 
 /// Render a single chat row from its row-local signal.
@@ -14,15 +14,22 @@ use crate::state::{ActiveAgentRef, ChatRowHandle, ToolRequestEntry};
 /// history replay does not wake every already-mounted row.
 /// One rendered slice of an assistant message.
 ///
-/// A message carries a single content string plus a positionless tool list, so
-/// rendering used to be "all text, then all tools" — which loses the order the
-/// model actually produced when it interleaves prose and tool calls. Each tool
-/// now records the scalar offset in `content` at which it was observed, and
-/// the message is rebuilt as the alternating sequence that implies.
+/// Hermes wraps a whole `run_conversation` loop in one `message.start` /
+/// `message.complete` pair, so several provider responses collapse into a
+/// single `ChatMessage` with one content string and a positionless tool list.
+/// `content_offset` comes from `tool.start`, which is an authoritative
+/// **provider-response boundary**: the text before it and the text after it
+/// were produced by different provider calls.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum MessageSegment {
     Content(String),
-    Tools(Vec<ToolRequestEntry>),
+    Tools {
+        entries: Vec<ToolRequestEntry>,
+        /// True when this group sits at a recorded provider boundary, so it
+        /// closes a phase. False for offsetless tools, which keep the legacy
+        /// tail position and belong to no phase.
+        placed: bool,
+    },
     /// Where attached images belong. Kept as a slot rather than appended by the
     /// renderer so the legacy order — content, images, tools — survives, and so
     /// the position is decided in one testable place instead of falling out of
@@ -30,32 +37,39 @@ pub(crate) enum MessageSegment {
     Images,
 }
 
-/// Rebuild a message as interleaved content, tool and image segments.
+/// Rebuild a message as the sequence of provider responses it actually was.
 ///
-/// - Tools are placed by the `content_offset` recorded on the matching
-///   [`protocol::ToolUseData`], matched by id.
-/// - Offsets are Unicode scalar indices, so they are resolved through
-///   `char_indices` and can never land inside a character.
-/// - `allowed_splits` are byte offsets a split may fall on. For Markdown these
-///   are top-level block boundaries, so every fragment parses exactly as it
-///   does inside the whole document; a tool observed inside a code fence, link
-///   or list is placed before that block rather than tearing it in half. Pass
-///   `None` for content that is not parsed as Markdown, where any scalar
-///   boundary is safe.
-/// - A tool with no offset — legacy data, or a backend that does not record one
-///   — keeps the old layout and is emitted after all content **and after the
-///   images**, which is exactly where it rendered before.
+/// Splitting happens at exactly the recorded offset. It is tempting to snap to
+/// a Markdown block boundary so each fragment is a whole document, but that is
+/// the wrong model: the fragments are *already* whole documents, because each
+/// one is a separate provider response. Snapping would move the tool card away
+/// from the boundary the provider reported, which is the very thing this data
+/// exists to record.
+///
+/// **Cross-phase Markdown deliberately does not resolve.** A link reference,
+/// footnote definition, or code fence opened in one phase and closed in another
+/// spans two different provider responses. Each phase is rendered as its own
+/// document, so such a construct stays literal rather than being silently
+/// joined into a document no provider produced. That is the honest rendering:
+/// the model did not emit one document, and pretending otherwise would invent
+/// structure — and, for assistive technology, invent relationships — that never
+/// existed.
+///
+/// - Tools are matched to offsets by id.
+/// - Offsets are Unicode scalar indices, resolved through `char_indices`, so a
+///   split can never land inside a character.
+/// - A tool with no offset — legacy data, or a backend that records none —
+///   keeps the old layout: after all content **and after the images**, which is
+///   exactly where it rendered before.
 /// - An offset past the end clamps to the end; a tool whose id matches no call
-///   is treated as offsetless. Bad metadata degrades to the legacy layout, it
-///   does not crash the chat.
-/// - Several tools at one placement keep their arrival order, and the sort is
-///   stable, so equal or equal-after-snapping offsets are not a reordering
-///   hazard.
+///   is treated as offsetless. Bad metadata degrades to the legacy layout
+///   rather than crashing the chat.
+/// - Several tools at one offset keep their arrival order, and the sort is
+///   stable, so equal offsets are not a reordering hazard.
 pub(crate) fn interleave_message(
     content: &str,
     tool_calls: &[protocol::ToolUseData],
     tools: Vec<ToolRequestEntry>,
-    allowed_splits: Option<&[usize]>,
     has_images: bool,
 ) -> Vec<MessageSegment> {
     // Scalar index -> byte index. Everything below works in bytes.
@@ -66,25 +80,13 @@ pub(crate) fn interleave_message(
             .map(|(byte, _)| byte)
             .unwrap_or(content.len())
     };
-    // Snap down to the nearest position a split may legally fall on.
-    let snap = |byte: usize| -> usize {
-        match allowed_splits {
-            Some(allowed) => allowed
-                .iter()
-                .copied()
-                .filter(|candidate| *candidate <= byte)
-                .next_back()
-                .unwrap_or(0),
-            None => byte,
-        }
-    };
 
     let placement_for = |tool_call_id: &str| -> Option<usize> {
         tool_calls
             .iter()
             .find(|call| call.id == tool_call_id)
             .and_then(|call| call.content_offset)
-            .map(|offset| snap(byte_at(offset as usize)))
+            .map(|offset| byte_at(offset as usize))
     };
 
     let mut placed: Vec<(usize, ToolRequestEntry)> = Vec::new();
@@ -107,7 +109,7 @@ pub(crate) fn interleave_message(
         // Legacy layout, unchanged: content, images, tools.
         push_content(&mut segments, content);
     } else {
-        // Stable, so tools sharing a placement keep arrival order.
+        // Stable, so tools sharing an offset keep arrival order.
         placed.sort_by_key(|(byte, _)| *byte);
         let mut cursor = 0usize;
         let mut index = 0usize;
@@ -117,12 +119,15 @@ pub(crate) fn interleave_message(
                 push_content(&mut segments, &content[cursor..byte]);
                 cursor = byte;
             }
-            let mut group = Vec::new();
+            let mut entries = Vec::new();
             while index < placed.len() && placed[index].0 == byte {
-                group.push(placed[index].1.clone());
+                entries.push(placed[index].1.clone());
                 index += 1;
             }
-            segments.push(MessageSegment::Tools(group));
+            segments.push(MessageSegment::Tools {
+                entries,
+                placed: true,
+            });
         }
         push_content(&mut segments, &content[cursor..]);
     }
@@ -131,7 +136,10 @@ pub(crate) fn interleave_message(
         segments.push(MessageSegment::Images);
     }
     if !trailing.is_empty() {
-        segments.push(MessageSegment::Tools(trailing));
+        segments.push(MessageSegment::Tools {
+            entries: trailing,
+            placed: false,
+        });
     }
     segments
 }
@@ -327,26 +335,48 @@ pub fn ChatMessageView(
                 let entry = entry_for_tools.get();
                 // Third member is `is_user`; the first is the card's CSS class.
                 let is_user = card_meta.with(|(_, _, is_user, _, _)| *is_user);
-                // Assistant content is Markdown, so splits may only fall on
-                // top-level block boundaries — an offset inside a code fence,
-                // link or list would otherwise tear the document in half and
-                // each half would parse as something else. User content is
-                // escaped text, where any scalar boundary is safe.
-                let allowed_splits = (!is_user)
-                    .then(|| top_level_block_boundaries(&entry.message.content));
                 let images = entry.message.images.clone();
                 let segments = interleave_message(
                     &entry.message.content,
                     &entry.message.tool_calls,
                     entry.tool_requests,
-                    allowed_splits.as_deref(),
                     images.as_ref().is_some_and(|imgs| !imgs.is_empty()),
                 );
+
+                // Each provider response is one group, so assistive technology
+                // walks the card as the sequence of responses it was rather
+                // than as one undifferentiated blob of text and cards. Groups
+                // close on a placed tool, which is the boundary `tool.start`
+                // reported. The trailing legacy tools and the images belong to
+                // no response and stay outside.
+                let mut rendered: Vec<AnyView> = Vec::new();
+                let mut phase: Vec<AnyView> = Vec::new();
+                let mut phase_index = 1usize;
                 let mut body_ref_taken = false;
-                segments
-                    .into_iter()
-                    .map(|segment| match segment {
+                let mut flush = |phase: &mut Vec<AnyView>, rendered: &mut Vec<AnyView>, index: usize| {
+                    if phase.is_empty() {
+                        return;
+                    }
+                    let parts = std::mem::take(phase);
+                    rendered.push(
+                        view! {
+                            <div
+                                class="chat-card-phase"
+                                role="group"
+                                aria-label=format!("Response {index}")
+                            >
+                                {parts}
+                            </div>
+                        }
+                        .into_any(),
+                    );
+                };
+
+                for segment in segments {
+                    match segment {
                         MessageSegment::Content(text) => {
+                            // Each phase is its own document: it was produced by
+                            // its own provider call.
                             let html = if is_user {
                                 let escaped = text
                                     .replace('&', "&amp;")
@@ -357,41 +387,52 @@ pub fn ChatMessageView(
                                 render_markdown(&text)
                             };
                             if html.is_empty() {
-                                return ().into_any();
+                                continue;
                             }
                             // The node ref identifies the row's body; with the
                             // body split it belongs to the first slice.
-                            let node_ref = (!body_ref_taken).then(|| {
+                            let view = if body_ref_taken {
+                                view! {
+                                    <div class="chat-card-body" inner_html=html></div>
+                                }
+                                .into_any()
+                            } else {
                                 body_ref_taken = true;
-                                body_ref
-                            });
-                            match node_ref {
-                                Some(node_ref) => view! {
+                                view! {
                                     <div
                                         class="chat-card-body"
-                                        node_ref=node_ref
+                                        node_ref=body_ref
                                         inner_html=html
                                     ></div>
                                 }
-                                .into_any(),
-                                None => view! {
-                                    <div class="chat-card-body" inner_html=html></div>
-                                }
-                                .into_any(),
+                                .into_any()
+                            };
+                            phase.push(view);
+                        }
+                        MessageSegment::Tools { entries, placed } => {
+                            let view = view! {
+                                <ToolCardListView agent_ref=agent_ref entries=entries />
+                            }
+                            .into_any();
+                            if placed {
+                                phase.push(view);
+                                flush(&mut phase, &mut rendered, phase_index);
+                                phase_index += 1;
+                            } else {
+                                flush(&mut phase, &mut rendered, phase_index);
+                                rendered.push(view);
                             }
                         }
-                        MessageSegment::Tools(entries) => view! {
-                            <ToolCardListView agent_ref=agent_ref entries=entries />
-                        }
-                        .into_any(),
                         MessageSegment::Images => {
-                            let Some(imgs) = images.clone() else {
-                                return ().into_any();
-                            };
-                            render_message_images(imgs).into_any()
+                            flush(&mut phase, &mut rendered, phase_index);
+                            if let Some(imgs) = images.clone() {
+                                rendered.push(render_message_images(imgs).into_any());
+                            }
                         }
-                    })
-                    .collect::<Vec<_>>()
+                    }
+                }
+                flush(&mut phase, &mut rendered, phase_index);
+                rendered
             }}
 
 
@@ -635,8 +676,9 @@ mod wasm_tests {
             .map(|segment| match segment {
                 MessageSegment::Content(text) => format!("content:{text}"),
                 MessageSegment::Images => "images".to_owned(),
-                MessageSegment::Tools(entries) => format!(
-                    "tools:{}",
+                MessageSegment::Tools { entries, placed } => format!(
+                    "{}:{}",
+                    if *placed { "tools" } else { "legacy" },
                     entries
                         .iter()
                         .map(|entry| entry.request.tool_call_id.clone())
@@ -657,7 +699,6 @@ mod wasm_tests {
             "PRE\nPOST",
             &[tool_call("t1", Some(4))],
             vec![tool_entry("t1")],
-            None,
             false,
         );
 
@@ -678,7 +719,6 @@ mod wasm_tests {
             content,
             &[tool_call("t1", Some(6))],
             vec![tool_entry("t1")],
-            None,
             false,
         );
 
@@ -701,7 +741,6 @@ mod wasm_tests {
                 tool_call("third", Some(1)),
             ],
             vec![tool_entry("first"), tool_entry("second"), tool_entry("third")],
-            None,
             false,
         );
 
@@ -720,13 +759,12 @@ mod wasm_tests {
             "all of the text",
             &[tool_call("t1", None), tool_call("t2", None)],
             vec![tool_entry("t1"), tool_entry("t2")],
-            None,
             false,
         );
 
         assert_eq!(
             segment_shape(&segments),
-            vec!["content:all of the text", "tools:t1,t2"],
+            vec!["content:all of the text", "legacy:t1,t2"],
             "unchanged from the positionless rendering"
         );
     }
@@ -739,12 +777,11 @@ mod wasm_tests {
             "short",
             &[tool_call("t1", Some(9_999))],
             vec![tool_entry("t1")],
-            None,
             false,
         );
         assert_eq!(
             segment_shape(&past_end),
-            vec!["content:short", "tools:t1"],
+            vec!["content:short", "legacy:t1"],
             "an out-of-range offset clamps to the end instead of panicking"
         );
 
@@ -752,17 +789,15 @@ mod wasm_tests {
             "text",
             &[tool_call("other", Some(1))],
             vec![tool_entry("t1")],
-            None,
             false,
         );
         assert_eq!(
             segment_shape(&unmatched),
-            vec!["content:text", "tools:t1"],
+            vec!["content:text", "legacy:t1"],
             "a tool with no matching call is placed as legacy data"
         );
 
         let zero = interleave_message("text", &[tool_call("t1", Some(0))], vec![tool_entry("t1")],
-            None,
             false,
         );
         assert_eq!(
@@ -773,7 +808,6 @@ mod wasm_tests {
 
         let empty_content =
             interleave_message("", &[tool_call("t1", Some(0))], vec![tool_entry("t1")],
-            None,
             false,
         );
         assert_eq!(
@@ -783,88 +817,97 @@ mod wasm_tests {
         );
     }
 
-    /// RLV-02: a tool offset that lands inside a Markdown construct must not
-    /// tear the document in half. Snapping to a top-level block boundary keeps
-    /// each fragment a whole document, so the code fence, list and link survive.
+    /// The offset is a provider-response boundary, so the split is exact — not
+    /// snapped to a Markdown block. Snapping would move the card away from the
+    /// boundary `tool.start` reported, which is the one thing this data exists
+    /// to record.
     #[wasm_bindgen_test]
-    fn markdown_constructs_are_never_split_mid_construct() {
-        // Offset 20 falls inside the fenced code block.
-        let content = "intro\n\n```rust\nfn a() {}\n```\n\ntail";
-        let boundaries = top_level_block_boundaries(content);
+    fn the_split_lands_exactly_on_the_recorded_boundary() {
+        // Offset 3 is mid-paragraph: no block boundary is anywhere near it.
         let segments = interleave_message(
-            content,
-            &[tool_call("t1", Some(20))],
+            "one two three",
+            &[tool_call("t1", Some(3))],
             vec![tool_entry("t1")],
-            Some(&boundaries),
             false,
         );
 
-        let shape = segment_shape(&segments);
-        let rejoined: String = segments
-            .iter()
-            .filter_map(|segment| match segment {
-                MessageSegment::Content(text) => Some(text.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(rejoined, content, "no content may be lost or duplicated");
-        for segment in &segments {
-            if let MessageSegment::Content(text) = segment {
-                assert_eq!(
-                    text.matches("```").count() % 2,
-                    0,
-                    "a fragment must never contain half a code fence: {text:?}"
-                );
-            }
-        }
-        assert!(
-            shape.iter().any(|s| s.starts_with("tools:")),
-            "the tool is still placed, just at a safe boundary: {shape:?}"
+        assert_eq!(
+            segment_shape(&segments),
+            vec!["content:one", "tools:t1", "content: two three"],
+            "the boundary is honoured exactly, mid-paragraph or not"
         );
     }
 
-    /// The same rule for a list and an inline link: splitting inside either
-    /// would leave one half without its syntax.
+    /// Each phase is a separate provider response, so each is well-formed on
+    /// its own. A fence opened and closed within one phase renders normally
+    /// even though the message as a whole is split.
     #[wasm_bindgen_test]
-    fn lists_and_links_survive_an_interior_offset() {
-        let content = "- one\n- two\n\nsee [label](https://example.com) here";
-        let boundaries = top_level_block_boundaries(content);
-
-        // Inside the list.
-        let in_list = interleave_message(
+    fn each_phase_is_independently_well_formed() {
+        let content = "```rust\nfn a() {}\n```\nAFTER";
+        // Offset 21 is the start of `AFTER`, i.e. the provider boundary.
+        let boundary = content.chars().count() - "AFTER".chars().count();
+        let segments = interleave_message(
             content,
-            &[tool_call("t1", Some(8))],
+            &[tool_call("t1", Some(boundary as u32))],
             vec![tool_entry("t1")],
-            Some(&boundaries),
             false,
         );
-        for segment in &in_list {
-            if let MessageSegment::Content(text) = segment {
-                let trimmed = text.trim();
-                assert!(
-                    trimmed.is_empty() || !trimmed.starts_with("two"),
-                    "the list must not be cut between its items: {text:?}"
-                );
-            }
-        }
 
-        // Inside the link target.
-        let in_link = interleave_message(
+        let MessageSegment::Content(first) = &segments[0] else {
+            panic!("first segment is the opening phase: {segments:?}");
+        };
+        assert_eq!(
+            first.matches("```").count(),
+            2,
+            "the first phase closes its own fence: {first:?}"
+        );
+        assert_eq!(
+            segment_shape(&segments),
+            vec![
+                "content:```rust\nfn a() {}\n```\n",
+                "tools:t1",
+                "content:AFTER"
+            ]
+        );
+    }
+
+    /// A reference that crosses a provider boundary must stay unresolved. The
+    /// definition and the use were produced by different provider calls, so
+    /// joining them would invent a document — and a relationship for assistive
+    /// technology — that no provider emitted.
+    #[wasm_bindgen_test]
+    fn a_cross_phase_reference_is_not_silently_joined() {
+        // `[label]` is used in the first phase; its definition arrives in the
+        // second, after the tool call.
+        let content = "see [label]\n\n[label]: https://example.com";
+        let boundary = "see [label]\n\n".chars().count();
+        let segments = interleave_message(
             content,
-            &[tool_call("t1", Some(30))],
+            &[tool_call("t1", Some(boundary as u32))],
             vec![tool_entry("t1")],
-            Some(&boundaries),
             false,
         );
-        for segment in &in_link {
-            if let MessageSegment::Content(text) = segment {
-                assert_eq!(
-                    text.matches('[').count(),
-                    text.matches(']').count(),
-                    "a fragment must not contain half a link: {text:?}"
-                );
-            }
-        }
+
+        assert_eq!(
+            segment_shape(&segments),
+            vec![
+                "content:see [label]\n\n",
+                "tools:t1",
+                "content:[label]: https://example.com"
+            ],
+            "the two phases stay separate documents"
+        );
+
+        // Rendered independently, the reference does not resolve to a link.
+        let MessageSegment::Content(first) = &segments[0] else {
+            panic!("expected content first");
+        };
+        let html = render_markdown(first);
+        assert!(
+            !html.contains("<a "),
+            "a definition from another provider response must not resolve the \
+             reference in this one: {html}"
+        );
     }
 
     /// RLV-03: offsetless tools keep the legacy order exactly — content, then
@@ -876,13 +919,12 @@ mod wasm_tests {
             "text",
             &[tool_call("t1", None)],
             vec![tool_entry("t1")],
-            None,
             true,
         );
 
         assert_eq!(
             segment_shape(&segments),
-            vec!["content:text", "images", "tools:t1"],
+            vec!["content:text", "images", "legacy:t1"],
             "legacy order is content, images, tools"
         );
     }
@@ -895,7 +937,6 @@ mod wasm_tests {
             "AB",
             &[tool_call("placed", Some(1)), tool_call("legacy", None)],
             vec![tool_entry("placed"), tool_entry("legacy")],
-            None,
             true,
         );
 
@@ -906,7 +947,7 @@ mod wasm_tests {
                 "tools:placed",
                 "content:B",
                 "images",
-                "tools:legacy"
+                "legacy:legacy"
             ]
         );
     }
@@ -919,13 +960,12 @@ mod wasm_tests {
             "AB",
             &[tool_call("placed", Some(1)), tool_call("legacy", None)],
             vec![tool_entry("placed"), tool_entry("legacy")],
-            None,
             false,
         );
 
         assert_eq!(
             segment_shape(&segments),
-            vec!["content:A", "tools:placed", "content:B", "tools:legacy"]
+            vec!["content:A", "tools:placed", "content:B", "legacy:legacy"]
         );
     }
 
@@ -1136,77 +1176,75 @@ mod wasm_tests {
         );
     }
 
-    /// A tool offset inside a fenced code block must leave the block intact:
-    /// one `<pre>`/code block, its full text, and no stray literal fence.
+    /// Provider order in the accessibility tree: each response is one labelled
+    /// group, and the groups follow the order the provider produced them.
     #[wasm_bindgen_test]
-    async fn tool_inside_a_code_fence_leaves_the_block_intact() {
+    async fn phases_are_grouped_and_labelled_in_provider_order() {
         let mut entry = assistant_msg(None);
-        entry.message.content = "intro\n\n```rust\nfn a() {}\n```\n\ntail".to_owned();
-        entry.message.tool_calls = vec![tool_call("t1", Some(20))];
+        entry.message.content = "first\n\nsecond\n\nthird".to_owned();
+        let first_break = "first\n\n".chars().count() as u32;
+        let second_break = "first\n\nsecond\n\n".chars().count() as u32;
+        entry.message.tool_calls = vec![
+            tool_call("t1", Some(first_break)),
+            tool_call("t2", Some(second_break)),
+        ];
+        entry.tool_requests = vec![tool_entry("t1"), tool_entry("t2")];
+        let container = mount_message(entry);
+        next_tick().await;
+
+        let groups = container.query_selector_all(".chat-card-phase").unwrap();
+        assert_eq!(groups.length(), 3, "three provider responses, three groups");
+        let labels: Vec<String> = (0..groups.length())
+            .filter_map(|index| groups.item(index))
+            .filter_map(|node| node.dyn_into::<web_sys::Element>().ok())
+            .map(|el| {
+                assert_eq!(
+                    el.get_attribute("role").as_deref(),
+                    Some("group"),
+                    "each phase is a group for assistive technology"
+                );
+                el.get_attribute("aria-label").unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["Response 1", "Response 2", "Response 3"],
+            "groups are labelled in provider order"
+        );
+
+        // Within the card, content and cards still read in provider order.
+        let order = dom_order(&container);
+        assert_eq!(
+            order,
+            vec!["body", "tools", "body", "tools", "body"],
+            "reading order alternates content and card as the provider emitted"
+        );
+    }
+
+    /// The live shape, through the real component: the card sits between the
+    /// two runs and neither run loses text.
+    #[wasm_bindgen_test]
+    async fn live_pre_tool_post_renders_in_provider_order() {
+        let mut entry = assistant_msg(None);
+        entry.message.content = "PRE\nPOST".to_owned();
+        entry.message.tool_calls = vec![tool_call("t1", Some(4))];
         entry.tool_requests = vec![tool_entry("t1")];
         let container = mount_message(entry);
         next_tick().await;
 
         assert_eq!(
-            container.query_selector_all(".md-code-block").unwrap().length(),
-            1,
-            "the fenced block renders once and whole"
+            dom_order(&container),
+            vec!["body", "tools", "body"],
+            "PRE, card, POST — the order the provider produced"
         );
         let text = container.text_content().unwrap_or_default();
         assert!(
-            text.contains("fn a() {}"),
-            "the code survives the split, got: {text}"
-        );
-        assert!(
-            !text.contains("```"),
-            "no half-fence leaks through as literal text, got: {text}"
+            text.contains("PRE") && text.contains("POST"),
+            "no content is lost across the boundary, got: {text}"
         );
     }
 
-    /// A tool offset inside a link must not leave half the link as literal
-    /// text: the anchor still renders with its href and label.
-    #[wasm_bindgen_test]
-    async fn tool_inside_a_link_leaves_the_anchor_intact() {
-        let mut entry = assistant_msg(None);
-        entry.message.content = "see [label](https://example.com) here".to_owned();
-        entry.message.tool_calls = vec![tool_call("t1", Some(12))];
-        entry.tool_requests = vec![tool_entry("t1")];
-        let container = mount_message(entry);
-        next_tick().await;
-
-        let anchor = container
-            .query_selector(".chat-card-body a")
-            .unwrap()
-            .expect("the link still renders as an anchor");
-        assert_eq!(
-            anchor.get_attribute("href").as_deref(),
-            Some("https://example.com")
-        );
-        assert_eq!(anchor.text_content().as_deref(), Some("label"));
-        let text = container.text_content().unwrap_or_default();
-        assert!(
-            !text.contains("](https://"),
-            "no half-link leaks through as literal text, got: {text}"
-        );
-    }
-
-    /// A tool offset inside a list must leave both items in one list.
-    #[wasm_bindgen_test]
-    async fn tool_inside_a_list_leaves_both_items_in_one_list() {
-        let mut entry = assistant_msg(None);
-        entry.message.content = "- one\n- two\n\ntail".to_owned();
-        entry.message.tool_calls = vec![tool_call("t1", Some(8))];
-        entry.tool_requests = vec![tool_entry("t1")];
-        let container = mount_message(entry);
-        next_tick().await;
-
-        let lists = container.query_selector_all(".chat-card-body ul").unwrap();
-        assert_eq!(lists.length(), 1, "the list is not cut in two");
-        let items = container.query_selector_all(".chat-card-body li").unwrap();
-        assert_eq!(items.length(), 2, "both items stay in it");
-    }
-
-    /// Reading order of the rendered card, as a screen reader would walk it.
+    /// Reading order of the rendered card, as a screen reader would walk it.    /// Reading order of the rendered card, as a screen reader would walk it.
     fn dom_order(container: &HtmlElement) -> Vec<String> {
         let nodes = container
             .query_selector_all(".chat-card-body, .chat-card-images, .chat-card-tools")

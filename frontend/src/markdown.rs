@@ -16,47 +16,6 @@ use crate::syntax_highlight::{highlight_to_html, syntax_for_lang_token};
 ///   and a copy button; the inner `<code>` body is pre-tokenized by syntect
 ///   into colored `<span>`s emitted directly into the HTML, so no client-side
 ///   DOM mutation is needed.
-/// Byte offsets in `input` at which the document can be split without changing
-/// how either half parses: the start, the end, and the end of every top-level
-/// block.
-///
-/// Splitting Markdown at an arbitrary offset and rendering the halves
-/// independently produces two unrelated documents. A split inside a fenced code
-/// block, link, image, list, table or emphasis span leaves the first half
-/// finalized without its closing syntax and the second half without its
-/// opening, so code blocks, links and list semantics are silently lost — and
-/// they are lost for assistive technology as much as for sighted readers.
-/// Snapping an arbitrary offset down to one of these boundaries keeps every
-/// fragment a whole number of top-level blocks, so each parses exactly as it
-/// does inside the whole document.
-pub fn top_level_block_boundaries(input: &str) -> Vec<usize> {
-    let mut options = Options::empty();
-    options.insert(Options::ENABLE_TABLES);
-    options.insert(Options::ENABLE_STRIKETHROUGH);
-    options.insert(Options::ENABLE_TASKLISTS);
-    options.insert(Options::ENABLE_FOOTNOTES);
-
-    let mut boundaries = vec![0usize];
-    let mut depth = 0usize;
-    for (event, range) in Parser::new_ext(input, options).into_offset_iter() {
-        match event {
-            Event::Start(_) => depth += 1,
-            Event::End(_) => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    boundaries.push(range.end);
-                }
-            }
-            _ => {}
-        }
-    }
-    if boundaries.last() != Some(&input.len()) {
-        boundaries.push(input.len());
-    }
-    boundaries.dedup();
-    boundaries
-}
-
 pub fn render_markdown(input: &str) -> String {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
