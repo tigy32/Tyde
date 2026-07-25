@@ -614,7 +614,11 @@ mod tests {
     #[test]
     fn count_badge_does_not_overstate_the_counter() {
         assert_eq!(format_turn_count(0), "0 responses");
-        assert_eq!(format_turn_count(1), "1 response", "singular reads naturally");
+        assert_eq!(
+            format_turn_count(1),
+            "1 response",
+            "singular reads naturally"
+        );
         assert_eq!(format_turn_count(4), "4 responses");
         for count in [0_u32, 1, 4] {
             let label = format_turn_count(count);
