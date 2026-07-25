@@ -4597,9 +4597,7 @@ impl CodexInner {
                                     stream
                                         .terminated_turns
                                         .iter()
-                                        .any(|terminated| {
-                                            terminated.turn_id == *awaiting_turn_id
-                                        })
+                                        .any(|terminated| terminated.turn_id == *awaiting_turn_id)
                                 });
                         !matches!(method, "turn/started" | "turn/completed")
                             && !is_tombstoned_item
