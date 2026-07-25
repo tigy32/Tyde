@@ -204,7 +204,7 @@ struct HostSubscriber {
     agent_replay: AgentReplayMode,
     session_list_replay: SessionListReplayMode,
     session_list_snapshot: Option<SessionListSnapshot>,
-    // Set when HostBootstrap or SessionList gives this stream a session list.
+    // HostBootstrap is a point-in-time list; ListSessions opts into updates.
     session_summary_updates_subscribed: bool,
     new_agent_fanouts_in_flight: u32,
     held_summary_count_frames: Vec<serde_json::Value>,
@@ -7355,8 +7355,15 @@ impl HostHandle {
         payload: ListSessionsPayload,
     ) -> AppResult<()> {
         const OPERATION: &str = "list_sessions";
-        let (sessions, page) = if let Some(cursor) = payload.cursor {
-            let mut state = self.state.lock().await;
+        let ListSessionsPayload {
+            scope,
+            cursor,
+            limit,
+        } = payload;
+        // Keep snapshot, response enqueue, and enrollment in one host-state
+        // critical section so a later count cannot overtake its SessionList.
+        let mut state = self.state.lock().await;
+        let (sessions, page) = if let Some(cursor) = cursor {
             let subscriber = state
                 .host_streams
                 .get_mut(host_output_stream.path())
@@ -7366,18 +7373,15 @@ impl HostHandle {
                         format!("unknown host stream {}", host_output_stream.path()),
                     )
                 })?;
-            let page = page_existing_session_list_snapshot(
+            page_existing_session_list_snapshot(
                 subscriber,
                 cursor,
-                payload.scope,
-                payload.limit,
+                scope,
+                limit,
                 OPERATION,
-            )?;
-            subscriber.session_summary_updates_subscribed = true;
-            page
+            )?
         } else {
-            let (session_store, scope, antigravity_conversations_dir) = {
-                let state = self.state.lock().await;
+            let scope = {
                 let subscriber = state
                     .host_streams
                     .get(host_output_stream.path())
@@ -7387,23 +7391,17 @@ impl HostHandle {
                             format!("unknown host stream {}", host_output_stream.path()),
                         )
                     })?;
-                (
-                    Arc::clone(&state.session_store),
-                    payload
-                        .scope
-                        .unwrap_or_else(|| subscriber.session_list_replay.default_scope()),
-                    state.antigravity_conversations_dir.clone(),
-                )
+                scope.unwrap_or_else(|| subscriber.session_list_replay.default_scope())
             };
-            let sessions = session_store
+            let sessions = state
+                .session_store
                 .lock()
                 .await
                 .summaries_for_scope_with_antigravity_conversations_dir(
                     scope,
-                    &antigravity_conversations_dir,
+                    &state.antigravity_conversations_dir,
                 )
                 .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
-            let mut state = self.state.lock().await;
             let subscriber = state
                 .host_streams
                 .get_mut(host_output_stream.path())
@@ -7413,15 +7411,7 @@ impl HostHandle {
                         format!("unknown host stream {}", host_output_stream.path()),
                     )
                 })?;
-            let page = replace_session_list_snapshot(
-                subscriber,
-                scope,
-                sessions,
-                payload.limit,
-                OPERATION,
-            )?;
-            subscriber.session_summary_updates_subscribed = true;
-            page
+            replace_session_list_snapshot(subscriber, scope, sessions, limit, OPERATION)?
         };
 
         let payload = SessionListPayload { sessions, page };
@@ -7432,12 +7422,29 @@ impl HostHandle {
                 error,
             )
         })?;
-        let _ = host_output_stream.send_value(FrameKind::SessionList, payload);
-        let mut state = self.state.lock().await;
-        flush_pending_session_summary_count_updates_for_subscriber(
-            &mut state,
-            host_output_stream.path(),
-        );
+        let delivered = {
+            let subscriber = state
+                .host_streams
+                .get_mut(host_output_stream.path())
+                .ok_or_else(|| {
+                    AppError::invalid(
+                        OPERATION,
+                        format!("unknown host stream {}", host_output_stream.path()),
+                    )
+                })?;
+            let delivered =
+                emit_or_queue_host_frame(subscriber, FrameKind::SessionList, payload).is_ok();
+            if delivered {
+                subscriber.session_summary_updates_subscribed = true;
+            }
+            delivered
+        };
+        if delivered {
+            flush_pending_session_summary_count_updates_for_subscriber(
+                &mut state,
+                host_output_stream.path(),
+            );
+        }
         Ok(())
     }
 
@@ -16807,14 +16814,12 @@ fn replace_session_list_snapshot(
         .session_list_snapshot
         .as_ref()
         .expect("session list snapshot was just stored");
-    let page = page_session_summaries(&snapshot.sessions, request).map_err(|message| {
+    page_session_summaries(&snapshot.sessions, request).map_err(|message| {
         AppError::invalid(
             operation,
             format!("failed to page session list snapshot: {message}"),
         )
-    })?;
-    subscriber.session_summary_updates_subscribed = true;
-    Ok(page)
+    })
 }
 
 fn page_existing_session_list_snapshot(
@@ -19418,7 +19423,7 @@ mod tests {
     use crate::store::agent_teams::AgentTeamsStoreFile;
     use protocol::{
         AgentErrorPayload, BackendConfigSnapshotStatus, BackendConfigSnapshotsPayload, BackendKind,
-        BackendNativeSettingsSnapshot, CustomAgentId, DiffContextMode, HostSettingValue,
+        BackendNativeSettingsSnapshot, CustomAgentId, DiffContextMode, Envelope, HostSettingValue,
         ProjectDiffScope, ProjectGitDiffFile, ProjectGitDiffPayload, ProtocolValidator, Review,
         ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewStatus, TeamMemberCreateSpec,
         ToolPolicy,
@@ -19427,6 +19432,52 @@ mod tests {
 
     static STARTUP_FAILURE_FANOUT_RACE_TEST_LOCK: tokio::sync::Mutex<()> =
         tokio::sync::Mutex::const_new(());
+
+    async fn recv_session_summary_count(
+        rx: &mut mpsc::UnboundedReceiver<Envelope>,
+        context: &str,
+    ) -> SessionSummaryCountUpdatedPayload {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let envelope = rx
+                    .recv()
+                    .await
+                    .unwrap_or_else(|| panic!("{context} stream closed"));
+                if envelope.kind == FrameKind::SessionSummaryCountUpdated {
+                    return envelope
+                        .parse_payload()
+                        .unwrap_or_else(|error| panic!("invalid {context} count payload: {error}"));
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {context} count"))
+    }
+
+    async fn assert_no_session_summary_count(
+        rx: &mut mpsc::UnboundedReceiver<Envelope>,
+        context: &str,
+    ) {
+        let received = timeout(Duration::from_millis(50), async {
+            loop {
+                let Some(envelope) = rx.recv().await else {
+                    return None;
+                };
+                if envelope.kind == FrameKind::SessionSummaryCountUpdated {
+                    return Some(envelope);
+                }
+            }
+        })
+        .await;
+        match received {
+            Err(_) => {}
+            Ok(Some(envelope)) => panic!(
+                "{context} received targeted count on {}: {:?}",
+                envelope.stream, envelope.payload
+            ),
+            Ok(None) => panic!("{context} stream closed"),
+        }
+    }
 
     #[test]
     fn default_compaction_prompt_matches_approved_handoff_note() {
@@ -22904,20 +22955,19 @@ Rules: Record only what remains true and useful for future work; drop transient 
     }
 
     #[tokio::test]
-    async fn session_list_delivery_subscribes_each_host_stream() {
+    async fn explicit_session_list_delivery_subscribes_each_host_stream() {
         let fixture = compact_fixture().await;
         let (first_tx, mut first_rx) = mpsc::unbounded_channel();
         let first_path = StreamPath(format!("/host/session-list-first-{}", Uuid::new_v4()));
+        let first_stream = Stream::new(first_path.clone(), first_tx);
         let (second_tx, mut second_rx) = mpsc::unbounded_channel();
         let second_path = StreamPath(format!("/host/session-list-second-{}", Uuid::new_v4()));
-        for (path, tx) in [
-            (first_path.clone(), first_tx),
-            (second_path.clone(), second_tx),
-        ] {
+        let second_stream = Stream::new(second_path.clone(), second_tx);
+        for stream in [first_stream.clone(), second_stream.clone()] {
             assert!(
                 fixture
                     .host
-                    .register_host_stream(Stream::new(path, tx), AgentReplayMode::Lazy)
+                    .register_host_stream(stream, AgentReplayMode::Lazy)
                     .await
                     .is_empty()
             );
@@ -22932,6 +22982,41 @@ Rules: Record only what remains true and useful for future work; drop transient 
         );
         while first_rx.try_recv().is_ok() {}
         while second_rx.try_recv().is_ok() {}
+        {
+            let state = fixture.host.state.lock().await;
+            assert!(
+                [&first_path, &second_path].into_iter().all(|path| {
+                    !state
+                        .host_streams
+                        .get(path)
+                        .expect("bootstrap subscriber")
+                        .session_summary_updates_subscribed
+                }),
+                "HostBootstrap snapshots must not enroll passive streams"
+            );
+        }
+
+        for (stream, receiver) in [
+            (&first_stream, &mut first_rx),
+            (&second_stream, &mut second_rx),
+        ] {
+            fixture
+                .host
+                .list_sessions(stream, ListSessionsPayload::default())
+                .await
+                .expect("explicit session list");
+            loop {
+                if receiver
+                    .recv()
+                    .await
+                    .expect("explicit SessionList recipient")
+                    .kind
+                    == FrameKind::SessionList
+                {
+                    break;
+                }
+            }
+        }
 
         let (unlisted_tx, mut unlisted_rx) = mpsc::unbounded_channel();
         let unlisted_path = StreamPath(format!("/host/session-list-unlisted-{}", Uuid::new_v4()));
@@ -22979,20 +23064,20 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 SessionSummaryCountDelivery::Delivered
             );
         }
+        let first_count =
+            recv_session_summary_count(&mut first_rx, "first explicit subscriber").await;
+        let second_count =
+            recv_session_summary_count(&mut second_rx, "second explicit subscriber").await;
         assert_eq!(
-            first_rx.recv().await.expect("first bootstrap count").kind,
-            FrameKind::SessionSummaryCountUpdated
+            first_count,
+            SessionSummaryCountUpdatedPayload {
+                session_id: SessionId("session-list-session".to_owned()),
+                assistant_turn_count: 1,
+                updated_at_ms: 10,
+            }
         );
-        assert_eq!(
-            second_rx.recv().await.expect("second bootstrap count").kind,
-            FrameKind::SessionSummaryCountUpdated
-        );
-        assert!(
-            timeout(Duration::from_millis(50), unlisted_rx.recv())
-                .await
-                .is_err(),
-            "a stream never given a session list must not receive targeted updates"
-        );
+        assert_eq!(second_count, first_count);
+        assert_no_session_summary_count(&mut unlisted_rx, "unlisted subscriber").await;
 
         fixture.host.fan_out_session_lists().await;
         for receiver in [&mut first_rx, &mut second_rx, &mut unlisted_rx] {
@@ -23009,9 +23094,21 @@ Rules: Record only what remains true and useful for future work; drop transient 
             assert!(
                 state
                     .host_streams
-                    .values()
-                    .all(|subscriber| subscriber.session_summary_updates_subscribed),
-                "fanout recipients must subscribe when their SessionList is delivered"
+                    .get(&first_path)
+                    .is_some_and(|subscriber| subscriber.session_summary_updates_subscribed)
+                    && state
+                        .host_streams
+                        .get(&second_path)
+                        .is_some_and(|subscriber| subscriber.session_summary_updates_subscribed),
+                "explicit ListSessions recipients must remain subscribed after fanout"
+            );
+            assert!(
+                !state
+                    .host_streams
+                    .get(&unlisted_path)
+                    .expect("unlisted subscriber")
+                    .session_summary_updates_subscribed,
+                "unsolicited SessionList fanout must not enroll a passive stream"
             );
             assert_eq!(
                 fan_out_session_summary_count_update_inner(
@@ -23028,12 +23125,14 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 SessionSummaryCountDelivery::Delivered
             );
         }
-        for receiver in [&mut first_rx, &mut second_rx, &mut unlisted_rx] {
-            assert_eq!(
-                receiver.recv().await.expect("subscribed count").kind,
-                FrameKind::SessionSummaryCountUpdated
-            );
-        }
+        let first_count =
+            recv_session_summary_count(&mut first_rx, "first fanout-preserved subscriber").await;
+        let second_count =
+            recv_session_summary_count(&mut second_rx, "second fanout-preserved subscriber").await;
+        assert_eq!(first_count.assistant_turn_count, 2);
+        assert_eq!(first_count.updated_at_ms, 20);
+        assert_eq!(second_count, first_count);
+        assert_no_session_summary_count(&mut unlisted_rx, "fanout-only subscriber").await;
     }
 
     #[tokio::test]
