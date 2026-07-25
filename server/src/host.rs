@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::{Component, Path, PathBuf};
@@ -901,8 +901,9 @@ pub(crate) struct HostState {
     pub capacity_tx: HostCapacityTx,
     pub session_summary_count_tx: HostSessionSummaryCountTx,
     // A response can finish while its NewAgent is still being published.
-    // Coalesce by agent so resumed instances sharing a session stay isolated.
-    pending_session_summary_count_updates: HashMap<AgentId, HostSessionSummaryCountUpdate>,
+    // Preserve every boundary so a later turn cannot replace the initial count.
+    pending_session_summary_count_updates:
+        HashMap<AgentId, VecDeque<HostSessionSummaryCountUpdate>>,
     pub use_mock_backend: bool,
     pub debug_mcp: DebugMcpHandle,
     pub agent_control_mcp: AgentControlMcpHandle,
@@ -1356,12 +1357,12 @@ impl AgentVisibilityRegistry {
             .unwrap_or_default()
     }
 
-    fn tracks_publishable_agent(&self, agent_id: &AgentId) -> bool {
+    fn publication_cancelled(&self, agent_id: &AgentId) -> bool {
         self.inner
             .lock()
             .expect("agent visibility mutex poisoned")
             .get(agent_id)
-            .is_some_and(|entry| entry.phase != AgentVisibilityPhase::Cancelled)
+            .is_some_and(|entry| entry.phase == AgentVisibilityPhase::Cancelled)
     }
 
     fn publication_pending(&self, agent_id: &AgentId) -> bool {
@@ -3218,6 +3219,13 @@ impl HostHandle {
             let mut state = self.state.lock().await;
             state.host_streams.remove(path);
             state.agent_visibility.remove_host_stream(path);
+            if !state
+                .host_streams
+                .values()
+                .any(|subscriber| subscriber.session_summary_updates_subscribed)
+            {
+                state.pending_session_summary_count_updates.clear();
+            }
             state.mobile_access.unregister_subscriber(path.clone());
             let review_registry = state.review_registry.clone();
             let project_handles = state
@@ -7427,7 +7435,7 @@ impl HostHandle {
         })?;
         let _ = host_output_stream.send_value(FrameKind::SessionList, payload);
         let mut state = self.state.lock().await;
-        flush_pending_session_summary_count_updates_for_snapshot(
+        flush_pending_session_summary_count_updates_for_subscriber(
             &mut state,
             host_output_stream.path(),
         );
@@ -16954,149 +16962,77 @@ async fn fan_out_session_lists(state: &mut HostState) {
 
     for path in dead_paths {
         state.host_streams.remove(&path);
+        state.agent_visibility.remove_host_stream(&path);
     }
 
-    let pending_updates = std::mem::take(&mut state.pending_session_summary_count_updates);
-    for mut update in pending_updates.into_values() {
-        if let Some(summary) = sessions
-            .iter()
-            .find(|summary| summary.id == update.payload.session_id)
-            && (summary.message_count, summary.updated_at_ms)
-                >= (
-                    update.payload.assistant_turn_count,
-                    update.payload.updated_at_ms,
-                )
-        {
-            update.payload.assistant_turn_count = summary.message_count;
-            update.payload.updated_at_ms = summary.updated_at_ms;
-        }
-        fan_out_session_summary_count_update_inner(state, &update, true);
-    }
+    drain_pending_session_summary_count_updates(state);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionSummaryCountDelivery {
+    Delivered,
+    Deferred,
+    Discarded,
 }
 
 fn fan_out_session_summary_count_update(
     state: &mut HostState,
     update: &HostSessionSummaryCountUpdate,
 ) {
-    fan_out_session_summary_count_update_inner(state, update, true);
+    if state
+        .pending_session_summary_count_updates
+        .contains_key(&update.agent_id)
+    {
+        queue_session_summary_count_update(state, update);
+        flush_pending_session_summary_count_update(state, &update.agent_id);
+        return;
+    }
+    if fan_out_session_summary_count_update_inner(state, update)
+        == SessionSummaryCountDelivery::Deferred
+    {
+        queue_session_summary_count_update(state, update);
+    }
 }
 
 fn fan_out_session_summary_count_update_inner(
     state: &mut HostState,
     update: &HostSessionSummaryCountUpdate,
-    queue_if_missing: bool,
-) {
+) -> SessionSummaryCountDelivery {
     let payload_update = &update.payload;
     if !state
         .host_streams
         .values()
         .any(|subscriber| subscriber.session_summary_updates_subscribed)
     {
-        if queue_if_missing
-            && state
-                .agent_visibility
-                .tracks_publishable_agent(&update.agent_id)
-        {
-            queue_session_summary_count_update(state, update);
-        } else {
-            state
-                .pending_session_summary_count_updates
-                .remove(&update.agent_id);
-        }
-        return;
+        return SessionSummaryCountDelivery::Discarded;
     }
-
-    let pending_session_binding = state
-        .pending_agent_sessions
-        .get(&update.agent_id)
-        .is_some_and(|session_id| session_id == &payload_update.session_id);
-    let published_session_binding = state
-        .agent_sessions
-        .get(&update.agent_id)
-        .is_some_and(|session_id| session_id == &payload_update.session_id);
-    if !pending_session_binding && !published_session_binding {
-        if queue_if_missing
-            && state
-                .agent_visibility
-                .tracks_publishable_agent(&update.agent_id)
-        {
-            queue_session_summary_count_update(state, update);
-        } else {
-            state
-                .pending_session_summary_count_updates
-                .remove(&update.agent_id);
-        }
-        return;
+    if state
+        .agent_visibility
+        .publication_cancelled(&update.agent_id)
+    {
+        return SessionSummaryCountDelivery::Discarded;
     }
     if state.agent_visibility.publication_pending(&update.agent_id) {
-        if queue_if_missing {
-            queue_session_summary_count_update(state, update);
-        }
-        return;
+        return SessionSummaryCountDelivery::Deferred;
     }
 
-    let visible_host_streams = state
-        .agent_visibility
-        .visible_host_streams(&update.agent_id);
-    if visible_host_streams.is_empty() {
-        if queue_if_missing
-            && state
-                .agent_visibility
-                .tracks_publishable_agent(&update.agent_id)
-        {
-            queue_session_summary_count_update(state, update);
-        } else {
-            state
-                .pending_session_summary_count_updates
-                .remove(&update.agent_id);
-        }
-        return;
-    }
     let payload = serde_json::to_value(payload_update)
         .expect("failed to serialize SessionSummaryCountUpdated payload for host stream fanout");
     let paths = state.host_streams.keys().cloned().collect::<Vec<_>>();
     let mut dead_paths = Vec::new();
-    let mut matched_snapshot = false;
-    let mut visible_subscriber = false;
+    let mut delivered = false;
 
     for path in paths {
         let Some(subscriber) = state.host_streams.get_mut(&path) else {
             continue;
         };
-        if !subscriber.session_summary_updates_subscribed || !visible_host_streams.contains(&path) {
+        if !subscriber.session_summary_updates_subscribed {
             continue;
         }
-        visible_subscriber = true;
-        let Some(summary) = subscriber
-            .session_list_snapshot
-            .as_ref()
-            .and_then(|snapshot| {
-                snapshot
-                    .sessions
-                    .iter()
-                    .find(|summary| summary.id == payload_update.session_id)
-            })
-        else {
-            continue;
-        };
-        matched_snapshot = true;
-        let current_count = summary.message_count;
-        let current_updated_at_ms = summary.updated_at_ms;
-        let should_emit = if payload_update.assistant_turn_count > current_count
-            || (payload_update.assistant_turn_count == current_count
-                && payload_update.updated_at_ms > current_updated_at_ms)
-        {
-            apply_session_summary_count_update(
-                subscriber.session_list_snapshot.as_mut(),
-                payload_update,
-            )
-        } else {
-            payload_update.assistant_turn_count == current_count
-                && payload_update.updated_at_ms == current_updated_at_ms
-        };
-        if !should_emit {
-            continue;
-        }
+        apply_session_summary_count_update(
+            subscriber.session_list_snapshot.as_mut(),
+            payload_update,
+        );
         if emit_or_queue_host_frame(
             subscriber,
             FrameKind::SessionSummaryCountUpdated,
@@ -17105,61 +17041,81 @@ fn fan_out_session_summary_count_update_inner(
         .is_err()
         {
             dead_paths.push(path);
+        } else {
+            delivered = true;
         }
     }
 
     for path in dead_paths {
         state.host_streams.remove(&path);
+        state.agent_visibility.remove_host_stream(&path);
     }
 
-    if matched_snapshot {
-        state
-            .pending_session_summary_count_updates
-            .remove(&update.agent_id);
-    } else if queue_if_missing && (pending_session_binding || visible_subscriber) {
-        queue_session_summary_count_update(state, update);
+    if delivered {
+        SessionSummaryCountDelivery::Delivered
+    } else {
+        SessionSummaryCountDelivery::Discarded
     }
 }
 
 fn flush_pending_session_summary_count_update(state: &mut HostState, agent_id: &AgentId) {
-    let Some(update) = state
-        .pending_session_summary_count_updates
-        .get(agent_id)
-        .cloned()
-    else {
-        return;
-    };
-    fan_out_session_summary_count_update_inner(state, &update, true);
+    loop {
+        let Some(update) = state
+            .pending_session_summary_count_updates
+            .get(agent_id)
+            .and_then(VecDeque::front)
+            .cloned()
+        else {
+            state
+                .pending_session_summary_count_updates
+                .remove(agent_id);
+            return;
+        };
+        match fan_out_session_summary_count_update_inner(state, &update) {
+            SessionSummaryCountDelivery::Delivered => {
+                let pending = state
+                    .pending_session_summary_count_updates
+                    .get_mut(agent_id)
+                    .expect("pending session count queue disappeared during delivery");
+                assert!(
+                    pending.pop_front().is_some(),
+                    "delivered session count queue was unexpectedly empty"
+                );
+            }
+            SessionSummaryCountDelivery::Deferred => return,
+            SessionSummaryCountDelivery::Discarded => {
+                state
+                    .pending_session_summary_count_updates
+                    .remove(agent_id);
+                return;
+            }
+        }
+    }
 }
 
-fn flush_pending_session_summary_count_updates_for_snapshot(
-    state: &mut HostState,
-    host_stream: &StreamPath,
-) {
-    let Some(snapshot) = state
-        .host_streams
-        .get(host_stream)
-        .and_then(|subscriber| subscriber.session_list_snapshot.as_ref())
-    else {
-        return;
-    };
-    let session_ids = snapshot
-        .sessions
-        .iter()
-        .map(|summary| summary.id.clone())
-        .collect::<HashSet<_>>();
+fn drain_pending_session_summary_count_updates(state: &mut HostState) {
     let agent_ids = state
         .pending_session_summary_count_updates
-        .iter()
-        .filter_map(|(agent_id, update)| {
-            session_ids
-                .contains(&update.payload.session_id)
-                .then_some(agent_id.clone())
-        })
+        .keys()
+        .cloned()
         .collect::<Vec<_>>();
     for agent_id in agent_ids {
         flush_pending_session_summary_count_update(state, &agent_id);
     }
+}
+
+fn flush_pending_session_summary_count_updates_for_subscriber(
+    state: &mut HostState,
+    host_stream: &StreamPath,
+) {
+    let subscribed = state
+        .host_streams
+        .get(host_stream)
+        .is_some_and(|subscriber| subscriber.session_summary_updates_subscribed);
+    if !subscribed {
+        return;
+    }
+    drain_pending_session_summary_count_updates(state);
 }
 
 fn queue_session_summary_count_update(
@@ -17169,16 +17125,8 @@ fn queue_session_summary_count_update(
     let pending = state
         .pending_session_summary_count_updates
         .entry(update.agent_id.clone())
-        .or_insert_with(|| update.clone());
-    if (
-        update.payload.assistant_turn_count,
-        update.payload.updated_at_ms,
-    ) > (
-        pending.payload.assistant_turn_count,
-        pending.payload.updated_at_ms,
-    ) {
-        *pending = update.clone();
-    }
+        .or_default();
+    pending.push_back(update.clone());
 }
 
 fn apply_session_summary_count_update(
@@ -23012,9 +22960,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                     updated_at_ms: summary.updated_at_ms,
                 },
             };
-            state
-                .pending_session_summary_count_updates
-                .insert(agent_id.clone(), update.clone());
+            queue_session_summary_count_update(&mut state, &update);
             update.payload
         };
 
@@ -23059,6 +23005,170 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 .contains_key(&agent_id),
             "matching pending count must be consumed when the snapshot is created"
         );
+    }
+
+    #[tokio::test]
+    async fn empty_session_snapshot_delivers_each_count_and_unsubscribe_discards() {
+        let fixture = compact_fixture().await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let host_path = StreamPath(format!("/host/session-count-snapshot-{}", Uuid::new_v4()));
+        let host_stream = Stream::new(host_path.clone(), tx);
+        assert!(
+            fixture
+                .host
+                .register_host_stream(host_stream.clone(), AgentReplayMode::Lazy)
+                .await
+                .is_empty()
+        );
+        let bootstrap = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("host bootstrap")
+            .expect("host stream remains open");
+        assert_eq!(bootstrap.kind, FrameKind::HostBootstrap);
+        assert!(
+            bootstrap
+                .parse_payload::<HostBootstrapPayload>()
+                .expect("HostBootstrap payload")
+                .sessions
+                .is_empty()
+        );
+        while rx.try_recv().is_ok() {}
+
+        fixture
+            .host
+            .list_sessions(&host_stream, ListSessionsPayload::default())
+            .await
+            .expect("subscribe with an empty session snapshot");
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let envelope = rx.recv().await.expect("host stream remains open");
+                if envelope.kind == FrameKind::SessionList {
+                    let payload: SessionListPayload =
+                        envelope.parse_payload().expect("SessionList payload");
+                    assert!(payload.sessions.is_empty());
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("empty SessionList response");
+
+        let agent_id = AgentId("session-scoped-count-producer".to_owned());
+        let session_id = SessionId("new-session-outside-empty-snapshot".to_owned());
+        {
+            let mut state = fixture.host.state.lock().await;
+            for assistant_turn_count in [1, 2] {
+                fan_out_session_summary_count_update(
+                    &mut state,
+                    &HostSessionSummaryCountUpdate {
+                        agent_id: agent_id.clone(),
+                        payload: SessionSummaryCountUpdatedPayload {
+                            session_id: session_id.clone(),
+                            assistant_turn_count,
+                            updated_at_ms: u64::from(assistant_turn_count) * 10,
+                        },
+                    },
+                );
+            }
+            let snapshot = state
+                .host_streams
+                .get(&host_path)
+                .and_then(|subscriber| subscriber.session_list_snapshot.as_ref())
+                .expect("subscribed session snapshot");
+            assert!(
+                snapshot.sessions.is_empty(),
+                "targeted delivery must not insert a session absent from the snapshot"
+            );
+        }
+
+        let counts = timeout(Duration::from_secs(1), async {
+            let mut counts = Vec::new();
+            while counts.len() < 2 {
+                let envelope = rx.recv().await.expect("host stream remains open");
+                if envelope.kind != FrameKind::SessionSummaryCountUpdated {
+                    continue;
+                }
+                let payload: SessionSummaryCountUpdatedPayload =
+                    envelope.parse_payload().expect("count payload");
+                if payload.session_id == session_id {
+                    counts.push(payload.assistant_turn_count);
+                }
+            }
+            counts
+        })
+        .await
+        .expect("both targeted count updates");
+        assert_eq!(
+            counts,
+            vec![1, 2],
+            "an empty snapshot must receive count one before count two"
+        );
+
+        let pending_agent_id = AgentId("pending-count-before-unsubscribe".to_owned());
+        let visibility = {
+            let state = fixture.host.state.lock().await;
+            state.agent_visibility.clone()
+        };
+        let pending_visibility = SpawnVisibility::new(pending_agent_id.clone(), visibility);
+        {
+            let mut state = fixture.host.state.lock().await;
+            for assistant_turn_count in [3, 4] {
+                fan_out_session_summary_count_update(
+                    &mut state,
+                    &HostSessionSummaryCountUpdate {
+                        agent_id: pending_agent_id.clone(),
+                        payload: SessionSummaryCountUpdatedPayload {
+                            session_id: session_id.clone(),
+                            assistant_turn_count,
+                            updated_at_ms: u64::from(assistant_turn_count) * 10,
+                        },
+                    },
+                );
+            }
+            assert_eq!(
+                state
+                    .pending_session_summary_count_updates
+                    .get(&pending_agent_id)
+                    .expect("deferred count queue")
+                    .iter()
+                    .map(|update| update.payload.assistant_turn_count)
+                    .collect::<Vec<_>>(),
+                vec![3, 4],
+                "deferred response counts must remain lossless and ordered"
+            );
+        }
+        assert!(
+            pending_visibility
+                .agent_visibility
+                .publication_pending(&pending_agent_id)
+        );
+
+        fixture.host.unregister_host_stream(&host_path).await;
+        assert!(
+            fixture
+                .host
+                .state
+                .lock()
+                .await
+                .pending_session_summary_count_updates
+                .is_empty(),
+            "removing the final subscriber must discard undeliverable counts"
+        );
+
+        let mut state = fixture.host.state.lock().await;
+        let outcome = fan_out_session_summary_count_update_inner(
+            &mut state,
+            &HostSessionSummaryCountUpdate {
+                agent_id,
+                payload: SessionSummaryCountUpdatedPayload {
+                    session_id,
+                    assistant_turn_count: 5,
+                    updated_at_ms: 50,
+                },
+            },
+        );
+        assert_eq!(outcome, SessionSummaryCountDelivery::Discarded);
+        assert!(state.pending_session_summary_count_updates.is_empty());
     }
 
     #[tokio::test]
