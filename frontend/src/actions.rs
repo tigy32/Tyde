@@ -152,6 +152,10 @@ pub fn begin_new_chat_with(
     state.draft_backend_override.set(backend_override);
     state.draft_custom_agent_id.set(custom_agent_id);
     state.draft_launch_profile_id.set(None);
+    // Bind the choice to the host it is being made against.
+    state
+        .draft_selection_host
+        .set(state.chat_context_host_id_untracked());
     state
         .draft_session_settings
         .set(SessionSettingsValues::default());
@@ -175,6 +179,10 @@ pub fn begin_new_chat_with_profile(
     state.draft_backend_override.set(Some(profile.backend_kind));
     state.draft_custom_agent_id.set(custom_agent_id);
     state.draft_launch_profile_id.set(Some(profile.id));
+    // A profile id is only meaningful in this host's catalog.
+    state
+        .draft_selection_host
+        .set(state.chat_context_host_id_untracked());
     // Show the profile's settings as the effective draft values, but mark them
     // clean so spawn defers to server-owned profile resolution unless the user
     // edits them.
@@ -213,6 +221,7 @@ pub fn open_new_chat_with_prefill(
     state.draft_backend_override.set(None);
     state.draft_custom_agent_id.set(None);
     state.draft_launch_profile_id.set(None);
+    state.draft_selection_host.set(None);
     state
         .draft_session_settings
         .set(SessionSettingsValues::default());
@@ -322,6 +331,7 @@ pub fn spawn_new_chat(
     state.draft_backend_override.set(None);
     state.draft_custom_agent_id.set(None);
     state.draft_launch_profile_id.set(None);
+    state.draft_selection_host.set(None);
     state
         .draft_session_settings
         .set(SessionSettingsValues::default());

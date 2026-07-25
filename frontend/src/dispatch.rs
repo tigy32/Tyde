@@ -1225,12 +1225,33 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
         },
         FrameKind::SessionList => match envelope.parse_payload::<SessionListPayload>() {
             Ok(payload) => {
-                // Distinguish a first page from a continuation. Replacing the
-                // host's rows unconditionally erases page 1 when page 2
-                // arrives, which makes the paging the protocol advertises
-                // unusable — `offset > 0` is the server telling us this
-                // continues an existing list rather than restating it.
-                let is_continuation = payload.page.cursor.offset > 0;
+                // A continuation must be *verified*, not merely assumed from a
+                // non-zero offset: rows from a different scope or a superseded
+                // generation describe a different result set, and merging them
+                // produces a list that never existed on the server. Only the
+                // exact cursor this client was told to ask for continues the
+                // list it already holds; anything else is treated as a fresh
+                // authoritative page and replaces.
+                let page_key = (
+                    host_id.to_string(),
+                    crate::state::session_list_scope_key(payload.page.scope),
+                );
+                let expected_continuation = state.session_list_pages.with_untracked(|pages| {
+                    pages.get(&page_key).and_then(|prior| match prior.status {
+                        protocol::SessionListPageStatus::More { next_cursor } => Some(next_cursor),
+                        protocol::SessionListPageStatus::Complete => None,
+                    })
+                });
+                let is_continuation = payload.page.cursor.offset > 0
+                    && expected_continuation == Some(payload.page.cursor);
+                if payload.page.cursor.offset > 0 && !is_continuation {
+                    log::warn!(
+                        "session_list: replacing rather than appending an unexpected \
+                         continuation host={host_id} offset={} generation={:?}",
+                        payload.page.cursor.offset,
+                        payload.page.cursor.generation
+                    );
+                }
                 let arriving: Vec<SessionInfo> = payload
                     .sessions
                     .into_iter()
@@ -1260,11 +1281,14 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     sessions
                         .sort_by_key(|session| std::cmp::Reverse(session.summary.updated_at_ms));
                 });
-                // Paging is per host and scope, so it is stored that way. The
-                // panel needs the next cursor to be able to ask for more at
-                // all.
                 state.session_list_pages.update(|pages| {
-                    pages.insert(host_id.to_string(), payload.page);
+                    // A first page for one scope invalidates any accumulated
+                    // paging for the *other* scopes on this host: their rows
+                    // were just replaced wholesale above.
+                    if !is_continuation {
+                        pages.retain(|(page_host, _), _| page_host != host_id);
+                    }
+                    pages.insert(page_key, payload.page);
                 });
             }
             Err(error) => report_dispatch_error(
@@ -1283,15 +1307,27 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     // ordered by last activity, and a per-turn reshuffle would
                     // move rows under the reader's cursor. Only the count the
                     // server just recomputed changes here.
-                    state.sessions.update(|sessions| {
-                        // A session this client has not listed yet needs no
-                        // action: the next SessionList/HostBootstrap carries the
-                        // authoritative row, so inventing one here would
-                        // fabricate a summary we do not have.
+                    // Whether this client holds the host's list in full. The
+                    // prefix argument for reordering only holds when it does:
+                    // with pages outstanding, an *unfetched* session can have
+                    // become the newest, so the rows on screen are no longer a
+                    // most-recent-first prefix and sorting them would assert an
+                    // order the server never published.
+                    let list_is_complete = state.session_list_pages.with_untracked(|pages| {
+                        let host_pages: Vec<_> = pages
+                            .iter()
+                            .filter(|((page_host, _), _)| page_host == host_id)
+                            .collect();
+                        !host_pages.is_empty()
+                            && host_pages.iter().all(|(_, page)| {
+                                matches!(page.status, protocol::SessionListPageStatus::Complete)
+                            })
+                    });
+                    let patched = state.sessions.try_update(|sessions| {
                         let Some(session) = sessions.iter_mut().find(|session| {
                             session.host_id == host_id && session.summary.id == payload.session_id
                         }) else {
-                            return;
+                            return false;
                         };
                         session.summary.message_count = payload.assistant_turn_count;
                         // The turn advanced last-activity too, and the frame now
@@ -1299,17 +1335,26 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         // displayed date true instead of leaving it behind the
                         // count beside it.
                         session.summary.updated_at_ms = payload.updated_at_ms;
-                        // Re-sort on the same key the list is defined by. The
-                        // client holds a most-recent-first *prefix* of the
-                        // server's order, so a row whose activity advanced can
-                        // only need to move earlier — never past rows it has
-                        // not fetched, which are all older. Leaving it in place
-                        // would show a fresh date sitting below stale ones, and
-                        // the next list frame would jump it anyway.
-                        sessions.sort_by_key(|session| {
-                            std::cmp::Reverse(session.summary.updated_at_ms)
-                        });
+                        if list_is_complete {
+                            sessions.sort_by_key(|session| {
+                                std::cmp::Reverse(session.summary.updated_at_ms)
+                            });
+                        }
+                        true
                     });
+
+                    // The update named a session this client does not hold. With
+                    // the list complete that is simply another host's or a
+                    // deleted session and there is nothing to do. With pages
+                    // outstanding it means an unfetched session just became more
+                    // recent than rows currently on screen, so the visible page
+                    // is no longer authoritative. The frame carries only a count
+                    // and a timestamp — not enough to insert the row — so ask
+                    // the server to restate the first page rather than render an
+                    // order known to be wrong.
+                    if patched != Some(true) && !list_is_complete {
+                        request_first_session_page(state, host_id);
+                    }
                 }
                 Err(error) => report_dispatch_error(
                     state,
@@ -5451,6 +5496,47 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
     restore_draft_selection_after_host_bootstrap(state, host_id);
 }
 
+/// Ask `host_id` to restate its first session page.
+///
+/// Used when a targeted activity update proves the client's view of the order
+/// is stale but carries too little to repair it locally. Guarded by an
+/// in-flight marker so a burst of updates for unfetched sessions cannot turn
+/// into a burst of list requests.
+fn request_first_session_page(state: &AppState, host_id: &str) {
+    let already_requested = state
+        .session_list_refresh_in_flight
+        .try_update(|hosts| !hosts.insert(host_id.to_string()))
+        .unwrap_or(true);
+    if already_requested {
+        return;
+    }
+    let Some(host_stream) = state.host_stream_untracked(host_id) else {
+        state.session_list_refresh_in_flight.update(|hosts| {
+            hosts.remove(host_id);
+        });
+        return;
+    };
+    let host_id = host_id.to_owned();
+    let refresh_flag = state.session_list_refresh_in_flight;
+    spawn_local(async move {
+        if let Err(error) = crate::send::send_frame(
+            &host_id,
+            host_stream,
+            FrameKind::ListSessions,
+            &protocol::ListSessionsPayload::default(),
+        )
+        .await
+        {
+            log::error!("failed to refresh session list for {host_id}: {error}");
+        }
+        // Cleared on completion either way: a failed request must not wedge
+        // the marker and suppress every later refresh.
+        let _ = refresh_flag.try_update(|hosts| {
+            hosts.remove(&host_id);
+        });
+    });
+}
+
 /// Reopen the chat that was active before a reload, once its owning host's
 /// bootstrap has installed the agents it names.
 ///
@@ -5478,7 +5564,13 @@ fn restore_active_chat_after_host_bootstrap(state: &AppState, host_id: &str) {
         agents
             .iter()
             .find(|agent| agent.host_id == host_id && agent.agent_id == pending.agent_id)
-            .map(|agent| (agent.name.clone(), agent.project_id.clone()))
+            .map(|agent| {
+                (
+                    agent.name.clone(),
+                    agent.project_id.clone(),
+                    agent.session_id.clone(),
+                )
+            })
     });
 
     // The chat's project must still be the one the user is looking at.
@@ -5486,8 +5578,20 @@ fn restore_active_chat_after_host_bootstrap(state: &AppState, host_id: &str) {
     // ownership disagreeing is the contradiction this whole finding is about.
     let active_project = state.active_project.get_untracked();
     let restores_cleanly = match &live {
-        Some((_, agent_project)) => {
-            *agent_project == pending.project_id
+        Some((_, agent_project, agent_session)) => {
+            // The session is the stable half of the identity. An agent id can
+            // be reused by a different session inside the same project, so
+            // matching host/agent/project alone proves an agent exists, not
+            // that it is still the conversation the user left. When the
+            // pointer predates session assignment there is nothing to compare,
+            // and host/agent/project is the best identity that ever existed
+            // for it.
+            let session_matches = pending
+                .session_id
+                .as_ref()
+                .is_none_or(|session_id| agent_session.as_ref() == Some(session_id));
+            session_matches
+                && *agent_project == pending.project_id
                 && pending.project_id == active_project.as_ref().map(|p| p.project_id.clone())
                 && active_project
                     .as_ref()
@@ -5503,7 +5607,7 @@ fn restore_active_chat_after_host_bootstrap(state: &AppState, host_id: &str) {
         state.retire_pending_restores();
         return;
     }
-    let (name, _) = live.expect("checked above");
+    let (name, _, _) = live.expect("checked above");
 
     let agent_ref = ActiveAgentRef {
         host_id: pending.host_id.clone(),
@@ -5575,6 +5679,9 @@ fn restore_draft_selection_after_host_bootstrap(state: &AppState, host_id: &str)
 
     state.draft_backend_override.set(pending.backend);
     state.draft_launch_profile_id.set(pending.launch_profile);
+    // Keep the binding alive past the restore: a later switch to another host
+    // must drop this selection rather than carry it across.
+    state.draft_selection_host.set(Some(host_id.to_owned()));
 }
 
 fn agent_info_from_payload(host_id: &str, payload: NewAgentPayload) -> AgentInfo {
@@ -6151,6 +6258,14 @@ mod tests {
     }
 
     fn restore_agent_payload(agent: &str, project: Option<&str>) -> NewAgentPayload {
+        restore_agent_payload_with_session(agent, project, None)
+    }
+
+    fn restore_agent_payload_with_session(
+        agent: &str,
+        project: Option<&str>,
+        session: Option<&str>,
+    ) -> NewAgentPayload {
         NewAgentPayload {
             agent_id: AgentId(agent.to_owned()),
             name: format!("Agent {agent}"),
@@ -6159,7 +6274,7 @@ mod tests {
             workspace_roots: Vec::new(),
             project_id: project.map(|p| ProjectId(p.to_owned())),
             parent_agent_id: None,
-            session_id: None,
+            session_id: session.map(|s| protocol::SessionId(s.to_owned())),
             custom_agent_id: None,
             workflow: None,
             created_at_ms: 0,
@@ -6265,34 +6380,127 @@ mod tests {
         });
     }
 
-    /// FE-05: project restoration opens a synthetic New Chat first. The chat
-    /// restore must upgrade that draft, not add a second tab beside it.
+    /// RF-01: the real cold path restores the project *first*, and that step
+    /// used to run through the user-selection path and consume the chat and
+    /// draft it was about to restore. Everything is seeded before a single
+    /// bootstrap so the production ordering is what runs.
+    ///
+    /// Also FE-05: the project restore opens a synthetic New Chat, which the
+    /// chat restore must upgrade rather than sit beside.
     #[test]
-    fn cold_restore_leaves_exactly_one_chat_tab() {
+    fn one_bootstrap_restores_project_chat_and_draft_together() {
         let owner = leptos::reactive::owner::Owner::new();
         owner.with(|| {
             let state = AppState::new();
-            let project = ActiveProjectRef {
-                host_id: "host-a".to_owned(),
-                project_id: ProjectId("project-a".to_owned()),
-            };
-            state.projects.update(|projects| {
-                projects.push(ProjectInfo {
+            // Exactly what a reload leaves behind: three pending values and an
+            // untouched center zone.
+            state
+                .pending_active_project_restore
+                .set(Some(ActiveProjectRef {
                     host_id: "host-a".to_owned(),
-                    project: restore_project("project-a"),
-                });
-            });
-            // Cold restore: project switch creates the synthetic New Chat.
-            state.switch_active_project(Some(project));
-            assert_eq!(chat_tab_count(&state), 1, "the synthetic draft exists");
-
+                    project_id: ProjectId("project-a".to_owned()),
+                }));
             state
                 .pending_active_chat_restore
                 .set(Some(crate::state::PersistedChatRef {
                     host_id: "host-a".to_owned(),
                     agent_id: AgentId("agent-a".to_owned()),
                     project_id: Some(ProjectId("project-a".to_owned())),
+                    session_id: Some(protocol::SessionId("session-a".to_owned())),
                 }));
+            state
+                .pending_draft_restore
+                .set(Some(crate::state::PersistedDraftSelection {
+                    host_id: "host-a".to_owned(),
+                    backend: Some(BackendKind::Hermes),
+                    launch_profile: Some(LaunchProfileId("hermes:profile:qa".to_owned())),
+                }));
+
+            let catalog = protocol::LaunchProfileCatalog {
+                entries: vec![protocol::LaunchProfileEntry::Ready {
+                    profile: protocol::LaunchProfile {
+                        id: LaunchProfileId("hermes:profile:qa".to_owned()),
+                        kind: protocol::LaunchProfileKind::BackendDefault,
+                        label: "Hermes — qa".to_owned(),
+                        description: None,
+                        backend_kind: BackendKind::Hermes,
+                        session_settings: Default::default(),
+                    },
+                }],
+                default_profile_id: None,
+            };
+
+            apply_host_bootstrap(
+                &state,
+                "host-a",
+                restore_bootstrap(
+                    vec![BackendKind::Hermes],
+                    catalog,
+                    vec![restore_project("project-a")],
+                    vec![restore_agent_payload_with_session(
+                        "agent-a",
+                        Some("project-a"),
+                        Some("session-a"),
+                    )],
+                ),
+            );
+
+            assert_eq!(
+                state.active_project.get_untracked(),
+                Some(ActiveProjectRef {
+                    host_id: "host-a".to_owned(),
+                    project_id: ProjectId("project-a".to_owned()),
+                }),
+                "the project restores"
+            );
+            assert_eq!(
+                state.active_agent.get_untracked(),
+                Some(ActiveAgentRef {
+                    host_id: "host-a".to_owned(),
+                    agent_id: AgentId("agent-a".to_owned()),
+                }),
+                "and the chat restores rather than being consumed by the project step"
+            );
+            assert_eq!(
+                state.draft_launch_profile_id.get_untracked(),
+                Some(LaunchProfileId("hermes:profile:qa".to_owned())),
+                "and so does the draft profile"
+            );
+            assert_eq!(
+                state.draft_backend_override.get_untracked(),
+                Some(BackendKind::Hermes)
+            );
+            assert_eq!(
+                chat_tab_count(&state),
+                1,
+                "the restored chat replaces the synthetic draft rather than \
+                 sitting beside it"
+            );
+        });
+    }
+
+    /// RF-02: an agent id can be reused by a different session in the same
+    /// project, so it is an accelerator and not the identity.
+    #[test]
+    fn chat_restore_refuses_a_session_mismatch() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            state
+                .pending_active_project_restore
+                .set(Some(ActiveProjectRef {
+                    host_id: "host-a".to_owned(),
+                    project_id: ProjectId("project-a".to_owned()),
+                }));
+            state
+                .pending_active_chat_restore
+                .set(Some(crate::state::PersistedChatRef {
+                    host_id: "host-a".to_owned(),
+                    agent_id: AgentId("agent-a".to_owned()),
+                    project_id: Some(ProjectId("project-a".to_owned())),
+                    session_id: Some(protocol::SessionId("session-old".to_owned())),
+                }));
+
             apply_host_bootstrap(
                 &state,
                 "host-a",
@@ -6300,22 +6508,99 @@ mod tests {
                     vec![BackendKind::Hermes],
                     Default::default(),
                     vec![restore_project("project-a")],
-                    vec![restore_agent_payload("agent-a", Some("project-a"))],
+                    // Same agent id, different conversation.
+                    vec![restore_agent_payload_with_session(
+                        "agent-a",
+                        Some("project-a"),
+                        Some("session-new"),
+                    )],
                 ),
             );
 
             assert_eq!(
                 state.active_agent.get_untracked(),
-                Some(ActiveAgentRef {
+                None,
+                "a live agent attached to a different session is not the chat \
+                 the user left"
+            );
+        });
+    }
+
+    /// RF-03: host scoping cannot stop at the pending form. Once a draft is
+    /// applied it sits in global signals, so moving the chat context to another
+    /// host must drop it rather than carry it across.
+    #[test]
+    fn a_restored_draft_is_dropped_when_the_context_moves_to_another_host() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            state.projects.update(|projects| {
+                projects.push(ProjectInfo {
                     host_id: "host-a".to_owned(),
-                    agent_id: AgentId("agent-a".to_owned()),
-                }),
-                "the persisted chat is restored"
+                    project: restore_project("project-a"),
+                });
+                projects.push(ProjectInfo {
+                    host_id: "host-b".to_owned(),
+                    project: restore_project("project-b"),
+                });
+            });
+            state.switch_active_project(Some(ActiveProjectRef {
+                host_id: "host-a".to_owned(),
+                project_id: ProjectId("project-a".to_owned()),
+            }));
+            state
+                .pending_draft_restore
+                .set(Some(crate::state::PersistedDraftSelection {
+                    host_id: "host-a".to_owned(),
+                    backend: Some(BackendKind::Hermes),
+                    launch_profile: Some(LaunchProfileId("hermes:profile:qa".to_owned())),
+                }));
+
+            let catalog = protocol::LaunchProfileCatalog {
+                entries: vec![protocol::LaunchProfileEntry::Ready {
+                    profile: protocol::LaunchProfile {
+                        id: LaunchProfileId("hermes:profile:qa".to_owned()),
+                        kind: protocol::LaunchProfileKind::BackendDefault,
+                        label: "Hermes — qa".to_owned(),
+                        description: None,
+                        backend_kind: BackendKind::Hermes,
+                        session_settings: Default::default(),
+                    },
+                }],
+                default_profile_id: None,
+            };
+            apply_host_bootstrap(
+                &state,
+                "host-a",
+                restore_bootstrap(
+                    vec![BackendKind::Hermes],
+                    catalog,
+                    vec![restore_project("project-a")],
+                    Vec::new(),
+                ),
             );
             assert_eq!(
-                chat_tab_count(&state),
-                1,
-                "and it replaces the synthetic draft rather than sitting beside it"
+                state.draft_launch_profile_id.get_untracked(),
+                Some(LaunchProfileId("hermes:profile:qa".to_owned())),
+                "precondition: the draft restored on its own host"
+            );
+
+            // The user moves to a project on a different host.
+            state.switch_active_project(Some(ActiveProjectRef {
+                host_id: "host-b".to_owned(),
+                project_id: ProjectId("project-b".to_owned()),
+            }));
+
+            assert_eq!(
+                state.draft_launch_profile_id.get_untracked(),
+                None,
+                "host-a's profile is meaningless in host-b's catalog and must \
+                 not be carried into a spawn against host-b"
+            );
+            assert_eq!(
+                state.draft_backend_override.get_untracked(),
+                None,
+                "and its backend must not bypass host-b's enabled set"
             );
         });
     }
@@ -8314,12 +8599,16 @@ mod wasm_tests {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn session_list_envelope(
         sessions: Vec<protocol::SessionSummary>,
+        generation: u64,
         offset: u32,
         total: u32,
+        more_at: Option<u32>,
         seq: u64,
     ) -> Envelope {
+        let generation = protocol::SessionListGeneration(generation);
         host_frame(
             FrameKind::SessionList,
             seq,
@@ -8327,13 +8616,15 @@ mod wasm_tests {
                 sessions,
                 page: protocol::SessionListPageInfo {
                     scope: Default::default(),
-                    cursor: protocol::SessionListCursor {
-                        generation: protocol::SessionListGeneration(1),
-                        offset,
-                    },
+                    cursor: protocol::SessionListCursor { generation, offset },
                     limit: 2,
                     total_count: total,
-                    status: protocol::SessionListPageStatus::Complete,
+                    status: match more_at {
+                        Some(offset) => protocol::SessionListPageStatus::More {
+                            next_cursor: protocol::SessionListCursor { generation, offset },
+                        },
+                        None => protocol::SessionListPageStatus::Complete,
+                    },
                 },
             },
         )
@@ -8347,14 +8638,30 @@ mod wasm_tests {
     fn session_summary_count_update_patches_one_row_in_place() {
         reset_inbound_state_for_host("host-a");
         let state = AppState::new();
-        state.sessions.set(vec![
-            listed_session("host-a", "session-1", 0, 200),
-            listed_session("host-a", "session-2", 7, 100),
-            listed_session("host-b", "session-1", 3, 300),
-        ]);
+        state
+            .sessions
+            .set(vec![listed_session("host-b", "session-1", 3, 300)]);
+        // Delivered as a real complete list so the ordering assertion below
+        // rests on the same completeness the reducer requires, rather than on
+        // hand-seeded rows with no paging state behind them.
+        dispatch_envelope(
+            &state,
+            "host-a",
+            session_list_envelope(
+                vec![
+                    listed_session("host-a", "session-1", 0, 200).summary,
+                    listed_session("host-a", "session-2", 7, 100).summary,
+                ],
+                1,
+                0,
+                2,
+                None,
+                0,
+            ),
+        );
 
         // Newest activity of the three, so it must also become the first row.
-        dispatch_envelope(&state, "host-a", count_update_envelope("session-1", 4, 400, 0));
+        dispatch_envelope(&state, "host-a", count_update_envelope("session-1", 4, 400, 1));
 
         let sessions = state.sessions.get_untracked();
         let patched = sessions
@@ -8433,17 +8740,19 @@ mod wasm_tests {
         assert_eq!(sessions[0].summary.message_count, 1);
     }
 
-    /// FE-07: a continuation page must accumulate, not replace. Page 2 erasing
-    /// page 1 makes the paging the protocol advertises unusable.
+    /// FE-07/RF-05: a continuation must accumulate, and only the exact cursor
+    /// the server told us to ask for counts as one. A page from a superseded
+    /// generation describes a different result set and merging it would build
+    /// a list the server never published.
     #[wasm_bindgen_test]
-    fn session_list_pages_accumulate_and_retain_other_hosts() {
+    fn session_list_appends_only_the_advertised_continuation() {
         reset_inbound_state_for_host("host-a");
         let state = AppState::new();
         state
             .sessions
             .set(vec![listed_session("host-b", "keep-me", 1, 500)]);
 
-        // Page 1 (offset 0) replaces host-a's rows.
+        // Page 1 advertises more at offset 2.
         dispatch_envelope(
             &state,
             "host-a",
@@ -8452,14 +8761,57 @@ mod wasm_tests {
                     listed_session("host-a", "s1", 1, 300).summary,
                     listed_session("host-a", "s2", 2, 200).summary,
                 ],
+                1,
                 0,
                 4,
+                Some(2),
                 0,
             ),
         );
-        assert_eq!(state.sessions.get_untracked().len(), 3);
 
-        // Page 2 (offset 2) appends.
+        // A stale-generation page at the right offset must NOT be appended.
+        dispatch_envelope(
+            &state,
+            "host-a",
+            session_list_envelope(
+                vec![listed_session("host-a", "ghost", 9, 250).summary],
+                7,
+                2,
+                1,
+                None,
+                1,
+            ),
+        );
+        let host_a: Vec<String> = state
+            .sessions
+            .get_untracked()
+            .iter()
+            .filter(|s| s.host_id == "host-a")
+            .map(|s| s.summary.id.0.clone())
+            .collect();
+        assert_eq!(
+            host_a,
+            vec!["ghost"],
+            "a page from another generation replaces rather than merging into \
+             a list it does not continue"
+        );
+
+        // Re-establish page 1, then deliver the advertised continuation.
+        dispatch_envelope(
+            &state,
+            "host-a",
+            session_list_envelope(
+                vec![
+                    listed_session("host-a", "s1", 1, 300).summary,
+                    listed_session("host-a", "s2", 2, 200).summary,
+                ],
+                2,
+                0,
+                4,
+                Some(2),
+                2,
+            ),
+        );
         dispatch_envelope(
             &state,
             "host-a",
@@ -8469,8 +8821,10 @@ mod wasm_tests {
                     listed_session("host-a", "s4", 4, 100).summary,
                 ],
                 2,
+                2,
                 4,
-                1,
+                None,
+                3,
             ),
         );
 
@@ -8483,48 +8837,257 @@ mod wasm_tests {
         assert_eq!(
             host_a,
             vec!["s1", "s2", "s3", "s4"],
-            "page 1 must survive page 2"
+            "the advertised continuation appends to page 1"
         );
         assert!(
             sessions.iter().any(|s| s.host_id == "host-b"),
             "another host's rows must be untouched by host-a paging"
         );
-        assert_eq!(
-            state
-                .session_list_pages
-                .get_untracked()
-                .get("host-a")
-                .map(|page| page.total_count),
-            Some(4),
-            "the panel needs paging state to be able to ask for more"
-        );
+    }
 
-        // A first page again replaces rather than duplicating.
+    /// RF-04: while pages are outstanding the visible rows are not a
+    /// most-recent-first prefix, because an *unfetched* session can have become
+    /// the newest. Reordering on that assumption would assert an order the
+    /// server never published, so it is withheld until the list is complete.
+    #[wasm_bindgen_test]
+    fn ordering_is_only_asserted_once_the_list_is_complete() {
+        reset_inbound_state_for_host("host-a");
+        let state = AppState::new();
+
+        // Incomplete: page 1 of 4.
         dispatch_envelope(
             &state,
             "host-a",
-            session_list_envelope(vec![listed_session("host-a", "s1", 9, 300).summary], 0, 1, 2),
+            session_list_envelope(
+                vec![
+                    listed_session("host-a", "s1", 1, 300).summary,
+                    listed_session("host-a", "s2", 2, 200).summary,
+                ],
+                1,
+                0,
+                4,
+                Some(2),
+                0,
+            ),
         );
-        let sessions = state.sessions.get_untracked();
+        dispatch_envelope(&state, "host-a", count_update_envelope("s2", 5, 900, 1));
+
+        let order: Vec<String> = state
+            .sessions
+            .get_untracked()
+            .iter()
+            .map(|s| s.summary.id.0.clone())
+            .collect();
         assert_eq!(
-            sessions.iter().filter(|s| s.host_id == "host-a").count(),
-            1,
-            "a fresh first page replaces the accumulated list"
+            order,
+            vec!["s1", "s2"],
+            "with pages outstanding the client must not claim an order it \
+             cannot know is correct"
         );
         assert_eq!(
-            sessions
+            state
+                .sessions
+                .get_untracked()
                 .iter()
-                .find(|s| s.host_id == "host-a" && s.summary.id.0 == "s1")
-                .expect("s1 survives the replacement")
+                .find(|s| s.summary.id.0 == "s2")
+                .expect("s2 listed")
                 .summary
-                .message_count,
-            9,
-            "and carries the replacing page's values"
+                .updated_at_ms,
+            900,
+            "the row's own facts are still updated — only the ordering claim \
+             is withheld"
+        );
+
+        // Complete list: ordering becomes the client's to maintain.
+        reset_inbound_state_for_host("host-c");
+        let complete = AppState::new();
+        dispatch_envelope(
+            &complete,
+            "host-c",
+            session_list_envelope(
+                vec![
+                    listed_session("host-c", "c1", 1, 300).summary,
+                    listed_session("host-c", "c2", 2, 200).summary,
+                ],
+                1,
+                0,
+                2,
+                None,
+                0,
+            ),
+        );
+        dispatch_envelope(&complete, "host-c", count_update_envelope("c2", 5, 900, 1));
+        let order: Vec<String> = complete
+            .sessions
+            .get_untracked()
+            .iter()
+            .map(|s| s.summary.id.0.clone())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["c2", "c1"],
+            "with the whole list held, the refreshed row takes its place"
+        );
+    }
+
+    /// RF-06: the whole reload lifecycle through real browser storage —
+    /// persist, construct a fresh state as the reload would, dispatch an
+    /// unrelated bootstrap, then the owning one, and read storage back.
+    ///
+    /// Native tests cannot cover this: `persist_workspace_selection` is a
+    /// no-op off wasm, which is exactly why RF-01's self-retirement survived a
+    /// wall of restore tests.
+    #[wasm_bindgen_test]
+    async fn reload_lifecycle_restores_through_real_storage() {
+        clear_workspace_storage();
+        reset_inbound_state_for_host("host-a");
+        reset_inbound_state_for_host("host-z");
+
+        // What the previous session left behind.
+        crate::state::persist_workspace_selection_for_tests(
+            &crate::state::PersistedWorkspaceSelection {
+                active_chat: Some(crate::state::PersistedChatRef {
+                    host_id: "host-a".to_owned(),
+                    agent_id: AgentId("agent-a".to_owned()),
+                    project_id: Some(ProjectId("project-a".to_owned())),
+                    session_id: Some(protocol::SessionId("session-a".to_owned())),
+                }),
+                draft: Some(crate::state::PersistedDraftSelection {
+                    host_id: "host-a".to_owned(),
+                    backend: Some(BackendKind::Hermes),
+                    launch_profile: None,
+                }),
+            },
+        );
+        crate::state::persist_active_project_for_tests(Some(&ActiveProjectRef {
+            host_id: "host-a".to_owned(),
+            project_id: ProjectId("project-a".to_owned()),
+        }));
+
+        // The reload.
+        let state = AppState::new();
+        assert!(
+            state.pending_active_chat_restore.get_untracked().is_some(),
+            "a fresh state must pick the pointer up from storage"
+        );
+
+        // An unrelated host connects first and must consume nothing.
+        apply_host_bootstrap(
+            &state,
+            "host-z",
+            restore_bootstrap(
+                vec![BackendKind::Claude],
+                Default::default(),
+                Vec::new(),
+                Vec::new(),
+            ),
         );
         assert!(
-            sessions.iter().any(|s| s.host_id == "host-b"),
-            "replacing one host's first page must not drop another host"
+            state.pending_active_chat_restore.get_untracked().is_some(),
+            "an unrelated host must leave the pointer pending"
         );
+
+        // The owning host.
+        apply_host_bootstrap(
+            &state,
+            "host-a",
+            restore_bootstrap(
+                vec![BackendKind::Hermes],
+                Default::default(),
+                vec![restore_project("project-a")],
+                vec![restore_agent_payload_with_session(
+                    "agent-a",
+                    Some("project-a"),
+                    Some("session-a"),
+                )],
+            ),
+        );
+        next_tick().await;
+
+        assert_eq!(
+            state.active_agent.get_untracked(),
+            Some(ActiveAgentRef {
+                host_id: "host-a".to_owned(),
+                agent_id: AgentId("agent-a".to_owned()),
+            }),
+            "the chat restores on the real bootstrap path"
+        );
+        assert_eq!(
+            state.draft_backend_override.get_untracked(),
+            Some(BackendKind::Hermes),
+            "and so does the draft"
+        );
+
+        // Storage must still describe the restored workspace, not be blanked by
+        // the restore itself.
+        let stored = crate::state::load_workspace_selection_for_tests();
+        let chat = stored.active_chat.expect("storage keeps the restored chat");
+        assert_eq!(chat.agent_id, AgentId("agent-a".to_owned()));
+        assert_eq!(
+            chat.session_id,
+            Some(protocol::SessionId("session-a".to_owned())),
+            "including the session identity, so the next reload can verify it"
+        );
+
+        clear_workspace_storage();
+    }
+
+    /// RF-02's missing case: a chat opened before its session exists must have
+    /// its stored identity upgraded when the session arrives, even though
+    /// `active_agent` never changes.
+    #[wasm_bindgen_test]
+    async fn stored_identity_gains_the_session_when_it_is_assigned() {
+        clear_workspace_storage();
+        let state = AppState::new();
+        let agent_ref = ActiveAgentRef {
+            host_id: "host-a".to_owned(),
+            agent_id: AgentId("agent-a".to_owned()),
+        };
+        state.agents.update(|agents| {
+            agents.push(agent_info_from_payload(
+                "host-a",
+                restore_agent_payload("agent-a", Some("project-a")),
+            ));
+        });
+        state.open_tab(
+            TabContent::chat_with_agent(agent_ref.clone()),
+            "Agent".to_owned(),
+            true,
+        );
+        next_tick().await;
+        assert_eq!(
+            crate::state::load_workspace_selection_for_tests()
+                .active_chat
+                .and_then(|chat| chat.session_id),
+            None,
+            "precondition: no session assigned yet"
+        );
+
+        // The backend assigns the session; the active tab does not change.
+        state.agents.update(|agents| {
+            if let Some(agent) = agents.iter_mut().find(|a| a.agent_id == agent_ref.agent_id) {
+                agent.session_id = Some(protocol::SessionId("session-new".to_owned()));
+            }
+        });
+        next_tick().await;
+
+        assert_eq!(
+            crate::state::load_workspace_selection_for_tests()
+                .active_chat
+                .and_then(|chat| chat.session_id),
+            Some(protocol::SessionId("session-new".to_owned())),
+            "the stored identity must gain the session, or only pre-existing \
+             agents could ever be restored by session"
+        );
+
+        clear_workspace_storage();
+    }
+
+    fn clear_workspace_storage() {
+        crate::state::persist_workspace_selection_for_tests(
+            &crate::state::PersistedWorkspaceSelection::default(),
+        );
+        crate::state::persist_active_project_for_tests(None);
     }
 
     /// FE-08: the visible badge must actually rerender. Inspecting `state`

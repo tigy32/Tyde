@@ -197,6 +197,21 @@ fn persist_active_project(project: Option<&ActiveProjectRef>) {
 #[cfg(not(target_arch = "wasm32"))]
 fn persist_active_project(_project: Option<&ActiveProjectRef>) {}
 
+/// Key for accumulated session-list paging state.
+///
+/// `SessionListScope` is not `Hash`, so the scope travels as a stable
+/// discriminant rather than the enum itself; the pair is still what identifies
+/// one paged result set.
+pub type SessionListPageKey = (String, &'static str);
+
+/// Stable discriminant for a scope, for use in [`SessionListPageKey`].
+pub fn session_list_scope_key(scope: protocol::SessionListScope) -> &'static str {
+    match scope {
+        protocol::SessionListScope::RootSessions => "root_sessions",
+        protocol::SessionListScope::AllSessions => "all_sessions",
+    }
+}
+
 /// The chat that was open, with enough identity to prove it is still the *same*
 /// chat in the same place on the way back in.
 ///
@@ -206,11 +221,19 @@ fn persist_active_project(_project: Option<&ActiveProjectRef>) {}
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PersistedChatRef {
     pub host_id: String,
+    /// Live-instance accelerator: which agent was rendering the chat.
     pub agent_id: AgentId,
     /// Project that owned the chat, or `None` for a Home chat. Restoration
     /// refuses to open the chat into a different project.
     #[serde(default)]
     pub project_id: Option<ProjectId>,
+    /// The backend session the chat was showing, once known. This is the
+    /// stable half of the identity: an agent id can be reused by a different
+    /// session in the same project, so matching on the agent alone proves only
+    /// that *an* agent exists, not that it is the conversation the user left.
+    /// `None` while the agent has not been assigned a session yet.
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
 }
 
 /// A draft backend/launch-profile choice, scoped to the host it was made
@@ -308,6 +331,24 @@ fn persist_workspace_selection(selection: &PersistedWorkspaceSelection) {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn persist_workspace_selection(_selection: &PersistedWorkspaceSelection) {}
+
+// Test-only re-exports. The persistence functions are private so nothing but
+// the effect writes them in production, but the reload lifecycle can only be
+// covered from a browser test that seeds and reads real storage.
+#[cfg(test)]
+pub fn persist_workspace_selection_for_tests(selection: &PersistedWorkspaceSelection) {
+    persist_workspace_selection(selection);
+}
+
+#[cfg(test)]
+pub fn load_workspace_selection_for_tests() -> PersistedWorkspaceSelection {
+    load_workspace_selection()
+}
+
+#[cfg(test)]
+pub fn persist_active_project_for_tests(project: Option<&ActiveProjectRef>) {
+    persist_active_project(project);
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TabId(pub u64);
@@ -2528,10 +2569,23 @@ pub struct AppState {
     /// only valid against that host's enabled backends and launch catalog, and
     /// neither exists until the bootstrap lands.
     pub pending_draft_restore: RwSignal<Option<PersistedDraftSelection>>,
-    /// Latest paging state per host, so a continuation page can be requested
-    /// and recognised. Keyed by host because cursors are host- and
-    /// scope-local.
-    pub session_list_pages: RwSignal<HashMap<String, protocol::SessionListPageInfo>>,
+    /// Host the *live* draft selection belongs to.
+    ///
+    /// Host scoping cannot stop at the serialized pending form: once a draft is
+    /// applied it lives in the same global `draft_backend_override` /
+    /// `draft_launch_profile_id` signals, and switching to another host would
+    /// otherwise carry host A's profile — meaningless in B's catalog — into a
+    /// spawn against B.
+    pub draft_selection_host: RwSignal<Option<String>>,
+    /// Latest paging state per `(host, scope)`, so a continuation can be both
+    /// requested and *verified*. Scope is part of the key because cursors are
+    /// scope-local: a page from another scope describes a different result set
+    /// and its rows must not be merged into this one.
+    pub session_list_pages: RwSignal<HashMap<SessionListPageKey, protocol::SessionListPageInfo>>,
+    /// Hosts with a first-page refresh already in flight, so a burst of
+    /// activity updates for unfetched sessions cannot become a burst of list
+    /// requests.
+    pub session_list_refresh_in_flight: RwSignal<HashSet<String>>,
     /// Derived from `center_zone.composer_owner()`. The focused pane's active
     /// chat wins; when a file pane is focused, the other pane's active chat
     /// remains the singleton composer owner. Read-only by design.
@@ -3028,7 +3082,9 @@ impl AppState {
             pending_active_project_restore: RwSignal::new(load_active_project()),
             pending_active_chat_restore: RwSignal::new(restored_selection.active_chat.clone()),
             pending_draft_restore: RwSignal::new(restored_selection.draft.clone()),
+            draft_selection_host: RwSignal::new(None),
             session_list_pages: RwSignal::new(HashMap::new()),
+            session_list_refresh_in_flight: RwSignal::new(HashSet::new()),
             active_agent,
             chat_rows: RwSignal::new(HashMap::new()),
             chat_tool_rows: RwSignal::new(HashMap::new()),
@@ -3181,10 +3237,12 @@ impl AppState {
                 return;
             }
             let active_chat = active_agent.and_then(|agent_ref| {
-                // The owning project is part of the chat's identity, so read it
-                // from the live agent rather than from whichever project
-                // happens to be active at write time.
-                selection_state.agents.with_untracked(|agents| {
+                // Tracked, not untracked: an agent's `session_id` arrives after
+                // the tab is already open and `active_agent` never changes for
+                // it. Reading this untracked would freeze the stored identity
+                // at the pre-session state, so a chat opened from a fresh spawn
+                // could never be restored by session.
+                selection_state.agents.with(|agents| {
                     agents
                         .iter()
                         .find(|agent| {
@@ -3195,6 +3253,7 @@ impl AppState {
                             host_id: agent_ref.host_id.clone(),
                             agent_id: agent_ref.agent_id.clone(),
                             project_id: agent.project_id.clone(),
+                            session_id: agent.session_id.clone(),
                         })
                 })
             });
@@ -3211,6 +3270,27 @@ impl AppState {
                 active_chat,
                 draft,
             });
+        });
+
+        // Drop a live draft selection when the chat context moves to another
+        // host. The selection is only meaningful against the host it was made
+        // for: a launch-profile id means nothing in another host's catalog, and
+        // a backend enabled on one host may be disabled on the next. Tracking
+        // the context host here is what makes the binding hold *after* a
+        // successful restore, not only while the restore is pending.
+        let draft_host_state = state.clone();
+        Effect::new(move |_| {
+            let context_host = draft_host_state.chat_context_host_id();
+            let bound_host = draft_host_state.draft_selection_host.get_untracked();
+            let Some(bound_host) = bound_host else {
+                return;
+            };
+            if context_host.as_deref() == Some(bound_host.as_str()) {
+                return;
+            }
+            draft_host_state.draft_selection_host.set(None);
+            draft_host_state.draft_backend_override.set(None);
+            draft_host_state.draft_launch_profile_id.set(None);
         });
 
         state
@@ -4042,7 +4122,9 @@ impl AppState {
             })
         });
         if exists {
-            self.switch_active_project(Some(pending));
+            // Restoring, not choosing: must not retire the chat/draft that
+            // are about to be restored on top of this project.
+            self.activate_restored_project(Some(pending));
         } else {
             persist_active_project(None);
         }
@@ -4125,6 +4207,26 @@ impl AppState {
     /// incoming project's last snapshot (or a fresh empty Chat view for a
     /// project seen for the first time, or Home view when switching to none).
     pub fn switch_active_project(&self, next: Option<ActiveProjectRef>) {
+        // A user picking a project is a statement about what the center should
+        // show, so it outranks any restore still in flight.
+        self.retire_pending_restores();
+        self.apply_active_project(next);
+    }
+
+    /// Activate a project as part of restoring a reload, **without** retiring
+    /// the pending chat/draft.
+    ///
+    /// Bootstrap restores the project first, then the chat and draft that
+    /// depend on it. Routing that first step through the user-selection path
+    /// made it consume the very intent the next two steps were about to read,
+    /// so an ordinary cold restore silently dropped both. Reactivating a
+    /// project the user already had open is not a new choice and must not be
+    /// treated as one.
+    pub(crate) fn activate_restored_project(&self, next: Option<ActiveProjectRef>) {
+        self.apply_active_project(next);
+    }
+
+    fn apply_active_project(&self, next: Option<ActiveProjectRef>) {
         let current = self.active_project.get_untracked();
         if current == next {
             return;
@@ -4146,10 +4248,6 @@ impl AppState {
             self.project_view_memory
                 .with_untracked(|m| m.get(r).cloned())
         });
-
-        // Choosing a project (or Home) is a deliberate statement about what the
-        // center should show, so it outranks any restore still in flight.
-        self.retire_pending_restores();
 
         self.active_project.set(next.clone());
         persist_active_project(next.as_ref());

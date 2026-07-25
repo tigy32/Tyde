@@ -5949,6 +5949,24 @@ kbd {
     flex-wrap: wrap;
 }
 
+/* Reaches the history the server has advertised but nothing could request. */
+.session-load-more {
+    margin: 8px auto;
+    padding: 6px 12px;
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 0.769rem;
+}
+
+.session-load-more:hover,
+.session-load-more:focus-visible {
+    background: var(--surface-2);
+    color: var(--text-primary);
+}
+
 .session-card-date {
     font-size: 0.769rem;
     color: var(--text-tertiary);

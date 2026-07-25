@@ -1,7 +1,9 @@
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
-use protocol::{BackendKind, DeleteSessionPayload, FrameKind, ListSessionsPayload};
+use protocol::{
+    BackendKind, DeleteSessionPayload, FrameKind, ListSessionsPayload, SessionListPageStatus,
+};
 
 use crate::actions::resume_session;
 use crate::send::send_frame;
@@ -237,12 +239,78 @@ pub fn SessionsPanel() -> impl IntoView {
                                 {sessions.into_iter().map(|session| {
                                     session_card(state.clone(), session)
                                 }).collect_view()}
+                                {load_more_button(state.clone())}
                             </div>
                         }.into_any()
                     }
                 }}
             </div>
         </div>
+    }
+}
+
+/// "Load more" for the selected host, shown only when the server has actually
+/// told us there is more.
+///
+/// The protocol has advertised a next cursor all along and nothing ever sent
+/// one back, so the remaining history was unreachable no matter how much of it
+/// existed. The request carries the exact stored cursor and scope, which is
+/// also what the reducer requires before it will append rather than replace.
+fn load_more_button(state: AppState) -> impl IntoView {
+    let next_page = {
+        let state = state.clone();
+        Memo::new(move |_| {
+            let host_id = state.selected_host_id.get()?;
+            state.session_list_pages.with(|pages| {
+                pages
+                    .iter()
+                    .find(|((page_host, _), _)| *page_host == host_id)
+                    .and_then(|((_, _), page)| match page.status {
+                        SessionListPageStatus::More { next_cursor } => {
+                            Some((host_id.clone(), page.scope, next_cursor, page.limit))
+                        }
+                        SessionListPageStatus::Complete => None,
+                    })
+            })
+        })
+    };
+
+    move || {
+        let (host_id, scope, cursor, limit) = next_page.get()?;
+        let state = state.clone();
+        let on_click = move |_| {
+            let state = state.clone();
+            let host_id = host_id.clone();
+            spawn_local(async move {
+                let Some(host_stream) = state.host_stream_untracked(&host_id) else {
+                    return;
+                };
+                if let Err(error) = send_frame(
+                    &host_id,
+                    host_stream,
+                    FrameKind::ListSessions,
+                    &ListSessionsPayload {
+                        scope: Some(scope),
+                        cursor: Some(cursor),
+                        limit: Some(limit),
+                    },
+                )
+                .await
+                {
+                    log::error!("failed to request more sessions: {error}");
+                }
+            });
+        };
+        Some(view! {
+            <button
+                type="button"
+                class="session-load-more"
+                data-test="session-load-more"
+                on:click=on_click
+            >
+                "Load more"
+            </button>
+        })
     }
 }
 
