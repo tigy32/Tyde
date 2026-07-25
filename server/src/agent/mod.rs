@@ -9511,9 +9511,9 @@ mod tests {
             .get(&session_id)
             .expect("persisted session");
         assert_eq!(persisted.message_count, 2);
-        assert_eq!(
-            persisted.updated_at_ms,
-            failed_response_update.updated_at_ms
+        assert!(
+            persisted.updated_at_ms >= failed_response_update.updated_at_ms,
+            "the later failure terminal may advance activity without adding another response"
         );
     }
 

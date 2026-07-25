@@ -194,6 +194,9 @@ struct HostSubscriber {
     agent_replay: AgentReplayMode,
     session_list_replay: SessionListReplayMode,
     session_list_snapshot: Option<SessionListSnapshot>,
+    // HostBootstrap supplies a point-in-time list; only ListSessions opts a
+    // stream into unsolicited summary updates.
+    session_summary_updates_subscribed: bool,
     known_agent_streams: HashSet<StreamPath>,
     attached_agent_streams: HashSet<StreamPath>,
     bootstrapped_agent_streams: HashSet<StreamPath>,
@@ -840,6 +843,9 @@ pub(crate) struct HostState {
     pub sub_agent_spawn_tx: HostSubAgentSpawnTx,
     pub capacity_tx: HostCapacityTx,
     pub session_summary_count_tx: HostSessionSummaryCountTx,
+    // A first response can finish before its NewAgent publication. Hold that
+    // targeted update until the publication fanout refreshes session snapshots.
+    pending_session_summary_count_updates: HashMap<SessionId, SessionSummaryCountUpdatedPayload>,
     pub use_mock_backend: bool,
     pub debug_mcp: DebugMcpHandle,
     pub agent_control_mcp: AgentControlMcpHandle,
@@ -2624,6 +2630,7 @@ impl HostHandle {
                 agent_replay,
                 session_list_replay: SessionListReplayMode::for_agent_replay(agent_replay),
                 session_list_snapshot: None,
+                session_summary_updates_subscribed: false,
                 known_agent_streams: HashSet::new(),
                 attached_agent_streams: HashSet::new(),
                 bootstrapped_agent_streams: HashSet::new(),
@@ -7229,23 +7236,25 @@ impl HostHandle {
     ) -> AppResult<()> {
         const OPERATION: &str = "list_sessions";
         let (sessions, page) = if let Some(cursor) = payload.cursor {
-            let state = self.state.lock().await;
+            let mut state = self.state.lock().await;
             let subscriber = state
                 .host_streams
-                .get(host_output_stream.path())
+                .get_mut(host_output_stream.path())
                 .ok_or_else(|| {
                     AppError::invalid(
                         OPERATION,
                         format!("unknown host stream {}", host_output_stream.path()),
                     )
                 })?;
-            page_existing_session_list_snapshot(
+            let page = page_existing_session_list_snapshot(
                 subscriber,
                 cursor,
                 payload.scope,
                 payload.limit,
                 OPERATION,
-            )?
+            )?;
+            subscriber.session_summary_updates_subscribed = true;
+            page
         } else {
             let (session_store, scope, antigravity_conversations_dir) = {
                 let state = self.state.lock().await;
@@ -7284,7 +7293,15 @@ impl HostHandle {
                         format!("unknown host stream {}", host_output_stream.path()),
                     )
                 })?;
-            replace_session_list_snapshot(subscriber, scope, sessions, payload.limit, OPERATION)?
+            let page = replace_session_list_snapshot(
+                subscriber,
+                scope,
+                sessions,
+                payload.limit,
+                OPERATION,
+            )?;
+            subscriber.session_summary_updates_subscribed = true;
+            page
         };
 
         let payload = SessionListPayload { sessions, page };
@@ -12879,6 +12896,7 @@ fn spawn_host_inner(
             sub_agent_spawn_tx,
             capacity_tx: capacity_tx.clone(),
             session_summary_count_tx,
+            pending_session_summary_count_updates: HashMap::new(),
             use_mock_backend,
             debug_mcp,
             agent_control_mcp: agent_control_mcp_placeholder,
@@ -16755,22 +16773,95 @@ async fn fan_out_session_lists(state: &mut HostState) {
     for path in dead_paths {
         state.host_streams.remove(&path);
     }
+
+    let pending_updates = std::mem::take(&mut state.pending_session_summary_count_updates);
+    for update in pending_updates.into_values() {
+        fan_out_session_summary_count_update_inner(state, &update, false);
+    }
 }
 
 fn fan_out_session_summary_count_update(
     state: &mut HostState,
     update: &SessionSummaryCountUpdatedPayload,
 ) {
+    fan_out_session_summary_count_update_inner(state, update, true);
+}
+
+fn fan_out_session_summary_count_update_inner(
+    state: &mut HostState,
+    update: &SessionSummaryCountUpdatedPayload,
+    queue_if_missing: bool,
+) {
+    if !state
+        .host_streams
+        .values()
+        .any(|subscriber| subscriber.session_summary_updates_subscribed)
+    {
+        state
+            .pending_session_summary_count_updates
+            .remove(&update.session_id);
+        return;
+    }
+
+    let Some((agent_id, pending_publication)) = state
+        .agent_sessions
+        .iter()
+        .find_map(|(agent_id, session_id)| {
+            (session_id == &update.session_id).then_some((agent_id.clone(), false))
+        })
+        .or_else(|| {
+            state
+                .pending_agent_sessions
+                .iter()
+                .find_map(|(agent_id, session_id)| {
+                    (session_id == &update.session_id).then_some((agent_id.clone(), true))
+                })
+        })
+    else {
+        state
+            .pending_session_summary_count_updates
+            .remove(&update.session_id);
+        return;
+    };
+    let visible_host_streams = state.agent_visibility.visible_host_streams(&agent_id);
     let payload = serde_json::to_value(update)
         .expect("failed to serialize SessionSummaryCountUpdated payload for host stream fanout");
     let paths = state.host_streams.keys().cloned().collect::<Vec<_>>();
     let mut dead_paths = Vec::new();
+    let mut matched_snapshot = false;
+    let mut visible_subscriber = false;
 
     for path in paths {
         let Some(subscriber) = state.host_streams.get_mut(&path) else {
             continue;
         };
-        if !apply_session_summary_count_update(subscriber.session_list_snapshot.as_mut(), update) {
+        if !subscriber.session_summary_updates_subscribed
+            || !visible_host_streams.contains(&path)
+        {
+            continue;
+        }
+        visible_subscriber = true;
+        let Some(summary) = subscriber.session_list_snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .sessions
+                .iter()
+                .find(|summary| summary.id == update.session_id)
+        }) else {
+            continue;
+        };
+        matched_snapshot = true;
+        let current_count = summary.message_count;
+        let current_updated_at_ms = summary.updated_at_ms;
+        let should_emit = if update.assistant_turn_count > current_count
+            || (update.assistant_turn_count == current_count
+                && update.updated_at_ms > current_updated_at_ms)
+        {
+            apply_session_summary_count_update(subscriber.session_list_snapshot.as_mut(), update)
+        } else {
+            update.assistant_turn_count == current_count
+                && update.updated_at_ms == current_updated_at_ms
+        };
+        if !should_emit {
             continue;
         }
         if emit_or_queue_host_frame(
@@ -16787,6 +16878,22 @@ fn fan_out_session_summary_count_update(
     for path in dead_paths {
         state.host_streams.remove(&path);
     }
+
+    if matched_snapshot {
+        state
+            .pending_session_summary_count_updates
+            .remove(&update.session_id);
+    } else if queue_if_missing && (pending_publication || visible_subscriber) {
+        let pending = state
+            .pending_session_summary_count_updates
+            .entry(update.session_id.clone())
+            .or_insert_with(|| update.clone());
+        if (update.assistant_turn_count, update.updated_at_ms)
+            > (pending.assistant_turn_count, pending.updated_at_ms)
+        {
+            *pending = update.clone();
+        }
+    }
 }
 
 fn apply_session_summary_count_update(
@@ -16801,6 +16908,12 @@ fn apply_session_summary_count_update(
     }) else {
         return false;
     };
+    if update.assistant_turn_count < summary.message_count
+        || (update.assistant_turn_count == summary.message_count
+            && update.updated_at_ms <= summary.updated_at_ms)
+    {
+        return false;
+    }
     summary.message_count = update.assistant_turn_count;
     summary.updated_at_ms = update.updated_at_ms;
     true
@@ -21114,6 +21227,16 @@ Rules: Record only what remains true and useful for future work; drop transient 
         ));
         assert_eq!(snapshot.sessions[0].message_count, 4);
         assert_eq!(snapshot.sessions[0].updated_at_ms, 40);
+        assert!(!apply_session_summary_count_update(
+            Some(&mut snapshot),
+            &SessionSummaryCountUpdatedPayload {
+                session_id: SessionId("tracked-session".to_owned()),
+                assistant_turn_count: 4,
+                updated_at_ms: 39,
+            },
+        ));
+        assert_eq!(snapshot.sessions[0].message_count, 4);
+        assert_eq!(snapshot.sessions[0].updated_at_ms, 40);
         assert_eq!(snapshot.generation, SessionListGeneration(7));
         assert_eq!(snapshot.scope, SessionListScope::RootSessions);
     }
@@ -22190,15 +22313,13 @@ Rules: Record only what remains true and useful for future work; drop transient 
     #[tokio::test]
     async fn response_end_fans_out_targeted_assistant_response_count() {
         let fixture = compact_fixture().await;
-        let (agent_id, session_id) =
-            spawn_idle_user_agent(&fixture.host, "count persisted assistant responses").await;
         let (tx, mut rx) = mpsc::unbounded_channel();
         let host_path = StreamPath(format!("/host/session-count-{}", Uuid::new_v4()));
         let host_stream = Stream::new(host_path.clone(), tx);
         assert!(
             fixture
                 .host
-                .register_host_stream(host_stream, AgentReplayMode::Lazy)
+                .register_host_stream(host_stream.clone(), AgentReplayMode::Lazy)
                 .await
                 .is_empty()
         );
@@ -22207,7 +22328,69 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .expect("host bootstrap")
             .expect("host stream remains open");
         assert_eq!(bootstrap.kind, FrameKind::HostBootstrap);
+
+        fixture
+            .host
+            .list_sessions(&host_stream, ListSessionsPayload::default())
+            .await
+            .expect("subscribe to session summary updates");
+        let session_list = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("initial session list")
+            .expect("host stream remains open");
+        assert_eq!(session_list.kind, FrameKind::SessionList);
+
+        let (agent_id, session_id) =
+            spawn_idle_user_agent(&fixture.host, "count persisted assistant responses").await;
+        let mut saw_new_agent = false;
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let envelope = rx.recv().await.expect("host stream remains open");
+                match envelope.kind {
+                    FrameKind::NewAgent => {
+                        let payload: NewAgentPayload =
+                            envelope.parse_payload().expect("NewAgent payload");
+                        saw_new_agent |= payload.agent_id == agent_id;
+                    }
+                    FrameKind::SessionSummaryCountUpdated => {
+                        let payload: SessionSummaryCountUpdatedPayload = envelope
+                            .parse_payload()
+                            .expect("session count update payload");
+                        if payload.session_id == session_id {
+                            assert!(
+                                saw_new_agent,
+                                "session summary update must follow NewAgent publication"
+                            );
+                            assert_eq!(payload.assistant_turn_count, 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("initial turn count update");
+        assert!(saw_new_agent, "spawn must publish NewAgent to the subscriber");
+
+        let (unsubscribed_tx, mut unsubscribed_rx) = mpsc::unbounded_channel();
+        let unsubscribed_path =
+            StreamPath(format!("/host/session-count-unsubscribed-{}", Uuid::new_v4()));
+        let unsubscribed_stream = Stream::new(unsubscribed_path, unsubscribed_tx);
+        assert!(
+            fixture
+                .host
+                .register_host_stream(unsubscribed_stream, AgentReplayMode::Lazy)
+                .await
+                .is_empty()
+        );
+        let unsubscribed_bootstrap = timeout(Duration::from_secs(1), unsubscribed_rx.recv())
+            .await
+            .expect("unsubscribed host bootstrap")
+            .expect("unsubscribed host stream remains open");
+        assert_eq!(unsubscribed_bootstrap.kind, FrameKind::HostBootstrap);
         while rx.try_recv().is_ok() {}
+        while unsubscribed_rx.try_recv().is_ok() {}
 
         let observation = fixture
             .host
@@ -22252,6 +22435,22 @@ Rules: Record only what remains true and useful for future work; drop transient 
         assert_eq!(
             rebuilt_session_lists, 0,
             "response persistence must not rebuild the full session list"
+        );
+        let unsubscribed_count = timeout(Duration::from_millis(50), async {
+            loop {
+                let envelope = unsubscribed_rx
+                    .recv()
+                    .await
+                    .expect("unsubscribed host stream remains open");
+                if envelope.kind == FrameKind::SessionSummaryCountUpdated {
+                    break envelope;
+                }
+            }
+        })
+        .await;
+        assert!(
+            unsubscribed_count.is_err(),
+            "bootstrap session snapshots must not opt a host stream into targeted updates"
         );
         {
             let state = fixture.host.state.lock().await;
@@ -22440,6 +22639,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             agent_replay: AgentReplayMode::Eager,
             session_list_replay: SessionListReplayMode::Full,
             session_list_snapshot: None,
+            session_summary_updates_subscribed: false,
             known_agent_streams: HashSet::new(),
             attached_agent_streams: HashSet::new(),
             bootstrapped_agent_streams: HashSet::new(),
@@ -22513,6 +22713,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             agent_replay: AgentReplayMode::Eager,
             session_list_replay: SessionListReplayMode::Full,
             session_list_snapshot: None,
+            session_summary_updates_subscribed: false,
             known_agent_streams: HashSet::new(),
             attached_agent_streams: HashSet::new(),
             bootstrapped_agent_streams: HashSet::new(),
@@ -22588,6 +22789,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             agent_replay: AgentReplayMode::Eager,
             session_list_replay: SessionListReplayMode::Full,
             session_list_snapshot: None,
+            session_summary_updates_subscribed: false,
             known_agent_streams: HashSet::new(),
             attached_agent_streams: HashSet::new(),
             bootstrapped_agent_streams: HashSet::new(),
