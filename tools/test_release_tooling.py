@@ -84,6 +84,23 @@ class SetReleaseVersionTests(unittest.TestCase):
                 with self.assertRaises(set_release_version.SetVersionError):
                     set_release_version.normalize_tag(tag)
 
+    def test_accepts_dash_heavy_prerelease_identifiers(self) -> None:
+        for tag in (
+            "v1.2.3---.-.-a",
+            "v1.2.3-0.--a",
+            "v10.20.30-rc.1.alpha-2",
+        ):
+            with self.subTest(tag=tag):
+                self.assertEqual(set_release_version.normalize_tag(tag), tag[1:])
+
+    def test_rejects_adversarial_prerelease(self) -> None:
+        tag = "v0.0.0-0." + "--." * 26 + "!"
+        start = time.perf_counter()
+
+        with self.assertRaises(set_release_version.SetVersionError):
+            set_release_version.normalize_tag(tag)
+        self.assertLess(time.perf_counter() - start, 1.0)
+
 
 class RunStatusTests(unittest.TestCase):
     def test_selects_exact_workflow_tag_and_sha(self) -> None:
