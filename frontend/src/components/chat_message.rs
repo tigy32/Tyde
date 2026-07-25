@@ -748,7 +748,11 @@ mod wasm_tests {
                 tool_call("second", Some(1)),
                 tool_call("third", Some(1)),
             ],
-            vec![tool_entry("first"), tool_entry("second"), tool_entry("third")],
+            vec![
+                tool_entry("first"),
+                tool_entry("second"),
+                tool_entry("third"),
+            ],
             false,
         );
 
