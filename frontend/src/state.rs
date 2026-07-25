@@ -3080,7 +3080,7 @@ impl AppState {
             })
         });
 
-        let state = Self {
+        Self {
             configured_hosts: RwSignal::new(Vec::new()),
             selected_host_id: RwSignal::new(None),
             host_streams: RwSignal::new(HashMap::new()),
@@ -3223,9 +3223,7 @@ impl AppState {
             pending_workbench_removes: RwSignal::new(Vec::new()),
             workbench_remove_prompt: RwSignal::new(None),
             upgrade_attempted: RwSignal::new(HashSet::new()),
-        };
-
-        state
+        }
     }
 
     /// Whether the Phase 2 safety net has already fired its one forced
