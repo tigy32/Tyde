@@ -163,13 +163,8 @@ pub(crate) struct HostSessionSummaryCountUpdate {
     pub payload: SessionSummaryCountUpdatedPayload,
 }
 
-pub(crate) struct HostSessionSummaryCountRequest {
-    pub update: HostSessionSummaryCountUpdate,
-    pub applied: oneshot::Sender<()>,
-}
-
-pub(crate) type HostSessionSummaryCountTx = mpsc::UnboundedSender<HostSessionSummaryCountRequest>;
-type HostSessionSummaryCountRx = mpsc::UnboundedReceiver<HostSessionSummaryCountRequest>;
+pub(crate) type HostSessionSummaryCountTx = mpsc::UnboundedSender<HostSessionSummaryCountUpdate>;
+type HostSessionSummaryCountRx = mpsc::UnboundedReceiver<HostSessionSummaryCountUpdate>;
 
 pub(crate) enum HostCapacityUpdate {
     Report {
@@ -1137,7 +1132,6 @@ impl Drop for HostHandle {
 struct PendingAgentSessionPublication {
     agent_id: AgentId,
     publish_tx: Option<mpsc::UnboundedSender<()>>,
-    ready_rx: Option<oneshot::Receiver<Result<SessionId, String>>>,
 }
 
 #[derive(Clone, Default)]
@@ -1419,21 +1413,6 @@ impl Drop for SpawnVisibilityGuard {
 }
 
 impl PendingAgentSessionPublication {
-    async fn wait_until_ready(&mut self) -> Result<SessionId, String> {
-        let Some(ready_rx) = self.ready_rx.take() else {
-            return Err(format!(
-                "agent {} session registration readiness was already consumed",
-                self.agent_id
-            ));
-        };
-        ready_rx.await.unwrap_or_else(|_| {
-            Err(format!(
-                "agent {} session registration ended before readiness",
-                self.agent_id
-            ))
-        })
-    }
-
     fn publish(mut self) {
         let Some(publish_tx) = self.publish_tx.take() else {
             tracing::error!(
@@ -5063,7 +5042,7 @@ impl HostHandle {
             "host spawn_agent resolved request"
         );
 
-        let (mut start, agent_handle, startup_rx, agent_visibility) = {
+        let (start, agent_handle, startup_rx, agent_visibility) = {
             let mut state = self.state.lock().await;
             let sub_agent_spawn_tx = state.sub_agent_spawn_tx.clone();
             let capacity_tx = state.capacity_tx.clone();
@@ -5094,16 +5073,13 @@ impl HostHandle {
         let agent_id = start.agent_id.clone();
         let visibility = SpawnVisibility::new(agent_id.clone(), agent_visibility);
         let mut visibility_guard = SpawnVisibilityGuard::new(visibility.clone());
-        let mut session_registration_publish = self.schedule_agent_session_registration(
+        let session_registration_publish = self.schedule_agent_session_registration(
             agent_id.clone(),
             startup_rx,
             visibility.clone(),
         );
         #[cfg(test)]
         wait_for_spawn_session_registration_test_hook(self).await;
-        if let Ok(session_id) = session_registration_publish.wait_until_ready().await {
-            start.session_id = Some(session_id);
-        }
 
         #[cfg(test)]
         wait_before_startup_failure_fanout_test_hook(self).await;
@@ -5452,7 +5428,7 @@ impl HostHandle {
             let state = self.state.lock().await;
             Arc::clone(&state.session_store)
         };
-        let (mut start, agent_handle, startup_rx, agent_visibility) = {
+        let (start, agent_handle, startup_rx, agent_visibility) = {
             let mut state = self.state.lock().await;
             let sub_agent_spawn_tx = state.sub_agent_spawn_tx.clone();
             let capacity_tx = state.capacity_tx.clone();
@@ -5483,16 +5459,13 @@ impl HostHandle {
         let agent_id = start.agent_id.clone();
         let visibility = SpawnVisibility::new(agent_id.clone(), agent_visibility);
         let mut visibility_guard = SpawnVisibilityGuard::new(visibility.clone());
-        let mut session_registration_publish = self.schedule_agent_session_registration(
+        let session_registration_publish = self.schedule_agent_session_registration(
             agent_id.clone(),
             startup_rx,
             visibility.clone(),
         );
         #[cfg(test)]
         wait_for_spawn_session_registration_test_hook(self).await;
-        if let Ok(session_id) = session_registration_publish.wait_until_ready().await {
-            start.session_id = Some(session_id);
-        }
 
         #[cfg(test)]
         wait_before_startup_failure_fanout_test_hook(self).await;
@@ -9907,24 +9880,19 @@ impl HostHandle {
         startup_rx: tokio::sync::oneshot::Receiver<Result<SessionId, String>>,
         visibility: SpawnVisibility,
     ) -> PendingAgentSessionPublication {
+        // NewAgent publication cannot wait for backend startup: its stream is
+        // how clients observe held and failed startup attempts.
         let (publish_tx, mut publish_rx) = mpsc::unbounded_channel::<()>();
-        let (ready_tx, ready_rx) = oneshot::channel();
         let host = self.clone();
         let task_agent_id = agent_id.clone();
         tokio::spawn(async move {
             let agent_id = task_agent_id;
-            let mut ready_tx = Some(ready_tx);
             let mut startup_rx = startup_rx;
             let startup_result = tokio::select! {
                 startup = &mut startup_rx => Some(startup),
                 publication = publish_rx.recv() => match publication {
                     Some(()) => None,
                     None => {
-                        if let Some(ready_tx) = ready_tx.take() {
-                            let _ = ready_tx.send(Err(format!(
-                                "agent {agent_id} session publication was cancelled before startup"
-                            )));
-                        }
                         host.cleanup_unpublished_agent_session(agent_id.clone(), None, &visibility)
                             .await;
                         return;
@@ -9953,9 +9921,6 @@ impl HostHandle {
                         }
                     };
                     if let Err(error) = pending_inserted {
-                        if let Some(ready_tx) = ready_tx.take() {
-                            let _ = ready_tx.send(Err(error.clone()));
-                        }
                         tracing::error!(
                             agent_id = %agent_id,
                             session_id = %session_id,
@@ -9966,15 +9931,9 @@ impl HostHandle {
                             .await;
                         return;
                     }
-                    if let Some(ready_tx) = ready_tx.take() {
-                        let _ = ready_tx.send(Ok(session_id.clone()));
-                    }
                     session_id
                 }
                 Ok(Err(err)) => {
-                    if let Some(ready_tx) = ready_tx.take() {
-                        let _ = ready_tx.send(Err(err.clone()));
-                    }
                     tracing::warn!(
                         agent_id = %agent_id,
                         error = %err,
@@ -10000,11 +9959,6 @@ impl HostHandle {
                     return;
                 }
                 Err(_) => {
-                    if let Some(ready_tx) = ready_tx.take() {
-                        let _ = ready_tx.send(Err(format!(
-                            "agent {agent_id} startup channel dropped before session registration"
-                        )));
-                    }
                     tracing::warn!(
                         agent_id = %agent_id,
                         "agent startup channel dropped before session registration"
@@ -10049,7 +10003,6 @@ impl HostHandle {
         PendingAgentSessionPublication {
             agent_id,
             publish_tx: Some(publish_tx),
-            ready_rx: Some(ready_rx),
         }
     }
 
@@ -15212,10 +15165,9 @@ fn spawn_host_capacity_task(host: HostHandle, mut rx: HostCapacityRx) {
 
 fn spawn_host_session_summary_count_task(host: HostHandle, mut rx: HostSessionSummaryCountRx) {
     let worker = async move {
-        while let Some(request) = rx.recv().await {
+        while let Some(update) = rx.recv().await {
             let mut state = host.state.lock().await;
-            fan_out_session_summary_count_update(&mut state, &request.update);
-            let _ = request.applied.send(());
+            fan_out_session_summary_count_update(&mut state, &update);
         }
     };
 

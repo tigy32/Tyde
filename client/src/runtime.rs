@@ -1201,6 +1201,17 @@ async fn emit_new_agent_endpoint(
         return false;
     }
 
+    if payload.session_id.is_none() {
+        // Keep wire-level NewAgent early while exposing the authoritative
+        // session id on the higher-level endpoint once its bootstrap arrives.
+        let host_tx = host_tx.clone();
+        let shared = Arc::downgrade(shared);
+        tokio::spawn(async move {
+            emit_new_agent_after_bootstrap(payload, agent_rx, host_tx, shared).await;
+        });
+        return true;
+    }
+
     let endpoint = AgentEndpoint {
         info: payload,
         events: AgentEvents {
@@ -1217,6 +1228,59 @@ async fn emit_new_agent_endpoint(
         shared.unregister_route(&stream);
     }
     true
+}
+
+async fn emit_new_agent_after_bootstrap(
+    mut payload: NewAgentPayload,
+    mut source_rx: mpsc::Receiver<AgentEvent>,
+    host_tx: mpsc::Sender<HostEvent>,
+    shared: std::sync::Weak<Shared>,
+) {
+    let Some(first_event) = source_rx.recv().await else {
+        return;
+    };
+    payload.session_id = agent_event_session_id(&first_event);
+
+    let Some(shared) = shared.upgrade() else {
+        return;
+    };
+    let stream = payload.instance_stream.clone();
+    let (agent_tx, agent_rx) = mpsc::channel(CHANNEL_CAPACITY);
+    let endpoint = AgentEndpoint {
+        info: payload,
+        events: AgentEvents {
+            stream: stream.clone(),
+            shared: shared.clone(),
+            rx: agent_rx,
+        },
+        commands: AgentCommands {
+            stream: stream.clone(),
+            shared: shared.clone(),
+        },
+    };
+    if host_tx.send(HostEvent::NewAgent(endpoint)).await.is_err() {
+        shared.unregister_route(&stream);
+        return;
+    }
+    if agent_tx.send(first_event).await.is_err() {
+        return;
+    }
+    while let Some(event) = source_rx.recv().await {
+        if agent_tx.send(event).await.is_err() {
+            return;
+        }
+    }
+}
+
+fn agent_event_session_id(event: &AgentEvent) -> Option<protocol::SessionId> {
+    match event {
+        AgentEvent::Start(payload) => payload.session_id.clone(),
+        AgentEvent::Bootstrap(payload) => payload.events.iter().find_map(|event| match event {
+            protocol::AgentBootstrapEvent::AgentStart(payload) => payload.session_id.clone(),
+            _ => None,
+        }),
+        _ => None,
+    }
 }
 
 async fn handle_agent_envelope(envelope: Envelope, shared: &Arc<Shared>) {

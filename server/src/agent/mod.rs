@@ -38,8 +38,7 @@ use crate::backend::{
     validate_session_settings_values,
 };
 use crate::host::{
-    HostCapacityTx, HostSessionSummaryCountRequest, HostSessionSummaryCountTx,
-    HostSessionSummaryCountUpdate, HostSubAgentEmitter,
+    HostCapacityTx, HostSessionSummaryCountTx, HostSessionSummaryCountUpdate, HostSubAgentEmitter,
 };
 use crate::review::ReviewRegistryHandle;
 use crate::store::session::SessionStore;
@@ -3025,12 +3024,10 @@ pub(crate) fn spawn_agent_actor(
                     )
                     .await
                     {
-                        publish_session_summary_count_update(
-                            &session_summary_count_tx,
-                            agent_id.clone(),
-                            update,
-                        )
-                        .await;
+                        let _ = session_summary_count_tx.send(HostSessionSummaryCountUpdate {
+                            agent_id: agent_id.clone(),
+                            payload: update,
+                        });
                     }
                     let source_seq = activity_event_seq;
                     activity_event_seq = activity_event_seq.saturating_add(1);
@@ -5043,12 +5040,10 @@ pub(crate) fn spawn_relay_agent_actor(
                     if let Some(update) =
                         apply_runtime_session_updates(&session_store, &session_id, &event).await
                     {
-                        publish_session_summary_count_update(
-                            &session_summary_count_tx,
-                            agent_id.clone(),
-                            update,
-                        )
-                        .await;
+                        let _ = session_summary_count_tx.send(HostSessionSummaryCountUpdate {
+                            agent_id: agent_id.clone(),
+                            payload: update,
+                        });
                     }
                     let source_seq = activity_event_seq;
                     activity_event_seq = activity_event_seq.saturating_add(1);
@@ -7787,25 +7782,6 @@ fn agent_bootstrap_event_from_envelope(envelope: &Envelope) -> AgentBootstrapEve
                 .expect("failed to parse ChatEvent from replay log"),
         ),
         other => panic!("unsupported agent replay event kind {other} in AgentBootstrap"),
-    }
-}
-
-async fn publish_session_summary_count_update(
-    tx: &HostSessionSummaryCountTx,
-    agent_id: AgentId,
-    payload: SessionSummaryCountUpdatedPayload,
-) {
-    let (applied, applied_rx) = oneshot::channel();
-    if tx
-        .send(HostSessionSummaryCountRequest {
-            update: HostSessionSummaryCountUpdate { agent_id, payload },
-            applied,
-        })
-        .is_ok()
-    {
-        // Keep the host notification ahead of this turn's terminal stream
-        // events so it cannot spill into the next command's response.
-        let _ = applied_rx.await;
     }
 }
 
