@@ -3,7 +3,7 @@ use protocol::MessageSender;
 use wasm_bindgen::JsCast;
 
 use crate::components::tool_card::ToolCardListView;
-use crate::markdown::render_markdown;
+use crate::markdown::{render_markdown, top_level_block_boundaries};
 use crate::state::{ActiveAgentRef, ChatRowHandle, ToolRequestEntry};
 
 /// Render a single chat row from its row-local signal.
@@ -23,63 +23,42 @@ use crate::state::{ActiveAgentRef, ChatRowHandle, ToolRequestEntry};
 pub(crate) enum MessageSegment {
     Content(String),
     Tools(Vec<ToolRequestEntry>),
+    /// Where attached images belong. Kept as a slot rather than appended by the
+    /// renderer so the legacy order — content, images, tools — survives, and so
+    /// the position is decided in one testable place instead of falling out of
+    /// the order of blocks in the view.
+    Images,
 }
 
-/// Rebuild a message as interleaved content and tool segments.
+/// Rebuild a message as interleaved content, tool and image segments.
 ///
 /// - Tools are placed by the `content_offset` recorded on the matching
 ///   [`protocol::ToolUseData`], matched by id.
-/// - A tool with no offset — legacy data, or a backend that does not record one
-///   — keeps the old layout and is emitted after all content. If *no* tool has
-///   an offset the output is exactly `[Content(all), Tools(all)]`, byte for
-///   byte what this rendered before.
-/// - Offsets are Unicode scalar indices, so splitting goes through
+/// - Offsets are Unicode scalar indices, so they are resolved through
 ///   `char_indices` and can never land inside a character.
-/// - An offset past the end clamps to the end rather than panicking; a
-///   backend that miscounts degrades to the legacy tail, it does not crash the
-///   chat.
-/// - Several tools at one offset keep their arrival order, and equal offsets
-///   sort stably, so a repeated offset is not a reordering hazard.
+/// - `allowed_splits` are byte offsets a split may fall on. For Markdown these
+///   are top-level block boundaries, so every fragment parses exactly as it
+///   does inside the whole document; a tool observed inside a code fence, link
+///   or list is placed before that block rather than tearing it in half. Pass
+///   `None` for content that is not parsed as Markdown, where any scalar
+///   boundary is safe.
+/// - A tool with no offset — legacy data, or a backend that does not record one
+///   — keeps the old layout and is emitted after all content **and after the
+///   images**, which is exactly where it rendered before.
+/// - An offset past the end clamps to the end; a tool whose id matches no call
+///   is treated as offsetless. Bad metadata degrades to the legacy layout, it
+///   does not crash the chat.
+/// - Several tools at one placement keep their arrival order, and the sort is
+///   stable, so equal or equal-after-snapping offsets are not a reordering
+///   hazard.
 pub(crate) fn interleave_message(
     content: &str,
     tool_calls: &[protocol::ToolUseData],
     tools: Vec<ToolRequestEntry>,
+    allowed_splits: Option<&[usize]>,
+    has_images: bool,
 ) -> Vec<MessageSegment> {
-    let scalar_len = content.chars().count();
-    let offset_for = |tool_call_id: &str| -> Option<usize> {
-        tool_calls
-            .iter()
-            .find(|call| call.id == tool_call_id)
-            .and_then(|call| call.content_offset)
-            .map(|offset| (offset as usize).min(scalar_len))
-    };
-
-    // Partition into placed and unplaced, preserving arrival order in both.
-    let mut placed: Vec<(usize, ToolRequestEntry)> = Vec::new();
-    let mut trailing: Vec<ToolRequestEntry> = Vec::new();
-    for entry in tools {
-        match offset_for(&entry.request.tool_call_id) {
-            Some(offset) => placed.push((offset, entry)),
-            None => trailing.push(entry),
-        }
-    }
-
-    if placed.is_empty() {
-        // Legacy layout, unchanged.
-        let mut segments = Vec::new();
-        if !content.is_empty() {
-            segments.push(MessageSegment::Content(content.to_owned()));
-        }
-        if !trailing.is_empty() {
-            segments.push(MessageSegment::Tools(trailing));
-        }
-        return segments;
-    }
-
-    // `sort_by_key` is stable, so tools sharing an offset keep arrival order.
-    placed.sort_by_key(|(offset, _)| *offset);
-
-    // Scalar index -> byte index, so a split can never fall inside a character.
+    // Scalar index -> byte index. Everything below works in bytes.
     let byte_at = |scalar: usize| -> usize {
         content
             .char_indices()
@@ -87,36 +66,101 @@ pub(crate) fn interleave_message(
             .map(|(byte, _)| byte)
             .unwrap_or(content.len())
     };
+    // Snap down to the nearest position a split may legally fall on.
+    let snap = |byte: usize| -> usize {
+        match allowed_splits {
+            Some(allowed) => allowed
+                .iter()
+                .copied()
+                .filter(|candidate| *candidate <= byte)
+                .next_back()
+                .unwrap_or(0),
+            None => byte,
+        }
+    };
 
-    let mut segments = Vec::new();
-    let mut cursor_scalar = 0usize;
-    let mut index = 0usize;
-    while index < placed.len() {
-        let offset = placed[index].0;
-        if offset > cursor_scalar {
-            let slice = &content[byte_at(cursor_scalar)..byte_at(offset)];
-            if !slice.is_empty() {
-                segments.push(MessageSegment::Content(slice.to_owned()));
-            }
-            cursor_scalar = offset;
+    let placement_for = |tool_call_id: &str| -> Option<usize> {
+        tool_calls
+            .iter()
+            .find(|call| call.id == tool_call_id)
+            .and_then(|call| call.content_offset)
+            .map(|offset| snap(byte_at(offset as usize)))
+    };
+
+    let mut placed: Vec<(usize, ToolRequestEntry)> = Vec::new();
+    let mut trailing: Vec<ToolRequestEntry> = Vec::new();
+    for entry in tools {
+        match placement_for(&entry.request.tool_call_id) {
+            Some(byte) => placed.push((byte, entry)),
+            None => trailing.push(entry),
         }
-        // Every tool at this offset becomes one group.
-        let mut group = Vec::new();
-        while index < placed.len() && placed[index].0 == offset {
-            group.push(placed[index].1.clone());
-            index += 1;
-        }
-        segments.push(MessageSegment::Tools(group));
     }
 
-    let tail = &content[byte_at(cursor_scalar)..];
-    if !tail.is_empty() {
-        segments.push(MessageSegment::Content(tail.to_owned()));
+    let mut segments = Vec::new();
+    let mut push_content = |segments: &mut Vec<MessageSegment>, slice: &str| {
+        if !slice.is_empty() {
+            segments.push(MessageSegment::Content(slice.to_owned()));
+        }
+    };
+
+    if placed.is_empty() {
+        // Legacy layout, unchanged: content, images, tools.
+        push_content(&mut segments, content);
+    } else {
+        // Stable, so tools sharing a placement keep arrival order.
+        placed.sort_by_key(|(byte, _)| *byte);
+        let mut cursor = 0usize;
+        let mut index = 0usize;
+        while index < placed.len() {
+            let byte = placed[index].0;
+            if byte > cursor {
+                push_content(&mut segments, &content[cursor..byte]);
+                cursor = byte;
+            }
+            let mut group = Vec::new();
+            while index < placed.len() && placed[index].0 == byte {
+                group.push(placed[index].1.clone());
+                index += 1;
+            }
+            segments.push(MessageSegment::Tools(group));
+        }
+        push_content(&mut segments, &content[cursor..]);
+    }
+
+    if has_images {
+        segments.push(MessageSegment::Images);
     }
     if !trailing.is_empty() {
         segments.push(MessageSegment::Tools(trailing));
     }
     segments
+}
+
+/// Attached images, rendered in the slot [`interleave_message`] chose for them.
+fn render_message_images(images: Vec<protocol::ImageData>) -> impl IntoView {
+    view! {
+        <div class="chat-card-images">
+            {images.into_iter().map(|img| {
+                let src = format!("data:{};base64,{}", img.media_type, img.data);
+                let href = matches!(
+                    img.media_type.as_str(),
+                    "image/png" | "image/jpeg" | "image/jpg" | "image/gif" | "image/webp"
+                )
+                .then(|| src.clone());
+                view! {
+                    <a
+                        class="chat-card-image-link"
+                        href=href
+                        target="_blank"
+                        rel="noopener"
+                        aria-label="Open image full size"
+                    >
+                        <img class="chat-card-image" src=src alt="Chat image" loading="lazy" />
+                    </a>
+                }
+            }).collect::<Vec<_>>()}
+        </div>
+    }
 }
 
 #[component]
@@ -221,7 +265,6 @@ pub fn ChatMessageView(
     let reasoning_open = RwSignal::new(false);
 
     let entry_for_reasoning = entry.clone();
-    let entry_for_images = entry.clone();
     let entry_for_tools = entry.clone();
     let entry_for_footer = entry.clone();
     let entry_for_reasoning_slot = StoredValue::new_local(entry_for_reasoning.clone());
@@ -282,11 +325,22 @@ pub fn ChatMessageView(
             // invalidate sibling rows.
             {move || {
                 let entry = entry_for_tools.get();
-                let is_user = card_meta.with(|(is_user, _, _, _, _)| *is_user);
+                // Third member is `is_user`; the first is the card's CSS class.
+                let is_user = card_meta.with(|(_, _, is_user, _, _)| *is_user);
+                // Assistant content is Markdown, so splits may only fall on
+                // top-level block boundaries — an offset inside a code fence,
+                // link or list would otherwise tear the document in half and
+                // each half would parse as something else. User content is
+                // escaped text, where any scalar boundary is safe.
+                let allowed_splits = (!is_user)
+                    .then(|| top_level_block_boundaries(&entry.message.content));
+                let images = entry.message.images.clone();
                 let segments = interleave_message(
                     &entry.message.content,
                     &entry.message.tool_calls,
                     entry.tool_requests,
+                    allowed_splits.as_deref(),
+                    images.as_ref().is_some_and(|imgs| !imgs.is_empty()),
                 );
                 let mut body_ref_taken = false;
                 segments
@@ -330,45 +384,16 @@ pub fn ChatMessageView(
                             <ToolCardListView agent_ref=agent_ref entries=entries />
                         }
                         .into_any(),
+                        MessageSegment::Images => {
+                            let Some(imgs) = images.clone() else {
+                                return ().into_any();
+                            };
+                            render_message_images(imgs).into_any()
+                        }
                     })
                     .collect::<Vec<_>>()
             }}
 
-            // Images
-            {move || {
-                entry_for_images.get().message.images.and_then(|imgs| {
-                    if imgs.is_empty() {
-                        return None;
-                    }
-                    Some(view! {
-                        <div class="chat-card-images">
-                            {imgs.into_iter().map(|img| {
-                                let src = format!("data:{};base64,{}", img.media_type, img.data);
-                                let href = matches!(
-                                    img.media_type.as_str(),
-                                    "image/png"
-                                        | "image/jpeg"
-                                        | "image/jpg"
-                                        | "image/gif"
-                                        | "image/webp"
-                                )
-                                .then(|| src.clone());
-                                view! {
-                                    <a
-                                        class="chat-card-image-link"
-                                        href=href
-                                        target="_blank"
-                                        rel="noopener"
-                                        aria-label="Open image full size"
-                                    >
-                                        <img class="chat-card-image" src=src alt="Chat image" loading="lazy" />
-                                    </a>
-                                }
-                            }).collect::<Vec<_>>()}
-                        </div>
-                    })
-                })
-            }}
 
 
             // Footer (assistant only)
@@ -609,6 +634,7 @@ mod wasm_tests {
             .iter()
             .map(|segment| match segment {
                 MessageSegment::Content(text) => format!("content:{text}"),
+                MessageSegment::Images => "images".to_owned(),
                 MessageSegment::Tools(entries) => format!(
                     "tools:{}",
                     entries
@@ -631,6 +657,8 @@ mod wasm_tests {
             "PRE\nPOST",
             &[tool_call("t1", Some(4))],
             vec![tool_entry("t1")],
+            None,
+            false,
         );
 
         assert_eq!(
@@ -646,7 +674,13 @@ mod wasm_tests {
     fn offsets_are_scalar_indices_not_byte_indices() {
         // Four scalars, ten bytes.
         let content = "héllo→ok";
-        let segments = interleave_message(content, &[tool_call("t1", Some(6))], vec![tool_entry("t1")]);
+        let segments = interleave_message(
+            content,
+            &[tool_call("t1", Some(6))],
+            vec![tool_entry("t1")],
+            None,
+            false,
+        );
 
         assert_eq!(
             segment_shape(&segments),
@@ -667,6 +701,8 @@ mod wasm_tests {
                 tool_call("third", Some(1)),
             ],
             vec![tool_entry("first"), tool_entry("second"), tool_entry("third")],
+            None,
+            false,
         );
 
         assert_eq!(
@@ -684,6 +720,8 @@ mod wasm_tests {
             "all of the text",
             &[tool_call("t1", None), tool_call("t2", None)],
             vec![tool_entry("t1"), tool_entry("t2")],
+            None,
+            false,
         );
 
         assert_eq!(
@@ -701,6 +739,8 @@ mod wasm_tests {
             "short",
             &[tool_call("t1", Some(9_999))],
             vec![tool_entry("t1")],
+            None,
+            false,
         );
         assert_eq!(
             segment_shape(&past_end),
@@ -712,6 +752,8 @@ mod wasm_tests {
             "text",
             &[tool_call("other", Some(1))],
             vec![tool_entry("t1")],
+            None,
+            false,
         );
         assert_eq!(
             segment_shape(&unmatched),
@@ -719,7 +761,10 @@ mod wasm_tests {
             "a tool with no matching call is placed as legacy data"
         );
 
-        let zero = interleave_message("text", &[tool_call("t1", Some(0))], vec![tool_entry("t1")]);
+        let zero = interleave_message("text", &[tool_call("t1", Some(0))], vec![tool_entry("t1")],
+            None,
+            false,
+        );
         assert_eq!(
             segment_shape(&zero),
             vec!["tools:t1", "content:text"],
@@ -727,11 +772,142 @@ mod wasm_tests {
         );
 
         let empty_content =
-            interleave_message("", &[tool_call("t1", Some(0))], vec![tool_entry("t1")]);
+            interleave_message("", &[tool_call("t1", Some(0))], vec![tool_entry("t1")],
+            None,
+            false,
+        );
         assert_eq!(
             segment_shape(&empty_content),
             vec!["tools:t1"],
             "an empty message emits no empty content segment"
+        );
+    }
+
+    /// RLV-02: a tool offset that lands inside a Markdown construct must not
+    /// tear the document in half. Snapping to a top-level block boundary keeps
+    /// each fragment a whole document, so the code fence, list and link survive.
+    #[wasm_bindgen_test]
+    fn markdown_constructs_are_never_split_mid_construct() {
+        // Offset 20 falls inside the fenced code block.
+        let content = "intro\n\n```rust\nfn a() {}\n```\n\ntail";
+        let boundaries = top_level_block_boundaries(content);
+        let segments = interleave_message(
+            content,
+            &[tool_call("t1", Some(20))],
+            vec![tool_entry("t1")],
+            Some(&boundaries),
+            false,
+        );
+
+        let shape = segment_shape(&segments);
+        let rejoined: String = segments
+            .iter()
+            .filter_map(|segment| match segment {
+                MessageSegment::Content(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rejoined, content, "no content may be lost or duplicated");
+        for segment in &segments {
+            if let MessageSegment::Content(text) = segment {
+                assert_eq!(
+                    text.matches("```").count() % 2,
+                    0,
+                    "a fragment must never contain half a code fence: {text:?}"
+                );
+            }
+        }
+        assert!(
+            shape.iter().any(|s| s.starts_with("tools:")),
+            "the tool is still placed, just at a safe boundary: {shape:?}"
+        );
+    }
+
+    /// The same rule for a list and an inline link: splitting inside either
+    /// would leave one half without its syntax.
+    #[wasm_bindgen_test]
+    fn lists_and_links_survive_an_interior_offset() {
+        let content = "- one\n- two\n\nsee [label](https://example.com) here";
+        let boundaries = top_level_block_boundaries(content);
+
+        // Inside the list.
+        let in_list = interleave_message(
+            content,
+            &[tool_call("t1", Some(8))],
+            vec![tool_entry("t1")],
+            Some(&boundaries),
+            false,
+        );
+        for segment in &in_list {
+            if let MessageSegment::Content(text) = segment {
+                let trimmed = text.trim();
+                assert!(
+                    trimmed.is_empty() || !trimmed.starts_with("two"),
+                    "the list must not be cut between its items: {text:?}"
+                );
+            }
+        }
+
+        // Inside the link target.
+        let in_link = interleave_message(
+            content,
+            &[tool_call("t1", Some(30))],
+            vec![tool_entry("t1")],
+            Some(&boundaries),
+            false,
+        );
+        for segment in &in_link {
+            if let MessageSegment::Content(text) = segment {
+                assert_eq!(
+                    text.matches('[').count(),
+                    text.matches(']').count(),
+                    "a fragment must not contain half a link: {text:?}"
+                );
+            }
+        }
+    }
+
+    /// RLV-03: offsetless tools keep the legacy order exactly — content, then
+    /// images, then tools. Appending images after the segments silently moved
+    /// every legacy multimodal message to content → tools → images.
+    #[wasm_bindgen_test]
+    fn images_keep_their_legacy_slot_for_offsetless_tools() {
+        let segments = interleave_message(
+            "text",
+            &[tool_call("t1", None)],
+            vec![tool_entry("t1")],
+            None,
+            true,
+        );
+
+        assert_eq!(
+            segment_shape(&segments),
+            vec!["content:text", "images", "tools:t1"],
+            "legacy order is content, images, tools"
+        );
+    }
+
+    /// Mixed placed and unplaced: images have no offset, so they keep the slot
+    /// before the legacy tail rather than being pushed to the end.
+    #[wasm_bindgen_test]
+    fn images_sit_before_the_legacy_tail_in_a_mixed_message() {
+        let segments = interleave_message(
+            "AB",
+            &[tool_call("placed", Some(1)), tool_call("legacy", None)],
+            vec![tool_entry("placed"), tool_entry("legacy")],
+            None,
+            true,
+        );
+
+        assert_eq!(
+            segment_shape(&segments),
+            vec![
+                "content:A",
+                "tools:placed",
+                "content:B",
+                "images",
+                "tools:legacy"
+            ]
         );
     }
 
@@ -743,6 +919,8 @@ mod wasm_tests {
             "AB",
             &[tool_call("placed", Some(1)), tool_call("legacy", None)],
             vec![tool_entry("placed"), tool_entry("legacy")],
+            None,
+            false,
         );
 
         assert_eq!(
@@ -877,6 +1055,176 @@ mod wasm_tests {
             .query_selector(".token-stat-output")
             .unwrap()
             .map(|el| el.text_content().unwrap_or_default())
+    }
+
+    /// DOM reading order for the legacy shape: content, image, tool card. This
+    /// is what assistive technology consumes, and appending images after the
+    /// segments silently reversed the last two.
+    #[wasm_bindgen_test]
+    async fn offsetless_tool_keeps_image_before_the_card_in_dom_order() {
+        let mut entry = assistant_msg(None);
+        entry.message.content = "some text".to_owned();
+        entry.message.tool_calls = vec![tool_call("t1", None)];
+        entry.message.images = Some(vec![protocol::ImageData {
+            media_type: "image/png".to_owned(),
+            data: "iVBORw0KGgo=".to_owned(),
+        }]);
+        entry.tool_requests = vec![tool_entry("t1")];
+        let container = mount_message(entry);
+        next_tick().await;
+
+        let order = dom_order(&container);
+        let body = order
+            .iter()
+            .position(|kind| kind == "body")
+            .expect("content renders");
+        let images = order
+            .iter()
+            .position(|kind| kind == "images")
+            .expect("image renders");
+        let tools = order
+            .iter()
+            .position(|kind| kind == "tools")
+            .expect("tool card renders");
+        assert!(
+            body < images && images < tools,
+            "legacy reading order is content, image, tool card; got {order:?}"
+        );
+        assert_eq!(
+            container
+                .query_selector(".chat-card-image-link")
+                .unwrap()
+                .and_then(|el| el.get_attribute("aria-label"))
+                .as_deref(),
+            Some("Open image full size"),
+            "the image keeps its accessible name in the legacy slot"
+        );
+    }
+
+    /// A placed tool renders between the two content runs in the DOM, which is
+    /// the reading order the live run got wrong.
+    #[wasm_bindgen_test]
+    async fn placed_tool_renders_between_content_runs_in_dom_order() {
+        let mut entry = assistant_msg(None);
+        entry.message.content = "PRE\n\nPOST".to_owned();
+        // Offset 5 is the start of the second paragraph.
+        entry.message.tool_calls = vec![tool_call("t1", Some(5))];
+        entry.tool_requests = vec![tool_entry("t1")];
+        let container = mount_message(entry);
+        next_tick().await;
+
+        let order = dom_order(&container);
+        let tools = order
+            .iter()
+            .position(|kind| kind == "tools")
+            .expect("tool card renders");
+        let bodies: Vec<usize> = order
+            .iter()
+            .enumerate()
+            .filter(|(_, kind)| *kind == "body")
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(bodies.len(), 2, "content is split in two, got {order:?}");
+        assert!(
+            bodies[0] < tools && tools < bodies[1],
+            "the card sits between the runs, got {order:?}"
+        );
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("PRE") && text.contains("POST"),
+            "no content is lost, got: {text}"
+        );
+    }
+
+    /// A tool offset inside a fenced code block must leave the block intact:
+    /// one `<pre>`/code block, its full text, and no stray literal fence.
+    #[wasm_bindgen_test]
+    async fn tool_inside_a_code_fence_leaves_the_block_intact() {
+        let mut entry = assistant_msg(None);
+        entry.message.content = "intro\n\n```rust\nfn a() {}\n```\n\ntail".to_owned();
+        entry.message.tool_calls = vec![tool_call("t1", Some(20))];
+        entry.tool_requests = vec![tool_entry("t1")];
+        let container = mount_message(entry);
+        next_tick().await;
+
+        assert_eq!(
+            container.query_selector_all(".md-code-block").unwrap().length(),
+            1,
+            "the fenced block renders once and whole"
+        );
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("fn a() {}"),
+            "the code survives the split, got: {text}"
+        );
+        assert!(
+            !text.contains("```"),
+            "no half-fence leaks through as literal text, got: {text}"
+        );
+    }
+
+    /// A tool offset inside a link must not leave half the link as literal
+    /// text: the anchor still renders with its href and label.
+    #[wasm_bindgen_test]
+    async fn tool_inside_a_link_leaves_the_anchor_intact() {
+        let mut entry = assistant_msg(None);
+        entry.message.content = "see [label](https://example.com) here".to_owned();
+        entry.message.tool_calls = vec![tool_call("t1", Some(12))];
+        entry.tool_requests = vec![tool_entry("t1")];
+        let container = mount_message(entry);
+        next_tick().await;
+
+        let anchor = container
+            .query_selector(".chat-card-body a")
+            .unwrap()
+            .expect("the link still renders as an anchor");
+        assert_eq!(
+            anchor.get_attribute("href").as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(anchor.text_content().as_deref(), Some("label"));
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            !text.contains("](https://"),
+            "no half-link leaks through as literal text, got: {text}"
+        );
+    }
+
+    /// A tool offset inside a list must leave both items in one list.
+    #[wasm_bindgen_test]
+    async fn tool_inside_a_list_leaves_both_items_in_one_list() {
+        let mut entry = assistant_msg(None);
+        entry.message.content = "- one\n- two\n\ntail".to_owned();
+        entry.message.tool_calls = vec![tool_call("t1", Some(8))];
+        entry.tool_requests = vec![tool_entry("t1")];
+        let container = mount_message(entry);
+        next_tick().await;
+
+        let lists = container.query_selector_all(".chat-card-body ul").unwrap();
+        assert_eq!(lists.length(), 1, "the list is not cut in two");
+        let items = container.query_selector_all(".chat-card-body li").unwrap();
+        assert_eq!(items.length(), 2, "both items stay in it");
+    }
+
+    /// Reading order of the rendered card, as a screen reader would walk it.
+    fn dom_order(container: &HtmlElement) -> Vec<String> {
+        let nodes = container
+            .query_selector_all(".chat-card-body, .chat-card-images, .chat-card-tools")
+            .unwrap();
+        (0..nodes.length())
+            .filter_map(|index| nodes.item(index))
+            .filter_map(|node| node.dyn_into::<web_sys::Element>().ok())
+            .map(|el| {
+                let class = el.get_attribute("class").unwrap_or_default();
+                if class.contains("chat-card-images") {
+                    "images".to_owned()
+                } else if class.contains("chat-card-body") {
+                    "body".to_owned()
+                } else {
+                    "tools".to_owned()
+                }
+            })
+            .collect()
     }
 
     #[wasm_bindgen_test]
