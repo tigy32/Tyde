@@ -16835,18 +16835,20 @@ fn fan_out_session_summary_count_update_inner(
         let Some(subscriber) = state.host_streams.get_mut(&path) else {
             continue;
         };
-        if !subscriber.session_summary_updates_subscribed
-            || !visible_host_streams.contains(&path)
-        {
+        if !subscriber.session_summary_updates_subscribed || !visible_host_streams.contains(&path) {
             continue;
         }
         visible_subscriber = true;
-        let Some(summary) = subscriber.session_list_snapshot.as_ref().and_then(|snapshot| {
-            snapshot
-                .sessions
-                .iter()
-                .find(|summary| summary.id == update.session_id)
-        }) else {
+        let Some(summary) = subscriber
+            .session_list_snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot
+                    .sessions
+                    .iter()
+                    .find(|summary| summary.id == update.session_id)
+            })
+        else {
             continue;
         };
         matched_snapshot = true;
@@ -22371,11 +22373,16 @@ Rules: Record only what remains true and useful for future work; drop transient 
         })
         .await
         .expect("initial turn count update");
-        assert!(saw_new_agent, "spawn must publish NewAgent to the subscriber");
+        assert!(
+            saw_new_agent,
+            "spawn must publish NewAgent to the subscriber"
+        );
 
         let (unsubscribed_tx, mut unsubscribed_rx) = mpsc::unbounded_channel();
-        let unsubscribed_path =
-            StreamPath(format!("/host/session-count-unsubscribed-{}", Uuid::new_v4()));
+        let unsubscribed_path = StreamPath(format!(
+            "/host/session-count-unsubscribed-{}",
+            Uuid::new_v4()
+        ));
         let unsubscribed_stream = Stream::new(unsubscribed_path, unsubscribed_tx);
         assert!(
             fixture
