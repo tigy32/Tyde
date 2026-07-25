@@ -5360,7 +5360,7 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
         host_id.to_string(),
         crate::state::session_list_scope_key(payload.session_list.scope),
     );
-    let bootstrap_page = payload.session_list.clone();
+    let bootstrap_page = payload.session_list;
     state.session_list_pages.update(|pages| {
         pages.retain(|(page_host, _), _| page_host != host_id);
         pages.insert(bootstrap_page_key, bootstrap_page);

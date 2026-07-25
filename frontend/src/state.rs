@@ -343,17 +343,21 @@ fn persist_workspace_selection(_selection: &PersistedWorkspaceSelection) {}
 // Test-only re-exports. The persistence functions are private so nothing but
 // the effect writes them in production, but the reload lifecycle can only be
 // covered from a browser test that seeds and reads real storage.
-#[cfg(test)]
+//
+// Gated to wasm alongside the functions they wrap: their callers are the
+// browser lifecycle tests in `dispatch`, which a native build does not compile,
+// so an ungated `#[cfg(test)]` makes them look dead to every native lint.
+#[cfg(all(test, target_arch = "wasm32"))]
 pub fn persist_workspace_selection_for_tests(selection: &PersistedWorkspaceSelection) {
     persist_workspace_selection(selection);
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "wasm32"))]
 pub fn load_workspace_selection_for_tests() -> PersistedWorkspaceSelection {
     load_workspace_selection()
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "wasm32"))]
 pub fn persist_active_project_for_tests(project: Option<&ActiveProjectRef>) {
     persist_active_project(project);
 }
