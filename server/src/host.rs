@@ -16771,13 +16771,11 @@ fn fan_out_session_summary_count_update(
         let Some(subscriber) = state.host_streams.get_mut(&path) else {
             continue;
         };
-        if let Some(snapshot) = subscriber.session_list_snapshot.as_mut()
-            && let Some(summary) = snapshot
-                .sessions
-                .iter_mut()
-                .find(|summary| summary.id == update.session_id)
-        {
-            summary.message_count = update.assistant_turn_count;
+        if !apply_session_summary_count_update(
+            subscriber.session_list_snapshot.as_mut(),
+            update,
+        ) {
+            continue;
         }
         if emit_or_queue_host_frame(
             subscriber,
@@ -16793,6 +16791,22 @@ fn fan_out_session_summary_count_update(
     for path in dead_paths {
         state.host_streams.remove(&path);
     }
+}
+
+fn apply_session_summary_count_update(
+    snapshot: Option<&mut SessionListSnapshot>,
+    update: &SessionSummaryCountUpdatedPayload,
+) -> bool {
+    let Some(summary) = snapshot.and_then(|snapshot| {
+        snapshot
+            .sessions
+            .iter_mut()
+            .find(|summary| summary.id == update.session_id)
+    }) else {
+        return false;
+    };
+    summary.message_count = update.assistant_turn_count;
+    true
 }
 
 async fn fan_out_task_token_usages(state: &mut HostState, payloads: Vec<TaskTokenUsagePayload>) {
@@ -18422,11 +18436,25 @@ fn hidden_helper_session_settings(
     backend_kind: BackendKind,
     session_settings: Option<&SessionSettingsValues>,
 ) -> Option<SessionSettingsValues> {
-    if backend_kind == BackendKind::Hermes {
-        session_settings.cloned()
-    } else {
-        None
+    if backend_kind != BackendKind::Hermes {
+        return None;
     }
+
+    let mut helper_settings = SessionSettingsValues::default();
+    if let Some(session_settings) = session_settings {
+        for key in [crate::backend::hermes::HERMES_PROFILE_SETTING, "model"] {
+            if let Some(value) = session_settings.0.get(key) {
+                helper_settings.0.insert(key.to_owned(), value.clone());
+            }
+        }
+    }
+    // Hermes cost hints do not supply defaults, so cap hidden inference
+    // explicitly instead of inheriting the visible session's effort or tier.
+    helper_settings.0.insert(
+        "reasoning_effort".to_owned(),
+        protocol::SessionSettingValue::String("low".to_owned()),
+    );
+    Some(helper_settings)
 }
 
 fn session_schema_entry_for_backend(
@@ -19065,7 +19093,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
     }
 
     #[test]
-    fn hidden_helpers_copy_all_hermes_session_settings_and_no_others() {
+    fn hidden_helpers_keep_hermes_scope_with_low_cost_settings() {
         let mut settings = SessionSettingsValues::default();
         settings.0.insert(
             crate::backend::hermes::HERMES_PROFILE_SETTING.to_owned(),
@@ -19079,22 +19107,47 @@ Rules: Record only what remains true and useful for future work; drop transient 
         );
         settings.0.insert(
             "reasoning_effort".to_owned(),
-            protocol::SessionSettingValue::String("low".to_owned()),
+            protocol::SessionSettingValue::String("xhigh".to_owned()),
         );
         settings.0.insert(
             "fast".to_owned(),
             protocol::SessionSettingValue::Bool(true),
         );
+        settings.0.insert(
+            "future_expensive_setting".to_owned(),
+            protocol::SessionSettingValue::Bool(true),
+        );
 
+        let helper_settings =
+            hidden_helper_session_settings(BackendKind::Hermes, Some(&settings))
+                .expect("Hermes helper settings");
         assert_eq!(
-            hidden_helper_session_settings(BackendKind::Hermes, Some(&settings)),
-            Some(settings.clone())
+            helper_settings
+                .0
+                .get(crate::backend::hermes::HERMES_PROFILE_SETTING),
+            settings
+                .0
+                .get(crate::backend::hermes::HERMES_PROFILE_SETTING)
         );
         assert_eq!(
-            hidden_helper_session_settings(BackendKind::Hermes, None),
-            None,
-            "a default Hermes session must keep using the default profile"
+            helper_settings.0.get("model"),
+            settings.0.get("model")
         );
+        assert_eq!(
+            helper_settings.0.get("reasoning_effort"),
+            Some(&protocol::SessionSettingValue::String("low".to_owned()))
+        );
+        assert!(!helper_settings.0.contains_key("fast"));
+        assert!(!helper_settings.0.contains_key("future_expensive_setting"));
+        assert_eq!(helper_settings.0.len(), 3);
+        let default_helper_settings =
+            hidden_helper_session_settings(BackendKind::Hermes, None)
+                .expect("default Hermes helper settings");
+        assert_eq!(
+            default_helper_settings.0.get("reasoning_effort"),
+            Some(&protocol::SessionSettingValue::String("low".to_owned()))
+        );
+        assert_eq!(default_helper_settings.0.len(), 1);
         for backend_kind in [
             BackendKind::Tycode,
             BackendKind::Kiro,
@@ -20986,6 +21039,46 @@ Rules: Record only what remains true and useful for future work; drop transient 
             compacted_at_ms: None,
             compaction_summary_preview: None,
         }
+    }
+
+    #[test]
+    fn session_count_update_applies_only_to_snapshots_containing_session() {
+        let tracked_session_id = SessionId("tracked-session".to_owned());
+        let mut snapshot = SessionListSnapshot {
+            generation: SessionListGeneration(7),
+            scope: SessionListScope::RootSessions,
+            sessions: vec![test_session_summary(
+                BackendKind::Hermes,
+                tracked_session_id.clone(),
+                true,
+            )],
+        };
+
+        assert!(!apply_session_summary_count_update(
+            None,
+            &SessionSummaryCountUpdatedPayload {
+                session_id: tracked_session_id.clone(),
+                assistant_turn_count: 2,
+            },
+        ));
+        assert!(!apply_session_summary_count_update(
+            Some(&mut snapshot),
+            &SessionSummaryCountUpdatedPayload {
+                session_id: SessionId("unlisted-session".to_owned()),
+                assistant_turn_count: 3,
+            },
+        ));
+        assert_eq!(snapshot.sessions[0].message_count, 0);
+        assert!(apply_session_summary_count_update(
+            Some(&mut snapshot),
+            &SessionSummaryCountUpdatedPayload {
+                session_id: tracked_session_id,
+                assistant_turn_count: 4,
+            },
+        ));
+        assert_eq!(snapshot.sessions[0].message_count, 4);
+        assert_eq!(snapshot.generation, SessionListGeneration(7));
+        assert_eq!(snapshot.scope, SessionListScope::RootSessions);
     }
 
     #[test]

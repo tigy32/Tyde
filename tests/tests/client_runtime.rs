@@ -364,13 +364,25 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
     let (session_list_tx, session_list_rx) = oneshot::channel();
     let (new_agent_tx, new_agent_rx) = oneshot::channel();
     let (session_count_tx, mut session_count_rx) = mpsc::channel(2);
+    let (host_loop_stop_tx, mut host_loop_stop_rx) = oneshot::channel();
+    let (host_loop_result_tx, host_loop_result_rx) = oneshot::channel();
 
     tokio::spawn(async move {
         let mut session_list_tx = Some(session_list_tx);
         let mut new_agent_tx = Some(new_agent_tx);
+        let mut expected_session_id = None;
         let mut saw_second_count = false;
 
-        while let Some(event) = events.recv().await {
+        loop {
+            let event = tokio::select! {
+                _ = &mut host_loop_stop_rx => break,
+                event = events.recv() => {
+                    let Some(event) = event else {
+                        break;
+                    };
+                    event
+                }
+            };
             match event {
                 HostEvent::SessionList(payload) => {
                     if let Some(tx) = session_list_tx.take() {
@@ -378,12 +390,14 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                     }
                 }
                 HostEvent::NewAgent(agent) => {
+                    expected_session_id = agent.info.session_id.clone();
                     if let Some(tx) = new_agent_tx.take() {
                         let _ = tx.send(agent);
                     }
                 }
                 HostEvent::SessionSummaryCountUpdated(payload) => {
-                    saw_second_count = payload.assistant_turn_count >= 2;
+                    saw_second_count |= expected_session_id.as_ref() == Some(&payload.session_id)
+                        && payload.assistant_turn_count >= 2;
                     let _ = session_count_tx.send(payload).await;
                 }
                 HostEvent::HostSettings(_)
@@ -416,11 +430,8 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                 | HostEvent::TeamDraftNotify(_)
                 | HostEvent::TeamMemberShuffleSuggestionNotify(_) => {}
             }
-
-            if session_list_tx.is_none() && new_agent_tx.is_none() && saw_second_count {
-                break;
-            }
         }
+        let _ = host_loop_result_tx.send(saw_second_count);
     });
 
     commands
@@ -536,11 +547,12 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
         }
         other => panic!("expected initial final response, got {other:?}"),
     }
-    let first_count = timeout(Duration::from_secs(5), session_count_rx.recv())
-        .await
-        .expect("timed out waiting for initial session count")
-        .expect("host event loop dropped before initial session count");
-    assert_eq!(first_count.session_id, session_id);
+    let first_count = next_session_count(
+        &mut session_count_rx,
+        &session_id,
+        "initial session count",
+    )
+    .await;
     assert_eq!(first_count.assistant_turn_count, 1);
 
     let follow_up = "follow-up after background event loop";
@@ -563,12 +575,24 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
         }
         other => panic!("expected follow-up final response, got {other:?}"),
     }
-    let second_count = timeout(Duration::from_secs(5), session_count_rx.recv())
-        .await
-        .expect("timed out waiting for follow-up session count")
-        .expect("host event loop dropped before follow-up session count");
-    assert_eq!(second_count.session_id, session_id);
+    let second_count = next_session_count(
+        &mut session_count_rx,
+        &session_id,
+        "follow-up session count",
+    )
+    .await;
     assert_eq!(second_count.assistant_turn_count, 2);
+    host_loop_stop_tx
+        .send(())
+        .expect("host event loop must remain active through count assertions");
+    let saw_second_count = timeout(Duration::from_secs(5), host_loop_result_rx)
+        .await
+        .expect("timed out stopping host event loop")
+        .expect("host event loop dropped its accumulated count result");
+    assert!(
+        saw_second_count,
+        "host event loop must accumulate the matching session's second count"
+    );
 }
 
 #[tokio::test]
@@ -665,6 +689,26 @@ async fn next_host_event(events: &mut client::HostEvents, context: &str) -> Host
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for host event: {context}"))
         .unwrap_or_else(|| panic!("host event stream closed while waiting for {context}"))
+}
+
+async fn next_session_count(
+    rx: &mut mpsc::Receiver<protocol::SessionSummaryCountUpdatedPayload>,
+    session_id: &protocol::SessionId,
+    context: &str,
+) -> protocol::SessionSummaryCountUpdatedPayload {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let payload = rx
+                .recv()
+                .await
+                .unwrap_or_else(|| panic!("host event loop closed while waiting for {context}"));
+            if &payload.session_id == session_id {
+                return payload;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {context}"))
 }
 
 async fn next_backend_capacity_event(

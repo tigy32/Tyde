@@ -945,10 +945,6 @@ mod tests {
             "reasoning_effort".to_owned(),
             protocol::SessionSettingValue::String("low".to_owned()),
         );
-        settings.0.insert(
-            "fast".to_owned(),
-            protocol::SessionSettingValue::Bool(true),
-        );
 
         let config = supervision_spawn_config(Some(SpawnCostHint::Low), Some(settings.clone()));
 

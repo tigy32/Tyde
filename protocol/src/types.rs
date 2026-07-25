@@ -3588,6 +3588,8 @@ pub struct SessionSummary {
     pub parent_id: Option<SessionId>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+    /// Completed assistant turns (one per persisted `StreamEnd`);
+    /// `message_count` is retained as the legacy wire name.
     pub message_count: u32,
     pub token_count: Option<u64>,
     pub resumable: bool,
@@ -3610,7 +3612,7 @@ pub struct SessionListPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummaryCountUpdatedPayload {
     pub session_id: SessionId,
-    /// Number of completed assistant turns persisted for this session.
+    /// Number of completed assistant turns (`StreamEnd`s) persisted for this session.
     pub assistant_turn_count: u32,
 }
 

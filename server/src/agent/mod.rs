@@ -11013,9 +11013,6 @@ mod tests {
             "reasoning_effort".to_owned(),
             SessionSettingValue::String("low".to_owned()),
         );
-        settings
-            .0
-            .insert("fast".to_owned(), SessionSettingValue::Bool(true));
         let config = agent_name_generation_spawn_config(Some(settings.clone()));
 
         assert!(config.startup_mcp_servers.is_empty());
