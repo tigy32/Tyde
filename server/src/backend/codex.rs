@@ -8539,29 +8539,27 @@ impl CodexInner {
                 if turn_status != "interrupted"
                     && partial_idless_reasoning.is_none()
                     && !open_item_without_completion
-                {
-                    if state
+                    && state
                         .pending_message_metadata
                         .as_ref()
                         .is_some_and(|pending| pending.turn_id == turn_id)
-                        && let Some(pending) = state.pending_message_metadata.take()
-                    {
-                        let token_usage = state.token_usage_by_turn.remove(&turn_id);
-                        let context_breakdown = estimate_context_breakdown(
-                            token_usage.as_ref(),
-                            &pending.turn_context,
-                            Some(&pending.model),
-                        );
-                        if token_usage.is_none() {
-                            state
-                                .completed_message_metadata_by_turn
-                                .insert(turn_id.clone(), pending.clone());
-                        }
-                        let model_token_usage =
-                            state.model_token_usage_by_turn.get(&turn_id).cloned();
-                        metadata_update =
-                            Some((pending, token_usage, model_token_usage, context_breakdown));
+                    && let Some(pending) = state.pending_message_metadata.take()
+                {
+                    let token_usage = state.token_usage_by_turn.remove(&turn_id);
+                    let context_breakdown = estimate_context_breakdown(
+                        token_usage.as_ref(),
+                        &pending.turn_context,
+                        Some(&pending.model),
+                    );
+                    if token_usage.is_none() {
+                        state
+                            .completed_message_metadata_by_turn
+                            .insert(turn_id.clone(), pending.clone());
                     }
+                    let model_token_usage =
+                        state.model_token_usage_by_turn.get(&turn_id).cloned();
+                    metadata_update =
+                        Some((pending, token_usage, model_token_usage, context_breakdown));
                 }
                 if turn_status == "interrupted" || partial_idless_reasoning.is_some() {
                     state.pending_message_metadata = None;
