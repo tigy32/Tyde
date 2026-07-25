@@ -4,7 +4,7 @@ use wasm_bindgen::JsCast;
 
 use crate::components::tool_card::ToolCardListView;
 use crate::markdown::render_markdown;
-use crate::state::{ActiveAgentRef, ChatRowHandle};
+use crate::state::{ActiveAgentRef, ChatRowHandle, ToolRequestEntry};
 
 /// Render a single chat row from its row-local signal.
 ///
@@ -12,6 +12,113 @@ use crate::state::{ActiveAgentRef, ChatRowHandle};
 /// this component. Appending a sibling row updates the row list, but existing
 /// `ChatMessageView`s only subscribe to their own `ArcRwSignal`, so long
 /// history replay does not wake every already-mounted row.
+/// One rendered slice of an assistant message.
+///
+/// A message carries a single content string plus a positionless tool list, so
+/// rendering used to be "all text, then all tools" — which loses the order the
+/// model actually produced when it interleaves prose and tool calls. Each tool
+/// now records the scalar offset in `content` at which it was observed, and
+/// the message is rebuilt as the alternating sequence that implies.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum MessageSegment {
+    Content(String),
+    Tools(Vec<ToolRequestEntry>),
+}
+
+/// Rebuild a message as interleaved content and tool segments.
+///
+/// - Tools are placed by the `content_offset` recorded on the matching
+///   [`protocol::ToolUseData`], matched by id.
+/// - A tool with no offset — legacy data, or a backend that does not record one
+///   — keeps the old layout and is emitted after all content. If *no* tool has
+///   an offset the output is exactly `[Content(all), Tools(all)]`, byte for
+///   byte what this rendered before.
+/// - Offsets are Unicode scalar indices, so splitting goes through
+///   `char_indices` and can never land inside a character.
+/// - An offset past the end clamps to the end rather than panicking; a
+///   backend that miscounts degrades to the legacy tail, it does not crash the
+///   chat.
+/// - Several tools at one offset keep their arrival order, and equal offsets
+///   sort stably, so a repeated offset is not a reordering hazard.
+pub(crate) fn interleave_message(
+    content: &str,
+    tool_calls: &[protocol::ToolUseData],
+    tools: Vec<ToolRequestEntry>,
+) -> Vec<MessageSegment> {
+    let scalar_len = content.chars().count();
+    let offset_for = |tool_call_id: &str| -> Option<usize> {
+        tool_calls
+            .iter()
+            .find(|call| call.id == tool_call_id)
+            .and_then(|call| call.content_offset)
+            .map(|offset| (offset as usize).min(scalar_len))
+    };
+
+    // Partition into placed and unplaced, preserving arrival order in both.
+    let mut placed: Vec<(usize, ToolRequestEntry)> = Vec::new();
+    let mut trailing: Vec<ToolRequestEntry> = Vec::new();
+    for entry in tools {
+        match offset_for(&entry.request.tool_call_id) {
+            Some(offset) => placed.push((offset, entry)),
+            None => trailing.push(entry),
+        }
+    }
+
+    if placed.is_empty() {
+        // Legacy layout, unchanged.
+        let mut segments = Vec::new();
+        if !content.is_empty() {
+            segments.push(MessageSegment::Content(content.to_owned()));
+        }
+        if !trailing.is_empty() {
+            segments.push(MessageSegment::Tools(trailing));
+        }
+        return segments;
+    }
+
+    // `sort_by_key` is stable, so tools sharing an offset keep arrival order.
+    placed.sort_by_key(|(offset, _)| *offset);
+
+    // Scalar index -> byte index, so a split can never fall inside a character.
+    let byte_at = |scalar: usize| -> usize {
+        content
+            .char_indices()
+            .nth(scalar)
+            .map(|(byte, _)| byte)
+            .unwrap_or(content.len())
+    };
+
+    let mut segments = Vec::new();
+    let mut cursor_scalar = 0usize;
+    let mut index = 0usize;
+    while index < placed.len() {
+        let offset = placed[index].0;
+        if offset > cursor_scalar {
+            let slice = &content[byte_at(cursor_scalar)..byte_at(offset)];
+            if !slice.is_empty() {
+                segments.push(MessageSegment::Content(slice.to_owned()));
+            }
+            cursor_scalar = offset;
+        }
+        // Every tool at this offset becomes one group.
+        let mut group = Vec::new();
+        while index < placed.len() && placed[index].0 == offset {
+            group.push(placed[index].1.clone());
+            index += 1;
+        }
+        segments.push(MessageSegment::Tools(group));
+    }
+
+    let tail = &content[byte_at(cursor_scalar)..];
+    if !tail.is_empty() {
+        segments.push(MessageSegment::Content(tail.to_owned()));
+    }
+    if !trailing.is_empty() {
+        segments.push(MessageSegment::Tools(trailing));
+    }
+    segments
+}
+
 #[component]
 pub fn ChatMessageView(
     agent_ref: Signal<Option<ActiveAgentRef>>,
@@ -63,30 +170,6 @@ pub fn ChatMessageView(
                 true,
             ),
         })
-    });
-
-    let entry_for_content = entry.clone();
-    let content_data: Memo<(bool, String)> = Memo::new(move |_| {
-        entry_for_content.with(|e| {
-            let is_user = matches!(e.message.sender, MessageSender::User);
-            (is_user, e.message.content.clone())
-        })
-    });
-
-    let content_html: Memo<String> = Memo::new(move |_| {
-        let (is_user, content) = content_data.get();
-        if content.is_empty() {
-            return String::new();
-        }
-        if is_user {
-            let escaped = content
-                .replace('&', "&amp;")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;");
-            format!("<span class=\"user-text\">{escaped}</span>")
-        } else {
-            render_markdown(&content)
-        }
     });
 
     let entry_for_timestamp = entry.clone();
@@ -194,20 +277,61 @@ pub fn ChatMessageView(
                 })
             }}
 
-            // Body — hidden when content is empty
+            // Body and tool cards, interleaved in the order the model produced
+            // them. Reads only this row's signal, so a tool update does not
+            // invalidate sibling rows.
             {move || {
-                let html = content_html.get();
-                if html.is_empty() {
-                    None
-                } else {
-                    Some(view! {
-                        <div
-                            class="chat-card-body"
-                            node_ref=body_ref
-                            inner_html=html
-                        ></div>
+                let entry = entry_for_tools.get();
+                let is_user = card_meta.with(|(is_user, _, _, _, _)| *is_user);
+                let segments = interleave_message(
+                    &entry.message.content,
+                    &entry.message.tool_calls,
+                    entry.tool_requests,
+                );
+                let mut body_ref_taken = false;
+                segments
+                    .into_iter()
+                    .map(|segment| match segment {
+                        MessageSegment::Content(text) => {
+                            let html = if is_user {
+                                let escaped = text
+                                    .replace('&', "&amp;")
+                                    .replace('<', "&lt;")
+                                    .replace('>', "&gt;");
+                                format!("<span class=\"user-text\">{escaped}</span>")
+                            } else {
+                                render_markdown(&text)
+                            };
+                            if html.is_empty() {
+                                return ().into_any();
+                            }
+                            // The node ref identifies the row's body; with the
+                            // body split it belongs to the first slice.
+                            let node_ref = (!body_ref_taken).then(|| {
+                                body_ref_taken = true;
+                                body_ref
+                            });
+                            match node_ref {
+                                Some(node_ref) => view! {
+                                    <div
+                                        class="chat-card-body"
+                                        node_ref=node_ref
+                                        inner_html=html
+                                    ></div>
+                                }
+                                .into_any(),
+                                None => view! {
+                                    <div class="chat-card-body" inner_html=html></div>
+                                }
+                                .into_any(),
+                            }
+                        }
+                        MessageSegment::Tools(entries) => view! {
+                            <ToolCardListView agent_ref=agent_ref entries=entries />
+                        }
+                        .into_any(),
                     })
-                }
+                    .collect::<Vec<_>>()
             }}
 
             // Images
@@ -246,17 +370,6 @@ pub fn ChatMessageView(
                 })
             }}
 
-            // Tool cards — read only this row's signal, so tool updates do not
-            // invalidate sibling rows.
-            {move || {
-                let tools = entry_for_tools.get().tool_requests;
-                if tools.is_empty() {
-                    return None;
-                }
-                Some(view! {
-                    <ToolCardListView agent_ref=agent_ref entries=tools />
-                })
-            }}
 
             // Footer (assistant only)
             {move || {
@@ -468,6 +581,175 @@ mod wasm_tests {
     use web_sys::HtmlElement;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    fn tool_call(id: &str, offset: Option<u32>) -> protocol::ToolUseData {
+        protocol::ToolUseData {
+            id: id.to_owned(),
+            name: "run".to_owned(),
+            arguments: serde_json::json!({}),
+            content_offset: offset,
+        }
+    }
+
+    fn tool_entry(id: &str) -> ToolRequestEntry {
+        ToolRequestEntry {
+            request: protocol::ToolRequest {
+                tool_call_id: id.to_owned(),
+                tool_name: "run".to_owned(),
+                tool_type: protocol::ToolRequestType::Other {
+                    args: serde_json::json!({}),
+                },
+            },
+            result: None,
+        }
+    }
+
+    fn segment_shape(segments: &[MessageSegment]) -> Vec<String> {
+        segments
+            .iter()
+            .map(|segment| match segment {
+                MessageSegment::Content(text) => format!("content:{text}"),
+                MessageSegment::Tools(entries) => format!(
+                    "tools:{}",
+                    entries
+                        .iter()
+                        .map(|entry| entry.request.tool_call_id.clone())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            })
+            .collect()
+    }
+
+    /// The live B1 shape: text, a tool call, then more text. Tyde rendered
+    /// `PRE`, `POST`, then the tool card, because a message carries one content
+    /// string and a positionless tool list. The recorded offset restores the
+    /// order the model actually produced.
+    #[wasm_bindgen_test]
+    fn content_and_tools_interleave_at_the_recorded_offset() {
+        let segments = interleave_message(
+            "PRE\nPOST",
+            &[tool_call("t1", Some(4))],
+            vec![tool_entry("t1")],
+        );
+
+        assert_eq!(
+            segment_shape(&segments),
+            vec!["content:PRE\n", "tools:t1", "content:POST"],
+            "the tool card belongs between the two text runs, not after both"
+        );
+    }
+
+    /// Offsets are Unicode scalar indices, so a split must never land inside a
+    /// character. Byte indexing here would panic or corrupt the text.
+    #[wasm_bindgen_test]
+    fn offsets_are_scalar_indices_not_byte_indices() {
+        // Four scalars, ten bytes.
+        let content = "héllo→ok";
+        let segments = interleave_message(content, &[tool_call("t1", Some(6))], vec![tool_entry("t1")]);
+
+        assert_eq!(
+            segment_shape(&segments),
+            vec!["content:héllo→", "tools:t1", "content:ok"],
+            "the split falls on the scalar boundary, keeping both runs intact"
+        );
+    }
+
+    /// Several tools observed at one point keep the order they arrived in, and
+    /// equal offsets must not reorder anything.
+    #[wasm_bindgen_test]
+    fn tools_sharing_an_offset_keep_their_arrival_order() {
+        let segments = interleave_message(
+            "AB",
+            &[
+                tool_call("first", Some(1)),
+                tool_call("second", Some(1)),
+                tool_call("third", Some(1)),
+            ],
+            vec![tool_entry("first"), tool_entry("second"), tool_entry("third")],
+        );
+
+        assert_eq!(
+            segment_shape(&segments),
+            vec!["content:A", "tools:first,second,third", "content:B"],
+            "one group at the shared offset, in arrival order"
+        );
+    }
+
+    /// No offsets at all is the legacy shape and must render exactly as before:
+    /// all content, then all tools.
+    #[wasm_bindgen_test]
+    fn absent_offsets_preserve_the_legacy_layout() {
+        let segments = interleave_message(
+            "all of the text",
+            &[tool_call("t1", None), tool_call("t2", None)],
+            vec![tool_entry("t1"), tool_entry("t2")],
+        );
+
+        assert_eq!(
+            segment_shape(&segments),
+            vec!["content:all of the text", "tools:t1,t2"],
+            "unchanged from the positionless rendering"
+        );
+    }
+
+    /// Malformed or unmatched metadata must degrade, not crash: an offset past
+    /// the end clamps, and a tool with no matching call keeps the legacy tail.
+    #[wasm_bindgen_test]
+    fn malformed_offsets_degrade_to_the_tail() {
+        let past_end = interleave_message(
+            "short",
+            &[tool_call("t1", Some(9_999))],
+            vec![tool_entry("t1")],
+        );
+        assert_eq!(
+            segment_shape(&past_end),
+            vec!["content:short", "tools:t1"],
+            "an out-of-range offset clamps to the end instead of panicking"
+        );
+
+        let unmatched = interleave_message(
+            "text",
+            &[tool_call("other", Some(1))],
+            vec![tool_entry("t1")],
+        );
+        assert_eq!(
+            segment_shape(&unmatched),
+            vec!["content:text", "tools:t1"],
+            "a tool with no matching call is placed as legacy data"
+        );
+
+        let zero = interleave_message("text", &[tool_call("t1", Some(0))], vec![tool_entry("t1")]);
+        assert_eq!(
+            segment_shape(&zero),
+            vec!["tools:t1", "content:text"],
+            "offset zero puts the tool before all content, with no empty run"
+        );
+
+        let empty_content =
+            interleave_message("", &[tool_call("t1", Some(0))], vec![tool_entry("t1")]);
+        assert_eq!(
+            segment_shape(&empty_content),
+            vec!["tools:t1"],
+            "an empty message emits no empty content segment"
+        );
+    }
+
+    /// Placed and unplaced tools in one message: the placed one interleaves and
+    /// the offsetless one keeps its legacy position after all content.
+    #[wasm_bindgen_test]
+    fn mixed_placed_and_unplaced_tools_each_keep_their_rule() {
+        let segments = interleave_message(
+            "AB",
+            &[tool_call("placed", Some(1)), tool_call("legacy", None)],
+            vec![tool_entry("placed"), tool_entry("legacy")],
+        );
+
+        assert_eq!(
+            segment_shape(&segments),
+            vec!["content:A", "tools:placed", "content:B", "tools:legacy"]
+        );
+    }
 
     async fn next_tick() {
         let promise = js_sys::Promise::new(&mut |resolve, _reject| {

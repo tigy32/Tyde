@@ -7145,6 +7145,7 @@ mod tests {
             id: id.to_owned(),
             name: name.to_owned(),
             arguments: serde_json::json!({}),
+            content_offset: None,
         }
     }
 
@@ -10034,6 +10035,7 @@ mod wasm_tests {
                         id: "toolu_send_3".to_owned(),
                         name: tool_name.to_owned(),
                         arguments: malformed_arguments.clone(),
+                        content_offset: None,
                     }],
                     model_info: None,
                     token_usage: None,
@@ -10204,6 +10206,7 @@ mod wasm_tests {
                 id: "toolu_send_3".to_owned(),
                 name: tool_name.to_owned(),
                 arguments: malformed_arguments.clone(),
+                content_offset: None,
             }],
             model_info: None,
             token_usage: None,
@@ -11177,6 +11180,7 @@ mod wasm_tests {
             id: "tool-call".to_owned(),
             name: "tool".to_owned(),
             arguments: serde_json::json!({}),
+            content_offset: None,
         }];
         authoritative.images = Some(vec![protocol::ImageData {
             media_type: "image/png".to_owned(),
