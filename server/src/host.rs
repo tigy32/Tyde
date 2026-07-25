@@ -5068,13 +5068,7 @@ impl HostHandle {
             "host spawn_agent resolved request"
         );
 
-        let (
-            start,
-            agent_handle,
-            startup_rx,
-            agent_visibility,
-            session_summary_count_tx,
-        ) = {
+        let (start, agent_handle, startup_rx, agent_visibility, session_summary_count_tx) = {
             let mut state = self.state.lock().await;
             let sub_agent_spawn_tx = state.sub_agent_spawn_tx.clone();
             let capacity_tx = state.capacity_tx.clone();
@@ -5251,9 +5245,9 @@ impl HostHandle {
         if visibility.finish_new_agent_fanout() {
             return Ok(agent_id);
         }
-        let _ = session_summary_count_tx.send(
-            HostSessionSummaryCountEvent::AgentPublished(agent_id.clone()),
-        );
+        let _ = session_summary_count_tx.send(HostSessionSummaryCountEvent::AgentPublished(
+            agent_id.clone(),
+        ));
         #[cfg(test)]
         wait_for_spawn_visible_before_publication_test_hook(self).await;
         {
@@ -5464,13 +5458,7 @@ impl HostHandle {
             let state = self.state.lock().await;
             Arc::clone(&state.session_store)
         };
-        let (
-            start,
-            agent_handle,
-            startup_rx,
-            agent_visibility,
-            session_summary_count_tx,
-        ) = {
+        let (start, agent_handle, startup_rx, agent_visibility, session_summary_count_tx) = {
             let mut state = self.state.lock().await;
             let sub_agent_spawn_tx = state.sub_agent_spawn_tx.clone();
             let capacity_tx = state.capacity_tx.clone();
@@ -5597,9 +5585,9 @@ impl HostHandle {
         if visibility.finish_new_agent_fanout() {
             return agent_id;
         }
-        let _ = session_summary_count_tx.send(
-            HostSessionSummaryCountEvent::AgentPublished(agent_id.clone()),
-        );
+        let _ = session_summary_count_tx.send(HostSessionSummaryCountEvent::AgentPublished(
+            agent_id.clone(),
+        ));
         #[cfg(test)]
         wait_for_spawn_visible_before_publication_test_hook(self).await;
 
@@ -16898,10 +16886,7 @@ fn fan_out_session_summary_count_update_inner(
         }
         return;
     }
-    if state
-        .agent_visibility
-        .publication_pending(&update.agent_id)
-    {
+    if state.agent_visibility.publication_pending(&update.agent_id) {
         if queue_if_missing {
             queue_session_summary_count_update(state, update);
         }
