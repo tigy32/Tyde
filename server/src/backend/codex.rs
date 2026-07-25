@@ -662,6 +662,7 @@ impl CodexSession {
                 supersession_warning_emitted: false,
                 provider_item_tombstones: VecDeque::new(),
                 terminated_turns: VecDeque::new(),
+                terminated_turn_awaiting_replacement: None,
                 generated_identity_epoch,
                 next_generated_identity_ordinal: 1,
                 pending_tool_call_ids: HashSet::new(),
@@ -1546,6 +1547,7 @@ struct CodexSubAgentStream {
     supersession_warning_emitted: bool,
     provider_item_tombstones: VecDeque<CodexProviderItemTombstone>,
     terminated_turns: VecDeque<TerminatedCodexTurn>,
+    terminated_turn_awaiting_replacement: Option<String>,
     generated_identity_epoch: u64,
     next_generated_identity_ordinal: u64,
     pending_message_metadata: Option<PendingCodexMessageMetadata>,
@@ -1673,6 +1675,7 @@ struct CodexState {
     supersession_warning_emitted: bool,
     provider_item_tombstones: VecDeque<CodexProviderItemTombstone>,
     terminated_turns: VecDeque<TerminatedCodexTurn>,
+    terminated_turn_awaiting_replacement: Option<String>,
     generated_identity_epoch: u64,
     next_generated_identity_ordinal: u64,
     pending_tool_call_ids: HashSet<String>,
@@ -3076,6 +3079,7 @@ impl CodexInner {
                 state.active_stream = active_stream;
                 return;
             }
+            state.terminated_turn_awaiting_replacement = Some(turn_id.clone());
             let active_item_id = active_stream
                 .as_ref()
                 .map(|stream| stream.message_id.clone());
@@ -3587,6 +3591,7 @@ impl CodexInner {
             state.supersession_warning_emitted = false;
             state.provider_item_tombstones.clear();
             state.terminated_turns.clear();
+            state.terminated_turn_awaiting_replacement = None;
             state.pending_message_metadata = None;
             state.token_usage_by_turn.clear();
             state.model_token_usage_by_turn.clear();
@@ -3959,8 +3964,17 @@ impl CodexInner {
                         .iter()
                         .any(|terminated| terminated.turn_id == *turn_id)
                 });
-            let awaiting_new_turn_after_termination =
-                state.active_turn_id.is_none() && !state.terminated_turns.is_empty();
+            let awaiting_new_turn_after_termination = notification_turn_id.is_none()
+                && state.active_turn_id.is_none()
+                && state
+                    .terminated_turn_awaiting_replacement
+                    .as_ref()
+                    .is_some_and(|awaiting_turn_id| {
+                        state
+                            .terminated_turns
+                            .iter()
+                            .any(|terminated| terminated.turn_id == *awaiting_turn_id)
+                    });
             let suppress = belongs_to_root
                 && !matches!(method, "turn/started" | "turn/completed")
                 && !is_tombstoned_item
@@ -4040,6 +4054,7 @@ impl CodexInner {
                         tracing::debug!(turn_id, "Ignoring duplicate Codex root turn start");
                         return;
                     }
+                    state.terminated_turn_awaiting_replacement = None;
                     state.active_turn_id = Some(turn_id.clone());
                     state.active_stream = None;
                     state.retired_unpublished_message_ids.clear();
@@ -4565,15 +4580,27 @@ impl CodexInner {
                                 .iter()
                                 .any(|tombstone| tombstone.message_id.0 == message_id)
                         });
+                        let notification_turn_id = extract_turn_id(params);
                         let is_explicitly_terminated_turn =
-                            extract_turn_id(params).as_ref().is_some_and(|turn_id| {
+                            notification_turn_id.as_ref().is_some_and(|turn_id| {
                                 stream
                                     .terminated_turns
                                     .iter()
                                     .any(|terminated| terminated.turn_id == *turn_id)
                             });
-                        let awaiting_new_turn_after_termination =
-                            stream.active_turn_id.is_none() && !stream.terminated_turns.is_empty();
+                        let awaiting_new_turn_after_termination = notification_turn_id.is_none()
+                            && stream.active_turn_id.is_none()
+                            && stream
+                                .terminated_turn_awaiting_replacement
+                                .as_ref()
+                                .is_some_and(|awaiting_turn_id| {
+                                    stream
+                                        .terminated_turns
+                                        .iter()
+                                        .any(|terminated| {
+                                            terminated.turn_id == *awaiting_turn_id
+                                        })
+                                });
                         !matches!(method, "turn/started" | "turn/completed")
                             && !is_tombstoned_item
                             && (is_explicitly_terminated_turn
@@ -4617,6 +4644,7 @@ impl CodexInner {
                 }
                 let Some(emitter) = self
                     .update_codex_subagent_stream(stream_key, |stream| {
+                        stream.terminated_turn_awaiting_replacement = None;
                         stream.active_turn_id = Some(turn_id.clone());
                         stream.current_message_id = None;
                         stream.current_generated_identity = None;
@@ -5434,6 +5462,7 @@ impl CodexInner {
             if !push_codex_terminated_turn(&mut stream.terminated_turns, turn_id.clone()) {
                 return;
             }
+            stream.terminated_turn_awaiting_replacement = Some(turn_id.clone());
             let finalized = stream.current_message_id.clone().map(|message_id| {
                 let kind = if stream.current_reasoning_only {
                     CodexProviderItemKind::Reasoning
@@ -6509,7 +6538,11 @@ impl CodexInner {
                     if turn_status == "interrupted" || partial_idless_reasoning.is_some() {
                         stream.pending_message_metadata = None;
                         if let Some(turn_id) = locally_completed_turn_id {
-                            push_codex_terminated_turn(&mut stream.terminated_turns, turn_id);
+                            push_codex_terminated_turn(
+                                &mut stream.terminated_turns,
+                                turn_id.clone(),
+                            );
+                            stream.terminated_turn_awaiting_replacement = Some(turn_id);
                         }
                     }
                     stream.active_turn_id = None;
@@ -8214,6 +8247,7 @@ impl CodexInner {
                         supersession_warning_emitted: false,
                         provider_item_tombstones: VecDeque::new(),
                         terminated_turns: VecDeque::new(),
+                        terminated_turn_awaiting_replacement: None,
                         generated_identity_epoch: codex_generated_identity_epoch(&thread_id),
                         next_generated_identity_ordinal: 1,
                         pending_message_metadata: None,
@@ -8535,6 +8569,7 @@ impl CodexInner {
                     state.pending_message_metadata = None;
                     state.completed_message_metadata_by_turn.remove(&turn_id);
                     push_codex_terminated_turn(&mut state.terminated_turns, turn_id.clone());
+                    state.terminated_turn_awaiting_replacement = Some(turn_id.clone());
                 }
                 state.turn_context_by_turn.remove(&turn_id);
                 state.token_usage_by_turn.remove(&turn_id);
@@ -15151,6 +15186,7 @@ for line in sys.stdin:
             supersession_warning_emitted: false,
             provider_item_tombstones: VecDeque::new(),
             terminated_turns: VecDeque::new(),
+            terminated_turn_awaiting_replacement: None,
             generated_identity_epoch: codex_generated_identity_epoch("thread-test"),
             next_generated_identity_ordinal: 1,
             pending_tool_call_ids: HashSet::new(),
@@ -15348,6 +15384,7 @@ for line in sys.stdin:
                 supersession_warning_emitted: false,
                 provider_item_tombstones: VecDeque::new(),
                 terminated_turns: VecDeque::new(),
+                terminated_turn_awaiting_replacement: None,
                 generated_identity_epoch: codex_generated_identity_epoch(receiver_thread_id),
                 next_generated_identity_ordinal: 1,
                 pending_message_metadata: None,
@@ -18162,12 +18199,13 @@ Do not describe the tool, and do not skip the tool call."#;
             );
             drop(state);
             let events = drain_events(&mut parent_rx);
-            // This receiver observes TurnEmitter's raw backend event. The agent
-            // forwarder is what later converts it into MessageAdded content.
+            // drain_events applies the same backend Error normalization as the
+            // agent forwarder, so this assertion pins the client-visible shape.
             assert!(events.iter().any(|event| {
-                event.get("kind").and_then(Value::as_str) == Some("Error")
+                event.get("kind").and_then(Value::as_str) == Some("MessageAdded")
+                    && event.pointer("/data/sender").and_then(Value::as_str) == Some("Error")
                     && event
-                        .get("data")
+                        .pointer("/data/content")
                         .and_then(Value::as_str)
                         .is_some_and(|content| {
                             content.contains("Codex child relay registration failed")
@@ -19687,6 +19725,66 @@ Do not describe the tool, and do not skip the tool call."#;
                     "TypingStatusChanged"
                 ],
                 "a distinct later turn must proceed past the prior turn tombstone"
+            );
+            inner
+                .handle_notification(
+                    "thread/tokenUsage/updated",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turnId": "turn-partial",
+                        "tokenUsage": {
+                            "input_tokens": 1,
+                            "output_tokens": 1,
+                            "total_tokens": 2
+                        }
+                    }),
+                )
+                .await;
+            assert!(
+                drain_events(&mut rx).is_empty(),
+                "the old terminated turn must remain suppressed by its explicit tombstone"
+            );
+
+            inner
+                .handle_notification(
+                    "thread/tokenUsage/updated",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turnId": "turn-after-partial",
+                        "tokenUsage": {
+                            "input_tokens": 31,
+                            "output_tokens": 9,
+                            "total_tokens": 40,
+                            "context_window": 200000
+                        }
+                    }),
+                )
+                .await;
+            let metadata = drain_events(&mut rx);
+            assert_eq!(event_kinds(&metadata), vec!["MessageMetadataUpdated"]);
+            assert_eq!(
+                metadata[0]
+                    .pointer("/data/message_id")
+                    .and_then(Value::as_str),
+                Some("after-partial-message")
+            );
+            assert_eq!(
+                metadata[0]
+                    .pointer("/data/token_usage/turn/usage/total_tokens")
+                    .and_then(Value::as_u64),
+                Some(40)
+            );
+            assert_eq!(
+                metadata[0]
+                    .pointer("/data/context_breakdown/input_tokens")
+                    .and_then(Value::as_u64),
+                Some(31)
+            );
+            assert_eq!(
+                metadata[0]
+                    .pointer("/data/context_breakdown/context_window")
+                    .and_then(Value::as_u64),
+                Some(200_000)
             );
             inner.rpc.shutdown().await;
         });
@@ -23212,6 +23310,114 @@ Do not describe the tool, and do not skip the tool call."#;
                 inner.handle_notification(method, &params).await;
             }
             assert!(drain_events(&mut child_rx).is_empty());
+            assert!(drain_events(&mut parent_rx).is_empty());
+
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({
+                        "threadId": "child-published-interrupt",
+                        "turn": { "id": "child-after-interrupt-turn" }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "child-published-interrupt",
+                        "item": {
+                            "type": "agentMessage",
+                            "id": "child-after-interrupt-message",
+                            "text": "child continued"
+                        }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "turn/completed",
+                    &json!({
+                        "threadId": "child-published-interrupt",
+                        "turn": {
+                            "id": "child-after-interrupt-turn",
+                            "status": "completed"
+                        }
+                    }),
+                )
+                .await;
+            assert_eq!(
+                event_kinds(&drain_events(&mut child_rx)),
+                vec![
+                    "TypingStatusChanged",
+                    "StreamStart",
+                    "StreamEnd",
+                    "TypingStatusChanged"
+                ],
+                "a distinct child turn must proceed past the prior turn tombstone"
+            );
+            assert!(drain_events(&mut parent_rx).is_empty());
+
+            inner
+                .handle_notification(
+                    "thread/tokenUsage/updated",
+                    &json!({
+                        "threadId": "child-published-interrupt",
+                        "turnId": "child-published-turn",
+                        "tokenUsage": {
+                            "input_tokens": 1,
+                            "output_tokens": 1,
+                            "total_tokens": 2
+                        }
+                    }),
+                )
+                .await;
+            assert!(
+                drain_events(&mut child_rx).is_empty(),
+                "the old child turn must remain suppressed by its explicit tombstone"
+            );
+
+            inner
+                .handle_notification(
+                    "thread/tokenUsage/updated",
+                    &json!({
+                        "threadId": "child-published-interrupt",
+                        "turnId": "child-after-interrupt-turn",
+                        "tokenUsage": {
+                            "input_tokens": 23,
+                            "output_tokens": 7,
+                            "total_tokens": 30,
+                            "context_window": 200000
+                        }
+                    }),
+                )
+                .await;
+            let metadata = drain_events(&mut child_rx);
+            assert_eq!(event_kinds(&metadata), vec!["MessageMetadataUpdated"]);
+            assert_eq!(
+                metadata[0]
+                    .pointer("/data/message_id")
+                    .and_then(Value::as_str),
+                Some("child-after-interrupt-message")
+            );
+            assert_eq!(
+                metadata[0]
+                    .pointer("/data/token_usage/turn/usage/total_tokens")
+                    .and_then(Value::as_u64),
+                Some(30)
+            );
+            assert_eq!(
+                metadata[0]
+                    .pointer("/data/context_breakdown/input_tokens")
+                    .and_then(Value::as_u64),
+                Some(23)
+            );
+            assert_eq!(
+                metadata[0]
+                    .pointer("/data/context_breakdown/context_window")
+                    .and_then(Value::as_u64),
+                Some(200_000)
+            );
             assert!(drain_events(&mut parent_rx).is_empty());
             inner.rpc.shutdown().await;
             assert!(drain_events(&mut child_rx).is_empty());
