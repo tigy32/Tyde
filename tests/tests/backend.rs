@@ -1194,9 +1194,30 @@ async fn fake_codex_provider_items_keep_identity_live_late_and_same_host_reconne
         ]
     );
     assert!(expected_parent.iter().all(|(id, _)| id != "child-good"));
+    // Corrected under the authorized finalize-before-terminate contract. This
+    // previously demanded that `child-active` produce no terminal at all, encoding the
+    // old behavior where strict child termination silently destroyed a live published
+    // stream. Rendered evidence from the failing run:
+    //
+    //   left:  [("child-good", "Child response"), ("child-active", "Valid before interleave")]
+    //   right: [("child-good", "Child response")]
+    //
+    // The extra row carries `child-active`'s accepted bytes verbatim, which is required
+    // production behavior now, and the reconnect expectation below already demanded both
+    // messages -- so the old live expectation contradicted this test's own replay half.
+    // The assertion is narrowed, not relaxed: it now pins both ids, both contents, and
+    // their order, where before it pinned one id and asserted the other away.
     assert_eq!(
         child_live.stream_ends,
-        vec![("child-good".to_owned(), "Child response".to_owned())]
+        vec![
+            ("child-good".to_owned(), "Child response".to_owned()),
+            (
+                "child-active".to_owned(),
+                "Valid before interleave".to_owned(),
+            ),
+        ],
+        "strict child termination must finalize the live published item at its own id \
+         with its accepted bytes before the terminal tail"
     );
     for forbidden in ["child-foreign", "child-late-delta", "child-late-completion"] {
         assert!(
@@ -1534,14 +1555,32 @@ for line in sys.stdin:
 /// `CodexIdentityObservation` keeps one vector per event kind, which cannot express
 /// ordering *between* kinds — and `End(A) -> Warning -> Start(B)` is exactly a
 /// cross-kind ordering contract. This type records a single ordered log instead, and
-/// captures stream-end reasoning, which a superseded reasoning item carries in place
-/// of content.
+/// captures terminal reasoning, which a superseded reasoning item carries in place of
+/// content.
+///
+/// A message has **two durable representations**, and both must be observed.
+/// `record_chat_event_for_replay` (`server/src/agent/mod.rs`, `ChatEvent::StreamEnd`
+/// arm) branches on `retains_explicit_stream = !message.tool_calls.is_empty()`:
+///
+/// - with tool calls, replay keeps the explicit `StreamStart` / delta / `StreamEnd`
+///   framing — this is why the tool containers keep their stream lifecycle;
+/// - without tool calls, replay records a single canonical
+///   `ChatEvent::MessageAdded(message)` carrying the id, content, and reasoning.
+///
+/// Codex emits provider items with `tool_calls: Vec::new()`, so `reason-a`, `reason-b`,
+/// and `final-answer` are assistant `MessageAdded` rows in settled history even though
+/// they were live `StreamEnd`s. An observer that only recorded `StreamEnd` would see
+/// live turns correctly and then find replay "empty" — which is exactly the false
+/// negative this projection previously produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CodexLifecycleEvent {
     StreamStart(String),
     StreamDelta(String),
     StreamReasoningDelta(String),
+    /// Terminal row in live stream framing.
     StreamEnd(String),
+    /// Terminal row in settled canonical history framing.
+    AssistantMessage(String),
     Warning(String),
     Error(String),
     ToolRequest(String),
@@ -1553,8 +1592,9 @@ enum CodexLifecycleEvent {
 #[derive(Debug, Default)]
 struct CodexLifecycleObservation {
     ordered: Vec<CodexLifecycleEvent>,
-    stream_end_content: HashMap<String, String>,
-    stream_end_reasoning: HashMap<String, Option<String>>,
+    /// Keyed by message id, populated from whichever terminal representation arrived.
+    terminal_content: HashMap<String, String>,
+    terminal_reasoning: HashMap<String, Option<String>>,
 }
 
 impl CodexLifecycleObservation {
@@ -1575,14 +1615,26 @@ impl CodexLifecycleObservation {
             ChatEvent::StreamEnd(end) => {
                 let message = end.message;
                 let id = message.message_id.expect("StreamEnd needs identity").0;
-                self.stream_end_content.insert(id.clone(), message.content);
+                self.terminal_content.insert(id.clone(), message.content);
                 let reasoning = message.reasoning.map(|reasoning| reasoning.text);
-                self.stream_end_reasoning.insert(id.clone(), reasoning);
+                self.terminal_reasoning.insert(id.clone(), reasoning);
                 Some(CodexLifecycleEvent::StreamEnd(id))
             }
             ChatEvent::MessageAdded(message) => match message.sender {
                 MessageSender::Warning => Some(CodexLifecycleEvent::Warning(message.content)),
                 MessageSender::Error => Some(CodexLifecycleEvent::Error(message.content)),
+                // The canonical terminal representation for a no-tool stream. Dropping
+                // this arm is what made settled history look empty for provider items.
+                MessageSender::Assistant { .. } => {
+                    let id = message
+                        .message_id
+                        .expect("assistant terminal needs identity")
+                        .0;
+                    self.terminal_content.insert(id.clone(), message.content);
+                    let reasoning = message.reasoning.map(|reasoning| reasoning.text);
+                    self.terminal_reasoning.insert(id.clone(), reasoning);
+                    Some(CodexLifecycleEvent::AssistantMessage(id))
+                }
                 _ => None,
             },
             ChatEvent::ToolRequest(request) => {
@@ -1631,8 +1683,42 @@ impl CodexLifecycleObservation {
                 CodexLifecycleEvent::StreamStart(id) => Some(id.as_str()),
                 _ => None,
             })
-            .filter(|id| !self.stream_end_content.contains_key(*id))
+            .filter(|id| !self.terminal_content.contains_key(*id))
             .collect()
+    }
+
+    /// Position of a message's terminal row in **either** durable representation.
+    ///
+    /// Settled history serves a no-tool stream as one assistant `MessageAdded` and a
+    /// tool container with its explicit `StreamEnd`, so an ordering assertion over
+    /// replay must be framing-agnostic. Live turns only ever produce `StreamEnd`, so
+    /// this is exact there too.
+    fn terminal_position(&self, message_id: &str) -> usize {
+        self.ordered
+            .iter()
+            .position(|event| match event {
+                CodexLifecycleEvent::StreamEnd(id)
+                | CodexLifecycleEvent::AssistantMessage(id) => id == message_id,
+                _ => false,
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing terminal row for {message_id} in observed order: {:?}",
+                    self.ordered
+                )
+            })
+    }
+
+    /// How many terminal rows a message produced. Exactly one is the contract: a
+    /// superseded item is terminalized once, and an absorbed late completion for it
+    /// must not add a second.
+    fn terminal_rows(&self, message_id: &str) -> usize {
+        self.count(|event| match event {
+            CodexLifecycleEvent::StreamEnd(id) | CodexLifecycleEvent::AssistantMessage(id) => {
+                id == message_id
+            }
+            _ => false,
+        })
     }
 
     fn warnings(&self) -> Vec<&str> {
@@ -1674,18 +1760,18 @@ impl CodexLifecycleObservation {
         );
         if superseded_is_reasoning {
             assert_eq!(
-                self.stream_end_reasoning.get(superseded_id),
+                self.terminal_reasoning.get(superseded_id),
                 Some(&Some(accepted.to_owned())),
                 "{context} must preserve the superseded item's accepted reasoning"
             );
             assert_eq!(
-                self.stream_end_content.get(superseded_id),
+                self.terminal_content.get(superseded_id),
                 Some(&String::new()),
                 "{context} reasoning terminal carries no assistant content"
             );
         } else {
             assert_eq!(
-                self.stream_end_content.get(superseded_id),
+                self.terminal_content.get(superseded_id),
                 Some(&accepted.to_owned()),
                 "{context} must preserve the superseded item's accepted text"
             );
@@ -1873,12 +1959,12 @@ async fn fake_codex_provider_item_supersession_recovers_live_and_on_replay() {
         );
     }
     assert_eq!(
-        first_turn.stream_end_content.get("final-answer"),
+        first_turn.terminal_content.get("final-answer"),
         Some(&"turn survived".to_owned()),
         "the answer the provider produced after the rollover must reach the client"
     );
     assert_eq!(
-        first_turn.stream_end_reasoning.get("reason-b"),
+        first_turn.terminal_reasoning.get("reason-b"),
         Some(&Some("continued reason-b".to_owned())),
         "the replacement item must complete normally"
     );
@@ -1926,51 +2012,67 @@ async fn fake_codex_provider_item_supersession_recovers_live_and_on_replay() {
         vec![CODEX_SUPERSESSION_WARNING_TEXT],
         "replay must retain the recovery warning verbatim, exactly once"
     );
-    // Replay must reproduce the whole recovered turn, not merely its terminal rows:
-    // End(A) -> Warning -> Start(B) -> End(B) -> the later tool -> the final answer.
-    // Asserting only the ends would let a replay that lost Start(B) still pass.
-    let replay_end_a = replay.position(&end_a);
+    // Settled history is canonical, not a transcript of the live wire. Provider items
+    // carry `tool_calls: Vec::new()`, so `record_chat_event_for_replay` records each of
+    // them as ONE assistant `MessageAdded`; only the tool containers, whose terminal
+    // messages declare tool calls, keep explicit `StreamStart`/`StreamEnd` framing.
+    // Demanding live framing here was the defect: it asserted a representation history
+    // never serves. The recovery contract is asserted over terminal rows instead, which
+    // is what a reconnecting client actually renders.
     let replay_warning = replay.position(&CodexLifecycleEvent::Warning(
         CODEX_SUPERSESSION_WARNING_TEXT.to_owned(),
     ));
-    let start_b = CodexLifecycleEvent::StreamStart("reason-b".to_owned());
-    let end_b = CodexLifecycleEvent::StreamEnd("reason-b".to_owned());
-    let tool_after_request = CodexLifecycleEvent::ToolRequest("tool-after-rollover".to_owned());
-    let replay_start_b = replay.position(&start_b);
-    let replay_end_b = replay.position(&end_b);
-    let replay_tool_after = replay.position(&tool_after_request);
-    let replay_final = replay.position(&end_final);
+    let replay_tool_before = replay.terminal_position("tool-before-rollover");
+    let replay_a = replay.terminal_position("reason-a");
+    let replay_b = replay.terminal_position("reason-b");
+    let replay_tool_after_request =
+        replay.position(&CodexLifecycleEvent::ToolRequest("tool-after-rollover".to_owned()));
+    let replay_tool_after = replay.terminal_position("tool-after-rollover");
+    let replay_final = replay.terminal_position("final-answer");
     assert!(
-        replay_end_a < replay_warning && replay_warning < replay_start_b,
-        "replay must preserve End(A) -> Warning -> Start(B): {:?}",
+        replay_tool_before < replay_a && replay_a < replay_warning,
+        "replay must keep the superseded item terminal before the recovery warning: {:?}",
         replay.ordered
     );
     assert!(
-        replay_start_b < replay_end_b && replay_end_b < replay_tool_after,
-        "replay must keep the replacement stream ahead of the later tool: {:?}",
+        replay_warning < replay_b,
+        "replay must keep the recovery warning before the replacement terminal: {:?}",
         replay.ordered
     );
     assert!(
-        replay_tool_after < replay_final,
-        "replay must keep the post-rollover tool and answer in order: {:?}",
+        replay_b < replay_tool_after_request
+            && replay_tool_after_request < replay_tool_after
+            && replay_tool_after < replay_final,
+        "replay must keep the post-rollover tool and answer after the replacement: {:?}",
         replay.ordered
     );
-    let replay_start_a = replay.position(&CodexLifecycleEvent::StreamStart("reason-a".to_owned()));
-    assert!(
-        replay_start_a < replay_end_a,
-        "replay must open the superseded item before terminalizing it: {:?}",
-        replay.ordered
-    );
+    // Content, not just order: a reconnecting client must render the same bytes the
+    // live client saw, including the superseded item's partial reasoning.
     assert_eq!(
-        replay.stream_end_reasoning.get("reason-a"),
+        replay.terminal_reasoning.get("reason-a"),
         Some(&Some("accepted reason-a".to_owned())),
-        "replay must retain the superseded item's accepted reasoning"
+        "replay must retain the superseded item's accepted reasoning verbatim"
     );
     assert_eq!(
-        replay.stream_end_content.get("final-answer"),
+        replay.terminal_reasoning.get("reason-b"),
+        Some(&Some("continued reason-b".to_owned())),
+        "replay must retain the replacement item's reasoning verbatim"
+    );
+    assert_eq!(
+        replay.terminal_content.get("final-answer"),
         Some(&"turn survived".to_owned()),
         "replay must retain the post-rollover answer"
     );
+    // The absorbed late completion for A must not have produced a second durable row,
+    // and A and B must stay distinct messages rather than collapsing into one.
+    for message_id in ["reason-a", "reason-b", "final-answer"] {
+        assert_eq!(
+            replay.terminal_rows(message_id),
+            1,
+            "replay must record exactly one terminal row for {message_id}: {:?}",
+            replay.ordered
+        );
+    }
     let unterminated = replay.unterminated_streams();
     assert!(
         unterminated.is_empty(),
@@ -2019,13 +2121,13 @@ async fn fake_codex_provider_item_supersession_recovers_live_and_on_replay() {
         let continued = format!("continued {second_id}");
         if second_is_reasoning {
             assert_eq!(
-                turn.stream_end_reasoning.get(second_id),
+                turn.terminal_reasoning.get(second_id),
                 Some(&Some(continued)),
                 "{context} replacement must complete normally"
             );
         } else {
             assert_eq!(
-                turn.stream_end_content.get(second_id),
+                turn.terminal_content.get(second_id),
                 Some(&continued),
                 "{context} replacement must complete normally"
             );
@@ -2105,7 +2207,7 @@ async fn fake_codex_identity_termination_is_finite_and_visible_to_clients() {
         terminated.ordered
     );
     assert_eq!(
-        terminated.stream_end_content.get("open-item"),
+        terminated.terminal_content.get("open-item"),
         Some(&"partial work".to_owned()),
         "termination must preserve the accepted bytes rather than dropping them"
     );
@@ -2128,7 +2230,7 @@ async fn fake_codex_identity_termination_is_finite_and_visible_to_clients() {
     );
     assert!(
         terminated
-            .stream_end_content
+            .terminal_content
             .keys()
             .all(|message_id| message_id != "foreign-item"),
         "the foreign item must never be attributed to a stream: {:?}",
@@ -2163,7 +2265,7 @@ async fn fake_codex_identity_termination_is_finite_and_visible_to_clients() {
     )
     .await;
     assert_eq!(
-        recovered.stream_end_content.get("recovered-item"),
+        recovered.terminal_content.get("recovered-item"),
         Some(&"next turn works".to_owned()),
         "a terminated turn must not poison the next one: {:?}",
         recovered.ordered
@@ -2187,7 +2289,7 @@ async fn fake_codex_identity_termination_is_finite_and_visible_to_clients() {
     );
     assert!(
         recovered
-            .stream_end_content
+            .terminal_content
             .keys()
             .all(|message_id| message_id != "unexpected-turn-start"),
         "the follow-up turn must be the one the client asked for: {:?}",
