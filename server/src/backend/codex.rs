@@ -1257,6 +1257,19 @@ impl CompletedCodexAgentMessage {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexProviderItemKind {
+    AgentMessage,
+    Reasoning,
+}
+
+enum CodexProviderStreamFinalization {
+    Completed {
+        text: String,
+        reasoning: Option<String>,
+    },
+}
+
 enum CodexAgentMessageOpen {
     Open,
     Existing,
@@ -1363,6 +1376,19 @@ struct CompletedCodexSubAgentStream {
     sender_thread_id: String,
     pending_message_metadata: Option<PendingCodexMessageMetadata>,
     model_token_usage_by_turn: HashMap<String, CodexTurnTokenUsage>,
+}
+
+struct FinalizedCodexSubAgentProviderItem {
+    emitter: Arc<TurnEmitter>,
+    message_id: ChatMessageId,
+    generated_identity: Option<ServerGeneratedChatMessageIdentity>,
+    synthetic_start: bool,
+    content: String,
+    reasoning: Option<String>,
+    token_usage: Option<Value>,
+    unavailable_reason: Option<TokenUsageUnavailableReason>,
+    tool_call_ids: Vec<String>,
+    images: Vec<ImageData>,
 }
 
 fn completed_codex_subagent_stream(stream: CodexSubAgentStream) -> CompletedCodexSubAgentStream {
@@ -1854,6 +1880,269 @@ impl CodexInner {
         } else {
             emitter.stream_start_with_id(message_id, AgentName(CODEX_AGENT_NAME), Some(model));
         }
+    }
+
+    async fn finalize_root_provider_stream(
+        &self,
+        stream: ActiveStreamState,
+        finalization: CodexProviderStreamFinalization,
+    ) {
+        let kind = if stream.reasoning_only {
+            CodexProviderItemKind::Reasoning
+        } else {
+            CodexProviderItemKind::AgentMessage
+        };
+        let (reported_text, reported_reasoning, content, reasoning) =
+            match (kind, finalization) {
+                (
+                    CodexProviderItemKind::AgentMessage,
+                    CodexProviderStreamFinalization::Completed { text, reasoning },
+                ) => {
+                    let content = if contains_non_whitespace(&text) {
+                        text.clone()
+                    } else {
+                        stream.text.clone()
+                    };
+                    let resolved_reasoning = if stream.reasoning.trim().is_empty() {
+                        reasoning.clone()
+                    } else {
+                        Some(stream.reasoning.clone())
+                    }
+                    .filter(|reasoning| contains_non_whitespace(reasoning));
+                    (text, reasoning, content, resolved_reasoning)
+                }
+                (
+                    CodexProviderItemKind::Reasoning,
+                    CodexProviderStreamFinalization::Completed { reasoning, .. },
+                ) => {
+                    let resolved_reasoning = reasoning.clone().or_else(|| {
+                        contains_non_whitespace(&stream.reasoning)
+                            .then_some(stream.reasoning.clone())
+                    });
+                    (
+                        String::new(),
+                        reasoning,
+                        String::new(),
+                        resolved_reasoning,
+                    )
+                }
+            };
+        let images = stream.images;
+        let renderable =
+            codex_message_is_renderable(&content, reasoning.as_deref(), 0, images.len());
+        let completion = CompletedCodexAgentMessage {
+            reported_text,
+            reported_reasoning,
+            completion_text: content.clone(),
+            completion_reasoning: reasoning.clone(),
+        };
+        let model = {
+            let mut state = self.state.lock().await;
+            if kind == CodexProviderItemKind::AgentMessage {
+                state.close_active_stream_when_tools_idle = false;
+                if renderable {
+                    state.conversation_bytes_total = state
+                        .conversation_bytes_total
+                        .saturating_add(content.len() as u64);
+                }
+            }
+            let model = state
+                .effective_model
+                .clone()
+                .unwrap_or_else(|| "codex".to_string());
+            let turn_context = state
+                .turn_context_by_turn
+                .get(&stream.turn_id)
+                .cloned()
+                .unwrap_or_default();
+            let metadata = match kind {
+                CodexProviderItemKind::AgentMessage if renderable => {
+                    metadata_target_for_visible_message(
+                        stream.turn_id.clone(),
+                        stream.message_id.clone(),
+                        &content,
+                        reasoning.as_deref(),
+                        model.clone(),
+                        turn_context,
+                    )
+                }
+                CodexProviderItemKind::Reasoning => reasoning.as_ref().and_then(|_| {
+                    metadata_target_for_visible_message(
+                        stream.turn_id.clone(),
+                        stream.message_id.clone(),
+                        "",
+                        reasoning.as_deref(),
+                        model.clone(),
+                        turn_context,
+                    )
+                }),
+                CodexProviderItemKind::AgentMessage => None,
+            };
+            if kind == CodexProviderItemKind::Reasoning {
+                state.pending_message_metadata = metadata;
+            } else if let Some(metadata) = metadata {
+                state.pending_message_metadata = Some(metadata);
+            }
+            state
+                .completed_agent_messages
+                .insert(stream.message_id.clone(), completion);
+            model
+        };
+        if !renderable && !stream.stream_published {
+            match kind {
+                CodexProviderItemKind::AgentMessage => tracing::debug!(
+                    provider_item_id = stream.message_id.0.as_str(),
+                    item_type = "agentMessage",
+                    text_bytes = content.len(),
+                    reasoning_bytes = reasoning.as_ref().map_or(0, String::len),
+                    "Suppressed contentless Codex completion"
+                ),
+                CodexProviderItemKind::Reasoning => tracing::debug!(
+                    provider_item_id = stream.message_id.0.as_str(),
+                    item_type = "reasoning",
+                    reasoning_bytes = 0,
+                    "Suppressed contentless Codex completion"
+                ),
+            }
+            return;
+        }
+        if !stream.stream_published {
+            Self::emit_stream_start(
+                self.emitter.as_ref(),
+                stream.message_id.clone(),
+                stream.generated_identity.as_ref(),
+                &model,
+            );
+            if let Some(reasoning) = reasoning.as_deref() {
+                self.emitter
+                    .stream_reasoning_delta_with_id(stream.message_id.clone(), reasoning);
+            }
+        }
+        self.trace_terminal_emission("stream_end", Some(&stream.message_id.0))
+            .await;
+        self.emitter.stream_end_with_id(
+            stream.message_id.clone(),
+            StreamEndPayload {
+                content: content.clone(),
+                agent: Some(AgentName(CODEX_AGENT_NAME)),
+                model: Some(model),
+                request_usage: None,
+                turn_usage: None,
+                cumulative_usage: None,
+                token_usage_unavailable_reason: None,
+                reasoning: reasoning.clone(),
+                tool_calls: Vec::new(),
+                context_breakdown: None,
+                images,
+            },
+        );
+    }
+
+    fn finalize_subagent_provider_stream(
+        stream: &mut CodexSubAgentStream,
+        turn_id_from_params: Option<String>,
+        message_id: ChatMessageId,
+        generated_identity: Option<ServerGeneratedChatMessageIdentity>,
+        kind: CodexProviderItemKind,
+        model: &str,
+        finalization: CodexProviderStreamFinalization,
+    ) -> Option<FinalizedCodexSubAgentProviderItem> {
+        let CodexProviderStreamFinalization::Completed {
+            text,
+            reasoning: reported_reasoning,
+        } = finalization;
+        let stream_published = stream.current_stream_published;
+        let (reported_text, content, reasoning) = match kind {
+            CodexProviderItemKind::AgentMessage => {
+                let content = if contains_non_whitespace(&text) {
+                    text.clone()
+                } else {
+                    stream.current_text.clone()
+                };
+                let reasoning = if stream.current_reasoning.trim().is_empty() {
+                    reported_reasoning.clone()
+                } else {
+                    Some(stream.current_reasoning.clone())
+                }
+                .filter(|reasoning| contains_non_whitespace(reasoning));
+                (text, content, reasoning)
+            }
+            CodexProviderItemKind::Reasoning => {
+                let reasoning = reported_reasoning.clone().or_else(|| {
+                    contains_non_whitespace(&stream.current_reasoning)
+                        .then_some(stream.current_reasoning.clone())
+                });
+                (String::new(), String::new(), reasoning)
+            }
+        };
+        let renderable = codex_message_is_renderable(
+            &content,
+            reasoning.as_deref(),
+            stream.current_tool_call_ids.len(),
+            stream.current_images.len(),
+        );
+        let completion = CompletedCodexAgentMessage {
+            reported_text,
+            reported_reasoning,
+            completion_text: content.clone(),
+            completion_reasoning: reasoning.clone(),
+        };
+        let turn_id = turn_id_from_params
+            .or_else(|| stream.active_turn_id.clone())
+            .unwrap_or_else(|| "turn".to_string());
+        stream.current_message_id = None;
+        stream.current_generated_identity = None;
+        stream.current_reasoning_only = false;
+        stream.current_stream_published = false;
+        stream.current_text.clear();
+        stream.current_reasoning.clear();
+        let tool_call_ids = std::mem::take(&mut stream.current_tool_call_ids);
+        let images = std::mem::take(&mut stream.current_images);
+        stream
+            .completed_agent_messages
+            .insert(message_id.clone(), completion);
+        if !renderable && !stream_published {
+            match kind {
+                CodexProviderItemKind::AgentMessage => tracing::debug!(
+                    provider_item_id = message_id.0.as_str(),
+                    item_type = "agentMessage",
+                    text_bytes = content.len(),
+                    reasoning_bytes = reasoning.as_ref().map_or(0, String::len),
+                    "Suppressed contentless Codex child completion"
+                ),
+                CodexProviderItemKind::Reasoning => tracing::debug!(
+                    provider_item_id = message_id.0.as_str(),
+                    item_type = "reasoning",
+                    reasoning_bytes = 0,
+                    "Suppressed contentless Codex child completion"
+                ),
+            }
+            return None;
+        }
+        let token_usage = stream.token_usage_by_turn.remove(&turn_id);
+        let unavailable_reason = if token_usage.is_some() {
+            None
+        } else {
+            stream.pending_message_metadata = Some(PendingCodexMessageMetadata {
+                turn_id,
+                message_id: message_id.clone(),
+                model: model.to_string(),
+                turn_context: TurnContextEstimate::default(),
+            });
+            Some(TokenUsageUnavailableReason::BackendDidNotReport)
+        };
+        Some(FinalizedCodexSubAgentProviderItem {
+            emitter: Arc::clone(&stream.emitter),
+            message_id,
+            generated_identity,
+            synthetic_start: !stream_published,
+            content,
+            reasoning,
+            token_usage,
+            unavailable_reason,
+            tool_call_ids,
+            images,
+        })
     }
 
     async fn append_text_to_active_stream(
@@ -4223,16 +4512,7 @@ impl CodexInner {
                     .unwrap_or_else(|| extract_codex_item_text(item));
                 let reasoning = extract_codex_item_reasoning(item);
                 let turn_id_from_params = extract_turn_id(params);
-                let Some((
-                    emitter,
-                    token_usage,
-                    unavailable_reason,
-                    synthetic_start,
-                    content,
-                    final_reasoning,
-                    tool_call_ids,
-                    images,
-                )) = self
+                let Some(finalized) = self
                     .complete_subagent_message(
                         stream_key,
                         turn_id_from_params,
@@ -4245,31 +4525,35 @@ impl CodexInner {
                 else {
                     return;
                 };
-                if synthetic_start {
-                    emitter.stream_start_with_id(
-                        message_id.clone(),
+                if finalized.synthetic_start {
+                    finalized.emitter.stream_start_with_id(
+                        finalized.message_id.clone(),
                         AgentName(CODEX_AGENT_NAME),
                         Some(model),
                     );
-                    if let Some(reasoning) = final_reasoning.as_deref() {
-                        emitter.stream_reasoning_delta_with_id(message_id.clone(), reasoning);
+                    if let Some(reasoning) = finalized.reasoning.as_deref() {
+                        finalized
+                            .emitter
+                            .stream_reasoning_delta_with_id(finalized.message_id.clone(), reasoning);
                     }
                 }
-                let tool_calls = emitter.tool_call_declarations(&tool_call_ids);
-                emitter.stream_end_with_id(
-                    message_id,
+                let tool_calls = finalized
+                    .emitter
+                    .tool_call_declarations(&finalized.tool_call_ids);
+                finalized.emitter.stream_end_with_id(
+                    finalized.message_id,
                     StreamEndPayload {
-                        content,
+                        content: finalized.content,
                         agent: Some(AgentName(CODEX_AGENT_NAME)),
                         model: Some(model.to_string()),
-                        request_usage: token_usage.clone(),
-                        turn_usage: token_usage,
+                        request_usage: finalized.token_usage.clone(),
+                        turn_usage: finalized.token_usage,
                         cumulative_usage: None,
-                        token_usage_unavailable_reason: unavailable_reason,
-                        reasoning: final_reasoning,
+                        token_usage_unavailable_reason: finalized.unavailable_reason,
+                        reasoning: finalized.reasoning,
                         tool_calls,
                         context_breakdown: None,
-                        images,
+                        images: finalized.images,
                     },
                 );
             }
@@ -4539,16 +4823,7 @@ impl CodexInner {
         model: String,
         completion_text: String,
         completion_reasoning: Option<String>,
-    ) -> Option<(
-        Arc<TurnEmitter>,
-        Option<Value>,
-        Option<TokenUsageUnavailableReason>,
-        bool,
-        String,
-        Option<String>,
-        Vec<String>,
-        Vec<ImageData>,
-    )> {
+    ) -> Option<FinalizedCodexSubAgentProviderItem> {
         self.close_subagent_tool_container_if_open(stream_key).await;
         let result = {
             let mut state = self.state.lock().await;
@@ -4586,78 +4861,19 @@ impl CodexInner {
             {
                 Err(StreamIdentityViolation::ForeignActiveMessageId)
             } else {
-                let stream_published = stream.current_stream_published;
-                let reported_text = completion_text.clone();
-                let reported_reasoning = completion_reasoning.clone();
-                let content = if contains_non_whitespace(&completion_text) {
-                    completion_text
-                } else {
-                    stream.current_text.clone()
-                };
-                let reasoning = if stream.current_reasoning.trim().is_empty() {
-                    completion_reasoning
-                } else {
-                    Some(stream.current_reasoning.clone())
-                }
-                .filter(|reasoning| contains_non_whitespace(reasoning));
-                let renderable = codex_message_is_renderable(
-                    &content,
-                    reasoning.as_deref(),
-                    stream.current_tool_call_ids.len(),
-                    stream.current_images.len(),
-                );
-                let resolved_completion = CompletedCodexAgentMessage {
-                    reported_text,
-                    reported_reasoning,
-                    completion_text: content.clone(),
-                    completion_reasoning: reasoning.clone(),
-                };
-                let turn_id = turn_id_from_params
-                    .or_else(|| stream.active_turn_id.clone())
-                    .unwrap_or_else(|| "turn".to_string());
-                stream.current_message_id = None;
-                stream.current_generated_identity = None;
-                stream.current_reasoning_only = false;
-                stream.current_stream_published = false;
-                stream.current_text.clear();
-                stream.current_reasoning.clear();
-                let tool_call_ids = std::mem::take(&mut stream.current_tool_call_ids);
-                let images = std::mem::take(&mut stream.current_images);
-                stream
-                    .completed_agent_messages
-                    .insert(message_id.clone(), resolved_completion);
-                if !renderable && !stream_published {
-                    tracing::debug!(
-                        provider_item_id = message_id.0.as_str(),
-                        item_type = "agentMessage",
-                        text_bytes = content.len(),
-                        reasoning_bytes = reasoning.as_ref().map_or(0, String::len),
-                        "Suppressed contentless Codex child completion"
-                    );
-                    return None;
-                }
-                let token_usage = stream.token_usage_by_turn.remove(&turn_id);
-                let unavailable_reason = if token_usage.is_some() {
-                    None
-                } else {
-                    stream.pending_message_metadata = Some(PendingCodexMessageMetadata {
-                        turn_id,
-                        message_id: message_id.clone(),
-                        model,
-                        turn_context: TurnContextEstimate::default(),
-                    });
-                    Some(TokenUsageUnavailableReason::BackendDidNotReport)
-                };
-                Ok(Some((
-                    Arc::clone(&stream.emitter),
-                    token_usage,
-                    unavailable_reason,
-                    !stream_published,
-                    content,
-                    reasoning,
-                    tool_call_ids,
-                    images,
-                )))
+                let generated_identity = stream.current_generated_identity.clone();
+                Ok(Self::finalize_subagent_provider_stream(
+                    stream,
+                    turn_id_from_params,
+                    message_id,
+                    generated_identity,
+                    CodexProviderItemKind::AgentMessage,
+                    &model,
+                    CodexProviderStreamFinalization::Completed {
+                        text: completion_text,
+                        reasoning: completion_reasoning,
+                    },
+                ))
             }
         };
         match result {
@@ -4746,121 +4962,68 @@ impl CodexInner {
                                 .message_id()
                         })
                     });
-                    let stream_published = stream.current_stream_published;
                     let reported_reasoning = completion_reasoning.clone();
-                    let reasoning = completion_reasoning.or_else(|| {
-                        contains_non_whitespace(&stream.current_reasoning)
-                            .then_some(stream.current_reasoning.clone())
-                    });
-                    let completion = CompletedCodexAgentMessage {
-                        reported_text: String::new(),
-                        reported_reasoning: reported_reasoning.clone(),
-                        completion_text: String::new(),
-                        completion_reasoning: reasoning.clone(),
-                    };
                     if let Some(previous) = stream.completed_agent_messages.get(&message_id) {
                         if previous.matches_replay("", &reported_reasoning) {
                             return;
                         }
                         Err(StreamIdentityViolation::ConflictingDuplicateCompletion)
                     } else {
-                        let turn_id = turn_id_from_params
-                            .or_else(|| stream.active_turn_id.clone())
-                            .unwrap_or_else(|| "turn".to_string());
-                        stream.current_message_id = None;
-                        stream.current_generated_identity = None;
-                        stream.current_reasoning_only = false;
-                        stream.current_stream_published = false;
-                        stream.current_text.clear();
-                        stream.current_reasoning.clear();
-                        let tool_call_ids = std::mem::take(&mut stream.current_tool_call_ids);
-                        let images = std::mem::take(&mut stream.current_images);
-                        stream
-                            .completed_agent_messages
-                            .insert(message_id.clone(), completion);
-                        if reasoning.is_none()
-                            && tool_call_ids.is_empty()
-                            && images.is_empty()
-                            && !stream_published
-                        {
-                            tracing::debug!(
-                                provider_item_id = message_id.0.as_str(),
-                                item_type = "reasoning",
-                                reasoning_bytes = 0,
-                                "Suppressed contentless Codex child completion"
-                            );
-                            return;
-                        }
-                        let token_usage = stream.token_usage_by_turn.remove(&turn_id);
-                        let unavailable_reason = if token_usage.is_some() {
-                            None
-                        } else {
-                            stream.pending_message_metadata = Some(PendingCodexMessageMetadata {
-                                turn_id,
-                                message_id: message_id.clone(),
-                                model: model.to_string(),
-                                turn_context: TurnContextEstimate::default(),
-                            });
-                            Some(TokenUsageUnavailableReason::BackendDidNotReport)
-                        };
-                        Ok((
-                            Arc::clone(&stream.emitter),
+                        Ok(Self::finalize_subagent_provider_stream(
+                            stream,
+                            turn_id_from_params,
                             message_id,
                             generated_identity,
-                            !stream_published,
-                            reasoning,
-                            token_usage,
-                            unavailable_reason,
-                            tool_call_ids,
-                            images,
+                            CodexProviderItemKind::Reasoning,
+                            model,
+                            CodexProviderStreamFinalization::Completed {
+                                text: String::new(),
+                                reasoning: completion_reasoning,
+                            },
                         ))
                     }
                 }
             }
         };
-        let (
-            emitter,
-            message_id,
-            generated_identity,
-            synthetic_start,
-            reasoning,
-            token_usage,
-            unavailable_reason,
-            tool_call_ids,
-            images,
-        ) = match result {
-            Ok(result) => result,
+        let finalized = match result {
+            Ok(Some(result)) => result,
+            Ok(None) => return,
             Err(violation) => {
                 self.reject_subagent_message_identity(stream_key, violation, "item/completed")
                     .await;
                 return;
             }
         };
-        if synthetic_start {
+        if finalized.synthetic_start {
             Self::emit_stream_start(
-                emitter.as_ref(),
-                message_id.clone(),
-                generated_identity.as_ref(),
+                finalized.emitter.as_ref(),
+                finalized.message_id.clone(),
+                finalized.generated_identity.as_ref(),
                 model,
             );
-            if let Some(reasoning) = reasoning.as_deref() {
-                emitter.stream_reasoning_delta_with_id(message_id.clone(), reasoning);
+            if let Some(reasoning) = finalized.reasoning.as_deref() {
+                finalized
+                    .emitter
+                    .stream_reasoning_delta_with_id(finalized.message_id.clone(), reasoning);
             }
         }
-        emitter.stream_end_with_id(
-            message_id,
+        let tool_calls = finalized
+            .emitter
+            .tool_call_declarations(&finalized.tool_call_ids);
+        finalized.emitter.stream_end_with_id(
+            finalized.message_id,
             StreamEndPayload {
-                content: String::new(),
+                content: finalized.content,
                 agent: Some(AgentName(CODEX_AGENT_NAME)),
                 model: Some(model.to_string()),
-                request_usage: token_usage.clone(),
-                turn_usage: token_usage,
+                request_usage: finalized.token_usage.clone(),
+                turn_usage: finalized.token_usage,
                 cumulative_usage: None,
-                token_usage_unavailable_reason: unavailable_reason,
-                reasoning,
-                tool_calls: emitter.tool_call_declarations(&tool_call_ids),
+                token_usage_unavailable_reason: finalized.unavailable_reason,
+                reasoning: finalized.reasoning,
+                tool_calls,
                 context_breakdown: None,
-                images,
+                images: finalized.images,
             },
         );
     }
@@ -5987,8 +6150,6 @@ impl CodexInner {
                     }
                     return;
                 }
-                let reported_text = text.clone();
-                let reported_reasoning = completion_reasoning.clone();
                 let result = {
                     let mut state = self.state.lock().await;
                     if let Some(previous) = state.completed_agent_messages.get(&message_id) {
@@ -6046,103 +6207,14 @@ impl CodexInner {
                         return;
                     }
                 };
-                let content = if contains_non_whitespace(&text) {
-                    text
-                } else {
-                    stream.text
-                };
-                let reasoning = if stream.reasoning.trim().is_empty() {
-                    completion_reasoning
-                } else {
-                    Some(stream.reasoning)
-                }
-                .filter(|reasoning| contains_non_whitespace(reasoning));
-                let images = stream.images;
-                let renderable =
-                    codex_message_is_renderable(&content, reasoning.as_deref(), 0, images.len());
-                let resolved_completion = CompletedCodexAgentMessage {
-                    reported_text,
-                    reported_reasoning,
-                    completion_text: content.clone(),
-                    completion_reasoning: reasoning.clone(),
-                };
-                let model = {
-                    let mut state = self.state.lock().await;
-                    state.close_active_stream_when_tools_idle = false;
-                    if renderable {
-                        state.conversation_bytes_total = state
-                            .conversation_bytes_total
-                            .saturating_add(content.len() as u64);
-                    }
-                    let model = state
-                        .effective_model
-                        .clone()
-                        .unwrap_or_else(|| "codex".to_string());
-                    let turn_context = state
-                        .turn_context_by_turn
-                        .get(&stream.turn_id)
-                        .cloned()
-                        .unwrap_or_default();
-                    let metadata = if renderable {
-                        metadata_target_for_visible_message(
-                            stream.turn_id.clone(),
-                            stream.message_id.clone(),
-                            &content,
-                            reasoning.as_deref(),
-                            model.clone(),
-                            turn_context,
-                        )
-                    } else {
-                        None
-                    };
-                    if let Some(metadata) = metadata {
-                        state.pending_message_metadata = Some(metadata);
-                    }
-                    state
-                        .completed_agent_messages
-                        .insert(message_id.clone(), resolved_completion);
-                    model
-                };
-                if !renderable && !stream.stream_published {
-                    tracing::debug!(
-                        provider_item_id = message_id.0.as_str(),
-                        item_type = "agentMessage",
-                        text_bytes = content.len(),
-                        reasoning_bytes = reasoning.as_ref().map_or(0, String::len),
-                        "Suppressed contentless Codex completion"
-                    );
-                    return;
-                }
-                if !stream.stream_published {
-                    Self::emit_stream_start(
-                        self.emitter.as_ref(),
-                        message_id.clone(),
-                        None,
-                        &model,
-                    );
-                    if let Some(reasoning) = reasoning.as_deref() {
-                        self.emitter
-                            .stream_reasoning_delta_with_id(message_id.clone(), reasoning);
-                    }
-                }
-                self.trace_terminal_emission("stream_end", Some(&message_id.0))
-                    .await;
-                self.emitter.stream_end_with_id(
-                    message_id,
-                    StreamEndPayload {
-                        content,
-                        agent: Some(AgentName(CODEX_AGENT_NAME)),
-                        model: Some(model),
-                        request_usage: None,
-                        turn_usage: None,
-                        cumulative_usage: None,
-                        token_usage_unavailable_reason: None,
-                        reasoning,
-                        tool_calls: Vec::new(),
-                        context_breakdown: None,
-                        images,
+                self.finalize_root_provider_stream(
+                    stream,
+                    CodexProviderStreamFinalization::Completed {
+                        text,
+                        reasoning: completion_reasoning,
                     },
-                );
+                )
+                .await;
             }
             "subAgentActivity" | "sub_agent_activity" => {
                 self.register_codex_subagent_activity_if_needed(item).await;
@@ -6265,82 +6337,14 @@ impl CodexInner {
                         return;
                     }
                 };
-                let reported_reasoning = completion_reasoning.clone();
-                let reasoning = completion_reasoning.or_else(|| {
-                    contains_non_whitespace(&stream.reasoning).then_some(stream.reasoning.clone())
-                });
-                let images = stream.images;
-                let completion = CompletedCodexAgentMessage {
-                    reported_text: String::new(),
-                    reported_reasoning,
-                    completion_text: String::new(),
-                    completion_reasoning: reasoning.clone(),
-                };
-                let model = {
-                    let mut state = self.state.lock().await;
-                    let model = state
-                        .effective_model
-                        .clone()
-                        .unwrap_or_else(|| "codex".to_string());
-                    let turn_context = state
-                        .turn_context_by_turn
-                        .get(&stream.turn_id)
-                        .cloned()
-                        .unwrap_or_default();
-                    state.pending_message_metadata = reasoning.as_ref().and_then(|_| {
-                        metadata_target_for_visible_message(
-                            stream.turn_id.clone(),
-                            stream.message_id.clone(),
-                            "",
-                            reasoning.as_deref(),
-                            model.clone(),
-                            turn_context,
-                        )
-                    });
-                    state
-                        .completed_agent_messages
-                        .insert(stream.message_id.clone(), completion);
-                    model
-                };
-                if reasoning.is_none() && images.is_empty() && !stream.stream_published {
-                    tracing::debug!(
-                        provider_item_id = stream.message_id.0.as_str(),
-                        item_type = "reasoning",
-                        reasoning_bytes = 0,
-                        "Suppressed contentless Codex completion"
-                    );
-                    return;
-                }
-                if !stream.stream_published {
-                    Self::emit_stream_start(
-                        self.emitter.as_ref(),
-                        stream.message_id.clone(),
-                        stream.generated_identity.as_ref(),
-                        &model,
-                    );
-                    if let Some(reasoning) = reasoning.as_deref() {
-                        self.emitter
-                            .stream_reasoning_delta_with_id(stream.message_id.clone(), reasoning);
-                    }
-                }
-                self.trace_terminal_emission("stream_end", Some(&stream.message_id.0))
-                    .await;
-                self.emitter.stream_end_with_id(
-                    stream.message_id,
-                    StreamEndPayload {
-                        content: String::new(),
-                        agent: Some(AgentName(CODEX_AGENT_NAME)),
-                        model: Some(model),
-                        request_usage: None,
-                        turn_usage: None,
-                        cumulative_usage: None,
-                        token_usage_unavailable_reason: None,
-                        reasoning,
-                        tool_calls: Vec::new(),
-                        context_breakdown: None,
-                        images,
+                self.finalize_root_provider_stream(
+                    stream,
+                    CodexProviderStreamFinalization::Completed {
+                        text: String::new(),
+                        reasoning: completion_reasoning,
                     },
-                );
+                )
+                .await;
             }
             "imageGeneration" => {
                 let item_id = self
