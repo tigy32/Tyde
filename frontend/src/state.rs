@@ -4171,6 +4171,16 @@ impl AppState {
     /// `retire_pending_restores`, which every deliberate center/project
     /// selection calls — including the ones (New Chat, Home, an unvisited
     /// project) that legitimately leave `active_agent` at `None`.
+    ///
+    /// Gated to wasm because this gate exists solely for the persistence
+    /// effect, which is itself browser-only. The native paths that write
+    /// storage — the retire and restore paths — call
+    /// [`Self::persist_selection_snapshot`] directly, because each already
+    /// knows whether its own intent is settled and has no pending state to
+    /// test. Unlike [`Self::drop_draft_bound_to_another_host`], which the
+    /// effect shares with a synchronous caller, this has no native counterpart
+    /// to keep.
+    #[cfg(target_arch = "wasm32")]
     pub(crate) fn persist_selection_snapshot_if_settled(&self) {
         let restore_pending = self
             .pending_active_chat_restore
