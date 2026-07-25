@@ -18449,13 +18449,32 @@ fn hidden_helper_session_settings(
             }
         }
     }
-    // Hermes cost hints do not supply defaults, so cap hidden inference
-    // explicitly instead of inheriting the visible session's effort or tier.
+    // Hermes cost hints supply no defaults. Preserve already-cheap explicit
+    // effort, cap higher effort at `low`, and use the schema's minimum for
+    // profile-default or invalid values.
     helper_settings.0.insert(
         "reasoning_effort".to_owned(),
-        protocol::SessionSettingValue::String("low".to_owned()),
+        protocol::SessionSettingValue::String(
+            hidden_helper_reasoning_effort(session_settings).to_owned(),
+        ),
     );
     Some(helper_settings)
+}
+
+fn hidden_helper_reasoning_effort(
+    session_settings: Option<&SessionSettingsValues>,
+) -> &'static str {
+    match session_settings
+        .and_then(|settings| settings.0.get("reasoning_effort"))
+        .and_then(|value| match value {
+            protocol::SessionSettingValue::String(value) => Some(value.as_str()),
+            _ => None,
+        }) {
+        Some("none") => "none",
+        Some("minimal") => "minimal",
+        Some("low") | Some("medium") | Some("high") | Some("xhigh") => "low",
+        Some(_) | None => "none",
+    }
 }
 
 fn session_schema_entry_for_backend(
@@ -19094,7 +19113,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
     }
 
     #[test]
-    fn hidden_helpers_keep_hermes_scope_with_low_cost_settings() {
+    fn hidden_helpers_keep_hermes_scope_with_non_increasing_effort() {
         let mut settings = SessionSettingsValues::default();
         settings.0.insert(
             crate::backend::hermes::HERMES_PROFILE_SETTING.to_owned(),
@@ -19146,9 +19165,33 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 .expect("default Hermes helper settings");
         assert_eq!(
             default_helper_settings.0.get("reasoning_effort"),
-            Some(&protocol::SessionSettingValue::String("low".to_owned()))
+            Some(&protocol::SessionSettingValue::String("none".to_owned()))
         );
         assert_eq!(default_helper_settings.0.len(), 1);
+        settings.0.insert(
+            "reasoning_effort".to_owned(),
+            protocol::SessionSettingValue::String("minimal".to_owned()),
+        );
+        assert_eq!(
+            hidden_helper_session_settings(BackendKind::Hermes, Some(&settings))
+                .expect("minimal-effort Hermes helper settings")
+                .0
+                .get("reasoning_effort"),
+            Some(&protocol::SessionSettingValue::String(
+                "minimal".to_owned()
+            ))
+        );
+        settings.0.insert(
+            "reasoning_effort".to_owned(),
+            protocol::SessionSettingValue::String("none".to_owned()),
+        );
+        assert_eq!(
+            hidden_helper_session_settings(BackendKind::Hermes, Some(&settings))
+                .expect("no-reasoning Hermes helper settings")
+                .0
+                .get("reasoning_effort"),
+            Some(&protocol::SessionSettingValue::String("none".to_owned()))
+        );
         for backend_kind in [
             BackendKind::Tycode,
             BackendKind::Kiro,

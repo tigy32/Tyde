@@ -11008,7 +11008,7 @@ mod tests {
         );
         settings.0.insert(
             "reasoning_effort".to_owned(),
-            SessionSettingValue::String("low".to_owned()),
+            SessionSettingValue::String("none".to_owned()),
         );
         let config = agent_name_generation_spawn_config(Some(settings.clone()));
 

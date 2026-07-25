@@ -943,7 +943,7 @@ mod tests {
         );
         settings.0.insert(
             "reasoning_effort".to_owned(),
-            protocol::SessionSettingValue::String("low".to_owned()),
+            protocol::SessionSettingValue::String("none".to_owned()),
         );
 
         let config = supervision_spawn_config(Some(SpawnCostHint::Low), Some(settings.clone()));
