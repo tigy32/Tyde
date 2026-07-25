@@ -61,9 +61,13 @@ pub(crate) enum MessageSegment {
 /// - A tool with no offset — legacy data, or a backend that records none —
 ///   keeps the old layout: after all content **and after the images**, which is
 ///   exactly where it rendered before.
-/// - An offset past the end clamps to the end; a tool whose id matches no call
-///   is treated as offsetless. Bad metadata degrades to the legacy layout
-///   rather than crashing the chat.
+/// - An offset past the end is **rejected, not clamped**, and the tool is
+///   treated as offsetless. Clamping would place the card at the end of the
+///   content, which is a positional claim the data does not support: an
+///   out-of-range offset says the sender's accounting is wrong, not that the
+///   tool ran last. The backend guarantees the bound; malformed metadata falls
+///   back to the legacy layout rather than inventing a position. A tool whose
+///   id matches no call is treated the same way.
 /// - Several tools at one offset keep their arrival order, and the sort is
 ///   stable, so equal offsets are not a reordering hazard.
 pub(crate) fn interleave_message(
@@ -81,11 +85,15 @@ pub(crate) fn interleave_message(
             .unwrap_or(content.len())
     };
 
+    // Valid offsets are `0..=scalar_len`: the end is a legitimate boundary,
+    // meaning the tool was observed after all of this phase's text.
+    let scalar_len = content.chars().count();
     let placement_for = |tool_call_id: &str| -> Option<usize> {
         tool_calls
             .iter()
             .find(|call| call.id == tool_call_id)
             .and_then(|call| call.content_offset)
+            .filter(|offset| (*offset as usize) <= scalar_len)
             .map(|offset| byte_at(offset as usize))
     };
 
@@ -782,7 +790,9 @@ mod wasm_tests {
         assert_eq!(
             segment_shape(&past_end),
             vec!["content:short", "legacy:t1"],
-            "an out-of-range offset clamps to the end instead of panicking"
+            "an out-of-range offset is rejected, not clamped: it is evidence the \
+             sender's accounting is wrong, not that the tool ran last, so the \
+             card falls back to the legacy tail rather than claiming a position"
         );
 
         let unmatched = interleave_message(
@@ -797,7 +807,10 @@ mod wasm_tests {
             "a tool with no matching call is placed as legacy data"
         );
 
-        let zero = interleave_message("text", &[tool_call("t1", Some(0))], vec![tool_entry("t1")],
+        let zero = interleave_message(
+            "text",
+            &[tool_call("t1", Some(0))],
+            vec![tool_entry("t1")],
             false,
         );
         assert_eq!(
@@ -806,14 +819,42 @@ mod wasm_tests {
             "offset zero puts the tool before all content, with no empty run"
         );
 
-        let empty_content =
-            interleave_message("", &[tool_call("t1", Some(0))], vec![tool_entry("t1")],
+        let empty_content = interleave_message(
+            "",
+            &[tool_call("t1", Some(0))],
+            vec![tool_entry("t1")],
             false,
         );
         assert_eq!(
             segment_shape(&empty_content),
             vec!["tools:t1"],
             "an empty message emits no empty content segment"
+        );
+
+        // The boundary between in-range and out-of-range: an offset *equal* to
+        // the scalar length means "after all of this phase's text" and is
+        // legitimate, so it is placed. One past it is not.
+        let at_end = interleave_message(
+            "abc",
+            &[tool_call("t1", Some(3))],
+            vec![tool_entry("t1")],
+            false,
+        );
+        assert_eq!(
+            segment_shape(&at_end),
+            vec!["content:abc", "tools:t1"],
+            "an offset at the end of the content is in range and placed"
+        );
+        let past_by_one = interleave_message(
+            "abc",
+            &[tool_call("t1", Some(4))],
+            vec![tool_entry("t1")],
+            false,
+        );
+        assert_eq!(
+            segment_shape(&past_by_one),
+            vec!["content:abc", "legacy:t1"],
+            "one past the end is malformed and falls back to legacy"
         );
     }
 
