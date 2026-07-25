@@ -70,6 +70,25 @@ timeout is 15 seconds and can be overridden with
 `HERMES_TUI_STARTUP_TIMEOUT_MS`. Individual JSON-RPC requests use
 `HERMES_TUI_RPC_TIMEOUT_MS` and default to 120 seconds.
 
+## Profiles
+
+Hermes's effective root is `HERMES_HOME` when set and the platform Hermes home
+otherwise. The root is the `default` profile. Named profiles are independent
+Hermes homes under `<root>/profiles/<name>`, where names follow
+`^[a-z0-9][a-z0-9_-]{0,63}$`.
+
+Tyde discovers the root and every valid named directory. It publishes
+`hermes:default` plus `hermes:profile:<name>` launch profiles, and carries the
+selected native profile as an immutable per-session setting. A named session
+spawns the gateway and MCP-registration subprocess with that profile
+directory as `HERMES_HOME`; a missing or failed named profile stays visible as
+an unavailable launch option with its probe error.
+
+Named profiles are local-only. An SSH-backed workspace cannot safely forward a
+local Hermes profile directory, so Tyde rejects that combination rather than
+silently launching the remote default. A running session cannot change
+profiles; start a new session to select another profile.
+
 ## MCP startup injection
 
 Hermes discovers MCP servers from `mcp_servers` in its native configuration,
@@ -90,15 +109,16 @@ servers explicitly selected for the Tyde session. Stdio servers map to Hermes
 `bearer_token_env_var` becomes an `Authorization: Bearer ${ENV_VAR}` template so
 Hermes resolves the token from its own environment or secret scope.
 
-The overlay deliberately keeps the real `HERMES_HOME`. Hermes credentials,
-profiles, state database, memories, and user-configured MCP servers therefore
-remain available. Tyde-provided entries win a same-name collision inside that
+The overlay keeps the session's effective `HERMES_HOME`. In an ordinary
+production launch that is the user's selected Hermes home, so its credentials,
+state database, memories, and user-configured MCP servers remain available. In
+an explicitly contained dev instance it is the attested disposable home
+described below. Tyde-provided entries win a same-name collision inside that
 gateway process. Wrapped Hermes save operations restore the native MCP section
-before writing, so session-only entries never leak into `~/.hermes/config.yaml`.
-Tyde does not mutate the global config, create an alternate Hermes home, write a
-temporary config file, or put the injected configuration or header values in
-process arguments or environment variables. The same stdin bootstrap works
-through the remote SSH transport.
+before writing, so session-only entries never leak into the selected
+`config.yaml`. The bootstrap does not put the injected configuration or header
+values in process arguments or environment variables. The same stdin bootstrap
+works through the remote SSH transport.
 
 ## JSON-RPC methods used
 
@@ -197,6 +217,53 @@ Hermes snapshots currently map `model.options.model` to `default_model` and
 explicit Tyde override because the native gateway does not expose a verified
 read contract for that value here.
 
+## Contained dev instances and loopback stubs
+
+`tyde_dev_instance_start` preserves its historical behavior when its optional
+`hermes` input is absent. Such a dev instance inherits the launching process's
+`HOME` and `HERMES_HOME` and is **not** safe for destructive Hermes QA merely
+because its Tyde stores are ephemeral.
+
+The typed opt-in creates a fresh home inside the instance store, exports both
+`HOME` and `HERMES_HOME`, seeds requested named profiles, and returns
+`hermesEnvironment` with the configured and filesystem-resolved paths plus
+`homeEphemeral: true` and `hermesHomeEphemeral: true`. Stop removes the entire
+instance store.
+
+For a no-paid-call run, `loopbackStub` additionally:
+
+- accepts only `http://127.0.0.1:<port>` or `http://[::1]:<port>` with an
+  explicit port and no URL credentials, query, or fragment;
+- writes a synthetic OpenAI-compatible model configuration and fake local key
+  into the disposable default and named profiles;
+- removes inherited provider credential environment variables; and
+- routes HTTP(S) proxy traffic to a closed loopback endpoint while exempting
+  only `127.0.0.1` and `::1`.
+
+The returned network policy is `loopback_stub_only`. This is a fail-closed
+provider-testing configuration, not a general OS network sandbox for arbitrary
+tools or subprocesses. The stub must already be listening on the supplied
+loopback URL and must implement the OpenAI-compatible endpoints exercised by
+the selected Hermes flow. It proves Tyde/Hermes request structure and lifecycle
+without provider spend; it does not verify a production provider's exact tool
+event order, cache/context accounting, reasoning fields, error body, latency,
+or billing. Those claims require a separately approved live call.
+
+Example:
+
+```json
+{
+  "project_dir": "/path/to/Tyde2",
+  "hermes": {
+    "profiles": ["qa"],
+    "loopbackStub": {
+      "baseUrl": "http://127.0.0.1:43123/v1",
+      "model": "tyde-stub"
+    }
+  }
+}
+```
+
 ## Cancellation ordering
 
 `session.interrupt` is cooperative. When Tyde cancels a turn it preserves the
@@ -218,6 +285,12 @@ absorbs it after the local cancellation sequence has already closed the stream.
 - Hermes delegation/subagent events currently surface as warnings. They are not
   projected into Tyde `SubAgentProgress` or first-class backend-native relay
   agents yet.
-- API-key editing from Tyde is intentionally out of scope; credentials stay
-  Hermes-owned. Default model/provider and base URL are configurable via the
-  Backend Configuration surface above.
+- Named-profile provider disconnect is disabled because the current Hermes RPC
+  cannot prove that it will mutate only the selected profile. Tyde does not
+  fall back to a default-home disconnect. Credentials stay Hermes-owned;
+  default model/provider and base URL remain configurable through Backend
+  Configuration.
+- Screenshot capture, a second UI client, native confirmation-dialog control,
+  and viewport resizing are not currently exposed by the dev-instance debug
+  protocol. Runtime QA must report those checks blocked rather than infer a
+  pass from DOM state.

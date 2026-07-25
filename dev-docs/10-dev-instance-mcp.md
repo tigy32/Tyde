@@ -429,15 +429,19 @@ only.
 Input:
 
 - `project_dir`
-- optional `workspace_path`
-- optional `launch_target`
+- optional `hermes`
+  - optional `profiles`: disposable native Hermes profile names
+  - optional `loopbackStub`: `{baseUrl, model}` for a no-paid-call local
+    OpenAI-compatible endpoint
 
 Output:
 
 - `instance_id`
 - `status`
 - `project_dir`
-- metadata needed for debugging
+- ephemeral Tyde store paths
+- optional `hermesEnvironment` path/network attestation when `hermes` was
+  requested
 
 This tool:
 
@@ -454,6 +458,50 @@ The restart rule is important:
 - an agent that wants to test newer code must stop the old instance and start a
   new one after making changes
 - tool docs should say this explicitly so agents do not assume hot reload
+
+The Hermes option is deliberately opt in. With no `hermes` field, the launcher
+does not set `HOME` or `HERMES_HOME`; existing behavior is unchanged. With the
+field present, it creates both paths beneath the instance's ephemeral
+`storeDir`, resolves them on disk before launch, exports them to the child, and
+returns:
+
+```json
+{
+  "hermesEnvironment": {
+    "home": "<storeDir>/hermes-home",
+    "resolvedHome": "<resolved path>",
+    "hermesHome": "<storeDir>/hermes-home/.hermes",
+    "resolvedHermesHome": "<resolved path>",
+    "homeEphemeral": true,
+    "hermesHomeEphemeral": true,
+    "profiles": ["qa"],
+    "loopbackStubUrl": "http://127.0.0.1:43123/v1",
+    "networkPolicy": "loopback_stub_only"
+  }
+}
+```
+
+Contained Hermes invocation:
+
+```json
+{
+  "project_dir": "/path/to/Tyde2",
+  "hermes": {
+    "profiles": ["qa"],
+    "loopbackStub": {
+      "baseUrl": "http://127.0.0.1:43123/v1",
+      "model": "tyde-stub"
+    }
+  }
+}
+```
+
+The stub URL must use numeric `127.0.0.1` or `::1`, plain HTTP, and an explicit
+port. The launcher writes only synthetic credentials, removes inherited
+provider credential variables, and installs a deny-by-default proxy
+environment with loopback exclusions. This confines the supported provider
+path; it is not an OS sandbox for arbitrary commands that open their own
+sockets.
 
 #### `tyde_debug_events_since`
 

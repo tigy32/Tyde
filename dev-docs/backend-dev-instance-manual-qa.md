@@ -133,6 +133,13 @@ test plan.
    points at the operator's normal stores. Running on the operator's normal
    host, polluting its session history, or silently reusing any normal store is
    an immediate setup `FAIL` and cannot certify a backend.
+   For Hermes, Tyde-store isolation alone is insufficient. Pass the typed
+   `hermes` option with a loopback stub and additionally require
+   `hermesEnvironment.homeEphemeral: true`,
+   `hermesEnvironment.hermesHomeEphemeral: true`,
+   `hermesEnvironment.networkPolicy: "loopback_stub_only"`, and both resolved
+   home paths beneath `storeDir`. Without that attestation, Hermes QA is
+   `BLOCKED`; do not open Hermes settings or start a Hermes agent.
 9. Confirm the available driver can capture screenshots, rendered DOM,
    console/backend events, and a separately controlled second client. Treat a
    missing required observation channel as `BLOCKED`, not as permission to
@@ -141,6 +148,21 @@ test plan.
 ## 2. Start a clean Tyde dev instance
 
 1. Call `tyde_dev_instance_start` with the repository root as `project_dir`.
+   For no-paid Hermes QA, also pass a disposable profile and a stub that is
+   already listening on numeric loopback:
+
+   ```json
+   {
+     "project_dir": "/path/to/Tyde2",
+     "hermes": {
+       "profiles": ["qa"],
+       "loopbackStub": {
+         "baseUrl": "http://127.0.0.1:43123/v1",
+         "model": "tyde-stub"
+       }
+     }
+   }
+   ```
 2. Before any backend call, require `storesEphemeral: true`, confirm the
    returned `sessionStorePath` is beneath the returned `storeDir`, and record
    both paths. This is a hard preflight gate, not optional evidence collected

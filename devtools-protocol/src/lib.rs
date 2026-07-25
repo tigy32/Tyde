@@ -1,6 +1,10 @@
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
+use std::fs;
 use std::path::{Path, PathBuf};
+use url::{Host, Url};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DevInstanceMutablePath {
@@ -10,6 +14,31 @@ pub struct DevInstanceMutablePath {
 
 pub const WORKFLOW_RUN_STORE_PATH_ENV: &str = "TYDE_WORKFLOW_RUN_STORE_PATH";
 pub const CONFIGURED_HOST_STORE_PATH_ENV: &str = "TYDE_CONFIGURED_HOST_STORE_PATH";
+pub const DEV_INSTANCE_HOME_ENV: &str = "HOME";
+pub const DEV_INSTANCE_HERMES_HOME_ENV: &str = "HERMES_HOME";
+pub const DEV_INSTANCE_HERMES_HOME_RELATIVE_PATH: &str = "hermes-home/.hermes";
+pub const DEV_INSTANCE_DENY_PROXY_URL: &str = "http://127.0.0.1:9";
+pub const DEV_INSTANCE_PROVIDER_CREDENTIAL_ENVS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "CEREBRAS_API_KEY",
+    "COHERE_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "ELEVENLABS_API_KEY",
+    "FIREWORKS_API_KEY",
+    "GEMINI_API_KEY",
+    "GITHUB_TOKEN",
+    "GOOGLE_API_KEY",
+    "GROQ_API_KEY",
+    "HF_TOKEN",
+    "HUGGINGFACE_API_KEY",
+    "MISTRAL_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "PERPLEXITY_API_KEY",
+    "TOGETHER_API_KEY",
+    "XAI_API_KEY",
+];
 
 pub const DEV_INSTANCE_MUTABLE_PATHS: &[DevInstanceMutablePath] = &[
     DevInstanceMutablePath {
@@ -84,6 +113,264 @@ pub fn dev_instance_mutable_paths(
     DEV_INSTANCE_MUTABLE_PATHS
         .iter()
         .map(|entry| (entry.env, store_dir.join(entry.relative_path)))
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DisposableHermesEnvironment {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 64))]
+    pub profiles: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loopback_stub: Option<HermesLoopbackStub>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HermesLoopbackStub {
+    pub base_url: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DevInstanceHermesNetworkPolicy {
+    Inherited,
+    LoopbackStubOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DevInstanceHermesEnvironmentAttestation {
+    pub home: String,
+    pub resolved_home: String,
+    pub hermes_home: String,
+    pub resolved_hermes_home: String,
+    pub home_ephemeral: bool,
+    pub hermes_home_ephemeral: bool,
+    pub profiles: Vec<String>,
+    pub loopback_stub_url: Option<String>,
+    pub network_policy: DevInstanceHermesNetworkPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedDisposableHermesEnvironment {
+    pub home: PathBuf,
+    pub hermes_home: PathBuf,
+    pub attestation: DevInstanceHermesEnvironmentAttestation,
+}
+
+pub fn prepare_disposable_hermes_environment(
+    store_dir: &Path,
+    input: &DisposableHermesEnvironment,
+) -> Result<PreparedDisposableHermesEnvironment, String> {
+    validate_profile_names(&input.profiles)?;
+    let stub = input
+        .loopback_stub
+        .as_ref()
+        .map(validate_loopback_stub)
+        .transpose()?;
+
+    let resolved_store = fs::canonicalize(store_dir).map_err(|error| {
+        format!(
+            "failed to resolve dev instance store {}: {error}",
+            store_dir.display()
+        )
+    })?;
+    let home = store_dir.join("hermes-home");
+    fs::create_dir(&home).map_err(|error| {
+        format!(
+            "failed to create disposable HOME {}: {error}",
+            home.display()
+        )
+    })?;
+    let resolved_home = fs::canonicalize(&home).map_err(|error| {
+        format!(
+            "failed to resolve disposable HOME {}: {error}",
+            home.display()
+        )
+    })?;
+    if !resolved_home.starts_with(&resolved_store) {
+        return Err(format!(
+            "disposable HOME escaped dev instance store {}",
+            resolved_store.display()
+        ));
+    }
+
+    let hermes_home = store_dir.join(DEV_INSTANCE_HERMES_HOME_RELATIVE_PATH);
+    fs::create_dir(&hermes_home).map_err(|error| {
+        format!(
+            "failed to create disposable HERMES_HOME {}: {error}",
+            hermes_home.display()
+        )
+    })?;
+    let resolved_hermes_home = fs::canonicalize(&hermes_home).map_err(|error| {
+        format!(
+            "failed to resolve disposable HERMES_HOME {}: {error}",
+            hermes_home.display()
+        )
+    })?;
+    if !resolved_hermes_home.starts_with(&resolved_home) {
+        return Err(format!(
+            "disposable HERMES_HOME escaped disposable HOME {}",
+            resolved_home.display()
+        ));
+    }
+
+    let profiles_dir = hermes_home.join("profiles");
+    fs::create_dir(&profiles_dir).map_err(|error| {
+        format!(
+            "failed to create disposable Hermes profiles directory {}: {error}",
+            profiles_dir.display()
+        )
+    })?;
+    let mut config_homes = vec![hermes_home.clone()];
+    for profile in &input.profiles {
+        let profile_home = profiles_dir.join(profile);
+        fs::create_dir(&profile_home).map_err(|error| {
+            format!(
+                "failed to create disposable Hermes profile {}: {error}",
+                profile_home.display()
+            )
+        })?;
+        let resolved_profile_home = fs::canonicalize(&profile_home).map_err(|error| {
+            format!(
+                "failed to resolve disposable Hermes profile {}: {error}",
+                profile_home.display()
+            )
+        })?;
+        if !resolved_profile_home.starts_with(&resolved_hermes_home) {
+            return Err(format!(
+                "disposable Hermes profile escaped HERMES_HOME {}",
+                resolved_hermes_home.display()
+            ));
+        }
+        config_homes.push(profile_home);
+    }
+
+    for config_home in &config_homes {
+        write_disposable_hermes_config(config_home, stub.as_ref())?;
+    }
+
+    let loopback_stub_url = stub.as_ref().map(|(url, _)| url.to_string());
+    Ok(PreparedDisposableHermesEnvironment {
+        home: resolved_home.clone(),
+        hermes_home: resolved_hermes_home.clone(),
+        attestation: DevInstanceHermesEnvironmentAttestation {
+            home: home.display().to_string(),
+            resolved_home: resolved_home.display().to_string(),
+            hermes_home: hermes_home.display().to_string(),
+            resolved_hermes_home: resolved_hermes_home.display().to_string(),
+            home_ephemeral: true,
+            hermes_home_ephemeral: true,
+            profiles: input.profiles.clone(),
+            loopback_stub_url,
+            network_policy: if stub.is_some() {
+                DevInstanceHermesNetworkPolicy::LoopbackStubOnly
+            } else {
+                DevInstanceHermesNetworkPolicy::Inherited
+            },
+        },
+    })
+}
+
+fn validate_profile_names(profiles: &[String]) -> Result<(), String> {
+    if profiles.len() > 64 {
+        return Err("at most 64 disposable Hermes profiles may be requested".to_string());
+    }
+    let mut unique = HashSet::new();
+    for profile in profiles {
+        let valid = (1..=64).contains(&profile.len())
+            && profile
+                .bytes()
+                .enumerate()
+                .all(|(index, byte)| match byte {
+                    b'a'..=b'z' | b'0'..=b'9' => true,
+                    b'_' | b'-' => index > 0,
+                    _ => false,
+                });
+        if !valid || profile == "default" {
+            return Err(format!("invalid disposable Hermes profile name '{profile}'"));
+        }
+        if !unique.insert(profile) {
+            return Err(format!(
+                "duplicate disposable Hermes profile name '{profile}'"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_loopback_stub(stub: &HermesLoopbackStub) -> Result<(Url, String), String> {
+    let url = Url::parse(stub.base_url.trim())
+        .map_err(|error| format!("invalid Hermes loopback stub base URL: {error}"))?;
+    if url.scheme() != "http"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.port().is_none()
+    {
+        return Err(
+            "Hermes loopback stub base URL must be plain HTTP with an explicit port, no credentials, query, or fragment"
+                .to_string(),
+        );
+    }
+    let is_supported_loopback = match url.host() {
+        Some(Host::Ipv4(address)) => address == std::net::Ipv4Addr::LOCALHOST,
+        Some(Host::Ipv6(address)) => address == std::net::Ipv6Addr::LOCALHOST,
+        _ => false,
+    };
+    if !is_supported_loopback {
+        return Err(
+            "Hermes loopback stub base URL must use 127.0.0.1 or ::1".to_string(),
+        );
+    }
+    let model = stub.model.trim();
+    if model.is_empty() || model.len() > 256 || model.chars().any(char::is_control) {
+        return Err("Hermes loopback stub model must be 1-256 printable characters".to_string());
+    }
+    Ok((url, model.to_owned()))
+}
+
+fn write_disposable_hermes_config(
+    home: &Path,
+    stub: Option<&(Url, String)>,
+) -> Result<(), String> {
+    let config = match stub {
+        Some((base_url, model)) => serde_json::json!({
+            "model": {
+                "provider": "openai",
+                "default": model,
+                "base_url": base_url.as_str(),
+            }
+        }),
+        None => serde_json::json!({}),
+    };
+    fs::write(
+        home.join("config.yaml"),
+        serde_json::to_vec_pretty(&config)
+            .map_err(|error| format!("failed to serialize disposable Hermes config: {error}"))?,
+    )
+    .map_err(|error| {
+        format!(
+            "failed to write disposable Hermes config in {}: {error}",
+            home.display()
+        )
+    })?;
+    if stub.is_some() {
+        fs::write(
+            home.join(".env"),
+            "OPENAI_API_KEY=tyde-local-loopback-stub\n",
+        )
+        .map_err(|error| {
+            format!(
+                "failed to write disposable Hermes stub environment in {}: {error}",
+                home.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -298,6 +585,91 @@ mod tests {
         assert_eq!(envs.len(), paths.len(), "environment keys must be unique");
         let disk_paths = paths.iter().map(|(_, path)| path).collect::<HashSet<_>>();
         assert_eq!(disk_paths.len(), paths.len(), "store paths must be unique");
+    }
+
+    #[test]
+    fn disposable_hermes_environment_is_confined_and_seeds_loopback_stub() {
+        let store = tempfile::tempdir().expect("store dir");
+        let prepared = prepare_disposable_hermes_environment(
+            store.path(),
+            &DisposableHermesEnvironment {
+                profiles: vec!["qa".to_owned()],
+                loopback_stub: Some(HermesLoopbackStub {
+                    base_url: "http://127.0.0.1:43123/v1".to_owned(),
+                    model: "tyde-stub".to_owned(),
+                }),
+            },
+        )
+        .expect("prepare disposable Hermes environment");
+
+        assert!(prepared.home.starts_with(store.path()));
+        assert!(prepared.hermes_home.starts_with(&prepared.home));
+        assert_eq!(
+            prepared.attestation.network_policy,
+            DevInstanceHermesNetworkPolicy::LoopbackStubOnly
+        );
+        assert!(prepared.attestation.home_ephemeral);
+        assert!(prepared.attestation.hermes_home_ephemeral);
+        assert_eq!(
+            prepared.attestation.loopback_stub_url.as_deref(),
+            Some("http://127.0.0.1:43123/v1")
+        );
+        assert_eq!(
+            fs::read_to_string(prepared.hermes_home.join("config.yaml"))
+                .expect("read default config"),
+            fs::read_to_string(
+                prepared
+                    .hermes_home
+                    .join("profiles")
+                    .join("qa")
+                    .join("config.yaml")
+            )
+            .expect("read named config")
+        );
+        assert!(
+            fs::read_to_string(prepared.hermes_home.join("config.yaml"))
+                .expect("read config")
+                .contains("\"base_url\": \"http://127.0.0.1:43123/v1\"")
+        );
+        assert_eq!(
+            fs::read_to_string(prepared.hermes_home.join(".env")).expect("read stub env"),
+            "OPENAI_API_KEY=tyde-local-loopback-stub\n"
+        );
+        let attestation =
+            serde_json::to_value(&prepared.attestation).expect("serialize attestation");
+        assert_eq!(attestation["homeEphemeral"], Value::Bool(true));
+        assert_eq!(attestation["hermesHomeEphemeral"], Value::Bool(true));
+        assert_eq!(
+            attestation["networkPolicy"],
+            Value::String("loopback_stub_only".to_owned())
+        );
+    }
+
+    #[test]
+    fn disposable_hermes_environment_rejects_egress_and_profile_traversal() {
+        let store = tempfile::tempdir().expect("store dir");
+        let egress = prepare_disposable_hermes_environment(
+            store.path(),
+            &DisposableHermesEnvironment {
+                profiles: Vec::new(),
+                loopback_stub: Some(HermesLoopbackStub {
+                    base_url: "https://api.openai.com/v1".to_owned(),
+                    model: "paid-model".to_owned(),
+                }),
+            },
+        )
+        .expect_err("external provider URL must be rejected");
+        assert!(egress.contains("plain HTTP"));
+
+        let traversal = prepare_disposable_hermes_environment(
+            store.path(),
+            &DisposableHermesEnvironment {
+                profiles: vec!["../real-home".to_owned()],
+                loopback_stub: None,
+            },
+        )
+        .expect_err("profile traversal must be rejected");
+        assert!(traversal.contains("invalid disposable Hermes profile"));
     }
 
     #[test]

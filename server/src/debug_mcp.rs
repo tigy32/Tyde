@@ -9,8 +9,11 @@ use axum::{Json, Router, response::IntoResponse, routing::get};
 use client::ClientConfig;
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use devtools_protocol::{
-    BoundedDebugOutput, DebugOutputSlice, UiDebugRequest, UiDebugResponse,
-    dev_instance_mutable_paths,
+    BoundedDebugOutput, DEV_INSTANCE_DENY_PROXY_URL, DEV_INSTANCE_HERMES_HOME_ENV,
+    DEV_INSTANCE_HOME_ENV, DEV_INSTANCE_PROVIDER_CREDENTIAL_ENVS, DebugOutputSlice,
+    DevInstanceHermesEnvironmentAttestation, DevInstanceHermesNetworkPolicy,
+    DisposableHermesEnvironment, PreparedDisposableHermesEnvironment, UiDebugRequest,
+    UiDebugResponse, dev_instance_mutable_paths, prepare_disposable_hermes_environment,
 };
 use protocol::{Project, ProjectId, ProjectRootPath, ProjectSource};
 use rmcp::{
@@ -61,6 +64,7 @@ struct DevInstanceRecord {
     frontend_url: String,
     config_path: PathBuf,
     store_dir: PathBuf,
+    hermes_environment: Option<DevInstanceHermesEnvironmentAttestation>,
     startup_output: Arc<StdMutex<BoundedDebugOutput>>,
     startup_capture_tasks: Vec<tokio::task::JoinHandle<()>>,
     child: AsyncGroupChild,
@@ -75,6 +79,8 @@ struct DevInstanceSummary {
     store_dir: String,
     session_store_path: String,
     stores_ephemeral: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hermes_environment: Option<DevInstanceHermesEnvironmentAttestation>,
     frontend_url: String,
     host_addr: String,
     ui_debug_addr: String,
@@ -102,6 +108,8 @@ impl TydeDebugMcpServer {
 #[serde(deny_unknown_fields)]
 struct StartInstanceToolInput {
     project_dir: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hermes: Option<DisposableHermesEnvironment>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -186,6 +194,8 @@ struct StartInstanceResult {
     store_dir: String,
     session_store_path: String,
     stores_ephemeral: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hermes_environment: Option<DevInstanceHermesEnvironmentAttestation>,
     frontend_url: String,
     host_addr: String,
     ui_debug_addr: String,
@@ -235,7 +245,7 @@ fn repo_root_from_parts(parts: &axum::http::request::Parts) -> Option<PathBuf> {
 #[tool_router]
 impl TydeDebugMcpServer {
     #[tool(
-        description = "Launch a Tyde desktop dev instance with isolated ephemeral stores and hot reload disabled. Returns the store paths and isolation attestation after the typed host and UI-debug loopback endpoints are ready. Stop and restart it to pick up code changes."
+        description = "Launch a Tyde desktop dev instance with isolated ephemeral stores and hot reload disabled. An optional typed hermes input creates a disposable HOME and HERMES_HOME; its optional loopback stub rejects non-loopback provider URLs. Returns store and Hermes isolation attestations after the typed host and UI-debug loopback endpoints are ready. Stop and restart it to pick up code changes."
     )]
     async fn tyde_dev_instance_start(
         &self,
@@ -422,6 +432,16 @@ async fn start_instance(
         )
     })?;
     seed_dev_project_store(&store_dir, &project_dir, &instance_id)?;
+    let prepared_hermes = match input.hermes.as_ref() {
+        Some(hermes) => match prepare_disposable_hermes_environment(&store_dir, hermes) {
+            Ok(prepared) => Some(prepared),
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&store_dir);
+                return Err(error);
+            }
+        },
+        None => None,
+    };
 
     let config_path = write_dev_config(&project_dir, frontend_port, &instance_id)?;
     let mut command = tauri_dev_command(&config_path)?;
@@ -433,7 +453,7 @@ async fn start_instance(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    configure_dev_instance_environment(&mut command, &store_dir);
+    configure_dev_instance_environment(&mut command, &store_dir, prepared_hermes.as_ref());
 
     let mut child = command
         .group_spawn()
@@ -465,6 +485,7 @@ async fn start_instance(
         frontend_url: frontend_url.clone(),
         config_path,
         store_dir,
+        hermes_environment: prepared_hermes.map(|prepared| prepared.attestation),
         startup_output,
         startup_capture_tasks,
         child,
@@ -485,6 +506,7 @@ async fn start_instance(
         store_dir: record.store_dir.display().to_string(),
         session_store_path: record.store_dir.join("sessions.json").display().to_string(),
         stores_ephemeral: true,
+        hermes_environment: record.hermes_environment.clone(),
         frontend_url: frontend_url.clone(),
         host_addr: record.host_addr.to_string(),
         ui_debug_addr: record.ui_debug_addr.to_string(),
@@ -496,9 +518,47 @@ async fn start_instance(
     Ok(result)
 }
 
-fn configure_dev_instance_environment(command: &mut Command, store_dir: &Path) {
+fn configure_dev_instance_environment(
+    command: &mut Command,
+    store_dir: &Path,
+    hermes: Option<&PreparedDisposableHermesEnvironment>,
+) {
     for (env, path) in dev_instance_mutable_paths(store_dir) {
         command.env(env, path);
+    }
+    let Some(hermes) = hermes else {
+        return;
+    };
+
+    preserve_toolchain_homes(command);
+    command
+        .env(DEV_INSTANCE_HOME_ENV, &hermes.home)
+        .env(DEV_INSTANCE_HERMES_HOME_ENV, &hermes.hermes_home);
+    if hermes.attestation.network_policy == DevInstanceHermesNetworkPolicy::LoopbackStubOnly {
+        for env in DEV_INSTANCE_PROVIDER_CREDENTIAL_ENVS {
+            command.env_remove(env);
+        }
+        for env in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
+            command.env(env, DEV_INSTANCE_DENY_PROXY_URL);
+        }
+        for env in ["http_proxy", "https_proxy", "all_proxy"] {
+            command.env(env, DEV_INSTANCE_DENY_PROXY_URL);
+        }
+        command
+            .env("NO_PROXY", "127.0.0.1,::1")
+            .env("no_proxy", "127.0.0.1,::1");
+    }
+}
+
+fn preserve_toolchain_homes(command: &mut Command) {
+    let Some(home) = std::env::var_os(DEV_INSTANCE_HOME_ENV) else {
+        return;
+    };
+    if std::env::var_os("CARGO_HOME").is_none() {
+        command.env("CARGO_HOME", PathBuf::from(&home).join(".cargo"));
+    }
+    if std::env::var_os("RUSTUP_HOME").is_none() {
+        command.env("RUSTUP_HOME", PathBuf::from(home).join(".rustup"));
     }
 }
 
@@ -739,6 +799,7 @@ async fn dev_instance_summary(record: &mut DevInstanceRecord) -> DevInstanceSumm
         store_dir: record.store_dir.display().to_string(),
         session_store_path: record.store_dir.join("sessions.json").display().to_string(),
         stores_ephemeral: true,
+        hermes_environment: record.hermes_environment.clone(),
         frontend_url: record.frontend_url.clone(),
         host_addr: record.host_addr.to_string(),
         ui_debug_addr: record.ui_debug_addr.to_string(),
@@ -1113,7 +1174,7 @@ mod tests {
     fn dev_instance_environment_isolates_every_mutable_path() {
         let store_dir = Path::new("/isolated/tyde-instance");
         let mut command = Command::new("tyde");
-        configure_dev_instance_environment(&mut command, store_dir);
+        configure_dev_instance_environment(&mut command, store_dir, None);
         let configured = command.as_std().get_envs().collect::<HashMap<_, _>>();
 
         for entry in devtools_protocol::DEV_INSTANCE_MUTABLE_PATHS {
@@ -1128,6 +1189,94 @@ mod tests {
                 entry.env
             );
         }
+        assert!(
+            !configured.contains_key(std::ffi::OsStr::new(DEV_INSTANCE_HOME_ENV)),
+            "default dev instance must inherit HOME"
+        );
+        assert!(
+            !configured.contains_key(std::ffi::OsStr::new(
+                DEV_INSTANCE_HERMES_HOME_ENV
+            )),
+            "default dev instance must inherit HERMES_HOME"
+        );
+    }
+
+    #[test]
+    fn disposable_hermes_environment_is_attested_and_denies_provider_egress() {
+        let store = tempfile::tempdir().expect("store dir");
+        let prepared = prepare_disposable_hermes_environment(
+            store.path(),
+            &DisposableHermesEnvironment {
+                profiles: vec!["qa".to_owned()],
+                loopback_stub: Some(devtools_protocol::HermesLoopbackStub {
+                    base_url: "http://127.0.0.1:43123/v1".to_owned(),
+                    model: "tyde-stub".to_owned(),
+                }),
+            },
+        )
+        .expect("prepare Hermes environment");
+        let mut command = Command::new("tyde");
+        configure_dev_instance_environment(&mut command, store.path(), Some(&prepared));
+        let configured = command.as_std().get_envs().collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            configured
+                .get(std::ffi::OsStr::new(DEV_INSTANCE_HOME_ENV))
+                .copied()
+                .flatten(),
+            Some(prepared.home.as_os_str())
+        );
+        assert_eq!(
+            configured
+                .get(std::ffi::OsStr::new(DEV_INSTANCE_HERMES_HOME_ENV))
+                .copied()
+                .flatten(),
+            Some(prepared.hermes_home.as_os_str())
+        );
+        assert_eq!(
+            configured
+                .get(std::ffi::OsStr::new("HTTPS_PROXY"))
+                .copied()
+                .flatten(),
+            Some(std::ffi::OsStr::new(DEV_INSTANCE_DENY_PROXY_URL))
+        );
+        assert_eq!(
+            configured
+                .get(std::ffi::OsStr::new("OPENAI_API_KEY"))
+                .copied(),
+            Some(None)
+        );
+        assert!(prepared.attestation.hermes_home_ephemeral);
+        assert_eq!(
+            prepared.attestation.resolved_hermes_home,
+            prepared.hermes_home.display().to_string()
+        );
+    }
+
+    #[test]
+    fn start_input_keeps_hermes_isolation_opt_in() {
+        let ordinary: StartInstanceToolInput =
+            serde_json::from_value(json!({ "project_dir": "/repo" })).expect("ordinary input");
+        assert!(ordinary.hermes.is_none());
+
+        let contained: StartInstanceToolInput = serde_json::from_value(json!({
+            "project_dir": "/repo",
+            "hermes": {
+                "profiles": ["qa"],
+                "loopbackStub": {
+                    "baseUrl": "http://[::1]:43123/v1",
+                    "model": "tyde-stub"
+                }
+            }
+        }))
+        .expect("contained input");
+        assert_eq!(
+            contained
+                .hermes
+                .expect("Hermes input")
+                .profiles,
+            vec!["qa"]
+        );
     }
 
     #[test]

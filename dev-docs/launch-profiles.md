@@ -43,7 +43,7 @@ Every enabled backend gets a default profile:
 
 Only enabled backends appear in the catalog.
 
-Additional named profiles come only from explicit host settings
+Most additional named profiles come from explicit host settings
 (`HostSettings.launch_profiles` / `HostSettingValue::LaunchProfiles`). They
 are server-owned, typed presets over `SessionSettingsValues`, and the server
 validates them against the backend session schema before marking them ready.
@@ -54,12 +54,29 @@ The Settings UI editor should write this explicit settings surface. It should
 not infer named profiles from backend model names, and it should render the
 server-emitted catalog rather than constructing launch options locally.
 
-Tyde does not infer named Hermes profiles from `model.options` names. Today
-Hermes exposes `hermes:default` automatically when Hermes is enabled. Profiles
-such as `hermes:claude`, `hermes:codex`, and `hermes:grok` are emitted only if
-they are explicitly configured with exact Hermes session settings; the native
-Hermes JSON-RPC shape currently used by Tyde exposes model/provider options,
-not a typed named-launch-profile catalog.
+Hermes is the exception because it has a native profile directory contract.
+When Hermes is enabled, Tyde discovers the effective Hermes home and emits:
+
+- `hermes:default` for the effective root profile
+- `hermes:profile:<name>` for each valid directory under
+  `<HERMES_HOME>/profiles/<name>`
+
+The label for a named entry is `Hermes — <name>`. A ready entry carries the
+immutable session setting `{profile: <name>}`. A profile whose configuration
+or gateway probe fails remains in the catalog as `unavailable` with the
+server-reported reason; it is not silently hidden or replaced by the default
+profile.
+
+Hermes profile discovery is not model-name inference. The directory name is
+the profile identity, while `model.options` supplies that profile's dynamic
+model choices and summary. Catalog updates are server-owned and are refreshed
+before `launch_profile_catalog_notify`, so a client must replace its rendered
+catalog with the latest notification rather than retain the startup snapshot.
+
+The `hermes:profile:` namespace is reserved and cannot be supplied by an
+explicit host launch-profile setting. Named Hermes profiles are local-only:
+Tyde cannot safely select a local `HERMES_HOME` through an SSH-backed workspace,
+so those launches fail visibly instead of falling back to the remote default.
 
 ## MCP
 
