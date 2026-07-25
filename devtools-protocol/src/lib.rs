@@ -269,26 +269,25 @@ pub fn prepare_disposable_hermes_environment(
 ) -> Result<PreparedDisposableHermesEnvironment, String> {
     validate_profile_names(&input.profiles)?;
     let stub = validate_loopback_stub(&input.loopback_stub)?;
-    let (executable, executable_launcher_chain, skipped_executable_launchers) =
-        validate_runtime_evidence(
-            runtime.executable.as_deref(),
-            &runtime.executable_launcher_chain,
-            &runtime.skipped_executable_launchers,
-            "Hermes",
-        )?;
-    let (python, python_launcher_chain, skipped_python_launchers) = validate_runtime_evidence(
+    let executable = validate_runtime_evidence(
+        runtime.executable.as_deref(),
+        &runtime.executable_launcher_chain,
+        &runtime.skipped_executable_launchers,
+        "Hermes",
+    )?;
+    let python = validate_runtime_evidence(
         runtime.python.as_deref(),
         &runtime.python_launcher_chain,
         &runtime.skipped_python_launchers,
         "HERMES_PYTHON",
     )?;
     let runtime = ResolvedHermesRuntime {
-        executable,
-        executable_launcher_chain,
-        skipped_executable_launchers,
-        python,
-        python_launcher_chain,
-        skipped_python_launchers,
+        executable: executable.program,
+        executable_launcher_chain: executable.launcher_chain,
+        skipped_executable_launchers: executable.skipped_launchers,
+        python: python.program,
+        python_launcher_chain: python.launcher_chain,
+        skipped_python_launchers: python.skipped_launchers,
     };
     if runtime.executable.is_none() && runtime.python.is_none() {
         return Err(
@@ -425,15 +424,23 @@ pub fn prepare_disposable_hermes_environment(
 }
 
 #[cfg(feature = "launcher")]
+#[derive(Debug, Default)]
+struct RuntimeProgramEvidence {
+    program: Option<PathBuf>,
+    launcher_chain: Vec<PathBuf>,
+    skipped_launchers: Vec<PathBuf>,
+}
+
+#[cfg(feature = "launcher")]
 fn validate_runtime_evidence(
     program: Option<&Path>,
     launcher_chain: &[PathBuf],
     skipped_launchers: &[PathBuf],
     source: &str,
-) -> Result<(Option<PathBuf>, Vec<PathBuf>, Vec<PathBuf>), String> {
+) -> Result<RuntimeProgramEvidence, String> {
     let Some(program) = program else {
         if launcher_chain.is_empty() && skipped_launchers.is_empty() {
-            return Ok((None, Vec::new(), Vec::new()));
+            return Ok(RuntimeProgramEvidence::default());
         }
         return Err(format!(
             "{source} launcher evidence requires a resolved executable"
@@ -466,7 +473,11 @@ fn validate_runtime_evidence(
             "{source} skipped launchers must be non-final entries in its launcher chain"
         ));
     }
-    Ok((Some(program), launcher_chain, skipped_launchers))
+    Ok(RuntimeProgramEvidence {
+        program: Some(program),
+        launcher_chain,
+        skipped_launchers,
+    })
 }
 
 #[cfg(feature = "launcher")]
@@ -601,17 +612,15 @@ pub fn resolve_parent_hermes_runtime(
         );
     }
 
-    let (executable, executable_launcher_chain, skipped_executable_launchers) =
-        resolved_launcher_evidence(executable);
-    let (python, python_launcher_chain, skipped_python_launchers) =
-        resolved_launcher_evidence(python);
+    let executable = resolved_launcher_evidence(executable);
+    let python = resolved_launcher_evidence(python);
     Ok(ResolvedHermesRuntime {
-        executable,
-        executable_launcher_chain,
-        skipped_executable_launchers,
-        python,
-        python_launcher_chain,
-        skipped_python_launchers,
+        executable: executable.program,
+        executable_launcher_chain: executable.launcher_chain,
+        skipped_executable_launchers: executable.skipped_launchers,
+        python: python.program,
+        python_launcher_chain: python.launcher_chain,
+        skipped_python_launchers: python.skipped_launchers,
     })
 }
 
@@ -625,9 +634,9 @@ struct ResolvedLauncher {
 #[cfg(feature = "launcher")]
 fn resolved_launcher_evidence(
     resolved: Option<ResolvedLauncher>,
-) -> (Option<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+) -> RuntimeProgramEvidence {
     let Some(resolved) = resolved else {
-        return (None, Vec::new(), Vec::new());
+        return RuntimeProgramEvidence::default();
     };
     let skipped = resolved
         .chain
@@ -635,7 +644,11 @@ fn resolved_launcher_evidence(
         .take(resolved.chain.len().saturating_sub(1))
         .cloned()
         .collect();
-    (Some(resolved.program), resolved.chain, skipped)
+    RuntimeProgramEvidence {
+        program: Some(resolved.program),
+        launcher_chain: resolved.chain,
+        skipped_launchers: skipped,
+    }
 }
 
 #[cfg(feature = "launcher")]
@@ -752,11 +765,11 @@ fn resolve_home_dependent_launcher_at_depth(
         })?;
     let mut chain = vec![executable];
     let mut target = targets[0].clone();
-    if targets.len() > 1 {
-        if let Some(passthrough) = argument_passthrough_launcher(&target, source)? {
-            chain.push(passthrough);
-            target = targets[1].clone();
-        }
+    if targets.len() > 1
+        && let Some(passthrough) = argument_passthrough_launcher(&target, source)?
+    {
+        chain.push(passthrough);
+        target = targets[1].clone();
     }
     let mut resolved =
         resolve_home_dependent_launcher_at_depth(&target, parent_home, source, depth + 1)?;
