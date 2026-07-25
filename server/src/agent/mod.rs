@@ -7792,6 +7792,7 @@ async fn apply_runtime_session_updates(
                 count_update = Some(SessionSummaryCountUpdatedPayload {
                     session_id: session_id.clone(),
                     assistant_turn_count: record.message_count,
+                    updated_at_ms: record.updated_at_ms,
                 });
                 if let Some(delta) =
                     known_turn_usage(&data.message.token_usage).map(|usage| usage.total_tokens)
@@ -9459,39 +9460,35 @@ mod tests {
             None,
             "a missing authoritative session must not publish a count"
         );
-        assert_eq!(
-            apply_runtime_session_updates(
-                &store,
-                &session_id,
-                &stream_end_with_usage("turn-1", "first", 5),
-            )
-            .await,
-            Some(protocol::SessionSummaryCountUpdatedPayload {
-                session_id: session_id.clone(),
-                assistant_turn_count: 1,
-            })
-        );
-        assert_eq!(
-            apply_runtime_session_updates(
-                &store,
-                &session_id,
-                &stream_end_with_usage("turn-2", "second", 7),
-            )
-            .await,
-            Some(protocol::SessionSummaryCountUpdatedPayload {
-                session_id: session_id.clone(),
-                assistant_turn_count: 2,
-            })
-        );
-        assert_eq!(
-            store
-                .lock()
-                .await
-                .get(&session_id)
-                .expect("persisted session")
-                .message_count,
-            2
-        );
+        let first_update = apply_runtime_session_updates(
+            &store,
+            &session_id,
+            &stream_end_with_usage("turn-1", "first", 5),
+        )
+        .await
+        .expect("first persisted count update");
+        assert_eq!(first_update.session_id, session_id);
+        assert_eq!(first_update.assistant_turn_count, 1);
+        assert!(first_update.updated_at_ms > 1);
+
+        let second_update = apply_runtime_session_updates(
+            &store,
+            &session_id,
+            &stream_end_with_usage("turn-2", "second", 7),
+        )
+        .await
+        .expect("second persisted count update");
+        assert_eq!(second_update.session_id, session_id);
+        assert_eq!(second_update.assistant_turn_count, 2);
+        assert!(second_update.updated_at_ms >= first_update.updated_at_ms);
+
+        let persisted = store
+            .lock()
+            .await
+            .get(&session_id)
+            .expect("persisted session");
+        assert_eq!(persisted.message_count, 2);
+        assert_eq!(persisted.updated_at_ms, second_update.updated_at_ms);
     }
 
     fn observe_stats(

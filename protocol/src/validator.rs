@@ -2079,6 +2079,35 @@ mod tests {
         assert!(err.message.contains("assistant_turn_count"));
     }
 
+    #[test]
+    fn session_summary_count_update_requires_authoritative_updated_at() {
+        let mut validator = ProtocolValidator::new();
+        validator
+            .validate_envelope(&host_bootstrap_with_agents(vec![]))
+            .expect("bootstrap should be valid");
+
+        let envelope = Envelope::from_payload(
+            host_stream(),
+            FrameKind::SessionSummaryCountUpdated,
+            1,
+            &serde_json::json!({
+                "session_id": "session-1",
+                "assistant_turn_count": 3,
+            }),
+        )
+        .expect("serialize count update without timestamp");
+
+        let err = validator
+            .validate_envelope(&envelope)
+            .expect_err("count update without updated_at_ms must be rejected");
+
+        assert!(
+            err.message
+                .contains("failed to parse SessionSummaryCountUpdated payload")
+        );
+        assert!(err.message.contains("updated_at_ms"));
+    }
+
     fn agent_start_payload() -> crate::AgentStartPayload {
         crate::AgentStartPayload {
             agent_id: crate::AgentId("test-agent".to_owned()),

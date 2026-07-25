@@ -554,6 +554,7 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
     )
     .await;
     assert_eq!(first_count.assistant_turn_count, 1);
+    assert!(first_count.updated_at_ms > 0);
 
     let follow_up = "follow-up after background event loop";
     commands
@@ -582,6 +583,7 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
     )
     .await;
     assert_eq!(second_count.assistant_turn_count, 2);
+    assert!(second_count.updated_at_ms >= first_count.updated_at_ms);
     host_loop_stop_tx
         .send(())
         .expect("host event loop must remain active through count assertions");

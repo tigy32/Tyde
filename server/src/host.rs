@@ -16806,6 +16806,7 @@ fn apply_session_summary_count_update(
         return false;
     };
     summary.message_count = update.assistant_turn_count;
+    summary.updated_at_ms = update.updated_at_ms;
     true
 }
 
@@ -21059,6 +21060,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             &SessionSummaryCountUpdatedPayload {
                 session_id: tracked_session_id.clone(),
                 assistant_turn_count: 2,
+                updated_at_ms: 20,
             },
         ));
         assert!(!apply_session_summary_count_update(
@@ -21066,17 +21068,21 @@ Rules: Record only what remains true and useful for future work; drop transient 
             &SessionSummaryCountUpdatedPayload {
                 session_id: SessionId("unlisted-session".to_owned()),
                 assistant_turn_count: 3,
+                updated_at_ms: 30,
             },
         ));
         assert_eq!(snapshot.sessions[0].message_count, 0);
+        assert_eq!(snapshot.sessions[0].updated_at_ms, 2);
         assert!(apply_session_summary_count_update(
             Some(&mut snapshot),
             &SessionSummaryCountUpdatedPayload {
                 session_id: tracked_session_id,
                 assistant_turn_count: 4,
+                updated_at_ms: 40,
             },
         ));
         assert_eq!(snapshot.sessions[0].message_count, 4);
+        assert_eq!(snapshot.sessions[0].updated_at_ms, 40);
         assert_eq!(snapshot.generation, SessionListGeneration(7));
         assert_eq!(snapshot.scope, SessionListScope::RootSessions);
     }
@@ -22157,7 +22163,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             spawn_idle_user_agent(&fixture.host, "count completed assistant turns").await;
         let (tx, mut rx) = mpsc::unbounded_channel();
         let host_path = StreamPath(format!("/host/session-count-{}", Uuid::new_v4()));
-        let host_stream = Stream::new(host_path, tx);
+        let host_stream = Stream::new(host_path.clone(), tx);
         assert!(
             fixture
                 .host
@@ -22192,7 +22198,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         wait_for_agent_idle(&fixture.host, &agent_id).await;
 
         let mut rebuilt_session_lists = 0;
-        timeout(Duration::from_secs(1), async {
+        let count_update = timeout(Duration::from_secs(1), async {
             loop {
                 let envelope = rx.recv().await.expect("host stream remains open");
                 match envelope.kind {
@@ -22202,7 +22208,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                             .parse_payload()
                             .expect("session count update payload");
                         if payload.session_id == session_id && payload.assistant_turn_count == 2 {
-                            break;
+                            break payload;
                         }
                     }
                     _ => {}
@@ -22216,16 +22222,30 @@ Rules: Record only what remains true and useful for future work; drop transient 
             rebuilt_session_lists, 0,
             "turn completion must not rebuild the full session list"
         );
+        {
+            let state = fixture.host.state.lock().await;
+            let summary = state
+                .host_streams
+                .get(&host_path)
+                .and_then(|subscriber| subscriber.session_list_snapshot.as_ref())
+                .and_then(|snapshot| {
+                    snapshot
+                        .sessions
+                        .iter()
+                        .find(|summary| summary.id == session_id)
+                })
+                .expect("subscriber session summary");
+            assert_eq!(summary.message_count, count_update.assistant_turn_count);
+            assert_eq!(summary.updated_at_ms, count_update.updated_at_ms);
+        }
         let session_store = { Arc::clone(&fixture.host.state.lock().await.session_store) };
-        assert_eq!(
-            session_store
-                .lock()
-                .await
-                .get(&session_id)
-                .expect("persisted session")
-                .message_count,
-            2
-        );
+        let persisted = session_store
+            .lock()
+            .await
+            .get(&session_id)
+            .expect("persisted session");
+        assert_eq!(persisted.message_count, 2);
+        assert!(persisted.updated_at_ms >= count_update.updated_at_ms);
     }
 
     #[tokio::test]

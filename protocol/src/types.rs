@@ -3614,6 +3614,8 @@ pub struct SessionSummaryCountUpdatedPayload {
     pub session_id: SessionId,
     /// Number of completed assistant turns (`StreamEnd`s) persisted for this session.
     pub assistant_turn_count: u32,
+    /// Authoritative last-activity timestamp persisted at the same turn boundary.
+    pub updated_at_ms: u64,
 }
 
 /// Input events that can be sent to a running agent.
@@ -7548,12 +7550,14 @@ mod search_serde_tests {
         let payload = SessionSummaryCountUpdatedPayload {
             session_id: SessionId("session-1".to_owned()),
             assistant_turn_count: 3,
+            updated_at_ms: 1_700_000_000_000,
         };
 
         let encoded =
             serde_json::to_value(&payload).expect("serialize SessionSummaryCountUpdatedPayload");
         assert_eq!(encoded["session_id"], "session-1");
         assert_eq!(encoded["assistant_turn_count"], 3);
+        assert_eq!(encoded["updated_at_ms"], 1_700_000_000_000_u64);
         assert!(encoded.get("message_count").is_none());
         assert_eq!(
             FrameKind::SessionSummaryCountUpdated.to_string(),
