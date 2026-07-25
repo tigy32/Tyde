@@ -1333,11 +1333,11 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                                 matches!(page.status, protocol::SessionListPageStatus::Complete)
                             })
                     });
-                    let patched = state.sessions.try_update(|sessions| {
+                    state.sessions.update(|sessions| {
                         let Some(session) = sessions.iter_mut().find(|session| {
                             session.host_id == host_id && session.summary.id == payload.session_id
                         }) else {
-                            return false;
+                            return;
                         };
                         session.summary.message_count = payload.assistant_turn_count;
                         // The turn advanced last-activity too, and the frame now
@@ -1353,7 +1353,6 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         sessions.sort_by_key(|session| {
                             std::cmp::Reverse(session.summary.updated_at_ms)
                         });
-                        true
                     });
 
                     // With pages outstanding the visible set is no longer a
@@ -6045,7 +6044,7 @@ fn apply_terminal_bootstrap(
 #[cfg(test)]
 mod restore_fixtures {
     use super::*;
-    use protocol::BackendKind;
+    use protocol::{BackendKind, ProjectRootPath};
 
     pub(crate) fn empty_host_bootstrap_envelope(stream: &str, seq: u64) -> Envelope {
         Envelope::from_payload(

@@ -127,6 +127,10 @@ const ACTIVE_PROJECT_STORAGE_KEY: &str = "tyde-active-project";
 /// the project format already ships and is covered by tests, and a separate
 /// key means an old or corrupt selection degrades to today's behaviour instead
 /// of taking project restoration down with it.
+///
+/// Gated like [`ACTIVE_PROJECT_STORAGE_KEY`]: only the wasm persistence
+/// functions read it, and `localStorage` does not exist off the browser.
+#[cfg(target_arch = "wasm32")]
 const WORKSPACE_SELECTION_STORAGE_KEY: &str = "tyde-workspace-selection";
 
 /// Id of the builtin "Default" custom agent. It backs every spawn that picks
@@ -276,6 +280,10 @@ pub struct PersistedWorkspaceSelection {
 }
 
 impl PersistedWorkspaceSelection {
+    /// Whether there is anything worth storing. Consulted only by the wasm
+    /// writer, which removes the key rather than persisting a record saying
+    /// the user chose nothing.
+    #[cfg(target_arch = "wasm32")]
     fn is_empty(&self) -> bool {
         self.active_chat.is_none() && self.draft.is_none()
     }
