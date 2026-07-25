@@ -7290,18 +7290,9 @@ for line in sys.stdin:
             ..ResolvedSpawnConfig::default()
         };
 
-        assert!(session_is_resumable_for_workspace_roots(
-            &remote_roots,
-            &plain
-        ));
-        assert!(!session_is_resumable_for_workspace_roots(
-            &remote_roots,
-            &protected
-        ));
-        assert!(session_is_resumable_for_workspace_roots(
-            &local_roots,
-            &protected
-        ));
+        assert!(session_is_resumable_for_workspace_roots(&remote_roots, &plain));
+        assert!(!session_is_resumable_for_workspace_roots(&remote_roots, &protected));
+        assert!(session_is_resumable_for_workspace_roots(&local_roots, &protected));
     }
 
     #[test]
@@ -8299,7 +8290,7 @@ for line in sys.stdin:
         assert!(events.iter().any(|event| matches!(
             event,
             ChatEvent::StreamEnd(_)
-        ));
+        )));
         assert!(events.iter().any(|event| matches!(
             event,
             ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
