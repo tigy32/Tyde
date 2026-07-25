@@ -8,7 +8,7 @@ use crate::actions::{
     create_workbench, delete_project, remove_workbench, rename_project, reorder_projects,
 };
 use crate::components::host_browser::open_project_browser;
-use crate::state::{ActiveProjectRef, AppState, TabContent};
+use crate::state::{ActiveProjectRef, AppState, TabContent, WorkbenchRemovePrompt};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DraggedProject {
@@ -64,6 +64,7 @@ pub fn ProjectRail() -> impl IntoView {
     let editing_project = RwSignal::new(None::<EditingKey>);
     let context_menu = RwSignal::new(None::<RailContextMenu>);
     let workbench_prompt = RwSignal::new(None::<WorkbenchCreatePrompt>);
+    let state_for_remove_prompt = state.clone();
 
     let state_for_home = state.clone();
     let go_home = move |_| {
@@ -219,6 +220,9 @@ pub fn ProjectRail() -> impl IntoView {
             })}
             {move || workbench_prompt.get().map(|prompt| view! {
                 <WorkbenchCreateModal prompt=prompt workbench_prompt=workbench_prompt />
+            })}
+            {move || state_for_remove_prompt.workbench_remove_prompt.get().map(|prompt| view! {
+                <WorkbenchRemoveModal prompt=prompt />
             })}
         </nav>
     }
@@ -771,7 +775,7 @@ fn RailContextMenuView(
             if !crate::bridge::confirm_dialog("Remove workbench", &message).await {
                 return;
             }
-            remove_workbench(&state, host_id, workbench_id);
+            remove_workbench(&state, host_id, workbench_id, workbench_name, false);
         });
     };
 
@@ -1076,6 +1080,90 @@ fn WorkbenchCreateModal(
     }
 }
 
+#[component]
+fn WorkbenchRemoveModal(prompt: WorkbenchRemovePrompt) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let close = {
+        let state = state.clone();
+        move || state.workbench_remove_prompt.set(None)
+    };
+    let close_for_backdrop = close;
+    let close_for_cancel = close;
+    let close_for_keydown = close;
+
+    let state_for_open = state.clone();
+    let open_prompt = prompt.clone();
+    let on_open = move |_| {
+        state_for_open.switch_active_project(Some(ActiveProjectRef {
+            host_id: open_prompt.host_id.clone(),
+            project_id: open_prompt.project_id.clone(),
+        }));
+        state_for_open.workbench_remove_prompt.set(None);
+    };
+
+    let state_for_force = state.clone();
+    let force_prompt = prompt.clone();
+    let on_force = move |_| {
+        state_for_force.workbench_remove_prompt.set(None);
+        remove_workbench(
+            &state_for_force,
+            force_prompt.host_id.clone(),
+            force_prompt.project_id.clone(),
+            force_prompt.project_name.clone(),
+            true,
+        );
+    };
+
+    let on_keydown = move |event: web_sys::KeyboardEvent| {
+        if event.key() == "Escape" {
+            event.prevent_default();
+            close_for_keydown();
+        }
+    };
+
+    view! {
+        <>
+            <div
+                class="modal-backdrop"
+                style="position: fixed; inset: 0; z-index: 1100; background: rgba(0,0,0,0.4);"
+                on:click=move |_| close_for_backdrop()
+            />
+            <div
+                class="modal workbench-create-modal workbench-remove-modal"
+                role="alertdialog"
+                aria-modal="true"
+                aria-labelledby="workbench-remove-title"
+                style="position: fixed; left: 50%; top: 24%; transform: translateX(-50%); z-index: 1101;"
+                tabindex="-1"
+                on:keydown=on_keydown
+                on:click=|event: web_sys::MouseEvent| event.stop_propagation()
+            >
+                <div id="workbench-remove-title" class="modal-title">
+                    "Workbench has uncommitted files"
+                </div>
+                <div class="modal-body">
+                    <div class="modal-error">{prompt.message}</div>
+                    <div class="modal-warning">
+                        {format!(
+                            "Deleting '{}' anyway permanently discards every uncommitted and untracked file in this workbench.",
+                            prompt.project_name
+                        )}
+                    </div>
+                </div>
+                <div class="modal-actions">
+                    <button class="modal-button" on:click=on_open>"Open Workbench"</button>
+                    <button class="modal-button" on:click=move |_| close_for_cancel()>
+                        "Cancel"
+                    </button>
+                    <button class="modal-button danger" on:click=on_force>
+                        "Delete Anyway"
+                    </button>
+                </div>
+            </div>
+        </>
+    }
+}
+
 /// Produce a short lowercase tag for a project name.
 ///
 /// - Multi-token names (split on non-alphanumerics) take the first char of each
@@ -1137,7 +1225,7 @@ mod wasm_tests {
     //! CLAUDE.md).
 
     use super::*;
-    use crate::state::{AppState, ProjectInfo, sort_project_infos};
+    use crate::state::{AppState, ProjectInfo, WorkbenchRemovePrompt, sort_project_infos};
     use host_config::{ConfiguredHost, HostTransportConfig};
     use leptos::mount::mount_to;
     use protocol::{
@@ -1480,6 +1568,93 @@ mod wasm_tests {
         assert_eq!(
             tyde_children, 1,
             "Tyde2 should have one workbench child after removal, got {tyde_children}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn dirty_remove_prompt_shows_actions_and_delete_anyway_sends_force() {
+        install_send_stub();
+        let container = make_container();
+        let state_signal = leptos::prelude::StoredValue::new(None::<AppState>);
+        let _handle = mount_to(container.clone(), move || {
+            let state = make_state_with_fixture();
+            state.host_streams.update(|streams| {
+                streams.insert(
+                    "host-a".to_owned(),
+                    protocol::StreamPath("/host/a".to_owned()),
+                );
+            });
+            state
+                .workbench_remove_prompt
+                .set(Some(WorkbenchRemovePrompt {
+                    host_id: "host-a".to_owned(),
+                    project_id: ProjectId("wb-feat".to_owned()),
+                    project_name: "feature-login".to_owned(),
+                    message: "dirty root:\n?? implementation.md".to_owned(),
+                }));
+            state_signal.set_value(Some(state.clone()));
+            provide_context(state);
+            view! { <ProjectRail /> }
+        });
+        next_tick().await;
+
+        let modal = container
+            .query_selector(".workbench-remove-modal")
+            .unwrap()
+            .expect("dirty removal modal");
+        assert_eq!(modal.get_attribute("role").as_deref(), Some("alertdialog"));
+        assert!(
+            modal
+                .text_content()
+                .unwrap_or_default()
+                .contains("?? implementation.md")
+        );
+        let buttons = modal.query_selector_all("button").unwrap();
+        let labels = (0..buttons.length())
+            .filter_map(|index| buttons.item(index)?.text_content())
+            .map(|label| label.trim().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["Open Workbench", "Cancel", "Delete Anyway"]);
+
+        buttons
+            .item(2)
+            .expect("Delete Anyway button")
+            .dyn_into::<HtmlElement>()
+            .expect("button element")
+            .click();
+        next_tick().await;
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".workbench-remove-modal")
+                .unwrap()
+                .is_none()
+        );
+
+        let forced = js_sys::eval(
+            r#"
+            (window.__test_send_calls || []).some(([cmd, args]) => {
+                if (cmd !== "send_host_line") return false;
+                const envelope = JSON.parse(JSON.parse(args).line);
+                return envelope.kind === "workbench_remove"
+                    && envelope.payload.id === "wb-feat"
+                    && envelope.payload.force === true;
+            })
+            "#,
+        )
+        .expect("inspect forced removal")
+        .as_bool()
+        .unwrap_or(false);
+        assert!(forced, "Delete Anyway must send force=true");
+        let state = state_signal
+            .get_value()
+            .expect("state should be captured by the mount closure");
+        assert!(
+            state
+                .pending_workbench_removes
+                .get_untracked()
+                .iter()
+                .any(|entry| entry.project_id.0 == "wb-feat" && entry.force)
         );
     }
 

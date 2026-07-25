@@ -11846,6 +11846,19 @@ pre.tool-error-pre {
     font-size: 0.846rem;
     line-height: 1.4;
     overflow-wrap: anywhere;
+    white-space: pre-wrap;
+}
+
+.workbench-remove-modal .modal-warning {
+    color: var(--text-primary);
+    font-size: 0.846rem;
+    line-height: 1.4;
+}
+
+.workbench-remove-modal .modal-button.danger {
+    color: var(--text-on-accent);
+    background: var(--error);
+    border-color: var(--error);
 }
 
 /* "Creating workbench…" indicator while the request is in flight. */

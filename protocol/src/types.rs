@@ -4745,6 +4745,8 @@ pub struct WorkbenchCreatePayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkbenchRemovePayload {
     pub id: ProjectId,
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -9046,5 +9048,19 @@ mod stream_identity_tests {
         )
         .expect("deserialize identity contract");
         assert_eq!(round_trip, identity);
+    }
+}
+
+#[cfg(test)]
+mod workbench_remove_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_payload_defaults_to_safe_removal() {
+        let payload: WorkbenchRemovePayload =
+            serde_json::from_value(serde_json::json!({ "id": "workbench-1" }))
+                .expect("legacy workbench removal payload");
+        assert_eq!(payload.id.0, "workbench-1");
+        assert!(!payload.force);
     }
 }

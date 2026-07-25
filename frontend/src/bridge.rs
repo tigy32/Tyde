@@ -194,6 +194,31 @@ pub async fn confirm_dialog(title: &str, message: &str) -> bool {
     }
 }
 
+pub async fn message_dialog(title: &str, message: &str) {
+    #[derive(Serialize)]
+    struct Args<'a> {
+        title: &'a str,
+        message: &'a str,
+        kind: &'a str,
+        buttons: &'a str,
+    }
+    let args = match serde_wasm_bindgen::to_value(&Args {
+        title,
+        message,
+        kind: "error",
+        buttons: "Ok",
+    }) {
+        Ok(value) => value,
+        Err(error) => {
+            log::error!("message_dialog: failed to serialize args: {error}");
+            return;
+        }
+    };
+    if let Err(error) = tauri_invoke("plugin:dialog|message", args).await {
+        log::error!("message_dialog: plugin:dialog|message failed: {error:?}");
+    }
+}
+
 pub async fn mark_ui_debug_ready() -> Result<(), String> {
     tauri_invoke("mark_ui_debug_ready", JsValue::NULL)
         .await

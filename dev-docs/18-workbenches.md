@@ -505,10 +505,13 @@ changes only `Project.name`. The git branch and on-disk path do not change.
 `InvalidInput`. The user must use `WorkbenchRemove`. This ensures the
 on-disk worktree is always cleaned up alongside the record.
 
-`WorkbenchRemove` rejects when any worktree root is dirty
+`WorkbenchRemove { force: false }` rejects when any worktree root is dirty
 (`git status --porcelain=v1 --untracked-files=all` produces output). The error
-message includes the dirty root paths verbatim. This is the one retained safety
-blocker because cascading removal must never discard uncommitted source work.
+message includes the dirty root paths and porcelain entries verbatim. The
+frontend shows that failure in a destructive-action dialog and offers an
+explicit choice to open the workbench, cancel, or delete anyway. Delete Anyway
+retries with `force: true`, which permanently discards tracked and untracked
+worktree changes.
 
 All project-owned runtime and persisted state is removed as one explicit
 cascade: live agents and terminals are closed; sessions and their task lists,
@@ -520,7 +523,9 @@ and team members, survive with only the deleted references removed.
 The authenticated agent-control MCP exposes `tyde_remove_workbench` for
 unrestricted callers. It is scoped to workbenches under the caller's canonical
 project and refuses to remove the caller's own active workbench because doing
-so would terminate the MCP request before a result could be delivered.
+so would terminate the MCP request before a result could be delivered. Its
+optional `force` argument defaults to `false`; callers must explicitly opt into
+destructive dirty-worktree removal.
 
 Additional structural blockers:
 
@@ -529,14 +534,16 @@ Additional structural blockers:
 - An absent worktree path is pruned from git bookkeeping and does not block
   deletion of the authoritative record.
 
-Dirty roots require explicit user cleanup. A missing parent requires repairing
-the corrupt project store.
+Dirty roots require either explicit user cleanup or an explicit forced retry. A
+missing parent requires repairing the corrupt project store.
 
 Successful flow:
 
-1. Validate the target, parent relationship, and clean roots.
+1. Validate the target and parent relationship. Validate clean roots unless
+   `force` is true.
 2. Close associated agents and terminals.
-3. Run `git worktree remove <worktree_root>` for every root (no `--force`).
+3. Run `git worktree remove <worktree_root>` for every root, adding `--force`
+   only for the explicit forced path.
 4. Delete or detach every persisted project reference in the cascade above.
 5. Call `ProjectStore::delete_workbench`.
 6. Abort the project actor and drop its stream.
@@ -719,8 +726,10 @@ bookkeeping and deletes the authoritative project record.
 
 ### 9.3 Workbench has uncommitted or untracked changes on remove
 
-Rejected with `Conflict`. Error message includes the dirty root paths
-verbatim. No `--force`, no auto-stash, no auto-discard.
+The safe default is rejected with `Conflict`. The error includes dirty root
+paths and status entries. The frontend makes the failure visible and offers a
+second destructive confirmation; accepting it retries with `force: true`.
+There is no auto-stash or auto-commit.
 
 ### 9.4 Workbench branch already exists at create time
 
@@ -811,7 +820,6 @@ Not part of v1:
 
 - Nested workbenches.
 - Workbench creation from an existing branch.
-- Force-remove of dirty worktrees (future explicit `force` flag).
 - Auto-stash, auto-discard, or auto-commit of dirty changes.
 - Deleting git branches when removing a workbench.
 - Renaming git branches.
@@ -820,24 +828,24 @@ Not part of v1:
 - Auto-syncing parent root edits (`ProjectAddRoot` / `ProjectDeleteRoot`) into
   existing workbenches.
 - Cascading parent deletion into workbench deletion.
-- Closing agents / killing terminals / deleting sessions automatically.
 - Cross-host workbenches (worktree on a different host than parent).
 - Auto-discovery of pre-existing on-disk worktrees not created by Tyde.
 - Importing original Tyde (`~/Tyde`) workbench records — would be a separate
   explicit import command.
 - Repairing out-of-band-deleted worktrees (future explicit
   `WorkbenchForgetMissing` repair command).
-- Agent-driven workbench removal.
 - Showing parent/workbench git ahead/behind relationships in the UI.
 
 ---
 
 ## 11. Agent-control MCP
 
-Authenticated control-surface callers can use `tyde_list_workbenches` and
-`tyde_create_workbench`. Listing is read-only and is limited to the caller's
-canonical standalone project plus that project's workbenches. Creation is
-limited to that same standalone parent and is rejected for read-only callers.
+Authenticated control-surface callers can use `tyde_list_workbenches`,
+`tyde_create_workbench`, and `tyde_remove_workbench`. Listing is read-only and
+is limited to the caller's canonical standalone project plus that project's
+workbenches. Creation and removal are limited to that same standalone parent
+and are rejected for read-only callers. Removal defaults to safe dirty-root
+rejection; `force: true` is the explicit destructive override.
 
 Creation accepts an optional `base_ref`. When omitted, every parent root uses
 its current `HEAD`. Before any worktree is added, the server resolves the base

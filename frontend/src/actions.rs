@@ -5,7 +5,7 @@ use crate::send::send_frame;
 use crate::state::{
     ActiveAgentRef, ActiveProjectRef, AppState, DockVisibility, FileResourceKey, LeftTab,
     OpenTarget, PaneId, PendingFileNavigation, PendingFileOpen, PendingOpenDestination,
-    PendingWorkbenchCreate, TabContent, TabId, sort_project_infos,
+    PendingWorkbenchCreate, PendingWorkbenchRemove, TabContent, TabId, sort_project_infos,
 };
 
 use protocol::{
@@ -1356,17 +1356,48 @@ pub fn create_workbench(
     });
 }
 
-pub fn remove_workbench(state: &AppState, host_id: String, workbench_id: ProjectId) {
+pub fn remove_workbench(
+    state: &AppState,
+    host_id: String,
+    workbench_id: ProjectId,
+    workbench_name: String,
+    force: bool,
+) {
     let Some(host_stream) = state.host_stream_untracked(&host_id) else {
         log::error!("remove_workbench: host stream missing for {host_id}");
         return;
     };
-    let payload = WorkbenchRemovePayload { id: workbench_id };
+    let pending = PendingWorkbenchRemove {
+        host_id: host_id.clone(),
+        project_id: workbench_id.clone(),
+        project_name: workbench_name,
+        force,
+    };
+    state.pending_workbench_removes.update(|entries| {
+        entries.retain(|entry| {
+            entry.host_id != pending.host_id || entry.project_id != pending.project_id
+        });
+        entries.push(pending);
+    });
+    let payload = WorkbenchRemovePayload {
+        id: workbench_id.clone(),
+        force,
+    };
+    let state = state.clone();
     spawn_local(async move {
         if let Err(error) =
             send_frame(&host_id, host_stream, FrameKind::WorkbenchRemove, &payload).await
         {
             log::error!("failed to send WorkbenchRemove: {error}");
+            state.pending_workbench_removes.update(|entries| {
+                entries
+                    .retain(|entry| entry.host_id != host_id || entry.project_id != workbench_id);
+            });
+            crate::bridge::message_dialog(
+                "Workbench could not be removed",
+                &format!("The removal request could not be sent: {error}"),
+            )
+            .await;
         }
     });
 }

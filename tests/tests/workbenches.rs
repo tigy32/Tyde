@@ -438,6 +438,7 @@ async fn workbench_create_and_remove_round_trip_real_git_repo() {
         .client
         .workbench_remove(WorkbenchRemovePayload {
             id: workbench.id.clone(),
+            force: false,
         })
         .await
         .expect("workbench_remove write failed");
@@ -529,7 +530,7 @@ async fn workbench_create_rejects_path_collision_and_existing_branch() {
 }
 
 #[tokio::test]
-async fn workbench_remove_rejects_dirty_worktree() {
+async fn workbench_remove_rejects_dirty_worktree_unless_forced() {
     let mut fixture = Fixture::new().await;
     let repo = init_git_repo("dirty-remove");
     let parent = create_project(&mut fixture.client, vec![repo.path()]).await;
@@ -541,6 +542,7 @@ async fn workbench_remove_rejects_dirty_worktree() {
         .client
         .workbench_remove(WorkbenchRemovePayload {
             id: workbench.id.clone(),
+            force: false,
         })
         .await
         .expect("workbench_remove write failed");
@@ -552,6 +554,23 @@ async fn workbench_remove_rejects_dirty_worktree() {
             .message
             .contains(worktree_root.to_string_lossy().as_ref())
     );
+    assert!(error.message.contains("?? dirty.txt"));
+    assert!(worktree_root.join("dirty.txt").exists());
+
+    fixture
+        .client
+        .workbench_remove(WorkbenchRemovePayload {
+            id: workbench.id.clone(),
+            force: true,
+        })
+        .await
+        .expect("forced workbench_remove write failed");
+    let deleted: ProjectNotifyPayload =
+        expect_project_notify(&mut fixture.client, "forced dirty workbench remove").await;
+    assert!(
+        matches!(deleted, ProjectNotifyPayload::Delete { project } if project.id == workbench.id)
+    );
+    assert!(!worktree_root.exists());
 }
 
 #[tokio::test]
@@ -762,6 +781,7 @@ async fn workbench_remove_succeeds_when_worktree_dir_was_deleted_out_of_band() {
         .client
         .workbench_remove(WorkbenchRemovePayload {
             id: workbench.id.clone(),
+            force: false,
         })
         .await
         .expect("workbench_remove write failed");
@@ -888,6 +908,7 @@ async fn workbench_remove_cascades_team_member_reference() {
         .client
         .workbench_remove(WorkbenchRemovePayload {
             id: workbench.id.clone(),
+            force: false,
         })
         .await
         .expect("workbench_remove write failed");
@@ -957,6 +978,7 @@ async fn workbench_remove_cascades_agents_terminals_sessions_and_steering() {
         .client
         .workbench_remove(WorkbenchRemovePayload {
             id: agent_workbench.id.clone(),
+            force: false,
         })
         .await
         .expect("workbench_remove write failed");
@@ -1018,6 +1040,7 @@ async fn workbench_remove_cascades_agents_terminals_sessions_and_steering() {
         .client
         .workbench_remove(WorkbenchRemovePayload {
             id: terminal_workbench.id.clone(),
+            force: false,
         })
         .await
         .expect("workbench_remove write failed");
@@ -1086,6 +1109,7 @@ async fn workbench_remove_cascades_agents_terminals_sessions_and_steering() {
         .client
         .workbench_remove(WorkbenchRemovePayload {
             id: session_workbench.id.clone(),
+            force: false,
         })
         .await
         .expect("workbench_remove write failed");
@@ -1128,6 +1152,7 @@ async fn workbench_remove_cascades_agents_terminals_sessions_and_steering() {
         .client
         .workbench_remove(WorkbenchRemovePayload {
             id: steering_workbench.id.clone(),
+            force: false,
         })
         .await
         .expect("workbench_remove write failed");
@@ -1487,6 +1512,9 @@ async fn agent_control_workbenches_enforce_auth_access_and_scope() {
     let removable = create_workbench(&mut fixture.client, &parent, "feature/mcp-remove").await;
     let other_workbench =
         create_workbench(&mut fixture.client, &other, "feature/out-of-scope-remove").await;
+    let removable_root = PathBuf::from(project_roots(&removable)[0].clone());
+    fs::write(removable_root.join("uncommitted.txt"), "discard me\n")
+        .expect("write dirty MCP workbench file");
 
     for (tool, arguments) in [
         ("tyde_list_workbenches", json!({})),
@@ -1592,6 +1620,17 @@ async fn agent_control_workbenches_enforce_auth_access_and_scope() {
         json!({"project_id": removable.id.0}),
     )
     .await;
+    assert!(is_error, "safe dirty remove succeeded: {body}");
+    assert!(body.contains("?? uncommitted.txt"));
+    assert!(removable_root.join("uncommitted.txt").exists());
+
+    let (is_error, body) = call_agent_control(
+        &fixture,
+        &caller.agent_id,
+        "tyde_remove_workbench",
+        json!({"project_id": removable.id.0, "force": true}),
+    )
+    .await;
     assert!(!is_error, "scoped remove failed: {body}");
     let removed: Value = serde_json::from_str(&body).expect("remove JSON");
     assert_eq!(removed["project_id"], removable.id.0);
@@ -1661,6 +1700,7 @@ async fn agent_control_multi_root_preflight_and_removed_spawn_are_atomic() {
         .client
         .workbench_remove(WorkbenchRemovePayload {
             id: removable.id.clone(),
+            force: false,
         })
         .await
         .expect("remove workbench");
@@ -1704,6 +1744,7 @@ async fn concurrent_workbench_remove_and_mcp_spawn_have_one_winner() {
     remove_client
         .workbench_remove(WorkbenchRemovePayload {
             id: workbench.id.clone(),
+            force: false,
         })
         .await
         .expect("send concurrent remove");

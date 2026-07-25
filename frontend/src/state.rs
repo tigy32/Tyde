@@ -2323,6 +2323,22 @@ pub struct PendingWorkbenchCreate {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingWorkbenchRemove {
+    pub host_id: String,
+    pub project_id: ProjectId,
+    pub project_name: String,
+    pub force: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkbenchRemovePrompt {
+    pub host_id: String,
+    pub project_id: ProjectId,
+    pub project_name: String,
+    pub message: String,
+}
+
 /// How long an in-flight workbench create stays correlatable. Past this the
 /// entry is purged on the next touch of `pending_workbench_creates`.
 pub const PENDING_WORKBENCH_CREATE_TTL_MS: u64 = 5 * 60 * 1000;
@@ -2765,6 +2781,11 @@ pub struct AppState {
     /// correlate the resulting `ProjectNotify::Upsert` and switch the active
     /// project to the freshly-created workbench. See `PendingWorkbenchCreate`.
     pub pending_workbench_creates: RwSignal<Vec<PendingWorkbenchCreate>>,
+    /// In-flight workbench removals. A host-scoped `CommandError` is paired
+    /// with the oldest entry for that host so the failure can be shown next
+    /// to the destructive action instead of disappearing into header status.
+    pub pending_workbench_removes: RwSignal<Vec<PendingWorkbenchRemove>>,
+    pub workbench_remove_prompt: RwSignal<Option<WorkbenchRemovePrompt>>,
     /// Managed remote hosts for which the Phase 2 safety net has already fired
     /// its one forced upgrade-and-reconnect after a `Reject{IncompatibleProtocol}`.
     /// This is ephemeral, frontend-owned *connect-control* state — a one-shot
@@ -2989,6 +3010,8 @@ impl AppState {
             mobile_pairing_offer: RwSignal::new(HashMap::new()),
             mobile_pairing_start_pending: RwSignal::new(HashSet::new()),
             pending_workbench_creates: RwSignal::new(Vec::new()),
+            pending_workbench_removes: RwSignal::new(Vec::new()),
+            workbench_remove_prompt: RwSignal::new(None),
             upgrade_attempted: RwSignal::new(HashSet::new()),
         }
     }
@@ -4321,6 +4344,16 @@ impl AppState {
             .update(|map| map.retain(|key, _| key.host_id != host_id));
         self.pending_workbench_creates
             .update(|pending| pending.retain(|entry| entry.host_id != host_id));
+        self.pending_workbench_removes
+            .update(|pending| pending.retain(|entry| entry.host_id != host_id));
+        self.workbench_remove_prompt.update(|prompt| {
+            if prompt
+                .as_ref()
+                .is_some_and(|prompt| prompt.host_id == host_id)
+            {
+                *prompt = None;
+            }
+        });
         self.pending_terminal_focus.update(|focus| {
             if focus.as_deref() == Some(host_id) {
                 *focus = None;

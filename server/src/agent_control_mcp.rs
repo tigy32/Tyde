@@ -321,6 +321,8 @@ struct CreateWorkbenchToolInput {
 #[serde(deny_unknown_fields)]
 struct RemoveWorkbenchToolInput {
     project_id: String,
+    #[serde(default)]
+    force: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -659,7 +661,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Remove a git workbench in the authenticated caller's canonical project. Cascades through its active agents, terminals, sessions, steering, team references, reviews, and workflow runs. Refuses dirty worktrees and cannot remove the caller's own active workbench."
+        description = "Remove a git workbench in the authenticated caller's canonical project. Cascades through its active agents, terminals, sessions, steering, team references, reviews, and workflow runs. Dirty worktrees are refused unless force=true, which permanently discards their uncommitted and untracked files. Cannot remove the caller's own active workbench."
     )]
     async fn tyde_remove_workbench(
         &self,
@@ -1392,9 +1394,12 @@ async fn do_remove_workbench(
     if target.parent_project_id() != Some(&canonical_project_id) {
         return Err(format!("project_id {project_id} is not a workbench"));
     }
-    host.remove_workbench(WorkbenchRemovePayload { id: project_id })
-        .await
-        .map_err(|error| error.to_string())
+    host.remove_workbench(WorkbenchRemovePayload {
+        id: project_id,
+        force: input.force,
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 async fn do_list_launch_options(host: &HostHandle) -> Result<ListLaunchOptionsResult, String> {

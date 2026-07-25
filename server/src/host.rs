@@ -6022,7 +6022,8 @@ impl HostHandle {
         project_store: &Arc<Mutex<ProjectStore>>,
     ) -> AppResult<()> {
         const OPERATION: &str = "workbench_remove";
-        self.validate_workbench_remove_roots(project).await?;
+        self.validate_workbench_remove_roots(project, payload.force)
+            .await?;
 
         let (agent_ids, terminals) = {
             let state = self.state.lock().await;
@@ -6066,7 +6067,7 @@ impl HostHandle {
                 .await
                 .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
             if exists {
-                git_worktree_remove(&root.parent_root, &root.worktree_root)
+                git_worktree_remove(&root.parent_root, &root.worktree_root, payload.force)
                     .await
                     .map_err(|error| {
                         AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
@@ -6173,7 +6174,11 @@ impl HostHandle {
         Ok(())
     }
 
-    async fn validate_workbench_remove_roots(&self, project: &Project) -> AppResult<()> {
+    async fn validate_workbench_remove_roots(
+        &self,
+        project: &Project,
+        force: bool,
+    ) -> AppResult<()> {
         const OPERATION: &str = "workbench_remove";
         let ProjectSource::GitWorkbench {
             parent_project_id,
@@ -6253,17 +6258,17 @@ impl HostHandle {
                 .map_err(|error| {
                     AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
                 })?;
-            if !status.trim().is_empty() {
-                dirty_roots.push(root.worktree_root.0.clone());
+            if !force && !status.trim().is_empty() {
+                dirty_roots.push(format!("{}:\n{}", root.worktree_root, status.trim()));
             }
         }
         if !dirty_roots.is_empty() {
             return Err(AppError::conflict(
                 OPERATION,
                 format!(
-                    "cannot remove workbench {} because worktree roots are dirty: {}",
+                    "cannot remove workbench {} because worktree roots are dirty:\n{}",
                     project.id,
-                    dirty_roots.join(", ")
+                    dirty_roots.join("\n")
                 ),
             ));
         }
@@ -12188,8 +12193,14 @@ async fn git_resolve_base_commit(
 async fn git_worktree_remove(
     parent_root: &ProjectRootPath,
     worktree_root: &ProjectRootPath,
+    force: bool,
 ) -> Result<(), String> {
-    let output = run_git(parent_root, &["worktree", "remove", &worktree_root.0]).await?;
+    let mut args = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.push(&worktree_root.0);
+    let output = run_git(parent_root, &args).await?;
     if output.status.success() {
         return Ok(());
     }
@@ -21248,7 +21259,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         };
 
         let error = host
-            .validate_workbench_remove_roots(&workbench)
+            .validate_workbench_remove_roots(&workbench, false)
             .await
             .expect_err("missing parent should block removal");
         assert_eq!(error.code(), protocol::CommandErrorCode::Internal);

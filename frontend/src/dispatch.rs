@@ -541,6 +541,47 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         }
                     });
                 }
+                if matches!(payload.request_kind, FrameKind::WorkbenchRemove) {
+                    let mut removal = None;
+                    state.pending_workbench_removes.update(|pending| {
+                        if let Some(index) =
+                            pending.iter().position(|entry| entry.host_id == host_id)
+                        {
+                            removal = Some(pending.remove(index));
+                        }
+                    });
+                    let message = payload.message.clone();
+                    let dirty = matches!(payload.code, protocol::CommandErrorCode::Conflict)
+                        && message.contains("worktree roots are dirty");
+                    if let Some(removal) = removal {
+                        if dirty && !removal.force {
+                            state.workbench_remove_prompt.set(Some(
+                                crate::state::WorkbenchRemovePrompt {
+                                    host_id: removal.host_id,
+                                    project_id: removal.project_id,
+                                    project_name: removal.project_name,
+                                    message,
+                                },
+                            ));
+                        } else {
+                            wasm_bindgen_futures::spawn_local(async move {
+                                crate::bridge::message_dialog(
+                                    "Workbench could not be removed",
+                                    &message,
+                                )
+                                .await;
+                            });
+                        }
+                    } else {
+                        wasm_bindgen_futures::spawn_local(async move {
+                            crate::bridge::message_dialog(
+                                "Workbench could not be removed",
+                                &message,
+                            )
+                            .await;
+                        });
+                    }
+                }
                 // A failed `ProjectReadFile` (e.g. the file was deleted on disk
                 // between a watcher-driven version bump and the refresh read)
                 // must release the in-flight refresh markers for this host.
@@ -3358,6 +3399,27 @@ fn apply_review_event(state: &AppState, review_id: &ReviewId, payload: ReviewEve
 /// view-memory entry. Forget runs **after** the active switch so
 /// `switch_active_project`'s outgoing-project snapshot can't reinsert it.
 pub(crate) fn handle_project_delete(state: &AppState, host_id: &str, project: &protocol::Project) {
+    let mut completed_remove = false;
+    state.pending_workbench_removes.update(|pending| {
+        pending.retain(|entry| {
+            let keep = entry.host_id != host_id || entry.project_id != project.id;
+            completed_remove |= !keep;
+            keep
+        });
+    });
+    if completed_remove {
+        state.command_errors_by_host.update(|errors| {
+            errors.remove(host_id);
+        });
+    }
+    state.workbench_remove_prompt.update(|prompt| {
+        if prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.host_id == host_id && prompt.project_id == project.id)
+        {
+            *prompt = None;
+        }
+    });
     state.projects.update(|projects| {
         projects.retain(|entry| !(entry.host_id == host_id && entry.project.id == project.id));
     });
@@ -7660,6 +7722,47 @@ mod wasm_tests {
                 .unwrap();
         });
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    #[wasm_bindgen_test]
+    fn dirty_workbench_error_opens_visible_removal_prompt() {
+        reset_inbound_state_for_host("host-a");
+        let state = AppState::new();
+        state.pending_workbench_removes.update(|pending| {
+            pending.push(crate::state::PendingWorkbenchRemove {
+                host_id: "host-a".to_owned(),
+                project_id: ProjectId("workbench-a".to_owned()),
+                project_name: "Dirty workbench".to_owned(),
+                force: false,
+            });
+        });
+        let message = "cannot remove workbench because worktree roots are dirty:\n/tmp/wb:\n?? implementation.md";
+        let envelope = Envelope::from_payload(
+            StreamPath("/host/local".to_owned()),
+            FrameKind::CommandError,
+            0,
+            &CommandErrorPayload {
+                stream: StreamPath("/host/local".to_owned()),
+                request_kind: FrameKind::WorkbenchRemove,
+                setting_target: None,
+                operation: "workbench_remove".to_owned(),
+                code: protocol::CommandErrorCode::Conflict,
+                message: message.to_owned(),
+                fatal: false,
+            },
+        )
+        .expect("command error envelope");
+
+        dispatch_envelope(&state, "host-a", envelope);
+
+        let prompt = state
+            .workbench_remove_prompt
+            .get_untracked()
+            .expect("dirty removal prompt");
+        assert_eq!(prompt.project_id.0, "workbench-a");
+        assert_eq!(prompt.project_name, "Dirty workbench");
+        assert!(prompt.message.contains("?? implementation.md"));
+        assert!(state.pending_workbench_removes.get_untracked().is_empty());
     }
 
     #[wasm_bindgen_test]
