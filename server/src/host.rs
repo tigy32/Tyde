@@ -168,8 +168,7 @@ pub(crate) struct HostSessionSummaryCountRequest {
     pub applied: oneshot::Sender<()>,
 }
 
-pub(crate) type HostSessionSummaryCountTx =
-    mpsc::UnboundedSender<HostSessionSummaryCountRequest>;
+pub(crate) type HostSessionSummaryCountTx = mpsc::UnboundedSender<HostSessionSummaryCountRequest>;
 type HostSessionSummaryCountRx = mpsc::UnboundedReceiver<HostSessionSummaryCountRequest>;
 
 pub(crate) enum HostCapacityUpdate {
