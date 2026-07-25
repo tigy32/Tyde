@@ -2047,14 +2047,17 @@ async fn fake_codex_provider_item_supersession_recovers_live_and_on_replay() {
     let replay_warning = replay.position(&CodexLifecycleEvent::Warning(
         CODEX_SUPERSESSION_WARNING_TEXT.to_owned(),
     ));
-    let replay_tool_before =
-        replay.position(&CodexLifecycleEvent::StreamEnd("tool-before-rollover".to_owned()));
+    let replay_tool_before = replay.position(&CodexLifecycleEvent::StreamEnd(
+        "tool-before-rollover".to_owned(),
+    ));
     let replay_a = replay.assistant_position("reason-a");
     let replay_b = replay.assistant_position("reason-b");
-    let replay_tool_after_request =
-        replay.position(&CodexLifecycleEvent::ToolRequest("tool-after-rollover".to_owned()));
-    let replay_tool_after =
-        replay.position(&CodexLifecycleEvent::StreamEnd("tool-after-rollover".to_owned()));
+    let replay_tool_after_request = replay.position(&CodexLifecycleEvent::ToolRequest(
+        "tool-after-rollover".to_owned(),
+    ));
+    let replay_tool_after = replay.position(&CodexLifecycleEvent::StreamEnd(
+        "tool-after-rollover".to_owned(),
+    ));
     let replay_final = replay.assistant_position("final-answer");
     assert!(
         replay_tool_before < replay_a && replay_a < replay_warning,
