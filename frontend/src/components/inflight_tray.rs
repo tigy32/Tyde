@@ -124,14 +124,25 @@ fn derive_child_status(state: &AppState, agent: &crate::state::AgentInfo) -> Chi
         state.agent_turn_active.with(|turn_active| {
             state.streaming_text.with(|streaming| {
                 state.transient_events.with(|transient| {
-                    derive_agent_state(agent, streaming, turn_active, compaction, transient)
+                    state.interrupt_pending.with(|interrupt_pending| {
+                        derive_agent_state(
+                            agent,
+                            streaming,
+                            turn_active,
+                            compaction,
+                            transient,
+                            interrupt_pending,
+                        )
+                    })
                 })
             })
         })
     });
     match derived {
         DerivedAgentState::Initializing => ChildAgentStatus::Starting,
-        DerivedAgentState::Thinking | DerivedAgentState::Compacting => ChildAgentStatus::Running,
+        DerivedAgentState::Thinking
+        | DerivedAgentState::Cancelling
+        | DerivedAgentState::Compacting => ChildAgentStatus::Running,
         // The tray tracks whether work is in flight, not how the last turn
         // ended; a cancelled child is idle for its purposes.
         DerivedAgentState::Idle | DerivedAgentState::Cancelled => ChildAgentStatus::Idle,

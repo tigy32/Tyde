@@ -43,8 +43,19 @@ pub(crate) fn clear_invalid_dependent_select_values(
 /// Suffix marking a value the session carries but the schema no longer offers.
 pub(crate) const UNAVAILABLE_OPTION_SUFFIX: &str = " (unavailable)";
 
-/// The `(value, label)` entries a select-like control should render, given the
-/// value the session actually carries.
+/// One entry of a select-like control.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ControlOption {
+    pub value: String,
+    pub label: String,
+    /// True for the synthetic entry standing in for a value the schema no
+    /// longer offers. Display-only: the control must render it as selected but
+    /// non-actionable, and no commit path may submit it as a user edit.
+    pub unavailable: bool,
+}
+
+/// The entries a select-like control should render, given the value the session
+/// actually carries.
 ///
 /// A value the schema does not offer is still the truth about this session, so
 /// it is appended as an explicitly-labelled entry instead of being dropped.
@@ -54,24 +65,30 @@ pub(crate) const UNAVAILABLE_OPTION_SUFFIX: &str = " (unavailable)";
 /// whose gateway probe failed leaves the schema, and the Profile control then
 /// claims the session is on `default` when it is not.
 ///
-/// The injected entry is only for display. It is never sent as a user edit
-/// unless the user actively selects it, which is a no-op re-selection of the
-/// value already in effect.
+/// The injected entry is display-only, and its `unavailable` flag is what the
+/// commit paths check to keep it that way. Offering it as a selectable value
+/// would invite the user to "set" a setting the backend has already said it
+/// cannot serve.
 pub(crate) fn options_including_current(
     options: &[SelectOption],
     current: &str,
-) -> Vec<(String, String)> {
-    let mut entries: Vec<(String, String)> = options
+) -> Vec<ControlOption> {
+    let mut entries: Vec<ControlOption> = options
         .iter()
-        .map(|option| (option.value.clone(), option.label.clone()))
+        .map(|option| ControlOption {
+            value: option.value.clone(),
+            label: option.label.clone(),
+            unavailable: false,
+        })
         .collect();
-    if current.is_empty() || entries.iter().any(|(value, _)| value == current) {
+    if current.is_empty() || entries.iter().any(|entry| entry.value == current) {
         return entries;
     }
-    entries.push((
-        current.to_owned(),
-        format!("{current}{UNAVAILABLE_OPTION_SUFFIX}"),
-    ));
+    entries.push(ControlOption {
+        value: current.to_owned(),
+        label: format!("{current}{UNAVAILABLE_OPTION_SUFFIX}"),
+        unavailable: true,
+    });
     entries
 }
 
@@ -149,18 +166,26 @@ pub fn SessionSettingsControls(
                                 let entries = Memo::new(move |_| {
                                     let mut v = Vec::new();
                                     if nullable {
-                                        v.push((String::new(), "Auto".to_string()));
+                                        v.push(ControlOption {
+                                            value: String::new(),
+                                            label: "Auto".to_string(),
+                                            unavailable: false,
+                                        });
                                     }
                                     let current = current_raw.get();
                                     v.extend(options_including_current(
                                         &available_options.get(),
                                         &current,
                                     ));
-                                    if !v.iter().any(|(value, _)| *value == current) {
+                                    if !v.iter().any(|entry| entry.value == current) {
                                         // Only reachable for an empty value on a
                                         // non-nullable field with no default:
                                         // genuinely unknown, and said so.
-                                        v.push((current, "Unknown".to_string()));
+                                        v.push(ControlOption {
+                                            value: current,
+                                            label: "Unknown".to_string(),
+                                            unavailable: true,
+                                        });
                                     }
                                     v
                                 });
@@ -170,7 +195,7 @@ pub fn SessionSettingsControls(
                                     entries
                                         .get()
                                         .iter()
-                                        .position(|(v, _)| v == &current_val)
+                                        .position(|entry| entry.value == current_val)
                                         .unwrap_or(0) as i64
                                 });
 
@@ -179,7 +204,7 @@ pub fn SessionSettingsControls(
                                     entries
                                         .get()
                                         .get(idx)
-                                        .map(|(_, label)| label.clone())
+                                        .map(|entry| entry.label.clone())
                                         .unwrap_or_default()
                                 };
 
@@ -190,15 +215,23 @@ pub fn SessionSettingsControls(
                                         let text = event_target_value(&ev);
                                         if let Ok(idx) = text.parse::<usize>() {
                                             let mut current = values.get_untracked();
-                                            if let Some((val, _)) = entries
+                                            if let Some(entry) = entries
                                                 .get_untracked()
                                                 .get(idx)
                                                 .cloned()
                                             {
-                                                if val.is_empty() {
+                                                // The unavailable stop exists so
+                                                // the slider can *show* the
+                                                // session's real value. Landing
+                                                // on it must not commit a value
+                                                // the backend already refused.
+                                                if entry.unavailable {
+                                                    return;
+                                                }
+                                                if entry.value.is_empty() {
                                                     current.0.insert(key.clone(), SessionSettingValue::Null);
                                                 } else {
-                                                    current.0.insert(key.clone(), SessionSettingValue::String(val));
+                                                    current.0.insert(key.clone(), SessionSettingValue::String(entry.value));
                                                 }
                                                 clear_invalid_dependent_select_values(
                                                     &all_fields,
@@ -253,6 +286,20 @@ pub fn SessionSettingsControls(
                                     let all_fields = all_fields.clone();
                                     move |ev: leptos::ev::Event| {
                                         let selected = event_target_value(&ev);
+                                        // The synthetic entry is rendered
+                                        // disabled, so a browser will not fire
+                                        // this for it — but the guard is what
+                                        // makes "display-only" a property of the
+                                        // commit path rather than of the markup.
+                                        let unavailable = options_including_current(
+                                            &available_options.get_untracked(),
+                                            &selected,
+                                        )
+                                        .into_iter()
+                                        .any(|entry| entry.value == selected && entry.unavailable);
+                                        if unavailable {
+                                            return;
+                                        }
                                         let mut current = values.get_untracked();
                                         if selected.is_empty() {
                                             current.0.insert(key.clone(), SessionSettingValue::Null);
@@ -306,9 +353,22 @@ pub fn SessionSettingsControls(
                                             &current_value.get(),
                                         )
                                             .into_iter()
-                                            .map(|(value, label)| {
+                                            .map(|entry| {
+                                                // Selected-but-disabled: the
+                                                // value is shown because it is
+                                                // in effect, and disabled
+                                                // because the backend cannot
+                                                // serve it.
+                                                let ControlOption {
+                                                    value,
+                                                    label,
+                                                    unavailable,
+                                                } = entry;
                                                 view! {
-                                                    <option value={value}>{label}</option>
+                                                    <option
+                                                        value={value}
+                                                        disabled=unavailable
+                                                    >{label}</option>
                                                 }
                                             })
                                             .collect_view()}
@@ -1028,23 +1088,30 @@ mod wasm_tests {
             2,
             "the session's own value must be added, not dropped: {entries:?}"
         );
-        assert_eq!(entries[1].0, "qatest", "the injected entry keeps the raw value");
+        assert_eq!(entries[1].value, "qatest", "the injected entry keeps the raw value");
         assert!(
-            entries[1].1.contains("qatest") && entries[1].1.contains("unavailable"),
+            entries[1].label.contains("qatest") && entries[1].label.contains("unavailable"),
             "the injected entry must name the value and mark it unavailable, got: {}",
-            entries[1].1
+            entries[1].label
+        );
+        assert!(
+            entries[1].unavailable,
+            "the injected entry must be flagged so commit paths can refuse it"
         );
         assert_eq!(
-            entries[0].0, "default",
+            entries[0].value, "default",
             "schema options are preserved ahead of the injected entry"
+        );
+        assert!(
+            !entries[0].unavailable,
+            "a real schema option is actionable"
         );
 
         // A value the schema does offer is untouched — no phantom duplicate.
-        assert_eq!(
-            options_including_current(&options, "default"),
-            vec![("default".to_owned(), "Default".to_owned())],
-            "a recognized value must not be duplicated or relabelled"
-        );
+        let known = options_including_current(&options, "default");
+        assert_eq!(known.len(), 1, "a recognized value must not be duplicated");
+        assert_eq!(known[0].label, "Default", "and must not be relabelled");
+        assert!(!known[0].unavailable);
         // Empty means "unset"; that is the nullable/Auto case, not an unknown.
         assert_eq!(
             options_including_current(&options, "").len(),
@@ -1113,6 +1180,258 @@ mod wasm_tests {
         assert!(
             select.selected_index() >= 0,
             "the control must resolve to a real option rather than an unmatched blank"
+        );
+    }
+
+    /// The synthetic entry is display-only. It must render disabled, and
+    /// selecting it must not reach `on_change` — otherwise the UI invites the
+    /// user to "set" a value the backend has already said it cannot serve.
+    #[wasm_bindgen_test]
+    async fn unavailable_option_is_rendered_disabled_and_is_not_committable() {
+        let container = make_container();
+        let schema = SessionSettingsSchema {
+            backend_kind: BackendKind::Hermes,
+            fields: vec![SessionSettingField {
+                key: "profile".to_owned(),
+                label: "Profile".to_owned(),
+                description: None,
+                use_slider: false,
+                select_options_by_setting: None,
+                field_type: SessionSettingFieldType::Select {
+                    options: vec![SelectOption {
+                        value: "default".to_owned(),
+                        label: "Default".to_owned(),
+                    }],
+                    default: Some("default".to_owned()),
+                    nullable: false,
+                },
+            }],
+        };
+        let mut values = SessionSettingsValues::default();
+        values.0.insert(
+            "profile".to_owned(),
+            SessionSettingValue::String("qatest".to_owned()),
+        );
+        let values = RwSignal::new(values);
+        let commits = RwSignal::new(0_usize);
+
+        let _handle = mount_to(container.clone(), move || {
+            view! {
+                <SessionSettingsControls
+                    schema=schema.clone()
+                    values=values.into()
+                    on_change=Callback::new(move |_| commits.update(|n| *n += 1))
+                />
+            }
+        });
+        next_tick().await;
+
+        let options = container.query_selector_all("option").unwrap();
+        let mut saw_disabled_unavailable = false;
+        for index in 0..options.length() {
+            let option: web_sys::HtmlOptionElement = options
+                .item(index)
+                .unwrap()
+                .dyn_into()
+                .expect("every child is an option");
+            let label = option.text();
+            if label.contains("qatest") {
+                assert!(
+                    option.disabled(),
+                    "the unavailable entry must not be selectable, got enabled: {label}"
+                );
+                saw_disabled_unavailable = true;
+            } else {
+                assert!(
+                    !option.disabled(),
+                    "real schema options stay actionable, got disabled: {label}"
+                );
+            }
+        }
+        assert!(
+            saw_disabled_unavailable,
+            "the session's unavailable value must still be present in the list"
+        );
+
+        // Even if a change event reaches the handler (a browser that ignores
+        // `disabled`, or a synthesized event), the commit path must refuse it.
+        let select: web_sys::HtmlSelectElement = query(&container, ".session-setting-select")
+            .expect("the profile select should render")
+            .dyn_into()
+            .unwrap();
+        select.set_value("qatest");
+        let event = web_sys::Event::new("change").unwrap();
+        select.dispatch_event(&event).unwrap();
+        next_tick().await;
+        assert_eq!(
+            commits.get_untracked(),
+            0,
+            "selecting an unavailable value must never be submitted as an edit"
+        );
+    }
+
+    /// The slider's unavailable stop exists so the control can *show* the
+    /// session's real value. Landing on it must not commit it.
+    #[wasm_bindgen_test]
+    async fn slider_does_not_commit_an_unavailable_value() {
+        let container = make_container();
+        let schema = SessionSettingsSchema {
+            backend_kind: BackendKind::Codex,
+            fields: vec![SessionSettingField {
+                key: "effort".to_owned(),
+                label: "Effort".to_owned(),
+                description: None,
+                use_slider: true,
+                select_options_by_setting: None,
+                field_type: SessionSettingFieldType::Select {
+                    options: vec![SelectOption {
+                        value: "low".to_owned(),
+                        label: "Low".to_owned(),
+                    }],
+                    default: Some("low".to_owned()),
+                    nullable: false,
+                },
+            }],
+        };
+        let mut values = SessionSettingsValues::default();
+        values.0.insert(
+            "effort".to_owned(),
+            SessionSettingValue::String("max".to_owned()),
+        );
+        let values = RwSignal::new(values);
+        let commits = RwSignal::new(0_usize);
+
+        let _handle = mount_to(container.clone(), move || {
+            view! {
+                <SessionSettingsControls
+                    schema=schema.clone()
+                    values=values.into()
+                    on_change=Callback::new(move |_| commits.update(|n| *n += 1))
+                />
+            }
+        });
+        next_tick().await;
+
+        let slider: web_sys::HtmlInputElement = query(&container, ".session-setting-slider")
+            .expect("the slider should render")
+            .dyn_into()
+            .unwrap();
+        // Index 1 is the injected `max (unavailable)` stop.
+        slider.set_value("1");
+        slider
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert_eq!(
+            commits.get_untracked(),
+            0,
+            "the unavailable stop is display-only and must not be committed"
+        );
+
+        // A real stop still commits, so the guard did not disable the control.
+        slider.set_value("0");
+        slider
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert_eq!(
+            commits.get_untracked(),
+            1,
+            "an available stop must still be committable"
+        );
+    }
+
+    /// F-04: the node-ref effect exists to reapply the value once a matching
+    /// option arrives *after* mount. This mounts a dependent select whose
+    /// options are unresolvable, then makes the parent value resolve, and
+    /// asserts the live control follows. A regression in effect scheduling or
+    /// node-ref timing leaves this red where a static-schema test stays green.
+    #[wasm_bindgen_test]
+    async fn select_adopts_an_option_that_arrives_after_mount() {
+        let container = make_container();
+        let schema = SessionSettingsSchema {
+            backend_kind: BackendKind::Hermes,
+            fields: vec![SessionSettingField {
+                key: "model".to_owned(),
+                label: "Model".to_owned(),
+                description: None,
+                use_slider: false,
+                select_options_by_setting: Some(SelectOptionsBySetting {
+                    setting_key: "profile".to_owned(),
+                    values: vec![SelectOptionsForValue {
+                        setting_value: "default".to_owned(),
+                        options: vec![SelectOption {
+                            value: "model-a".to_owned(),
+                            label: "Model A".to_owned(),
+                        }],
+                    }],
+                }),
+                field_type: SessionSettingFieldType::Select {
+                    options: vec![],
+                    default: None,
+                    nullable: true,
+                },
+            }],
+        };
+        // `profile=unknown` has no entry in `select_options_by_setting`, so
+        // `select_options` answers None and the model list is unresolvable.
+        let mut initial = SessionSettingsValues::default();
+        initial.0.insert(
+            "profile".to_owned(),
+            SessionSettingValue::String("unknown".to_owned()),
+        );
+        initial.0.insert(
+            "model".to_owned(),
+            SessionSettingValue::String("model-a".to_owned()),
+        );
+        let values = RwSignal::new(initial);
+
+        let _handle = mount_to(container.clone(), move || {
+            view! {
+                <SessionSettingsControls
+                    schema=schema.clone()
+                    values=values.into()
+                    on_change=Callback::new(|_| {})
+                />
+            }
+        });
+        next_tick().await;
+
+        let select: web_sys::HtmlSelectElement = query(&container, ".session-setting-select")
+            .expect("the model select should render")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            select.value(),
+            "model-a",
+            "before the options resolve, the effective value is still shown"
+        );
+
+        // The parent resolves; `model-a` now arrives as a real schema option.
+        values.update(|v| {
+            v.0.insert(
+                "profile".to_owned(),
+                SessionSettingValue::String("default".to_owned()),
+            );
+        });
+        next_tick().await;
+        next_tick().await;
+
+        assert_eq!(
+            select.value(),
+            "model-a",
+            "the late-arriving option must be adopted, not left unmatched"
+        );
+        let selected = select.selected_index();
+        assert!(selected >= 0, "the control must resolve to a real option");
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Model A"),
+            "the resolved option's real label must now be shown, got: {text}"
+        );
+        assert!(
+            !text.contains("model-a (unavailable)"),
+            "the synthetic entry must disappear once the real option exists, got: {text}"
         );
     }
 

@@ -4011,6 +4011,9 @@ fn apply_agent_closed(state: &AppState, host_id: &str, agent_id: AgentId) {
     state.transient_events.update(|map| {
         map.remove(&agent_id);
     });
+    state.interrupt_pending.update(|set| {
+        set.remove(&agent_id);
+    });
     state.task_lists.update(|map| {
         map.remove(&agent_id);
     });
@@ -4729,6 +4732,11 @@ pub fn apply_chat_event(state: &AppState, host_id: &str, agent_id: &AgentId, eve
                     map.remove(&agent_id);
                 }
             });
+            // Either transition settles a pending interrupt: the turn has moved
+            // on, so nothing is still waiting to be cancelled.
+            state.interrupt_pending.update(|set| {
+                set.remove(&agent_id);
+            });
             if !typing {
                 state.streaming_text.update(|map| {
                     map.remove(&agent_id);
@@ -5021,6 +5029,12 @@ pub fn apply_chat_event(state: &AppState, host_id: &str, agent_id: &AgentId, eve
             });
             state.agent_turn_active.update(|map| {
                 map.remove(&agent_id);
+            });
+            // The interrupt has been answered; the request is no longer in
+            // flight and the composer's Cancel control can re-arm for the next
+            // turn.
+            state.interrupt_pending.update(|set| {
+                set.remove(&agent_id);
             });
             // Close any in-flight orchestration: Tycode drops fan-outs and
             // workers without terminal events on cancel, so the panel would
@@ -5421,6 +5435,9 @@ fn apply_agent_bootstrap(
     });
     state.transient_events.update(|map| {
         map.remove(&agent_id);
+    });
+    state.interrupt_pending.update(|set| {
+        set.remove(&agent_id);
     });
     state.task_lists.update(|map| {
         map.remove(&agent_id);

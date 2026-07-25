@@ -429,15 +429,23 @@ fn submit_side_question(
 }
 
 fn interrupt_target_turn(state: &AppState, agent_ref: Signal<Option<ActiveAgentRef>>) {
-    let host_id = match agent_ref.get_untracked() {
-        Some(active_agent) => active_agent.host_id,
-        None => return,
+    let Some(active_agent) = agent_ref.get_untracked() else {
+        return;
     };
+    let host_id = active_agent.host_id;
 
     let instance_stream = match target_instance_stream(state, agent_ref) {
         Some(stream) => stream,
         None => return,
     };
+
+    // Record the request before it goes out. Cancelling is a phase the user has
+    // to be able to see; without this the control stays armed and a second
+    // click sends a second Interrupt frame for the same turn. The dispatcher
+    // clears this on the backend's terminal answer.
+    state.interrupt_pending.update(|pending| {
+        pending.insert(active_agent.agent_id);
+    });
 
     spawn_local(async move {
         if let Err(e) = send_frame(
@@ -736,6 +744,22 @@ pub fn ChatInput(
 
     let can_send = move || ui_mode.get().0 && !is_readonly.get();
     let can_interrupt = move || ui_mode.get().1 && !is_readonly.get();
+    // True between sending an interrupt and the backend answering it. A memo so
+    // the three places that gate on it (enablement, label, tooltip) share one
+    // subscription and one answer.
+    let interrupt_in_flight = {
+        let state = state.clone();
+        Memo::new(move |_| {
+            agent_ref
+                .get()
+                .map(|agent_ref| {
+                    state
+                        .interrupt_pending
+                        .with(|pending| pending.contains(&agent_ref.agent_id))
+                })
+                .unwrap_or(false)
+        })
+    };
     let is_steer = Memo::new(move |_| ui_mode.get().2);
 
     // The dropdown holds items only in specific states (see state matrix):
@@ -1173,15 +1197,27 @@ pub fn ChatInput(
                             let mode = ui_mode.get();
                             let is_steer_now = is_steer.get();
                             let readonly = is_readonly.get();
-                            // thinking+empty → Cancel, always enabled
-                            if mode.1 && !is_steer_now && !readonly { false } else { !can_send() }
+                            // thinking+empty → Cancel, enabled until the
+                            // interrupt is sent; disabled while it is unanswered
+                            // so the turn cannot be cancelled twice.
+                            if mode.1 && !is_steer_now && !readonly {
+                                interrupt_in_flight.get()
+                            } else {
+                                !can_send()
+                            }
                         }
                         on:click=on_click_primary
                         title=move || {
                             let mode = ui_mode.get();
                             let is_steer_now = is_steer.get();
                             let readonly = is_readonly.get();
-                            if mode.1 && !is_steer_now && !readonly { "Cancel current turn" }
+                            if mode.1 && !is_steer_now && !readonly {
+                                if interrupt_in_flight.get() {
+                                    "Cancelling — waiting for the backend to stop this turn"
+                                } else {
+                                    "Cancel current turn"
+                                }
+                            }
                             else if is_steer_now && !readonly { "Queue message (Enter)" }
                             else { "Send message (Enter)" }
                         }
@@ -1190,7 +1226,9 @@ pub fn ChatInput(
                             let mode = ui_mode.get();
                             let is_steer_now = is_steer.get();
                             let readonly = is_readonly.get();
-                            if mode.1 && !is_steer_now && !readonly { "Cancel" }
+                            if mode.1 && !is_steer_now && !readonly {
+                                if interrupt_in_flight.get() { "Cancelling\u{2026}" } else { "Cancel" }
+                            }
                             else if is_steer_now && !readonly { "Queue" }
                             else { "Send" }
                         }}</span>
@@ -1257,10 +1295,20 @@ pub fn ChatInput(
                                     class="chat-send-menu-item"
                                     role="menuitem"
                                     data-test="chat-send-menu-cancel"
-                                    title="Cancel the current turn"
+                                    // Same single-submit rule as the primary
+                                    // button: one interrupt per turn.
+                                    disabled=move || interrupt_in_flight.get()
+                                    title=move || if interrupt_in_flight.get() {
+                                        "Cancelling \u{2014} waiting for the backend to stop this turn"
+                                    } else {
+                                        "Cancel the current turn"
+                                    }
                                     on:click=on_menu_cancel
                                 >
-                                    <span class="chat-send-menu-label">"Cancel"</span>
+                                    <span class="chat-send-menu-label">{move || {
+                                        if interrupt_in_flight.get() { "Cancelling\u{2026}" }
+                                        else { "Cancel" }
+                                    }}</span>
                                 </button>
                             </Show>
                         </div>

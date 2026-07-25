@@ -148,6 +148,11 @@ pub(crate) fn relative_time(created_at_ms: u64) -> String {
 pub(crate) enum DerivedAgentState {
     Initializing,
     Thinking,
+    /// An interrupt has been sent and the backend has not yet answered it. A
+    /// real phase, not an instant: the request can be in flight for as long as
+    /// the backend takes to tear its turn down, and during that window the user
+    /// needs to see that their cancel was heard.
+    Cancelling,
     Idle,
     /// The last turn ended because the user cancelled it. Distinct from `Idle`:
     /// a cancelled turn is *not* a completed one, and rendering it with the
@@ -166,6 +171,7 @@ pub(crate) fn derive_agent_state(
     turn_active: &HashMap<AgentId, bool>,
     compaction: &HashMap<AgentId, CompactionOldInfo>,
     transient: &HashMap<AgentId, Vec<TransientEvent>>,
+    interrupt_pending: &HashSet<AgentId>,
 ) -> DerivedAgentState {
     if agent.fatal_error.is_some() {
         return DerivedAgentState::Terminated;
@@ -179,6 +185,11 @@ pub(crate) fn derive_agent_state(
     let typing = turn_active.get(&agent.agent_id).copied().unwrap_or(false);
     let streaming_open = streaming.contains_key(&agent.agent_id);
     if typing || streaming_open {
+        // Still running, but the user has asked it to stop. Reporting plain
+        // Thinking here hides that the interrupt was accepted at all.
+        if interrupt_pending.contains(&agent.agent_id) {
+            return DerivedAgentState::Cancelling;
+        }
         return DerivedAgentState::Thinking;
     }
     // Not running. Distinguish "finished" from "was stopped": the terminal
@@ -200,6 +211,7 @@ pub(crate) fn status_label(derived: &DerivedAgentState) -> &'static str {
     match derived {
         DerivedAgentState::Initializing => "Initializing",
         DerivedAgentState::Thinking => "Thinking",
+        DerivedAgentState::Cancelling => "Cancelling",
         DerivedAgentState::Compacting => "Compacting",
         DerivedAgentState::Idle => "Idle",
         DerivedAgentState::Cancelled => "Cancelled",
@@ -211,6 +223,7 @@ pub(crate) fn status_icon(derived: &DerivedAgentState) -> &'static str {
     match derived {
         DerivedAgentState::Initializing => "\u{25F7}", // ◷ clock (CSS animates)
         DerivedAgentState::Thinking => "\u{25F7}",     // ◷ clock (CSS animates)
+        DerivedAgentState::Cancelling => "\u{25F7}",   // ◷ clock (CSS animates)
         DerivedAgentState::Compacting => "\u{27F2}",   // ⟲ counter-clockwise gapped circle
         DerivedAgentState::Idle => "\u{2713}",         // ✓
         DerivedAgentState::Cancelled => "\u{2298}",    // ⊘ circled division slash
@@ -222,6 +235,7 @@ pub(crate) fn status_class(derived: &DerivedAgentState) -> &'static str {
     match derived {
         DerivedAgentState::Initializing => "agent-card-status running",
         DerivedAgentState::Thinking => "agent-card-status running",
+        DerivedAgentState::Cancelling => "agent-card-status running",
         DerivedAgentState::Compacting => "agent-card-status running",
         DerivedAgentState::Idle => "agent-card-status completed",
         DerivedAgentState::Cancelled => "agent-card-status cancelled",
@@ -1563,18 +1577,22 @@ fn agent_card(
         let turn_active = state.agent_turn_active;
         let compaction = state.compaction_in_progress;
         let transient = state.transient_events;
+        let interrupt_pending = state.interrupt_pending;
         move || {
             compaction.with(|compaction| {
                 turn_active.with(|turn_active| {
                     streaming.with(|streaming| {
                         transient.with(|transient| {
-                            derive_agent_state(
-                                &agent_for_derived,
-                                streaming,
-                                turn_active,
-                                compaction,
-                                transient,
-                            )
+                            interrupt_pending.with(|interrupt_pending| {
+                                derive_agent_state(
+                                    &agent_for_derived,
+                                    streaming,
+                                    turn_active,
+                                    compaction,
+                                    transient,
+                                    interrupt_pending,
+                                )
+                            })
                         })
                     })
                 })
@@ -1597,6 +1615,19 @@ fn agent_card(
     let status_label_sig = {
         let derived = derived.clone();
         move || status_label(&derived())
+    };
+    // Running and idle states are conventional enough to read from their glyph
+    // alone. A cancelled or cancelling turn is not: `⊘` is ambiguous, and
+    // "your work was stopped" is exactly the outcome a user must not have to
+    // hover or use a screen reader to discover.
+    let status_label_visible_sig = {
+        let derived = derived.clone();
+        move || {
+            matches!(
+                derived(),
+                DerivedAgentState::Cancelled | DerivedAgentState::Cancelling
+            )
+        }
     };
 
     // Compact (Compact/Rotate) action — gated on the agent being idle on a
@@ -1873,7 +1904,13 @@ fn agent_card(
             <div class="agent-card-bottom">
                 <span class=status_class_sig title=status_title_sig>
                     <span aria-hidden="true">{status_icon_sig}</span>
-                    <span class="visually-hidden">{status_label_sig}</span>
+                    <span class=move || {
+                        if status_label_visible_sig() {
+                            "agent-card-status-text"
+                        } else {
+                            "visually-hidden"
+                        }
+                    }>{status_label_sig}</span>
                 </span>
                 <span class="agent-card-time">{relative_time(created)}</span>
                 {move || custom_agent_name().map(|n| {
@@ -1964,8 +2001,14 @@ mod tests {
             }],
         );
 
-        let derived =
-            derive_agent_state(&agent, &streaming, &turn_active, &compaction, &transient);
+        let derived = derive_agent_state(
+            &agent,
+            &streaming,
+            &turn_active,
+            &compaction,
+            &transient,
+            &HashSet::new(),
+        );
 
         assert_eq!(
             derived,
@@ -2005,7 +2048,14 @@ mod tests {
         let mut turn_active = HashMap::new();
         turn_active.insert(agent.agent_id.clone(), true);
         assert_eq!(
-            derive_agent_state(&agent, &streaming, &turn_active, &compaction, &transient),
+            derive_agent_state(
+                &agent,
+                &streaming,
+                &turn_active,
+                &compaction,
+                &transient,
+                &HashSet::new(),
+            ),
             DerivedAgentState::Thinking,
             "a live turn outranks the previous turn's cancelled outcome"
         );
@@ -2017,10 +2067,63 @@ mod tests {
                 &streaming,
                 &turn_active,
                 &compaction,
-                &HashMap::new()
+                &HashMap::new(),
+                &HashSet::new(),
             ),
             DerivedAgentState::Idle,
             "an agent that was never cancelled still derives as Idle"
+        );
+    }
+
+    /// Cancelling is the window between sending the interrupt and the backend
+    /// answering it. Without it the card claims plain Thinking and the composer
+    /// keeps an armed Cancel button, so the user cannot tell their request was
+    /// accepted and clicking again sends another Interrupt frame.
+    #[test]
+    fn pending_interrupt_reports_cancelling_until_the_backend_answers() {
+        let agent = mk_agent("a", "h", None, None, true);
+        let (streaming, _) = no_runtime();
+        let compaction = HashMap::new();
+        let transient = HashMap::new();
+        let mut turn_active = HashMap::new();
+        turn_active.insert(agent.agent_id.clone(), true);
+        let mut pending = HashSet::new();
+        pending.insert(agent.agent_id.clone());
+
+        assert_eq!(
+            derive_agent_state(
+                &agent,
+                &streaming,
+                &turn_active,
+                &compaction,
+                &transient,
+                &pending,
+            ),
+            DerivedAgentState::Cancelling,
+            "a running turn with an unanswered interrupt is Cancelling, not Thinking"
+        );
+        assert_eq!(status_label(&DerivedAgentState::Cancelling), "Cancelling");
+
+        // Once the turn stops and the cancellation lands, the outcome takes over.
+        let (streaming, turn_active) = no_runtime();
+        let mut transient = HashMap::new();
+        transient.insert(
+            agent.agent_id.clone(),
+            vec![TransientEvent::OperationCancelled {
+                message: "Operation cancelled".to_owned(),
+            }],
+        );
+        assert_eq!(
+            derive_agent_state(
+                &agent,
+                &streaming,
+                &turn_active,
+                &compaction,
+                &transient,
+                &HashSet::new(),
+            ),
+            DerivedAgentState::Cancelled,
+            "the settled outcome replaces the in-flight phase"
         );
     }
 
@@ -2627,6 +2730,99 @@ mod wasm_tests {
             provide_context(state_for_mount.clone());
             view! { <AgentsPanel /> }
         })
+    }
+
+    /// F-06: the cancelled outcome must be reactively visible on the card, and
+    /// must reset when the next turn starts. Pure-function coverage of
+    /// `derive_agent_state` cannot see a card regressing to the completed
+    /// class/check, losing its text, or failing to clear.
+    #[wasm_bindgen_test]
+    async fn cancelled_card_shows_the_outcome_and_resets_on_the_next_turn() {
+        let container = make_container();
+        let state = make_app_state("local");
+        push_agent(&state, "local", "a1", "Cancel Me", true);
+        let agent_id = AgentId("a1".to_owned());
+
+        // A live turn.
+        state.agent_turn_active.update(|map| {
+            map.insert(agent_id.clone(), true);
+        });
+        let _handle = mount_panel(&container, state.clone());
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let card = agent_card_el(&container, "a1");
+        assert!(
+            !card.text_content().unwrap_or_default().contains("Cancelled"),
+            "a running turn is not cancelled"
+        );
+
+        // The user interrupts; the request is in flight but unanswered.
+        state.interrupt_pending.update(|pending| {
+            pending.insert(agent_id.clone());
+        });
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        let card = agent_card_el(&container, "a1");
+        assert!(
+            card.text_content().unwrap_or_default().contains("Cancelling"),
+            "the in-flight interrupt must be visible, got: {:?}",
+            card.text_content()
+        );
+
+        // The backend answers.
+        state.interrupt_pending.update(|pending| {
+            pending.remove(&agent_id);
+        });
+        state.agent_turn_active.update(|map| {
+            map.remove(&agent_id);
+        });
+        state.transient_events.update(|events| {
+            events.entry(agent_id.clone()).or_default().push(
+                crate::state::TransientEvent::OperationCancelled {
+                    message: "Operation cancelled".to_owned(),
+                },
+            );
+        });
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        let card = agent_card_el(&container, "a1");
+        let text = card.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Cancelled"),
+            "the cancelled outcome must be visible without hovering, got: {text:?}"
+        );
+        let status = card
+            .query_selector(".agent-card-status")
+            .unwrap()
+            .expect("the card renders a status element");
+        let class = status.get_attribute("class").unwrap_or_default();
+        assert!(
+            !class.contains("completed"),
+            "a cancelled turn must not reuse the completed style, got: {class}"
+        );
+        assert!(
+            !text.contains('\u{2713}'),
+            "a cancelled turn must not show the success check, got: {text:?}"
+        );
+
+        // The next turn clears the outcome.
+        state.transient_events.update(|events| {
+            events.remove(&agent_id);
+        });
+        state.agent_turn_active.update(|map| {
+            map.insert(agent_id.clone(), true);
+        });
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        let card = agent_card_el(&container, "a1");
+        assert!(
+            !card.text_content().unwrap_or_default().contains("Cancelled"),
+            "the cancelled outcome describes the last turn only and must reset"
+        );
     }
 
     fn text_position(text: &str, needle: &str) -> usize {

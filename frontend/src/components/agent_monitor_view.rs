@@ -168,7 +168,10 @@ pub(crate) fn agent_passes_tag_filter(tag_refs: &[AgentTagRef], filter: &[AgentT
 pub(crate) fn status_to_filter(status: DerivedAgentState) -> AgentStatusFilter {
     match status {
         DerivedAgentState::Initializing => AgentStatusFilter::Initializing,
-        DerivedAgentState::Thinking => AgentStatusFilter::Thinking,
+        // Cancelling is still a running turn for filter purposes.
+        DerivedAgentState::Thinking | DerivedAgentState::Cancelling => {
+            AgentStatusFilter::Thinking
+        }
         DerivedAgentState::Compacting => AgentStatusFilter::Compacting,
         // A cancelled agent is not running, so it belongs to the Idle filter
         // bucket — "Idle" here means "no work in flight", which is exactly what
@@ -294,6 +297,7 @@ fn monitor_status_rank(status: DerivedAgentState) -> u8 {
     match status {
         DerivedAgentState::Initializing
         | DerivedAgentState::Thinking
+        | DerivedAgentState::Cancelling
         | DerivedAgentState::Compacting => 0,
         DerivedAgentState::Idle | DerivedAgentState::Cancelled => 1,
         DerivedAgentState::Terminated => 2,
@@ -968,13 +972,16 @@ pub fn AgentMonitorView() -> impl IntoView {
                     let mut normal_rows: Vec<AgentMonitorRow> = Vec::new();
                     for agent in agents.iter() {
                         let status = rows_state.transient_events.with(|transient| {
-                            derive_agent_state(
-                                agent,
-                                streaming,
-                                turn_active,
-                                compaction,
-                                transient,
-                            )
+                            rows_state.interrupt_pending.with(|interrupt_pending| {
+                                derive_agent_state(
+                                    agent,
+                                    streaming,
+                                    turn_active,
+                                    compaction,
+                                    transient,
+                                    interrupt_pending,
+                                )
+                            })
                         });
                         if !agent_passes_view_filters(agent, status, &preferences.filters, &query) {
                             continue;

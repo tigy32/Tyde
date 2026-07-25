@@ -129,10 +129,17 @@ fn render_context_view(
                 >
                     {metrics.as_ref().map(|m| {
                         m.categories.iter().filter(|cat| cat.percent > 0.0).map(|cat| {
+                            // Each slice names itself. A bare coloured span
+                            // conveys nothing without sight, and the parent
+                            // progressbar only reports the overall percentage.
+                            let name = format!("{}: {:.0}% of context", cat.label, cat.percent);
                             view! {
                                 <span
                                     class=format!("summary-context-segment {}", cat.css_class)
                                     data-testid="context-segment"
+                                    role="img"
+                                    aria-label=name.clone()
+                                    title=name
                                     style=format!("width: {:.2}%", cat.percent)
                                 ></span>
                             }
@@ -352,7 +359,16 @@ fn render_context_legend(categories: &[ContextCategory]) -> impl IntoView {
         .collect::<Vec<_>>();
 
     view! {
-        <div class="summary-context-breakdown">
+        // Named for what it actually measures. These shares are a partition of
+        // the categories the backend reported, which is not necessarily the
+        // whole prompt — `ContextBreakdown` carries no same-unit total against
+        // which the remainder could be derived.
+        <div
+            class="summary-context-breakdown"
+            role="group"
+            aria-label="Share of the context categories this backend reported"
+            title="Share of the context categories this backend reported"
+        >
             {rows}
         </div>
     }
@@ -374,13 +390,6 @@ struct ContextMetrics {
     utilization_pct: f64,
 }
 
-/// Bytes-per-token estimate backends use when projecting category *token*
-/// counts into the `*_bytes` fields of [`ContextBreakdown`] (the Hermes mapper
-/// multiplies each category's tokens by this factor). It is used here only to
-/// put the category buckets and `input_tokens` on one scale so the two can be
-/// compared; it never alters a token figure shown to the user.
-const BYTES_PER_TOKEN: u64 = 4;
-
 fn compute_context_metrics(bd: &ContextBreakdown) -> ContextMetrics {
     let input_tokens = bd.input_tokens;
     let system_bytes = bd.system_prompt_bytes;
@@ -388,26 +397,19 @@ fn compute_context_metrics(bd: &ContextBreakdown) -> ContextMetrics {
     let history_bytes = bd.conversation_history_bytes;
     let reasoning_bytes = bd.reasoning_bytes;
     let context_bytes = bd.context_injection_bytes;
-    let accounted_bytes = system_bytes
+    // Sum of everything the backend attributed. The category fields are bytes
+    // and `input_tokens` is tokens: the protocol carries no same-unit total, so
+    // the two cannot be compared and a *partial* breakdown is indistinguishable
+    // from a complete one here. The segments below are therefore a partition of
+    // what the backend reported — nothing more is inferable without a
+    // same-unit remainder in `ContextBreakdown`.
+    let total_bytes = system_bytes
         .saturating_add(tool_bytes)
         .saturating_add(history_bytes)
         .saturating_add(reasoning_bytes)
         .saturating_add(context_bytes);
     let context_window = bd.context_window.max(1);
     let utilization_pct = ((input_tokens as f64 / context_window as f64) * 100.0).clamp(0.0, 100.0);
-
-    // The categories describe *part* of the prompt; `input_tokens` describes
-    // all of it. Normalizing the categories against their own sum would let a
-    // single recognized category claim the entire bar even when it explains a
-    // sliver of real occupancy — which is exactly what a backend whose other
-    // category ids we don't recognize produces. Normalize against the input
-    // instead, and give whatever is left over its own visible segment rather
-    // than silently inflating the categories we did recognize.
-    let input_bytes = input_tokens.saturating_mul(BYTES_PER_TOKEN);
-    let unaccounted_bytes = input_bytes.saturating_sub(accounted_bytes);
-    // Buckets may overshoot the input (they are estimates); denominating by
-    // the larger of the two keeps every share in range without clamping.
-    let total_bytes = accounted_bytes.max(input_bytes);
 
     let mut categories = vec![
         ContextCategory {
@@ -440,18 +442,12 @@ fn compute_context_metrics(bd: &ContextBreakdown) -> ContextMetrics {
             dot_class: "dot-context",
             percent: 0.0,
         },
-        ContextCategory {
-            label: "Unaccounted",
-            css_class: "segment-unaccounted",
-            dot_class: "dot-unaccounted",
-            percent: 0.0,
-        },
     ];
 
-    // `total_bytes == 0` means the prompt is empty *and* no category reported
-    // anything — there is genuinely nothing to attribute. Previously this case
-    // assigned the whole bar to "Context", which invented an attribution the
-    // data never supported.
+    // No category reported anything. Previously this assigned the whole bar to
+    // "Context", inventing an attribution the payload never carried; now it
+    // simply leaves every segment at zero, and `has_detailed_breakdown` keeps
+    // the legend suppressed so nothing claims to explain the occupancy.
     if total_bytes > 0 {
         let share = |bytes: u64| bytes as f64 / total_bytes as f64 * utilization_pct;
         categories[0].percent = share(system_bytes);
@@ -459,7 +455,6 @@ fn compute_context_metrics(bd: &ContextBreakdown) -> ContextMetrics {
         categories[2].percent = share(history_bytes);
         categories[3].percent = share(reasoning_bytes);
         categories[4].percent = share(context_bytes);
-        categories[5].percent = share(unaccounted_bytes);
     }
 
     ContextMetrics {
@@ -487,29 +482,31 @@ fn format_token_count(tokens: u64) -> String {
     }
 }
 
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod native_tests {
     use super::*;
 
-    /// `ContextBreakdown` with the category buckets given in *tokens*, using
-    /// the same tokens→bytes projection the backends apply.
+    /// Category fields are **bytes**; `input_tokens` is **tokens**. The two are
+    /// deliberately never compared — the protocol carries no same-unit total,
+    /// so any remainder derived from them would be fabricated.
     fn breakdown(
-        system: u64,
-        tools: u64,
-        history: u64,
-        reasoning: u64,
-        context: u64,
+        system_bytes: u64,
+        tool_bytes: u64,
+        history_bytes: u64,
+        reasoning_bytes: u64,
+        context_bytes: u64,
         input_tokens: u64,
-        window: u64,
+        context_window: u64,
     ) -> ContextBreakdown {
         ContextBreakdown {
-            system_prompt_bytes: system * BYTES_PER_TOKEN,
-            tool_io_bytes: tools * BYTES_PER_TOKEN,
-            conversation_history_bytes: history * BYTES_PER_TOKEN,
-            reasoning_bytes: reasoning * BYTES_PER_TOKEN,
-            context_injection_bytes: context * BYTES_PER_TOKEN,
+            system_prompt_bytes: system_bytes,
+            tool_io_bytes: tool_bytes,
+            conversation_history_bytes: history_bytes,
+            reasoning_bytes,
+            context_injection_bytes: context_bytes,
             input_tokens,
-            context_window: window,
+            context_window,
         }
     }
 
@@ -522,61 +519,45 @@ mod native_tests {
             .percent
     }
 
-    /// The reported H6 shape: the backend recognized only the Tools category
-    /// while the prompt is far larger. Normalizing the categories against their
-    /// own sum made Tools claim the entire bar, presenting a sliver of real
-    /// attribution as a complete picture.
+    /// Guards against re-deriving an "unaccounted" remainder by comparing the
+    /// byte-denominated categories with the token-denominated input. The mock
+    /// backend's 250K payload (`server/src/backend/mock.rs`) is the concrete
+    /// counter-example: its categories total 250,000 bytes against 250,000
+    /// input tokens, so any bytes-per-token factor invents a shortfall and
+    /// steals bar width from the categories the backend actually reported.
     #[test]
-    fn unrecognized_categories_surface_as_unaccounted_not_as_tools() {
-        // 8.1K-token prompt of which only 1K is attributed to tools.
-        let metrics = compute_context_metrics(&breakdown(0, 1_000, 0, 0, 0, 8_100, 1_048_000));
+    fn categories_partition_the_bar_without_inferring_a_remainder() {
+        // Exactly the mock's 250K fixture.
+        let metrics = compute_context_metrics(&breakdown(
+            100_000, 40_000, 60_000, 20_000, 30_000, 250_000, 300_000,
+        ));
 
-        let tools = percent(&metrics, "Tools");
-        let unaccounted = percent(&metrics, "Unaccounted");
-        assert!(
-            tools < metrics.utilization_pct * 0.5,
-            "Tools explains ~1K of an 8.1K prompt and must not dominate the bar: \
-             tools={tools}, utilization={}",
-            metrics.utilization_pct
-        );
-        assert!(
-            unaccounted > tools,
-            "the unattributed majority must be the larger segment: \
-             tools={tools}, unaccounted={unaccounted}"
-        );
         let total: f64 = metrics.categories.iter().map(|c| c.percent).sum();
         assert!(
             (total - metrics.utilization_pct).abs() < 0.001,
-            "segments must still account for exactly the utilization: \
-             total={total}, utilization={}",
+            "reported categories must partition exactly the utilization, with no \
+             invented remainder: total={total}, utilization={}",
             metrics.utilization_pct
         );
-    }
-
-    /// When the categories do explain the whole prompt there is nothing left
-    /// over, and the bar is unchanged from its previous behavior.
-    #[test]
-    fn fully_attributed_breakdown_leaves_nothing_unaccounted() {
-        let metrics =
-            compute_context_metrics(&breakdown(100, 200, 500, 0, 200, 1_000, 10_000));
-
-        assert_eq!(
-            percent(&metrics, "Unaccounted"),
-            0.0,
-            "a breakdown that sums to the input must show no unaccounted segment"
+        // 100_000 of 250_000 reported bytes is 40% of the occupied bar.
+        assert!(
+            (percent(&metrics, "System") - metrics.utilization_pct * 0.4).abs() < 0.001,
+            "a category's share must be its share of the reported bytes"
         );
         assert!(
-            (percent(&metrics, "History") - metrics.utilization_pct * 0.5).abs() < 0.001,
-            "history is half the prompt and must render as half the bar"
+            metrics.categories.iter().all(|c| c.label != "Unaccounted"),
+            "no remainder category may exist: the protocol has no same-unit total \
+             from which one could be derived"
         );
-        assert_eq!(metrics.total_used, 1_000);
     }
 
-    /// No category matched at all. The previous code assigned the whole bar to
-    /// "Context", inventing an attribution the payload never supported.
+    /// No category reported anything. The bar still shows real occupancy, but
+    /// nothing may claim to explain it — this previously attributed the whole
+    /// bar to "Context".
     #[test]
     fn empty_breakdown_attributes_nothing_to_a_real_category() {
-        let metrics = compute_context_metrics(&breakdown(0, 0, 0, 0, 0, 5_000, 10_000));
+        let bd = breakdown(0, 0, 0, 0, 0, 5_000, 10_000);
+        let metrics = compute_context_metrics(&bd);
 
         assert_eq!(
             percent(&metrics, "Context"),
@@ -584,30 +565,232 @@ mod native_tests {
             "an empty breakdown must not be reported as context injection"
         );
         assert!(
-            (percent(&metrics, "Unaccounted") - metrics.utilization_pct).abs() < 0.001,
-            "with no categories reported, all known occupancy is unaccounted"
+            metrics.categories.iter().all(|c| c.percent == 0.0),
+            "no segment may be drawn when nothing was attributed"
         );
         assert!(
-            !has_detailed_breakdown(&breakdown(0, 0, 0, 0, 0, 5_000, 10_000)),
+            (metrics.utilization_pct - 50.0).abs() < 0.001,
+            "real occupancy is still reported: 5K of a 10K window"
+        );
+        assert!(
+            !has_detailed_breakdown(&bd),
             "an empty breakdown is not a detailed one, so no legend is claimed"
         );
     }
 
-    /// Category estimates can overshoot the measured input. Shares must stay
-    /// within the bar rather than exceeding it or going negative.
+    /// A single reported category still fills the bar. That is a faithful
+    /// rendering of a partial backend payload, not a frontend defect: without a
+    /// same-unit total the frontend cannot distinguish "tools are the whole
+    /// prompt" from "tools are all we recognized". Pinned so the distinction
+    /// stays a documented backend dependency rather than being re-guessed here.
     #[test]
-    fn buckets_exceeding_input_stay_within_the_bar() {
-        let metrics = compute_context_metrics(&breakdown(0, 4_000, 0, 0, 0, 1_000, 10_000));
+    fn a_single_reported_category_is_rendered_as_reported() {
+        let bd = breakdown(0, 4_000, 0, 0, 0, 8_100, 1_048_000);
+        let metrics = compute_context_metrics(&bd);
 
-        assert_eq!(
-            percent(&metrics, "Unaccounted"),
-            0.0,
-            "there is no shortfall when the buckets already exceed the input"
+        assert!(
+            (percent(&metrics, "Tools") - metrics.utilization_pct).abs() < 0.001,
+            "the only reported category accounts for the whole reported total"
+        );
+        assert!(
+            has_detailed_breakdown(&bd),
+            "one reported category is still a breakdown, and the legend names it"
+        );
+    }
+
+    /// Utilization is clamped, so a prompt exceeding its window cannot paint
+    /// segments past the end of the bar.
+    #[test]
+    fn overfull_context_stays_within_the_bar() {
+        let metrics = compute_context_metrics(&breakdown(50, 50, 0, 0, 0, 20_000, 10_000));
+
+        assert!(
+            (metrics.utilization_pct - 100.0).abs() < 0.001,
+            "utilization clamps at 100%"
         );
         let total: f64 = metrics.categories.iter().map(|c| c.percent).sum();
         assert!(
-            total <= metrics.utilization_pct + 0.001,
-            "segments must never exceed the utilization they sit inside: total={total}"
+            total <= 100.0 + 0.001,
+            "segments must never exceed the bar they sit inside: total={total}"
+        );
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use leptos::mount::mount_to;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::*;
+    use web_sys::HtmlElement;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    fn make_container() -> HtmlElement {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document.create_element("div").unwrap();
+        container
+            .set_attribute(
+                "style",
+                "position: absolute; top: 0; left: 0; width: 600px; height: 400px;",
+            )
+            .unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        container.dyn_into::<HtmlElement>().unwrap()
+    }
+
+    async fn next_tick() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
+                .unwrap();
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    fn mount_context(container: &HtmlElement, breakdown: ContextBreakdown) -> impl Sized {
+        mount_to(container.clone(), move || {
+            view! {
+                <TaskListView task_list=None context_breakdown=Some(breakdown.clone()) />
+            }
+        })
+    }
+
+    fn segments(container: &HtmlElement) -> Vec<web_sys::Element> {
+        let list = container
+            .query_selector_all("[data-testid='context-segment']")
+            .unwrap();
+        (0..list.length())
+            .filter_map(|i| list.item(i))
+            .map(|node| node.dyn_into::<web_sys::Element>().unwrap())
+            .collect()
+    }
+
+    /// The panel names its own scope. It measures the latest request, while the
+    /// session footer measures the whole task; two unlabelled token figures of
+    /// different scope read as an arithmetic error rather than as two different
+    /// measurements.
+    #[wasm_bindgen_test]
+    async fn context_panel_names_its_scope() {
+        let container = make_container();
+        let _handle = mount_context(
+            &container,
+            ContextBreakdown {
+                system_prompt_bytes: 100,
+                tool_io_bytes: 100,
+                conversation_history_bytes: 0,
+                reasoning_bytes: 0,
+                context_injection_bytes: 0,
+                input_tokens: 5_000,
+                context_window: 10_000,
+            },
+        );
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Current context"),
+            "the panel must say which scope it measures, got: {text}"
+        );
+    }
+
+    /// Every drawn slice carries its own accessible name. A bare coloured span
+    /// conveys nothing without sight, and the parent progressbar reports only
+    /// the overall percentage.
+    #[wasm_bindgen_test]
+    async fn every_context_segment_is_individually_named() {
+        let container = make_container();
+        let _handle = mount_context(
+            &container,
+            ContextBreakdown {
+                system_prompt_bytes: 100,
+                tool_io_bytes: 300,
+                conversation_history_bytes: 0,
+                reasoning_bytes: 0,
+                context_injection_bytes: 0,
+                input_tokens: 5_000,
+                context_window: 10_000,
+            },
+        );
+        next_tick().await;
+
+        let drawn = segments(&container);
+        assert_eq!(drawn.len(), 2, "two reported categories draw two segments");
+        for segment in &drawn {
+            let name = segment.get_attribute("aria-label").unwrap_or_default();
+            assert!(
+                !name.is_empty(),
+                "each segment must expose an accessible name"
+            );
+            assert!(
+                name.contains('%'),
+                "a segment's name must state its share, got: {name}"
+            );
+        }
+        let names: Vec<String> = drawn
+            .iter()
+            .map(|s| s.get_attribute("aria-label").unwrap_or_default())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.starts_with("System"))
+                && names.iter().any(|n| n.starts_with("Tools")),
+            "segments must name their category, got: {names:?}"
+        );
+
+        // The legend says what its percentages are a share *of*.
+        let legend = container
+            .query_selector(".summary-context-breakdown")
+            .unwrap()
+            .expect("a reported breakdown renders a legend");
+        assert!(
+            legend
+                .get_attribute("aria-label")
+                .unwrap_or_default()
+                .contains("reported"),
+            "the legend must scope its shares to what the backend reported"
+        );
+    }
+
+    /// A breakdown with no reported categories draws no segments and claims no
+    /// legend, rather than attributing the occupancy to an arbitrary category.
+    #[wasm_bindgen_test]
+    async fn unattributed_context_draws_no_segment_and_no_legend() {
+        let container = make_container();
+        let _handle = mount_context(
+            &container,
+            ContextBreakdown {
+                system_prompt_bytes: 0,
+                tool_io_bytes: 0,
+                conversation_history_bytes: 0,
+                reasoning_bytes: 0,
+                context_injection_bytes: 0,
+                input_tokens: 5_000,
+                context_window: 10_000,
+            },
+        );
+        next_tick().await;
+
+        assert!(
+            segments(&container).is_empty(),
+            "nothing was attributed, so no slice may be drawn"
+        );
+        assert!(
+            container
+                .query_selector(".summary-context-breakdown")
+                .unwrap()
+                .is_none(),
+            "no legend may claim to explain an unattributed prompt"
+        );
+        // The occupancy itself is still reported.
+        let bar = container
+            .query_selector("[data-testid='context-bar']")
+            .unwrap()
+            .expect("the utilization bar still renders");
+        assert_eq!(
+            bar.get_attribute("aria-valuenow").as_deref(),
+            Some("50"),
+            "real occupancy is still exposed even with no attribution"
         );
     }
 }

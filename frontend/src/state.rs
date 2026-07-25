@@ -2495,6 +2495,13 @@ pub struct AppState {
     pub terminals: RwSignal<Vec<TerminalInfo>>,
     pub active_terminal: RwSignal<Option<ActiveTerminalRef>>,
     pub transient_events: RwSignal<HashMap<AgentId, Vec<TransientEvent>>>,
+    /// Agents whose interrupt has been sent but not yet acknowledged by a
+    /// terminal event. Cancelling is a real phase of the turn lifecycle, not an
+    /// instant: without it the Cancel control stays armed while the request is
+    /// in flight, so repeated clicks send repeated Interrupt frames and the user
+    /// gets no sign the first one was heard. Cleared by `OperationCancelled`, by
+    /// any typing transition, and by agent teardown.
+    pub interrupt_pending: RwSignal<HashSet<AgentId>>,
     pub browse_dialog: RwSignal<Option<BrowseDialogState>>,
     /// Per-project snapshots of center-zone state. Updated whenever the user
     /// switches away from a project; consulted on switch-in to restore.
@@ -2919,6 +2926,7 @@ impl AppState {
             terminals: RwSignal::new(Vec::new()),
             active_terminal: RwSignal::new(None),
             transient_events: RwSignal::new(HashMap::new()),
+            interrupt_pending: RwSignal::new(HashSet::new()),
             browse_dialog: RwSignal::new(None),
             project_view_memory: RwSignal::new(HashMap::new()),
             command_palette_open: RwSignal::new(false),
@@ -3285,6 +3293,9 @@ impl AppState {
         });
         self.transient_events.update(|map| {
             map.remove(agent_id);
+        });
+        self.interrupt_pending.update(|set| {
+            set.remove(agent_id);
         });
         self.task_lists.update(|map| {
             map.remove(agent_id);
@@ -4107,6 +4118,9 @@ impl AppState {
             });
             self.transient_events.update(|map| {
                 map.retain(|id, _| !drop_set.contains(id));
+            });
+            self.interrupt_pending.update(|set| {
+                set.retain(|id| !drop_set.contains(id));
             });
             self.agent_message_queue.update(|map| {
                 map.retain(|id, _| !drop_set.contains(id));

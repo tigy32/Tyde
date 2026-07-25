@@ -4651,13 +4651,6 @@ kbd {
     background: #bf69ff;
 }
 
-/* Prompt tokens no reported category accounts for. Deliberately muted and
-   neutral: it marks absence of attribution, not a category of its own. */
-.summary-context-segment.segment-unaccounted {
-    background: var(--text-tertiary);
-    opacity: 0.4;
-}
-
 /* Context breakdown legend */
 .summary-context-meta {
     display: flex;
@@ -4723,11 +4716,6 @@ kbd {
 
 .context-breakdown-dot.dot-context {
     background: #bf69ff;
-}
-
-.context-breakdown-dot.dot-unaccounted {
-    background: var(--text-tertiary);
-    opacity: 0.4;
 }
 
 /* Task hint link — switches to task view */
@@ -5802,6 +5790,12 @@ kbd {
    deliberately. Neutral, so it never reads as a completed result. */
 .agent-card-status.cancelled {
     color: var(--text-tertiary);
+}
+
+/* Spelled-out status, shown for outcomes whose glyph alone is ambiguous. */
+.agent-card-status-text {
+    margin-left: 4px;
+    font-size: 0.769rem;
 }
 
 .agent-card-status.error {
