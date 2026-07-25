@@ -276,13 +276,12 @@ pub fn prepare_disposable_hermes_environment(
             &runtime.skipped_executable_launchers,
             "Hermes",
         )?;
-    let (python, python_launcher_chain, skipped_python_launchers) =
-        validate_runtime_evidence(
-            runtime.python.as_deref(),
-            &runtime.python_launcher_chain,
-            &runtime.skipped_python_launchers,
-            "HERMES_PYTHON",
-        )?;
+    let (python, python_launcher_chain, skipped_python_launchers) = validate_runtime_evidence(
+        runtime.python.as_deref(),
+        &runtime.python_launcher_chain,
+        &runtime.skipped_python_launchers,
+        "HERMES_PYTHON",
+    )?;
     let runtime = ResolvedHermesRuntime {
         executable,
         executable_launcher_chain,
@@ -486,7 +485,9 @@ fn validate_profile_names(profiles: &[String]) -> Result<(), String> {
     let mut unique = HashSet::new();
     for profile in profiles {
         if !is_valid_disposable_hermes_profile_name(profile) {
-            return Err(format!("invalid disposable Hermes profile name '{profile}'"));
+            return Err(format!(
+                "invalid disposable Hermes profile name '{profile}'"
+            ));
         }
         if !unique.insert(profile) {
             return Err(format!(
@@ -501,14 +502,11 @@ fn validate_profile_names(profiles: &[String]) -> Result<(), String> {
 pub fn is_valid_disposable_hermes_profile_name(profile: &str) -> bool {
     profile != "default"
         && (1..=64).contains(&profile.len())
-        && profile
-            .bytes()
-            .enumerate()
-            .all(|(index, byte)| match byte {
-                b'a'..=b'z' | b'0'..=b'9' => true,
-                b'_' | b'-' => index > 0,
-                _ => false,
-            })
+        && profile.bytes().enumerate().all(|(index, byte)| match byte {
+            b'a'..=b'z' | b'0'..=b'9' => true,
+            b'_' | b'-' => index > 0,
+            _ => false,
+        })
 }
 
 #[cfg(feature = "launcher")]
@@ -542,10 +540,7 @@ fn validate_loopback_stub(stub: &HermesLoopbackStub) -> Result<(Url, String), St
 }
 
 #[cfg(feature = "launcher")]
-fn write_disposable_hermes_config(
-    home: &Path,
-    stub: &(Url, String),
-) -> Result<(), String> {
+fn write_disposable_hermes_config(home: &Path, stub: &(Url, String)) -> Result<(), String> {
     let model = serde_json::to_string(&stub.1)
         .map_err(|error| format!("failed to quote disposable Hermes model: {error}"))?;
     let base_url = serde_json::to_string(stub.0.as_str())
@@ -587,11 +582,7 @@ pub fn resolve_parent_hermes_runtime(
         .transpose()?;
 
     let executable_candidate = match explicit_executable {
-        Some(program) => Some(resolve_program(
-            program,
-            search_path,
-            "HERMES_EXECUTABLE",
-        )?),
+        Some(program) => Some(resolve_program(program, search_path, "HERMES_EXECUTABLE")?),
         None => parent_home
             .map(PathBuf::from)
             .map(|home| home.join(".local").join("bin").join("hermes"))
@@ -729,9 +720,7 @@ fn resolve_home_dependent_launcher_at_depth(
     depth: usize,
 ) -> Result<ResolvedLauncher, String> {
     if depth > 6 {
-        return Err(format!(
-            "{source} launcher indirection exceeded six levels"
-        ));
+        return Err(format!("{source} launcher indirection exceeded six levels"));
     }
     let executable = checked_executable_path(path, source)?;
     let Ok(contents) = fs::read_to_string(&executable) else {
@@ -1218,13 +1207,11 @@ mod tests {
             Value::String("loopback_stub_only".to_owned())
         );
         assert_eq!(
-            attestation["home"],
-            attestation["resolvedHome"],
+            attestation["home"], attestation["resolvedHome"],
             "attested HOME must equal the exported canonical path"
         );
         assert_eq!(
-            attestation["hermesHome"],
-            attestation["resolvedHermesHome"],
+            attestation["hermesHome"], attestation["resolvedHermesHome"],
             "attested HERMES_HOME must equal the exported canonical path"
         );
         assert_eq!(
