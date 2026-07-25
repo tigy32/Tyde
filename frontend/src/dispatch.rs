@@ -5563,7 +5563,7 @@ fn request_first_session_page(state: &AppState, host_id: &str) {
     };
     let host_id = host_id.to_owned();
     let refresh_flag = state.session_list_refresh_in_flight;
-    spawn_local(async move {
+    wasm_bindgen_futures::spawn_local(async move {
         // The gate is released by the arriving first page, not here: a socket
         // write completes long before the response, and clearing it now would
         // let a burst of updates open overlapping refresh generations. It is
@@ -6037,11 +6037,154 @@ fn apply_terminal_bootstrap(
     });
 }
 
+/// Shared fixtures for the restore/bootstrap tests.
+///
+/// Module scope rather than inside `mod tests`: the same fixtures are used by
+/// the wasm lifecycle tests, and `use super::*` in `mod wasm_tests` reaches
+/// this module, not its sibling test module.
+#[cfg(test)]
+mod restore_fixtures {
+    use super::*;
+    use protocol::BackendKind;
+
+    pub(crate) fn empty_host_bootstrap_envelope(stream: &str, seq: u64) -> Envelope {
+        Envelope::from_payload(
+            StreamPath(stream.to_owned()),
+            FrameKind::HostBootstrap,
+            seq,
+            &HostBootstrapPayload {
+                settings: protocol::HostSettings {
+                    enabled_backends: Vec::new(),
+                    default_backend: None,
+                    enable_mobile_connections: false,
+                    mobile_broker_url: None,
+                    tyde_debug_mcp_enabled: false,
+                    tyde_agent_control_mcp_enabled: true,
+                    complexity_tiers_enabled: false,
+                    backend_tier_configs: std::collections::HashMap::new(),
+                    background_agent_features: Default::default(),
+                    supervisor: Default::default(),
+                    code_intel: Default::default(),
+                    backend_config: std::collections::HashMap::new(),
+                    launch_profiles: Vec::new(),
+                },
+                mobile_access: MobileAccessStatePayload {
+                    broker_status: protocol::MobileBrokerStatus::Disabled,
+                    pairing: MobilePairingState::Idle,
+                    paired_devices: Vec::new(),
+                },
+                backend_setup: BackendSetupPayload {
+                    backends: Vec::new(),
+                },
+                session_schemas: Vec::new(),
+                backend_config_schemas: Vec::new(),
+                backend_config_snapshots: Vec::new(),
+                launch_profile_catalog: Default::default(),
+                sessions: Vec::new(),
+                session_list: Default::default(),
+                projects: Vec::new(),
+                mcp_servers: Vec::new(),
+                skills: Vec::new(),
+                steering: Vec::new(),
+                custom_agents: Vec::new(),
+                team_preset_catalog: protocol::TeamPresetCatalog {
+                    role_presets: Vec::new(),
+                    personality_traits: Vec::new(),
+                    personality_presets: Vec::new(),
+                    team_templates: Vec::new(),
+                },
+                team_drafts: Vec::new(),
+                teams: Vec::new(),
+                team_members: Vec::new(),
+                team_member_bindings: Vec::new(),
+                agents: Vec::new(),
+                task_token_usages: Vec::new(),
+                workflow_summaries: Vec::new(),
+                workflow_diagnostics: Vec::new(),
+                workflow_runs: Vec::new(),
+                workflow_locations: Vec::new(),
+                agents_view_preferences: None,
+            },
+        )
+        .expect("synthetic HostBootstrap")
+    }
+
+    /// A HostBootstrap payload with the pieces the restore path actually reads.
+    /// Built from the empty fixture so it stays in step with protocol growth.
+    pub(crate) fn restore_bootstrap(
+        enabled_backends: Vec<BackendKind>,
+        catalog: protocol::LaunchProfileCatalog,
+        projects: Vec<protocol::Project>,
+        agents: Vec<NewAgentPayload>,
+    ) -> HostBootstrapPayload {
+        let mut payload = empty_host_bootstrap_envelope("/host", 0)
+            .parse_payload::<HostBootstrapPayload>()
+            .expect("fixture parses");
+        payload.settings.enabled_backends = enabled_backends;
+        payload.launch_profile_catalog = catalog;
+        payload.projects = projects;
+        payload.agents = agents;
+        payload
+    }
+
+    pub(crate) fn restore_project(id: &str) -> protocol::Project {
+        protocol::Project {
+            id: ProjectId(id.to_owned()),
+            name: id.to_owned(),
+            sort_order: 0,
+            source: protocol::ProjectSource::Standalone {
+                roots: vec![ProjectRootPath(format!("/{id}"))],
+            },
+        }
+    }
+
+    pub(crate) fn restore_agent_payload(agent: &str, project: Option<&str>) -> NewAgentPayload {
+        restore_agent_payload_with_session(agent, project, None)
+    }
+
+    pub(crate) fn restore_agent_payload_with_session(
+        agent: &str,
+        project: Option<&str>,
+        session: Option<&str>,
+    ) -> NewAgentPayload {
+        NewAgentPayload {
+            agent_id: AgentId(agent.to_owned()),
+            name: format!("Agent {agent}"),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Hermes,
+            launch_profile_id: None,
+            workspace_roots: Vec::new(),
+            custom_agent_id: None,
+            team_id: None,
+            team_member_id: None,
+            project_id: project.map(|p| ProjectId(p.to_owned())),
+            parent_agent_id: None,
+            session_id: session.map(|s| protocol::SessionId(s.to_owned())),
+            workflow: None,
+            created_at_ms: 0,
+            instance_stream: StreamPath(format!("/agent/{agent}/inst")),
+            activity_summary: Default::default(),
+        }
+    }
+
+    pub(crate) fn chat_tab_count(state: &AppState) -> usize {
+        state.center_zone.with_untracked(|cz| {
+            cz.panes()
+                .flat_map(|(_, pane)| pane.tabs.iter())
+                .filter(|tab| matches!(tab.content, TabContent::Chat { .. }))
+                .count()
+        })
+    }
+
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::restore_fixtures::*;
     use protocol::{
-        FileEntryOp, ProjectFileEntry, ProjectFileKind, ProjectFileVersion, ProjectRootPath,
+        BackendKind, FileEntryOp, LaunchProfileId, ProjectFileEntry, ProjectFileKind,
+        ProjectFileVersion, ProjectRootPath,
     };
 
     fn install_code_intel_source(
@@ -6210,130 +6353,6 @@ mod tests {
         .expect("synthetic Welcome")
     }
 
-    fn empty_host_bootstrap_envelope(stream: &str, seq: u64) -> Envelope {
-        Envelope::from_payload(
-            StreamPath(stream.to_owned()),
-            FrameKind::HostBootstrap,
-            seq,
-            &HostBootstrapPayload {
-                settings: protocol::HostSettings {
-                    enabled_backends: Vec::new(),
-                    default_backend: None,
-                    enable_mobile_connections: false,
-                    mobile_broker_url: None,
-                    tyde_debug_mcp_enabled: false,
-                    tyde_agent_control_mcp_enabled: true,
-                    complexity_tiers_enabled: false,
-                    backend_tier_configs: std::collections::HashMap::new(),
-                    background_agent_features: Default::default(),
-                    supervisor: Default::default(),
-                    code_intel: Default::default(),
-                    backend_config: std::collections::HashMap::new(),
-                    launch_profiles: Vec::new(),
-                },
-                mobile_access: MobileAccessStatePayload {
-                    broker_status: protocol::MobileBrokerStatus::Disabled,
-                    pairing: MobilePairingState::Idle,
-                    paired_devices: Vec::new(),
-                },
-                backend_setup: BackendSetupPayload {
-                    backends: Vec::new(),
-                },
-                session_schemas: Vec::new(),
-                backend_config_schemas: Vec::new(),
-                backend_config_snapshots: Vec::new(),
-                launch_profile_catalog: Default::default(),
-                sessions: Vec::new(),
-                session_list: Default::default(),
-                projects: Vec::new(),
-                mcp_servers: Vec::new(),
-                skills: Vec::new(),
-                steering: Vec::new(),
-                custom_agents: Vec::new(),
-                team_preset_catalog: protocol::TeamPresetCatalog {
-                    role_presets: Vec::new(),
-                    personality_traits: Vec::new(),
-                    personality_presets: Vec::new(),
-                    team_templates: Vec::new(),
-                },
-                team_drafts: Vec::new(),
-                teams: Vec::new(),
-                team_members: Vec::new(),
-                team_member_bindings: Vec::new(),
-                agents: Vec::new(),
-                task_token_usages: Vec::new(),
-                workflow_summaries: Vec::new(),
-                workflow_diagnostics: Vec::new(),
-                workflow_runs: Vec::new(),
-                workflow_locations: Vec::new(),
-                agents_view_preferences: None,
-            },
-        )
-        .expect("synthetic HostBootstrap")
-    }
-
-    /// A HostBootstrap payload with the pieces the restore path actually reads.
-    /// Built from the empty fixture so it stays in step with protocol growth.
-    fn restore_bootstrap(
-        enabled_backends: Vec<BackendKind>,
-        catalog: protocol::LaunchProfileCatalog,
-        projects: Vec<protocol::Project>,
-        agents: Vec<NewAgentPayload>,
-    ) -> HostBootstrapPayload {
-        let mut payload = empty_host_bootstrap_envelope("/host", 0)
-            .parse_payload::<HostBootstrapPayload>()
-            .expect("fixture parses");
-        payload.settings.enabled_backends = enabled_backends;
-        payload.launch_profile_catalog = catalog;
-        payload.projects = projects;
-        payload.agents = agents;
-        payload
-    }
-
-    fn restore_project(id: &str) -> protocol::Project {
-        protocol::Project {
-            id: ProjectId(id.to_owned()),
-            name: id.to_owned(),
-            sort_order: 0,
-            source: protocol::ProjectSource::Standalone {
-                roots: vec![ProjectRootPath(format!("/{id}"))],
-            },
-        }
-    }
-
-    fn restore_agent_payload(agent: &str, project: Option<&str>) -> NewAgentPayload {
-        restore_agent_payload_with_session(agent, project, None)
-    }
-
-    fn restore_agent_payload_with_session(
-        agent: &str,
-        project: Option<&str>,
-        session: Option<&str>,
-    ) -> NewAgentPayload {
-        NewAgentPayload {
-            agent_id: AgentId(agent.to_owned()),
-            name: format!("Agent {agent}"),
-            origin: AgentOrigin::User,
-            backend_kind: BackendKind::Hermes,
-            workspace_roots: Vec::new(),
-            project_id: project.map(|p| ProjectId(p.to_owned())),
-            parent_agent_id: None,
-            session_id: session.map(|s| protocol::SessionId(s.to_owned())),
-            custom_agent_id: None,
-            workflow: None,
-            created_at_ms: 0,
-            instance_stream: StreamPath(format!("/agent/{agent}/inst")),
-        }
-    }
-
-    fn chat_tab_count(state: &AppState) -> usize {
-        state.center_zone.with_untracked(|cz| {
-            cz.panes()
-                .flat_map(|(_, pane)| pane.tabs.iter())
-                .filter(|tab| matches!(tab.content, TabContent::Chat { .. }))
-                .count()
-        })
-    }
 
     /// FE-01: New Chat, Home and switching to an unvisited project all leave
     /// `active_agent` at `None`, so intent cannot be inferred from it. A late
@@ -6349,6 +6368,9 @@ mod tests {
                     host_id: "host-a".to_owned(),
                     agent_id: AgentId("agent-old".to_owned()),
                     project_id: None,
+                    // Persisted before the agent was assigned a session; the
+                    // point of this case is that New Chat retires it either way.
+                    session_id: None,
                 }));
 
             // The user opens a New Chat while host-a is still connecting.
@@ -6402,6 +6424,9 @@ mod tests {
                     host_id: "host-a".to_owned(),
                     agent_id: AgentId("agent-a".to_owned()),
                     project_id: Some(ProjectId("project-a".to_owned())),
+                    // Matches the live agent below, so the project is the only
+                    // thing that can refuse this restore.
+                    session_id: Some(protocol::SessionId("session-a".to_owned())),
                 }));
 
             apply_host_bootstrap(
@@ -6411,7 +6436,13 @@ mod tests {
                     vec![BackendKind::Hermes],
                     Default::default(),
                     vec![restore_project("project-a"), restore_project("project-b")],
-                    vec![restore_agent_payload("agent-a", Some("project-a"))],
+                    // Same session as the pointer, so the project is genuinely
+                    // the only thing that differs.
+                    vec![restore_agent_payload_with_session(
+                        "agent-a",
+                        Some("project-a"),
+                        Some("session-a"),
+                    )],
                 ),
             );
 
@@ -8663,11 +8694,15 @@ mod tests {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
+    use super::restore_fixtures::*;
     use crate::components::chat_message::ChatMessageView;
     use crate::state::{AppState, CodeIntelKey};
     use leptos::mount::mount_to;
     use leptos::prelude::*;
-    use protocol::{CodeIntelDiagnostic, ProjectFileVersion, ProjectPath, ProjectRootPath};
+    use protocol::{
+        BackendKind, CodeIntelDiagnostic, LaunchProfileId, ProjectFileVersion, ProjectPath,
+        ProjectRootPath,
+    };
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
     use web_sys::HtmlElement;
