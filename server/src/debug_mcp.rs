@@ -248,7 +248,7 @@ fn repo_root_from_parts(parts: &axum::http::request::Parts) -> Option<PathBuf> {
 #[tool_router]
 impl TydeDebugMcpServer {
     #[tool(
-        description = "Launch a Tyde desktop dev instance with isolated ephemeral stores and hot reload disabled. An optional typed hermes input requires an IPv4 loopback stub, creates a disposable HOME and HERMES_HOME, strips inherited provider credentials and endpoint overrides, and denies provider proxy egress. Returns canonical store, Hermes runtime, and isolation attestations after the typed host and UI-debug loopback endpoints are ready. Stop and restart it to pick up code changes."
+        description = "Launch a Tyde desktop dev instance with isolated ephemeral stores and hot reload disabled. An optional typed hermes input requires an IPv4 loopback stub, creates a disposable HOME and HERMES_HOME, strips inherited provider credentials and endpoint overrides, and denies provider proxy egress. Returns canonical store, Hermes runtime, launcher-chain/skipped-wrapper, and isolation attestations after the typed host and UI-debug loopback endpoints are ready. A false launcherEnvironmentPreserved value means skipped shell-wrapper environment was not reproduced. Stop and restart it to pick up code changes."
     )]
     async fn tyde_dev_instance_start(
         &self,
@@ -1269,7 +1269,7 @@ mod tests {
         let store = tempfile::tempdir().expect("store dir");
         let runtime = devtools_protocol::ResolvedHermesRuntime {
             executable: Some(std::env::current_exe().expect("current executable")),
-            python: None,
+            ..devtools_protocol::ResolvedHermesRuntime::default()
         };
         let prepared = prepare_disposable_hermes_environment(
             store.path(),

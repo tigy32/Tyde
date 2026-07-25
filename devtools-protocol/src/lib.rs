@@ -229,14 +229,27 @@ pub struct DevInstanceHermesEnvironmentAttestation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hermes_executable: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_hermes_executable: Option<String>,
+    pub hermes_launcher_chain: Vec<String>,
+    pub skipped_launchers: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hermes_python: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_hermes_python: Option<String>,
+    pub hermes_python_launcher_chain: Vec<String>,
+    pub skipped_python_launchers: Vec<String>,
+    pub launcher_environment_preserved: bool,
 }
 
 #[cfg(feature = "launcher")]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedHermesRuntime {
     pub executable: Option<PathBuf>,
+    pub executable_launcher_chain: Vec<PathBuf>,
+    pub skipped_executable_launchers: Vec<PathBuf>,
     pub python: Option<PathBuf>,
+    pub python_launcher_chain: Vec<PathBuf>,
+    pub skipped_python_launchers: Vec<PathBuf>,
 }
 
 #[cfg(feature = "launcher")]
@@ -256,17 +269,27 @@ pub fn prepare_disposable_hermes_environment(
 ) -> Result<PreparedDisposableHermesEnvironment, String> {
     validate_profile_names(&input.profiles)?;
     let stub = validate_loopback_stub(&input.loopback_stub)?;
+    let (executable, executable_launcher_chain, skipped_executable_launchers) =
+        validate_runtime_evidence(
+            runtime.executable.as_deref(),
+            &runtime.executable_launcher_chain,
+            &runtime.skipped_executable_launchers,
+            "Hermes",
+        )?;
+    let (python, python_launcher_chain, skipped_python_launchers) =
+        validate_runtime_evidence(
+            runtime.python.as_deref(),
+            &runtime.python_launcher_chain,
+            &runtime.skipped_python_launchers,
+            "HERMES_PYTHON",
+        )?;
     let runtime = ResolvedHermesRuntime {
-        executable: runtime
-            .executable
-            .as_deref()
-            .map(|path| canonical_executable(path, "Hermes"))
-            .transpose()?,
-        python: runtime
-            .python
-            .as_deref()
-            .map(|path| canonical_executable(path, "HERMES_PYTHON"))
-            .transpose()?,
+        executable,
+        executable_launcher_chain,
+        skipped_executable_launchers,
+        python,
+        python_launcher_chain,
+        skipped_python_launchers,
     };
     if runtime.executable.is_none() && runtime.python.is_none() {
         return Err(
@@ -376,12 +399,83 @@ pub fn prepare_disposable_hermes_environment(
                 .executable
                 .as_ref()
                 .map(|path| path.display().to_string()),
+            resolved_hermes_executable: runtime
+                .executable
+                .as_deref()
+                .map(|path| canonical_executable(path, "Hermes"))
+                .transpose()?
+                .map(|path| path.display().to_string()),
+            hermes_launcher_chain: display_paths(&runtime.executable_launcher_chain),
+            skipped_launchers: display_paths(&runtime.skipped_executable_launchers),
             hermes_python: runtime
                 .python
                 .as_ref()
                 .map(|path| path.display().to_string()),
+            resolved_hermes_python: runtime
+                .python
+                .as_deref()
+                .map(|path| canonical_executable(path, "HERMES_PYTHON"))
+                .transpose()?
+                .map(|path| path.display().to_string()),
+            hermes_python_launcher_chain: display_paths(&runtime.python_launcher_chain),
+            skipped_python_launchers: display_paths(&runtime.skipped_python_launchers),
+            launcher_environment_preserved: runtime.skipped_executable_launchers.is_empty()
+                && runtime.skipped_python_launchers.is_empty(),
         },
     })
+}
+
+#[cfg(feature = "launcher")]
+fn validate_runtime_evidence(
+    program: Option<&Path>,
+    launcher_chain: &[PathBuf],
+    skipped_launchers: &[PathBuf],
+    source: &str,
+) -> Result<(Option<PathBuf>, Vec<PathBuf>, Vec<PathBuf>), String> {
+    let Some(program) = program else {
+        if launcher_chain.is_empty() && skipped_launchers.is_empty() {
+            return Ok((None, Vec::new(), Vec::new()));
+        }
+        return Err(format!(
+            "{source} launcher evidence requires a resolved executable"
+        ));
+    };
+    let program = checked_executable_path(program, source)?;
+    let launcher_chain = if launcher_chain.is_empty() {
+        vec![program.clone()]
+    } else {
+        launcher_chain
+            .iter()
+            .map(|path| checked_executable_path(path, source))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    if launcher_chain.last() != Some(&program) {
+        return Err(format!(
+            "{source} launcher chain must end at the exported executable {}",
+            program.display()
+        ));
+    }
+    let skipped_launchers = skipped_launchers
+        .iter()
+        .map(|path| checked_executable_path(path, source))
+        .collect::<Result<Vec<_>, _>>()?;
+    if skipped_launchers
+        .iter()
+        .any(|path| !launcher_chain.contains(path) || path == &program)
+    {
+        return Err(format!(
+            "{source} skipped launchers must be non-final entries in its launcher chain"
+        ));
+    }
+    Ok((Some(program), launcher_chain, skipped_launchers))
+}
+
+#[cfg(feature = "launcher")]
+fn display_paths(paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect()
 }
 
 #[cfg(feature = "launcher")]
@@ -457,7 +551,7 @@ fn write_disposable_hermes_config(
     let base_url = serde_json::to_string(stub.0.as_str())
         .map_err(|error| format!("failed to quote disposable Hermes base URL: {error}"))?;
     let config = format!(
-        "model:\n  provider: openai\n  default: {model}\n  base_url: {base_url}\nbedrock:\n  discovery: false\n"
+        "model:\n  provider: openai\n  default: {model}\n  base_url: {base_url}\nbedrock:\n  discovery:\n    enabled: false\n"
     );
     fs::write(home.join("config.yaml"), config).map_err(|error| {
         format!(
@@ -487,6 +581,9 @@ pub fn resolve_parent_hermes_runtime(
 ) -> Result<ResolvedHermesRuntime, String> {
     let python = explicit_python
         .map(|program| resolve_program(program, search_path, "HERMES_PYTHON"))
+        .transpose()?
+        .as_deref()
+        .map(|path| resolve_home_dependent_launcher(path, parent_home, "HERMES_PYTHON"))
         .transpose()?;
 
     let executable_candidate = match explicit_executable {
@@ -495,7 +592,6 @@ pub fn resolve_parent_hermes_runtime(
             search_path,
             "HERMES_EXECUTABLE",
         )?),
-        None if python.is_some() => None,
         None => parent_home
             .map(PathBuf::from)
             .map(|home| home.join(".local").join("bin").join("hermes"))
@@ -504,7 +600,7 @@ pub fn resolve_parent_hermes_runtime(
     };
     let executable = executable_candidate
         .as_deref()
-        .map(|path| resolve_home_dependent_launcher(path, parent_home))
+        .map(|path| resolve_home_dependent_launcher(path, parent_home, "Hermes"))
         .transpose()?;
 
     if executable.is_none() && python.is_none() {
@@ -514,7 +610,41 @@ pub fn resolve_parent_hermes_runtime(
         );
     }
 
-    Ok(ResolvedHermesRuntime { executable, python })
+    let (executable, executable_launcher_chain, skipped_executable_launchers) =
+        resolved_launcher_evidence(executable);
+    let (python, python_launcher_chain, skipped_python_launchers) =
+        resolved_launcher_evidence(python);
+    Ok(ResolvedHermesRuntime {
+        executable,
+        executable_launcher_chain,
+        skipped_executable_launchers,
+        python,
+        python_launcher_chain,
+        skipped_python_launchers,
+    })
+}
+
+#[cfg(feature = "launcher")]
+#[derive(Debug)]
+struct ResolvedLauncher {
+    program: PathBuf,
+    chain: Vec<PathBuf>,
+}
+
+#[cfg(feature = "launcher")]
+fn resolved_launcher_evidence(
+    resolved: Option<ResolvedLauncher>,
+) -> (Option<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+    let Some(resolved) = resolved else {
+        return (None, Vec::new(), Vec::new());
+    };
+    let skipped = resolved
+        .chain
+        .iter()
+        .take(resolved.chain.len().saturating_sub(1))
+        .cloned()
+        .collect();
+    (Some(resolved.program), resolved.chain, skipped)
 }
 
 #[cfg(feature = "launcher")]
@@ -530,7 +660,7 @@ fn resolve_program(
         find_program_in_path(program, search_path)
             .ok_or_else(|| format!("{source} executable '{}' was not found", path.display()))?
     };
-    canonical_executable(&candidate, source)
+    checked_executable_path(&candidate, source)
 }
 
 #[cfg(feature = "launcher")]
@@ -542,6 +672,20 @@ fn find_program_in_path(program: &OsStr, search_path: Option<&OsStr>) -> Option<
 
 #[cfg(feature = "launcher")]
 fn canonical_executable(path: &Path, source: &str) -> Result<PathBuf, String> {
+    checked_executable_path(path, source)?
+        .canonicalize()
+        .map_err(|error| format!("failed to resolve {source} {}: {error}", path.display()))
+}
+
+#[cfg(feature = "launcher")]
+fn checked_executable_path(path: &Path, source: &str) -> Result<PathBuf, String> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("failed to resolve current directory: {error}"))?
+            .join(path)
+    };
     if !path.is_file() {
         return Err(format!(
             "{source} executable {} is not a file",
@@ -565,38 +709,47 @@ fn canonical_executable(path: &Path, source: &str) -> Result<PathBuf, String> {
             ));
         }
     }
-    path.canonicalize()
-        .map_err(|error| format!("failed to resolve {source} {}: {error}", path.display()))
+    Ok(path)
 }
 
 #[cfg(feature = "launcher")]
 fn resolve_home_dependent_launcher(
     path: &Path,
     parent_home: Option<&OsStr>,
-) -> Result<PathBuf, String> {
-    resolve_home_dependent_launcher_at_depth(path, parent_home, 0)
+    source: &str,
+) -> Result<ResolvedLauncher, String> {
+    resolve_home_dependent_launcher_at_depth(path, parent_home, source, 0)
 }
 
 #[cfg(feature = "launcher")]
 fn resolve_home_dependent_launcher_at_depth(
     path: &Path,
     parent_home: Option<&OsStr>,
+    source: &str,
     depth: usize,
-) -> Result<PathBuf, String> {
+) -> Result<ResolvedLauncher, String> {
     if depth > 6 {
-        return Err("Hermes launcher indirection exceeded six levels".to_string());
+        return Err(format!(
+            "{source} launcher indirection exceeded six levels"
+        ));
     }
-    let canonical = canonical_executable(path, "Hermes")?;
-    let Ok(contents) = fs::read_to_string(&canonical) else {
-        return Ok(canonical);
+    let executable = checked_executable_path(path, source)?;
+    let Ok(contents) = fs::read_to_string(&executable) else {
+        return Ok(ResolvedLauncher {
+            program: executable.clone(),
+            chain: vec![executable],
+        });
     };
     if !contents.contains("$HOME") && !contents.contains("${HOME}") {
-        return Ok(canonical);
+        return Ok(ResolvedLauncher {
+            program: executable.clone(),
+            chain: vec![executable],
+        });
     }
     let home = parent_home.ok_or_else(|| {
         format!(
-            "Hermes launcher {} depends on HOME, but the parent HOME is unavailable",
-            canonical.display()
+            "{source} launcher {} depends on HOME, but the parent HOME is unavailable",
+            executable.display()
         )
     })?;
     let targets = contents
@@ -604,15 +757,23 @@ fn resolve_home_dependent_launcher_at_depth(
         .find_map(|line| home_dependent_exec_targets(line, home))
         .ok_or_else(|| {
             format!(
-                "Hermes launcher {} depends on HOME and its executable target could not be resolved safely",
-                canonical.display()
+                "{source} launcher {} depends on HOME and its executable target could not be resolved safely",
+                executable.display()
             )
         })?;
+    let mut chain = vec![executable];
     let mut target = targets[0].clone();
-    if targets.len() > 1 && is_argument_passthrough_launcher(&target)? {
-        target = targets[1].clone();
+    if targets.len() > 1 {
+        if let Some(passthrough) = argument_passthrough_launcher(&target, source)? {
+            chain.push(passthrough);
+            target = targets[1].clone();
+        }
     }
-    resolve_home_dependent_launcher_at_depth(&target, parent_home, depth + 1)
+    let mut resolved =
+        resolve_home_dependent_launcher_at_depth(&target, parent_home, source, depth + 1)?;
+    chain.append(&mut resolved.chain);
+    resolved.chain = chain;
+    Ok(resolved)
 }
 
 #[cfg(feature = "launcher")]
@@ -637,15 +798,18 @@ fn home_dependent_exec_targets(line: &str, home: &OsStr) -> Option<Vec<PathBuf>>
 }
 
 #[cfg(feature = "launcher")]
-fn is_argument_passthrough_launcher(path: &Path) -> Result<bool, String> {
-    let canonical = canonical_executable(path, "Hermes")?;
-    let Ok(contents) = fs::read_to_string(canonical) else {
-        return Ok(false);
+fn argument_passthrough_launcher(path: &Path, source: &str) -> Result<Option<PathBuf>, String> {
+    let executable = checked_executable_path(path, source)?;
+    let Ok(contents) = fs::read_to_string(&executable) else {
+        return Ok(None);
     };
-    Ok(contents.lines().any(|line| {
-        let line = line.trim();
-        line == "exec \"$@\"" || line == "exec '$@'" || line == "exec $@"
-    }))
+    Ok(contents
+        .lines()
+        .any(|line| {
+            let line = line.trim();
+            line == "exec \"$@\"" || line == "exec '$@'" || line == "exec $@"
+        })
+        .then_some(executable))
 }
 
 #[cfg(feature = "launcher")]
@@ -983,7 +1147,7 @@ mod tests {
         let executable = test_executable(runtime_dir.path().join("hermes"));
         let runtime = ResolvedHermesRuntime {
             executable: Some(executable.canonicalize().expect("resolve executable")),
-            python: None,
+            ..ResolvedHermesRuntime::default()
         };
         let prepared = prepare_disposable_hermes_environment(
             store.path(),
@@ -1036,9 +1200,11 @@ mod tests {
                 .expect("read config")
                 .contains("base_url: \"http://127.0.0.1:43123/v1\"")
         );
-        assert!(fs::read_to_string(prepared.hermes_home.join("config.yaml"))
-            .expect("read config")
-            .contains("discovery: false"));
+        assert!(
+            fs::read_to_string(prepared.hermes_home.join("config.yaml"))
+                .expect("read config")
+                .contains("discovery:\n    enabled: false")
+        );
         assert_eq!(
             fs::read_to_string(prepared.hermes_home.join(".env")).expect("read stub env"),
             "OPENAI_API_KEY=tyde-local-loopback-stub\n"
@@ -1065,6 +1231,19 @@ mod tests {
             attestation["hermesExecutable"],
             Value::String(runtime.executable.unwrap().display().to_string())
         );
+        assert_eq!(
+            attestation["resolvedHermesExecutable"],
+            attestation["hermesExecutable"]
+        );
+        assert_eq!(
+            attestation["hermesLauncherChain"],
+            serde_json::json!([prepared.runtime.executable.unwrap()])
+        );
+        assert_eq!(attestation["skippedLaunchers"], serde_json::json!([]));
+        assert_eq!(
+            attestation["launcherEnvironmentPreserved"],
+            Value::Bool(true)
+        );
     }
 
     #[test]
@@ -1073,7 +1252,7 @@ mod tests {
         let runtime_dir = tempfile::tempdir().expect("runtime dir");
         let runtime = ResolvedHermesRuntime {
             executable: Some(test_executable(runtime_dir.path().join("hermes"))),
-            python: None,
+            ..ResolvedHermesRuntime::default()
         };
         let egress = prepare_disposable_hermes_environment(
             store.path(),
@@ -1156,21 +1335,193 @@ mod tests {
             runtime.executable,
             Some(agent.canonicalize().expect("resolve agent executable"))
         );
+        assert_eq!(
+            runtime.executable_launcher_chain,
+            vec![
+                launcher.canonicalize().expect("resolve launcher"),
+                hermes_home
+                    .join("hermes-private")
+                    .canonicalize()
+                    .expect("resolve private launcher"),
+                private_bin
+                    .join("hermes-private-env")
+                    .canonicalize()
+                    .expect("resolve environment wrapper"),
+                agent.canonicalize().expect("resolve agent executable"),
+            ]
+        );
+        assert_eq!(
+            runtime.skipped_executable_launchers,
+            runtime.executable_launcher_chain[..3].to_vec()
+        );
         assert!(runtime.python.is_none());
+
+        let store = tempfile::tempdir().expect("store dir");
+        let prepared = prepare_disposable_hermes_environment(
+            store.path(),
+            &DisposableHermesEnvironment {
+                profiles: Vec::new(),
+                loopback_stub: HermesLoopbackStub {
+                    base_url: "http://127.0.0.1:43123/v1".to_owned(),
+                    model: "tyde-stub".to_owned(),
+                },
+            },
+            &runtime,
+        )
+        .expect("attest launcher chain");
+        assert!(!prepared.attestation.launcher_environment_preserved);
+        assert_eq!(
+            prepared.attestation.hermes_launcher_chain,
+            display_paths(&runtime.executable_launcher_chain)
+        );
+        assert_eq!(
+            prepared.attestation.skipped_launchers,
+            display_paths(&runtime.skipped_executable_launchers)
+        );
     }
 
     #[test]
-    fn parent_runtime_canonicalizes_explicit_python() {
-        let runtime_dir = tempfile::tempdir().expect("runtime dir");
-        let python = test_executable(runtime_dir.path().join("python"));
-        let runtime =
-            resolve_parent_hermes_runtime(None, None, None, Some(python.as_os_str()))
-                .expect("resolve explicit Python");
+    fn parent_runtime_resolves_home_dependent_python_and_executable() {
+        let parent = tempfile::tempdir().expect("parent home");
+        let bin = parent.path().join(".local").join("bin");
+        let hermes_home = parent.path().join(".hermes");
+        let private_bin = hermes_home.join("bin");
+        let agent_bin = hermes_home.join("hermes-agent").join("venv").join("bin");
+        fs::create_dir_all(&bin).expect("create bin");
+        fs::create_dir_all(&private_bin).expect("create private bin");
+        fs::create_dir_all(&agent_bin).expect("create agent bin");
+        let executable = test_executable(bin.join("hermes"));
+        let python = test_executable(agent_bin.join("python"));
+        let environment_wrapper = test_executable_with_contents(
+            private_bin.join("hermes-private-env"),
+            "#!/bin/sh\nHOME_ROOT=\"$HOME/.hermes\"\nexec \"$@\"\n",
+        );
+        let python_launcher = test_executable_with_contents(
+            hermes_home.join("tyde-hermes-python"),
+            "#!/bin/sh\nexec \"$HOME/.hermes/bin/hermes-private-env\" \"$HOME/.hermes/hermes-agent/venv/bin/python\" \"$@\"\n",
+        );
+        let runtime = resolve_parent_hermes_runtime(
+            Some(parent.path().as_os_str()),
+            Some(bin.as_os_str()),
+            None,
+            Some(python_launcher.as_os_str()),
+        )
+        .expect("resolve explicit Python");
 
-        assert!(runtime.executable.is_none());
+        assert_eq!(
+            runtime.executable,
+            Some(executable.canonicalize().expect("resolve executable"))
+        );
         assert_eq!(
             runtime.python,
             Some(python.canonicalize().expect("resolve Python"))
+        );
+        assert_eq!(
+            runtime.python_launcher_chain,
+            vec![
+                python_launcher
+                    .canonicalize()
+                    .expect("resolve Python launcher"),
+                environment_wrapper
+                    .canonicalize()
+                    .expect("resolve environment wrapper"),
+                python.canonicalize().expect("resolve Python"),
+            ]
+        );
+        assert_eq!(
+            runtime.skipped_python_launchers,
+            runtime.python_launcher_chain[..2].to_vec()
+        );
+
+        let store = tempfile::tempdir().expect("store dir");
+        let prepared = prepare_disposable_hermes_environment(
+            store.path(),
+            &DisposableHermesEnvironment {
+                profiles: Vec::new(),
+                loopback_stub: HermesLoopbackStub {
+                    base_url: "http://127.0.0.1:43123/v1".to_owned(),
+                    model: "tyde-stub".to_owned(),
+                },
+            },
+            &runtime,
+        )
+        .expect("attest Python launcher chain");
+        assert_eq!(
+            prepared.attestation.hermes_python_launcher_chain,
+            display_paths(&runtime.python_launcher_chain)
+        );
+        assert_eq!(
+            prepared.attestation.skipped_python_launchers,
+            display_paths(&runtime.skipped_python_launchers)
+        );
+        assert!(!prepared.attestation.launcher_environment_preserved);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_runtime_preserves_python_venv_symlink_invocation() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().expect("parent home");
+        let bin = parent.path().join(".local").join("bin");
+        let hermes_home = parent.path().join(".hermes");
+        let private_bin = hermes_home.join("bin");
+        let agent_bin = hermes_home.join("hermes-agent").join("venv").join("bin");
+        fs::create_dir_all(&bin).expect("create bin");
+        fs::create_dir_all(&private_bin).expect("create private bin");
+        fs::create_dir_all(&agent_bin).expect("create agent bin");
+        test_executable(bin.join("hermes"));
+        let base_python = test_executable(parent.path().join("python-base"));
+        let venv_python = agent_bin.join("python");
+        symlink(&base_python, &venv_python).expect("create venv Python symlink");
+        test_executable_with_contents(
+            private_bin.join("hermes-private-env"),
+            "#!/bin/sh\nHOME_ROOT=\"$HOME/.hermes\"\nexec \"$@\"\n",
+        );
+        let python_launcher = test_executable_with_contents(
+            hermes_home.join("tyde-hermes-python"),
+            "#!/bin/sh\nexec \"$HOME/.hermes/bin/hermes-private-env\" \"$HOME/.hermes/hermes-agent/venv/bin/python\" \"$@\"\n",
+        );
+
+        let runtime = resolve_parent_hermes_runtime(
+            Some(parent.path().as_os_str()),
+            Some(bin.as_os_str()),
+            None,
+            Some(python_launcher.as_os_str()),
+        )
+        .expect("resolve venv Python");
+        assert_eq!(runtime.python, Some(venv_python.clone()));
+        assert_ne!(
+            runtime.python,
+            Some(base_python.canonicalize().expect("resolve base Python"))
+        );
+
+        let store = tempfile::tempdir().expect("store dir");
+        let prepared = prepare_disposable_hermes_environment(
+            store.path(),
+            &DisposableHermesEnvironment {
+                profiles: Vec::new(),
+                loopback_stub: HermesLoopbackStub {
+                    base_url: "http://127.0.0.1:43123/v1".to_owned(),
+                    model: "tyde-stub".to_owned(),
+                },
+            },
+            &runtime,
+        )
+        .expect("prepare venv Python runtime");
+        assert_eq!(
+            prepared.attestation.hermes_python,
+            Some(venv_python.display().to_string())
+        );
+        assert_eq!(
+            prepared.attestation.resolved_hermes_python,
+            Some(
+                base_python
+                    .canonicalize()
+                    .expect("resolve base Python")
+                    .display()
+                    .to_string()
+            )
         );
     }
 

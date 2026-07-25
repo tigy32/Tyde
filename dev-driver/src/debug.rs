@@ -332,7 +332,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "tyde_dev_instance_start",
-            description: "Launch a Tyde desktop dev instance with isolated ephemeral stores and wait until its typed host and UI-debug loopback endpoints are ready. An optional typed hermes input requires an IPv4 loopback stub, creates a disposable HOME and HERMES_HOME, strips inherited provider credentials and endpoint overrides, and denies provider proxy egress. Returns canonical store, Hermes runtime, and isolation attestations.",
+            description: "Launch a Tyde desktop dev instance with isolated ephemeral stores and wait until its typed host and UI-debug loopback endpoints are ready. An optional typed hermes input requires an IPv4 loopback stub, creates a disposable HOME and HERMES_HOME, strips inherited provider credentials and endpoint overrides, and denies provider proxy egress. Returns canonical store, Hermes runtime, launcher-chain/skipped-wrapper, and isolation attestations. A false launcherEnvironmentPreserved value means skipped shell-wrapper environment was not reproduced.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1493,7 +1493,7 @@ mod tests {
         let store = tempfile::tempdir().expect("store dir");
         let runtime = devtools_protocol::ResolvedHermesRuntime {
             executable: Some(std::env::current_exe().expect("current executable")),
-            python: None,
+            ..devtools_protocol::ResolvedHermesRuntime::default()
         };
         let prepared = prepare_disposable_hermes_environment(
             store.path(),

@@ -226,20 +226,34 @@ because its Tyde stores are ephemeral.
 
 The typed opt-in requires `loopbackStub`. Before redirecting `HOME`, the parent
 launcher resolves and canonicalizes the Hermes executable and an explicitly
-configured `HERMES_PYTHON`; start fails closed if neither is usable. It then
-creates a fresh home inside the instance store, exports canonical `HOME`,
-`HERMES_HOME`, and runtime paths, seeds requested named profiles, and returns
-those same canonical values in `hermesEnvironment` with derived
-`homeEphemeral` and `hermesHomeEphemeral` facts. Stop removes the entire
-instance store.
+configured `HERMES_PYTHON`, expanding `$HOME` launcher chains for both against
+the parent home; start fails closed if neither is usable. It still resolves the
+Hermes executable when `HERMES_PYTHON` is explicit so both runtime surfaces are
+attested. It then creates a fresh home inside the instance store, exports
+canonical `HOME` and `HERMES_HOME` plus final runtime invocation paths, seeds
+requested named profiles, and returns those values in `hermesEnvironment` with
+derived `homeEphemeral` and `hermesHomeEphemeral` facts. Runtime attestations
+also include `resolvedHermesExecutable` / `resolvedHermesPython` canonical
+targets. The exported Python invocation path intentionally retains a
+virtual-environment symlink because replacing it with the base interpreter can
+lose that environment's imports. Stop removes the entire instance store.
+
+Resolving a launcher chain to a bare `HERMES_EXECUTABLE` or `HERMES_PYTHON`
+cannot reproduce shell-wrapper environment mutations. The attestation reports
+the full `hermesLauncherChain` / `hermesPythonLauncherChain`, the
+`skippedLaunchers` / `skippedPythonLaunchers`, and
+`launcherEnvironmentPreserved`. When the last value is `false`, containment is
+still valid, but wrapper-provided toolset, tool-progress, `PYTHONPATH`, and
+network-guard behavior was not retained. Do not cite that run as
+production-wrapper fidelity evidence for findings sensitive to those settings.
 
 The contained no-paid-call mode:
 
 - accepts only `http://127.0.0.1:<port>` with an explicit port and no URL
   credentials, query, or fragment;
 - writes a synthetic OpenAI-compatible model configuration and fake local key
-  into the disposable default and named profiles and disables Bedrock
-  discovery;
+  into the disposable default and named profiles and sets
+  `bedrock.discovery.enabled: false`;
 - removes inherited provider credential, token, credential-file, endpoint,
   base-URL, organization, project, and cloud-profile environment surfaces;
 - redirects Tyde's configured-host store with the other mutable stores; and

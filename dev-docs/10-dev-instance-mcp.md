@@ -464,7 +464,9 @@ does not set `HOME` or `HERMES_HOME`; existing behavior is unchanged. With the
 field present, `loopbackStub` is required. The launcher resolves the Hermes
 executable (and an explicit `HERMES_PYTHON`) against the parent environment
 before redirecting `HOME`, creates both homes beneath the instance's ephemeral
-`storeDir`, and exports only canonicalized paths to the child. Start fails
+`storeDir`, and exports canonical homes plus the parent-resolved runtime
+invocation path to the child. A Python virtual-environment symlink is preserved
+for invocation while its canonical target is separately attested. Start fails
 before creating the store when no usable Hermes runtime can be resolved. It
 returns:
 
@@ -480,10 +482,35 @@ returns:
     "profiles": ["qa"],
     "loopbackStubUrl": "http://127.0.0.1:43123/v1",
     "networkPolicy": "loopback_stub_only",
-    "hermesExecutable": "<canonical parent-resolved executable>"
+    "hermesExecutable": "<exported parent-resolved executable>",
+    "resolvedHermesExecutable": "<canonical executable target>",
+    "hermesLauncherChain": [
+      "<parent launcher>",
+      "<environment wrapper>",
+      "<exported executable>"
+    ],
+    "skippedLaunchers": [
+      "<parent launcher>",
+      "<environment wrapper>"
+    ],
+    "hermesPythonLauncherChain": [],
+    "skippedPythonLaunchers": [],
+    "launcherEnvironmentPreserved": false
   }
 }
 ```
+
+`hermesLauncherChain` and `hermesPythonLauncherChain` report every executable
+found while expanding parent-`HOME` launchers. The corresponding
+`skipped*Launchers` entries are not executed after the resolver exports the
+final program. Therefore their environment mutations are not reproduced.
+`hermesExecutable` / `hermesPython` are the actual exported invocation paths;
+the `resolvedHermes*` values are their canonical filesystem targets. Keeping
+those distinct preserves virtual-environment Python selection.
+`launcherEnvironmentPreserved: false` is explicit evidence of that divergence,
+not a containment failure. A run with that value cannot establish
+production-wrapper fidelity for toolset, tool-progress, Python-path, or
+network-guard behavior.
 
 Contained Hermes invocation:
 
@@ -502,11 +529,11 @@ Contained Hermes invocation:
 
 The stub URL must use numeric `127.0.0.1`, plain HTTP, and an explicit port.
 There is no contained no-stub or inherited-network mode. The launcher writes
-only synthetic credentials, disables Bedrock discovery, removes inherited
-provider credentials and endpoint/base-URL overrides, redirects Tyde's
-configured-host store, and installs a deny-by-default proxy environment whose
-only exemption is `127.0.0.1`. This confines the supported provider path; it is
-not an OS sandbox for arbitrary commands that open their own sockets.
+only synthetic credentials, sets `bedrock.discovery.enabled: false`, removes
+inherited provider credentials and endpoint/base-URL overrides, redirects
+Tyde's configured-host store, and installs a deny-by-default proxy environment
+whose only exemption is `127.0.0.1`. This confines the supported provider path;
+it is not an OS sandbox for arbitrary commands that open their own sockets.
 
 The stub must implement `GET /v1/models` and `POST /v1/chat/completions` for
 the configured model. It must return ordinary completion JSON when

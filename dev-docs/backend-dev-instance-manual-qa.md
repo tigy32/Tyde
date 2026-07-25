@@ -141,10 +141,19 @@ test plan.
    home paths beneath the canonical `storeDir`. Require
    `hermesEnvironment.home == hermesEnvironment.resolvedHome`,
    `hermesEnvironment.hermesHome ==
-   hermesEnvironment.resolvedHermesHome`, and a canonical
-   `hermesExecutable` or `hermesPython` path that exists outside the disposable
-   home. Without that attestation, Hermes QA is `BLOCKED`; do not open Hermes
-   settings or start a Hermes agent.
+   hermesEnvironment.resolvedHermesHome`, an exported `hermesExecutable` or
+   `hermesPython` invocation path that exists outside the disposable home, and
+   its corresponding canonical `resolvedHermesExecutable` or
+   `resolvedHermesPython` target. The two Python values may differ when a
+   virtual-environment symlink must be retained. Record `hermesLauncherChain`,
+   `hermesPythonLauncherChain`,
+   `skippedLaunchers`, `skippedPythonLaunchers`, and
+   `launcherEnvironmentPreserved`. Without that attestation, Hermes QA is
+   `BLOCKED`; do not open Hermes settings or start a Hermes agent. If
+   `launcherEnvironmentPreserved` is `false`, the contained run remains valid
+   for Tyde/Hermes protocol QA but cannot certify production-wrapper behavior
+   affected by toolset, tool-progress, `PYTHONPATH`, or network-guard
+   environment.
 9. Confirm the available driver can capture screenshots, rendered DOM,
    console/backend events, and a separately controlled second client. Treat a
    missing required observation channel as `BLOCKED`, not as permission to
