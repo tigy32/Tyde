@@ -6453,6 +6453,9 @@ impl CodexInner {
                     .as_ref()
                     .is_none_or(|turn_id| stream.active_turn_id.as_ref() == Some(turn_id))
                 {
+                    let locally_completed_turn_id = completed_turn_id
+                        .clone()
+                        .or_else(|| stream.active_turn_id.clone());
                     let reasoning = contains_non_whitespace(&stream.current_reasoning)
                         .then(|| stream.current_reasoning.clone());
                     if turn_status == "interrupted"
@@ -6501,6 +6504,12 @@ impl CodexInner {
                                 },
                             );
                             partial_idless_reasoning = Some((message_id, reasoning));
+                        }
+                    }
+                    if turn_status == "interrupted" || partial_idless_reasoning.is_some() {
+                        stream.pending_message_metadata = None;
+                        if let Some(turn_id) = locally_completed_turn_id {
+                            push_codex_terminated_turn(&mut stream.terminated_turns, turn_id);
                         }
                     }
                     stream.active_turn_id = None;
@@ -8521,14 +8530,11 @@ impl CodexInner {
                         metadata_update =
                             Some((pending, token_usage, model_token_usage, context_breakdown));
                     }
-                } else if turn_status == "interrupted"
-                    && state
-                        .pending_message_metadata
-                        .as_ref()
-                        .is_some_and(|pending| pending.turn_id == turn_id)
-                {
+                }
+                if turn_status == "interrupted" || partial_idless_reasoning.is_some() {
                     state.pending_message_metadata = None;
                     state.completed_message_metadata_by_turn.remove(&turn_id);
+                    push_codex_terminated_turn(&mut state.terminated_turns, turn_id.clone());
                 }
                 state.turn_context_by_turn.remove(&turn_id);
                 state.token_usage_by_turn.remove(&turn_id);
@@ -18103,6 +18109,11 @@ Do not describe the tool, and do not skip the tool call."#;
             {
                 let mut state = inner.state.lock().await;
                 state.thread_id = "parent-thread".to_string();
+                state.active_turn_id = Some("parent-turn".to_string());
+                // The shared fixture has a published seed response. Remove it so
+                // this test reaches child registration rather than correctly
+                // rejecting a tool container that overlaps that response.
+                state.active_stream = None;
                 state.subagent_emitter = Some(Arc::new(FailingSubAgentEmitter));
             }
             inner
@@ -18151,14 +18162,17 @@ Do not describe the tool, and do not skip the tool call."#;
             );
             drop(state);
             let events = drain_events(&mut parent_rx);
+            // This receiver observes TurnEmitter's raw backend event. The agent
+            // forwarder is what later converts it into MessageAdded content.
             assert!(events.iter().any(|event| {
-                event
-                    .pointer("/data/content")
-                    .and_then(Value::as_str)
-                    .is_some_and(|content| {
-                        content.contains("Codex child relay registration failed")
-                            && content.contains("parent session is unavailable")
-                    })
+                event.get("kind").and_then(Value::as_str) == Some("Error")
+                    && event
+                        .get("data")
+                        .and_then(Value::as_str)
+                        .is_some_and(|content| {
+                            content.contains("Codex child relay registration failed")
+                                && content.contains("parent session is unavailable")
+                        })
             }));
             assert!(events.iter().any(|event| {
                 event.get("kind").and_then(Value::as_str) == Some("TypingStatusChanged")
@@ -18648,6 +18662,14 @@ Do not describe the tool, and do not skip the tool call."#;
             .expect("tokio runtime");
         rt.block_on(async {
             let (inner, _parent_rx) = test_codex_inner();
+            {
+                let mut state = inner.state.lock().await;
+                state.thread_id = "thread-parent".to_string();
+                state.active_turn_id = Some("parent-turn".to_string());
+                // The parent completion below must own the live parent turn;
+                // test_codex_state otherwise supplies turn-test/msg-seed.
+                state.active_stream = None;
+            }
             let (subagent_tx, mut subagent_rx) = mpsc::unbounded_channel::<Value>();
             attach_test_codex_subagent(&inner, subagent_tx, "thread-sub-idle").await;
             inner
