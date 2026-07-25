@@ -16,9 +16,9 @@ use protocol::{
     QueuedMessagesPayload, ReasoningData, ReviewErrorContext, SendMessagePayload, SessionId,
     SessionSettingsPayload, SessionSettingsValues, SessionSummaryCountUpdatedPayload,
     SpawnCostHint, StreamEndData, StreamStartData, StreamTextDeltaData, TaskTokenUsageAmount,
-    TaskTokenUsageScope,
-    TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
-    ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy, ToolRequestType,
+    TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope,
+    TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy,
+    ToolRequestType,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -8283,8 +8283,7 @@ mod tests {
         .expect("spawn review registry");
         let (host_sub_agent_spawn_tx, _host_sub_agent_spawn_rx) = mpsc::unbounded_channel();
         let (capacity_tx, _capacity_rx) = mpsc::unbounded_channel();
-        let (session_summary_count_tx, _session_summary_count_rx) =
-            mpsc::unbounded_channel();
+        let (session_summary_count_tx, _session_summary_count_rx) = mpsc::unbounded_channel();
         let (status_handle, _status_rx) = AgentStatusHandle::new();
         let start = AgentStartPayload {
             backend_kind: protocol::BackendKind::Claude,
@@ -9492,9 +9491,7 @@ mod tests {
         .expect("failed partial response count update");
         assert_eq!(failed_response_update.session_id, session_id);
         assert_eq!(failed_response_update.assistant_turn_count, 2);
-        assert!(
-            failed_response_update.updated_at_ms >= cancelled_response_update.updated_at_ms
-        );
+        assert!(failed_response_update.updated_at_ms >= cancelled_response_update.updated_at_ms);
         let mut failure_message = assistant_message("provider failed after partial response");
         failure_message.sender = MessageSender::Error;
         assert_eq!(

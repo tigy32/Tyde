@@ -54,22 +54,21 @@ use protocol::{
     SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
     SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath,
     TaskTokenUsageAggregate, TaskTokenUsageAmount, TaskTokenUsageEntry, TaskTokenUsagePayload,
-    TaskTokenUsageScope, TaskTokenUsageStatus, TaskTokenUsageUnavailableReason,
-    TeamCreatePayload, TeamDeletePayload,
-    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
-    TeamDraftDiscardPayload, TeamDraftNotifyPayload, TeamDraftShufflePayload,
-    TeamDraftUpdatePayload, TeamId, TeamMember, TeamMemberBindingNotifyPayload,
-    TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberId, TeamMemberNotifyPayload,
-    TeamMemberRole, TeamMemberShufflePayload, TeamMemberShuffleSuggestionNotifyPayload,
-    TeamMemberState, TeamMemberUpdatePayload, TeamNotifyPayload, TeamRenamePayload,
-    TeamSetManagerPayload, TerminalCreatePayload, TerminalId, TerminalLaunchTarget,
-    TerminalResizePayload, TerminalSendPayload, TriggerWorkflowPayload, WorkbenchCreatePayload,
-    WorkbenchRemovePayload, WorkbenchRoot, WorkflowCatalogLocation, WorkflowDiagnostic,
-    WorkflowDiagnosticSeverity, WorkflowInputControl, WorkflowInputSpec, WorkflowNotifyPayload,
-    WorkflowRunId, WorkflowRunNotifyPayload, WorkflowRunSnapshot, WorkflowRunSnapshotStatus,
-    WorkflowSaveMode, WorkflowSaveRequest, WorkflowSaveResponse, WorkflowSaveTarget,
-    WorkflowSource, WorkflowSourceScope, WorkflowStepRunId, WorkflowStepRunSnapshot,
-    WorkflowTargetDirectory, WorkflowTargetsResponse,
+    TaskTokenUsageScope, TaskTokenUsageStatus, TaskTokenUsageUnavailableReason, TeamCreatePayload,
+    TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
+    TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftNotifyPayload,
+    TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamId, TeamMember,
+    TeamMemberBindingNotifyPayload, TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberId,
+    TeamMemberNotifyPayload, TeamMemberRole, TeamMemberShufflePayload,
+    TeamMemberShuffleSuggestionNotifyPayload, TeamMemberState, TeamMemberUpdatePayload,
+    TeamNotifyPayload, TeamRenamePayload, TeamSetManagerPayload, TerminalCreatePayload, TerminalId,
+    TerminalLaunchTarget, TerminalResizePayload, TerminalSendPayload, TriggerWorkflowPayload,
+    WorkbenchCreatePayload, WorkbenchRemovePayload, WorkbenchRoot, WorkflowCatalogLocation,
+    WorkflowDiagnostic, WorkflowDiagnosticSeverity, WorkflowInputControl, WorkflowInputSpec,
+    WorkflowNotifyPayload, WorkflowRunId, WorkflowRunNotifyPayload, WorkflowRunSnapshot,
+    WorkflowRunSnapshotStatus, WorkflowSaveMode, WorkflowSaveRequest, WorkflowSaveResponse,
+    WorkflowSaveTarget, WorkflowSource, WorkflowSourceScope, WorkflowStepRunId,
+    WorkflowStepRunSnapshot, WorkflowTargetDirectory, WorkflowTargetsResponse,
 };
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -16771,10 +16770,7 @@ fn fan_out_session_summary_count_update(
         let Some(subscriber) = state.host_streams.get_mut(&path) else {
             continue;
         };
-        if !apply_session_summary_count_update(
-            subscriber.session_list_snapshot.as_mut(),
-            update,
-        ) {
+        if !apply_session_summary_count_update(subscriber.session_list_snapshot.as_mut(), update) {
             continue;
         }
         if emit_or_queue_host_frame(
@@ -19129,18 +19125,16 @@ Rules: Record only what remains true and useful for future work; drop transient 
             "reasoning_effort".to_owned(),
             protocol::SessionSettingValue::String("xhigh".to_owned()),
         );
-        settings.0.insert(
-            "fast".to_owned(),
-            protocol::SessionSettingValue::Bool(true),
-        );
+        settings
+            .0
+            .insert("fast".to_owned(), protocol::SessionSettingValue::Bool(true));
         settings.0.insert(
             "future_expensive_setting".to_owned(),
             protocol::SessionSettingValue::Bool(true),
         );
 
-        let helper_settings =
-            hidden_helper_session_settings(BackendKind::Hermes, Some(&settings))
-                .expect("Hermes helper settings");
+        let helper_settings = hidden_helper_session_settings(BackendKind::Hermes, Some(&settings))
+            .expect("Hermes helper settings");
         assert_eq!(
             helper_settings
                 .0
@@ -19149,10 +19143,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 .0
                 .get(crate::backend::hermes::HERMES_PROFILE_SETTING)
         );
-        assert_eq!(
-            helper_settings.0.get("model"),
-            settings.0.get("model")
-        );
+        assert_eq!(helper_settings.0.get("model"), settings.0.get("model"));
         assert_eq!(
             helper_settings.0.get("reasoning_effort"),
             Some(&protocol::SessionSettingValue::String("low".to_owned()))
@@ -19160,9 +19151,8 @@ Rules: Record only what remains true and useful for future work; drop transient 
         assert!(!helper_settings.0.contains_key("fast"));
         assert!(!helper_settings.0.contains_key("future_expensive_setting"));
         assert_eq!(helper_settings.0.len(), 3);
-        let default_helper_settings =
-            hidden_helper_session_settings(BackendKind::Hermes, None)
-                .expect("default Hermes helper settings");
+        let default_helper_settings = hidden_helper_session_settings(BackendKind::Hermes, None)
+            .expect("default Hermes helper settings");
         assert_eq!(
             default_helper_settings.0.get("reasoning_effort"),
             Some(&protocol::SessionSettingValue::String("none".to_owned()))
@@ -19177,9 +19167,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 .expect("minimal-effort Hermes helper settings")
                 .0
                 .get("reasoning_effort"),
-            Some(&protocol::SessionSettingValue::String(
-                "minimal".to_owned()
-            ))
+            Some(&protocol::SessionSettingValue::String("minimal".to_owned()))
         );
         settings.0.insert(
             "reasoning_effort".to_owned(),

@@ -33,13 +33,13 @@ use crate::{
     SetAgentTagsPayload, SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload,
     SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentPayload,
     SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload, StreamPath,
-    TaskTokenUsagePayload, TeamCreatePayload, TeamDeletePayload,
-    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
-    TeamDraftDiscardPayload, TeamDraftNotifyPayload, TeamDraftShufflePayload,
-    TeamDraftUpdatePayload, TeamMemberActivatePayload, TeamMemberBindingNotifyPayload,
-    TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberNotifyPayload,
-    TeamMemberShufflePayload, TeamMemberShuffleSuggestionNotifyPayload, TeamMemberUpdatePayload,
-    TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
+    TaskTokenUsagePayload, TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload,
+    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload,
+    TeamDraftNotifyPayload, TeamDraftShufflePayload, TeamDraftUpdatePayload,
+    TeamMemberActivatePayload, TeamMemberBindingNotifyPayload, TeamMemberCreatePayload,
+    TeamMemberDeletePayload, TeamMemberNotifyPayload, TeamMemberShufflePayload,
+    TeamMemberShuffleSuggestionNotifyPayload, TeamMemberUpdatePayload, TeamNotifyPayload,
+    TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
     TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
     ToolExecutionCompletedData, ToolRequest, TriggerWorkflowPayload, WelcomePayload,
     WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowNotifyPayload, WorkflowRefreshPayload,
@@ -331,13 +331,11 @@ impl ProtocolValidator {
             FrameKind::SessionList => {
                 parse_host_payload::<SessionListPayload>(self, envelope, "SessionList")
             }
-            FrameKind::SessionSummaryCountUpdated => {
-                parse_host_payload::<SessionSummaryCountUpdatedPayload>(
-                    self,
-                    envelope,
-                    "SessionSummaryCountUpdated",
-                )
-            }
+            FrameKind::SessionSummaryCountUpdated => parse_host_payload::<
+                SessionSummaryCountUpdatedPayload,
+            >(
+                self, envelope, "SessionSummaryCountUpdated"
+            ),
             FrameKind::CommandError => {
                 parse_host_payload::<CommandErrorPayload>(self, envelope, "CommandError")
             }

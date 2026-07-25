@@ -547,12 +547,8 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
         }
         other => panic!("expected initial final response, got {other:?}"),
     }
-    let first_count = next_session_count(
-        &mut session_count_rx,
-        &session_id,
-        "initial session count",
-    )
-    .await;
+    let first_count =
+        next_session_count(&mut session_count_rx, &session_id, "initial session count").await;
     assert_eq!(first_count.assistant_turn_count, 1);
     assert!(first_count.updated_at_ms > 0);
 

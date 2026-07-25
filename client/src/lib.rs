@@ -39,13 +39,12 @@ use protocol::{
     TeamDraftNotifyPayload, TeamDraftShufflePayload, TeamDraftUpdatePayload,
     TeamMemberActivatePayload, TeamMemberBindingNotifyPayload, TeamMemberCreatePayload,
     TeamMemberDeletePayload, TeamMemberNotifyPayload, TeamMemberShufflePayload,
-    TeamMemberUpdatePayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
-    TeamRenamePayload, TeamSetManagerPayload,
-    TerminalBootstrapPayload, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
-    TerminalExitPayload, TerminalId, TerminalOutputPayload, TerminalResizePayload,
-    TerminalSendPayload, TerminalStartPayload, TriggerWorkflowPayload, Version, WelcomePayload,
-    WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowNotifyPayload, WorkflowRefreshPayload,
-    WorkflowRunNotifyPayload, read_envelope, write_envelope,
+    TeamMemberUpdatePayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TeamRenamePayload,
+    TeamSetManagerPayload, TerminalBootstrapPayload, TerminalClosePayload, TerminalCreatePayload,
+    TerminalErrorPayload, TerminalExitPayload, TerminalId, TerminalOutputPayload,
+    TerminalResizePayload, TerminalSendPayload, TerminalStartPayload, TriggerWorkflowPayload,
+    Version, WelcomePayload, WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowNotifyPayload,
+    WorkflowRefreshPayload, WorkflowRunNotifyPayload, read_envelope, write_envelope,
 };
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, BufReader};
 #[cfg(unix)]
