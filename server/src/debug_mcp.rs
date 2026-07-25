@@ -9,9 +9,9 @@ use axum::{Json, Router, response::IntoResponse, routing::get};
 use client::ClientConfig;
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use devtools_protocol::{
-    BoundedDebugOutput, DEV_INSTANCE_DENY_PROXY_URL, DEV_INSTANCE_HERMES_HOME_ENV,
-    DEV_INSTANCE_HERMES_EXECUTABLE_ENV, DEV_INSTANCE_HERMES_PYTHON_ENV,
-    DEV_INSTANCE_HOME_ENV, DEV_INSTANCE_PROVIDER_ENV_EXACT_KEYS, DebugOutputSlice,
+    BoundedDebugOutput, DEV_INSTANCE_DENY_PROXY_URL, DEV_INSTANCE_HERMES_EXECUTABLE_ENV,
+    DEV_INSTANCE_HERMES_HOME_ENV, DEV_INSTANCE_HERMES_PYTHON_ENV, DEV_INSTANCE_HOME_ENV,
+    DEV_INSTANCE_PROVIDER_ENV_EXACT_KEYS, DebugOutputSlice,
     DevInstanceHermesEnvironmentAttestation, DevInstanceStartupCleanup,
     DisposableHermesEnvironment, PreparedDisposableHermesEnvironment, UiDebugRequest,
     UiDebugResponse, dev_instance_mutable_paths, is_provider_environment_key,
@@ -451,9 +451,7 @@ async fn start_instance(
         .hermes
         .as_ref()
         .zip(resolved_hermes_runtime.as_ref())
-        .map(|(hermes, runtime)| {
-            prepare_disposable_hermes_environment(&store_dir, hermes, runtime)
-        })
+        .map(|(hermes, runtime)| prepare_disposable_hermes_environment(&store_dir, hermes, runtime))
         .transpose()?;
 
     startup_cleanup.track_config(dev_instance_config_path(&instance_id));
@@ -608,8 +606,8 @@ fn preserve_toolchain_homes_from(
     }
 }
 
-fn resolve_parent_hermes_runtime_for_dev_instance(
-) -> Result<devtools_protocol::ResolvedHermesRuntime, String> {
+fn resolve_parent_hermes_runtime_for_dev_instance()
+-> Result<devtools_protocol::ResolvedHermesRuntime, String> {
     let home = std::env::var_os(DEV_INSTANCE_HOME_ENV);
     let executable = std::env::var_os(DEV_INSTANCE_HERMES_EXECUTABLE_ENV);
     let python = std::env::var_os(DEV_INSTANCE_HERMES_PYTHON_ENV);
@@ -1257,9 +1255,7 @@ mod tests {
             "default dev instance must inherit HOME"
         );
         assert!(
-            !configured.contains_key(std::ffi::OsStr::new(
-                DEV_INSTANCE_HERMES_HOME_ENV
-            )),
+            !configured.contains_key(std::ffi::OsStr::new(DEV_INSTANCE_HERMES_HOME_ENV)),
             "default dev instance must inherit HERMES_HOME"
         );
     }
@@ -1347,9 +1343,7 @@ mod tests {
         );
         assert_eq!(
             configured
-                .get(std::ffi::OsStr::new(
-                    DEV_INSTANCE_HERMES_EXECUTABLE_ENV
-                ))
+                .get(std::ffi::OsStr::new(DEV_INSTANCE_HERMES_EXECUTABLE_ENV))
                 .copied()
                 .flatten(),
             prepared.runtime.executable.as_deref().map(Path::as_os_str)
@@ -1378,13 +1372,7 @@ mod tests {
             }
         }))
         .expect("contained input");
-        assert_eq!(
-            contained
-                .hermes
-                .expect("Hermes input")
-                .profiles,
-            vec!["qa"]
-        );
+        assert_eq!(contained.hermes.expect("Hermes input").profiles, vec!["qa"]);
 
         let missing_stub = serde_json::from_value::<StartInstanceToolInput>(json!({
             "project_dir": "/repo",
@@ -1457,7 +1445,9 @@ mod tests {
                 crate::backend::hermes_config::is_valid_profile_name(profile)
             );
         }
-        assert!(crate::backend::hermes_config::is_valid_profile_name("default"));
+        assert!(crate::backend::hermes_config::is_valid_profile_name(
+            "default"
+        ));
         assert!(!is_valid_disposable_hermes_profile_name("default"));
     }
 
