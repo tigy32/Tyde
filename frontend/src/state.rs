@@ -3225,80 +3225,36 @@ impl AppState {
             upgrade_attempted: RwSignal::new(HashSet::new()),
         };
 
-        // Persist the user's explicit selection whenever it changes.
-        //
-        // The gate matters: at cold start `active_agent` is `None` because no
-        // tab has been restored yet, and writing that would erase the very
-        // pointer the restore is about to read. So while a restore is pending,
-        // nothing is written — a pending restore is retired explicitly by
-        // `retire_pending_restores`, which every deliberate center/project
-        // selection calls, including the ones (New Chat, Home, an unvisited
-        // project) that legitimately leave `active_agent` at `None`.
-        let selection_state = state.clone();
-        Effect::new(move |_| {
-            let active_agent = selection_state.active_agent.get();
-            let draft_backend = selection_state.draft_backend_override.get();
-            let draft_launch_profile = selection_state.draft_launch_profile_id.get();
-            let restore_pending = selection_state
-                .pending_active_chat_restore
-                .with_untracked(|pending| pending.is_some())
-                || selection_state
-                    .pending_draft_restore
-                    .with_untracked(|pending| pending.is_some());
-            if restore_pending {
-                return;
-            }
-            let active_chat = active_agent.and_then(|agent_ref| {
-                // Tracked, not untracked: an agent's `session_id` arrives after
-                // the tab is already open and `active_agent` never changes for
-                // it. Reading this untracked would freeze the stored identity
-                // at the pre-session state, so a chat opened from a fresh spawn
-                // could never be restored by session.
-                selection_state.agents.with(|agents| {
-                    agents
-                        .iter()
-                        .find(|agent| {
-                            agent.host_id == agent_ref.host_id
-                                && agent.agent_id == agent_ref.agent_id
-                        })
-                        .map(|agent| PersistedChatRef {
-                            host_id: agent_ref.host_id.clone(),
-                            agent_id: agent_ref.agent_id.clone(),
-                            project_id: agent.project_id.clone(),
-                            session_id: agent.session_id.clone(),
-                        })
-                })
+        // Reactive wiring is browser-only. Both effects below exist to react to
+        // *user* interaction in a running app; a native unit test constructs
+        // `AppState` with no executor, so registering them there panics before
+        // the test body runs. Neither is load-bearing off the browser:
+        // persistence is `localStorage`, which does not exist, and the draft
+        // host guard has a synchronous counterpart on every path a native test
+        // can reach (`switch_active_project`, and the spawn boundary itself).
+        #[cfg(target_arch = "wasm32")]
+        {
+            let selection_state = state.clone();
+            Effect::new(move |_| {
+                // Tracked reads: the stored identity must follow a session
+                // assignment that arrives after the tab is already open.
+                let _ = selection_state.active_agent.get();
+                let _ = selection_state.draft_backend_override.get();
+                let _ = selection_state.draft_launch_profile_id.get();
+                let _ = selection_state.draft_selection_host.get();
+                let _ = selection_state.agents.get();
+                selection_state.persist_selection_snapshot_if_settled();
             });
-            // A draft selection is only meaningful against the host it targets.
-            let draft = selection_state
-                .chat_context_host_id_untracked()
-                .map(|host_id| PersistedDraftSelection {
-                    host_id,
-                    backend: draft_backend,
-                    launch_profile: draft_launch_profile,
-                })
-                .filter(|draft| !draft.is_empty());
-            persist_workspace_selection(&PersistedWorkspaceSelection { active_chat, draft });
-        });
 
-        // Drop a live draft selection when the chat context moves to another
-        // host. The selection is only meaningful against the host it was made
-        // for: a launch-profile id means nothing in another host's catalog, and
-        // a backend enabled on one host may be disabled on the next. Tracking
-        // the context host here is what makes the binding hold *after* a
-        // successful restore, not only while the restore is pending.
-        let draft_host_state = state.clone();
-        Effect::new(move |_| {
-            let context_host = draft_host_state.chat_context_host_id();
-            let bound_host = draft_host_state.draft_selection_host.get_untracked();
-            let Some(bound_host) = bound_host else {
-                return;
-            };
-            if context_host.as_deref() == Some(bound_host.as_str()) {
-                return;
-            }
-            draft_host_state.clear_draft_selection();
-        });
+            let draft_host_state = state.clone();
+            Effect::new(move |_| {
+                // Tracked so a context change through *any* route — including
+                // selecting a chat tab on another host, which no synchronous
+                // call site covers — drops a foreign draft.
+                let _ = draft_host_state.chat_context_host_id();
+                draft_host_state.drop_draft_bound_to_another_host();
+            });
+        }
 
         state
     }
@@ -4207,6 +4163,44 @@ impl AppState {
         }
     }
 
+    /// Persist the current selection, unless a restore has not yet resolved.
+    ///
+    /// At cold start `active_agent` is `None` because no tab has been restored
+    /// yet, and writing that would erase the very pointer the restore is about
+    /// to read. A pending restore is retired explicitly by
+    /// `retire_pending_restores`, which every deliberate center/project
+    /// selection calls — including the ones (New Chat, Home, an unvisited
+    /// project) that legitimately leave `active_agent` at `None`.
+    pub(crate) fn persist_selection_snapshot_if_settled(&self) {
+        let restore_pending = self
+            .pending_active_chat_restore
+            .with_untracked(|pending| pending.is_some())
+            || self
+                .pending_draft_restore
+                .with_untracked(|pending| pending.is_some());
+        if restore_pending {
+            return;
+        }
+        self.persist_selection_snapshot();
+    }
+
+    /// Drop a live draft selection whose host is no longer the chat context.
+    ///
+    /// The selection is only meaningful against the host it was made for: a
+    /// launch-profile id means nothing in another host's catalog, and a backend
+    /// enabled on one host may be disabled on the next. This is what keeps the
+    /// binding holding *after* a successful restore, not only while it is
+    /// pending.
+    pub(crate) fn drop_draft_bound_to_another_host(&self) {
+        let Some(bound_host) = self.draft_selection_host.get_untracked() else {
+            return;
+        };
+        if self.chat_context_host_id_untracked().as_deref() == Some(bound_host.as_str()) {
+            return;
+        }
+        self.clear_draft_selection();
+    }
+
     /// Write the current selection to storage immediately.
     ///
     /// The persistence effect only fires on a reactive change, and a restore
@@ -4412,6 +4406,13 @@ impl AppState {
                 self.diff_contents.set(HashMap::new());
             }
         }
+
+        // Synchronous counterpart to the browser-only guard: a project switch is
+        // the context change a native build can drive, and a draft bound to the
+        // old host must not survive it. Last, so the context it compares
+        // against is the settled one — `active_agent` derives from the center
+        // zone, which the match above has just replaced.
+        self.drop_draft_bound_to_another_host();
     }
 
     pub fn forget_project_view_memory(&self, project: &ActiveProjectRef) {
