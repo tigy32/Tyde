@@ -615,8 +615,9 @@ impl Backend for HermesBackend {
         let result = gateway
             .request("session.list", json!({ "limit": 200 }))
             .await;
+        let resumable = gateway.system_overlay_installed;
         gateway.shutdown().await;
-        parse_session_list(&result?)
+        parse_session_list(&result?, resumable)
     }
 
     fn session_id(&self) -> SessionId {
@@ -2919,14 +2920,16 @@ impl HermesEventMapper {
                         status = %text,
                         "Hermes lifecycle status omitted structured retry telemetry"
                     );
-                    vec![ChatEvent::TypingStatusChanged(true)]
+                    Vec::new()
                 },
                 |retry| vec![ChatEvent::RetryAttempt(retry)],
             ));
         }
         if kind == "compacting" {
             tracing::debug!(status = %text, "Hermes is compacting the active context");
-            return Ok(vec![ChatEvent::TypingStatusChanged(true)]);
+            // ChatEvent has no text-only transient/compaction variant. A typing
+            // marker would start a Tyde turn and can latch busy after cancel.
+            return Ok(Vec::new());
         }
         tracing::debug!(status_kind = %kind, status = %text, "Hermes transient status");
         Ok(Vec::new())
@@ -3934,6 +3937,17 @@ fn render_hermes_spawn_instructions(resolved: &ResolvedSpawnConfig) -> Option<St
     }
 }
 
+pub(crate) fn session_is_resumable_for_workspace_roots(
+    workspace_roots: &[String],
+    resolved: &ResolvedSpawnConfig,
+) -> bool {
+    render_hermes_spawn_instructions(resolved).is_none()
+        || matches!(
+            crate::remote::parse_remote_workspace_roots(workspace_roots),
+            Ok(None)
+        )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HermesModelSelection {
     model: String,
@@ -4187,7 +4201,7 @@ fn session_tools_include_managed_mcp(tools: &serde_json::Map<String, Value>) -> 
     })
 }
 
-fn parse_session_list(value: &Value) -> Result<Vec<BackendSession>, String> {
+fn parse_session_list(value: &Value, resumable: bool) -> Result<Vec<BackendSession>, String> {
     let sessions = value
         .get("sessions")
         .and_then(Value::as_array)
@@ -4207,7 +4221,7 @@ fn parse_session_list(value: &Value) -> Result<Vec<BackendSession>, String> {
             token_count: None,
             created_at_ms: timestamp,
             updated_at_ms: timestamp,
-            resumable: true,
+            resumable,
         });
     }
     Ok(out)
@@ -7250,18 +7264,44 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn hermes_session_catalog_advertises_reseeded_resume_support() {
-        let sessions = parse_session_list(&json!({
+    fn hermes_session_catalog_reflects_system_overlay_support() {
+        let value = json!({
             "sessions": [{
                 "id": "stored",
                 "title": "Resumable Hermes session",
                 "started_at": 1_700_000_000.0
             }]
-        }))
-        .expect("session catalog");
+        });
+        let sessions = parse_session_list(&value, true).expect("local session catalog");
 
         assert_eq!(sessions.len(), 1);
         assert!(sessions[0].resumable);
+        let sessions = parse_session_list(&value, false).expect("remote session catalog");
+        assert!(!sessions[0].resumable);
+    }
+
+    #[test]
+    fn hermes_remote_resume_catalog_matches_the_instruction_overlay_gate() {
+        let remote_roots = vec!["ssh://builder.example/work/repo".to_string()];
+        let local_roots = vec!["/work/repo".to_string()];
+        let plain = ResolvedSpawnConfig::default();
+        let protected = ResolvedSpawnConfig {
+            access_mode: BackendAccessMode::ReadOnly,
+            ..ResolvedSpawnConfig::default()
+        };
+
+        assert!(session_is_resumable_for_workspace_roots(
+            &remote_roots,
+            &plain
+        ));
+        assert!(!session_is_resumable_for_workspace_roots(
+            &remote_roots,
+            &protected
+        ));
+        assert!(session_is_resumable_for_workspace_roots(
+            &local_roots,
+            &protected
+        ));
     }
 
     #[test]
@@ -8148,8 +8188,15 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn hermes_lifecycle_status_does_not_fabricate_retry_numbers() {
+    fn hermes_trailing_lifecycle_status_cannot_rearm_a_cancelled_turn() {
         let mut mapper = HermesEventMapper::default();
+        let _ = mapper.map_event("message.start", None);
+        let cancel_events = mapper.cancel_events("cancelled");
+        assert!(cancel_events.iter().any(|event| matches!(
+            event,
+            ChatEvent::TypingStatusChanged(false)
+        )));
+
         let events = mapper.map_event(
             "status.update",
             Some(json!({
@@ -8158,19 +8205,14 @@ for line in sys.stdin:
             })),
         );
 
-        assert!(matches!(
-            events.as_slice(),
-            [ChatEvent::TypingStatusChanged(true)]
-        ));
-        assert!(events.iter().all(|event| !matches!(
-            event,
-            ChatEvent::RetryAttempt(_)
-        )));
+        assert!(events.is_empty());
+        assert!(mapper.current_message_id.is_none());
     }
 
     #[test]
-    fn hermes_compacting_status_keeps_the_turn_visibly_active() {
+    fn hermes_compacting_status_stays_off_turn_lifecycle() {
         let mut mapper = HermesEventMapper::default();
+        let _ = mapper.map_event("message.start", None);
         let events = mapper.map_event(
             "status.update",
             Some(json!({
@@ -8179,14 +8221,8 @@ for line in sys.stdin:
             })),
         );
 
-        assert!(matches!(
-            events.as_slice(),
-            [ChatEvent::TypingStatusChanged(true)]
-        ));
-        assert!(events.iter().all(|event| !matches!(
-            event,
-            ChatEvent::MessageAdded(_) | ChatEvent::RetryAttempt(_)
-        )));
+        assert!(events.is_empty());
+        assert!(mapper.current_message_id.is_some());
     }
 
     #[test]

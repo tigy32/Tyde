@@ -2105,6 +2105,7 @@ pub(crate) fn spawn_agent_actor(
             ..
         } = request;
         let mut current_start = start.clone();
+        let session_resumability_config = resolved_spawn_config.clone();
         let spawn_config = BackendSpawnConfig {
             execution_mode: BackendExecutionMode::Agent,
             cost_hint,
@@ -2497,6 +2498,7 @@ pub(crate) fn spawn_agent_actor(
             parent_session_id,
             &current_start,
             &current_session_settings,
+            &session_resumability_config,
             &mut pending_alias,
         )
         .await
@@ -5990,6 +5992,7 @@ async fn persist_agent_session(
     parent_session_id: Option<SessionId>,
     current_start: &AgentStartPayload,
     current_session_settings: &SessionSettingsValues,
+    resolved_spawn_config: &customization::ResolvedSpawnConfig,
     pending_alias: &mut Option<InitialAgentAlias>,
 ) -> Result<(), String> {
     let session = BackendSession {
@@ -6001,7 +6004,12 @@ async fn persist_agent_session(
         created_at_ms: Some(current_start.created_at_ms),
         updated_at_ms: Some(current_start.created_at_ms),
         resumable: current_start.origin != AgentOrigin::BackendNative
-            && backend_session_is_resumable(current_start.backend_kind, session_id),
+            && backend_session_is_resumable(
+                current_start.backend_kind,
+                session_id,
+                &current_start.workspace_roots,
+                resolved_spawn_config,
+            ),
     };
 
     {
@@ -6029,14 +6037,19 @@ async fn persist_agent_session(
     Ok(())
 }
 
-fn backend_session_is_resumable(backend_kind: BackendKind, session_id: &SessionId) -> bool {
+fn backend_session_is_resumable(
+    backend_kind: BackendKind,
+    session_id: &SessionId,
+    workspace_roots: &[String],
+    resolved_spawn_config: &customization::ResolvedSpawnConfig,
+) -> bool {
     match backend_kind {
         BackendKind::Antigravity => is_antigravity_native_session_id(session_id),
-        BackendKind::Tycode
-        | BackendKind::Kiro
-        | BackendKind::Claude
-        | BackendKind::Codex
-        | BackendKind::Hermes => true,
+        BackendKind::Hermes => crate::backend::hermes::session_is_resumable_for_workspace_roots(
+            workspace_roots,
+            resolved_spawn_config,
+        ),
+        BackendKind::Tycode | BackendKind::Kiro | BackendKind::Claude | BackendKind::Codex => true,
     }
 }
 

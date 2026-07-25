@@ -312,6 +312,10 @@ async fn collect_supervision_events(
 
 fn supervision_backend_error_kind(backend_kind: BackendKind) -> SupervisionFailureKind {
     if backend_kind == BackendKind::Hermes {
+        // Hermes exposes terminal gateway errors without a machine-readable
+        // retry disposition. Fail closed so permanent auth/entitlement faults
+        // cannot multiply paid supervisor calls; transient faults also stop
+        // until user activity until Hermes adds structured error taxonomy.
         SupervisionFailureKind::BackendTerminal
     } else {
         SupervisionFailureKind::BackendStream
@@ -907,6 +911,21 @@ mod tests {
             supervision_backend_error_kind(BackendKind::Claude),
             SupervisionFailureKind::BackendStream
         );
+    }
+
+    #[test]
+    fn supervisor_hermes_terminal_taxonomy_fails_closed_without_parsing_prose() {
+        for message in [
+            "No allowed providers are available for the selected model.",
+            "provider connection reset before response",
+        ] {
+            let failure = SupervisionFailure::new(
+                supervision_backend_error_kind(BackendKind::Hermes),
+                message,
+            );
+            assert_eq!(failure.kind, SupervisionFailureKind::BackendTerminal);
+            assert!(!failure.is_retryable());
+        }
     }
 
     #[test]
