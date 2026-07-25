@@ -8556,8 +8556,7 @@ impl CodexInner {
                             .completed_message_metadata_by_turn
                             .insert(turn_id.clone(), pending.clone());
                     }
-                    let model_token_usage =
-                        state.model_token_usage_by_turn.get(&turn_id).cloned();
+                    let model_token_usage = state.model_token_usage_by_turn.get(&turn_id).cloned();
                     metadata_update =
                         Some((pending, token_usage, model_token_usage, context_breakdown));
                 }
