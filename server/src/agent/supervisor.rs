@@ -9,7 +9,7 @@
 
 use protocol::{
     ChatEvent, ChatMessage, Envelope, FrameKind, MessageSender, SUPERVISOR_MESSAGE_PREFIX,
-    SendMessagePayload, Task, TaskList, TaskStatus,
+    SendMessagePayload, SessionSettingsValues, Task, TaskList, TaskStatus,
 };
 use tokio::sync::mpsc;
 
@@ -55,6 +55,10 @@ impl SupervisionFailure {
             kind,
             message: message.into(),
         }
+    }
+
+    pub(crate) fn is_retryable(&self) -> bool {
+        !matches!(self.kind, SupervisionFailureKind::BackendStart)
     }
 }
 
@@ -170,6 +174,7 @@ pub(crate) struct GenerateSupervisionVerdictRequest {
     pub max_kicks: u32,
     /// Model tier for the verdict call; `None` runs the backend's default.
     pub cost_hint: Option<SpawnCostHint>,
+    pub session_settings: Option<SessionSettingsValues>,
     pub use_mock_backend: bool,
     pub capacity_tx: HostCapacityTx,
 }
@@ -182,7 +187,8 @@ pub(crate) async fn generate_supervision_verdict(
     }
 
     let prompt = build_supervision_prompt(&request);
-    let spawn_config = supervision_spawn_config(request.cost_hint);
+    let spawn_config =
+        supervision_spawn_config(request.cost_hint, request.session_settings.clone());
     let isolated_workspace = tempfile::tempdir().map_err(|err| {
         SupervisionFailure::new(
             SupervisionFailureKind::BackendStart,
@@ -235,13 +241,16 @@ pub(crate) async fn generate_supervision_verdict(
     result
 }
 
-fn supervision_spawn_config(cost_hint: Option<SpawnCostHint>) -> BackendSpawnConfig {
+fn supervision_spawn_config(
+    cost_hint: Option<SpawnCostHint>,
+    session_settings: Option<SessionSettingsValues>,
+) -> BackendSpawnConfig {
     BackendSpawnConfig {
         execution_mode: BackendExecutionMode::InferenceOnly,
         cost_hint,
         custom_agent_id: None,
         startup_mcp_servers: Vec::new(),
-        session_settings: None,
+        session_settings,
         backend_config: Default::default(),
         resolved_spawn_config: super::customization::ResolvedSpawnConfig {
             tool_policy: ToolPolicy::AllowList { tools: Vec::new() },
@@ -795,6 +804,7 @@ mod tests {
             kicks_so_far: 1,
             max_kicks: 3,
             cost_hint: Some(SpawnCostHint::Low),
+            session_settings: None,
             use_mock_backend: true,
             capacity_tx: mpsc::unbounded_channel().0,
         };
@@ -824,6 +834,7 @@ mod tests {
                 kicks_so_far: 0,
                 max_kicks: 3,
                 cost_hint: Some(SpawnCostHint::Low),
+                session_settings: None,
                 use_mock_backend: true,
                 capacity_tx: mpsc::unbounded_channel().0,
             }
@@ -855,5 +866,41 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn supervisor_backend_start_failure_is_not_retried() {
+        let start = SupervisionFailure::new(
+            SupervisionFailureKind::BackendStart,
+            "profile authentication is unavailable",
+        );
+        let stream = SupervisionFailure::new(
+            SupervisionFailureKind::BackendStream,
+            "transient stream ended",
+        );
+
+        assert!(!start.is_retryable());
+        assert!(stream.is_retryable());
+    }
+
+    #[test]
+    fn supervisor_spawn_preserves_scoped_hermes_profile() {
+        let mut settings = SessionSettingsValues::default();
+        settings.0.insert(
+            crate::backend::hermes::HERMES_PROFILE_SETTING.to_string(),
+            protocol::SessionSettingValue::String("work".to_string()),
+        );
+
+        let config = supervision_spawn_config(Some(SpawnCostHint::Low), Some(settings.clone()));
+
+        assert_eq!(config.session_settings, Some(settings));
+        assert_eq!(
+            config.resolved_spawn_config.tool_policy,
+            ToolPolicy::AllowList { tools: Vec::new() }
+        );
+        assert_eq!(
+            config.resolved_spawn_config.access_mode,
+            BackendAccessMode::ReadOnly
+        );
     }
 }

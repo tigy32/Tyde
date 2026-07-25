@@ -2913,8 +2913,12 @@ pub(crate) fn spawn_agent_actor(
                                     "ignoring backend idle marker before idle was armed"
                                 );
                             }
+                            let visibly_busy = backend_turn_visibly_busy(
+                                typing,
+                                pending_tool_response_ids.len(),
+                            );
                             status_handle.update(|s| {
-                                s.is_thinking = typing;
+                                s.is_thinking = visibly_busy;
                                 if completed_by_idle {
                                     s.turn_completed = true;
                                 }
@@ -3923,6 +3927,7 @@ pub(crate) fn spawn_agent_actor(
                                     }
                                     if let Err(err) = validate_runtime_session_settings_update(
                                         current_start.backend_kind,
+                                        &current_session_settings,
                                         &update.values,
                                     ) {
                                         let payload = AgentErrorPayload {
@@ -3951,10 +3956,17 @@ pub(crate) fn spawn_agent_actor(
                                         .await;
                                         continue;
                                     }
+                                    let mut backend_update = update.clone();
+                                    if current_start.backend_kind == BackendKind::Hermes {
+                                        backend_update
+                                            .values
+                                            .0
+                                            .remove(crate::backend::hermes::HERMES_PROFILE_SETTING);
+                                    }
                                     if let Err(err) = backend
                                         .as_mut()
                                         .expect("backend must exist while actor is running")
-                                        .update_session_settings(update)
+                                        .update_session_settings(backend_update)
                                         .await
                                     {
                                         let payload = AgentErrorPayload {
@@ -6269,6 +6281,10 @@ async fn mark_agent_turn_active(status_handle: &registry::AgentStatusHandle) {
             status.activity_counter = status.activity_counter.saturating_add(1);
         })
         .await;
+}
+
+fn backend_turn_visibly_busy(backend_typing: bool, pending_tool_responses: usize) -> bool {
+    backend_typing || pending_tool_responses > 0
 }
 
 fn record_agent_started(status: &mut registry::AgentStatus, is_resume: bool) {
@@ -10654,6 +10670,13 @@ mod tests {
         assert!(!status.turn_completed);
         assert!(status.is_active());
         assert_eq!(status.status(), AgentControlStatus::Thinking);
+    }
+
+    #[test]
+    fn pending_tool_response_keeps_backend_visibly_busy() {
+        assert!(backend_turn_visibly_busy(false, 1));
+        assert!(backend_turn_visibly_busy(true, 0));
+        assert!(!backend_turn_visibly_busy(false, 0));
     }
 
     #[tokio::test]

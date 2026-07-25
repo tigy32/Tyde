@@ -10,9 +10,10 @@ use protocol::{
     AgentInput, BackendConfigSnapshotStatus, BackendKind, BackendNativeSettingsSnapshot,
     BackendSetupDiagnosticCode, BackgroundTaskState, BackgroundTaskStatus, ChatEvent, ChatMessage,
     ContextBreakdown, MessageSender, MessageTokenUsage, ModelInfo, OperationCancelledData,
-    SelectOption, SendMessageToolResponse, SessionId, SessionSettingField, SessionSettingFieldType,
-    SessionSettingValue, SessionSettingsSchema, SessionSettingsValues, StreamEndData,
-    StreamStartData, StreamTextDeltaData, TokenUsage, TokenUsageUnavailableReason,
+    RetryAttemptData, SelectOption, SendMessageToolResponse, SessionId, SessionSettingField,
+    SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SessionSettingsValues,
+    StreamEndData, StreamStartData, StreamTextDeltaData, TokenUsage, TokenUsageScope,
+    TokenUsageUnavailableReason,
     ToolExecutionCompletedData, ToolExecutionResult, ToolProgressData, ToolProgressUpdate,
     ToolRequest, ToolRequestType, ToolUseData,
 };
@@ -52,6 +53,11 @@ const HERMES_BRIDGE_EXECUTABLE_ENV: &str = "TYDE_HERMES_BRIDGE_EXECUTABLE";
 const HERMES_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const HERMES_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const HERMES_USAGE_TIMEOUT: Duration = Duration::from_secs(2);
+const HERMES_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
+const HERMES_SHUTDOWN_GRACE: Duration = Duration::from_secs(4);
+#[cfg(test)]
+const HERMES_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 const HERMES_MODEL_PROVIDER_FLAG: &str = " --provider ";
 const HERMES_TOOLSETS_ENV: &str = "HERMES_TUI_TOOLSETS";
 const HERMES_TOOL_PROGRESS_ENV: &str = "HERMES_TUI_TOOL_PROGRESS";
@@ -195,7 +201,7 @@ enum HermesBackendCommand {
     ),
     SetSubagentEmitter(Arc<dyn SubAgentEmitter>, oneshot::Sender<()>),
     Interrupt(oneshot::Sender<bool>),
-    Shutdown,
+    Shutdown(oneshot::Sender<()>),
 }
 
 #[derive(Clone)]
@@ -210,7 +216,7 @@ enum HermesGatewayCommand {
         params: Value,
         reply: oneshot::Sender<Result<Value, String>>,
     },
-    Shutdown,
+    Shutdown(oneshot::Sender<()>),
 }
 
 enum HermesGatewayInbound {
@@ -330,7 +336,8 @@ struct HermesEventMapper {
     cancelled_tools: HashSet<String>,
     background_tasks: HashMap<String, HermesBackgroundTask>,
     pending_approval_tool_id: Option<String>,
-    cumulative_usage: Option<TokenUsage>,
+    last_session_usage: Option<TokenUsage>,
+    cumulative_usage_incomplete: bool,
     awaiting_interrupted_complete: bool,
     session_info_emitted: bool,
     approval_counter: u64,
@@ -491,6 +498,13 @@ impl Backend for HermesBackend {
         session_id: SessionId,
     ) -> Result<(Self, EventStream), String> {
         reject_unverified_resume_capabilities(&config)?;
+        if render_hermes_spawn_instructions(&config.resolved_spawn_config).is_some() {
+            return Err(
+                "Hermes cannot safely resume this session because the gateway does not persist \
+                 Tyde access, steering, custom-agent, or skill instructions; start a new session"
+                    .to_string(),
+            );
+        }
         let resolved_settings = resolve_session_settings(&config);
         let profile = resolve_session_profile(&resolved_settings)?;
         let (gateway, gateway_events_rx) = HermesGatewayHandle::spawn(
@@ -529,7 +543,10 @@ impl Backend for HermesBackend {
         let actor = HermesSessionActor {
             gateway: gateway.clone(),
             live_session_id,
-            mapper: HermesEventMapper::default(),
+            mapper: HermesEventMapper {
+                cumulative_usage_incomplete: true,
+                ..HermesEventMapper::default()
+            },
             events_tx,
             command_rx,
             gateway_events_rx,
@@ -625,7 +642,14 @@ impl Backend for HermesBackend {
     }
 
     async fn shutdown(self) {
-        let _ = self.command_tx.send(HermesBackendCommand::Shutdown);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .command_tx
+            .send(HermesBackendCommand::Shutdown(reply_tx))
+            .is_ok()
+        {
+            let _ = tokio::time::timeout(HERMES_SHUTDOWN_TIMEOUT, reply_rx).await;
+        }
     }
 }
 
@@ -649,9 +673,13 @@ pub(crate) const HERMES_PROFILE_SETTING: &str = "profile";
 /// A running Hermes session's gateway is bound to the profile's HERMES_HOME
 /// it was spawned with; the profile cannot change mid-session.
 pub(crate) fn validate_runtime_session_settings_update(
+    current: &SessionSettingsValues,
     update: &SessionSettingsValues,
 ) -> Result<(), String> {
-    if update.0.contains_key(HERMES_PROFILE_SETTING) {
+    if let Some(requested) = update.0.get(HERMES_PROFILE_SETTING)
+        && normalized_profile_setting(Some(requested))
+            != normalized_profile_setting(current.0.get(HERMES_PROFILE_SETTING))
+    {
         return Err(
             "Hermes profile cannot be changed on a running session; start a new Hermes session \
              with the desired profile"
@@ -659,6 +687,16 @@ pub(crate) fn validate_runtime_session_settings_update(
         );
     }
     Ok(())
+}
+
+fn normalized_profile_setting(value: Option<&SessionSettingValue>) -> Option<&str> {
+    match value {
+        Some(SessionSettingValue::String(name)) if !name.trim().is_empty() => Some(name.trim()),
+        Some(SessionSettingValue::Null) | None => Some(hermes_config_default_profile()),
+        Some(SessionSettingValue::String(_))
+        | Some(SessionSettingValue::Bool(_))
+        | Some(SessionSettingValue::Integer(_)) => None,
+    }
 }
 
 fn resolve_session_profile(settings: &SessionSettingsValues) -> Result<HermesProfileRef, String> {
@@ -898,8 +936,13 @@ pub(crate) async fn persist_native_settings(
         config_writes.push((profile, base.clone(), profile_settings.config.clone()));
     }
 
+    let mut credential_errors = Vec::new();
     for (profile, actions) in &actions_by_profile {
-        run_credential_actions_for_profile(workspace_roots, profile, actions).await?;
+        if let Err(error) =
+            run_credential_actions_for_profile(workspace_roots, profile, actions).await
+        {
+            credential_errors.push(error);
+        }
     }
 
     for (profile, base, config) in &config_writes {
@@ -912,7 +955,14 @@ pub(crate) async fn persist_native_settings(
         }
         hermes_config::apply_profile_config(&profile.home_dir, config)?;
     }
-    Ok(())
+    if credential_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Hermes saved the unrelated configuration changes, but credential actions failed: {}",
+            credential_errors.join("; ")
+        ))
+    }
 }
 
 async fn run_credential_actions_for_profile(
@@ -929,7 +979,7 @@ async fn run_credential_actions_for_profile(
         profile,
     )
     .await?;
-    let mut result = Ok(());
+    let mut errors = Vec::new();
     for action in actions {
         let outcome = match action {
             HermesCredentialAction::SaveApiKey {
@@ -947,21 +997,32 @@ async fn run_credential_actions_for_profile(
                         .map(|_| ())
                 }
             }
+            HermesCredentialAction::Disconnect { provider, .. } if !profile.is_default() => Err(
+                format!(
+                    "disconnect for provider '{provider}' is disabled because Hermes cannot \
+                     prove that credential deletion is scoped to named profile '{}'",
+                    profile.name
+                ),
+            ),
             HermesCredentialAction::Disconnect { provider, .. } => gateway
                 .request("model.disconnect", json!({ "slug": provider }))
                 .await
                 .map(|_| ()),
         };
         if let Err(error) = outcome {
-            result = Err(format!(
-                "Hermes credential update failed for profile '{}': {error}",
-                profile.name
-            ));
-            break;
+            errors.push(error);
         }
     }
     gateway.shutdown().await;
-    result
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "profile '{}': {}",
+            profile.name,
+            errors.join("; ")
+        ))
+    }
 }
 
 /// One discovered Hermes profile as the launch-profile catalog sees it.
@@ -1051,7 +1112,7 @@ fn session_schema_probe_from_model_options(
         .ok_or_else(|| "Hermes default profile probe produced no models".to_string())?;
 
     let mut fields = Vec::new();
-    if per_profile.len() > 1 {
+    if infos.len() > 1 {
         fields.push(SessionSettingField {
             key: HERMES_PROFILE_SETTING.to_string(),
             label: "Profile".to_string(),
@@ -1063,14 +1124,16 @@ fn session_schema_probe_from_model_options(
             use_slider: false,
             select_options_by_setting: None,
             field_type: SessionSettingFieldType::Select {
-                options: per_profile
+                options: infos
                     .iter()
-                    .map(|models| SelectOption {
-                        value: models.name.clone(),
-                        label: if models.name == hermes_config_default_profile() {
+                    .map(|info| SelectOption {
+                        value: info.name.clone(),
+                        label: if info.name == hermes_config_default_profile() {
                             "Default".to_string()
+                        } else if let Some(error) = &info.error {
+                            format!("{} — Unavailable: {error}", info.name)
                         } else {
-                            models.name.clone()
+                            info.name.clone()
                         },
                     })
                     .collect(),
@@ -1086,7 +1149,7 @@ fn session_schema_probe_from_model_options(
             "Hermes model from authenticated providers reported by model.options.".to_string(),
         ),
         use_slider: false,
-        select_options_by_setting: (per_profile.len() > 1).then(|| {
+        select_options_by_setting: (infos.len() > 1).then(|| {
             protocol::SelectOptionsBySetting {
                 setting_key: HERMES_PROFILE_SETTING.to_string(),
                 values: per_profile
@@ -1185,7 +1248,11 @@ impl HermesSessionActor {
                             let ok = self.handle_interrupt().await;
                             let _ = reply.send(ok);
                         }
-                        HermesBackendCommand::Shutdown => break,
+                        HermesBackendCommand::Shutdown(reply) => {
+                            self.gateway.shutdown().await;
+                            let _ = reply.send(());
+                            return;
+                        }
                     }
                 }
             }
@@ -1456,7 +1523,15 @@ impl HermesSessionActor {
                     return true;
                 }
                 if event_type == "message.complete" {
-                    payload = self.enrich_message_complete_payload(payload).await;
+                    let status = payload
+                        .as_ref()
+                        .and_then(|value| optional_string(value, &["status"]));
+                    let cancelled_settlement = (self.mapper.awaiting_interrupted_complete
+                        && self.mapper.current_message_id.is_none())
+                        || status.as_deref() == Some("interrupted");
+                    if !cancelled_settlement {
+                        payload = self.enrich_message_complete_payload(payload).await;
+                    }
                 }
                 let mapped = self.mapper.map_event(&event_type, payload);
                 for event in mapped {
@@ -1630,22 +1705,16 @@ impl HermesSessionActor {
             turn_usage = match usage_result {
                 Ok(Ok(value)) => token_usage_from_value(&value),
                 Ok(Err(err)) => {
-                    self.emit(ChatEvent::MessageAdded(warning_message(format!(
-                        "Hermes session.usage failed: {err}"
-                    ))));
+                    tracing::debug!(error = %err, "Hermes session.usage failed");
                     None
                 }
                 Err(_) => {
-                    self.emit(ChatEvent::MessageAdded(warning_message(
-                        "Hermes session.usage timed out",
-                    )));
+                    tracing::debug!("Hermes session.usage timed out");
                     None
                 }
             };
             if turn_usage.is_none() {
-                self.emit(ChatEvent::MessageAdded(warning_message(
-                    "Hermes session.usage did not report token counts",
-                )));
+                tracing::debug!("Hermes session.usage did not report token counts");
             }
         }
 
@@ -1661,9 +1730,9 @@ impl HermesSessionActor {
             Ok(Ok(value)) => match context_breakdown_from_hermes(&value) {
                 Some(context_breakdown) => Some(context_breakdown),
                 None => {
-                    self.emit(ChatEvent::MessageAdded(warning_message(
-                        "Hermes session.context_breakdown did not report context usage",
-                    )));
+                    tracing::debug!(
+                        "Hermes session.context_breakdown did not report context usage"
+                    );
                     None
                 }
             },
@@ -1675,36 +1744,32 @@ impl HermesSessionActor {
                 if is_unsupported_gateway_method(&err) {
                     tracing::debug!(error = %err, "Hermes gateway lacks session.context_breakdown");
                 } else {
-                    self.emit(ChatEvent::MessageAdded(warning_message(format!(
-                        "Hermes session.context_breakdown failed: {err}"
-                    ))));
+                    tracing::debug!(error = %err, "Hermes session.context_breakdown failed");
                 }
                 None
             }
             Err(_) => {
-                self.emit(ChatEvent::MessageAdded(warning_message(
-                    "Hermes session.context_breakdown timed out",
-                )));
+                tracing::debug!("Hermes session.context_breakdown timed out");
                 None
             }
         };
 
         if let Some(object) = payload.as_object_mut() {
-            if let Some(turn_usage) = turn_usage {
-                // Hermes constructs a fresh agent for each prompt, so both the
-                // message payload and session.usage expose this turn's counters.
-                // Tyde owns the task-wide cumulative scope across those turns.
-                let cumulative =
-                    token_usage_sum(self.mapper.cumulative_usage.as_ref(), &turn_usage);
-                self.mapper.cumulative_usage = Some(cumulative.clone());
+            if let Some(session_usage) = turn_usage {
+                let (turn_usage, cumulative_usage) =
+                    self.mapper.record_session_usage(session_usage);
                 object.insert(
                     "usage".to_string(),
                     token_usage_to_gateway_value(&turn_usage),
                 );
-                object.insert(
-                    "cumulative_usage".to_string(),
-                    token_usage_to_gateway_value(&cumulative),
-                );
+                if let Some(cumulative_usage) = cumulative_usage {
+                    object.insert(
+                        "cumulative_usage".to_string(),
+                        token_usage_to_gateway_value(&cumulative_usage),
+                    );
+                } else {
+                    object.remove("cumulative_usage");
+                }
             }
             if let Some(context_breakdown) = context_breakdown {
                 object.insert(
@@ -1812,12 +1877,13 @@ impl HermesGatewayHandle {
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        let (force_shutdown_tx, force_shutdown_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = oneshot::channel();
 
         spawn_stdout_reader(stdout, inbound_tx.clone());
         spawn_stderr_reader(stderr, inbound_tx.clone());
-        spawn_child_waiter(child, inbound_tx);
+        spawn_child_waiter(child, inbound_tx, force_shutdown_rx);
         tokio::spawn(run_gateway_actor(
             stdin,
             command_rx,
@@ -1825,6 +1891,7 @@ impl HermesGatewayHandle {
             event_tx,
             Some(ready_tx),
             mcp_runtime,
+            force_shutdown_tx,
         ));
 
         let handle = Self {
@@ -1887,7 +1954,14 @@ impl HermesGatewayHandle {
     }
 
     async fn shutdown(&self) {
-        let _ = self.tx.send(HermesGatewayCommand::Shutdown);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(HermesGatewayCommand::Shutdown(reply_tx))
+            .is_ok()
+        {
+            let _ = tokio::time::timeout(HERMES_SHUTDOWN_TIMEOUT, reply_rx).await;
+        }
     }
 }
 
@@ -2059,10 +2133,12 @@ async fn run_gateway_actor(
     event_tx: mpsc::UnboundedSender<HermesGatewayEvent>,
     mut ready_tx: Option<oneshot::Sender<Result<(), String>>>,
     _mcp_runtime: Option<HermesMcpRuntime>,
+    force_shutdown_tx: mpsc::UnboundedSender<()>,
 ) {
     let mut next_id = 1_u64;
     let mut pending: HashMap<u64, oneshot::Sender<Result<Value, String>>> = HashMap::new();
     let mut startup_stderr = VecDeque::new();
+    let mut shutdown_reply = None;
 
     loop {
         tokio::select! {
@@ -2070,6 +2146,12 @@ async fn run_gateway_actor(
                 let Some(command) = maybe_command else { break; };
                 match command {
                     HermesGatewayCommand::Request { method, params, reply } => {
+                        if shutdown_reply.is_some() {
+                            let _ = reply.send(Err(
+                                "Hermes gateway is shutting down".to_string()
+                            ));
+                            continue;
+                        }
                         let id = next_id;
                         next_id = next_id.saturating_add(1);
                         let frame = json!({
@@ -2093,7 +2175,19 @@ async fn run_gateway_actor(
                             }
                         }
                     }
-                    HermesGatewayCommand::Shutdown => break,
+                    HermesGatewayCommand::Shutdown(reply) => {
+                        if shutdown_reply.is_none() {
+                            shutdown_reply = Some(reply);
+                            let _ = stdin.shutdown().await;
+                            let force_shutdown_tx = force_shutdown_tx.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(HERMES_SHUTDOWN_GRACE).await;
+                                let _ = force_shutdown_tx.send(());
+                            });
+                        } else {
+                            let _ = reply.send(());
+                        }
+                    }
                 }
             }
             maybe_inbound = inbound_rx.recv() => {
@@ -2146,6 +2240,9 @@ async fn run_gateway_actor(
 
     for (_id, reply) in pending.drain() {
         let _ = reply.send(Err("Hermes gateway actor stopped".to_string()));
+    }
+    if let Some(reply) = shutdown_reply {
+        let _ = reply.send(());
     }
 }
 
@@ -2306,11 +2403,22 @@ fn spawn_stderr_reader(
 fn spawn_child_waiter(
     mut child: AsyncGroupChild,
     inbound_tx: mpsc::UnboundedSender<HermesGatewayInbound>,
+    mut force_shutdown_rx: mpsc::UnboundedReceiver<()>,
 ) {
     tokio::spawn(async move {
-        let code = match child.wait().await {
-            Ok(status) => status.code(),
-            Err(_) => None,
+        let code = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status.code(),
+                Ok(None) => {}
+                Err(_) => break None,
+            }
+            tokio::select! {
+                _ = force_shutdown_rx.recv() => {
+                    let _ = child.kill().await;
+                    break child.try_wait().ok().flatten().and_then(|status| status.code());
+                }
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+            }
         };
         let _ = inbound_tx.send(HermesGatewayInbound::Closed(code));
     });
@@ -2710,9 +2818,25 @@ impl HermesEventMapper {
         if text == "ready" || text.trim().is_empty() || kind == "process" {
             return Ok(Vec::new());
         }
-        Ok(vec![ChatEvent::MessageAdded(system_message(format!(
-            "Hermes {kind}: {text}"
-        )))])
+        if matches!(kind.as_str(), "retry" | "lifecycle") {
+            return Ok(vec![ChatEvent::RetryAttempt(RetryAttemptData {
+                attempt: payload
+                    .get("attempt")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                max_retries: payload
+                    .get("max_retries")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                error: text,
+                backoff_ms: payload
+                    .get("backoff_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            })]);
+        }
+        tracing::debug!(status_kind = %kind, status = %text, "Hermes transient status");
+        Ok(Vec::new())
     }
 
     fn map_message_start(&mut self) -> Result<Vec<ChatEvent>, String> {
@@ -2807,10 +2931,7 @@ impl HermesEventMapper {
             Some(raw) => raw.trim().to_string(),
             None => "complete".to_string(),
         };
-        if self.awaiting_interrupted_complete
-            && status == "interrupted"
-            && self.current_message_id.is_none()
-        {
+        if self.awaiting_interrupted_complete && self.current_message_id.is_none() {
             self.awaiting_interrupted_complete = false;
             return Ok(Vec::new());
         }
@@ -2852,15 +2973,26 @@ impl HermesEventMapper {
                 events.extend(self.cancel_events("Operation cancelled"));
             }
             "error" | "failed" => {
+                let error_text =
+                    optional_string(&payload, &["error"]).or_else(|| stream_final_text.clone());
+                if error_text.as_ref().is_some_and(|error| {
+                    !self.current_text.trim().is_empty()
+                        && self.current_text.trim() == error.trim()
+                }) {
+                    self.current_text.clear();
+                }
+                let assistant_final = stream_final_text.clone().filter(|text| {
+                    error_text
+                        .as_ref()
+                        .is_none_or(|error| text.trim() != error.trim())
+                });
                 events.extend(self.finish_stream_events(
-                    stream_final_text.clone(),
+                    assistant_final,
                     usage,
                     cumulative_usage,
                     context_breakdown,
                 ));
-                if let Some(error_text) =
-                    optional_string(&payload, &["error"]).or_else(|| stream_final_text.clone())
-                {
+                if let Some(error_text) = error_text {
                     events.push(ChatEvent::MessageAdded(error_message(error_text)));
                 } else {
                     events.push(ChatEvent::MessageAdded(error_message(
@@ -3128,17 +3260,14 @@ impl HermesEventMapper {
         self.pending_approval_tool_id = Some(tool_call_id.clone());
         self.pending_tools
             .insert(tool_call_id.clone(), "approval.request".to_string());
-        Ok(vec![
-            ChatEvent::ToolRequest(ToolRequest {
-                tool_call_id,
-                tool_name: "approval.request".to_string(),
-                tool_type: ToolRequestType::ExitPlanMode {
-                    plan: Some(question),
-                    plan_path: None,
-                },
-            }),
-            ChatEvent::TypingStatusChanged(false),
-        ])
+        Ok(vec![ChatEvent::ToolRequest(ToolRequest {
+            tool_call_id,
+            tool_name: "approval.request".to_string(),
+            tool_type: ToolRequestType::ExitPlanMode {
+                plan: Some(question),
+                plan_path: None,
+            },
+        })])
     }
 
     fn map_error(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
@@ -3146,7 +3275,35 @@ impl HermesEventMapper {
         let message = optional_string(&payload, &["message"])
             .or_else(|| optional_string(&payload, &["error"]))
             .unwrap_or_else(|| payload.to_string());
-        Ok(self.fail_active_turn(message))
+        Ok(vec![ChatEvent::RetryAttempt(RetryAttemptData {
+            attempt: payload
+                .get("attempt")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            max_retries: payload
+                .get("max_retries")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            error: message,
+            backoff_ms: payload
+                .get("backoff_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        })])
+    }
+
+    fn record_session_usage(
+        &mut self,
+        session_usage: TokenUsage,
+    ) -> (TokenUsage, Option<TokenUsage>) {
+        let (turn_usage, reset) =
+            token_usage_delta(self.last_session_usage.as_ref(), &session_usage);
+        if reset {
+            self.cumulative_usage_incomplete = true;
+        }
+        self.last_session_usage = Some(session_usage.clone());
+        let cumulative_usage = (!self.cumulative_usage_incomplete).then_some(session_usage);
+        (turn_usage, cumulative_usage)
     }
 
     fn finish_stream_events(
@@ -3156,21 +3313,29 @@ impl HermesEventMapper {
         cumulative_usage: Option<TokenUsage>,
         context_breakdown: Option<ContextBreakdown>,
     ) -> Vec<ChatEvent> {
-        let content = final_text.unwrap_or_else(|| self.current_text.clone());
+        let content = reconcile_hermes_stream_text(&self.current_text, final_text.as_deref());
         let message_id = self.current_message_id.take().map(protocol::ChatMessageId);
         let reasoning = None;
         self.current_text.clear();
         self.current_reasoning_seen = false;
         let turn_usage = usage;
         let token_usage = match (turn_usage, cumulative_usage) {
-            (Some(turn), Some(cumulative)) => Some(
-                MessageTokenUsage::request_and_turn_known(turn.clone(), turn)
-                    .with_cumulative(cumulative),
-            ),
-            (Some(turn), None) => Some(MessageTokenUsage::request_and_turn_known(
-                turn.clone(),
-                turn,
-            )),
+            (Some(turn), cumulative) => Some(MessageTokenUsage {
+                request: TokenUsageScope::Unavailable {
+                    reason: TokenUsageUnavailableReason::ProviderScopeAmbiguous,
+                },
+                turn: TokenUsageScope::Known {
+                    usage: Box::new(turn),
+                },
+                cumulative: cumulative.map_or(
+                    TokenUsageScope::Unavailable {
+                        reason: TokenUsageUnavailableReason::ProviderScopeAmbiguous,
+                    },
+                    |usage| TokenUsageScope::Known {
+                        usage: Box::new(usage),
+                    },
+                ),
+            }),
             (None, _) => Some(MessageTokenUsage::unavailable(
                 TokenUsageUnavailableReason::BackendDidNotReport,
             )),
@@ -3232,9 +3397,8 @@ impl HermesEventMapper {
                 ToolExecutionCompletedData {
                     tool_call_id,
                     tool_name,
-                    tool_result: ToolExecutionResult::Error {
-                        short_message: "Cancelled".to_string(),
-                        detailed_message: detailed_message.to_string(),
+                    tool_result: ToolExecutionResult::Cancelled {
+                        message: detailed_message.to_string(),
                     },
                     success: false,
                     error: Some("Cancelled".to_string()),
@@ -3268,6 +3432,7 @@ impl HermesEventMapper {
         self.current_message_id = None;
         self.current_text.clear();
         self.current_reasoning_seen = false;
+        self.awaiting_interrupted_complete = false;
         self.clear_turn_tool_state();
     }
 
@@ -3633,7 +3798,7 @@ fn build_session_create_params(
         "close_on_disconnect": false,
     });
 
-    if let Some(instructions) = render_combined_spawn_instructions(resolved) {
+    if let Some(instructions) = render_hermes_spawn_instructions(resolved) {
         params["messages"] = json!([{ "role": "system", "content": instructions }]);
     }
 
@@ -3660,6 +3825,35 @@ fn build_session_create_params(
     }
 
     Ok(params)
+}
+
+fn render_hermes_spawn_instructions(resolved: &ResolvedSpawnConfig) -> Option<String> {
+    let mut without_skills = resolved.clone();
+    without_skills.skills.clear();
+    let mut sections = render_combined_spawn_instructions(&without_skills)
+        .into_iter()
+        .collect::<Vec<_>>();
+    if !resolved.skills.is_empty() {
+        let names = resolved
+            .skills
+            .iter()
+            .map(|skill| {
+                let name = skill.name.split_whitespace().collect::<Vec<_>>().join(" ");
+                format!("- {name}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(format!(
+            "Selected Tyde skills:\n{names}\n\nUse Hermes skill discovery to load matching \
+             skill instructions on demand. If a selected skill is unavailable, report that \
+             instead of inventing its instructions."
+        ));
+    }
+    if sections.is_empty() {
+        None
+    } else {
+        Some(sections.join("\n\n"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4965,7 +5159,43 @@ fn optional_string_any(value: &Value, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| optional_string(value, &[*key]))
 }
 
+fn reconcile_hermes_stream_text(streamed: &str, final_text: Option<&str>) -> String {
+    let Some(final_text) = final_text.filter(|text| !text.trim().is_empty()) else {
+        return streamed.to_string();
+    };
+    if streamed.trim().is_empty() {
+        return final_text.to_string();
+    }
+
+    let streamed_trimmed = streamed.trim();
+    let final_trimmed = final_text.trim();
+    if streamed_trimmed == final_trimmed || streamed_trimmed.ends_with(final_trimmed) {
+        return streamed.to_string();
+    }
+    if final_trimmed.starts_with(streamed_trimmed) {
+        return final_text.to_string();
+    }
+    format!("{}\n\n{}", streamed.trim_end(), final_text.trim_start())
+}
+
 fn token_usage_from_value(value: &Value) -> Option<TokenUsage> {
+    let reports_usage = [
+        "input",
+        "input_tokens",
+        "output",
+        "output_tokens",
+        "total",
+        "total_tokens",
+        "cached_prompt_tokens",
+        "cache_creation_input_tokens",
+        "reasoning_tokens",
+        "reasoning",
+    ]
+    .iter()
+    .any(|key| value.get(*key).is_some_and(Value::is_number));
+    if !reports_usage {
+        return None;
+    }
     let input_tokens = value
         .get("input")
         .or_else(|| value.get("input_tokens"))
@@ -4981,9 +5211,6 @@ fn token_usage_from_value(value: &Value) -> Option<TokenUsage> {
         .or_else(|| value.get("total_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(input_tokens.saturating_add(output_tokens));
-    if input_tokens == 0 && output_tokens == 0 && total_tokens == 0 {
-        return None;
-    }
     Some(TokenUsage {
         input_tokens,
         output_tokens,
@@ -4992,7 +5219,10 @@ fn token_usage_from_value(value: &Value) -> Option<TokenUsage> {
         cache_creation_input_tokens: value
             .get("cache_creation_input_tokens")
             .and_then(Value::as_u64),
-        reasoning_tokens: value.get("reasoning_tokens").and_then(Value::as_u64),
+        reasoning_tokens: value
+            .get("reasoning_tokens")
+            .or_else(|| value.get("reasoning"))
+            .and_then(Value::as_u64),
     })
 }
 
@@ -5007,30 +5237,53 @@ fn token_usage_to_gateway_value(usage: &TokenUsage) -> Value {
     })
 }
 
-fn token_usage_sum(previous: Option<&TokenUsage>, current: &TokenUsage) -> TokenUsage {
-    let previous = previous.cloned().unwrap_or_default();
-    TokenUsage {
-        input_tokens: previous.input_tokens.saturating_add(current.input_tokens),
-        output_tokens: previous.output_tokens.saturating_add(current.output_tokens),
-        total_tokens: previous.total_tokens.saturating_add(current.total_tokens),
-        cached_prompt_tokens: optional_token_sum(
-            previous.cached_prompt_tokens,
-            current.cached_prompt_tokens,
-        ),
-        cache_creation_input_tokens: optional_token_sum(
+fn token_usage_delta(previous: Option<&TokenUsage>, current: &TokenUsage) -> (TokenUsage, bool) {
+    let Some(previous) = previous else {
+        return (current.clone(), false);
+    };
+    let reset = current.input_tokens < previous.input_tokens
+        || current.output_tokens < previous.output_tokens
+        || current.total_tokens < previous.total_tokens
+        || optional_counter_decreased(previous.cached_prompt_tokens, current.cached_prompt_tokens)
+        || optional_counter_decreased(
             previous.cache_creation_input_tokens,
             current.cache_creation_input_tokens,
-        ),
-        reasoning_tokens: optional_token_sum(previous.reasoning_tokens, current.reasoning_tokens),
+        )
+        || optional_counter_decreased(previous.reasoning_tokens, current.reasoning_tokens);
+    if reset {
+        return (current.clone(), true);
     }
+    (
+        TokenUsage {
+            input_tokens: current.input_tokens - previous.input_tokens,
+            output_tokens: current.output_tokens - previous.output_tokens,
+            total_tokens: current.total_tokens - previous.total_tokens,
+            cached_prompt_tokens: optional_token_delta(
+                previous.cached_prompt_tokens,
+                current.cached_prompt_tokens,
+            ),
+            cache_creation_input_tokens: optional_token_delta(
+                previous.cache_creation_input_tokens,
+                current.cache_creation_input_tokens,
+            ),
+            reasoning_tokens: optional_token_delta(
+                previous.reasoning_tokens,
+                current.reasoning_tokens,
+            ),
+        },
+        false,
+    )
 }
 
-fn optional_token_sum(previous: Option<u64>, current: Option<u64>) -> Option<u64> {
+fn optional_counter_decreased(previous: Option<u64>, current: Option<u64>) -> bool {
+    matches!((previous, current), (Some(previous), Some(current)) if current < previous)
+}
+
+fn optional_token_delta(previous: Option<u64>, current: Option<u64>) -> Option<u64> {
     match (previous, current) {
-        (Some(previous), Some(current)) => Some(previous.saturating_add(current)),
-        (Some(previous), None) => Some(previous),
+        (Some(previous), Some(current)) => Some(current - previous),
         (None, Some(current)) => Some(current),
-        (None, None) => None,
+        (_, None) => None,
     }
 }
 
@@ -5060,17 +5313,35 @@ fn context_breakdown_from_hermes(value: &Value) -> Option<ContextBreakdown> {
             .fold(0_u64, u64::saturating_add)
     };
     let bytes = |tokens: u64| tokens.saturating_mul(4);
+    let system_prompt_tokens = category_tokens(&["system_prompt"]);
+    let tool_tokens = category_tokens(&["tool_definitions", "mcp", "subagent_definitions"]);
+    let conversation_tokens = category_tokens(&["conversation"]);
+    let context_injection_tokens = category_tokens(&["rules", "skills", "memory"]);
+    let reasoning_tokens = value
+        .get("reasoning_tokens")
+        .or_else(|| value.get("reasoning"))
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| category_tokens(&["reasoning"]));
+    let accounted_tokens = system_prompt_tokens
+        .saturating_add(tool_tokens)
+        .saturating_add(conversation_tokens)
+        .saturating_add(context_injection_tokens)
+        .saturating_add(reasoning_tokens);
+    if accounted_tokens != input_tokens {
+        tracing::debug!(
+            input_tokens,
+            accounted_tokens,
+            "Hermes context breakdown is incomplete"
+        );
+        return None;
+    }
 
     Some(ContextBreakdown {
-        system_prompt_bytes: bytes(category_tokens(&["system_prompt"])),
-        tool_io_bytes: bytes(category_tokens(&[
-            "tool_definitions",
-            "mcp",
-            "subagent_definitions",
-        ])),
-        conversation_history_bytes: bytes(category_tokens(&["conversation"])),
-        reasoning_bytes: 0,
-        context_injection_bytes: bytes(category_tokens(&["rules", "skills", "memory"])),
+        system_prompt_bytes: bytes(system_prompt_tokens),
+        tool_io_bytes: bytes(tool_tokens),
+        conversation_history_bytes: bytes(conversation_tokens),
+        reasoning_bytes: bytes(reasoning_tokens),
+        context_injection_bytes: bytes(context_injection_tokens),
         input_tokens,
         context_window,
     })
@@ -5596,23 +5867,25 @@ for line in sys.stdin:
     params = req.get("params") or {}
     if method == "session.create":
         sid = "live1"
-        sessions[sid] = "stored1"
+        sessions[sid] = 0
         print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"session_id":sid,"stored_session_id":"stored1","messages":[],"info":{}}}), flush=True)
         emit("session.info", sid, {"model":"fake-model","provider":"fake","cwd":"/tmp"})
     elif method == "prompt.submit":
         sid = params["session_id"]
+        sessions[sid] = sessions.get(sid, 0) + 1
+        turn = sessions[sid]
         print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"status":"streaming"}}), flush=True)
         emit("message.start", sid)
         emit("reasoning.delta", sid, {"text":"think"})
         emit("message.delta", sid, {"text":"hel"})
         emit("message.delta", sid, {"text":"lo"})
-        emit("message.complete", sid, {"text":"hello","status":"complete","usage":{"input":1,"output":2,"total":3,"cached_prompt_tokens":10,"cache_creation_input_tokens":4,"reasoning_tokens":1}})
+        emit("message.complete", sid, {"text":"hello","status":"complete","usage":{"input":turn,"output":2*turn,"total":3*turn,"cached_prompt_tokens":10*turn,"cache_creation_input_tokens":4*turn,"reasoning_tokens":turn}})
     elif method == "session.interrupt":
         print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"status":"interrupted"}}), flush=True)
     elif method == "session.usage":
         print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"input":1,"output":2,"total":3}}), flush=True)
     elif method == "session.context_breakdown":
-        print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"context_used":12000,"context_max":200000,"categories":[{"id":"system_prompt","tokens":1000},{"id":"tool_definitions","tokens":2000},{"id":"conversation","tokens":5000}]}}), flush=True)
+        print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"context_used":12000,"context_max":200000,"categories":[{"id":"system_prompt","tokens":1000},{"id":"tool_definitions","tokens":2000},{"id":"conversation","tokens":9000}]}}), flush=True)
     elif method == "session.history":
         print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"count":0,"messages":[]}}), flush=True)
     elif method == "session.list":
@@ -6209,8 +6482,14 @@ for line in sys.stdin:
                 nullable,
             } => {
                 let values: Vec<&str> = options.iter().map(|o| o.value.as_str()).collect();
-                assert_eq!(values, vec!["default", "claude"]);
+                assert_eq!(values, vec!["default", "claude", "gpt"]);
                 assert_eq!(options[0].label, "Default");
+                assert!(
+                    options[2].label.contains("Unavailable")
+                        && options[2].label.contains("gateway exploded"),
+                    "failed profiles must remain visible with their error: {:?}",
+                    options[2]
+                );
                 assert_eq!(default.as_deref(), Some("default"));
                 assert!(!nullable);
             }
@@ -6338,6 +6617,87 @@ for line in sys.stdin:
         assert!(
             config.contains("hermes-cli"),
             "unmodeled keys preserved: {config}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hermes_named_profile_disconnect_is_blocked_without_blocking_config_save() {
+        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
+        let dir = TempDir::new().expect("tempdir");
+        let rpc_log = dir.path().join("rpc.jsonl");
+        let fake = write_fake_gateway(
+            &dir,
+            &format!(
+                r#"
+import json, sys
+print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"gateway.ready","payload":{{}}}}}}), flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    with open({rpc_log:?}, "a") as output:
+        output.write(json.dumps({{"method": req["method"], "params": req.get("params")}}) + "\n")
+    print(json.dumps({{"jsonrpc":"2.0","id":req["id"],"result":{{}}}}), flush=True)
+"#
+            ),
+        );
+        let _python_guard = TestHermesPythonGuard::set(&fake);
+        let home = TempDir::new().expect("Hermes home");
+        let profile_home = home.path().join("profiles").join("work");
+        fs::create_dir_all(&profile_home).expect("profile home");
+        fs::write(
+            profile_home.join("config.yaml"),
+            "model:\n  provider: openrouter\n  default: old/model\n",
+        )
+        .expect("profile config");
+        let root_auth = home.path().join("auth.json");
+        let root_auth_bytes = br#"{"providers":{"copilot":{"token":"synthetic"}}}"#;
+        fs::write(&root_auth, root_auth_bytes).expect("synthetic root auth");
+        let _home_guard = TestHermesHomeGuard::set(home.path());
+
+        let base = hermes_config::load_profile_config(&profile_home).expect("base config");
+        let mut changed = base.clone();
+        changed.model.model = Some("new/model".to_string());
+        let doc = protocol::hermes_config::HermesNativeSettingsDoc {
+            version: protocol::hermes_config::HERMES_NATIVE_SETTINGS_VERSION,
+            profiles: vec![protocol::hermes_config::HermesProfileSettings {
+                name: "work".to_string(),
+                home_dir: profile_home.to_string_lossy().to_string(),
+                config: changed,
+                base_config: Some(base),
+                providers: None,
+                providers_error: None,
+                active_model: None,
+                active_provider: None,
+            }],
+            actions: vec![protocol::hermes_config::HermesCredentialAction::Disconnect {
+                profile: "work".to_string(),
+                provider: "copilot".to_string(),
+            }],
+        };
+
+        let error = persist_native_settings(
+            serde_json::to_value(doc).expect("settings"),
+            &[dir.path().to_string_lossy().to_string()],
+        )
+        .await
+        .expect_err("blocked credential action must be reported");
+
+        assert!(error.contains("saved the unrelated configuration"), "{error}");
+        assert!(error.contains("cannot prove"), "{error}");
+        assert_eq!(
+            fs::read(&root_auth).expect("root auth"),
+            root_auth_bytes,
+            "named-profile action must never mutate the default credential store"
+        );
+        assert!(
+            fs::read_to_string(profile_home.join("config.yaml"))
+                .expect("saved profile config")
+                .contains("new/model"),
+            "unrelated config edit must still land"
+        );
+        let rpc = fs::read_to_string(&rpc_log).unwrap_or_default();
+        assert!(
+            !rpc.contains("model.disconnect"),
+            "unsafe disconnect RPC must not be sent: {rpc}"
         );
     }
 
@@ -6476,21 +6836,143 @@ for line in sys.stdin:
             HermesBackend::spawn(Vec::new(), BackendSpawnConfig::default(), payload("hello"))
                 .await
                 .expect("spawn fake hermes");
+        let mut warnings = Vec::new();
         timeout(Duration::from_secs(2), async {
             while let Some(event) = events.recv().await {
-                if matches!(event, ChatEvent::StreamEnd(_)) {
-                    break;
+                match event {
+                    ChatEvent::MessageAdded(ChatMessage {
+                        sender: MessageSender::Warning,
+                        content,
+                        ..
+                    }) => warnings.push(content),
+                    ChatEvent::StreamEnd(_) => break,
+                    _ => {}
                 }
             }
         })
         .await
         .expect("turn should finish");
         backend.shutdown().await;
+        assert!(
+            warnings.is_empty(),
+            "optional usage diagnostics must stay out of chat: {warnings:?}"
+        );
 
         let cwd = fs::read_to_string(&cwd_log).expect("read cwd log");
         assert!(
             cwd.ends_with(".tyde/hermes/no-root"),
             "empty-root gateway cwd must be Tyde-owned no-root dir, got {cwd}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hermes_shutdown_waits_for_child_eof_and_exit() {
+        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
+        let dir = TempDir::new().expect("tempdir");
+        let exited = dir.path().join("child-exited");
+        let fake = write_fake_gateway(
+            &dir,
+            &format!(
+                r#"
+import json, sys, time
+print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"gateway.ready","payload":{{}}}}}}), flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    method = req["method"]
+    if method == "session.create":
+        result = {{"session_id":"live","stored_session_id":"stored"}}
+    elif method == "prompt.submit":
+        result = {{"status":"streaming"}}
+    else:
+        result = {{}}
+    print(json.dumps({{"jsonrpc":"2.0","id":req["id"],"result":result}}), flush=True)
+    if method == "prompt.submit":
+        print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"message.start","session_id":"live"}}}}), flush=True)
+        print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"message.complete","session_id":"live","payload":{{"text":"done","status":"complete","usage":{{"input":1,"output":1,"total":2}}}}}}}}), flush=True)
+time.sleep(0.05)
+print("final shutdown diagnostic", file=sys.stderr, flush=True)
+with open({exited:?}, "w") as output:
+    output.write("exited")
+"#
+            ),
+        );
+        let _guard = TestHermesPythonGuard::set(&fake);
+        let (backend, mut events) =
+            HermesBackend::spawn(Vec::new(), BackendSpawnConfig::default(), payload("hello"))
+                .await
+                .expect("spawn fake Hermes");
+        timeout(Duration::from_secs(2), async {
+            while let Some(event) = events.recv().await {
+                if matches!(event, ChatEvent::StreamEnd(_)) {
+                    return;
+                }
+            }
+            panic!("event stream closed before completion");
+        })
+        .await
+        .expect("turn");
+
+        backend.shutdown().await;
+
+        assert_eq!(
+            fs::read_to_string(&exited).expect("child exit marker"),
+            "exited",
+            "shutdown must await child EOF/exit before returning"
+        );
+    }
+
+    #[tokio::test]
+    async fn hermes_shutdown_forces_a_child_that_ignores_eof() {
+        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
+        let dir = TempDir::new().expect("tempdir");
+        let survived = dir.path().join("child-survived");
+        let fake = write_fake_gateway(
+            &dir,
+            &format!(
+                r#"
+import json, sys, time
+print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"gateway.ready","payload":{{}}}}}}), flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    method = req["method"]
+    if method == "session.create":
+        result = {{"session_id":"live","stored_session_id":"stored"}}
+    elif method == "prompt.submit":
+        result = {{"status":"streaming"}}
+    else:
+        result = {{}}
+    print(json.dumps({{"jsonrpc":"2.0","id":req["id"],"result":result}}), flush=True)
+    if method == "prompt.submit":
+        print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"message.start","session_id":"live"}}}}), flush=True)
+        print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"message.complete","session_id":"live","payload":{{"text":"done","status":"complete","usage":{{"input":1,"output":1,"total":2}}}}}}}}), flush=True)
+time.sleep(0.5)
+with open({survived:?}, "w") as output:
+    output.write("survived")
+"#
+            ),
+        );
+        let _guard = TestHermesPythonGuard::set(&fake);
+        let (backend, mut events) =
+            HermesBackend::spawn(Vec::new(), BackendSpawnConfig::default(), payload("hello"))
+                .await
+                .expect("spawn fake Hermes");
+        timeout(Duration::from_secs(2), async {
+            while let Some(event) = events.recv().await {
+                if matches!(event, ChatEvent::StreamEnd(_)) {
+                    return;
+                }
+            }
+            panic!("event stream closed before completion");
+        })
+        .await
+        .expect("turn");
+
+        backend.shutdown().await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        assert!(
+            !survived.exists(),
+            "shutdown must force a child that remains alive after stdin EOF"
         );
     }
 
@@ -6519,6 +7001,99 @@ for line in sys.stdin:
             .as_str()
             .expect("system seed");
         assert!(message.contains("Backend access mode is read-only"));
+    }
+
+    #[test]
+    fn hermes_skill_seed_is_a_compact_progressive_catalog() {
+        let body_sentinel = "BODY_SENTINEL_SHOULD_NOT_BE_EAGERLY_INJECTED";
+        let resolved = ResolvedSpawnConfig {
+            skills: vec![
+                crate::agent::customization::ResolvedSkill {
+                    name: "Review changes".to_string(),
+                    body: format!("{body_sentinel}\n{}", "x".repeat(20_000)),
+                },
+                crate::agent::customization::ResolvedSkill {
+                    name: "Trace failures".to_string(),
+                    body: "another private body".to_string(),
+                },
+            ],
+            ..ResolvedSpawnConfig::default()
+        };
+
+        let params = build_session_create_params(&[], &resolved, &SessionSettingsValues::default())
+            .expect("params");
+        let seed = params["messages"][0]["content"]
+            .as_str()
+            .expect("system seed");
+
+        assert!(seed.contains("Review changes"));
+        assert!(seed.contains("Trace failures"));
+        assert!(seed.contains("skill discovery"));
+        assert!(!seed.contains(body_sentinel));
+        assert!(!seed.contains("another private body"));
+        assert!(
+            seed.len() < 1_000,
+            "skill catalogue must stay bounded independently of body size"
+        );
+    }
+
+    #[tokio::test]
+    async fn hermes_resume_fails_closed_when_tyde_seed_is_required() {
+        let mut config = BackendSpawnConfig::default();
+        config.resolved_spawn_config.access_mode = BackendAccessMode::ReadOnly;
+
+        let error = match HermesBackend::resume(
+            Vec::new(),
+            config,
+            SessionId("stored".to_string()),
+        )
+        .await
+        {
+            Ok(_) => panic!("resume must not silently drop read-only instructions"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("cannot safely resume"), "{error}");
+        assert!(error.contains("start a new session"), "{error}");
+    }
+
+    #[test]
+    fn hermes_runtime_profile_validation_allows_only_same_effective_profile() {
+        let mut current = SessionSettingsValues::default();
+        current.0.insert(
+            HERMES_PROFILE_SETTING.to_string(),
+            SessionSettingValue::String("work".to_string()),
+        );
+        let mut same = SessionSettingsValues::default();
+        same.0.insert(
+            HERMES_PROFILE_SETTING.to_string(),
+            SessionSettingValue::String("work".to_string()),
+        );
+        assert!(validate_runtime_session_settings_update(&current, &same).is_ok());
+
+        let mut changed = same;
+        changed.0.insert(
+            HERMES_PROFILE_SETTING.to_string(),
+            SessionSettingValue::String("other".to_string()),
+        );
+        assert!(validate_runtime_session_settings_update(&current, &changed).is_err());
+        let mut removed = SessionSettingsValues::default();
+        removed.0.insert(
+            HERMES_PROFILE_SETTING.to_string(),
+            SessionSettingValue::Null,
+        );
+        assert!(validate_runtime_session_settings_update(&current, &removed).is_err());
+
+        let default = SessionSettingsValues::default();
+        let mut explicit_default = SessionSettingsValues::default();
+        explicit_default.0.insert(
+            HERMES_PROFILE_SETTING.to_string(),
+            SessionSettingValue::String(hermes_config_default_profile().to_string()),
+        );
+        assert!(
+            validate_runtime_session_settings_update(&default, &explicit_default).is_ok(),
+            "absent and explicit default are the same effective profile"
+        );
     }
 
     #[test]
@@ -6966,7 +7541,11 @@ for line in sys.stdin:
         let cancelled = mapper.cancel_events("Operation cancelled");
         assert!(cancelled.iter().any(|event| matches!(
             event,
-            ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData { success: false, .. })
+            ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
+                success: false,
+                tool_result: ToolExecutionResult::Cancelled { .. },
+                ..
+            })
         )));
         assert!(
             mapper
@@ -6980,6 +7559,16 @@ for line in sys.stdin:
                 )
                 .is_empty()
         );
+        assert!(
+            mapper
+                .map_event(
+                    "message.complete",
+                    Some(json!({ "text": "already finished", "status": "complete" })),
+                )
+                .is_empty(),
+            "the post-cancel settlement may race with a normal completion"
+        );
+        assert!(!mapper.awaiting_interrupted_complete);
     }
 
     #[test]
@@ -7304,6 +7893,184 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn hermes_completion_preserves_streamed_text_and_new_final_suffix() {
+        let mut mapper = HermesEventMapper::default();
+        let _ = mapper.map_event("message.start", None);
+        let _ = mapper.map_event(
+            "message.delta",
+            Some(json!({ "text": "Checked the repository before the tool." })),
+        );
+        let _ = mapper.map_event(
+            "message.delta",
+            Some(json!({ "text": " The tool completed." })),
+        );
+
+        let events = mapper.map_event(
+            "message.complete",
+            Some(json!({
+                "text": "Final recommendation not present in the deltas.",
+                "status": "complete"
+            })),
+        );
+        let content = events
+            .iter()
+            .find_map(|event| match event {
+                ChatEvent::StreamEnd(data) => Some(data.message.content.as_str()),
+                _ => None,
+            })
+            .expect("StreamEnd");
+
+        assert!(
+            content.starts_with("Checked the repository before the tool."),
+            "{content}"
+        );
+        assert!(
+            content.ends_with("Final recommendation not present in the deltas."),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn hermes_completion_does_not_duplicate_repeated_final_text() {
+        let mut mapper = HermesEventMapper::default();
+        let _ = mapper.map_event("message.start", None);
+        let _ = mapper.map_event("message.delta", Some(json!({ "text": "hello" })));
+
+        let events = mapper.map_event(
+            "message.complete",
+            Some(json!({ "text": "hello", "status": "complete" })),
+        );
+        let content = events
+            .iter()
+            .find_map(|event| match event {
+                ChatEvent::StreamEnd(data) => Some(data.message.content.as_str()),
+                _ => None,
+            })
+            .expect("StreamEnd");
+        assert_eq!(content, "hello");
+    }
+
+    #[test]
+    fn hermes_transient_status_uses_retry_channel_not_history() {
+        let mut mapper = HermesEventMapper::default();
+        let events = mapper.map_event(
+            "status.update",
+            Some(json!({
+                "kind": "lifecycle",
+                "text": "Retrying provider",
+                "attempt": 2,
+                "max_retries": 3,
+                "backoff_ms": 500
+            })),
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [ChatEvent::RetryAttempt(RetryAttemptData {
+                attempt: 2,
+                max_retries: 3,
+                backoff_ms: 500,
+                ..
+            })]
+        ));
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, ChatEvent::MessageAdded(_)))
+        );
+    }
+
+    #[test]
+    fn hermes_approval_request_keeps_turn_busy() {
+        let mut mapper = HermesEventMapper::default();
+        let _ = mapper.map_event("message.start", None);
+
+        let events = mapper.map_event(
+            "approval.request",
+            Some(json!({
+                "description": "Run the command?",
+                "command": "printf ok"
+            })),
+        );
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::ToolRequest(_)))
+        );
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            ChatEvent::TypingStatusChanged(false)
+        )));
+    }
+
+    #[test]
+    fn hermes_error_completion_emits_one_error_without_assistant_masquerade() {
+        let mut mapper = HermesEventMapper::default();
+        let _ = mapper.map_event("message.start", None);
+        let failure = "No allowed providers are available";
+
+        let events = mapper.map_event(
+            "message.complete",
+            Some(json!({ "text": failure, "status": "error" })),
+        );
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ChatEvent::MessageAdded(ChatMessage {
+                        sender: MessageSender::Error,
+                        content,
+                        ..
+                    }) if content == failure
+                ))
+                .count(),
+            1
+        );
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            ChatEvent::StreamEnd(StreamEndData { message })
+                if message.content == failure
+        )));
+    }
+
+    #[test]
+    fn hermes_error_event_is_diagnostic_not_terminal() {
+        let mut mapper = HermesEventMapper::default();
+        let _ = mapper.map_event("message.start", None);
+        let diagnostic = mapper.map_event(
+            "error",
+            Some(json!({ "message": "provider retry failed once" })),
+        );
+
+        assert!(mapper.current_message_id.is_some());
+        assert!(matches!(
+            diagnostic.as_slice(),
+            [ChatEvent::RetryAttempt(RetryAttemptData { error, .. })]
+                if error == "provider retry failed once"
+        ));
+        assert!(diagnostic.iter().all(|event| !matches!(
+            event,
+            ChatEvent::TypingStatusChanged(false)
+                | ChatEvent::StreamEnd(_)
+                | ChatEvent::OperationCancelled(_)
+        )));
+
+        let _ = mapper.map_event("message.delta", Some(json!({ "text": "recovered" })));
+        let completed = mapper.map_event(
+            "message.complete",
+            Some(json!({ "text": "recovered", "status": "complete" })),
+        );
+        assert!(completed.iter().any(|event| matches!(
+            event,
+            ChatEvent::StreamEnd(StreamEndData { message })
+                if message.content == "recovered"
+        )));
+    }
+
+    #[test]
     fn hermes_message_complete_missing_status_defaults_to_complete() {
         let mut mapper = HermesEventMapper::default();
         let _ = mapper.map_event("message.start", None);
@@ -7360,6 +8127,12 @@ for line in sys.stdin:
                 .total_tokens,
             25
         );
+        assert!(matches!(
+            usage.request,
+            TokenUsageScope::Unavailable {
+                reason: TokenUsageUnavailableReason::ProviderScopeAmbiguous
+            }
+        ));
     }
 
     #[test]
@@ -7389,7 +8162,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn hermes_token_usage_sum_accumulates_per_turn_counts() {
+    fn hermes_session_cumulative_usage_is_differenced_per_turn() {
         let previous = token_usage_from_value(&json!({
             "input": 10,
             "output": 5,
@@ -7409,14 +8182,99 @@ for line in sys.stdin:
         }))
         .expect("current usage");
 
-        let cumulative = token_usage_sum(Some(&previous), &current);
+        let (turn, reset) = token_usage_delta(Some(&previous), &current);
 
-        assert_eq!(cumulative.input_tokens, 28);
-        assert_eq!(cumulative.output_tokens, 18);
-        assert_eq!(cumulative.total_tokens, 46);
-        assert_eq!(cumulative.cached_prompt_tokens, Some(9));
-        assert_eq!(cumulative.cache_creation_input_tokens, Some(11));
-        assert_eq!(cumulative.reasoning_tokens, Some(13));
+        assert!(!reset);
+        assert_eq!(turn.input_tokens, 8);
+        assert_eq!(turn.output_tokens, 8);
+        assert_eq!(turn.total_tokens, 16);
+        assert_eq!(turn.cached_prompt_tokens, Some(5));
+        assert_eq!(turn.cache_creation_input_tokens, Some(5));
+        assert_eq!(turn.reasoning_tokens, Some(5));
+    }
+
+    #[test]
+    fn hermes_usage_counter_decrease_starts_a_new_epoch() {
+        let previous = token_usage_from_value(&json!({
+            "input": 100,
+            "output": 40,
+            "total": 140,
+            "reasoning_tokens": 20
+        }))
+        .expect("previous usage");
+        let current = token_usage_from_value(&json!({
+            "input": 9,
+            "output": 3,
+            "total": 12,
+            "reasoning_tokens": 2
+        }))
+        .expect("current usage");
+
+        let (turn, reset) = token_usage_delta(Some(&previous), &current);
+
+        assert!(reset);
+        assert_eq!(turn, current);
+    }
+
+    #[test]
+    fn hermes_resumed_usage_epoch_keeps_first_turn_and_hides_partial_total() {
+        let mut mapper = HermesEventMapper {
+            cumulative_usage_incomplete: true,
+            ..HermesEventMapper::default()
+        };
+        let first = TokenUsage {
+            input_tokens: 12,
+            output_tokens: 3,
+            total_tokens: 15,
+            ..TokenUsage::default()
+        };
+
+        let (first_turn, first_cumulative) = mapper.record_session_usage(first.clone());
+
+        assert_eq!(first_turn, first);
+        assert!(
+            first_cumulative.is_none(),
+            "a resumed runtime has no authoritative prior-session total"
+        );
+
+        let second = TokenUsage {
+            input_tokens: 20,
+            output_tokens: 7,
+            total_tokens: 27,
+            ..TokenUsage::default()
+        };
+        let (second_turn, second_cumulative) = mapper.record_session_usage(second);
+        assert_eq!(second_turn.input_tokens, 8);
+        assert_eq!(second_turn.output_tokens, 4);
+        assert_eq!(second_turn.total_tokens, 12);
+        assert!(second_cumulative.is_none());
+    }
+
+    #[test]
+    fn hermes_usage_accepts_upstream_reasoning_alias() {
+        let usage = token_usage_from_value(&json!({
+            "input": 10,
+            "output": 4,
+            "total": 14,
+            "reasoning": 3
+        }))
+        .expect("usage");
+
+        assert_eq!(usage.reasoning_tokens, Some(3));
+    }
+
+    #[test]
+    fn hermes_explicit_zero_usage_is_distinct_from_missing_usage() {
+        assert!(token_usage_from_value(&json!({})).is_none());
+        assert_eq!(
+            token_usage_from_value(&json!({
+                "input": 0,
+                "output": 0,
+                "total": 0
+            }))
+            .expect("explicit zero usage"),
+            TokenUsage::default()
+        );
     }
 
     #[test]
@@ -7429,7 +8287,7 @@ for line in sys.stdin:
                 { "id": "tool_definitions", "tokens": 2_000 },
                 { "id": "mcp", "tokens": 300 },
                 { "id": "subagent_definitions", "tokens": 200 },
-                { "id": "conversation", "tokens": 5_000 },
+                { "id": "conversation", "tokens": 7_000 },
                 { "id": "rules", "tokens": 400 },
                 { "id": "skills", "tokens": 500 },
                 { "id": "memory", "tokens": 600 }
@@ -7441,8 +8299,38 @@ for line in sys.stdin:
         assert_eq!(breakdown.context_window, 200_000);
         assert_eq!(breakdown.system_prompt_bytes, 4_000);
         assert_eq!(breakdown.tool_io_bytes, 10_000);
-        assert_eq!(breakdown.conversation_history_bytes, 20_000);
+        assert_eq!(breakdown.conversation_history_bytes, 28_000);
         assert_eq!(breakdown.context_injection_bytes, 6_000);
+    }
+
+    #[test]
+    fn hermes_incomplete_context_breakdown_is_not_presented_as_complete() {
+        assert!(
+            context_breakdown_from_hermes(&json!({
+                "context_used": 61_000,
+                "context_max": 1_048_000,
+                "categories": [
+                    { "id": "tool_definitions", "tokens": 8_100 }
+                ]
+            }))
+            .is_none(),
+            "an unexplained coverage gap must remain unavailable"
+        );
+    }
+
+    #[test]
+    fn hermes_context_breakdown_attributes_reasoning_tokens() {
+        let breakdown = context_breakdown_from_hermes(&json!({
+            "context_used": 10,
+            "context_max": 1_000,
+            "reasoning_tokens": 2,
+            "categories": [
+                { "id": "system_prompt", "tokens": 8 }
+            ]
+        }))
+        .expect("complete context breakdown");
+
+        assert_eq!(breakdown.reasoning_bytes, 8);
     }
 
     #[test]

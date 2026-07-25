@@ -7705,7 +7705,8 @@ impl HostHandle {
     fn schedule_session_schema_refresh(&self) {
         let host = self.clone();
         tokio::spawn(async move {
-            host.refresh_pending_session_schemas().await;
+            host.refresh_pending_session_schemas_and_hermes_catalog()
+                .await;
         });
     }
 
@@ -7805,9 +7806,9 @@ impl HostHandle {
             .await;
     }
 
-    async fn refresh_pending_session_schemas(&self) {
+    async fn refresh_pending_session_schemas_and_hermes_catalog(&self) {
         let _refresh_guard = self.session_schema_refresh_lock.lock().await;
-        let (settings_store, codex_pending, kiro_pending, hermes_pending) = {
+        let (settings_store, codex_pending, kiro_pending, hermes_state) = {
             let state = self.state.lock().await;
             (
                 Arc::clone(&state.settings_store),
@@ -7816,10 +7817,7 @@ impl HostHandle {
                     CodexSessionSchemaState::Pending
                 ),
                 matches!(&state.kiro_session_schema, KiroSessionSchemaState::Pending),
-                matches!(
-                    &state.hermes_session_schema,
-                    HermesSessionSchemaState::Pending
-                ),
+                state.hermes_session_schema.clone(),
             )
         };
         let enabled = settings_store
@@ -7828,12 +7826,21 @@ impl HostHandle {
             .get()
             .unwrap_or_else(|err| panic!("failed to load host settings for session schemas: {err}"))
             .enabled_backends;
-        let pending = (codex_pending && enabled.contains(&protocol::BackendKind::Codex))
+        let hermes_enabled = enabled.contains(&protocol::BackendKind::Hermes);
+        let any_pending = (codex_pending && enabled.contains(&protocol::BackendKind::Codex))
             || (kiro_pending && enabled.contains(&protocol::BackendKind::Kiro))
-            || (hermes_pending && enabled.contains(&protocol::BackendKind::Hermes));
-        if pending {
+            || (matches!(&hermes_state, HermesSessionSchemaState::Pending) && hermes_enabled);
+        if any_pending {
             self.refresh_session_schemas_with_fanout_unlocked(false, false, None)
                 .await;
+        }
+        if hermes_enabled && !matches!(hermes_state, HermesSessionSchemaState::Pending) {
+            self.refresh_session_schemas_with_fanout_unlocked(
+                false,
+                true,
+                Some(protocol::BackendKind::Hermes),
+            )
+            .await;
         }
     }
 
@@ -13986,6 +13993,27 @@ async fn launch_supervision_verdict(
     let use_mock_backend = host.use_mock_backend().await;
     let capacity_tx = { host.state.lock().await.capacity_tx.clone() };
     let backend_kind = observation.start.backend_kind;
+    let supervisor_session_settings = if backend_kind == BackendKind::Hermes {
+        session_record
+            .as_ref()
+            .and_then(|record| record.session_settings.as_ref())
+            .and_then(|settings| {
+                settings
+                    .0
+                    .get(crate::backend::hermes::HERMES_PROFILE_SETTING)
+                    .cloned()
+            })
+            .map(|profile| {
+                let mut settings = protocol::SessionSettingsValues::default();
+                settings.0.insert(
+                    crate::backend::hermes::HERMES_PROFILE_SETTING.to_owned(),
+                    profile,
+                );
+                settings
+            })
+    } else {
+        None
+    };
     let cost_hint = settings.settings.cost_tier.as_cost_hint();
     let last_assistant_message = context.last_assistant_message;
     let last_error = context.last_error_since_user_message;
@@ -14076,6 +14104,7 @@ async fn launch_supervision_verdict(
             kicks_so_far: baseline.kicks_since_user_message,
             max_kicks,
             cost_hint,
+            session_settings: supervisor_session_settings,
             use_mock_backend,
             capacity_tx,
         };
@@ -14377,6 +14406,20 @@ async fn accept_supervision_verdict_result(
     let verdict = match result.result {
         Ok(verdict) => verdict,
         Err(error) => {
+            if !error.is_retryable() {
+                entries
+                    .get_mut(&result.agent_id)
+                    .expect("entry exists")
+                    .phase = SupervisorPhase::Dormant { idle_since };
+                tracing::warn!(
+                    agent_id = %result.agent_id,
+                    attempts_started = result.attempts_started,
+                    failure_kind = ?error.kind,
+                    error = %error.message,
+                    "agent supervision stopped after a non-retryable backend failure"
+                );
+                return;
+            }
             let failure_kind = error.kind;
             let failure_message = error.message;
             let schedule = schedule_supervision_retry_at(
@@ -22194,6 +22237,48 @@ Rules: Record only what remains true and useful for future work; drop transient 
         assert_eq!(forced.kind, FrameKind::SessionSchemas);
     }
 
+    #[tokio::test]
+    async fn host_reload_reprobes_ready_dynamic_session_schemas() {
+        let fixture = compact_fixture().await;
+        fixture
+            .host
+            .set_setting(SetSettingPayload {
+                setting: HostSettingValue::EnabledBackends {
+                    enabled_backends: vec![BackendKind::Hermes],
+                },
+            })
+            .await
+            .expect("enable Hermes");
+        fixture
+            .host
+            .set_session_schema_ready_for_test(BackendKind::Hermes)
+            .await;
+        let before = fixture.host.session_schema_probe_count_for_test().await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        fixture
+            .host
+            .register_host_stream(
+                Stream::new(
+                    StreamPath(format!("/host/hermes-reload-{}", Uuid::new_v4())),
+                    tx,
+                ),
+                AgentReplayMode::Lazy,
+            )
+            .await;
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if fixture.host.session_schema_probe_count_for_test().await > before {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("host reload must re-probe an already-ready Hermes profile catalog");
+    }
+
     async fn wait_for_agent_idle(host: &HostHandle, agent_id: &AgentId) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -24458,6 +24543,93 @@ Rules: Record only what remains true and useful for future work; drop transient 
         );
         assert!(!warnings[0].contains("private backend detail"));
         assert!(!warnings[0].contains("BackendStream"));
+    }
+
+    #[tokio::test]
+    async fn non_retryable_supervisor_backend_failure_stops_without_warning() {
+        let fixture = compact_fixture().await;
+        let (agent_id, session_id) =
+            spawn_idle_user_agent(&fixture.host, "non-retryable supervisor failure").await;
+        fixture
+            .host
+            .set_setting(SetSettingPayload {
+                setting: HostSettingValue::SupervisorEnabled { enabled: true },
+            })
+            .await
+            .expect("enable supervisor");
+        fixture
+            .host
+            .set_setting(SetSettingPayload {
+                setting: HostSettingValue::SupervisorRetryAttempts { count: 5 },
+            })
+            .await
+            .expect("set retry cap");
+        let settings = fixture.host.supervisor_settings_signal().await;
+        let observation = fixture
+            .host
+            .activity_summary_observation(&agent_id)
+            .await
+            .expect("agent observation");
+        let context = observation
+            .handle
+            .read_supervision_context()
+            .await
+            .expect("supervision context");
+        let baseline = SupervisionBaseline {
+            last_user_message: context.last_user_message.expect("last user message"),
+            kicks_since_user_message: context.kicks_since_user_message,
+            session_id: Some(session_id),
+        };
+        let activity_counter = observation.status.activity_counter;
+        let idle_since = Instant::now();
+        let fingerprint = VerdictSettingsFingerprint::from(settings.settings);
+        let mut entries = HashMap::from([(
+            agent_id.clone(),
+            SupervisorSchedulerEntry {
+                last_activity_counter: activity_counter,
+                phase: SupervisorPhase::VerdictInFlight {
+                    idle_since,
+                    baseline: baseline.clone(),
+                    attempts_started: 1,
+                    verdict_settings: fingerprint,
+                },
+            },
+        )]);
+
+        accept_supervision_verdict_result(
+            &fixture.host,
+            &mut entries,
+            settings,
+            SupervisorVerdictTaskResult {
+                agent_id: agent_id.clone(),
+                activity_counter,
+                baseline,
+                attempts_started: 1,
+                verdict_settings: fingerprint,
+                result: Err(crate::agent::supervisor::SupervisionFailure {
+                    kind: crate::agent::supervisor::SupervisionFailureKind::BackendStart,
+                    message: "profile authentication unavailable".to_owned(),
+                }),
+            },
+            Instant::now(),
+        )
+        .await;
+
+        assert!(matches!(
+            entries.get(&agent_id).map(|entry| &entry.phase),
+            Some(SupervisorPhase::Dormant { .. })
+        ));
+        let history = observation
+            .handle
+            .fetch_session_history(None, 100)
+            .await
+            .expect("actor history");
+        assert!(history.events.iter().all(|event| !matches!(
+            event,
+            ChatEvent::MessageAdded(message)
+                if matches!(message.sender, MessageSender::Warning)
+                    && message.content.starts_with("Supervisor could not verify")
+        )));
     }
 
     #[tokio::test]
