@@ -9124,6 +9124,148 @@ mod wasm_tests {
         );
     }
 
+    /// The live M7 refutation: four turns completed, History opened, and the row
+    /// still read `0 responses` until a reload. Nothing on the open path asked
+    /// for anything newer than the bootstrap snapshot — and that request is
+    /// also what subscribes the client to turn-boundary updates server-side, so
+    /// its absence explains both the stale count and the missing notifications.
+    #[wasm_bindgen_test]
+    async fn opening_history_requests_an_authoritative_page() {
+        reset_inbound_state_for_host("host-a");
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document
+            .create_element("div")
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+
+        let state = AppState::new();
+        state.host_streams.update(|streams| {
+            streams.insert("host-a".to_owned(), StreamPath("/host".to_owned()));
+        });
+        state.selected_host_id.set(Some("host-a".to_owned()));
+        // Bootstrap left a stale row: the session existed at connect time with
+        // no completed turns.
+        state
+            .sessions
+            .set(vec![listed_session("host-a", "session-1", 0, 100)]);
+
+        install_send_stub();
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <crate::components::sessions_panel::SessionsPanel /> }
+        });
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        assert!(
+            container
+                .text_content()
+                .unwrap_or_default()
+                .contains("0 responses"),
+            "precondition: the bootstrap snapshot is what is on screen"
+        );
+        assert_eq!(
+            list_sessions_hosts(),
+            vec!["host-a".to_owned()],
+            "opening History must ask its host for an authoritative page"
+        );
+
+        // The server answers with the real count, as a reload would have.
+        dispatch_envelope(
+            &state,
+            "host-a",
+            session_list_envelope(
+                vec![listed_session("host-a", "session-1", 4, 500).summary],
+                1,
+                0,
+                1,
+                None,
+                0,
+            ),
+        );
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("4 responses"),
+            "the row must show the authoritative count without a reload, got: {text}"
+        );
+        assert!(
+            !text.contains("0 responses"),
+            "and must not still be showing the bootstrap snapshot, got: {text}"
+        );
+
+        // The arriving page released the in-flight marker; the panel must not
+        // then re-fire on its own response.
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert_eq!(
+            list_sessions_hosts(),
+            vec!["host-a".to_owned()],
+            "one request per host per open — the response must not retrigger it"
+        );
+    }
+
+    /// Multi-host: opening History asks *each* responsible host, with that
+    /// host's own scope and limit, and a later count update still lands on the
+    /// right row.
+    #[wasm_bindgen_test]
+    async fn opening_history_requests_every_responsible_host() {
+        reset_inbound_state_for_host("host-a");
+        reset_inbound_state_for_host("host-b");
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document
+            .create_element("div")
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+
+        let state = AppState::new();
+        state.host_streams.update(|streams| {
+            streams.insert("host-a".to_owned(), StreamPath("/host".to_owned()));
+            streams.insert("host-b".to_owned(), StreamPath("/host".to_owned()));
+        });
+        state.selected_host_id.set(Some("host-b".to_owned()));
+        state.sessions.set(vec![
+            listed_session("host-a", "a1", 0, 300),
+            listed_session("host-b", "b1", 2, 200),
+        ]);
+
+        install_send_stub();
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <crate::components::sessions_panel::SessionsPanel /> }
+        });
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let mut asked = list_sessions_hosts();
+        asked.sort();
+        assert_eq!(
+            asked,
+            vec!["host-a".to_owned(), "host-b".to_owned()],
+            "Home shows both hosts, so both must be asked — not just the one \
+             Settings happens to have selected"
+        );
+
+        // A turn lands on host-a; only its row moves.
+        dispatch_envelope(&state, "host-a", count_update_envelope("a1", 3, 900, 0));
+        next_tick().await;
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("3 responses") && text.contains("2 responses"),
+            "the updated host's row advances and the other is untouched, got: {text}"
+        );
+    }
+
     /// RD748-01: a project-scoped History view belongs to its project's host,
     /// and nothing another host does may displace it. With project A active,
     /// no A row currently matching, A complete, and host B advertising more

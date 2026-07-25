@@ -8,6 +8,8 @@ use protocol::{
 
 use crate::actions::resume_session;
 use crate::send::send_frame;
+use std::collections::HashSet;
+
 use crate::state::{
     ActiveProjectRef, AppState, ConnectionStatus, SessionInfo, SessionsPanelFilters,
 };
@@ -220,27 +222,42 @@ pub fn SessionsPanel() -> impl IntoView {
         })
     };
 
-    let state_for_refresh = state.clone();
-    let on_refresh = move |_| {
-        let state = state_for_refresh.clone();
-        // Refresh every host this panel is showing. Sending only to
-        // `selected_host_id` refreshed whichever host Settings happened to have
-        // selected, which in project A with host B selected updated B while the
-        // user watched A — and made History look stale or current depending on
-        // an unrelated choice.
-        // Everything the send needs is resolved *before* spawning. Reading a
-        // signal after an await means reading it after the panel may have
-        // unmounted, and a disposed signal panics rather than returning None.
-        let requests: Vec<(String, StreamPath, ListSessionsPayload)> = rendered_hosts
-            .get_untracked()
-            .into_iter()
+    // Ask every host this panel is showing for its authoritative first page.
+    //
+    // Sending only to `selected_host_id` refreshed whichever host Settings
+    // happened to have selected, which in project A with host B selected
+    // updated B while the user watched A — and made History look stale or
+    // current depending on an unrelated choice.
+    //
+    // Everything the send needs is resolved *before* spawning: reading a signal
+    // after an await means reading it after the panel may have unmounted, and a
+    // disposed signal panics rather than returning `None`.
+    fn request_authoritative_pages(state: &AppState, hosts: &[String], force: bool) {
+        let requests: Vec<(String, StreamPath, ListSessionsPayload)> = hosts
+            .iter()
             .filter_map(|host_id| {
-                let host_stream = state.host_stream_untracked(&host_id)?;
+                // Automatic requests take one slot per host, so a burst of
+                // reasons to refresh cannot become a burst of requests. An
+                // explicit Refresh always sends: a user who presses it and gets
+                // nothing has been silently ignored.
+                let claimed = state
+                    .session_list_refresh_in_flight
+                    .try_update(|hosts| hosts.insert(host_id.clone()))
+                    .unwrap_or(false);
+                if !claimed && !force {
+                    return None;
+                }
+                let Some(host_stream) = state.host_stream_untracked(host_id) else {
+                    state.session_list_refresh_in_flight.update(|hosts| {
+                        hosts.remove(host_id);
+                    });
+                    return None;
+                };
                 // Ask for the scope/limit this host's view is actually using.
                 let payload = state.session_list_pages.with_untracked(|pages| {
                     pages
                         .iter()
-                        .find(|((page_host, _), _)| *page_host == host_id)
+                        .find(|((page_host, _), _)| page_host == host_id)
                         .map(|((_, _), page)| ListSessionsPayload {
                             scope: Some(page.scope),
                             cursor: None,
@@ -248,18 +265,58 @@ pub fn SessionsPanel() -> impl IntoView {
                         })
                         .unwrap_or_default()
                 });
-                Some((host_id, host_stream, payload))
+                Some((host_id.clone(), host_stream, payload))
             })
             .collect();
         for (host_id, host_stream, payload) in requests {
+            let refresh_flag = state.session_list_refresh_in_flight;
             spawn_local(async move {
                 if let Err(e) =
                     send_frame(&host_id, host_stream, FrameKind::ListSessions, &payload).await
                 {
                     log::error!("failed to send ListSessions to {host_id}: {e}");
+                    // Nothing is in flight after a failed send; releasing here
+                    // stops one failure suppressing every later refresh.
+                    let _ = refresh_flag.try_update(|hosts| {
+                        hosts.remove(&host_id);
+                    });
                 }
             });
         }
+    }
+
+    // Opening History must not show whatever the bootstrap happened to leave
+    // behind. Bootstrap counts are a snapshot from connect time, and the live
+    // run showed a session sitting at `0 responses` after four completed turns
+    // because nothing on this path ever asked for anything newer. This request
+    // is also what establishes the server-side session-summary subscription,
+    // so subsequent turn updates arrive without a manual Refresh.
+    //
+    // Requested once per host per open. The effect tracks `rendered_hosts`,
+    // which the arriving page itself mutates, so without this it would re-fire
+    // on its own response and request forever. A host entering the set later —
+    // a project switch, a host connecting — is new and does get its request.
+    let requested_hosts: RwSignal<HashSet<String>> = RwSignal::new(HashSet::new());
+    let state_for_mount = state.clone();
+    Effect::new(move |_| {
+        let hosts = rendered_hosts.get();
+        let fresh: Vec<String> = requested_hosts
+            .try_update(|requested| {
+                hosts
+                    .into_iter()
+                    .filter(|host_id| requested.insert(host_id.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if fresh.is_empty() {
+            return;
+        }
+        request_authoritative_pages(&state_for_mount, &fresh, false);
+    });
+
+    let state_for_refresh = state.clone();
+    let on_refresh = move |_| {
+        request_authoritative_pages(&state_for_refresh, &rendered_hosts.get_untracked(), true);
     };
 
     view! {
