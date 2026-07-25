@@ -6175,13 +6175,12 @@ mod restore_fixtures {
                 .count()
         })
     }
-
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::restore_fixtures::*;
+    use super::*;
     use protocol::{
         BackendKind, FileEntryOp, LaunchProfileId, ProjectFileEntry, ProjectFileKind,
         ProjectFileVersion, ProjectRootPath,
@@ -6352,7 +6351,6 @@ mod tests {
         )
         .expect("synthetic Welcome")
     }
-
 
     /// FE-01: New Chat, Home and switching to an unvisited project all leave
     /// `active_agent` at `None`, so intent cannot be inferred from it. A late
@@ -8693,8 +8691,8 @@ mod tests {
 /// transport (the refresh subscribe is a network send), so they are wasm-only.
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
-    use super::*;
     use super::restore_fixtures::*;
+    use super::*;
     use crate::components::chat_message::ChatMessageView;
     use crate::state::{AppState, CodeIntelKey};
     use leptos::mount::mount_to;
