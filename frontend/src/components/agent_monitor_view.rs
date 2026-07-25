@@ -169,9 +169,7 @@ pub(crate) fn status_to_filter(status: DerivedAgentState) -> AgentStatusFilter {
     match status {
         DerivedAgentState::Initializing => AgentStatusFilter::Initializing,
         // Cancelling is still a running turn for filter purposes.
-        DerivedAgentState::Thinking | DerivedAgentState::Cancelling => {
-            AgentStatusFilter::Thinking
-        }
+        DerivedAgentState::Thinking | DerivedAgentState::Cancelling => AgentStatusFilter::Thinking,
         DerivedAgentState::Compacting => AgentStatusFilter::Compacting,
         // A cancelled agent is not running, so it belongs to the Idle filter
         // bucket — "Idle" here means "no work in flight", which is exactly what

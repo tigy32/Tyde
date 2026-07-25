@@ -2753,7 +2753,10 @@ mod wasm_tests {
         }
         let card = agent_card_el(&container, "a1");
         assert!(
-            !card.text_content().unwrap_or_default().contains("Cancelled"),
+            !card
+                .text_content()
+                .unwrap_or_default()
+                .contains("Cancelled"),
             "a running turn is not cancelled"
         );
 
@@ -2766,7 +2769,9 @@ mod wasm_tests {
         }
         let card = agent_card_el(&container, "a1");
         assert!(
-            card.text_content().unwrap_or_default().contains("Cancelling"),
+            card.text_content()
+                .unwrap_or_default()
+                .contains("Cancelling"),
             "the in-flight interrupt must be visible, got: {:?}",
             card.text_content()
         );
@@ -2820,7 +2825,10 @@ mod wasm_tests {
         }
         let card = agent_card_el(&container, "a1");
         assert!(
-            !card.text_content().unwrap_or_default().contains("Cancelled"),
+            !card
+                .text_content()
+                .unwrap_or_default()
+                .contains("Cancelled"),
             "the cancelled outcome describes the last turn only and must reset"
         );
     }

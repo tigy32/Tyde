@@ -1104,7 +1104,10 @@ mod wasm_tests {
             2,
             "the session's own value must be added, not dropped: {entries:?}"
         );
-        assert_eq!(entries[1].value, "qatest", "the injected entry keeps the raw value");
+        assert_eq!(
+            entries[1].value, "qatest",
+            "the injected entry keeps the raw value"
+        );
         assert!(
             entries[1].label.contains("qatest") && entries[1].label.contains("unavailable"),
             "the injected entry must name the value and mark it unavailable, got: {}",

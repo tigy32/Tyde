@@ -1575,10 +1575,7 @@ mod wasm_tests {
 
         let agent_id = AgentId(AGENT.to_owned());
         assert!(
-            !state
-                .interrupt_pending
-                .get_untracked()
-                .contains(&agent_id),
+            !state.interrupt_pending.get_untracked().contains(&agent_id),
             "a failed send must release the interrupt slot"
         );
         let primary_btn = primary(&container);

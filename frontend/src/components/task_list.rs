@@ -516,7 +516,6 @@ fn format_token_count(tokens: u64) -> String {
     }
 }
 
-
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod native_tests {
     use super::*;
