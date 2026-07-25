@@ -3513,10 +3513,7 @@ impl HermesEventMapper {
     fn tool_uses_for_message(&self, streamed_text: &str, content: &str) -> Vec<ToolUseData> {
         let mut tools = self.turn_tools.iter().collect::<Vec<_>>();
         tools.sort_by_key(|(_, tool)| {
-            (
-                tool.content_offset.unwrap_or(u32::MAX),
-                tool.observed_order,
-            )
+            (tool.content_offset.unwrap_or(u32::MAX), tool.observed_order)
         });
         tools
             .into_iter()
@@ -5308,13 +5305,11 @@ fn reanchor_hermes_content_offset(
         return Some(0);
     }
 
-    let mut matches = content
-        .char_indices()
-        .filter_map(|(byte_index, _)| {
-            content[byte_index..]
-                .starts_with(observed_prefix)
-                .then_some(byte_index)
-        });
+    let mut matches = content.char_indices().filter_map(|(byte_index, _)| {
+        content[byte_index..]
+            .starts_with(observed_prefix)
+            .then_some(byte_index)
+    });
     let byte_index = matches.next()?;
     if matches.next().is_some() {
         return None;
@@ -8203,10 +8198,7 @@ for line in sys.stdin:
     fn hermes_tool_offsets_preserve_pre_tool_post_interleaving() {
         let mut mapper = HermesEventMapper::default();
         let mut events = mapper.map_event("message.start", None);
-        events.extend(mapper.map_event(
-            "message.delta",
-            Some(json!({ "text": "Pré🙂 " })),
-        ));
+        events.extend(mapper.map_event("message.delta", Some(json!({ "text": "Pré🙂 " }))));
         events.extend(mapper.map_event(
             "tool.start",
             Some(json!({
@@ -8223,10 +8215,7 @@ for line in sys.stdin:
                 "result": { "exit_code": 0, "stdout": "LIVE_TOOL_OK" }
             })),
         ));
-        events.extend(mapper.map_event(
-            "message.delta",
-            Some(json!({ "text": "POST" })),
-        ));
+        events.extend(mapper.map_event("message.delta", Some(json!({ "text": "POST" }))));
         events.extend(mapper.map_event(
             "message.complete",
             Some(json!({ "text": "POST", "status": "complete" })),
@@ -8313,7 +8302,10 @@ for line in sys.stdin:
             })
             .expect("StreamEnd tools");
         assert_eq!(
-            tools.iter().map(|tool| tool.id.as_str()).collect::<Vec<_>>(),
+            tools
+                .iter()
+                .map(|tool| tool.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["tool-b", "tool-a"]
         );
         assert_eq!(
@@ -8358,8 +8350,7 @@ for line in sys.stdin:
 
         let mut invalidated = HermesEventMapper::default();
         let _ = invalidated.map_event("message.start", None);
-        let _ =
-            invalidated.map_event("message.delta", Some(json!({ "text": "PRE   " })));
+        let _ = invalidated.map_event("message.delta", Some(json!({ "text": "PRE   " })));
         let _ = invalidated.map_event(
             "tool.start",
             Some(json!({ "tool_id": "tool-2", "name": "terminal" })),

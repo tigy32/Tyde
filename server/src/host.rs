@@ -22934,8 +22934,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         while second_rx.try_recv().is_ok() {}
 
         let (unlisted_tx, mut unlisted_rx) = mpsc::unbounded_channel();
-        let unlisted_path =
-            StreamPath(format!("/host/session-list-unlisted-{}", Uuid::new_v4()));
+        let unlisted_path = StreamPath(format!("/host/session-list-unlisted-{}", Uuid::new_v4()));
         {
             let mut state = fixture.host.state.lock().await;
             state.host_streams.insert(

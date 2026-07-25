@@ -11582,9 +11582,7 @@ mod tests {
         let message = replay
             .iter()
             .find_map(|event| match event {
-                AgentBootstrapEvent::ChatEvent(ChatEvent::StreamEnd(data)) => {
-                    Some(&data.message)
-                }
+                AgentBootstrapEvent::ChatEvent(ChatEvent::StreamEnd(data)) => Some(&data.message),
                 _ => None,
             })
             .expect("replayed positioned StreamEnd");
