@@ -3288,9 +3288,7 @@ impl AppState {
             if context_host.as_deref() == Some(bound_host.as_str()) {
                 return;
             }
-            draft_host_state.draft_selection_host.set(None);
-            draft_host_state.draft_backend_override.set(None);
-            draft_host_state.draft_launch_profile_id.set(None);
+            draft_host_state.clear_draft_selection();
         });
 
         state
@@ -4128,6 +4126,39 @@ impl AppState {
         } else {
             persist_active_project(None);
         }
+    }
+
+    /// Every queued pending session-settings value, for tests that need to
+    /// inspect what a spawn actually carries rather than trusting the draft
+    /// signals it was built from.
+    #[cfg(test)]
+    pub(crate) fn pending_settings_values_for_tests(&self) -> Vec<SessionSettingsValues> {
+        self.pending_agent_session_settings
+            .get_untracked()
+            .values()
+            .flat_map(|queue| queue.iter().map(|pending| pending.values.clone()))
+            .collect()
+    }
+
+    /// Reset every field of the new-chat draft.
+    ///
+    /// The draft is **one** host-bound value, not a bag of independent ones:
+    /// the backend, launch profile, custom agent, and profile-derived session
+    /// settings are all chosen against a single host and are all meaningless
+    /// against another. Clearing only the obvious three left a custom-agent id
+    /// and provider-specific settings armed, which the spawn path then read and
+    /// sent to whichever host it was targeting.
+    ///
+    /// Every mismatch path routes through here so the set can never drift
+    /// apart again.
+    pub(crate) fn clear_draft_selection(&self) {
+        self.draft_backend_override.set(None);
+        self.draft_launch_profile_id.set(None);
+        self.draft_custom_agent_id.set(None);
+        self.draft_session_settings
+            .set(SessionSettingsValues::default());
+        self.draft_session_settings_dirty.set(false);
+        self.draft_selection_host.set(None);
     }
 
     /// The selection as it should currently be stored.

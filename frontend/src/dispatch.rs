@@ -6615,6 +6615,18 @@ mod tests {
                 project_id: ProjectId("project-b".to_owned()),
             }));
 
+            // A whole host-A draft, not just the backend and profile.
+            state
+                .draft_custom_agent_id
+                .set(Some(protocol::CustomAgentId("agent-a-custom".to_owned())));
+            let mut settings = protocol::SessionSettingsValues::default();
+            settings.0.insert(
+                "profile".to_owned(),
+                protocol::SessionSettingValue::String("hermes-qa".to_owned()),
+            );
+            state.draft_session_settings.set(settings);
+            state.draft_session_settings_dirty.set(true);
+
             crate::actions::spawn_new_chat(&state, "hello".to_owned(), None, |_| {});
 
             assert_eq!(
@@ -6623,9 +6635,39 @@ mod tests {
                 "host-a's profile must not reach a spawn against host-b"
             );
             assert_eq!(
+                state.draft_backend_override.get_untracked(),
+                None,
+                "nor its backend override, which host-b has disabled"
+            );
+            assert_eq!(
+                state.draft_custom_agent_id.get_untracked(),
+                None,
+                "nor its custom agent, which is host-scoped in exactly the same way"
+            );
+            assert!(
+                state
+                    .draft_session_settings
+                    .get_untracked()
+                    .0
+                    .is_empty(),
+                "nor its profile-derived session settings"
+            );
+            assert!(!state.draft_session_settings_dirty.get_untracked());
+            assert_eq!(
                 state.draft_selection_host.get_untracked(),
                 None,
                 "and its binding must not survive the spawn"
+            );
+
+            // The queued settings that ride along to the target host must be
+            // empty too — this is the payload the spawn actually carries.
+            let queued_has_host_a_settings = state
+                .pending_settings_values_for_tests()
+                .iter()
+                .any(|values| values.0.contains_key("profile"));
+            assert!(
+                !queued_has_host_a_settings,
+                "host-A settings must not be queued under the host-B spawn"
             );
         });
     }
@@ -9047,6 +9089,114 @@ mod wasm_tests {
         );
     }
 
+    /// R48-02: History is a multi-host view. Refresh must reach the hosts on
+    /// screen — not whichever host Settings happens to have selected — and
+    /// every rendered host with unfetched history needs its own reachable
+    /// continuation.
+    #[wasm_bindgen_test]
+    async fn history_refresh_and_paging_follow_the_rendered_hosts() {
+        reset_inbound_state_for_host("host-a");
+        reset_inbound_state_for_host("host-b");
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document
+            .create_element("div")
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+
+        let state = AppState::new();
+        state.host_streams.update(|streams| {
+            streams.insert("host-a".to_owned(), StreamPath("/host".to_owned()));
+            streams.insert("host-b".to_owned(), StreamPath("/host".to_owned()));
+        });
+        // Settings points at host-b; the panel is showing Home, i.e. both.
+        state.selected_host_id.set(Some("host-b".to_owned()));
+        state.sessions.set(vec![
+            listed_session("host-a", "a1", 1, 300),
+            listed_session("host-b", "b1", 1, 200),
+        ]);
+        // Both hosts have more history.
+        state.session_list_pages.update(|pages| {
+            for host in ["host-a", "host-b"] {
+                pages.insert(
+                    (host.to_owned(), crate::state::session_list_scope_key(
+                        protocol::SessionListScope::AllSessions,
+                    )),
+                    protocol::SessionListPageInfo {
+                        scope: protocol::SessionListScope::AllSessions,
+                        cursor: protocol::SessionListCursor {
+                            generation: protocol::SessionListGeneration(1),
+                            offset: 0,
+                        },
+                        limit: 1,
+                        total_count: 4,
+                        status: protocol::SessionListPageStatus::More {
+                            next_cursor: protocol::SessionListCursor {
+                                generation: protocol::SessionListGeneration(1),
+                                offset: 1,
+                            },
+                        },
+                    },
+                );
+            }
+        });
+
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <crate::components::sessions_panel::SessionsPanel /> }
+        });
+        next_tick().await;
+
+        // One continuation control per host with more history — previously
+        // there was exactly one, so the other host's pages were unreachable.
+        let buttons = container
+            .query_selector_all("[data-test='session-load-more']")
+            .unwrap();
+        assert_eq!(
+            buttons.length(),
+            2,
+            "every rendered host with unfetched history needs its own control"
+        );
+        let hosts_with_controls: Vec<String> = (0..buttons.length())
+            .filter_map(|i| buttons.item(i))
+            .filter_map(|node| {
+                node.dyn_into::<web_sys::Element>()
+                    .ok()
+                    .and_then(|el| el.get_attribute("data-host"))
+            })
+            .collect();
+        assert!(
+            hosts_with_controls.contains(&"host-a".to_owned())
+                && hosts_with_controls.contains(&"host-b".to_owned()),
+            "both rendered hosts must be reachable, got: {hosts_with_controls:?}"
+        );
+
+        // Refresh must reach the rendered hosts, not just Settings' choice.
+        install_send_stub();
+        let refresh: HtmlElement = container
+            .query_selector("[data-test='sessions-refresh']")
+            .unwrap()
+            .expect("the panel renders a refresh control")
+            .dyn_into()
+            .unwrap();
+        refresh.click();
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let refreshed = list_sessions_hosts();
+        assert!(
+            refreshed.contains(&"host-a".to_owned()),
+            "refresh must reach the host whose rows are on screen, got: {refreshed:?}"
+        );
+        assert!(
+            refreshed.contains(&"host-b".to_owned()),
+            "and every other rendered host, got: {refreshed:?}"
+        );
+    }
+
     /// R7701-01: a chat that cannot be restored must forget itself, and must
     /// not take an independent, still-valid draft choice with it.
     #[wasm_bindgen_test]
@@ -9876,6 +10026,31 @@ mod wasm_tests {
             "#,
         )
         .expect("install send stub");
+    }
+
+    /// Hosts that received a `list_sessions` frame, in order, as captured by
+    /// the send stub. The host is the outbound frame's own `hostId`, so this
+    /// proves where a request actually went rather than what the UI intended.
+    fn list_sessions_hosts() -> Vec<String> {
+        let raw = js_sys::eval(
+            r#"
+            (function() {
+                const out = [];
+                for (const [cmd, args] of (window.__test_send_calls || [])) {
+                    if (cmd !== "send_host_line") continue;
+                    const parsed = JSON.parse(args);
+                    const env = JSON.parse(parsed.line);
+                    if (env.kind !== "list_sessions") continue;
+                    out.push(parsed.hostId || parsed.host_id);
+                }
+                return JSON.stringify(out);
+            })()
+            "#,
+        )
+        .expect("probe list_sessions frames")
+        .as_string()
+        .unwrap_or_else(|| "[]".to_owned());
+        serde_json::from_str(&raw).unwrap_or_default()
     }
 
     /// Count `code_intel_subscribe_file` frames captured by the send stub.

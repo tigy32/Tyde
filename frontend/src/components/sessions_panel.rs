@@ -171,22 +171,74 @@ pub fn SessionsPanel() -> impl IntoView {
         }));
     };
 
+    // Hosts the panel is responsible for: those whose rows are rendered, plus
+    // those with pages still unfetched. A host in the second group has no cards
+    // on screen yet its history is part of this view, so leaving it out is what
+    // made later pages unreachable.
+    let rendered_hosts = {
+        let state = state.clone();
+        Memo::new(move |_| {
+            let mut hosts: Vec<String> = filtered_sessions
+                .get()
+                .iter()
+                .map(|session| session.host_id.clone())
+                .collect();
+            state.session_list_pages.with(|pages| {
+                for ((host_id, _), page) in pages.iter() {
+                    if matches!(page.status, SessionListPageStatus::More { .. }) {
+                        hosts.push(host_id.clone());
+                    }
+                }
+            });
+            if hosts.is_empty()
+                && let Some(host_id) = state
+                    .active_project
+                    .get()
+                    .map(|project| project.host_id)
+                    .or_else(|| state.selected_host_id.get())
+            {
+                hosts.push(host_id);
+            }
+            hosts.sort();
+            hosts.dedup();
+            hosts
+        })
+    };
+
     let state_for_refresh = state.clone();
     let on_refresh = move |_| {
         let state = state_for_refresh.clone();
-        spawn_local(async move {
-            if let Some((host_id, host_stream)) = state.selected_host_stream_untracked()
-                && let Err(e) = send_frame(
-                    &host_id,
-                    host_stream,
-                    FrameKind::ListSessions,
-                    &ListSessionsPayload::default(),
-                )
-                .await
-            {
-                log::error!("failed to send ListSessions: {e}");
-            }
-        });
+        // Refresh every host this panel is showing. Sending only to
+        // `selected_host_id` refreshed whichever host Settings happened to have
+        // selected, which in project A with host B selected updated B while the
+        // user watched A — and made History look stale or current depending on
+        // an unrelated choice.
+        let hosts = rendered_hosts.get_untracked();
+        for host_id in hosts {
+            let state = state.clone();
+            spawn_local(async move {
+                let Some(host_stream) = state.host_stream_untracked(&host_id) else {
+                    return;
+                };
+                // Ask for the scope/limit this host's view is actually using.
+                let payload = state.session_list_pages.with_untracked(|pages| {
+                    pages
+                        .iter()
+                        .find(|((page_host, _), _)| *page_host == host_id)
+                        .map(|((_, _), page)| ListSessionsPayload {
+                            scope: Some(page.scope),
+                            cursor: None,
+                            limit: Some(page.limit),
+                        })
+                        .unwrap_or_default()
+                });
+                if let Err(e) =
+                    send_frame(&host_id, host_stream, FrameKind::ListSessions, &payload).await
+                {
+                    log::error!("failed to send ListSessions to {host_id}: {e}");
+                }
+            });
+        }
     };
 
     view! {
@@ -217,7 +269,11 @@ pub fn SessionsPanel() -> impl IntoView {
                 >
                     "Show all projects"
                 </button>
-                <button class="filter-toggle refresh-btn" on:click=on_refresh>
+                <button
+                    class="filter-toggle refresh-btn"
+                    data-test="sessions-refresh"
+                    on:click=on_refresh
+                >
                     "Refresh"
                 </button>
             </div>
@@ -235,7 +291,7 @@ pub fn SessionsPanel() -> impl IntoView {
                         // about the pages that have not been.
                         view! {
                             <div class="panel-empty">{msg}</div>
-                            {load_more_button(state.clone())}
+                            {load_more_buttons(state.clone(), rendered_hosts)}
                         }.into_any()
                     } else {
                         view! {
@@ -243,7 +299,7 @@ pub fn SessionsPanel() -> impl IntoView {
                                 {sessions.into_iter().map(|session| {
                                     session_card(state.clone(), session)
                                 }).collect_view()}
-                                {load_more_button(state.clone())}
+                                {load_more_buttons(state.clone(), rendered_hosts)}
                             </div>
                         }.into_any()
                     }
@@ -253,76 +309,94 @@ pub fn SessionsPanel() -> impl IntoView {
     }
 }
 
-/// "Load more" for the selected host, shown only when the server has actually
-/// told us there is more.
+/// One "Load more" per rendered host that still has unfetched history.
 ///
-/// The protocol has advertised a next cursor all along and nothing ever sent
-/// one back, so the remaining history was unreachable no matter how much of it
-/// existed. The request carries the exact stored cursor and scope, which is
-/// also what the reducer requires before it will append rather than replace.
-fn load_more_button(state: AppState) -> impl IntoView {
-    let next_page = {
-        let state = state.clone();
-        Memo::new(move |_| {
-            // The host whose rows this panel is showing, which is the active
-            // project's host — not `selected_host_id`, an independent Settings
-            // choice. Reading the latter could hide host A's continuation while
-            // offering (and sending) host B's cursor.
-            let host_id = state
-                .active_project
-                .get()
-                .map(|project| project.host_id)
-                .or_else(|| state.selected_host_id.get())?;
-            state.session_list_pages.with(|pages| {
-                pages
-                    .iter()
-                    .find(|((page_host, _), _)| *page_host == host_id)
-                    .and_then(|((_, _), page)| match page.status {
-                        SessionListPageStatus::More { next_cursor } => {
-                            Some((host_id.clone(), page.scope, next_cursor, page.limit))
-                        }
-                        SessionListPageStatus::Complete => None,
-                    })
-            })
+/// Previously this picked a single host, so in a multi-host view — Home, or
+/// "show all projects" — every other host's later pages were unreachable no
+/// matter how much history existed. Each control carries the exact stored
+/// cursor, scope and limit for its own host, which is also what the reducer
+/// requires before it will append rather than ignore the response.
+fn load_more_buttons(state: AppState, hosts: Memo<Vec<String>>) -> impl IntoView {
+    let pages_state = state.clone();
+    let continuations = Memo::new(move |_| {
+        let hosts = hosts.get();
+        pages_state.session_list_pages.with(|pages| {
+            hosts
+                .iter()
+                .filter_map(|host_id| {
+                    pages
+                        .iter()
+                        .find(|((page_host, _), _)| page_host == host_id)
+                        .and_then(|((_, _), page)| match page.status {
+                            SessionListPageStatus::More { next_cursor } => Some((
+                                host_id.clone(),
+                                page.scope,
+                                next_cursor,
+                                page.limit,
+                            )),
+                            SessionListPageStatus::Complete => None,
+                        })
+                })
+                .collect::<Vec<_>>()
         })
-    };
+    });
 
     move || {
-        let (host_id, scope, cursor, limit) = next_page.get()?;
-        let state = state.clone();
-        let on_click = move |_| {
-            let state = state.clone();
-            let host_id = host_id.clone();
-            spawn_local(async move {
-                let Some(host_stream) = state.host_stream_untracked(&host_id) else {
-                    return;
+        let entries = continuations.get();
+        // Only name the host when there is more than one control to tell apart.
+        let label_hosts = entries.len() > 1;
+        let host_labels = state.configured_hosts.get();
+        entries
+            .into_iter()
+            .map(|(host_id, scope, cursor, limit)| {
+                let label = if label_hosts {
+                    let name = host_labels
+                        .iter()
+                        .find(|host| host.id == host_id)
+                        .map(|host| host.label.clone())
+                        .unwrap_or_else(|| host_id.clone());
+                    format!("Load more from {name}")
+                } else {
+                    "Load more".to_owned()
                 };
-                if let Err(error) = send_frame(
-                    &host_id,
-                    host_stream,
-                    FrameKind::ListSessions,
-                    &ListSessionsPayload {
-                        scope: Some(scope),
-                        cursor: Some(cursor),
-                        limit: Some(limit),
-                    },
-                )
-                .await
-                {
-                    log::error!("failed to request more sessions: {error}");
+                let state = state.clone();
+                let click_host = host_id.clone();
+                let on_click = move |_| {
+                    let state = state.clone();
+                    let host_id = click_host.clone();
+                    spawn_local(async move {
+                        let Some(host_stream) = state.host_stream_untracked(&host_id) else {
+                            return;
+                        };
+                        if let Err(error) = send_frame(
+                            &host_id,
+                            host_stream,
+                            FrameKind::ListSessions,
+                            &ListSessionsPayload {
+                                scope: Some(scope),
+                                cursor: Some(cursor),
+                                limit: Some(limit),
+                            },
+                        )
+                        .await
+                        {
+                            log::error!("failed to request more sessions: {error}");
+                        }
+                    });
+                };
+                view! {
+                    <button
+                        type="button"
+                        class="session-load-more"
+                        data-test="session-load-more"
+                        data-host=host_id.clone()
+                        on:click=on_click
+                    >
+                        {label}
+                    </button>
                 }
-            });
-        };
-        Some(view! {
-            <button
-                type="button"
-                class="session-load-more"
-                data-test="session-load-more"
-                on:click=on_click
-            >
-                "Load more"
-            </button>
-        })
+            })
+            .collect_view()
     }
 }
 

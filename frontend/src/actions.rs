@@ -218,14 +218,7 @@ pub fn open_new_chat_with_prefill(
 
     // Ordinary new-chat draft: no backend override, no custom agent, default
     // session settings. Backend selection stays on the host/project default.
-    state.draft_backend_override.set(None);
-    state.draft_custom_agent_id.set(None);
-    state.draft_launch_profile_id.set(None);
-    state.draft_selection_host.set(None);
-    state
-        .draft_session_settings
-        .set(SessionSettingsValues::default());
-    state.draft_session_settings_dirty.set(false);
+    state.clear_draft_selection();
 
     // Open (and activate) the new chat tab, then seed the composer. The composer
     // mirrors `chat_input` into the textarea reactively, so the prefill appears
@@ -313,9 +306,10 @@ pub fn spawn_new_chat(
             "spawn_new_chat: discarding a draft selection bound to {:?} for a spawn against {host_id}",
             draft_host
         );
-        state.draft_backend_override.set(None);
-        state.draft_launch_profile_id.set(None);
-        state.draft_selection_host.set(None);
+        // The whole draft goes, not just the backend and profile: the custom
+        // agent and the profile-derived session settings were chosen against
+        // the same host and would otherwise be read below and sent to this one.
+        state.clear_draft_selection();
     }
 
     let backend_kind = match resolve_backend(state, &host_id) {
@@ -347,14 +341,7 @@ pub fn spawn_new_chat(
         draft_settings,
     );
 
-    state.draft_backend_override.set(None);
-    state.draft_custom_agent_id.set(None);
-    state.draft_launch_profile_id.set(None);
-    state.draft_selection_host.set(None);
-    state
-        .draft_session_settings
-        .set(SessionSettingsValues::default());
-    state.draft_session_settings_dirty.set(false);
+    state.clear_draft_selection();
 
     let pending_state = state.clone();
     spawn_local(async move {
