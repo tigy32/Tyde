@@ -17066,9 +17066,7 @@ fn flush_pending_session_summary_count_update(state: &mut HostState, agent_id: &
             .and_then(VecDeque::front)
             .cloned()
         else {
-            state
-                .pending_session_summary_count_updates
-                .remove(agent_id);
+            state.pending_session_summary_count_updates.remove(agent_id);
             return;
         };
         match fan_out_session_summary_count_update_inner(state, &update) {
@@ -17084,9 +17082,7 @@ fn flush_pending_session_summary_count_update(state: &mut HostState, agent_id: &
             }
             SessionSummaryCountDelivery::Deferred => return,
             SessionSummaryCountDelivery::Discarded => {
-                state
-                    .pending_session_summary_count_updates
-                    .remove(agent_id);
+                state.pending_session_summary_count_updates.remove(agent_id);
                 return;
             }
         }
