@@ -207,6 +207,8 @@ struct HostSubscriber {
     // HostBootstrap supplies a point-in-time list; only ListSessions opts a
     // stream into unsolicited summary updates.
     session_summary_updates_subscribed: bool,
+    new_agent_fanouts_in_flight: u32,
+    held_summary_count_frames: Vec<serde_json::Value>,
     known_agent_streams: HashSet<StreamPath>,
     attached_agent_streams: HashSet<StreamPath>,
     bootstrapped_agent_streams: HashSet<StreamPath>,
@@ -1456,6 +1458,20 @@ impl PendingAgentSessionPublication {
     }
 }
 
+fn finish_agent_publication(
+    visibility: &SpawnVisibility,
+    session_registration_publish: PendingAgentSessionPublication,
+    session_summary_count_tx: &HostSessionSummaryCountTx,
+    agent_id: &AgentId,
+) -> bool {
+    let cleanup_requested = visibility.finish_new_agent_fanout();
+    session_registration_publish.publish();
+    let _ = session_summary_count_tx.send(HostSessionSummaryCountEvent::AgentPublished(
+        agent_id.clone(),
+    ));
+    cleanup_requested
+}
+
 impl Drop for PendingAgentSessionPublication {
     fn drop(&mut self) {
         self.publish_tx.take();
@@ -2662,6 +2678,8 @@ impl HostHandle {
                 session_list_replay: SessionListReplayMode::for_agent_replay(agent_replay),
                 session_list_snapshot: None,
                 session_summary_updates_subscribed: false,
+                new_agent_fanouts_in_flight: 0,
+                held_summary_count_frames: Vec::new(),
                 known_agent_streams: HashSet::new(),
                 attached_agent_streams: HashSet::new(),
                 bootstrapped_agent_streams: HashSet::new(),
@@ -5156,6 +5174,10 @@ impl HostHandle {
             host_streams
         };
         host_streams.sort_by(|left, right| left.0.0.cmp(&right.0.0));
+        let fanout_paths = host_streams
+            .iter()
+            .map(|(path, _, _, _, _)| path.clone())
+            .collect::<Vec<_>>();
 
         let mut dead_paths = Vec::new();
         let mut deferred_attachments = Vec::new();
@@ -5220,6 +5242,13 @@ impl HostHandle {
                 }
             }
         }
+        {
+            let mut state = self.state.lock().await;
+            dead_paths.extend(release_new_agent_fanout_holds(
+                &mut state,
+                &fanout_paths,
+            ));
+        }
         if let Some(request) = generated_name_request {
             self.schedule_generated_agent_name(agent_handle.clone(), request);
         }
@@ -5242,12 +5271,14 @@ impl HostHandle {
                 state.agent_visibility.remove_host_stream(&path);
             }
         }
-        if visibility.finish_new_agent_fanout() {
+        if finish_agent_publication(
+            &visibility,
+            session_registration_publish,
+            &session_summary_count_tx,
+            &agent_id,
+        ) {
             return Ok(agent_id);
         }
-        let _ = session_summary_count_tx.send(HostSessionSummaryCountEvent::AgentPublished(
-            agent_id.clone(),
-        ));
         #[cfg(test)]
         wait_for_spawn_visible_before_publication_test_hook(self).await;
         {
@@ -5266,8 +5297,6 @@ impl HostHandle {
                 "failed to warm code intelligence after agent launch"
             );
         }
-
-        session_registration_publish.publish();
         visibility_guard.disarm();
         tracing::info!(
             agent_id = %agent_id,
@@ -5535,6 +5564,10 @@ impl HostHandle {
                 .collect::<Vec<_>>()
         };
         host_streams.sort_by(|left, right| left.0.0.cmp(&right.0.0));
+        let fanout_paths = host_streams
+            .iter()
+            .map(|(path, _, _, _, _)| path.clone())
+            .collect::<Vec<_>>();
 
         let mut dead_paths = Vec::new();
         let mut deferred_attachments = Vec::new();
@@ -5568,6 +5601,13 @@ impl HostHandle {
                 Err(_) => dead_paths.push(path),
             }
         }
+        {
+            let mut state = self.state.lock().await;
+            dead_paths.extend(release_new_agent_fanout_holds(
+                &mut state,
+                &fanout_paths,
+            ));
+        }
         for attachment in deferred_attachments {
             self.attach_deferred_agent_stream(attachment).await;
         }
@@ -5582,12 +5622,14 @@ impl HostHandle {
                 state.agent_visibility.remove_host_stream(&path);
             }
         }
-        if visibility.finish_new_agent_fanout() {
+        if finish_agent_publication(
+            &visibility,
+            session_registration_publish,
+            &session_summary_count_tx,
+            &agent_id,
+        ) {
             return agent_id;
         }
-        let _ = session_summary_count_tx.send(HostSessionSummaryCountEvent::AgentPublished(
-            agent_id.clone(),
-        ));
         #[cfg(test)]
         wait_for_spawn_visible_before_publication_test_hook(self).await;
 
@@ -5602,8 +5644,6 @@ impl HostHandle {
                 "failed to warm code intelligence after agent launch"
             );
         }
-
-        session_registration_publish.publish();
         visibility_guard.disarm();
         tracing::info!(
             agent_id = %agent_id,
@@ -7352,6 +7392,11 @@ impl HostHandle {
             )
         })?;
         let _ = host_output_stream.send_value(FrameKind::SessionList, payload);
+        let mut state = self.state.lock().await;
+        flush_pending_session_summary_count_updates_for_snapshot(
+            &mut state,
+            host_output_stream.path(),
+        );
         Ok(())
     }
 
@@ -8665,6 +8710,9 @@ impl HostHandle {
 
             let removed_session_id = state.agent_sessions.remove(&closed_agent_id);
             let removed_pending_session_id = state.pending_agent_sessions.remove(&closed_agent_id);
+            state
+                .pending_session_summary_count_updates
+                .remove(&closed_agent_id);
             state.agent_activity_summaries.remove(&closed_agent_id);
             for subscriber in state.host_streams.values_mut() {
                 forget_agent_fanout_for_subscriber(subscriber, &closed_agent_id);
@@ -10338,6 +10386,10 @@ impl HostHandle {
 
         let mut dead_paths = Vec::new();
         let mut deferred_attachments = Vec::new();
+        let fanout_paths = host_streams
+            .iter()
+            .map(|(path, _, _, _, _)| path.clone())
+            .collect::<Vec<_>>();
         for (path, stream, attach_eagerly, instance_stream, activity_summary) in host_streams {
             match emit_new_agent_for_stream(
                 &start,
@@ -10355,6 +10407,13 @@ impl HostHandle {
                 }
                 Err(_) => dead_paths.push(path),
             }
+        }
+        {
+            let mut state = self.state.lock().await;
+            dead_paths.extend(release_new_agent_fanout_holds(
+                &mut state,
+                &fanout_paths,
+            ));
         }
         for attachment in deferred_attachments {
             self.attach_deferred_agent_stream(attachment).await;
@@ -16468,6 +16527,12 @@ fn emit_or_queue_host_frame(
     kind: FrameKind,
     payload: serde_json::Value,
 ) -> Result<(), StreamClosed> {
+    if kind == FrameKind::SessionSummaryCountUpdated
+        && subscriber.new_agent_fanouts_in_flight > 0
+    {
+        subscriber.held_summary_count_frames.push(payload);
+        return Ok(());
+    }
     if subscriber.bootstrapped {
         subscriber.stream.send_value(kind, payload)
     } else {
@@ -16494,6 +16559,10 @@ fn prepare_new_agent_fanout_for_subscriber(
     }
 
     if subscriber.bootstrapped {
+        subscriber.new_agent_fanouts_in_flight = subscriber
+            .new_agent_fanouts_in_flight
+            .checked_add(1)
+            .expect("host subscriber NewAgent fanout counter overflowed");
         Some((
             subscriber.stream.clone(),
             attach_eagerly,
@@ -16512,6 +16581,40 @@ fn prepare_new_agent_fanout_for_subscriber(
             });
         None
     }
+}
+
+fn release_new_agent_fanout_holds(
+    state: &mut HostState,
+    fanout_paths: &[StreamPath],
+) -> Vec<StreamPath> {
+    let mut dead_paths = Vec::new();
+    for path in fanout_paths {
+        let Some(subscriber) = state.host_streams.get_mut(path) else {
+            continue;
+        };
+        if release_new_agent_fanout_hold(subscriber).is_err() {
+            dead_paths.push(path.clone());
+        }
+    }
+    dead_paths
+}
+
+fn release_new_agent_fanout_hold(subscriber: &mut HostSubscriber) -> Result<(), StreamClosed> {
+    subscriber.new_agent_fanouts_in_flight = subscriber
+        .new_agent_fanouts_in_flight
+        .checked_sub(1)
+        .expect("host subscriber NewAgent fanout completed without a matching start");
+    if subscriber.new_agent_fanouts_in_flight > 0 {
+        return Ok(());
+    }
+    for payload in std::mem::take(&mut subscriber.held_summary_count_frames) {
+        emit_or_queue_host_frame(
+            subscriber,
+            FrameKind::SessionSummaryCountUpdated,
+            payload,
+        )?;
+    }
+    Ok(())
 }
 
 fn forget_agent_fanout_for_subscriber(subscriber: &mut HostSubscriber, agent_id: &AgentId) {
@@ -16980,6 +17083,36 @@ fn flush_pending_session_summary_count_update(state: &mut HostState, agent_id: &
         return;
     };
     fan_out_session_summary_count_update_inner(state, &update, true);
+}
+
+fn flush_pending_session_summary_count_updates_for_snapshot(
+    state: &mut HostState,
+    host_stream: &StreamPath,
+) {
+    let Some(snapshot) = state
+        .host_streams
+        .get(host_stream)
+        .and_then(|subscriber| subscriber.session_list_snapshot.as_ref())
+    else {
+        return;
+    };
+    let session_ids = snapshot
+        .sessions
+        .iter()
+        .map(|summary| summary.id.clone())
+        .collect::<HashSet<_>>();
+    let agent_ids = state
+        .pending_session_summary_count_updates
+        .iter()
+        .filter_map(|(agent_id, update)| {
+            session_ids
+                .contains(&update.payload.session_id)
+                .then_some(agent_id.clone())
+        })
+        .collect::<Vec<_>>();
+    for agent_id in agent_ids {
+        flush_pending_session_summary_count_update(state, &agent_id);
+    }
 }
 
 fn queue_session_summary_count_update(
@@ -21347,6 +21480,145 @@ Rules: Record only what remains true and useful for future work; drop transient 
     }
 
     #[test]
+    fn cancelled_fanout_still_authorizes_and_signals_publication() {
+        let agent_id = AgentId(Uuid::new_v4().to_string());
+        let visibility =
+            SpawnVisibility::new(agent_id.clone(), AgentVisibilityRegistry::default());
+        assert!(visibility.begin_fanout());
+        visibility.cancel_outer_spawn();
+        let (publish_tx, mut publish_rx) = mpsc::unbounded_channel();
+        let publication = PendingAgentSessionPublication {
+            agent_id: agent_id.clone(),
+            publish_tx: Some(publish_tx),
+        };
+        let (summary_tx, mut summary_rx) = mpsc::unbounded_channel();
+
+        assert!(finish_agent_publication(
+            &visibility,
+            publication,
+            &summary_tx,
+            &agent_id,
+        ));
+        publish_rx
+            .try_recv()
+            .expect("cancelled fanout must still authorize session publication");
+        match summary_rx
+            .try_recv()
+            .expect("cancelled fanout must still settle pending summary updates")
+        {
+            HostSessionSummaryCountEvent::AgentPublished(published_agent_id) => {
+                assert_eq!(published_agent_id, agent_id);
+            }
+            HostSessionSummaryCountEvent::Update(_) => {
+                panic!("publication completion emitted a count update")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn summary_from_same_session_agent_waits_for_other_agent_new_agent() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let stream = Stream::new(
+            StreamPath(format!("/host/cross-agent-order-{}", Uuid::new_v4())),
+            tx,
+        );
+        let mut subscriber = HostSubscriber {
+            stream: stream.clone(),
+            bootstrapped: true,
+            agent_replay: AgentReplayMode::Eager,
+            session_list_replay: SessionListReplayMode::Full,
+            session_list_snapshot: None,
+            session_summary_updates_subscribed: true,
+            new_agent_fanouts_in_flight: 2,
+            held_summary_count_frames: Vec::new(),
+            known_agent_streams: HashSet::new(),
+            attached_agent_streams: HashSet::new(),
+            bootstrapped_agent_streams: HashSet::new(),
+            pending_bootstrap_new_agents: Vec::new(),
+            pending_bootstrap_frames: Vec::new(),
+            last_session_schemas: None,
+            last_backend_config_schemas: None,
+            last_backend_config_snapshots: None,
+            last_backend_native_settings_snapshots: None,
+            last_backend_capacity: None,
+            capacity_replay_ready: true,
+            last_launch_profile_catalog: None,
+        };
+        let shared_session_id = SessionId("shared-resume-session".to_owned());
+        let producer_agent_id = AgentId("existing-session-agent".to_owned());
+        let first_publishing_agent_id = AgentId("first-resumed-session-agent".to_owned());
+        let second_publishing_agent_id = AgentId("second-resumed-session-agent".to_owned());
+        let count_payload = SessionSummaryCountUpdatedPayload {
+            session_id: shared_session_id.clone(),
+            assistant_turn_count: 3,
+            updated_at_ms: 30,
+        };
+        let new_agent_payload = |agent_id: AgentId| NewAgentPayload {
+            agent_id: agent_id.clone(),
+            name: "Resumed session agent".to_owned(),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Hermes,
+            launch_profile_id: None,
+            workspace_roots: Vec::new(),
+            custom_agent_id: None,
+            team_id: None,
+            team_member_id: None,
+            project_id: None,
+            parent_agent_id: Some(producer_agent_id.clone()),
+            session_id: Some(shared_session_id.clone()),
+            workflow: None,
+            created_at_ms: 31,
+            instance_stream: new_instance_stream(&agent_id),
+            activity_summary: AgentActivitySummaryState::default(),
+        };
+
+        emit_or_queue_host_frame(
+            &mut subscriber,
+            FrameKind::SessionSummaryCountUpdated,
+            serde_json::to_value(&count_payload).expect("serialize count payload"),
+        )
+        .expect("hold count from existing agent");
+        assert!(
+            rx.try_recv().is_err(),
+            "a count from another agent sharing the session must wait for NewAgent"
+        );
+
+        stream
+            .send_value(
+                FrameKind::NewAgent,
+                serde_json::to_value(new_agent_payload(first_publishing_agent_id))
+                    .expect("serialize first NewAgent"),
+            )
+            .expect("send first resumed NewAgent");
+        release_new_agent_fanout_hold(&mut subscriber).expect("release count hold");
+        let first_new_agent = rx.recv().await.expect("first NewAgent frame");
+        assert_eq!(first_new_agent.kind, FrameKind::NewAgent);
+        assert!(
+            rx.try_recv().is_err(),
+            "the count must remain held while another NewAgent fanout is active"
+        );
+
+        stream
+            .send_value(
+                FrameKind::NewAgent,
+                serde_json::to_value(new_agent_payload(second_publishing_agent_id))
+                    .expect("serialize second NewAgent"),
+            )
+            .expect("send second resumed NewAgent");
+        release_new_agent_fanout_hold(&mut subscriber).expect("release final count hold");
+        let second_new_agent = rx.recv().await.expect("second NewAgent frame");
+        assert_eq!(second_new_agent.kind, FrameKind::NewAgent);
+        let count = rx.recv().await.expect("count frame");
+        assert_eq!(count.kind, FrameKind::SessionSummaryCountUpdated);
+        assert_eq!(
+            count
+                .parse_payload::<SessionSummaryCountUpdatedPayload>()
+                .expect("count payload"),
+            count_payload
+        );
+    }
+
+    #[test]
     fn spawn_host_with_mock_backend_does_not_require_existing_tokio_runtime() {
         let dir = std::env::temp_dir().join(format!("tyde-host-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create temp host dir");
@@ -22589,6 +22861,101 @@ Rules: Record only what remains true and useful for future work; drop transient 
     }
 
     #[tokio::test]
+    async fn session_list_snapshot_creation_flushes_matching_pending_count() {
+        let fixture = compact_fixture().await;
+        let (agent_id, session_id) =
+            spawn_idle_user_agent(&fixture.host, "persist a response before subscribing").await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let host_path = StreamPath(format!(
+            "/host/session-count-snapshot-{}",
+            Uuid::new_v4()
+        ));
+        let host_stream = Stream::new(host_path.clone(), tx);
+        assert!(
+            fixture
+                .host
+                .register_host_stream(host_stream.clone(), AgentReplayMode::Lazy)
+                .await
+                .is_empty()
+        );
+        let bootstrap = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("host bootstrap")
+            .expect("host stream remains open");
+        assert_eq!(bootstrap.kind, FrameKind::HostBootstrap);
+        while rx.try_recv().is_ok() {}
+
+        let expected = {
+            let mut state = fixture.host.state.lock().await;
+            let summary = state
+                .host_streams
+                .get(&host_path)
+                .and_then(|subscriber| subscriber.session_list_snapshot.as_ref())
+                .and_then(|snapshot| {
+                    snapshot
+                        .sessions
+                        .iter()
+                        .find(|summary| summary.id == session_id)
+                })
+                .expect("bootstrap snapshot contains persisted session");
+            let update = HostSessionSummaryCountUpdate {
+                agent_id: agent_id.clone(),
+                payload: SessionSummaryCountUpdatedPayload {
+                    session_id: session_id.clone(),
+                    assistant_turn_count: summary.message_count,
+                    updated_at_ms: summary.updated_at_ms,
+                },
+            };
+            state
+                .pending_session_summary_count_updates
+                .insert(agent_id.clone(), update.clone());
+            update.payload
+        };
+
+        fixture
+            .host
+            .list_sessions(&host_stream, ListSessionsPayload::default())
+            .await
+            .expect("create subscribed session snapshot");
+
+        let mut saw_session_list = false;
+        let count = timeout(Duration::from_secs(1), async {
+            loop {
+                let envelope = rx.recv().await.expect("host stream remains open");
+                match envelope.kind {
+                    FrameKind::SessionList => saw_session_list = true,
+                    FrameKind::SessionSummaryCountUpdated => {
+                        let payload = envelope
+                            .parse_payload::<SessionSummaryCountUpdatedPayload>()
+                            .expect("count payload");
+                        if payload.session_id == session_id {
+                            assert!(
+                                saw_session_list,
+                                "snapshot response must precede its pending count flush"
+                            );
+                            break payload;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("matching pending count flush");
+        assert_eq!(count, expected);
+        assert!(
+            !fixture
+                .host
+                .state
+                .lock()
+                .await
+                .pending_session_summary_count_updates
+                .contains_key(&agent_id),
+            "matching pending count must be consumed when the snapshot is created"
+        );
+    }
+
+    #[tokio::test]
     async fn lazy_host_registration_defers_agent_bootstrap_until_load() {
         let fixture = compact_fixture().await;
         let (agent_id, _) =
@@ -22750,6 +23117,8 @@ Rules: Record only what remains true and useful for future work; drop transient 
             session_list_replay: SessionListReplayMode::Full,
             session_list_snapshot: None,
             session_summary_updates_subscribed: false,
+            new_agent_fanouts_in_flight: 0,
+            held_summary_count_frames: Vec::new(),
             known_agent_streams: HashSet::new(),
             attached_agent_streams: HashSet::new(),
             bootstrapped_agent_streams: HashSet::new(),
@@ -22824,6 +23193,8 @@ Rules: Record only what remains true and useful for future work; drop transient 
             session_list_replay: SessionListReplayMode::Full,
             session_list_snapshot: None,
             session_summary_updates_subscribed: false,
+            new_agent_fanouts_in_flight: 0,
+            held_summary_count_frames: Vec::new(),
             known_agent_streams: HashSet::new(),
             attached_agent_streams: HashSet::new(),
             bootstrapped_agent_streams: HashSet::new(),
@@ -22900,6 +23271,8 @@ Rules: Record only what remains true and useful for future work; drop transient 
             session_list_replay: SessionListReplayMode::Full,
             session_list_snapshot: None,
             session_summary_updates_subscribed: false,
+            new_agent_fanouts_in_flight: 0,
+            held_summary_count_frames: Vec::new(),
             known_agent_streams: HashSet::new(),
             attached_agent_streams: HashSet::new(),
             bootstrapped_agent_streams: HashSet::new(),

@@ -108,6 +108,8 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
             push_bootstrap_events(client, events);
             continue;
         }
+        // A completed response on any visible agent may update the host while
+        // these callers await the next lifecycle or chat frame.
         if matches!(
             env.kind,
             FrameKind::HostSettings
@@ -119,6 +121,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::SessionList
+                | FrameKind::SessionSummaryCountUpdated
                 | FrameKind::TaskTokenUsage
                 | FrameKind::WorkflowNotify
                 | FrameKind::AgentsViewPreferencesNotify
@@ -395,6 +398,8 @@ async fn wait_for_session_list(
         if env.kind == FrameKind::AgentBootstrap {
             continue;
         }
+        // This helper waits for the requested SessionList, not for the
+        // absence of unrelated targeted host notifications.
         if matches!(
             env.kind,
             FrameKind::HostSettings
@@ -410,6 +415,7 @@ async fn wait_for_session_list(
                 | FrameKind::NewAgent
                 | FrameKind::AgentStart
                 | FrameKind::AgentError
+                | FrameKind::SessionSummaryCountUpdated
                 | FrameKind::TaskTokenUsage
                 | FrameKind::ChatEvent
         ) {
