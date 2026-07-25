@@ -37,8 +37,9 @@ pub struct SessionRecord {
     pub parent_id: Option<SessionId>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
-    /// Completed assistant turns (one per persisted `StreamEnd`);
-    /// `message_count` is retained for store compatibility.
+    /// Persisted assistant responses (one per `StreamEnd`, including partial
+    /// responses followed by cancellation or failure); `message_count` is
+    /// retained for store compatibility.
     #[serde(default)]
     pub message_count: u32,
     #[serde(default)]

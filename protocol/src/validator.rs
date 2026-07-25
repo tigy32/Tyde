@@ -2051,7 +2051,7 @@ mod tests {
     }
 
     #[test]
-    fn session_summary_count_update_requires_typed_assistant_turn_count() {
+    fn session_summary_count_update_requires_typed_response_count_wire_field() {
         let mut validator = ProtocolValidator::new();
         validator
             .validate_envelope(&host_bootstrap_with_agents(vec![]))

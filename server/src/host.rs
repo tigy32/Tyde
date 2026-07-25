@@ -22200,10 +22200,10 @@ Rules: Record only what remains true and useful for future work; drop transient 
     }
 
     #[tokio::test]
-    async fn completed_turn_fans_out_targeted_assistant_turn_count() {
+    async fn response_end_fans_out_targeted_assistant_response_count() {
         let fixture = compact_fixture().await;
         let (agent_id, session_id) =
-            spawn_idle_user_agent(&fixture.host, "count completed assistant turns").await;
+            spawn_idle_user_agent(&fixture.host, "count persisted assistant responses").await;
         let (tx, mut rx) = mpsc::unbounded_channel();
         let host_path = StreamPath(format!("/host/session-count-{}", Uuid::new_v4()));
         let host_stream = Stream::new(host_path.clone(), tx);
@@ -22263,7 +22263,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
 
         assert_eq!(
             rebuilt_session_lists, 0,
-            "turn completion must not rebuild the full session list"
+            "response persistence must not rebuild the full session list"
         );
         {
             let state = fixture.host.state.lock().await;

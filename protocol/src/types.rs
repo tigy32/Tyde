@@ -3588,8 +3588,9 @@ pub struct SessionSummary {
     pub parent_id: Option<SessionId>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
-    /// Completed assistant turns (one per persisted `StreamEnd`);
-    /// `message_count` is retained as the legacy wire name.
+    /// Persisted assistant responses (one per `StreamEnd`, including partial
+    /// responses followed by cancellation or failure); `message_count` is
+    /// retained as the legacy wire name.
     pub message_count: u32,
     pub token_count: Option<u64>,
     pub resumable: bool,
@@ -3612,9 +3613,12 @@ pub struct SessionListPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummaryCountUpdatedPayload {
     pub session_id: SessionId,
-    /// Number of completed assistant turns (`StreamEnd`s) persisted for this session.
+    /// Persisted assistant responses for this session. Each `StreamEnd` counts,
+    /// including a partial response followed by cancellation or failure.
+    /// `assistant_turn_count` is retained as the existing wire field name.
     pub assistant_turn_count: u32,
-    /// Authoritative last-activity timestamp persisted at the same turn boundary.
+    /// Authoritative last-activity timestamp persisted at the same response
+    /// boundary.
     pub updated_at_ms: u64,
 }
 
@@ -7546,7 +7550,7 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn session_summary_count_update_names_assistant_turn_semantics() {
+    fn session_summary_count_update_retains_existing_typed_wire_name() {
         let payload = SessionSummaryCountUpdatedPayload {
             session_id: SessionId("session-1".to_owned()),
             assistant_turn_count: 3,
@@ -7559,6 +7563,7 @@ mod search_serde_tests {
         assert_eq!(encoded["assistant_turn_count"], 3);
         assert_eq!(encoded["updated_at_ms"], 1_700_000_000_000_u64);
         assert!(encoded.get("message_count").is_none());
+        assert!(encoded.get("assistant_response_count").is_none());
         assert_eq!(
             FrameKind::SessionSummaryCountUpdated.to_string(),
             "session_summary_count_updated"

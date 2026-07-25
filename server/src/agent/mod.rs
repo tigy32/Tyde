@@ -9410,7 +9410,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_session_updates_publish_completed_assistant_turn_counts() {
+    async fn runtime_session_updates_count_terminal_assistant_responses() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(Mutex::new(
             SessionStore::load(dir.path().join("sessions.json")).expect("session store"),
@@ -9447,7 +9447,7 @@ mod tests {
             assert_eq!(
                 apply_runtime_session_updates(&store, &session_id, &event).await,
                 None,
-                "{event:?} must not advance the assistant-turn count"
+                "{event:?} must not advance the assistant-response count"
             );
         }
         assert_eq!(
@@ -9460,27 +9460,53 @@ mod tests {
             None,
             "a missing authoritative session must not publish a count"
         );
-        let first_update = apply_runtime_session_updates(
+        let cancelled_response_update = apply_runtime_session_updates(
             &store,
             &session_id,
-            &stream_end_with_usage("turn-1", "first", 5),
+            &stream_end_with_usage("turn-1", "partial response before cancellation", 5),
         )
         .await
-        .expect("first persisted count update");
-        assert_eq!(first_update.session_id, session_id);
-        assert_eq!(first_update.assistant_turn_count, 1);
-        assert!(first_update.updated_at_ms > 1);
+        .expect("cancelled partial response count update");
+        assert_eq!(cancelled_response_update.session_id, session_id);
+        assert_eq!(cancelled_response_update.assistant_turn_count, 1);
+        assert!(cancelled_response_update.updated_at_ms > 1);
+        assert_eq!(
+            apply_runtime_session_updates(
+                &store,
+                &session_id,
+                &ChatEvent::OperationCancelled(protocol::OperationCancelledData {
+                    message: "cancelled after partial response".to_owned(),
+                }),
+            )
+            .await,
+            None,
+            "the cancellation terminal must not count separately from StreamEnd"
+        );
 
-        let second_update = apply_runtime_session_updates(
+        let failed_response_update = apply_runtime_session_updates(
             &store,
             &session_id,
-            &stream_end_with_usage("turn-2", "second", 7),
+            &stream_end_with_usage("turn-2", "partial response before failure", 7),
         )
         .await
-        .expect("second persisted count update");
-        assert_eq!(second_update.session_id, session_id);
-        assert_eq!(second_update.assistant_turn_count, 2);
-        assert!(second_update.updated_at_ms >= first_update.updated_at_ms);
+        .expect("failed partial response count update");
+        assert_eq!(failed_response_update.session_id, session_id);
+        assert_eq!(failed_response_update.assistant_turn_count, 2);
+        assert!(
+            failed_response_update.updated_at_ms >= cancelled_response_update.updated_at_ms
+        );
+        let mut failure_message = assistant_message("provider failed after partial response");
+        failure_message.sender = MessageSender::Error;
+        assert_eq!(
+            apply_runtime_session_updates(
+                &store,
+                &session_id,
+                &ChatEvent::MessageAdded(failure_message),
+            )
+            .await,
+            None,
+            "the failure terminal must not count separately from StreamEnd"
+        );
 
         let persisted = store
             .lock()
@@ -9488,7 +9514,10 @@ mod tests {
             .get(&session_id)
             .expect("persisted session");
         assert_eq!(persisted.message_count, 2);
-        assert_eq!(persisted.updated_at_ms, second_update.updated_at_ms);
+        assert_eq!(
+            persisted.updated_at_ms,
+            failed_response_update.updated_at_ms
+        );
     }
 
     fn observe_stats(
