@@ -244,12 +244,16 @@ pub fn SessionsPanel() -> impl IntoView {
     }
 }
 
-/// Singular/plural label for the per-session turn counter.
+/// Singular/plural label for the per-session response counter.
+///
+/// "Responses", not "completed turns": the store increments on every
+/// `StreamEnd`, and cancelled and protocol-failed streams emit one too. Calling
+/// those completed would present an abandoned partial answer as a finished one.
 fn format_turn_count(turns: u32) -> String {
     if turns == 1 {
-        "1 turn".to_owned()
+        "1 response".to_owned()
     } else {
-        format!("{turns} turns")
+        format!("{turns} responses")
     }
 }
 
@@ -265,10 +269,19 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
         .first()
         .map(|w| last_path_component(w).to_string())
         .unwrap_or_default();
-    // The store increments this once per completed assistant turn (a StreamEnd),
-    // never for the user's own message, so it counts turns and not messages.
-    // Labelled for what it is rather than inheriting a name that overstates it.
+    // The store increments this once per persisted assistant stream (a
+    // StreamEnd), never for the user's own message, so it counts responses and
+    // not messages. Labelled for what it is rather than inheriting a name that
+    // overstates it.
     let turn_count = session.summary.message_count;
+    // Whether a turn has landed since the last authoritative list. The targeted
+    // count frame carries no timestamp, so the date beside this badge is known
+    // to be older than the session's real last activity.
+    let stale_date = {
+        let state = state.clone();
+        let key = (session.host_id.clone(), session.summary.id.clone());
+        Memo::new(move |_| state.sessions_with_newer_activity.with(|s| s.contains(&key)))
+    };
     let session_id = session.summary.id.clone();
     let resumable = session.summary.resumable;
     let session_host_id = session.host_id.clone();
@@ -399,7 +412,21 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
                 </div>
             </div>
             <div class="session-card-meta">
-                <span class="session-card-date">{last_active}</span>
+                <span
+                    class="session-card-date"
+                    class:session-card-date-stale=move || stale_date.get()
+                    title=move || if stale_date.get() {
+                        "A newer response has landed; this host has not sent an \
+                         updated last-active time yet"
+                    } else {
+                        "Last active"
+                    }
+                >
+                    {last_active}
+                    {move || stale_date.get().then(|| view! {
+                        <span class="session-card-date-stale-marker">" · newer activity"</span>
+                    })}
+                </span>
                 {move || project_name().map(|n| view! {
                     <span class="session-card-project">{n}</span>
                 })}
@@ -408,7 +435,8 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
                 })}
                 <span
                     class="session-card-msgs"
-                    title="Completed assistant turns in this session"
+                    title="Assistant responses persisted for this session, including \
+                           any that were cancelled or failed part-way"
                 >{format_turn_count(turn_count)}</span>
             </div>
             <div class="session-card-id">{short_id}</div>

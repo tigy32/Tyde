@@ -5955,6 +5955,14 @@ kbd {
     font-family: var(--font-mono);
 }
 
+/* The displayed date is known to lag the session's real last activity: a turn
+   landed, but the host has not sent an updated timestamp. Marked rather than
+   quietly shown as current. */
+.session-card-date-stale-marker {
+    font-style: italic;
+    opacity: 0.8;
+}
+
 .session-card-workspace {
     font-size: 0.769rem;
     color: var(--text-secondary);

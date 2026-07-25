@@ -16,7 +16,7 @@ use protocol::{
     CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CodeIntelStatusScope,
     CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FrameKind, HostBootstrapPayload,
     HostBrowseEntriesPayload, HostBrowseErrorPayload, HostBrowseOpenedPayload,
-    HostSettingErrorTarget, HostSettingsPayload, LaunchProfileCatalogPayload,
+    HostSettingErrorTarget, HostSettingsPayload, LaunchProfileCatalogPayload, LaunchProfileEntry,
     McpServerNotifyPayload, MobileAccessStatePayload, MobilePairingOfferPayload,
     MobilePairingState, NewAgentPayload, NewTerminalPayload, ProjectBootstrapPayload,
     ProjectEventPayload, ProjectFileContentsPayload, ProjectFileListPayload,
@@ -1225,14 +1225,51 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
         },
         FrameKind::SessionList => match envelope.parse_payload::<SessionListPayload>() {
             Ok(payload) => {
-                state.sessions.update(|sessions| {
-                    sessions.retain(|session| session.host_id != host_id);
-                    sessions.extend(payload.sessions.into_iter().map(|summary| SessionInfo {
+                // Distinguish a first page from a continuation. Replacing the
+                // host's rows unconditionally erases page 1 when page 2
+                // arrives, which makes the paging the protocol advertises
+                // unusable — `offset > 0` is the server telling us this
+                // continues an existing list rather than restating it.
+                let is_continuation = payload.page.cursor.offset > 0;
+                let arriving: Vec<SessionInfo> = payload
+                    .sessions
+                    .into_iter()
+                    .map(|summary| SessionInfo {
                         host_id: host_id.to_string(),
                         summary,
-                    }));
+                    })
+                    .collect();
+                state.sessions.update(|sessions| {
+                    if is_continuation {
+                        // Append, de-duplicating by id so a replayed or
+                        // overlapping page cannot double a row.
+                        for session in arriving {
+                            if let Some(existing) = sessions.iter_mut().find(|existing| {
+                                existing.host_id == session.host_id
+                                    && existing.summary.id == session.summary.id
+                            }) {
+                                *existing = session;
+                            } else {
+                                sessions.push(session);
+                            }
+                        }
+                    } else {
+                        sessions.retain(|session| session.host_id != host_id);
+                        sessions.extend(arriving);
+                    }
                     sessions
                         .sort_by_key(|session| std::cmp::Reverse(session.summary.updated_at_ms));
+                });
+                // Paging is per host and scope, so it is stored that way. The
+                // panel needs the next cursor to be able to ask for more at
+                // all.
+                state.session_list_pages.update(|pages| {
+                    pages.insert(host_id.to_string(), payload.page);
+                });
+                // An authoritative list supersedes any per-turn count patches,
+                // including the activity ordering they could not update.
+                state.sessions_with_newer_activity.update(|stale| {
+                    stale.retain(|(stale_host, _)| stale_host != host_id);
                 });
             }
             Err(error) => report_dispatch_error(
@@ -1251,17 +1288,32 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     // ordered by last activity, and a per-turn reshuffle would
                     // move rows under the reader's cursor. Only the count the
                     // server just recomputed changes here.
-                    state.sessions.update(|sessions| {
-                        if let Some(session) = sessions.iter_mut().find(|session| {
-                            session.host_id == host_id && session.summary.id == payload.session_id
-                        }) {
-                            session.summary.message_count = payload.assistant_turn_count;
-                        }
+                    let patched = state.sessions.try_update(|sessions| {
                         // A session this client has not listed yet needs no
                         // action: the next SessionList/HostBootstrap carries the
                         // authoritative count, so inventing a row here would
                         // fabricate a summary we do not have.
+                        let Some(session) = sessions.iter_mut().find(|session| {
+                            session.host_id == host_id && session.summary.id == payload.session_id
+                        }) else {
+                            return false;
+                        };
+                        session.summary.message_count = payload.assistant_turn_count;
+                        true
                     });
+                    if patched == Some(true) {
+                        // The turn also advanced the session's last activity,
+                        // but this frame carries only the count, so the
+                        // displayed date is now older than the truth. Mark it
+                        // rather than render a stale date as current or invent
+                        // a client-side timestamp. Ordering is deliberately
+                        // left alone for the same reason: without the
+                        // authoritative timestamp any reorder would be a guess,
+                        // and it would move rows under the reader mid-scroll.
+                        state.sessions_with_newer_activity.update(|stale| {
+                            stale.insert((host_id.to_string(), payload.session_id.clone()));
+                        });
+                    }
                 }
                 Err(error) => report_dispatch_error(
                     state,
@@ -5395,10 +5447,138 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
             }
         }
     });
-    // Only now can a persisted chat pointer be resolved: it names an agent, and
-    // the agents it names exist as of this line. The project restore above runs
-    // earlier because it only needs `state.projects`.
-    state.restore_active_chat_after_host_bootstrap(host_id);
+    // Only now can the persisted selection be resolved: it names an agent, a
+    // backend and a launch profile, and all three become knowable at this line.
+    // The project restore above runs earlier because it only needs
+    // `state.projects`.
+    restore_active_chat_after_host_bootstrap(state, host_id);
+    restore_draft_selection_after_host_bootstrap(state, host_id);
+}
+
+/// Reopen the chat that was active before a reload, once its owning host's
+/// bootstrap has installed the agents it names.
+///
+/// Conservative by design:
+///
+/// - The **whole** persisted identity must still resolve — host, agent, and the
+///   project that owned it. An agent id that merely exists is not proof the
+///   chat belongs where it is about to be opened.
+/// - Live agents only. A pointer whose agent is gone is retired rather than
+///   resumed; resuming would be an implicit, possibly paid, backend action on
+///   page load, and explicit history clicks already own that.
+/// - A selection the user already made wins, which is enforced upstream by
+///   `retire_pending_restores`.
+fn restore_active_chat_after_host_bootstrap(state: &AppState, host_id: &str) {
+    let Some(pending) = state
+        .pending_active_chat_restore
+        .get_untracked()
+        .filter(|pending| pending.host_id == host_id)
+    else {
+        return;
+    };
+    state.pending_active_chat_restore.set(None);
+
+    let live = state.agents.with_untracked(|agents| {
+        agents
+            .iter()
+            .find(|agent| agent.host_id == host_id && agent.agent_id == pending.agent_id)
+            .map(|agent| (agent.name.clone(), agent.project_id.clone()))
+    });
+
+    // The chat's project must still be the one the user is looking at.
+    // Otherwise a project-A chat lands in project B — visible context and chat
+    // ownership disagreeing is the contradiction this whole finding is about.
+    let active_project = state.active_project.get_untracked();
+    let restores_cleanly = match &live {
+        Some((_, agent_project)) => {
+            *agent_project == pending.project_id
+                && pending.project_id == active_project.as_ref().map(|p| p.project_id.clone())
+                && active_project
+                    .as_ref()
+                    .is_none_or(|project| project.host_id == host_id)
+        }
+        None => false,
+    };
+    if !restores_cleanly {
+        // Retire the stale pointer explicitly. The persist effect keys off
+        // `active_agent`, which does not change here, so nothing else would
+        // clear it and the same unresolvable chat would be retried every
+        // reload.
+        state.retire_pending_restores();
+        return;
+    }
+    let (name, _) = live.expect("checked above");
+
+    let agent_ref = ActiveAgentRef {
+        host_id: pending.host_id.clone(),
+        agent_id: pending.agent_id.clone(),
+    };
+    // Project restoration has already opened a synthetic New Chat for a project
+    // with no view memory. Upgrade that draft in place rather than opening a
+    // second tab beside it, which would leave every cold restore with an unused
+    // New Chat and an ambiguous draft.
+    if upgrade_draft_chat_tab(state, active_project.as_ref(), &agent_ref, &name)
+        != TabUpgradeResult::Updated
+    {
+        state.open_tab(TabContent::chat_with_agent(agent_ref), name, true);
+    }
+}
+
+/// Re-apply the draft backend/launch-profile choice, but only against the host
+/// it was made for and only if that host still offers it.
+///
+/// A launch-profile id means nothing outside its own host's catalog, and a
+/// backend enabled on one host may be disabled on another. An unreconciled
+/// selection can therefore arm Send for a deleted profile or a disabled
+/// backend — either a predictable spawn failure or a spawn that bypasses the
+/// host's own setting. When the selection no longer resolves it is dropped, so
+/// the composer falls back to the host default rather than staying armed with
+/// something the host has refused.
+fn restore_draft_selection_after_host_bootstrap(state: &AppState, host_id: &str) {
+    let Some(pending) = state
+        .pending_draft_restore
+        .get_untracked()
+        .filter(|pending| pending.host_id == host_id)
+    else {
+        return;
+    };
+    state.pending_draft_restore.set(None);
+
+    let backend_enabled = pending.backend.is_none_or(|backend| {
+        state
+            .host_settings_untracked(host_id)
+            .is_some_and(|settings| settings.enabled_backends.contains(&backend))
+    });
+    let profile_ready = pending.launch_profile.as_ref().is_none_or(|profile_id| {
+        state.launch_profile_catalog.with_untracked(|catalog| {
+            catalog.get(host_id).is_some_and(|catalog| {
+                catalog.entries.iter().any(|entry| match entry {
+                    // Only a Ready entry is selectable. An Unavailable entry is
+                    // retained by the server precisely so its reason stays
+                    // visible; it is not something to re-arm.
+                    LaunchProfileEntry::Ready { profile } => {
+                        profile.id == *profile_id
+                            && pending
+                                .backend
+                                .is_none_or(|backend| profile.backend_kind == backend)
+                    }
+                    LaunchProfileEntry::Unavailable { .. } => false,
+                })
+            })
+        })
+    });
+
+    if !backend_enabled || !profile_ready {
+        log::warn!(
+            "dropping restored draft selection for host={host_id}: \
+             backend_enabled={backend_enabled} profile_ready={profile_ready}"
+        );
+        state.retire_pending_restores();
+        return;
+    }
+
+    state.draft_backend_override.set(pending.backend);
+    state.draft_launch_profile_id.set(pending.launch_profile);
 }
 
 fn agent_info_from_payload(host_id: &str, payload: NewAgentPayload) -> AgentInfo {
@@ -5943,6 +6123,317 @@ mod tests {
             },
         )
         .expect("synthetic HostBootstrap")
+    }
+
+    /// A HostBootstrap payload with the pieces the restore path actually reads.
+    /// Built from the empty fixture so it stays in step with protocol growth.
+    fn restore_bootstrap(
+        enabled_backends: Vec<BackendKind>,
+        catalog: protocol::LaunchProfileCatalog,
+        projects: Vec<protocol::Project>,
+        agents: Vec<NewAgentPayload>,
+    ) -> HostBootstrapPayload {
+        let mut payload = empty_host_bootstrap_envelope("/host", 0)
+            .parse_payload::<HostBootstrapPayload>()
+            .expect("fixture parses");
+        payload.settings.enabled_backends = enabled_backends;
+        payload.launch_profile_catalog = catalog;
+        payload.projects = projects;
+        payload.agents = agents;
+        payload
+    }
+
+    fn restore_project(id: &str) -> protocol::Project {
+        protocol::Project {
+            id: ProjectId(id.to_owned()),
+            name: id.to_owned(),
+            sort_order: 0,
+            source: protocol::ProjectSource::Standalone {
+                roots: vec![ProjectRootPath(format!("/{id}"))],
+            },
+        }
+    }
+
+    fn restore_agent_payload(agent: &str, project: Option<&str>) -> NewAgentPayload {
+        NewAgentPayload {
+            agent_id: AgentId(agent.to_owned()),
+            name: format!("Agent {agent}"),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Hermes,
+            workspace_roots: Vec::new(),
+            project_id: project.map(|p| ProjectId(p.to_owned())),
+            parent_agent_id: None,
+            session_id: None,
+            custom_agent_id: None,
+            workflow: None,
+            created_at_ms: 0,
+            instance_stream: StreamPath(format!("/agent/{agent}/inst")),
+        }
+    }
+
+    fn chat_tab_count(state: &AppState) -> usize {
+        state.center_zone.with_untracked(|cz| {
+            cz.panes()
+                .flat_map(|(_, pane)| pane.tabs.iter())
+                .filter(|tab| matches!(tab.content, TabContent::Chat { .. }))
+                .count()
+        })
+    }
+
+    /// FE-01: New Chat, Home and switching to an unvisited project all leave
+    /// `active_agent` at `None`, so intent cannot be inferred from it. A late
+    /// bootstrap must not insert the old chat over a choice already made.
+    #[test]
+    fn new_chat_before_bootstrap_survives_a_late_restore() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            state
+                .pending_active_chat_restore
+                .set(Some(crate::state::PersistedChatRef {
+                    host_id: "host-a".to_owned(),
+                    agent_id: AgentId("agent-old".to_owned()),
+                    project_id: None,
+                }));
+
+            // The user opens a New Chat while host-a is still connecting.
+            crate::actions::begin_new_chat_with(&state, None, None);
+            assert_eq!(
+                state.pending_active_chat_restore.get_untracked(),
+                None,
+                "an explicit New Chat must retire the pending restore"
+            );
+
+            apply_host_bootstrap(
+                &state,
+                "host-a",
+                restore_bootstrap(
+                    vec![BackendKind::Hermes],
+                    Default::default(),
+                    Vec::new(),
+                    vec![restore_agent_payload("agent-old", None)],
+                ),
+            );
+
+            assert_eq!(
+                state.active_agent.get_untracked(),
+                None,
+                "the late bootstrap must not steal focus back to the old chat"
+            );
+        });
+    }
+
+    /// FE-04: an agent id that merely exists is not an identity. A project-A
+    /// chat must not be opened while project B is active.
+    #[test]
+    fn chat_restore_refuses_a_project_mismatch() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            state.projects.update(|projects| {
+                projects.push(ProjectInfo {
+                    host_id: "host-a".to_owned(),
+                    project: restore_project("project-b"),
+                });
+            });
+            state.switch_active_project(Some(ActiveProjectRef {
+                host_id: "host-a".to_owned(),
+                project_id: ProjectId("project-b".to_owned()),
+            }));
+            // Pointer names a chat owned by project-a.
+            state
+                .pending_active_chat_restore
+                .set(Some(crate::state::PersistedChatRef {
+                    host_id: "host-a".to_owned(),
+                    agent_id: AgentId("agent-a".to_owned()),
+                    project_id: Some(ProjectId("project-a".to_owned())),
+                }));
+
+            apply_host_bootstrap(
+                &state,
+                "host-a",
+                restore_bootstrap(
+                    vec![BackendKind::Hermes],
+                    Default::default(),
+                    vec![restore_project("project-a"), restore_project("project-b")],
+                    vec![restore_agent_payload("agent-a", Some("project-a"))],
+                ),
+            );
+
+            assert_eq!(
+                state.active_agent.get_untracked(),
+                None,
+                "a project-A chat must not open while project B is active"
+            );
+            assert_eq!(state.pending_active_chat_restore.get_untracked(), None);
+        });
+    }
+
+    /// FE-05: project restoration opens a synthetic New Chat first. The chat
+    /// restore must upgrade that draft, not add a second tab beside it.
+    #[test]
+    fn cold_restore_leaves_exactly_one_chat_tab() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let project = ActiveProjectRef {
+                host_id: "host-a".to_owned(),
+                project_id: ProjectId("project-a".to_owned()),
+            };
+            state.projects.update(|projects| {
+                projects.push(ProjectInfo {
+                    host_id: "host-a".to_owned(),
+                    project: restore_project("project-a"),
+                });
+            });
+            // Cold restore: project switch creates the synthetic New Chat.
+            state.switch_active_project(Some(project));
+            assert_eq!(chat_tab_count(&state), 1, "the synthetic draft exists");
+
+            state
+                .pending_active_chat_restore
+                .set(Some(crate::state::PersistedChatRef {
+                    host_id: "host-a".to_owned(),
+                    agent_id: AgentId("agent-a".to_owned()),
+                    project_id: Some(ProjectId("project-a".to_owned())),
+                }));
+            apply_host_bootstrap(
+                &state,
+                "host-a",
+                restore_bootstrap(
+                    vec![BackendKind::Hermes],
+                    Default::default(),
+                    vec![restore_project("project-a")],
+                    vec![restore_agent_payload("agent-a", Some("project-a"))],
+                ),
+            );
+
+            assert_eq!(
+                state.active_agent.get_untracked(),
+                Some(ActiveAgentRef {
+                    host_id: "host-a".to_owned(),
+                    agent_id: AgentId("agent-a".to_owned()),
+                }),
+                "the persisted chat is restored"
+            );
+            assert_eq!(
+                chat_tab_count(&state),
+                1,
+                "and it replaces the synthetic draft rather than sitting beside it"
+            );
+        });
+    }
+
+    /// FE-02: a launch-profile id means nothing outside its own host's catalog.
+    /// A selection made against host-a must not arm host-b.
+    #[test]
+    fn draft_selection_is_not_applied_to_a_different_host() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            state
+                .pending_draft_restore
+                .set(Some(crate::state::PersistedDraftSelection {
+                    host_id: "host-a".to_owned(),
+                    backend: Some(BackendKind::Hermes),
+                    launch_profile: Some(LaunchProfileId("hermes:profile:qa".to_owned())),
+                }));
+
+            apply_host_bootstrap(
+                &state,
+                "host-b",
+                restore_bootstrap(
+                    vec![BackendKind::Hermes],
+                    Default::default(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            );
+
+            assert_eq!(
+                state.draft_backend_override.get_untracked(),
+                None,
+                "host-b must not inherit host-a's backend choice"
+            );
+            assert_eq!(
+                state.draft_launch_profile_id.get_untracked(),
+                None,
+                "nor its profile id, which host-b's catalog does not define"
+            );
+            assert!(
+                state.pending_draft_restore.get_untracked().is_some(),
+                "and host-a's own selection stays pending for host-a"
+            );
+        });
+    }
+
+    /// FE-03: a restored selection the host no longer offers must be dropped,
+    /// not left armed. Otherwise Send stays enabled for a deleted profile or a
+    /// backend the host has disabled.
+    #[test]
+    fn draft_selection_is_dropped_when_the_host_no_longer_offers_it() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            // Backend disabled on the target host.
+            let state = AppState::new();
+            state
+                .pending_draft_restore
+                .set(Some(crate::state::PersistedDraftSelection {
+                    host_id: "host-a".to_owned(),
+                    backend: Some(BackendKind::Hermes),
+                    launch_profile: None,
+                }));
+            apply_host_bootstrap(
+                &state,
+                "host-a",
+                restore_bootstrap(
+                    vec![BackendKind::Claude],
+                    Default::default(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            );
+            assert_eq!(
+                state.draft_backend_override.get_untracked(),
+                None,
+                "a backend the host has disabled must not stay armed"
+            );
+
+            // Profile present in the catalog but Unavailable.
+            let state = AppState::new();
+            state
+                .pending_draft_restore
+                .set(Some(crate::state::PersistedDraftSelection {
+                    host_id: "host-a".to_owned(),
+                    backend: Some(BackendKind::Hermes),
+                    launch_profile: Some(LaunchProfileId("hermes:profile:qa".to_owned())),
+                }));
+            let catalog = protocol::LaunchProfileCatalog {
+                entries: vec![protocol::LaunchProfileEntry::Unavailable {
+                    id: LaunchProfileId("hermes:profile:qa".to_owned()),
+                    kind: protocol::LaunchProfileKind::BackendDefault,
+                    backend_kind: BackendKind::Hermes,
+                    label: "Hermes — qa".to_owned(),
+                    message: "gateway exploded".to_owned(),
+                }],
+                default_profile_id: None,
+            };
+            apply_host_bootstrap(
+                &state,
+                "host-a",
+                restore_bootstrap(vec![BackendKind::Hermes], catalog, Vec::new(), Vec::new()),
+            );
+            assert_eq!(
+                state.draft_launch_profile_id.get_untracked(),
+                None,
+                "an Unavailable catalog entry must not be re-armed"
+            );
+            assert_eq!(
+                state.draft_backend_override.get_untracked(),
+                None,
+                "and its backend goes with it rather than half-applying"
+            );
+        });
     }
 
     fn project_bootstrap_envelope(project_id: &ProjectId, name: &str, seq: u64) -> Envelope {
@@ -7800,17 +8291,50 @@ mod wasm_tests {
         }
     }
 
-    fn count_update_envelope(session_id: &str, turns: u32) -> Envelope {
-        Envelope::from_payload(
-            StreamPath("/host".to_owned()),
+    /// A host-stream frame at `seq`. Sequencing is not decoration: a frame at
+    /// the wrong sequence is rejected by the desync guard in
+    /// `dispatch_envelope` *before* any reducer runs, so a test that guesses
+    /// the sequence proves nothing about the reducer — and passes or fails
+    /// depending on what an earlier test left in the thread-local validator.
+    fn host_frame<T: serde::Serialize>(kind: FrameKind, seq: u64, payload: &T) -> Envelope {
+        Envelope::from_payload(StreamPath("/host".to_owned()), kind, seq, payload)
+            .expect("payload serializes")
+    }
+
+    fn count_update_envelope(session_id: &str, turns: u32, seq: u64) -> Envelope {
+        host_frame(
             FrameKind::SessionSummaryCountUpdated,
-            1,
+            seq,
             &SessionSummaryCountUpdatedPayload {
                 session_id: protocol::SessionId(session_id.to_owned()),
                 assistant_turn_count: turns,
             },
         )
-        .expect("payload serializes")
+    }
+
+    fn session_list_envelope(
+        sessions: Vec<protocol::SessionSummary>,
+        offset: u32,
+        total: u32,
+        seq: u64,
+    ) -> Envelope {
+        host_frame(
+            FrameKind::SessionList,
+            seq,
+            &protocol::SessionListPayload {
+                sessions,
+                page: protocol::SessionListPageInfo {
+                    scope: Default::default(),
+                    cursor: protocol::SessionListCursor {
+                        generation: protocol::SessionListGeneration(1),
+                        offset,
+                    },
+                    limit: 2,
+                    total_count: total,
+                    status: protocol::SessionListPageStatus::Complete,
+                },
+            },
+        )
     }
 
     /// M7: a completed turn updates the listed count without a refresh, and
@@ -7819,6 +8343,7 @@ mod wasm_tests {
     /// the user is reading, must be untouched.
     #[wasm_bindgen_test]
     fn session_summary_count_update_patches_one_row_in_place() {
+        reset_inbound_state_for_host("host-a");
         let state = AppState::new();
         state.sessions.set(vec![
             listed_session("host-a", "session-1", 0, 200),
@@ -7826,7 +8351,7 @@ mod wasm_tests {
             listed_session("host-b", "session-1", 3, 300),
         ]);
 
-        dispatch_envelope(&state, "host-a", count_update_envelope("session-1", 4));
+        dispatch_envelope(&state, "host-a", count_update_envelope("session-1", 4, 0));
 
         let sessions = state.sessions.get_untracked();
         assert_eq!(
@@ -7860,16 +8385,149 @@ mod wasm_tests {
     /// list carries the real one.
     #[wasm_bindgen_test]
     fn session_summary_count_update_for_unknown_session_adds_nothing() {
+        reset_inbound_state_for_host("host-a");
         let state = AppState::new();
         state
             .sessions
             .set(vec![listed_session("host-a", "session-1", 1, 100)]);
 
-        dispatch_envelope(&state, "host-a", count_update_envelope("session-unknown", 9));
+        dispatch_envelope(&state, "host-a", count_update_envelope("session-unknown", 9, 0));
 
         let sessions = state.sessions.get_untracked();
         assert_eq!(sessions.len(), 1, "no row may be invented");
         assert_eq!(sessions[0].summary.message_count, 1);
+    }
+
+    /// FE-07: a continuation page must accumulate, not replace. Page 2 erasing
+    /// page 1 makes the paging the protocol advertises unusable.
+    #[wasm_bindgen_test]
+    fn session_list_pages_accumulate_and_retain_other_hosts() {
+        reset_inbound_state_for_host("host-a");
+        let state = AppState::new();
+        state
+            .sessions
+            .set(vec![listed_session("host-b", "keep-me", 1, 500)]);
+
+        // Page 1 (offset 0) replaces host-a's rows.
+        dispatch_envelope(
+            &state,
+            "host-a",
+            session_list_envelope(
+                vec![
+                    listed_session("host-a", "s1", 1, 300).summary,
+                    listed_session("host-a", "s2", 2, 200).summary,
+                ],
+                0,
+                4,
+                0,
+            ),
+        );
+        assert_eq!(state.sessions.get_untracked().len(), 3);
+
+        // Page 2 (offset 2) appends.
+        dispatch_envelope(
+            &state,
+            "host-a",
+            session_list_envelope(
+                vec![
+                    listed_session("host-a", "s3", 3, 150).summary,
+                    listed_session("host-a", "s4", 4, 100).summary,
+                ],
+                2,
+                4,
+                1,
+            ),
+        );
+
+        let sessions = state.sessions.get_untracked();
+        let host_a: Vec<String> = sessions
+            .iter()
+            .filter(|s| s.host_id == "host-a")
+            .map(|s| s.summary.id.0.clone())
+            .collect();
+        assert_eq!(
+            host_a,
+            vec!["s1", "s2", "s3", "s4"],
+            "page 1 must survive page 2"
+        );
+        assert!(
+            sessions.iter().any(|s| s.host_id == "host-b"),
+            "another host's rows must be untouched by host-a paging"
+        );
+        assert_eq!(
+            state
+                .session_list_pages
+                .get_untracked()
+                .get("host-a")
+                .map(|page| page.total_count),
+            Some(4),
+            "the panel needs paging state to be able to ask for more"
+        );
+
+        // A first page again replaces rather than duplicating.
+        dispatch_envelope(
+            &state,
+            "host-a",
+            session_list_envelope(vec![listed_session("host-a", "s1", 9, 300).summary], 0, 1, 2),
+        );
+        let sessions = state.sessions.get_untracked();
+        assert_eq!(
+            sessions.iter().filter(|s| s.host_id == "host-a").count(),
+            1,
+            "a fresh first page replaces the accumulated list"
+        );
+        assert_eq!(sessions[0].summary.message_count, 9);
+    }
+
+    /// FE-08: the visible badge must actually rerender. Inspecting `state`
+    /// alone cannot prove the user sees the new count.
+    #[wasm_bindgen_test]
+    async fn count_update_rerenders_the_history_badge() {
+        reset_inbound_state_for_host("host-a");
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document
+            .create_element("div")
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+
+        let state = AppState::new();
+        state.sessions.set(vec![
+            listed_session("host-a", "session-1", 0, 200),
+            listed_session("host-b", "session-1", 5, 100),
+        ]);
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <crate::components::sessions_panel::SessionsPanel /> }
+        });
+        next_tick().await;
+
+        let before = container.text_content().unwrap_or_default();
+        assert!(
+            before.contains("0 responses"),
+            "precondition: the badge starts at zero, got: {before}"
+        );
+
+        dispatch_envelope(&state, "host-a", count_update_envelope("session-1", 1, 0));
+        next_tick().await;
+
+        let after = container.text_content().unwrap_or_default();
+        assert!(
+            after.contains("1 response"),
+            "the badge must rerender without a refresh, got: {after}"
+        );
+        assert!(
+            after.contains("5 responses"),
+            "the same-id session on another host must be untouched, got: {after}"
+        );
+        // FE-06: the date cannot be corrected from this frame, so it must not
+        // be presented as if it were current.
+        assert!(
+            after.contains("newer activity"),
+            "a stale last-active date must be marked, got: {after}"
+        );
     }
 
     #[wasm_bindgen_test]

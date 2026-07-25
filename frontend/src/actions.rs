@@ -50,6 +50,8 @@ pub fn resume_session(
         project_id: pid,
     });
     state.switch_active_project(target_project);
+    // An explicit New Chat outranks a restore still waiting on its host.
+    state.retire_pending_restores();
     state.open_tab(TabContent::empty_chat(), "New Chat".to_owned(), true);
     let state = state.clone();
     spawn_local(async move {
@@ -156,6 +158,8 @@ pub fn begin_new_chat_with(
     state.draft_session_settings_dirty.set(false);
     // Opening (and activating) the new chat tab drives `active_agent` to None
     // via the Memo derived from `center_zone`.
+    // An explicit New Chat outranks a restore still waiting on its host.
+    state.retire_pending_restores();
     state.open_tab(TabContent::empty_chat(), "New Chat".to_string(), true);
 }
 
@@ -176,6 +180,8 @@ pub fn begin_new_chat_with_profile(
     // edits them.
     state.draft_session_settings.set(profile.session_settings);
     state.draft_session_settings_dirty.set(false);
+    // An explicit New Chat outranks a restore still waiting on its host.
+    state.retire_pending_restores();
     state.open_tab(TabContent::empty_chat(), "New Chat".to_string(), true);
 }
 
@@ -215,6 +221,8 @@ pub fn open_new_chat_with_prefill(
     // Open (and activate) the new chat tab, then seed the composer. The composer
     // mirrors `chat_input` into the textarea reactively, so the prefill appears
     // immediately and the user can edit before sending.
+    // An explicit New Chat outranks a restore still waiting on its host.
+    state.retire_pending_restores();
     state.open_tab(TabContent::empty_chat(), "New Chat".to_string(), true);
     state.chat_input.set(prompt);
 }
