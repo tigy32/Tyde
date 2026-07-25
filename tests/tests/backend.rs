@@ -1314,7 +1314,16 @@ The partial output above was kept and the turn continued.";
 struct CodexLifecycleFake {
     _dir: tempfile::TempDir,
     binary: PathBuf,
+    turn_starts: PathBuf,
 }
+
+/// The exact follow-up the termination scenario expects. The fake refuses to run
+/// its success path for any other input, so a synthetic retry cannot be mistaken
+/// for the explicit user message.
+const CODEX_LIFECYCLE_FOLLOW_UP: &str = "drive the next turn";
+
+/// The spawn prompt, pinned so the `turn/start` ledger can be asserted exactly.
+const CODEX_LIFECYCLE_SPAWN_PROMPT: &str = "drive the first provider turn";
 
 impl CodexLifecycleFake {
     fn new(scenario: &str) -> Self {
@@ -1326,6 +1335,7 @@ import sys
 
 SCENARIO = "__SCENARIO__"
 THREAD = "lifecycle-thread"
+FOLLOW_UP_TEXT = "__FOLLOW_UP__"
 
 def send(value):
     sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
@@ -1370,46 +1380,82 @@ def publish_then_roll_over(first_id, first_kind, second_id, second_kind):
     item_started(second_id, second_kind)
     item_delta(second_id, second_kind, "continued " + second_id)
     item_completed(second_id, second_kind, "continued " + second_id)
+    # A compatible late completion for the superseded item: same kind, and for
+    # agent messages exactly the accepted prefix. It must be absorbed silently.
+    item_completed(first_id, first_kind, "accepted " + first_id)
 
 def rollover_turn(turn_id, first_id, first_kind, second_id, second_kind):
     turn_started(turn_id)
     publish_then_roll_over(first_id, first_kind, second_id, second_kind)
     turn_completed(turn_id)
+    return turn_id
+
+def unexpected_turn(turn_count):
+    # Any turn the test did not explicitly ask for is reported with a distinct
+    # item id so an automatic retry can never borrow the success path.
+    turn_id = "unexpected-turn-" + str(turn_count)
+    turn_started(turn_id)
+    item_started("unexpected-turn-start", "agentMessage")
+    item_delta("unexpected-turn-start", "agentMessage", "unexpected")
+    item_completed("unexpected-turn-start", "agentMessage", "unexpected")
+    turn_completed(turn_id)
+    return turn_id
 
 def supersession_turn(turn_count):
     if turn_count == 1:
         # Production ordering: the command completes BEFORE the abandoned item
         # starts, matching the rollout. Never place a tool between A and B.
-        turn_started("rollover-turn-one")
+        turn_id = "rollover-turn-one"
+        turn_started(turn_id)
         command("tool-before-rollover")
         publish_then_roll_over("reason-a", "reasoning", "reason-b", "reasoning")
         command("tool-after-rollover")
         item_started("final-answer", "agentMessage")
         item_delta("final-answer", "agentMessage", "turn survived")
         item_completed("final-answer", "agentMessage", "turn survived")
-        turn_completed("rollover-turn-one")
-    elif turn_count == 2:
-        rollover_turn("rollover-turn-two", "agent-a", "agentMessage", "agent-b", "agentMessage")
-    elif turn_count == 3:
-        rollover_turn("rollover-turn-three", "reason-c", "reasoning", "agent-c", "agentMessage")
-    else:
-        rollover_turn("rollover-turn-four", "agent-d", "agentMessage", "reason-d", "reasoning")
+        turn_completed(turn_id)
+        return turn_id
+    if turn_count == 2:
+        return rollover_turn("rollover-turn-two", "agent-a", "agentMessage", "agent-b", "agentMessage")
+    if turn_count == 3:
+        return rollover_turn("rollover-turn-three", "reason-c", "reasoning", "agent-c", "agentMessage")
+    if turn_count == 4:
+        return rollover_turn("rollover-turn-four", "agent-d", "agentMessage", "reason-d", "reasoning")
+    return unexpected_turn(turn_count)
 
-def termination_turn(turn_count):
+def termination_turn(turn_count, text):
     if turn_count == 1:
-        turn_started("termination-turn-one")
+        turn_id = "termination-turn-one"
+        turn_started(turn_id)
         item_started("open-item", "agentMessage")
         item_delta("open-item", "agentMessage", "partial work")
         # A foreign completion while open-item is still live. The turn must end
         # visibly and finitely; the provider deliberately never sends
         # turn/completed for it, so local state cannot depend on that arriving.
         item_completed("foreign-item", "agentMessage", "must not be attributed")
-    else:
-        turn_started("termination-turn-two")
-        item_started("recovered-item", "agentMessage")
-        item_delta("recovered-item", "agentMessage", "next turn works")
-        item_completed("recovered-item", "agentMessage", "next turn works")
-        turn_completed("termination-turn-two")
+        return turn_id
+    # The success path is gated on the explicit follow-up text, so a synthetic
+    # retry cannot consume it and then let the real message pass unobserved.
+    if text != FOLLOW_UP_TEXT:
+        return unexpected_turn(turn_count)
+    turn_id = "termination-turn-two"
+    turn_started(turn_id)
+    item_started("recovered-item", "agentMessage")
+    item_delta("recovered-item", "agentMessage", "next turn works")
+    item_completed("recovered-item", "agentMessage", "next turn works")
+    turn_completed(turn_id)
+    return turn_id
+
+def turn_start_text(params):
+    for item in params.get("input") or []:
+        if item.get("type") == "text":
+            return item.get("text", "")
+    return ""
+
+def record_turn_start(index, text):
+    with open(__file__ + ".turn-starts", "a", encoding="utf-8") as ledger:
+        entry = {"index":index,"input":text}
+        ledger.write(json.dumps(entry, separators=(",", ":")) + "\n")
 
 turn_count = 0
 for line in sys.stdin:
@@ -1428,17 +1474,20 @@ for line in sys.stdin:
         send({"jsonrpc":"2.0","id":request_id,"result":{"thread":{"id":THREAD,"sessionId":THREAD,"turns":[]},"model":"fake-codex-model"}})
     elif method == "turn/start":
         turn_count += 1
+        text = turn_start_text(params)
+        record_turn_start(turn_count, text)
         if SCENARIO == "supersession":
-            supersession_turn(turn_count)
+            turn_id = supersession_turn(turn_count)
         else:
-            termination_turn(turn_count)
-        send({"jsonrpc":"2.0","id":request_id,"result":{"turn":{"id":"lifecycle-turn"}}})
+            turn_id = termination_turn(turn_count, text)
+        send({"jsonrpc":"2.0","id":request_id,"result":{"turn":{"id":turn_id}}})
     elif method == "turn/interrupt":
         send({"jsonrpc":"2.0","id":request_id,"result":{}})
     elif method == "thread/settings/update":
         send({"jsonrpc":"2.0","id":request_id,"result":{}})
 "#
-        .replace("__SCENARIO__", scenario);
+        .replace("__SCENARIO__", scenario)
+        .replace("__FOLLOW_UP__", CODEX_LIFECYCLE_FOLLOW_UP);
         std::fs::write(&binary, program).expect("write Codex lifecycle fake");
         #[cfg(unix)]
         {
@@ -1449,7 +1498,34 @@ for line in sys.stdin:
             permissions.set_mode(0o755);
             std::fs::set_permissions(&binary, permissions).expect("chmod Codex lifecycle fake");
         }
-        Self { _dir: dir, binary }
+        let turn_starts = PathBuf::from(format!("{}.turn-starts", binary.to_string_lossy()));
+        Self {
+            _dir: dir,
+            binary,
+            turn_starts,
+        }
+    }
+
+    /// Every `turn/start` the adapter issued, in order, with the input text that
+    /// reached the provider. This is the ledger that distinguishes an explicit
+    /// user message from a forbidden automatic retry.
+    fn turn_start_inputs(&self) -> Vec<String> {
+        let Ok(contents) = std::fs::read_to_string(&self.turn_starts) else {
+            return Vec::new();
+        };
+        contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let entry: Value =
+                    serde_json::from_str(line).expect("parse recorded turn/start ledger entry");
+                entry
+                    .get("input")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect()
     }
 }
 
@@ -1543,6 +1619,10 @@ impl CodexLifecycleObservation {
         self.ordered.iter().filter(|event| predicate(event)).count()
     }
 
+    fn occurrences(&self, expected: &CodexLifecycleEvent) -> usize {
+        self.count(|event| event == expected)
+    }
+
     /// Stream ids that were opened but never terminalized.
     fn unterminated_streams(&self) -> Vec<&str> {
         self.ordered
@@ -1575,6 +1655,7 @@ impl CodexLifecycleObservation {
         superseded_is_reasoning: bool,
         context: &str,
     ) {
+        let start_a = CodexLifecycleEvent::StreamStart(superseded_id.to_owned());
         let end_a = CodexLifecycleEvent::StreamEnd(superseded_id.to_owned());
         let warning_text = CODEX_SUPERSESSION_WARNING_TEXT.to_owned();
         let start_b = CodexLifecycleEvent::StreamStart(replacement_id.to_owned());
@@ -1628,6 +1709,20 @@ impl CodexLifecycleObservation {
         assert!(
             idle > replacement_start,
             "{context} must not go idle mid-recovery: {:?}",
+            self.ordered
+        );
+        // The fake sends a compatible late completion for A after B completes. It
+        // must be absorbed: no second lifecycle for A, and nothing new on the wire.
+        assert_eq!(
+            self.occurrences(&start_a),
+            1,
+            "{context} late completion must not reopen the superseded item: {:?}",
+            self.ordered
+        );
+        assert_eq!(
+            self.occurrences(&end_a),
+            1,
+            "{context} late completion must not re-terminalize A: {:?}",
             self.ordered
         );
     }
@@ -1697,7 +1792,7 @@ async fn spawn_fake_codex_lifecycle_agent(
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec![workspace.to_string_lossy().into_owned()],
-                prompt: "drive the first provider turn".to_owned(),
+                prompt: CODEX_LIFECYCLE_SPAWN_PROMPT.to_owned(),
                 images: None,
                 backend_kind: BackendKind::Codex,
                 launch_profile_id: None,
@@ -1804,7 +1899,7 @@ async fn fake_codex_provider_item_supersession_recovers_live_and_on_replay() {
     // is still the whole history: `INITIAL_HISTORY_TAIL_LIMIT` bounds bootstrap replay
     // to the last 15 terminal messages, so deferring it until after the kind-pair
     // turns below would silently drop this turn out of the tail.
-    let (_replay_client, replayed_agent, bootstrap) =
+    let (replay_client, replayed_agent, bootstrap) =
         connect_and_replay_agent(&fixture, &agent.agent_id, "Codex supersession replay").await;
     assert_ne!(replayed_agent.instance_stream, agent.instance_stream);
     let replay_turn_active = bootstrap.turn_active;
@@ -1831,20 +1926,39 @@ async fn fake_codex_provider_item_supersession_recovers_live_and_on_replay() {
         vec![CODEX_SUPERSESSION_WARNING_TEXT],
         "replay must retain the recovery warning verbatim, exactly once"
     );
+    // Replay must reproduce the whole recovered turn, not merely its terminal rows:
+    // End(A) -> Warning -> Start(B) -> End(B) -> the later tool -> the final answer.
+    // Asserting only the ends would let a replay that lost Start(B) still pass.
     let replay_end_a = replay.position(&end_a);
     let replay_warning = replay.position(&CodexLifecycleEvent::Warning(
         CODEX_SUPERSESSION_WARNING_TEXT.to_owned(),
     ));
-    let replay_end_b = replay.position(&CodexLifecycleEvent::StreamEnd("reason-b".to_owned()));
+    let start_b = CodexLifecycleEvent::StreamStart("reason-b".to_owned());
+    let end_b = CodexLifecycleEvent::StreamEnd("reason-b".to_owned());
+    let tool_after_request = CodexLifecycleEvent::ToolRequest("tool-after-rollover".to_owned());
+    let replay_start_b = replay.position(&start_b);
+    let replay_end_b = replay.position(&end_b);
+    let replay_tool_after = replay.position(&tool_after_request);
     let replay_final = replay.position(&end_final);
     assert!(
-        replay_end_a < replay_warning && replay_warning < replay_end_b,
-        "replay must preserve the recovery order: {:?}",
+        replay_end_a < replay_warning && replay_warning < replay_start_b,
+        "replay must preserve End(A) -> Warning -> Start(B): {:?}",
         replay.ordered
     );
     assert!(
-        replay_end_b < replay_final,
-        "replay must keep the post-rollover answer last: {:?}",
+        replay_start_b < replay_end_b && replay_end_b < replay_tool_after,
+        "replay must keep the replacement stream ahead of the later tool: {:?}",
+        replay.ordered
+    );
+    assert!(
+        replay_tool_after < replay_final,
+        "replay must keep the post-rollover tool and answer in order: {:?}",
+        replay.ordered
+    );
+    let replay_start_a = replay.position(&CodexLifecycleEvent::StreamStart("reason-a".to_owned()));
+    assert!(
+        replay_start_a < replay_end_a,
+        "replay must open the superseded item before terminalizing it: {:?}",
         replay.ordered
     );
     assert_eq!(
@@ -1863,6 +1977,9 @@ async fn fake_codex_provider_item_supersession_recovers_live_and_on_replay() {
         "replay must leave no stream open, found {unterminated:?}: {:?}",
         replay.ordered
     );
+    // Close the replay subscriber before driving more turns rather than leaving an
+    // unread connection accumulating events behind the remaining matrix.
+    drop(replay_client);
 
     // Remaining provider-owned kind pairs. Each rollover gets its own turn because
     // recovery allowance and the warning latch both reset only on turn/started.
@@ -1914,6 +2031,19 @@ async fn fake_codex_provider_item_supersession_recovers_live_and_on_replay() {
             );
         }
     }
+
+    // Recovery is not allowed to synthesize turns: one provider turn per message
+    // the client actually sent, and no retry after any of them.
+    assert_eq!(
+        fake.turn_start_inputs(),
+        vec![
+            CODEX_LIFECYCLE_SPAWN_PROMPT.to_owned(),
+            "drive agentMessage rollover".to_owned(),
+            "drive reasoning to agentMessage rollover".to_owned(),
+            "drive agentMessage to reasoning rollover".to_owned(),
+        ],
+        "each recovered turn must come from exactly one explicit client message"
+    );
 }
 
 /// The second half of the incident: when a conflict is genuinely unrecoverable the
@@ -2005,13 +2135,23 @@ async fn fake_codex_identity_termination_is_finite_and_visible_to_clients() {
         terminated.ordered
     );
 
+    // No synthetic recovery: after termination the adapter must not start another
+    // provider turn on its own. Checked before the explicit send, so an automatic
+    // retry cannot hide inside the follow-up's turn.
+    assert_eq!(
+        fake.turn_start_inputs(),
+        vec![CODEX_LIFECYCLE_SPAWN_PROMPT.to_owned()],
+        "a terminated turn must not be retried or resumed automatically"
+    );
+
     // Finiteness: the terminated turn never received turn/completed, yet the session
     // must still accept a new turn and render it in full. This also exercises the
-    // message-delivery contract -- a follow-up after termination must be delivered,
-    // not rejected or silently dropped.
+    // message-delivery contract -- a follow-up after termination must be delivered
+    // once, not rejected, duplicated, or silently dropped. The fake refuses its
+    // success path for any other input, so the observed turn can only be this one.
     fixture
         .client
-        .send_message(&agent.instance_stream, "drive the next turn".to_owned())
+        .send_message(&agent.instance_stream, CODEX_LIFECYCLE_FOLLOW_UP.to_owned())
         .await
         .expect("queue follow-up after terminated Codex turn");
     let mut recovered = CodexLifecycleObservation::default();
@@ -2044,6 +2184,61 @@ async fn fake_codex_identity_termination_is_finite_and_visible_to_clients() {
     assert!(
         unterminated.is_empty(),
         "the recovering turn must leave no stream open, found {unterminated:?}"
+    );
+    assert!(
+        recovered
+            .stream_end_content
+            .keys()
+            .all(|message_id| message_id != "unexpected-turn-start"),
+        "the follow-up turn must be the one the client asked for: {:?}",
+        recovered.ordered
+    );
+
+    // Drain what the server has already queued so a duplicated tail or a late retry
+    // emitted after the first idle is observed rather than missed. Bounded and
+    // deterministic: it reads until the connection is quiet, it does not sleep on a
+    // timer hoping something arrives.
+    let mut post_idle = CodexLifecycleObservation::default();
+    loop {
+        match tokio::time::timeout(Duration::from_millis(250), fixture.client.next_event()).await {
+            Err(_) => break,
+            Ok(Ok(Some(env))) if env.kind == FrameKind::CommandError => {
+                let error: CommandErrorPayload = env.parse_payload().expect("parse CommandError");
+                panic!("unexpected command error after terminated Codex turn: {error:?}");
+            }
+            Ok(Ok(Some(env)))
+                if env.kind == FrameKind::ChatEvent && env.stream == agent.instance_stream =>
+            {
+                let event: ChatEvent = env.parse_payload().expect("parse post-idle ChatEvent");
+                post_idle.observe(event);
+            }
+            Ok(Ok(Some(_))) => {}
+            Ok(Ok(None)) => panic!("connection closed during post-idle drain"),
+            Ok(Err(error)) => panic!("post-idle drain failed: {error:?}"),
+        }
+    }
+    assert_eq!(
+        post_idle.count(|event| matches!(event, CodexLifecycleEvent::Error(_))),
+        0,
+        "no terminal tail may arrive after the turn settled: {:?}",
+        post_idle.ordered
+    );
+    assert_eq!(
+        post_idle.count(|event| matches!(event, CodexLifecycleEvent::Cancelled)),
+        0,
+        "no second cancellation may arrive after the turn settled: {:?}",
+        post_idle.ordered
+    );
+
+    // Exactly two provider turns for exactly two client messages, in order, with the
+    // explicit follow-up text delivered verbatim and no retry before or after it.
+    assert_eq!(
+        fake.turn_start_inputs(),
+        vec![
+            CODEX_LIFECYCLE_SPAWN_PROMPT.to_owned(),
+            CODEX_LIFECYCLE_FOLLOW_UP.to_owned(),
+        ],
+        "the explicit follow-up must start exactly one new turn, with no retry"
     );
 }
 
