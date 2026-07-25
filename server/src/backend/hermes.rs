@@ -2425,6 +2425,13 @@ async fn register_hermes_mcp_bridge(
         MANAGED_SERVER_NAME,
         bridge_program,
     ]);
+    // Registration must run against the same Hermes home the gateway will be
+    // spawned with. `target.env` carries the selected profile's HERMES_HOME,
+    // so without this the script reads and writes the *default* profile's
+    // `config.yaml` while the gateway reads the named profile's — the managed
+    // server is never registered there, Hermes never launches the bridge, and
+    // startup dies on the MCP-bridge readiness timeout.
+    command.envs(&target.env);
     command.env_remove(HERMES_TOOLSETS_ENV);
     if let Some(path) = process_env::resolved_child_process_path() {
         command.env("PATH", path);
@@ -5882,6 +5889,60 @@ for line in sys.stdin:
         .expect("deferred MCP test turn should finish");
 
         backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn register_runs_in_the_selected_profile_hermes_home() {
+        // The registration script writes `mcp_servers.<managed>` into whatever
+        // config.yaml its own HERMES_HOME resolves to. The gateway is later
+        // spawned with the profile's HERMES_HOME, so if registration does not
+        // inherit the same env it registers the bridge in the default profile,
+        // the named profile's Hermes never launches the bridge, and startup
+        // fails on the MCP-bridge readiness timeout.
+        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
+        let dir = TempDir::new().expect("tempdir");
+        let observed = dir.path().join("observed-home");
+        let launcher = dir.path().join("fake_python_record_home.sh");
+        fs::write(
+            &launcher,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"${{HERMES_HOME:-<unset>}}\" > {}\necho '[\"terminal\"]'\n",
+                observed.display()
+            ),
+        )
+        .expect("write fake python");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&launcher)
+                .expect("launcher metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&launcher, perms).expect("chmod launcher");
+        }
+
+        let profile_home = dir.path().join("profiles").join("work");
+        let target = HermesSpawnTarget {
+            program: launcher.to_string_lossy().to_string(),
+            args: Vec::new(),
+            env: HashMap::from([(
+                crate::backend::hermes_config::HERMES_HOME_ENV.to_string(),
+                profile_home.to_string_lossy().to_string(),
+            )]),
+            cwd: None,
+            remote_host: None,
+            display_program: "hermes".to_string(),
+        };
+
+        let selected = register_hermes_mcp_bridge(&target, "/opt/tyde/tyde-server")
+            .await
+            .expect("registration must succeed");
+        assert_eq!(selected, Some(vec!["terminal".to_string()]));
+        assert_eq!(
+            fs::read_to_string(&observed).expect("registration must have run"),
+            profile_home.to_string_lossy(),
+            "registration must run against the selected profile's HERMES_HOME"
+        );
     }
 
     #[tokio::test]
