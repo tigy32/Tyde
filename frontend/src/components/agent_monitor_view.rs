@@ -170,7 +170,12 @@ pub(crate) fn status_to_filter(status: DerivedAgentState) -> AgentStatusFilter {
         DerivedAgentState::Initializing => AgentStatusFilter::Initializing,
         DerivedAgentState::Thinking => AgentStatusFilter::Thinking,
         DerivedAgentState::Compacting => AgentStatusFilter::Compacting,
-        DerivedAgentState::Idle => AgentStatusFilter::Idle,
+        // A cancelled agent is not running, so it belongs to the Idle filter
+        // bucket — "Idle" here means "no work in flight", which is exactly what
+        // someone filtering for it wants. Only the card's own presentation
+        // distinguishes cancelled from completed; the filter vocabulary is
+        // persisted in user preferences and is deliberately left unchanged.
+        DerivedAgentState::Idle | DerivedAgentState::Cancelled => AgentStatusFilter::Idle,
         DerivedAgentState::Terminated => AgentStatusFilter::Terminated,
     }
 }
@@ -290,7 +295,7 @@ fn monitor_status_rank(status: DerivedAgentState) -> u8 {
         DerivedAgentState::Initializing
         | DerivedAgentState::Thinking
         | DerivedAgentState::Compacting => 0,
-        DerivedAgentState::Idle => 1,
+        DerivedAgentState::Idle | DerivedAgentState::Cancelled => 1,
         DerivedAgentState::Terminated => 2,
     }
 }
@@ -962,7 +967,15 @@ pub fn AgentMonitorView() -> impl IntoView {
                     let mut pinned_rows: Vec<AgentMonitorRow> = Vec::new();
                     let mut normal_rows: Vec<AgentMonitorRow> = Vec::new();
                     for agent in agents.iter() {
-                        let status = derive_agent_state(agent, streaming, turn_active, compaction);
+                        let status = rows_state.transient_events.with(|transient| {
+                            derive_agent_state(
+                                agent,
+                                streaming,
+                                turn_active,
+                                compaction,
+                                transient,
+                            )
+                        });
                         if !agent_passes_view_filters(agent, status, &preferences.filters, &query) {
                             continue;
                         }

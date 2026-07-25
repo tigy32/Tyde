@@ -2,7 +2,7 @@ use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
 use protocol::{
-    BackendKind, SessionSchemaEntry, SessionSettingFieldType, SessionSettingValue,
+    BackendKind, SelectOption, SessionSchemaEntry, SessionSettingFieldType, SessionSettingValue,
     SessionSettingsSchema, SessionSettingsValues, TaskTokenUsageAmount, TaskTokenUsagePayload,
     TaskTokenUsageScope, TaskTokenUsageStatus, TaskTokenUsageUnavailableReason,
 };
@@ -40,6 +40,41 @@ pub(crate) fn clear_invalid_dependent_select_values(
     }
 }
 
+/// Suffix marking a value the session carries but the schema no longer offers.
+pub(crate) const UNAVAILABLE_OPTION_SUFFIX: &str = " (unavailable)";
+
+/// The `(value, label)` entries a select-like control should render, given the
+/// value the session actually carries.
+///
+/// A value the schema does not offer is still the truth about this session, so
+/// it is appended as an explicitly-labelled entry instead of being dropped.
+/// Dropping it makes the control display some *other* option — the schema
+/// default, or whichever the browser picks first — and silently misreport the
+/// session's real setting. That is the Hermes named-profile case: a profile
+/// whose gateway probe failed leaves the schema, and the Profile control then
+/// claims the session is on `default` when it is not.
+///
+/// The injected entry is only for display. It is never sent as a user edit
+/// unless the user actively selects it, which is a no-op re-selection of the
+/// value already in effect.
+pub(crate) fn options_including_current(
+    options: &[SelectOption],
+    current: &str,
+) -> Vec<(String, String)> {
+    let mut entries: Vec<(String, String)> = options
+        .iter()
+        .map(|option| (option.value.clone(), option.label.clone()))
+        .collect();
+    if current.is_empty() || entries.iter().any(|(value, _)| value == current) {
+        return entries;
+    }
+    entries.push((
+        current.to_owned(),
+        format!("{current}{UNAVAILABLE_OPTION_SUFFIX}"),
+    ));
+    entries
+}
+
 #[component]
 pub fn SessionSettingsControls(
     schema: SessionSettingsSchema,
@@ -58,12 +93,24 @@ pub fn SessionSettingsControls(
                 let field_type = field.field_type.clone();
                 let use_slider = field.use_slider;
                 let field_for_options = field.clone();
+                let field_for_unknown = field.clone();
                 let available_options = Memo::new(move |_| {
                     let current = values.get();
                     field_for_options
                         .select_options(&current)
                         .unwrap_or_default()
                         .to_vec()
+                });
+                // `select_options` answers `None` when this field's options
+                // depend on another setting whose current value it does not
+                // recognize — e.g. a Hermes `model` list keyed by a `profile`
+                // that left the schema. Flattening that to an empty list (as
+                // the memo above must, to keep one type) would render an empty
+                // control with no explanation, which reads as "this backend has
+                // no models" rather than "Tyde cannot tell yet".
+                let options_unknown = Memo::new(move |_| {
+                    let current = values.get();
+                    field_for_unknown.select_options(&current).is_none()
                 });
                 let on_change_cb = on_change;
                 let all_fields = all_fields.clone();
@@ -76,23 +123,12 @@ pub fn SessionSettingsControls(
                         <span class="session-setting-label">{label}</span>
                         {match field_type {
                             SessionSettingFieldType::Select { options: _, default, nullable } if use_slider => {
-                                let entries = Memo::new(move |_| {
-                                    let mut v = Vec::new();
-                                    if nullable {
-                                        v.push((String::new(), "Auto".to_string()));
-                                    }
-                                    for opt in available_options.get() {
-                                        v.push((opt.value.clone(), opt.label.clone()));
-                                    }
-                                    v
-                                });
-
-                                let current_idx = {
+                                let current_raw = {
                                     let key = key.clone();
                                     let default = default.clone();
                                     Signal::derive(move || {
                                         let vals = values.get();
-                                        let current_val = match vals.0.get(&key) {
+                                        match vals.0.get(&key) {
                                             Some(SessionSettingValue::String(s)) => s.clone(),
                                             Some(SessionSettingValue::Null) | None => {
                                                 if nullable {
@@ -102,12 +138,41 @@ pub fn SessionSettingsControls(
                                                 }
                                             }
                                             _ => String::new(),
-                                        };
-                                        let entries = entries.get();
-                                        entries.iter().position(|(v, _)| v == &current_val)
-                                            .unwrap_or(0) as i64
+                                        }
                                     })
                                 };
+
+                                // Built so the effective value is always one of
+                                // the entries. Previously an unknown value fell
+                                // through to index 0, which silently presented
+                                // the first option as the current setting.
+                                let entries = Memo::new(move |_| {
+                                    let mut v = Vec::new();
+                                    if nullable {
+                                        v.push((String::new(), "Auto".to_string()));
+                                    }
+                                    let current = current_raw.get();
+                                    v.extend(options_including_current(
+                                        &available_options.get(),
+                                        &current,
+                                    ));
+                                    if !v.iter().any(|(value, _)| *value == current) {
+                                        // Only reachable for an empty value on a
+                                        // non-nullable field with no default:
+                                        // genuinely unknown, and said so.
+                                        v.push((current, "Unknown".to_string()));
+                                    }
+                                    v
+                                });
+
+                                let current_idx = Signal::derive(move || {
+                                    let current_val = current_raw.get();
+                                    entries
+                                        .get()
+                                        .iter()
+                                        .position(|(v, _)| v == &current_val)
+                                        .unwrap_or(0) as i64
+                                });
 
                                 let current_label = move || {
                                     let idx = current_idx.get() as usize;
@@ -167,7 +232,7 @@ pub fn SessionSettingsControls(
                                 let current_value = {
                                     let key = key.clone();
                                     let default = default_for_view.clone();
-                                    move || {
+                                    Signal::derive(move || {
                                         let vals = values.get();
                                         match vals.0.get(&key) {
                                             Some(SessionSettingValue::String(s)) => s.clone(),
@@ -180,7 +245,7 @@ pub fn SessionSettingsControls(
                                             }
                                             _ => String::new(),
                                         }
-                                    }
+                                    })
                                 };
 
                                 let on_select_change = {
@@ -202,20 +267,61 @@ pub fn SessionSettingsControls(
                                     }
                                 };
 
+                                // A `<select>` ignores a value that has no
+                                // matching `<option>` yet, and the options here
+                                // are reactive children rendered after the
+                                // element's properties are applied. Re-applying
+                                // the value from a node ref — tracking the
+                                // option list so this re-runs whenever the set
+                                // changes — is what makes a late-arriving
+                                // option actually take effect. Without it the
+                                // control silently falls back to whichever
+                                // option the browser picks.
+                                let select_ref: NodeRef<leptos::html::Select> = NodeRef::new();
+                                Effect::new(move |_| {
+                                    let value = current_value.get();
+                                    let _ = available_options.get();
+                                    if let Some(element) = select_ref.get() {
+                                        element.set_value(&value);
+                                    }
+                                });
+
                                 view! {
                                     <select
                                         class="session-setting-select"
-                                        prop:value=current_value
+                                        node_ref=select_ref
+                                        prop:value=move || current_value.get()
                                         on:change=on_select_change
                                     >
                                         {nullable.then(|| view! {
                                             <option value="">"Auto"</option>
                                         })}
-                                        {move || available_options.get().into_iter().map(|opt| {
+                                        // Options include the session's own
+                                        // value even when the schema stopped
+                                        // offering it, so the control cannot
+                                        // fall back to displaying a different
+                                        // option as if it were the setting.
+                                        {move || options_including_current(
+                                            &available_options.get(),
+                                            &current_value.get(),
+                                        )
+                                            .into_iter()
+                                            .map(|(value, label)| {
                                                 view! {
-                                                    <option value={opt.value.clone()}>{opt.label}</option>
+                                                    <option value={value}>{label}</option>
                                                 }
-                                            }).collect_view()}
+                                            })
+                                            .collect_view()}
+                                        // Say why the list is empty rather than
+                                        // presenting "no choices" as a fact.
+                                        {move || (options_unknown.get()
+                                            && available_options.get().is_empty())
+                                            .then(|| view! {
+                                                <option value="" disabled=true>
+                                                    "Unavailable \u{2014} depends on another \
+                                                     setting Tyde cannot resolve"
+                                                </option>
+                                            })}
                                     </select>
                                 }.into_any()
                             }
@@ -730,8 +836,16 @@ fn TaskUsageBadge(
                         aria-haspopup="dialog"
                         aria-expanded=move || open.get().to_string()
                         aria-controls=popover_id_attr
+                        title="Cumulative tokens across this task's requests and \
+                               agents. The context panel shows the latest \
+                               request's occupancy instead."
                         on:click=move |_| open.update(|o| *o = !*o)
                     >
+                        // Scope marker. This figure is task-wide and
+                        // cumulative; the context bar is single-request
+                        // occupancy. Unlabelled, the pair reads as bad
+                        // arithmetic rather than two different measurements.
+                        <span class="session-task-scope">"Task"</span>
                         {match usage_texts {
                             Some((input_text, output_text)) => view! {
                                 <>
@@ -895,6 +1009,172 @@ mod wasm_tests {
         clear_invalid_dependent_select_values(&fields, &mut values);
 
         assert_eq!(values.0.get("effort"), Some(&SessionSettingValue::Null));
+    }
+
+    /// A session's effective value must stay visible even after the schema
+    /// stops offering it — the Hermes case where a named profile's gateway
+    /// probe fails and the profile leaves the schema. Dropping the value lets
+    /// the control display a *different* option as though it were the setting.
+    #[wasm_bindgen_test]
+    fn current_value_absent_from_options_is_kept_and_marked() {
+        let options = vec![SelectOption {
+            value: "default".to_owned(),
+            label: "Default".to_owned(),
+        }];
+
+        let entries = options_including_current(&options, "qatest");
+        assert_eq!(
+            entries.len(),
+            2,
+            "the session's own value must be added, not dropped: {entries:?}"
+        );
+        assert_eq!(entries[1].0, "qatest", "the injected entry keeps the raw value");
+        assert!(
+            entries[1].1.contains("qatest") && entries[1].1.contains("unavailable"),
+            "the injected entry must name the value and mark it unavailable, got: {}",
+            entries[1].1
+        );
+        assert_eq!(
+            entries[0].0, "default",
+            "schema options are preserved ahead of the injected entry"
+        );
+
+        // A value the schema does offer is untouched — no phantom duplicate.
+        assert_eq!(
+            options_including_current(&options, "default"),
+            vec![("default".to_owned(), "Default".to_owned())],
+            "a recognized value must not be duplicated or relabelled"
+        );
+        // Empty means "unset"; that is the nullable/Auto case, not an unknown.
+        assert_eq!(
+            options_including_current(&options, "").len(),
+            1,
+            "an empty value must not inject an entry"
+        );
+    }
+
+    /// End-to-end for M5: a session carrying `profile=qatest` against a schema
+    /// that only knows `default` must render `qatest`, not `Default`. Asserts
+    /// on what the user sees and on the control's effective value.
+    #[wasm_bindgen_test]
+    async fn named_profile_absent_from_schema_is_not_displayed_as_default() {
+        let container = make_container();
+        let schema = SessionSettingsSchema {
+            backend_kind: BackendKind::Hermes,
+            fields: vec![SessionSettingField {
+                key: "profile".to_owned(),
+                label: "Profile".to_owned(),
+                description: None,
+                use_slider: false,
+                select_options_by_setting: None,
+                field_type: SessionSettingFieldType::Select {
+                    options: vec![SelectOption {
+                        value: "default".to_owned(),
+                        label: "Default".to_owned(),
+                    }],
+                    default: Some("default".to_owned()),
+                    nullable: false,
+                },
+            }],
+        };
+        let mut values = SessionSettingsValues::default();
+        values.0.insert(
+            "profile".to_owned(),
+            SessionSettingValue::String("qatest".to_owned()),
+        );
+        let values = RwSignal::new(values);
+
+        let _handle = mount_to(container.clone(), move || {
+            view! {
+                <SessionSettingsControls
+                    schema=schema.clone()
+                    values=values.into()
+                    on_change=Callback::new(|_| {})
+                />
+            }
+        });
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("qatest"),
+            "the session's real profile must be visible, got: {text}"
+        );
+
+        let select: web_sys::HtmlSelectElement = query(&container, ".session-setting-select")
+            .expect("the profile select should render")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            select.value(),
+            "qatest",
+            "the control's effective value must be the session's profile, not the schema default"
+        );
+        assert!(
+            select.selected_index() >= 0,
+            "the control must resolve to a real option rather than an unmatched blank"
+        );
+    }
+
+    /// The slider path had its own coercion: an unresolvable value fell through
+    /// to `.unwrap_or(0)`, silently presenting the first option as current.
+    #[wasm_bindgen_test]
+    async fn slider_does_not_coerce_an_unknown_value_to_the_first_option() {
+        let container = make_container();
+        let schema = SessionSettingsSchema {
+            backend_kind: BackendKind::Codex,
+            fields: vec![SessionSettingField {
+                key: "effort".to_owned(),
+                label: "Effort".to_owned(),
+                description: None,
+                use_slider: true,
+                select_options_by_setting: None,
+                field_type: SessionSettingFieldType::Select {
+                    options: vec![
+                        SelectOption {
+                            value: "low".to_owned(),
+                            label: "Low".to_owned(),
+                        },
+                        SelectOption {
+                            value: "high".to_owned(),
+                            label: "High".to_owned(),
+                        },
+                    ],
+                    default: Some("low".to_owned()),
+                    nullable: false,
+                },
+            }],
+        };
+        let mut values = SessionSettingsValues::default();
+        values.0.insert(
+            "effort".to_owned(),
+            SessionSettingValue::String("max".to_owned()),
+        );
+        let values = RwSignal::new(values);
+
+        let _handle = mount_to(container.clone(), move || {
+            view! {
+                <SessionSettingsControls
+                    schema=schema.clone()
+                    values=values.into()
+                    on_change=Callback::new(|_| {})
+                />
+            }
+        });
+        next_tick().await;
+
+        let label = query(&container, ".session-setting-value-label")
+            .expect("the slider value label should render")
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            label.contains("max"),
+            "the slider must report the effective value, got: {label}"
+        );
+        assert!(
+            !label.contains("Low"),
+            "an unknown value must not be coerced to the first option, got: {label}"
+        );
     }
 
     fn make_container() -> HtmlElement {

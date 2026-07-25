@@ -4651,6 +4651,13 @@ kbd {
     background: #bf69ff;
 }
 
+/* Prompt tokens no reported category accounts for. Deliberately muted and
+   neutral: it marks absence of attribution, not a category of its own. */
+.summary-context-segment.segment-unaccounted {
+    background: var(--text-tertiary);
+    opacity: 0.4;
+}
+
 /* Context breakdown legend */
 .summary-context-meta {
     display: flex;
@@ -4716,6 +4723,11 @@ kbd {
 
 .context-breakdown-dot.dot-context {
     background: #bf69ff;
+}
+
+.context-breakdown-dot.dot-unaccounted {
+    background: var(--text-tertiary);
+    opacity: 0.4;
 }
 
 /* Task hint link — switches to task view */
@@ -5784,6 +5796,12 @@ kbd {
 
 .agent-card-status.completed {
     color: var(--success);
+}
+
+/* A cancelled turn is neither a success nor a failure — the user stopped it
+   deliberately. Neutral, so it never reads as a completed result. */
+.agent-card-status.cancelled {
+    color: var(--text-tertiary);
 }
 
 .agent-card-status.error {
@@ -9992,6 +10010,18 @@ kbd {
 .session-task-toggle:focus-visible {
     background: var(--surface-2);
     color: var(--text-secondary);
+}
+
+/* Scope marker for the task-wide total, distinguishing it from the
+   single-request context bar. Quiet by design: it qualifies the figure
+   beside it rather than competing with it. */
+.session-task-scope {
+    font-family: var(--font-sans);
+    font-size: 0.68rem;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    color: var(--text-tertiary);
+    opacity: 0.75;
 }
 
 /* "including N agents" suffix — subordinate to the token figures */

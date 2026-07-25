@@ -13,7 +13,7 @@ use protocol::{
 use crate::send::{close_agent, compact_agent, send_frame};
 use crate::state::{
     ActiveAgentRef, ActiveProjectRef, AgentInfo, AgentsPanelFilters, AppState, CompactionOldInfo,
-    ConnectionStatus, ProjectInfo, StreamingState, TabContent, sort_project_infos,
+    ConnectionStatus, ProjectInfo, StreamingState, TabContent, TransientEvent, sort_project_infos,
 };
 
 /// Pure predicate used by the Agents panel filter memo. Extracted so the
@@ -149,6 +149,13 @@ pub(crate) enum DerivedAgentState {
     Initializing,
     Thinking,
     Idle,
+    /// The last turn ended because the user cancelled it. Distinct from `Idle`:
+    /// a cancelled turn is *not* a completed one, and rendering it with the
+    /// success check told users their interrupt had produced a finished result.
+    /// Cleared by the next turn, since `OperationCancelled` lives in
+    /// `transient_events`, which the reducer drops on the next
+    /// `TypingStatusChanged(true)`.
+    Cancelled,
     Compacting,
     Terminated,
 }
@@ -158,6 +165,7 @@ pub(crate) fn derive_agent_state(
     streaming: &HashMap<AgentId, StreamingState>,
     turn_active: &HashMap<AgentId, bool>,
     compaction: &HashMap<AgentId, CompactionOldInfo>,
+    transient: &HashMap<AgentId, Vec<TransientEvent>>,
 ) -> DerivedAgentState {
     if agent.fatal_error.is_some() {
         return DerivedAgentState::Terminated;
@@ -171,7 +179,18 @@ pub(crate) fn derive_agent_state(
     let typing = turn_active.get(&agent.agent_id).copied().unwrap_or(false);
     let streaming_open = streaming.contains_key(&agent.agent_id);
     if typing || streaming_open {
-        DerivedAgentState::Thinking
+        return DerivedAgentState::Thinking;
+    }
+    // Not running. Distinguish "finished" from "was stopped": the terminal
+    // outcome is a separate question from whether work is in flight, and only
+    // the former deserves a success affordance.
+    let cancelled = transient.get(&agent.agent_id).is_some_and(|events| {
+        events
+            .iter()
+            .any(|event| matches!(event, TransientEvent::OperationCancelled { .. }))
+    });
+    if cancelled {
+        DerivedAgentState::Cancelled
     } else {
         DerivedAgentState::Idle
     }
@@ -183,6 +202,7 @@ pub(crate) fn status_label(derived: &DerivedAgentState) -> &'static str {
         DerivedAgentState::Thinking => "Thinking",
         DerivedAgentState::Compacting => "Compacting",
         DerivedAgentState::Idle => "Idle",
+        DerivedAgentState::Cancelled => "Cancelled",
         DerivedAgentState::Terminated => "Terminated",
     }
 }
@@ -193,6 +213,7 @@ pub(crate) fn status_icon(derived: &DerivedAgentState) -> &'static str {
         DerivedAgentState::Thinking => "\u{25F7}",     // ◷ clock (CSS animates)
         DerivedAgentState::Compacting => "\u{27F2}",   // ⟲ counter-clockwise gapped circle
         DerivedAgentState::Idle => "\u{2713}",         // ✓
+        DerivedAgentState::Cancelled => "\u{2298}",    // ⊘ circled division slash
         DerivedAgentState::Terminated => "\u{2022}",   // •
     }
 }
@@ -203,6 +224,7 @@ pub(crate) fn status_class(derived: &DerivedAgentState) -> &'static str {
         DerivedAgentState::Thinking => "agent-card-status running",
         DerivedAgentState::Compacting => "agent-card-status running",
         DerivedAgentState::Idle => "agent-card-status completed",
+        DerivedAgentState::Cancelled => "agent-card-status cancelled",
         DerivedAgentState::Terminated => "agent-card-status error",
     }
 }
@@ -1540,11 +1562,20 @@ fn agent_card(
         let streaming = state.streaming_text;
         let turn_active = state.agent_turn_active;
         let compaction = state.compaction_in_progress;
+        let transient = state.transient_events;
         move || {
             compaction.with(|compaction| {
                 turn_active.with(|turn_active| {
                     streaming.with(|streaming| {
-                        derive_agent_state(&agent_for_derived, streaming, turn_active, compaction)
+                        transient.with(|transient| {
+                            derive_agent_state(
+                                &agent_for_derived,
+                                streaming,
+                                turn_active,
+                                compaction,
+                                transient,
+                            )
+                        })
                     })
                 })
             })
@@ -1915,6 +1946,82 @@ mod tests {
 
     fn no_runtime() -> (HashMap<AgentId, StreamingState>, HashMap<AgentId, bool>) {
         (HashMap::new(), HashMap::new())
+    }
+
+    /// A cancelled turn is a distinct outcome from a completed one. Rendering
+    /// it as `Idle` gave the user a success check (`✓`, `completed`) for work
+    /// they had just stopped, which is the display half of H7.
+    #[test]
+    fn cancelled_turn_is_not_reported_as_completed_idle() {
+        let agent = mk_agent("a", "h", None, None, true);
+        let (streaming, turn_active) = no_runtime();
+        let compaction = HashMap::new();
+        let mut transient = HashMap::new();
+        transient.insert(
+            agent.agent_id.clone(),
+            vec![TransientEvent::OperationCancelled {
+                message: "Operation cancelled".to_owned(),
+            }],
+        );
+
+        let derived =
+            derive_agent_state(&agent, &streaming, &turn_active, &compaction, &transient);
+
+        assert_eq!(
+            derived,
+            DerivedAgentState::Cancelled,
+            "an agent whose last turn was cancelled must not derive as Idle"
+        );
+        assert_eq!(status_label(&derived), "Cancelled");
+        assert_ne!(
+            status_icon(&derived),
+            "\u{2713}",
+            "a cancelled turn must not carry the success check"
+        );
+        assert!(
+            !status_class(&derived).contains("completed"),
+            "a cancelled turn must not use the completed style, got: {}",
+            status_class(&derived)
+        );
+    }
+
+    /// The cancelled outcome describes the *last* turn only. `OperationCancelled`
+    /// lives in `transient_events`, which the reducer clears when the next turn
+    /// starts, so a running agent reports Thinking even while that event is
+    /// still recorded — and an agent with no cancellation stays Idle.
+    #[test]
+    fn cancelled_outcome_yields_to_a_running_turn_and_is_absent_by_default() {
+        let agent = mk_agent("a", "h", None, None, true);
+        let (streaming, _) = no_runtime();
+        let compaction = HashMap::new();
+        let mut transient = HashMap::new();
+        transient.insert(
+            agent.agent_id.clone(),
+            vec![TransientEvent::OperationCancelled {
+                message: "Operation cancelled".to_owned(),
+            }],
+        );
+
+        let mut turn_active = HashMap::new();
+        turn_active.insert(agent.agent_id.clone(), true);
+        assert_eq!(
+            derive_agent_state(&agent, &streaming, &turn_active, &compaction, &transient),
+            DerivedAgentState::Thinking,
+            "a live turn outranks the previous turn's cancelled outcome"
+        );
+
+        let (streaming, turn_active) = no_runtime();
+        assert_eq!(
+            derive_agent_state(
+                &agent,
+                &streaming,
+                &turn_active,
+                &compaction,
+                &HashMap::new()
+            ),
+            DerivedAgentState::Idle,
+            "an agent that was never cancelled still derives as Idle"
+        );
     }
 
     #[test]
