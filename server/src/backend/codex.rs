@@ -1487,7 +1487,12 @@ enum CodexSubAgentMessageOpen {
     Retired,
     Terminal,
     Foreign,
-    Superseded(FinalizedCodexSubAgentProviderItem),
+    Superseded(Box<FinalizedCodexSubAgentProviderItem>),
+}
+
+struct CodexProviderNotificationOwner<'a> {
+    thread_id: Option<&'a str>,
+    turn_id: Option<&'a str>,
 }
 
 #[derive(Clone, Default)]
@@ -2856,8 +2861,7 @@ impl CodexInner {
         provider_message_id: Option<ChatMessageId>,
         kind: CodexProviderItemKind,
         cause: CodexProviderOpenCause,
-        notification_thread_id: Option<&str>,
-        notification_turn_id: Option<&str>,
+        notification_owner: CodexProviderNotificationOwner<'_>,
         model: &str,
     ) -> CodexSubAgentMessageOpen {
         let tool_container_was_open = {
@@ -2912,13 +2916,16 @@ impl CodexInner {
             let retired =
                 provider_message_id.is_some() && stream.retire_replaceable_provider_reservation();
             if !retired {
-                let same_owner =
-                    notification_thread_id.is_none_or(|thread_id| thread_id == stream_key);
+                let same_owner = notification_owner
+                    .thread_id
+                    .is_none_or(|thread_id| thread_id == stream_key);
                 // Child turn boundaries clear current_message_id, so any live
                 // child item is owned by active_turn_id without a second item
                 // turn field to compare as the root path does.
                 let same_turn = stream.active_turn_id.as_ref().is_some_and(|turn_id| {
-                    notification_turn_id.is_none_or(|incoming| incoming == turn_id)
+                    notification_owner
+                        .turn_id
+                        .is_none_or(|incoming| incoming == turn_id)
                 });
                 let tool_ownership_is_clear = !tool_container_was_open
                     && stream.pending_tool_call_ids.is_empty()
@@ -2966,7 +2973,7 @@ impl CodexInner {
                 stream.current_reasoning.clear();
                 stream.current_tool_call_ids.clear();
                 stream.current_images.clear();
-                return CodexSubAgentMessageOpen::Superseded(finalized);
+                return CodexSubAgentMessageOpen::Superseded(Box::new(finalized));
             }
         }
         let generated_identity = provider_message_id.is_none().then(|| {
@@ -4992,8 +4999,10 @@ impl CodexInner {
                             provider_message_id.clone(),
                             provider_kind,
                             CodexProviderOpenCause::ItemStarted,
-                            notification_thread_id.as_deref(),
-                            notification_turn_id.as_deref(),
+                            CodexProviderNotificationOwner {
+                                thread_id: notification_thread_id.as_deref(),
+                                turn_id: notification_turn_id.as_deref(),
+                            },
                             model,
                         )
                         .await;
@@ -5004,7 +5013,7 @@ impl CodexInner {
                         CodexSubAgentMessageOpen::Superseded(finalized) => {
                             self.finalize_subagent_provider_supersession(
                                 stream_key,
-                                finalized,
+                                *finalized,
                                 provider_message_id
                                     .as_ref()
                                     .expect("superseded child item has provider id"),
@@ -6358,20 +6367,17 @@ impl CodexInner {
                 return;
             };
             match completed_turn_id.as_ref() {
-                Some(completed_turn_id) => {
+                Some(completed_turn_id)
                     if stream
                         .terminated_turns
                         .iter()
-                        .any(|turn| turn.turn_id == *completed_turn_id)
-                    {
-                        stream.token_usage_by_turn.remove(completed_turn_id);
-                        stream.model_token_usage_by_turn.remove(completed_turn_id);
-                        true
-                    } else {
-                        false
-                    }
+                        .any(|turn| turn.turn_id == *completed_turn_id) =>
+                {
+                    stream.token_usage_by_turn.remove(completed_turn_id);
+                    stream.model_token_usage_by_turn.remove(completed_turn_id);
+                    true
                 }
-                None => false,
+                _ => false,
             }
         };
         if consumed_terminated_turn {
@@ -8339,24 +8345,21 @@ impl CodexInner {
         let consumed_terminated_turn = {
             let mut state = self.state.lock().await;
             match completed_turn_id.as_ref() {
-                Some(completed_turn_id) => {
+                Some(completed_turn_id)
                     if state
                         .terminated_turns
                         .iter()
-                        .any(|turn| turn.turn_id == *completed_turn_id)
-                    {
-                        state.token_usage_by_turn.remove(completed_turn_id);
-                        state.model_token_usage_by_turn.remove(completed_turn_id);
-                        state.turn_context_by_turn.remove(completed_turn_id);
-                        state
-                            .completed_message_metadata_by_turn
-                            .remove(completed_turn_id);
-                        true
-                    } else {
-                        false
-                    }
+                        .any(|turn| turn.turn_id == *completed_turn_id) =>
+                {
+                    state.token_usage_by_turn.remove(completed_turn_id);
+                    state.model_token_usage_by_turn.remove(completed_turn_id);
+                    state.turn_context_by_turn.remove(completed_turn_id);
+                    state
+                        .completed_message_metadata_by_turn
+                        .remove(completed_turn_id);
+                    true
                 }
-                None => false,
+                _ => false,
             }
         };
         if consumed_terminated_turn {
