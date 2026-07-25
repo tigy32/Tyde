@@ -10315,9 +10315,7 @@ mod wasm_tests {
         // being applied to host B's agent at startup.
         let queued = state.pending_settings_values_for_tests();
         assert!(
-            !queued
-                .iter()
-                .any(|values| values.0.contains_key("profile")),
+            !queued.iter().any(|values| values.0.contains_key("profile")),
             "host-A settings must not be queued under the host-B spawn, got: {queued:?}"
         );
     }
