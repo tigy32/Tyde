@@ -954,8 +954,8 @@ mod wasm_tests {
                         return Promise.resolve();
                     }
                     window.__test_send_lines.push(args.line);
-                    return new Promise(function(resolve) {
-                        window.__test_send_resolvers.push(resolve);
+                    return new Promise(function(resolve, reject) {
+                        window.__test_send_resolvers.push({ resolve, reject });
                     });
                 };
             })();
@@ -968,13 +968,33 @@ mod wasm_tests {
         js_sys::eval(
             r#"
             (function() {
-                const resolve = window.__test_send_resolvers.shift();
-                if (!resolve) throw new Error("no deferred send");
-                resolve();
+                const pending = window.__test_send_resolvers.shift();
+                if (!pending) throw new Error("no deferred send");
+                pending.resolve();
             })();
             "#,
         )
         .expect("resolve next deferred send");
+    }
+
+    fn reject_next_send() {
+        js_sys::eval(
+            r#"
+            (function() {
+                const pending = window.__test_send_resolvers.shift();
+                if (!pending) throw new Error("no deferred send");
+                pending.reject("simulated deferred bridge rejection");
+            })();
+            "#,
+        )
+        .expect("reject next deferred send");
+    }
+
+    fn has_sequence_cursor(host_id: &str, stream: &StreamPath) -> bool {
+        SEQ_MAP.with(|map| {
+            map.borrow()
+                .contains_key(&(host_id.to_owned(), stream.clone()))
+        })
     }
 
     fn sent_envelopes() -> Vec<Envelope> {
@@ -1099,5 +1119,79 @@ mod wasm_tests {
 
         assert!(matches!(&*outcome.borrow(), Some(Ok(()))));
         assert_eq!(current_seq(host_id, &stream), 0);
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    async fn stale_failure_after_clear_does_not_recreate_the_cursor() {
+        let host_id = "host-clear-failure";
+        let stream = StreamPath("/host/clear-failure".to_owned());
+        clear_host_seqs(host_id);
+        install_deferred_send_stub();
+
+        let outcome = Rc::new(RefCell::new(None));
+        let captured_outcome = Rc::clone(&outcome);
+        let suspended_stream = stream.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            *captured_outcome.borrow_mut() = Some(
+                send_frame(
+                    host_id,
+                    suspended_stream,
+                    FrameKind::ClientError,
+                    &serde_json::json!({"attempt": 1}),
+                )
+                .await,
+            );
+        });
+
+        settle().await;
+        assert!(has_sequence_cursor(host_id, &stream));
+        assert_eq!(current_seq(host_id, &stream), 1);
+
+        clear_host_seqs(host_id);
+        assert!(!has_sequence_cursor(host_id, &stream));
+        reject_next_send();
+        settle().await;
+
+        assert!(matches!(&*outcome.borrow(), Some(Err(_))));
+        assert!(!has_sequence_cursor(host_id, &stream));
+        assert_eq!(current_seq(host_id, &stream), 0);
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    async fn stale_failure_does_not_roll_back_a_new_epoch_reservation() {
+        let host_id = "host-new-epoch";
+        let stream = StreamPath("/host/new-epoch".to_owned());
+        clear_host_seqs(host_id);
+        install_deferred_send_stub();
+
+        let outcome = Rc::new(RefCell::new(None));
+        let captured_outcome = Rc::clone(&outcome);
+        let suspended_stream = stream.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            *captured_outcome.borrow_mut() = Some(
+                send_frame(
+                    host_id,
+                    suspended_stream,
+                    FrameKind::ClientError,
+                    &serde_json::json!({"attempt": 1}),
+                )
+                .await,
+            );
+        });
+
+        settle().await;
+        assert_eq!(current_seq(host_id, &stream), 1);
+
+        clear_host_seqs(host_id);
+        let new_epoch_reservation = reserve_seq(host_id, &stream);
+        assert_eq!(new_epoch_reservation.seq, 0);
+        assert_eq!(current_seq(host_id, &stream), 1);
+
+        reject_next_send();
+        settle().await;
+
+        assert!(matches!(&*outcome.borrow(), Some(Err(_))));
+        assert!(has_sequence_cursor(host_id, &stream));
+        assert_eq!(current_seq(host_id, &stream), 1);
     }
 }
