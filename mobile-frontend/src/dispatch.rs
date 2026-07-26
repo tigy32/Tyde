@@ -2716,6 +2716,16 @@ mod tests {
                         .is_some_and(|a| a.fatal_error.is_none())),
                 "a nonfatal error must not mark the agent dead"
             );
+            // Settlement of the transient map must be fatal-only too. Without
+            // this the Retry card seeded above could be swept by a routine
+            // recoverable error, and the user would lose the running account of
+            // why their turn is stalling at the moment they most need it.
+            assert!(
+                state
+                    .transient_events
+                    .with_untracked(|m| m.get(&alive).is_some_and(|events| events.len() == 1)),
+                "a nonfatal error must keep the agent's transient cards"
+            );
 
             // Both errors are still visible as transcript rows — settlement
             // clears live UI, it never edits history.
@@ -2810,13 +2820,24 @@ mod tests {
                             "backend crashed",
                         )),
                         // Deliberately after the fatal record, and deliberately
-                        // contradicted by `turn_active: true` below.
+                        // contradicted by `turn_active: true` below. One event
+                        // per settled slot, so the post-replay settlement is
+                        // load-bearing for each of them rather than passing
+                        // because nothing repopulated the map.
                         AgentBootstrapEvent::ChatEvent(ChatEvent::TypingStatusChanged(true)),
                         AgentBootstrapEvent::ChatEvent(ChatEvent::StreamStart(
                             protocol::StreamStartData {
                                 message_id: Some("m-1".to_owned()),
                                 agent: "Agent".to_owned(),
                                 model: None,
+                            },
+                        )),
+                        AgentBootstrapEvent::ChatEvent(ChatEvent::RetryAttempt(
+                            protocol::RetryAttemptData {
+                                attempt: 2,
+                                max_retries: 3,
+                                error: "still retrying".to_owned(),
+                                backoff_ms: 800,
                             },
                         )),
                     ],
@@ -2828,6 +2849,28 @@ mod tests {
             assert!(
                 is_settled(&state, &agent_ref),
                 "fatal is terminal authority over the snapshot's own turn_active"
+            );
+            // Named individually, because each one is a distinct claim and each
+            // was populated by a replayed event *after* the fatal record — so
+            // any of them surviving means the post-replay settlement did not run.
+            assert!(
+                !state
+                    .agent_turn_active
+                    .with_untracked(|m| m.contains_key(&agent_ref)),
+                "the replayed Typing(true) and turn_active: true must not re-arm the turn"
+            );
+            assert!(
+                !state
+                    .streaming_text
+                    .with_untracked(|m| m.contains_key(&agent_ref)),
+                "the replayed StreamStart must not leave an open stream"
+            );
+            assert!(
+                !state
+                    .transient_events
+                    .with_untracked(|m| m.contains_key(&agent_ref)),
+                "the replayed RetryAttempt must not leave a card promising a retry \
+                 that a dead agent can never perform"
             );
         });
     }
@@ -2856,15 +2899,27 @@ mod tests {
                 AgentBootstrapPayload {
                     // No AgentError in this payload — the registry is the only
                     // record that the agent is dead.
-                    events: vec![AgentBootstrapEvent::ChatEvent(
-                        ChatEvent::TypingStatusChanged(true),
-                    )],
+                    events: vec![
+                        AgentBootstrapEvent::ChatEvent(ChatEvent::TypingStatusChanged(true)),
+                        AgentBootstrapEvent::ChatEvent(ChatEvent::RetryAttempt(
+                            protocol::RetryAttemptData {
+                                attempt: 1,
+                                max_retries: 3,
+                                error: "still retrying".to_owned(),
+                                backoff_ms: 800,
+                            },
+                        )),
+                    ],
                     latest_output: Default::default(),
                     turn_active: true,
                 },
             );
 
-            assert!(is_settled(&state, &agent_ref));
+            assert!(
+                is_settled(&state, &agent_ref),
+                "an agent already fatal from an earlier frame stays settled, even \
+                 though this payload never mentions the error"
+            );
         });
     }
 
