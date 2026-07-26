@@ -41,6 +41,15 @@ pub(crate) struct AgentStatus {
     pub pending_user_response: Option<PendingUserResponseKind>,
     pub last_error: Option<String>,
     pub activity_counter: u64,
+    /// This agent's transcript was replayed from a saved session and no live
+    /// turn has begun since. The supervisor reads it to leave reopened history
+    /// alone until the agent actually works, unless the host opts into
+    /// supervising restored agents.
+    pub restored_without_live_turn: bool,
+    /// When the current or most recent live turn started. The supervisor's
+    /// stall clock starts here, so a turn whose backend never emits anything is
+    /// still measured from the moment it began rather than from an older event.
+    pub turn_started_at: Option<std::time::Instant>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

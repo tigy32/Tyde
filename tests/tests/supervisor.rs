@@ -10,12 +10,16 @@ use fixture::Fixture;
 use protocol::{
     AgentClosedPayload, BackendKind, ChatEvent, CommandErrorPayload, Envelope,
     FetchSessionHistoryPayload, FrameKind, HostSettingErrorTarget, HostSettingValue,
-    HostSettingsPayload, MessageSender, NewAgentPayload, SUPERVISOR_MESSAGE_PREFIX,
+    HostSettingsPayload, ListSessionsPayload, MessageSender, NewAgentPayload,
+    SUPERVISOR_MESSAGE_PREFIX, SUPERVISOR_STALL_INTERRUPT_NOTICE_PREFIX, SessionListPayload,
     SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
 };
 use std::time::Duration;
 
 const MOCK_ERROR_WITHOUT_IDLE_SENTINEL: &str = "__mock_error_without_idle__";
+/// Holds a turn open until something interrupts it — a backend that has stopped
+/// producing anything, which is exactly what the stall timeout exists for.
+const MOCK_HOLD_UNTIL_INTERRUPT_SENTINEL: &str = "__mock_hold_until_interrupt__";
 /// Opts the mock backend into emitting `MessageSender::User` transcript
 /// bubbles like real backends do — the supervisor's context reader consumes
 /// them, so supervised sessions must run with bubbles on.
@@ -23,6 +27,7 @@ const MOCK_USER_BUBBLES_SENTINEL: &str = "__mock_user_bubbles__";
 const MOCK_CONTEXT_250K_SENTINEL: &str = "__mock_context_250k__";
 const MOCK_SUPERVISOR_DONE: &str = "__mock_supervisor_done__";
 const MOCK_SUPERVISOR_AWAITING_USER: &str = "__mock_supervisor_awaiting_user__";
+const MOCK_SUPERVISOR_CONTINUE: &str = "__mock_supervisor_continue__";
 const MOCK_SUPERVISOR_ERROR: &str = "__mock_supervisor_error__";
 const MOCK_ACTIVE_IDLE_CYCLE: &str = "__mock_active_idle_cycle__";
 const MOCK_CODEX_INTERNAL_ERROR_TAIL: &str = "__mock_codex_internal_error_tail__";
@@ -108,6 +113,20 @@ fn supervisor_failure_warning(env: &Envelope) -> Option<(StreamPath, String)> {
                 ) =>
         {
             Some((env.stream.clone(), message.content))
+        }
+        _ => None,
+    }
+}
+
+fn stall_interrupt_notice(env: &Envelope, stream: &StreamPath) -> Option<String> {
+    match chat_event_on(env, stream)? {
+        ChatEvent::MessageAdded(message)
+            if matches!(message.sender, MessageSender::Warning)
+                && message
+                    .content
+                    .starts_with(SUPERVISOR_STALL_INTERRUPT_NOTICE_PREFIX) =>
+        {
+            Some(message.content)
         }
         _ => None,
     }
@@ -1036,5 +1055,318 @@ async fn invalid_supervisor_retry_limit_returns_typed_setting_target() {
     assert_eq!(
         error.setting_target,
         Some(HostSettingErrorTarget::SupervisorRetryAttempts)
+    );
+}
+
+/// Reopening a saved session replays its transcript, which reaches the
+/// supervisor looking exactly like an agent that just finished a turn. The
+/// default must leave that history alone; enabling the opt-in must judge the
+/// very agents that were waiting on it.
+#[tokio::test]
+async fn restored_session_is_supervised_only_after_the_restore_opt_in() {
+    fixture::init_tracing();
+    let mut fixture = Fixture::new().await;
+    let source_name = "restore-supervision-source";
+    let prompt = format!("hello {MOCK_USER_BUBBLES_SENTINEL} {MOCK_SUPERVISOR_CONTINUE}");
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some(source_name.to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: prompt.clone(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn restore source");
+    let source: NewAgentPayload = wait_for_envelope(
+        &mut fixture.client,
+        Duration::from_secs(5),
+        "restore source NewAgent",
+        |env| env.kind == FrameKind::NewAgent,
+    )
+    .await
+    .parse_payload()
+    .expect("parse restore source NewAgent");
+    let source_stream = source.instance_stream.clone();
+    wait_for_envelope(
+        &mut fixture.client,
+        Duration::from_secs(5),
+        "restore source turn",
+        |env| is_assistant_message_containing(env, &source_stream, "mock backend response to:"),
+    )
+    .await;
+
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list sessions for restore");
+    let sessions: SessionListPayload = wait_for_envelope(
+        &mut fixture.client,
+        Duration::from_secs(5),
+        "restore SessionList",
+        |env| env.kind == FrameKind::SessionList,
+    )
+    .await
+    .parse_payload()
+    .expect("parse restore SessionList");
+    let session_id = sessions
+        .sessions
+        .iter()
+        .find(|session| session.user_alias.as_deref() == Some(source_name))
+        .expect("restore source session is listed")
+        .id
+        .clone();
+
+    fixture
+        .client
+        .close_agent(&source.instance_stream)
+        .await
+        .expect("close restore source");
+    wait_for_envelope(
+        &mut fixture.client,
+        Duration::from_secs(5),
+        "restore source AgentClosed",
+        |env| env.kind == FrameKind::AgentClosed,
+    )
+    .await;
+
+    apply_supervisor_setting(
+        &mut fixture,
+        HostSettingValue::SupervisorEnabled { enabled: true },
+    )
+    .await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("restored-agent".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id,
+                prompt: None,
+            },
+        })
+        .await
+        .expect("resume the saved session");
+    let restored: NewAgentPayload = wait_for_envelope(
+        &mut fixture.client,
+        Duration::from_secs(5),
+        "restored NewAgent",
+        |env| env.kind == FrameKind::NewAgent,
+    )
+    .await
+    .parse_payload()
+    .expect("parse restored NewAgent");
+    let restored_stream = restored.instance_stream.clone();
+    // Replayed history is recorded without being broadcast as live events; the
+    // client is attached once the replay has settled, so its bootstrap is what
+    // proves the restored transcript — including the replayed request the
+    // supervisor would read — is in place.
+    let bootstrap: protocol::AgentBootstrapPayload = wait_for_envelope(
+        &mut fixture.client,
+        Duration::from_secs(10),
+        "restored agent bootstrap after replay",
+        |env| env.kind == FrameKind::AgentBootstrap && env.stream == restored_stream,
+    )
+    .await
+    .parse_payload()
+    .expect("parse restored AgentBootstrap");
+    assert!(
+        bootstrap.events.iter().any(|event| matches!(
+            event,
+            protocol::AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message))
+                if matches!(message.sender, MessageSender::User)
+                    && message.content == prompt
+        )),
+        "the restored transcript must replay the original request the supervisor reads"
+    );
+
+    let quiet_stream = restored_stream.clone();
+    assert_no_envelope(
+        &mut fixture.client,
+        QUIET_WAIT,
+        "supervisor kick on a restored agent before the opt-in",
+        |env| is_supervisor_kick(env, &quiet_stream),
+    )
+    .await;
+
+    apply_supervisor_setting(
+        &mut fixture,
+        HostSettingValue::SupervisorSuperviseRestoredAgents { enabled: true },
+    )
+    .await;
+    let kick = wait_for_envelope(
+        &mut fixture.client,
+        SUPERVISION_WAIT,
+        "supervisor kick after enabling restored-agent supervision",
+        |env| is_supervisor_kick(env, &restored_stream),
+    )
+    .await;
+    assert_eq!(kick.stream, restored.instance_stream);
+}
+
+/// A turn that stops producing anything is cancelled, the cancel is attributed
+/// to the supervisor in the transcript, and the truncated turn is then judged —
+/// a user cancel would have suppressed supervision instead.
+#[tokio::test]
+async fn stalled_turn_is_interrupted_then_judged_once() {
+    fixture::init_tracing();
+    let mut fixture = Fixture::new().await;
+    apply_supervisor_setting(
+        &mut fixture,
+        HostSettingValue::SupervisorStallTimeoutSeconds { seconds: 1 },
+    )
+    .await;
+    apply_supervisor_setting(
+        &mut fixture,
+        HostSettingValue::SupervisorStallTimeoutEnabled { enabled: true },
+    )
+    .await;
+    apply_supervisor_setting(
+        &mut fixture,
+        HostSettingValue::SupervisorEnabled { enabled: true },
+    )
+    .await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("stalled-agent".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: format!(
+                    "stall forever {MOCK_USER_BUBBLES_SENTINEL} {MOCK_HOLD_UNTIL_INTERRUPT_SENTINEL}"
+                ),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn a stalling agent");
+    let agent: NewAgentPayload = wait_for_envelope(
+        &mut fixture.client,
+        Duration::from_secs(5),
+        "stalled NewAgent",
+        |env| env.kind == FrameKind::NewAgent,
+    )
+    .await
+    .parse_payload()
+    .expect("parse stalled NewAgent");
+    let agent_stream = agent.instance_stream.clone();
+
+    let notice = wait_for_envelope(
+        &mut fixture.client,
+        SUPERVISION_WAIT,
+        "stall interrupt notice",
+        |env| stall_interrupt_notice(env, &agent_stream).is_some(),
+    )
+    .await;
+    let notice_copy =
+        stall_interrupt_notice(&notice, &agent_stream).expect("stall interrupt notice payload");
+    assert!(
+        notice_copy.contains("1 second"),
+        "the notice must name the configured window: {notice_copy}"
+    );
+    assert!(
+        notice_copy.contains("no progress") && notice_copy.contains("supervisor"),
+        "the notice must say why the turn stopped and who stopped it: {notice_copy}"
+    );
+
+    let kick_stream = agent_stream.clone();
+    wait_for_envelope(
+        &mut fixture.client,
+        SUPERVISION_WAIT,
+        "supervisor follow-up after the stalled turn was cancelled",
+        |env| is_supervisor_kick(env, &kick_stream),
+    )
+    .await;
+
+    // The follow-up turn is ordinary work, so the truncation must not keep
+    // re-arming: no second interrupt and no second follow-up.
+    let quiet_stream = agent_stream.clone();
+    assert_no_envelope(
+        &mut fixture.client,
+        QUIET_WAIT,
+        "repeat stall interrupt or follow-up after the agent resumed working",
+        |env| {
+            stall_interrupt_notice(env, &quiet_stream).is_some()
+                || is_supervisor_kick(env, &quiet_stream)
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn invalid_supervisor_stall_timeout_returns_typed_setting_target() {
+    fixture::init_tracing();
+    let mut fixture = Fixture::new().await;
+    for seconds in [0_u32, 86_401] {
+        fixture
+            .client
+            .set_setting(SetSettingPayload {
+                setting: HostSettingValue::SupervisorStallTimeoutSeconds { seconds },
+            })
+            .await
+            .expect("send invalid stall timeout setting");
+        let envelope = wait_for_envelope(
+            &mut fixture.client,
+            Duration::from_secs(5),
+            "typed invalid stall timeout error",
+            |envelope| envelope.kind == FrameKind::CommandError,
+        )
+        .await;
+        let error: CommandErrorPayload = envelope.parse_payload().expect("parse CommandError");
+        assert_eq!(
+            error.setting_target,
+            Some(HostSettingErrorTarget::SupervisorStallTimeoutSeconds)
+        );
+    }
+
+    apply_supervisor_setting(
+        &mut fixture,
+        HostSettingValue::SupervisorStallTimeoutSeconds { seconds: 900 },
+    )
+    .await;
+    fixture
+        .client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::SupervisorSuperviseRestoredAgents { enabled: true },
+        })
+        .await
+        .expect("send restore opt-in");
+    let payload: HostSettingsPayload = wait_for_envelope(
+        &mut fixture.client,
+        Duration::from_secs(5),
+        "HostSettings after the restore opt-in",
+        |env| env.kind == FrameKind::HostSettings,
+    )
+    .await
+    .parse_payload()
+    .expect("parse HostSettings");
+    assert_eq!(payload.settings.supervisor.stall_timeout_seconds, 900);
+    assert!(payload.settings.supervisor.supervise_restored_agents);
+    assert!(
+        !payload.settings.supervisor.stall_timeout_enabled,
+        "the window and the opt-in must not switch interrupting on by themselves"
     );
 }

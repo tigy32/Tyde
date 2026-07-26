@@ -65,6 +65,64 @@ mod supervisor_inactivity_delay_tests {
         .expect("deserialize legacy supervisor settings");
         assert_eq!(settings.auto_compact_inactivity_delay_seconds, 300);
     }
+
+    /// Both new controls are destructive or paid, so a supervisor that was
+    /// already enabled before they existed must decode with them off, and the
+    /// stall delay must round-trip its 30-minute default.
+    #[test]
+    fn restore_and_stall_controls_default_off_for_legacy_settings() {
+        assert_eq!(SUPERVISOR_STALL_TIMEOUT_SECONDS_MIN, 1);
+        assert_eq!(SUPERVISOR_STALL_TIMEOUT_SECONDS_MAX, 86_400);
+        let defaults = SupervisorSettings::default();
+        assert!(!defaults.supervise_restored_agents);
+        assert!(!defaults.stall_timeout_enabled);
+        assert_eq!(defaults.stall_timeout_seconds, 1_800);
+
+        let legacy: SupervisorSettings = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "auto_compact_on_success": true,
+            "auto_compact_inactivity_delay_seconds": 300,
+            "auto_compact_min_context_tokens": 200000,
+            "max_kicks_per_task": 3,
+            "retry_attempts": 1,
+            "cost_tier": "low"
+        }))
+        .expect("deserialize supervisor settings saved before the stall timeout existed");
+        assert!(legacy.enabled);
+        assert!(!legacy.supervise_restored_agents);
+        assert!(!legacy.stall_timeout_enabled);
+        assert_eq!(legacy.stall_timeout_seconds, 1_800);
+
+        let round_tripped: SupervisorSettings = serde_json::from_value(
+            serde_json::to_value(SupervisorSettings {
+                supervise_restored_agents: true,
+                stall_timeout_enabled: true,
+                stall_timeout_seconds: 600,
+                ..SupervisorSettings::default()
+            })
+            .expect("serialize supervisor settings"),
+        )
+        .expect("deserialize supervisor settings");
+        assert!(round_tripped.supervise_restored_agents);
+        assert!(round_tripped.stall_timeout_enabled);
+        assert_eq!(round_tripped.stall_timeout_seconds, 600);
+    }
+
+    #[test]
+    fn new_supervisor_settings_report_distinct_error_targets() {
+        assert_eq!(
+            HostSettingValue::SupervisorSuperviseRestoredAgents { enabled: true }.error_target(),
+            HostSettingErrorTarget::SupervisorSuperviseRestoredAgents
+        );
+        assert_eq!(
+            HostSettingValue::SupervisorStallTimeoutEnabled { enabled: true }.error_target(),
+            HostSettingErrorTarget::SupervisorStallTimeoutEnabled
+        );
+        assert_eq!(
+            HostSettingValue::SupervisorStallTimeoutSeconds { seconds: 1_800 }.error_target(),
+            HostSettingErrorTarget::SupervisorStallTimeoutSeconds
+        );
+    }
 }
 
 impl fmt::Display for Version {
@@ -2304,6 +2362,24 @@ pub struct BackgroundAgentFeaturesSettings {
 pub struct SupervisorSettings {
     #[serde(default)]
     pub enabled: bool,
+    /// Judge an agent whose session was restored from history as soon as its
+    /// replayed transcript settles into idle. Off by default: reopening a saved
+    /// session is not new work, so the supervisor waits for that agent's first
+    /// live turn instead of spending a verdict — and possibly a kick — on a
+    /// conversation the user only wanted to look at.
+    #[serde(default)]
+    pub supervise_restored_agents: bool,
+    /// Interrupt a turn that has gone [`Self::stall_timeout_seconds`] without
+    /// observable progress and let the supervisor decide how to make progress.
+    /// Off by default; cancelling a running turn is destructive.
+    #[serde(default)]
+    pub stall_timeout_enabled: bool,
+    /// Whole seconds without any observable turn progress before a stalled turn
+    /// is interrupted. Progress is any backend event on the turn, so a slow but
+    /// working agent never trips this. Only read when
+    /// [`Self::stall_timeout_enabled`] is set.
+    #[serde(default = "default_supervisor_stall_timeout_seconds")]
+    pub stall_timeout_seconds: u32,
     /// When the supervisor judges the task complete, automatically compact
     /// (rotate-and-summarize) the agent so reusing it later starts from a
     /// small warm context instead of resuming a huge cold session.
@@ -2375,10 +2451,20 @@ pub fn default_supervisor_auto_compact_inactivity_delay_seconds() -> u32 {
     300
 }
 
+pub const SUPERVISOR_STALL_TIMEOUT_SECONDS_MIN: u32 = 1;
+pub const SUPERVISOR_STALL_TIMEOUT_SECONDS_MAX: u32 = 86_400;
+
+pub fn default_supervisor_stall_timeout_seconds() -> u32 {
+    1_800
+}
+
 impl Default for SupervisorSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            supervise_restored_agents: false,
+            stall_timeout_enabled: false,
+            stall_timeout_seconds: default_supervisor_stall_timeout_seconds(),
             auto_compact_on_success: false,
             auto_compact_inactivity_delay_seconds:
                 default_supervisor_auto_compact_inactivity_delay_seconds(),
@@ -2395,6 +2481,14 @@ impl Default for SupervisorSettings {
 /// consecutive supervisor kicks straight from the event log, with no
 /// per-agent bookkeeping that could survive or miss restarts.
 pub const SUPERVISOR_MESSAGE_PREFIX: &str = "[Tyde Supervisor] ";
+
+/// Prefix of the visible notice the agent actor records when the supervisor
+/// interrupts a stalled turn. It keeps the interrupt attributable in the
+/// transcript and is how the supervision context reader tells the supervisor's
+/// own cancel apart from a user pressing stop — the log is the only state that
+/// distinction may live in, so a scheduler restart cannot desync it.
+pub const SUPERVISOR_STALL_INTERRUPT_NOTICE_PREFIX: &str =
+    "[Tyde Supervisor] Interrupted this turn after no progress for";
 
 /// Per-backend mapping from spawn complexity tiers to session-settings
 /// overrides (e.g. `model`, `effort`). An empty map means "no override" —
@@ -2475,6 +2569,15 @@ pub enum HostSettingValue {
     SupervisorEnabled {
         enabled: bool,
     },
+    SupervisorSuperviseRestoredAgents {
+        enabled: bool,
+    },
+    SupervisorStallTimeoutEnabled {
+        enabled: bool,
+    },
+    SupervisorStallTimeoutSeconds {
+        seconds: u32,
+    },
     SupervisorAutoCompactOnSuccess {
         enabled: bool,
     },
@@ -2537,6 +2640,15 @@ impl HostSettingValue {
                 HostSettingErrorTarget::BackgroundAgentFeatureEnabled
             }
             Self::SupervisorEnabled { .. } => HostSettingErrorTarget::SupervisorEnabled,
+            Self::SupervisorSuperviseRestoredAgents { .. } => {
+                HostSettingErrorTarget::SupervisorSuperviseRestoredAgents
+            }
+            Self::SupervisorStallTimeoutEnabled { .. } => {
+                HostSettingErrorTarget::SupervisorStallTimeoutEnabled
+            }
+            Self::SupervisorStallTimeoutSeconds { .. } => {
+                HostSettingErrorTarget::SupervisorStallTimeoutSeconds
+            }
             Self::SupervisorAutoCompactOnSuccess { .. } => {
                 HostSettingErrorTarget::SupervisorAutoCompactOnSuccess
             }
@@ -2578,6 +2690,9 @@ pub enum HostSettingErrorTarget {
     BackendTiers,
     BackgroundAgentFeatureEnabled,
     SupervisorEnabled,
+    SupervisorSuperviseRestoredAgents,
+    SupervisorStallTimeoutEnabled,
+    SupervisorStallTimeoutSeconds,
     SupervisorAutoCompactOnSuccess,
     SupervisorAutoCompactInactivityDelaySeconds,
     SupervisorAutoCompactMinContextTokens,

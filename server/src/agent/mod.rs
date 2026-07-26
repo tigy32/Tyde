@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use protocol::types::StreamIdentityViolation;
 use protocol::{
@@ -192,6 +192,11 @@ enum AgentCommand {
         supervisor_settings_rx: watch::Receiver<crate::host::SupervisorSettingsSignal>,
         reply: oneshot::Sender<AppendSupervisorWarningOutcome>,
     },
+    InterruptStalledTurnIfStalled {
+        expected_settings: crate::host::SupervisorSettingsSignal,
+        supervisor_settings_rx: watch::Receiver<crate::host::SupervisorSettingsSignal>,
+        reply: oneshot::Sender<SupervisorStallInterruptOutcome>,
+    },
     Compact {
         summary_prompt: String,
         max_summary_bytes: usize,
@@ -272,6 +277,30 @@ pub(crate) enum SupervisorVerdictStart {
         reason: SupervisorVerdictStartRejection,
         live_settings: crate::host::SupervisorSettingsSignal,
     },
+    Closed,
+}
+
+/// Result of asking an agent to cancel a turn that stopped making progress.
+/// The actor owns the decision: it is the only place that sees every backend
+/// event, including the stream deltas that never reach the status watch, so the
+/// scheduler's deadline is a prompt to re-evaluate rather than a verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SupervisorStallInterruptOutcome {
+    /// The stall notice was recorded and the backend was interrupted.
+    Interrupted,
+    /// The live stall is younger than the scheduler believed; ask again after
+    /// this long. Carries no attempt cost — interrupts are free.
+    TooEarly {
+        remaining: Duration,
+    },
+    /// No turn to interrupt, or the turn is parked on a user decision.
+    NotStalled,
+    /// A settings edit was ordered before this mailbox boundary.
+    SettingsChanged {
+        live: crate::host::SupervisorSettingsSignal,
+    },
+    /// The backend refused the interrupt or is mid-compaction.
+    Rejected,
     Closed,
 }
 
@@ -1104,6 +1133,35 @@ impl AgentHandle {
         reply_rx
             .await
             .unwrap_or(AppendSupervisorWarningOutcome::Closed)
+    }
+
+    /// Cancels the running turn if it has genuinely stalled for the configured
+    /// stall timeout, recording a visible notice first so the transcript — and
+    /// the supervision context read from it — attributes the cancel to the
+    /// supervisor rather than to the user.
+    pub(crate) async fn interrupt_stalled_turn_for_supervision(
+        &self,
+        expected_settings: crate::host::SupervisorSettingsSignal,
+        supervisor_settings_rx: watch::Receiver<crate::host::SupervisorSettingsSignal>,
+    ) -> SupervisorStallInterruptOutcome {
+        if !self.accepting_input.load(Ordering::SeqCst) {
+            return SupervisorStallInterruptOutcome::Closed;
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(AgentCommand::InterruptStalledTurnIfStalled {
+                expected_settings,
+                supervisor_settings_rx,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return SupervisorStallInterruptOutcome::Closed;
+        }
+        reply_rx
+            .await
+            .unwrap_or(SupervisorStallInterruptOutcome::Closed)
     }
 
     pub fn begin_compact(
@@ -2183,6 +2241,8 @@ pub(crate) fn spawn_agent_actor(
         let mut latest_output = AgentControlLatestOutput::default();
         let mut replay_state = AgentReplayState::default();
         let mut last_supervisor_failure_warning_activity_counter = None;
+        let mut last_backend_event_at: Option<Instant> = None;
+        let mut last_stall_interrupt_at: Option<Instant> = None;
         let mut last_stream_identity_violation: Option<StreamIdentityViolation> = None;
         let mut subscribers: Vec<Stream> = Vec::new();
         let mut active_stream_text = String::new();
@@ -2445,6 +2505,9 @@ pub(crate) fn spawn_agent_actor(
                             reply, ..
                         } => {
                             let _ = reply.send(AppendSupervisorWarningOutcome::Ineligible);
+                        }
+                        AgentCommand::InterruptStalledTurnIfStalled { reply, .. } => {
+                            let _ = reply.send(SupervisorStallInterruptOutcome::NotStalled);
                         }
                         AgentCommand::CompactIfInactive {
                             accepted, reply, ..
@@ -2894,6 +2957,11 @@ pub(crate) fn spawn_agent_actor(
                         .await;
                         continue;
                     }
+                    // Any live backend event is observable turn progress, so it
+                    // restarts the supervisor's stall clock. Stream deltas
+                    // count and never reach the status watch, which is why the
+                    // authoritative clock lives here and not in the scheduler.
+                    last_backend_event_at = Some(Instant::now());
                     let mut real_idle_transition = false;
                     let mut synthesize_idle_after_error = false;
                     match &event {
@@ -4324,6 +4392,101 @@ pub(crate) fn spawn_agent_actor(
                             };
                             let _ = reply.send(outcome);
                         }
+                        AgentCommand::InterruptStalledTurnIfStalled {
+                            expected_settings,
+                            supervisor_settings_rx,
+                            reply,
+                        } => {
+                            let live_status = status_handle.snapshot().await;
+                            let live = *supervisor_settings_rx.borrow();
+                            let stall_timeout = Duration::from_secs(u64::from(
+                                live.settings.stall_timeout_seconds,
+                            ));
+                            let now = Instant::now();
+                            // The turn's own start counts as progress so a
+                            // backend that goes silent immediately is measured
+                            // from when it began, not from an older event.
+                            let progress_at = [live_status.turn_started_at, last_backend_event_at]
+                                .into_iter()
+                                .flatten()
+                                .max();
+                            let outcome = if !live.settings.enabled
+                                || !live.settings.stall_timeout_enabled
+                                || live != expected_settings
+                            {
+                                SupervisorStallInterruptOutcome::SettingsChanged { live }
+                            } else if live_status.terminated
+                                || matches!(lifecycle, ActorLifecycle::Closing)
+                            {
+                                SupervisorStallInterruptOutcome::Closed
+                            } else if !in_turn
+                                || !live_status.is_active()
+                                || live_status.is_plan_approval_pending()
+                            {
+                                // Waiting on the user is not stalling, and the
+                                // clock restarts when that turn resumes.
+                                SupervisorStallInterruptOutcome::NotStalled
+                            } else if active_compaction.is_some() || compaction_blocked {
+                                SupervisorStallInterruptOutcome::Rejected
+                            } else if let Some(remaining) = progress_at
+                                .map(|at| stall_timeout.saturating_sub(now.saturating_duration_since(at)))
+                                .filter(|remaining| !remaining.is_zero())
+                            {
+                                SupervisorStallInterruptOutcome::TooEarly { remaining }
+                            } else if let Some(remaining) = last_stall_interrupt_at
+                                .map(|at| stall_timeout.saturating_sub(now.saturating_duration_since(at)))
+                                .filter(|remaining| !remaining.is_zero())
+                            {
+                                // One interrupt per stall window: a backend that
+                                // swallows the first one gets another attempt a
+                                // full window later instead of a tight loop.
+                                SupervisorStallInterruptOutcome::TooEarly { remaining }
+                            } else {
+                                append_chat_event(
+                                    &canonical_stream,
+                                    &mut event_log,
+                                    &mut subscribers,
+                                    &mut replay_state,
+                                    &supervisor_stall_interrupt_notice_event(
+                                        live.settings.stall_timeout_seconds,
+                                    ),
+                                )
+                                .await;
+                                let interrupted = backend
+                                    .as_ref()
+                                    .expect("backend must exist while actor is running")
+                                    .interrupt()
+                                    .await;
+                                last_stall_interrupt_at = Some(now);
+                                if interrupted {
+                                    tracing::warn!(
+                                        agent_id = %current_start.agent_id,
+                                        stall_timeout_seconds =
+                                            live.settings.stall_timeout_seconds,
+                                        "supervisor interrupted a turn that stopped making progress"
+                                    );
+                                    SupervisorStallInterruptOutcome::Interrupted
+                                } else {
+                                    let payload = AgentErrorPayload {
+                                        agent_id: current_start.agent_id.clone(),
+                                        code: AgentErrorCode::Internal,
+                                        message: "agent backend does not support interrupt"
+                                            .to_owned(),
+                                        fatal: false,
+                                    };
+                                    append_event(
+                                        &canonical_stream,
+                                        &mut event_log,
+                                        &mut subscribers,
+                                        FrameKind::AgentError,
+                                        &payload,
+                                    )
+                                    .await;
+                                    SupervisorStallInterruptOutcome::Rejected
+                                }
+                            };
+                            let _ = reply.send(outcome);
+                        }
                         AgentCommand::CompactIfInactive {
                             expected_activity_counter,
                             expected_supervisor_settings_epoch,
@@ -5294,6 +5457,9 @@ pub(crate) fn spawn_relay_agent_actor(
                         AgentCommand::AppendSupervisorFailureWarningIfInactive { reply, .. } => {
                             let _ = reply.send(AppendSupervisorWarningOutcome::Ineligible);
                         }
+                        AgentCommand::InterruptStalledTurnIfStalled { reply, .. } => {
+                            let _ = reply.send(SupervisorStallInterruptOutcome::NotStalled);
+                        }
                         AgentCommand::CompactIfInactive { accepted, reply, .. } => {
                             let error = "backend-native agents cannot be compacted".to_owned();
                             let _ = accepted.send(Err(error.clone()));
@@ -5461,6 +5627,41 @@ pub(crate) fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("system time is before UNIX_EPOCH")
         .as_millis() as u64
+}
+
+/// Renders a stall window the way a person would read it: whole minutes when
+/// the configured value is whole minutes, seconds otherwise.
+fn stall_timeout_label(seconds: u32) -> String {
+    if seconds >= 60 && seconds.is_multiple_of(60) {
+        let minutes = seconds / 60;
+        if minutes == 1 {
+            return "1 minute".to_owned();
+        }
+        return format!("{minutes} minutes");
+    }
+    if seconds == 1 {
+        return "1 second".to_owned();
+    }
+    format!("{seconds} seconds")
+}
+
+fn supervisor_stall_interrupt_notice_event(stall_timeout_seconds: u32) -> ChatEvent {
+    ChatEvent::MessageAdded(ChatMessage {
+        message_id: None,
+        timestamp: now_ms(),
+        sender: MessageSender::Warning,
+        content: format!(
+            "{} {}. The supervisor is deciding how to make progress.",
+            protocol::SUPERVISOR_STALL_INTERRUPT_NOTICE_PREFIX,
+            stall_timeout_label(stall_timeout_seconds)
+        ),
+        reasoning: None,
+        tool_calls: Vec::new(),
+        model_info: None,
+        token_usage: None,
+        context_breakdown: None,
+        images: None,
+    })
 }
 
 fn supervisor_failure_warning_event(attempts_started: u8) -> ChatEvent {
@@ -5784,6 +5985,9 @@ async fn park_terminal_agent(
             AgentCommand::AppendSupervisorFailureWarningIfInactive { reply, .. } => {
                 let _ = reply.send(AppendSupervisorWarningOutcome::Closed);
             }
+            AgentCommand::InterruptStalledTurnIfStalled { reply, .. } => {
+                let _ = reply.send(SupervisorStallInterruptOutcome::Closed);
+            }
             AgentCommand::CompactIfInactive {
                 accepted, reply, ..
             } => {
@@ -5944,6 +6148,9 @@ async fn park_relay_terminal_agent(
             }
             AgentCommand::AppendSupervisorFailureWarningIfInactive { reply, .. } => {
                 let _ = reply.send(AppendSupervisorWarningOutcome::Closed);
+            }
+            AgentCommand::InterruptStalledTurnIfStalled { reply, .. } => {
+                let _ = reply.send(SupervisorStallInterruptOutcome::Closed);
             }
             AgentCommand::CompactIfInactive {
                 accepted, reply, ..
@@ -6559,6 +6766,10 @@ async fn mark_agent_turn_active(status_handle: &registry::AgentStatusHandle) {
             status.turn_completed = false;
             status.last_error = None;
             status.activity_counter = status.activity_counter.saturating_add(1);
+            // A live turn is the thing a restored transcript was missing, and
+            // it is where the supervisor's stall clock starts.
+            status.restored_without_live_turn = false;
+            status.turn_started_at = Some(Instant::now());
         })
         .await;
 }
@@ -6572,6 +6783,9 @@ fn record_agent_started(status: &mut registry::AgentStatus, is_resume: bool) {
     if is_resume {
         status.is_thinking = false;
         status.turn_completed = true;
+        // Replayed history is not work this agent just did. Cleared by the
+        // first live turn (see `mark_agent_turn_active`).
+        status.restored_without_live_turn = true;
     }
     status.last_error = None;
     status.activity_counter = status.activity_counter.saturating_add(1);
@@ -8293,8 +8507,8 @@ mod tests {
         AgentActorRuntimeContext, AgentCommand, AgentHandle, AgentNameChangeContext,
         AgentReplayState, AgentStartupFailure, AgentStartupTestGate,
         AppendSupervisorWarningOutcome, GenerateAgentActivitySummaryRequest, InterruptOutcome,
-        RelayEventReceivers, ResolvedSpawnRequest, SupervisorVerdictStart,
-        SupervisorVerdictStartRejection, activity_history_snapshot,
+        RelayEventReceivers, ResolvedSpawnRequest, SupervisorStallInterruptOutcome,
+        SupervisorVerdictStart, SupervisorVerdictStartRejection, activity_history_snapshot,
         agent_name_generation_spawn_config, agent_usage_snapshot_from_log, append_chat_event,
         append_event, apply_generated_agent_name, apply_runtime_session_updates, attach_subscriber,
         attach_subscriber_with_latest_output, collect_agent_activity_summary_events,
@@ -9522,6 +9736,9 @@ mod tests {
                     }
                     AgentCommand::AppendSupervisorFailureWarningIfInactive { reply, .. } => {
                         let _ = reply.send(AppendSupervisorWarningOutcome::Closed);
+                    }
+                    AgentCommand::InterruptStalledTurnIfStalled { reply, .. } => {
+                        let _ = reply.send(SupervisorStallInterruptOutcome::Closed);
                     }
                     AgentCommand::CompactIfInactive {
                         accepted, reply, ..

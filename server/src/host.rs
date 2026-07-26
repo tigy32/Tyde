@@ -472,7 +472,17 @@ enum SupervisionRetryReason {
 }
 
 enum SupervisorPhase {
-    Active,
+    Active {
+        /// Last observed activity for the live turn; the stall clock restarts
+        /// here. `None` while the turn is parked on a user decision (plan
+        /// approval), which pauses the clock entirely — waiting on a person is
+        /// not stalling.
+        progress_at: Option<Instant>,
+        /// Floor for the next stall query, raised when the agent actor reports
+        /// the live turn made progress the scheduler could not observe (stream
+        /// deltas never reach the status watch).
+        recheck_after: Option<Instant>,
+    },
     Debouncing {
         idle_since: Instant,
     },
@@ -506,6 +516,12 @@ enum SupervisorPhase {
         idle_since: Instant,
     },
     Dormant {
+        idle_since: Instant,
+    },
+    /// A restored session settled into idle while `supervise_restored_agents`
+    /// was off. Distinct from `Dormant` so enabling that setting can arm the
+    /// waiting agents instead of silently leaving them behind.
+    RestoreDeferred {
         idle_since: Instant,
     },
     CompactionPending {
@@ -13474,7 +13490,7 @@ fn spawn_agent_supervisor_task(host: HostHandle) {
         let mut last_seen_settings = *settings_rx.borrow();
 
         if last_seen_settings.settings.enabled {
-            observe_supervised_agents(&host, &mut entries).await;
+            observe_supervised_agents(&host, &mut entries, last_seen_settings.settings).await;
         }
 
         loop {
@@ -13497,9 +13513,10 @@ fn spawn_agent_supervisor_task(host: HostHandle) {
                     if changed.is_err() {
                         break;
                     }
-                    let supervisor_enabled = settings_rx.borrow().settings.enabled;
-                    if supervisor_enabled {
-                        observe_supervised_agents(&host, &mut entries).await;
+                    let live_settings = *settings_rx.borrow();
+                    if live_settings.settings.enabled {
+                        observe_supervised_agents(&host, &mut entries, live_settings.settings)
+                            .await;
                     }
                 }
                 changed = settings_rx.changed() => {
@@ -13566,7 +13583,8 @@ fn spawn_agent_supervisor_task(host: HostHandle) {
                                     activity_counter,
                                     "supervisor auto-compaction rejected after intervening activity"
                                 );
-                                observe_supervised_agents(&host, &mut entries).await;
+                                let live_settings = settings_rx.borrow().settings;
+                                observe_supervised_agents(&host, &mut entries, live_settings).await;
                             }
                         }
                         SupervisorCompactionTaskEvent::Finished {
@@ -13654,9 +13672,95 @@ fn supervisor_phase_idle_since(phase: &SupervisorPhase) -> Option<Instant> {
         | SupervisorPhase::DoneAuthorized { idle_since, .. }
         | SupervisorPhase::AwaitingUser { idle_since, .. }
         | SupervisorPhase::Dormant { idle_since }
+        | SupervisorPhase::RestoreDeferred { idle_since }
         | SupervisorPhase::CompactionPending { idle_since, .. } => Some(*idle_since),
-        SupervisorPhase::Active | SupervisorPhase::Compacting => None,
+        SupervisorPhase::Active { .. } | SupervisorPhase::Compacting => None,
     }
+}
+
+/// Phase for an agent that just settled into idle. A session restored from
+/// history settles the same way, but its transcript is replayed work rather
+/// than work this agent just did, so judging it is opt-in.
+fn supervisor_idle_phase(
+    status: &crate::agent::registry::AgentStatus,
+    settings: protocol::SupervisorSettings,
+    idle_since: Instant,
+) -> SupervisorPhase {
+    if status.restored_without_live_turn && !settings.supervise_restored_agents {
+        SupervisorPhase::RestoreDeferred { idle_since }
+    } else {
+        SupervisorPhase::Debouncing { idle_since }
+    }
+}
+
+/// Active phase for a turn the scheduler just saw make progress: observable
+/// activity restarts the stall clock and drops any actor-supplied floor.
+fn supervisor_active_phase_after_progress(
+    status: &crate::agent::registry::AgentStatus,
+    now: Instant,
+) -> SupervisorPhase {
+    SupervisorPhase::Active {
+        // Waiting on a person is not stalling, so the clock stays paused until
+        // that turn resumes.
+        progress_at: (!status.is_plan_approval_pending()).then_some(now),
+        recheck_after: None,
+    }
+}
+
+/// Active phase for a turn re-observed without any new activity: the stall
+/// clock and the actor-supplied floor must survive, or a status notification
+/// about something else would silently reset the timeout.
+fn supervisor_active_phase_unchanged(
+    status: &crate::agent::registry::AgentStatus,
+    previous: &SupervisorPhase,
+    now: Instant,
+) -> SupervisorPhase {
+    if status.is_plan_approval_pending() {
+        return SupervisorPhase::Active {
+            progress_at: None,
+            recheck_after: None,
+        };
+    }
+    if let SupervisorPhase::Active {
+        progress_at: Some(progress_at),
+        recheck_after,
+    } = previous
+    {
+        return SupervisorPhase::Active {
+            progress_at: Some(*progress_at),
+            recheck_after: *recheck_after,
+        };
+    }
+    // Either newly active or resuming from a paused clock: start a fresh one.
+    SupervisorPhase::Active {
+        progress_at: Some(now),
+        recheck_after: None,
+    }
+}
+
+/// Earliest instant the scheduler should ask the actor whether a live turn has
+/// stalled. `None` when the stall timeout is off or the clock is paused.
+fn supervisor_stall_deadline(
+    phase: &SupervisorPhase,
+    settings: protocol::SupervisorSettings,
+) -> Option<Instant> {
+    if !settings.stall_timeout_enabled {
+        return None;
+    }
+    let SupervisorPhase::Active {
+        progress_at: Some(progress_at),
+        recheck_after,
+    } = phase
+    else {
+        return None;
+    };
+    let due = progress_at.checked_add(Duration::from_secs(u64::from(
+        settings.stall_timeout_seconds,
+    )))?;
+    Some(match recheck_after {
+        Some(recheck_after) => due.max(*recheck_after),
+        None => due,
+    })
 }
 
 fn supervised_observation_is_eligible(observation: &ActivitySummaryObservation) -> bool {
@@ -13669,14 +13773,15 @@ fn supervised_observation_is_eligible(observation: &ActivitySummaryObservation) 
 
 fn supervisor_phase_for_fresh_observation(
     status: &crate::agent::registry::AgentStatus,
+    settings: protocol::SupervisorSettings,
     now: Instant,
 ) -> SupervisorPhase {
     if status.is_active() {
-        SupervisorPhase::Active
+        supervisor_active_phase_after_progress(status, now)
     } else if status.is_plan_approval_pending() {
         SupervisorPhase::Dormant { idle_since: now }
     } else {
-        SupervisorPhase::Debouncing { idle_since: now }
+        supervisor_idle_phase(status, settings, now)
     }
 }
 
@@ -13813,9 +13918,11 @@ async fn apply_supervisor_settings_change(
     } else if !previous.settings.enabled {
         tracing::info!("agent supervisor enabled; starting fresh inactivity intervals");
         entries.clear();
-        observe_supervised_agents(host, entries).await;
+        observe_supervised_agents(host, entries, current.settings).await;
     } else {
-        observe_supervised_agents(host, entries).await;
+        observe_supervised_agents(host, entries, current.settings).await;
+        arm_restore_deferred_entries(entries, previous, current);
+        apply_live_stall_settings(entries, previous, current);
         let agent_ids = entries.keys().cloned().collect::<Vec<_>>();
         let mut failure_exhaustions = Vec::new();
         for agent_id in agent_ids {
@@ -13853,9 +13960,55 @@ async fn apply_supervisor_settings_change(
     }
 }
 
+/// Turning `supervise_restored_agents` on judges the restored agents that were
+/// waiting on it, from now rather than from their original restore instant: the
+/// verdict is being authorized at this edit, and the debounce exists to let an
+/// immediate user follow-up win the race.
+fn arm_restore_deferred_entries(
+    entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
+    previous: SupervisorSettingsSignal,
+    current: SupervisorSettingsSignal,
+) {
+    if previous.settings.supervise_restored_agents || !current.settings.supervise_restored_agents {
+        return;
+    }
+    let now = Instant::now();
+    for (agent_id, entry) in entries.iter_mut() {
+        if matches!(&entry.phase, SupervisorPhase::RestoreDeferred { .. }) {
+            entry.phase = SupervisorPhase::Debouncing { idle_since: now };
+            tracing::info!(
+                agent_id = %agent_id,
+                "supervising a restored agent after the restore setting was enabled"
+            );
+        }
+    }
+}
+
+/// A stall-timeout edit must take effect on turns already being watched. Only
+/// the actor-supplied floor is dropped — the observed progress instant stays, so
+/// the new window is measured from real activity, and re-asking the actor costs
+/// nothing when the floor turns out to have been right.
+fn apply_live_stall_settings(
+    entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
+    previous: SupervisorSettingsSignal,
+    current: SupervisorSettingsSignal,
+) {
+    if previous.settings.stall_timeout_enabled == current.settings.stall_timeout_enabled
+        && previous.settings.stall_timeout_seconds == current.settings.stall_timeout_seconds
+    {
+        return;
+    }
+    for entry in entries.values_mut() {
+        if let SupervisorPhase::Active { recheck_after, .. } = &mut entry.phase {
+            *recheck_after = None;
+        }
+    }
+}
+
 async fn observe_supervised_agents(
     host: &HostHandle,
     entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
+    settings: protocol::SupervisorSettings,
 ) {
     let observations = host.activity_summary_observations().await;
     let eligible_ids = observations
@@ -13872,7 +14025,7 @@ async fn observe_supervised_agents(
         let now = Instant::now();
         let status = &observation.status;
         let Some(entry) = entries.get_mut(&observation.agent_id) else {
-            let phase = supervisor_phase_for_fresh_observation(status, now);
+            let phase = supervisor_phase_for_fresh_observation(status, settings, now);
             entries.insert(
                 observation.agent_id,
                 SupervisorSchedulerEntry {
@@ -13907,21 +14060,22 @@ async fn observe_supervised_agents(
                 );
             }
             entry.last_activity_counter = status.activity_counter;
-            entry.phase = supervisor_phase_for_fresh_observation(status, now);
+            entry.phase = supervisor_phase_for_fresh_observation(status, settings, now);
             continue;
         }
 
         if status.is_active() {
             if !matches!(&entry.phase, SupervisorPhase::Compacting) {
-                entry.phase = SupervisorPhase::Active;
+                let phase = supervisor_active_phase_unchanged(status, &entry.phase, now);
+                entry.phase = phase;
             }
         } else if status.is_plan_approval_pending() {
             if !matches!(&entry.phase, SupervisorPhase::Compacting) {
                 let idle_since = supervisor_phase_idle_since(&entry.phase).unwrap_or(now);
                 entry.phase = SupervisorPhase::Dormant { idle_since };
             }
-        } else if matches!(&entry.phase, SupervisorPhase::Active) {
-            entry.phase = SupervisorPhase::Debouncing { idle_since: now };
+        } else if matches!(&entry.phase, SupervisorPhase::Active { .. }) {
+            entry.phase = supervisor_idle_phase(status, settings, now);
         }
     }
 }
@@ -13934,6 +14088,11 @@ fn supervisor_next_deadline(
     entries
         .values()
         .filter_map(|entry| match &entry.phase {
+            // Interrupting a stalled turn spends no paid call, so it is not
+            // gated on the verdict slot; the verdict it leads to is.
+            SupervisorPhase::Active { .. } => {
+                supervisor_stall_deadline(&entry.phase, settings.settings)
+            }
             SupervisorPhase::Debouncing { idle_since } if !verdict_task_in_flight => {
                 idle_since.checked_add(SUPERVISION_DEBOUNCE)
             }
@@ -14023,6 +14182,18 @@ async fn process_supervisor_deadlines_at(
         }
     }
 
+    let due_stalls = entries
+        .iter()
+        .filter_map(|(agent_id, entry)| {
+            supervisor_stall_deadline(&entry.phase, settings.settings)
+                .filter(|due| *due <= now)
+                .map(|_| agent_id.clone())
+        })
+        .collect::<Vec<_>>();
+    for agent_id in due_stalls {
+        interrupt_stalled_supervised_agent(host, entries, agent_id, settings, now).await;
+    }
+
     let due_compactions = entries
         .iter()
         .filter_map(|(agent_id, entry)| match &entry.phase {
@@ -14045,6 +14216,112 @@ async fn process_supervisor_deadlines_at(
         .collect::<Vec<_>>();
     for agent_id in due_compactions {
         launch_supervisor_auto_compaction(host, entries, agent_id, settings, compaction_tx).await;
+    }
+}
+
+/// Cancels a turn whose backend has gone quiet for the configured stall
+/// timeout, so the ordinary idle path can judge it and decide how to make
+/// progress. The interrupt itself is free; the verdict it leads to is the paid
+/// step, and it stays subject to the kick budget. That budget is checked here
+/// *before* interrupting: cutting a turn short with no follow-up left to send
+/// would destroy work and offer nothing in return.
+async fn interrupt_stalled_supervised_agent(
+    host: &HostHandle,
+    entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
+    agent_id: AgentId,
+    settings: SupervisorSettingsSignal,
+    now: Instant,
+) {
+    if !settings.settings.enabled || !settings.settings.stall_timeout_enabled {
+        return;
+    }
+    let Some(entry) = entries.get(&agent_id) else {
+        return;
+    };
+    let activity_counter = entry.last_activity_counter;
+    let Some(observation) = host.activity_summary_observation(&agent_id).await else {
+        entries.remove(&agent_id);
+        return;
+    };
+    if observation.status.activity_counter != activity_counter
+        || observation.status.terminated
+        || !observation.status.is_active()
+        || observation.status.is_plan_approval_pending()
+    {
+        observe_supervised_agents(host, entries, settings.settings).await;
+        return;
+    }
+    let Some(context) = observation.handle.read_supervision_context().await else {
+        return;
+    };
+    if context.last_user_message.is_none() {
+        return;
+    }
+    let max_kicks = u32::from(settings.settings.max_kicks_per_task.max(1));
+    if context.kicks_since_user_message >= max_kicks {
+        tracing::info!(
+            agent_id = %agent_id,
+            kicks = context.kicks_since_user_message,
+            "skipping stall interrupt: no supervisor follow-up left for this request"
+        );
+        supervisor_defer_stall_check(entries, &agent_id, settings.settings, now);
+        return;
+    }
+
+    let settings_rx = host.supervisor_settings_receiver().await;
+    let outcome = observation
+        .handle
+        .interrupt_stalled_turn_for_supervision(settings, settings_rx)
+        .await;
+    match outcome {
+        crate::agent::SupervisorStallInterruptOutcome::Interrupted => {
+            tracing::info!(
+                agent_id = %agent_id,
+                stall_timeout_seconds = settings.settings.stall_timeout_seconds,
+                "supervisor cancelled a stalled turn; awaiting the idle transition"
+            );
+            // The cancel advances the activity counter, so the ordinary
+            // observation path takes the agent from here. Deferring a full
+            // window meanwhile keeps a backend that ignored the interrupt from
+            // being asked again immediately.
+            supervisor_defer_stall_check(entries, &agent_id, settings.settings, now);
+        }
+        crate::agent::SupervisorStallInterruptOutcome::TooEarly { remaining } => {
+            if let Some(entry) = entries.get_mut(&agent_id)
+                && let SupervisorPhase::Active { recheck_after, .. } = &mut entry.phase
+            {
+                *recheck_after = now.checked_add(remaining);
+            }
+        }
+        crate::agent::SupervisorStallInterruptOutcome::NotStalled
+        | crate::agent::SupervisorStallInterruptOutcome::Rejected => {
+            supervisor_defer_stall_check(entries, &agent_id, settings.settings, now);
+        }
+        crate::agent::SupervisorStallInterruptOutcome::SettingsChanged { live } => {
+            apply_supervisor_settings_change(host, entries, settings, live).await;
+        }
+        crate::agent::SupervisorStallInterruptOutcome::Closed => {
+            entries.remove(&agent_id);
+        }
+    }
+}
+
+/// Pushes an agent's next stall query one full window out without disturbing
+/// the observed progress instant, so a live settings change still recomputes
+/// from real activity.
+fn supervisor_defer_stall_check(
+    entries: &mut HashMap<AgentId, SupervisorSchedulerEntry>,
+    agent_id: &AgentId,
+    settings: protocol::SupervisorSettings,
+    now: Instant,
+) {
+    let Some(entry) = entries.get_mut(agent_id) else {
+        return;
+    };
+    if let SupervisorPhase::Active { recheck_after, .. } = &mut entry.phase {
+        *recheck_after = now.checked_add(Duration::from_secs(u64::from(
+            settings.stall_timeout_seconds,
+        )));
     }
 }
 
@@ -14092,7 +14369,7 @@ async fn launch_supervision_verdict(
         || observation.status.is_active()
         || observation.status.is_plan_approval_pending()
     {
-        observe_supervised_agents(host, entries).await;
+        observe_supervised_agents(host, entries, settings.settings).await;
         return;
     }
     let Some(context) = observation.handle.read_supervision_context().await else {
@@ -14188,6 +14465,7 @@ async fn launch_supervision_verdict(
     let cost_hint = settings.settings.cost_tier.as_cost_hint();
     let last_assistant_message = context.last_assistant_message;
     let last_error = context.last_error_since_user_message;
+    let stall_interrupted = context.last_turn_was_stall_interrupted;
     let tx = verdict_tx.clone();
     let verdict_settings = VerdictSettingsFingerprint::from(settings.settings);
     let settings_rx = host.supervisor_settings_receiver().await;
@@ -14209,7 +14487,7 @@ async fn launch_supervision_verdict(
             if live_settings != settings {
                 apply_supervisor_settings_change(host, entries, settings, live_settings).await;
             } else {
-                observe_supervised_agents(host, entries).await;
+                observe_supervised_agents(host, entries, settings.settings).await;
             }
             return;
         }
@@ -14272,6 +14550,7 @@ async fn launch_supervision_verdict(
             task_list,
             last_assistant_message,
             last_error,
+            stall_interrupted,
             kicks_so_far: baseline.kicks_since_user_message,
             max_kicks,
             cost_hint,
@@ -14348,12 +14627,12 @@ async fn exhaust_supervision_by_failure(
                     "agent supervision verdict attempts exhausted; leaving the agent idle"
                 );
             } else {
-                observe_supervised_agents(host, entries).await;
+                observe_supervised_agents(host, entries, expected_settings.settings).await;
             }
         }
         AppendSupervisorWarningOutcome::ActivityChanged
         | AppendSupervisorWarningOutcome::Ineligible => {
-            observe_supervised_agents(host, entries).await;
+            observe_supervised_agents(host, entries, expected_settings.settings).await;
         }
         AppendSupervisorWarningOutcome::SettingsChanged { live } => {
             Box::pin(apply_supervisor_settings_change(
@@ -14505,7 +14784,7 @@ async fn accept_supervision_verdict_result(
         || observation.status.is_active()
         || observation.status.is_plan_approval_pending()
     {
-        observe_supervised_agents(host, entries).await;
+        observe_supervised_agents(host, entries, live_settings.settings).await;
         return;
     }
     if observation.start.session_id != result.baseline.session_id {
@@ -14645,7 +14924,10 @@ async fn accept_supervision_verdict_result(
             entries
                 .get_mut(&result.agent_id)
                 .expect("entry exists")
-                .phase = SupervisorPhase::Active;
+                .phase = SupervisorPhase::Active {
+                progress_at: Some(Instant::now()),
+                recheck_after: None,
+            };
             if let Some(status_handle) = host.agent_status_handle(&result.agent_id).await {
                 status_handle.update(mark_supervisor_kick_pending).await;
             }
@@ -14745,7 +15027,7 @@ async fn launch_supervisor_auto_compaction(
         || observation.status.is_active()
         || observation.status.is_plan_approval_pending()
     {
-        observe_supervised_agents(host, entries).await;
+        observe_supervised_agents(host, entries, settings.settings).await;
         return;
     }
     if observation.start.session_id != baseline.session_id {
@@ -25391,6 +25673,187 @@ Rules: Record only what remains true and useful for future work; drop transient 
         );
     }
 
+    fn stall_settings(seconds: u32) -> protocol::SupervisorSettings {
+        protocol::SupervisorSettings {
+            enabled: true,
+            stall_timeout_enabled: true,
+            stall_timeout_seconds: seconds,
+            ..Default::default()
+        }
+    }
+
+    fn active_entries(
+        agent_id: &AgentId,
+        progress_at: Option<Instant>,
+        recheck_after: Option<Instant>,
+    ) -> HashMap<AgentId, SupervisorSchedulerEntry> {
+        HashMap::from([(
+            agent_id.clone(),
+            SupervisorSchedulerEntry {
+                last_activity_counter: 3,
+                phase: SupervisorPhase::Active {
+                    progress_at,
+                    recheck_after,
+                },
+            },
+        )])
+    }
+
+    /// The stall clock measures silence, not turn length: it runs from the last
+    /// observed progress, honors a live timeout edit, and never fires while the
+    /// turn is parked on a plan approval or while the timeout is off.
+    #[test]
+    fn supervisor_stall_deadline_tracks_progress_not_turn_start() {
+        let agent_id = AgentId("supervisor-stall".to_owned());
+        let progress_at = Instant::now();
+        let entries = active_entries(&agent_id, Some(progress_at), None);
+        let signal = |settings| SupervisorSettingsSignal { settings, epoch: 1 };
+
+        assert_eq!(
+            supervisor_next_deadline(&entries, signal(stall_settings(1_800)), false),
+            progress_at.checked_add(Duration::from_secs(1_800))
+        );
+        assert_eq!(
+            supervisor_next_deadline(&entries, signal(stall_settings(60)), false),
+            progress_at.checked_add(Duration::from_secs(60)),
+            "a live timeout edit must apply to the turn already being watched"
+        );
+        assert_eq!(
+            supervisor_next_deadline(
+                &entries,
+                signal(protocol::SupervisorSettings {
+                    stall_timeout_enabled: false,
+                    ..stall_settings(60)
+                }),
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            supervisor_next_deadline(&entries, signal(stall_settings(1_800)), true),
+            progress_at.checked_add(Duration::from_secs(1_800)),
+            "a verdict call in flight must not hold off a free interrupt"
+        );
+
+        // Waiting on a plan approval pauses the clock outright.
+        let paused = active_entries(&agent_id, None, None);
+        assert_eq!(
+            supervisor_next_deadline(&paused, signal(stall_settings(1)), false),
+            None
+        );
+    }
+
+    /// The actor sees stream deltas the status watch never carries, so its
+    /// "not yet" answer must push the next query out without moving the
+    /// observed progress instant a later settings edit recomputes from.
+    #[test]
+    fn supervisor_stall_recheck_floor_defers_then_clears_on_settings_edit() {
+        let agent_id = AgentId("supervisor-stall-floor".to_owned());
+        let progress_at = Instant::now();
+        let mut entries = active_entries(&agent_id, Some(progress_at), None);
+        let previous = SupervisorSettingsSignal {
+            settings: stall_settings(60),
+            epoch: 1,
+        };
+
+        supervisor_defer_stall_check(&mut entries, &agent_id, previous.settings, progress_at);
+        assert_eq!(
+            supervisor_next_deadline(&entries, previous, false),
+            progress_at.checked_add(Duration::from_secs(60))
+        );
+        supervisor_defer_stall_check(
+            &mut entries,
+            &agent_id,
+            previous.settings,
+            progress_at + Duration::from_secs(90),
+        );
+        assert_eq!(
+            supervisor_next_deadline(&entries, previous, false),
+            progress_at.checked_add(Duration::from_secs(150)),
+            "a deferral must hold off the next query by a full window"
+        );
+
+        let current = SupervisorSettingsSignal {
+            settings: stall_settings(30),
+            epoch: 2,
+        };
+        apply_live_stall_settings(&mut entries, previous, current);
+        assert_eq!(
+            supervisor_next_deadline(&entries, current, false),
+            progress_at.checked_add(Duration::from_secs(30)),
+            "shortening the timeout must not stay blocked behind the old floor"
+        );
+
+        apply_live_stall_settings(&mut entries, current, current);
+        assert_eq!(
+            supervisor_next_deadline(&entries, current, false),
+            progress_at.checked_add(Duration::from_secs(30)),
+            "an unrelated settings edit must leave the live window alone"
+        );
+    }
+
+    /// Restored agents wait for the opt-in rather than being judged on replayed
+    /// history, and enabling it arms exactly those waiting agents.
+    #[test]
+    fn supervisor_restore_gate_defers_until_the_setting_is_enabled() {
+        let deferred = AgentId("restored".to_owned());
+        let awaiting_user = AgentId("awaiting".to_owned());
+        let idle_since = Instant::now();
+        let mut entries = HashMap::from([
+            (
+                deferred.clone(),
+                SupervisorSchedulerEntry {
+                    last_activity_counter: 2,
+                    phase: SupervisorPhase::RestoreDeferred { idle_since },
+                },
+            ),
+            (
+                awaiting_user.clone(),
+                SupervisorSchedulerEntry {
+                    last_activity_counter: 5,
+                    phase: SupervisorPhase::AwaitingUser { idle_since },
+                },
+            ),
+        ]);
+        let off = SupervisorSettingsSignal {
+            settings: protocol::SupervisorSettings {
+                enabled: true,
+                ..Default::default()
+            },
+            epoch: 1,
+        };
+        assert_eq!(supervisor_next_deadline(&entries, off, false), None);
+
+        let on = SupervisorSettingsSignal {
+            settings: protocol::SupervisorSettings {
+                supervise_restored_agents: true,
+                ..off.settings
+            },
+            epoch: 2,
+        };
+        arm_restore_deferred_entries(&mut entries, off, on);
+        assert!(matches!(
+            entries.get(&deferred).map(|entry| &entry.phase),
+            Some(SupervisorPhase::Debouncing { .. })
+        ));
+        assert!(
+            matches!(
+                entries.get(&awaiting_user).map(|entry| &entry.phase),
+                Some(SupervisorPhase::AwaitingUser { .. })
+            ),
+            "already-judged agents must not be re-judged by the restore opt-in"
+        );
+
+        arm_restore_deferred_entries(&mut entries, on, off);
+        assert!(
+            matches!(
+                entries.get(&deferred).map(|entry| &entry.phase),
+                Some(SupervisorPhase::Debouncing { .. })
+            ),
+            "turning the opt-in back off must not retract an armed agent"
+        );
+    }
+
     #[test]
     fn supervisor_failed_gate_is_suppressed_for_only_its_settings_epoch() {
         let agent_id = AgentId("supervisor-gate".to_owned());
@@ -25451,18 +25914,45 @@ Rules: Record only what remains true and useful for future work; drop transient 
             activity_counter: 11,
             ..Default::default()
         };
+        let settings = protocol::SupervisorSettings {
+            enabled: true,
+            ..Default::default()
+        };
         assert!(matches!(
-            supervisor_phase_for_fresh_observation(&idle, now),
+            supervisor_phase_for_fresh_observation(&idle, settings, now),
             SupervisorPhase::Debouncing { idle_since } if idle_since == now
         ));
 
         let active = crate::agent::registry::AgentStatus {
             is_thinking: true,
+            ..idle.clone()
+        };
+        assert!(matches!(
+            supervisor_phase_for_fresh_observation(&active, settings, now),
+            SupervisorPhase::Active { progress_at, recheck_after }
+                if progress_at == Some(now) && recheck_after.is_none()
+        ));
+
+        // A session restored from history settles into idle exactly like a
+        // finished turn does, so only the restore opt-in separates them.
+        let restored = crate::agent::registry::AgentStatus {
+            restored_without_live_turn: true,
             ..idle
         };
         assert!(matches!(
-            supervisor_phase_for_fresh_observation(&active, now),
-            SupervisorPhase::Active
+            supervisor_phase_for_fresh_observation(&restored, settings, now),
+            SupervisorPhase::RestoreDeferred { idle_since } if idle_since == now
+        ));
+        assert!(matches!(
+            supervisor_phase_for_fresh_observation(
+                &restored,
+                protocol::SupervisorSettings {
+                    supervise_restored_agents: true,
+                    ..settings
+                },
+                now
+            ),
+            SupervisorPhase::Debouncing { idle_since } if idle_since == now
         ));
     }
 
@@ -25481,8 +25971,15 @@ Rules: Record only what remains true and useful for future work; drop transient 
 
         assert!(status.is_active());
         assert!(matches!(
-            supervisor_phase_for_fresh_observation(&status, now),
-            SupervisorPhase::Active
+            supervisor_phase_for_fresh_observation(
+                &status,
+                protocol::SupervisorSettings {
+                    enabled: true,
+                    ..Default::default()
+                },
+                now
+            ),
+            SupervisorPhase::Active { .. }
         ));
     }
 
@@ -25875,11 +26372,19 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 status.turn_completed = false;
             })
             .await;
-        observe_supervised_agents(&fixture.host, &mut entries).await;
+        observe_supervised_agents(
+            &fixture.host,
+            &mut entries,
+            protocol::SupervisorSettings {
+                enabled: true,
+                ..Default::default()
+            },
+        )
+        .await;
 
         let entry = entries.get(&agent_id).expect("scheduler entry");
         assert_ne!(entry.last_activity_counter, status.activity_counter);
-        assert!(matches!(entry.phase, SupervisorPhase::Active));
+        assert!(matches!(entry.phase, SupervisorPhase::Active { .. }));
     }
 
     #[tokio::test]
@@ -25984,7 +26489,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         .await;
         assert!(matches!(
             entries.get(&agent_id).map(|entry| &entry.phase),
-            Some(SupervisorPhase::Active)
+            Some(SupervisorPhase::Active { .. })
         ));
         let mut kicks = 0;
         for _ in 0..100 {
@@ -26736,15 +27241,15 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 .await
         );
         wait_for_agent_active(&fixture.host, &agent_id).await;
-        observe_supervised_agents(&fixture.host, &mut entries).await;
+        observe_supervised_agents(&fixture.host, &mut entries, settings.settings).await;
         assert!(matches!(
             entries.get(&agent_id).map(|entry| &entry.phase),
-            Some(SupervisorPhase::Active)
+            Some(SupervisorPhase::Active { .. })
         ));
         assert!(verdict_task_state.is_active());
         assert!(starts.try_recv().is_err());
         wait_for_agent_idle(&fixture.host, &agent_id).await;
-        observe_supervised_agents(&fixture.host, &mut entries).await;
+        observe_supervised_agents(&fixture.host, &mut entries, settings.settings).await;
         let fresh_due = match entries.get(&agent_id).map(|entry| &entry.phase) {
             Some(SupervisorPhase::Debouncing { idle_since }) => {
                 idle_since.checked_add(SUPERVISION_DEBOUNCE).unwrap()
@@ -27073,7 +27578,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         .await;
         assert!(matches!(
             entries.get(&agent_id).map(|entry| &entry.phase),
-            Some(SupervisorPhase::Active)
+            Some(SupervisorPhase::Active { .. })
         ));
         let mut kicks = 0;
         for _ in 0..100 {
@@ -27347,6 +27852,24 @@ Rules: Record only what remains true and useful for future work; drop transient 
             &fixture,
             &agent_id,
             HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens: 900_000 },
+        )
+        .await;
+        assert_settings_edit_rejects_actor_pending_compaction(
+            &fixture,
+            &agent_id,
+            HostSettingValue::SupervisorStallTimeoutEnabled { enabled: true },
+        )
+        .await;
+        assert_settings_edit_rejects_actor_pending_compaction(
+            &fixture,
+            &agent_id,
+            HostSettingValue::SupervisorStallTimeoutSeconds { seconds: 120 },
+        )
+        .await;
+        assert_settings_edit_rejects_actor_pending_compaction(
+            &fixture,
+            &agent_id,
+            HostSettingValue::SupervisorSuperviseRestoredAgents { enabled: true },
         )
         .await;
     }

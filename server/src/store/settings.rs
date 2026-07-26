@@ -7,7 +7,8 @@ use protocol::{
     HostSettingValue, HostSettings, LaunchProfileId,
     SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX,
     SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN, SUPERVISOR_RETRY_ATTEMPTS_MAX,
-    SUPERVISOR_RETRY_ATTEMPTS_MIN,
+    SUPERVISOR_RETRY_ATTEMPTS_MIN, SUPERVISOR_STALL_TIMEOUT_SECONDS_MAX,
+    SUPERVISOR_STALL_TIMEOUT_SECONDS_MIN,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -362,6 +363,23 @@ fn apply_setting(settings: &mut HostSettings, setting: HostSettingValue) -> Resu
         HostSettingValue::SupervisorEnabled { enabled } => {
             settings.supervisor.enabled = enabled;
         }
+        HostSettingValue::SupervisorSuperviseRestoredAgents { enabled } => {
+            settings.supervisor.supervise_restored_agents = enabled;
+        }
+        HostSettingValue::SupervisorStallTimeoutEnabled { enabled } => {
+            settings.supervisor.stall_timeout_enabled = enabled;
+        }
+        HostSettingValue::SupervisorStallTimeoutSeconds { seconds } => {
+            if !(SUPERVISOR_STALL_TIMEOUT_SECONDS_MIN..=SUPERVISOR_STALL_TIMEOUT_SECONDS_MAX)
+                .contains(&seconds)
+            {
+                return Err(format!(
+                    "supervisor stall timeout must be between {} and {} seconds",
+                    SUPERVISOR_STALL_TIMEOUT_SECONDS_MIN, SUPERVISOR_STALL_TIMEOUT_SECONDS_MAX,
+                ));
+            }
+            settings.supervisor.stall_timeout_seconds = seconds;
+        }
         HostSettingValue::SupervisorAutoCompactOnSuccess { enabled } => {
             settings.supervisor.auto_compact_on_success = enabled;
         }
@@ -545,6 +563,15 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
             "supervisor auto-compact inactivity delay must be between {} and {} seconds",
             SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN,
             SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX,
+        ));
+    }
+
+    if !(SUPERVISOR_STALL_TIMEOUT_SECONDS_MIN..=SUPERVISOR_STALL_TIMEOUT_SECONDS_MAX)
+        .contains(&settings.supervisor.stall_timeout_seconds)
+    {
+        return Err(format!(
+            "supervisor stall timeout must be between {} and {} seconds",
+            SUPERVISOR_STALL_TIMEOUT_SECONDS_MIN, SUPERVISOR_STALL_TIMEOUT_SECONDS_MAX,
         ));
     }
 

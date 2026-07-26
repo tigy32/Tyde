@@ -18,7 +18,8 @@ use protocol::{
     MobileDeviceState, MobilePairingOfferId, MobilePairingOfferPayload, MobilePairingState,
     ProjectId, RunBackendSetupPayload, SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX,
     SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN, SUPERVISOR_RETRY_ATTEMPTS_MAX,
-    SUPERVISOR_RETRY_ATTEMPTS_MIN, SessionSchemaEntry, SessionSettingField,
+    SUPERVISOR_RETRY_ATTEMPTS_MIN, SUPERVISOR_STALL_TIMEOUT_SECONDS_MAX,
+    SUPERVISOR_STALL_TIMEOUT_SECONDS_MIN, SessionSchemaEntry, SessionSettingField,
     SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SessionSettingsValues,
     SetSettingPayload, Skill, SkillId, Steering, SteeringId, SteeringScope, ToolPolicy,
 };
@@ -708,6 +709,9 @@ impl SettingsTab {
                 "Backend default",
                 "Kick limit",
                 "Extra delayed attempts",
+                "Supervise restored agents",
+                "Stall timeout",
+                "Interrupt stalled turns",
                 "Idle",
                 "Continue",
                 "Task list",
@@ -2020,175 +2024,233 @@ fn BackgroundAgentFeaturesSection() -> impl IntoView {
 #[component]
 fn SupervisorTab() -> impl IntoView {
     let state = expect_context::<AppState>();
-    let state_for_enabled_checked = state.clone();
-    let state_for_enabled_disabled = state.clone();
-    let state_for_compact_checked = state.clone();
-    let state_for_compact_disabled = state.clone();
-    let state_for_compact_delay_value = state.clone();
-    let state_for_compact_delay_disabled = state.clone();
-    let state_for_compact_min_value = state.clone();
-    let state_for_compact_min_disabled = state.clone();
-    let state_for_kicks_value = state.clone();
-    let state_for_kicks_disabled = state.clone();
-    let state_for_retries_value = state.clone();
-    let state_for_retries_disabled = state.clone();
-
-    let enabled_checked = move || {
-        state_for_enabled_checked
-            .selected_host_settings()
-            .is_some_and(|settings| settings.supervisor.enabled)
-    };
-    let enabled_disabled = move || {
-        state_for_enabled_disabled
-            .selected_host_settings()
-            .is_none()
-    };
-    let enabled_on_toggle = {
+    let supervisor = {
         let state = state.clone();
-        move |ev: web_sys::Event| {
-            let target = ev.target().unwrap();
-            let input: web_sys::HtmlInputElement = target.unchecked_into();
-            send_host_setting(
-                &state,
-                HostSettingValue::SupervisorEnabled {
-                    enabled: input.checked(),
-                },
-            );
+        move || {
+            state
+                .selected_host_settings()
+                .map(|settings| settings.supervisor)
         }
     };
-
-    let compact_checked = move || {
-        state_for_compact_checked
-            .selected_host_settings()
-            .is_some_and(|settings| settings.supervisor.auto_compact_on_success)
+    let known = {
+        let supervisor = supervisor.clone();
+        move || supervisor().is_some()
     };
-    let compact_disabled = move || {
-        state_for_compact_disabled
-            .selected_host_settings()
-            .is_none_or(|settings| !settings.supervisor.enabled)
+    let enabled = {
+        let supervisor = supervisor.clone();
+        move || supervisor().is_some_and(|supervisor| supervisor.enabled)
     };
-
-    let compact_delay_value = move || {
-        state_for_compact_delay_value
-            .selected_host_settings()
-            .map(|settings| {
-                settings
-                    .supervisor
-                    .auto_compact_inactivity_delay_seconds
-                    .to_string()
-            })
-            .unwrap_or_default()
+    // Reading through one derived accessor keeps every field below on the same
+    // host snapshot, and keeps the tab's view type small: the wasm test build
+    // ran out of memory when each field carried its own closure types.
+    let field = |supervisor: &dyn Fn() -> Option<protocol::SupervisorSettings>,
+                 read: fn(&protocol::SupervisorSettings) -> String| {
+        supervisor().as_ref().map(read).unwrap_or_default()
     };
-    let compact_delay_disabled = move || {
-        state_for_compact_delay_disabled
-            .selected_host_settings()
-            .is_none_or(|settings| {
-                !settings.supervisor.enabled || !settings.supervisor.auto_compact_on_success
-            })
-    };
-    let compact_delay_on_change = {
+    let commit = {
         let state = state.clone();
-        move |ev: web_sys::Event| {
-            let target = ev.target().unwrap();
-            let input: web_sys::HtmlInputElement = target.unchecked_into();
-            if let Ok(seconds) = input.value().trim().parse::<u32>()
-                && (SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN
-                    ..=SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX)
-                    .contains(&seconds)
+        move |setting: HostSettingValue| send_host_setting(&state, setting)
+    };
+
+    let enabled_toggle = {
+        let known = known.clone();
+        let enabled = enabled.clone();
+        let commit = commit.clone();
+        (
+            Signal::derive(enabled),
+            Signal::derive(move || !known()),
+            Callback::new(move |checked: bool| {
+                commit(HostSettingValue::SupervisorEnabled { enabled: checked })
+            }),
+        )
+    };
+    let restored_toggle = {
+        let supervisor = supervisor.clone();
+        let enabled = enabled.clone();
+        let commit = commit.clone();
+        (
+            Signal::derive(move || {
+                supervisor().is_some_and(|supervisor| supervisor.supervise_restored_agents)
+            }),
+            Signal::derive(move || !enabled()),
+            Callback::new(move |checked: bool| {
+                commit(HostSettingValue::SupervisorSuperviseRestoredAgents { enabled: checked })
+            }),
+        )
+    };
+    let stall_toggle = {
+        let supervisor = supervisor.clone();
+        let enabled = enabled.clone();
+        let commit = commit.clone();
+        (
+            Signal::derive(move || {
+                supervisor().is_some_and(|supervisor| supervisor.stall_timeout_enabled)
+            }),
+            Signal::derive(move || !enabled()),
+            Callback::new(move |checked: bool| {
+                commit(HostSettingValue::SupervisorStallTimeoutEnabled { enabled: checked })
+            }),
+        )
+    };
+    let stall_seconds = {
+        let supervisor = supervisor.clone();
+        let commit = commit.clone();
+        (
+            Signal::derive({
+                let supervisor = supervisor.clone();
+                move || field(&supervisor, |s| s.stall_timeout_seconds.to_string())
+            }),
+            Signal::derive({
+                let supervisor = supervisor.clone();
+                move || {
+                    supervisor().is_none_or(|supervisor| {
+                        !supervisor.enabled || !supervisor.stall_timeout_enabled
+                    })
+                }
+            }),
+            Callback::new(move |raw: String| {
+                if let Ok(seconds) = raw.trim().parse::<u32>()
+                    && (SUPERVISOR_STALL_TIMEOUT_SECONDS_MIN..=SUPERVISOR_STALL_TIMEOUT_SECONDS_MAX)
+                        .contains(&seconds)
+                {
+                    commit(HostSettingValue::SupervisorStallTimeoutSeconds { seconds });
+                }
+            }),
+        )
+    };
+    let compact_toggle = {
+        let supervisor = supervisor.clone();
+        let enabled = enabled.clone();
+        let commit = commit.clone();
+        (
+            Signal::derive(move || {
+                supervisor().is_some_and(|supervisor| supervisor.auto_compact_on_success)
+            }),
+            Signal::derive(move || !enabled()),
+            Callback::new(move |checked: bool| {
+                commit(HostSettingValue::SupervisorAutoCompactOnSuccess { enabled: checked })
+            }),
+        )
+    };
+    let compact_delay = {
+        let supervisor = supervisor.clone();
+        let commit = commit.clone();
+        (
+            Signal::derive({
+                let supervisor = supervisor.clone();
+                move || {
+                    field(&supervisor, |s| {
+                        s.auto_compact_inactivity_delay_seconds.to_string()
+                    })
+                }
+            }),
+            Signal::derive({
+                let supervisor = supervisor.clone();
+                move || {
+                    supervisor().is_none_or(|supervisor| {
+                        !supervisor.enabled || !supervisor.auto_compact_on_success
+                    })
+                }
+            }),
+            Callback::new(move |raw: String| {
+                if let Ok(seconds) = raw.trim().parse::<u32>()
+                    && (SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN
+                        ..=SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX)
+                        .contains(&seconds)
+                {
+                    commit(
+                        HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds },
+                    );
+                }
+            }),
+        )
+    };
+    let compact_min = {
+        let supervisor = supervisor.clone();
+        let commit = commit.clone();
+        (
+            Signal::derive({
+                let supervisor = supervisor.clone();
+                move || {
+                    field(&supervisor, |s| {
+                        s.auto_compact_min_context_tokens.to_string()
+                    })
+                }
+            }),
+            Signal::derive({
+                let supervisor = supervisor.clone();
+                move || {
+                    supervisor().is_none_or(|supervisor| {
+                        !supervisor.enabled || !supervisor.auto_compact_on_success
+                    })
+                }
+            }),
+            Callback::new(move |raw: String| {
+                if let Ok(tokens) = raw.trim().parse::<u64>() {
+                    commit(HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens });
+                }
+            }),
+        )
+    };
+    let kicks = {
+        let supervisor = supervisor.clone();
+        let known = known.clone();
+        let commit = commit.clone();
+        (
+            Signal::derive({
+                let supervisor = supervisor.clone();
+                move || field(&supervisor, |s| s.max_kicks_per_task.to_string())
+            }),
+            Signal::derive(move || !known()),
+            Callback::new(move |raw: String| {
+                if let Ok(count) = raw.trim().parse::<u8>()
+                    && count >= 1
+                {
+                    commit(HostSettingValue::SupervisorMaxKicksPerTask { count });
+                }
+            }),
+        )
+    };
+    let retries = {
+        let supervisor = supervisor.clone();
+        let known = known.clone();
+        let commit = commit.clone();
+        (
+            Signal::derive({
+                let supervisor = supervisor.clone();
+                move || field(&supervisor, |s| s.retry_attempts.to_string())
+            }),
+            Signal::derive(move || !known()),
+            Callback::new(move |raw: String| {
+                if let Ok(count) = raw.trim().parse::<u8>()
+                    && count <= SUPERVISOR_RETRY_ATTEMPTS_MAX
+                {
+                    commit(HostSettingValue::SupervisorRetryAttempts { count });
+                }
+            }),
+        )
+    };
+
+    let tier_value = {
+        let supervisor = supervisor.clone();
+        move || {
+            match supervisor()
+                .map(|supervisor| supervisor.cost_tier)
+                .unwrap_or_default()
             {
-                send_host_setting(
-                    &state,
-                    HostSettingValue::SupervisorAutoCompactInactivityDelaySeconds { seconds },
-                );
+                protocol::SupervisorCostTier::Low => "low",
+                protocol::SupervisorCostTier::Default => "default",
+                protocol::SupervisorCostTier::High => "high",
             }
+            .to_owned()
         }
     };
-    let compact_on_toggle = {
-        let state = state.clone();
-        move |ev: web_sys::Event| {
-            let target = ev.target().unwrap();
-            let input: web_sys::HtmlInputElement = target.unchecked_into();
-            send_host_setting(
-                &state,
-                HostSettingValue::SupervisorAutoCompactOnSuccess {
-                    enabled: input.checked(),
-                },
-            );
-        }
+    let tier_disabled = {
+        let known = known.clone();
+        move || !known()
     };
-
-    let compact_min_value = move || {
-        state_for_compact_min_value
-            .selected_host_settings()
-            .map(|settings| {
-                settings
-                    .supervisor
-                    .auto_compact_min_context_tokens
-                    .to_string()
-            })
-            .unwrap_or_default()
-    };
-    let compact_min_disabled = move || {
-        state_for_compact_min_disabled
-            .selected_host_settings()
-            .is_none_or(|settings| {
-                !settings.supervisor.enabled || !settings.supervisor.auto_compact_on_success
-            })
-    };
-    let compact_min_on_change = {
-        let state = state.clone();
-        move |ev: web_sys::Event| {
-            let target = ev.target().unwrap();
-            let input: web_sys::HtmlInputElement = target.unchecked_into();
-            if let Ok(tokens) = input.value().trim().parse::<u64>() {
-                send_host_setting(
-                    &state,
-                    HostSettingValue::SupervisorAutoCompactMinContextTokens { tokens },
-                );
-            }
-        }
-    };
-
-    let kicks_value = move || {
-        state_for_kicks_value
-            .selected_host_settings()
-            .map(|settings| settings.supervisor.max_kicks_per_task.to_string())
-            .unwrap_or_default()
-    };
-    let kicks_disabled = move || state_for_kicks_disabled.selected_host_settings().is_none();
-    let kicks_on_change = {
-        let state = state.clone();
-        move |ev: web_sys::Event| {
-            let target = ev.target().unwrap();
-            let input: web_sys::HtmlInputElement = target.unchecked_into();
-            if let Ok(count) = input.value().trim().parse::<u8>()
-                && count >= 1
-            {
-                send_host_setting(
-                    &state,
-                    HostSettingValue::SupervisorMaxKicksPerTask { count },
-                );
-            }
-        }
-    };
-
-    let state_for_tier_value = state.clone();
-    let state_for_tier_disabled = state.clone();
-    let tier_value = move || {
-        let tier = state_for_tier_value
-            .selected_host_settings()
-            .map(|settings| settings.supervisor.cost_tier)
-            .unwrap_or_default();
-        match tier {
-            protocol::SupervisorCostTier::Low => "low",
-            protocol::SupervisorCostTier::Default => "default",
-            protocol::SupervisorCostTier::High => "high",
-        }
-        .to_owned()
-    };
-    let tier_disabled = move || state_for_tier_disabled.selected_host_settings().is_none();
     let tier_on_change = {
-        let state = state.clone();
+        let commit = commit.clone();
         move |ev: web_sys::Event| {
             let target = ev.target().unwrap();
             let select: web_sys::HtmlSelectElement = target.unchecked_into();
@@ -2201,117 +2263,83 @@ fn SupervisorTab() -> impl IntoView {
                     return;
                 }
             };
-            send_host_setting(&state, HostSettingValue::SupervisorCostTier { tier });
-        }
-    };
-
-    let retries_value = move || {
-        state_for_retries_value
-            .selected_host_settings()
-            .map(|settings| settings.supervisor.retry_attempts.to_string())
-            .unwrap_or_default()
-    };
-    let retries_disabled = move || {
-        state_for_retries_disabled
-            .selected_host_settings()
-            .is_none()
-    };
-    let retries_on_change = {
-        let state = state.clone();
-        move |ev: web_sys::Event| {
-            let target = ev.target().unwrap();
-            let input: web_sys::HtmlInputElement = target.unchecked_into();
-            if let Ok(count) = input.value().trim().parse::<u8>()
-                && count <= SUPERVISOR_RETRY_ATTEMPTS_MAX
-            {
-                send_host_setting(&state, HostSettingValue::SupervisorRetryAttempts { count });
-            }
+            commit(HostSettingValue::SupervisorCostTier { tier });
         }
     };
 
     view! {
         <h2 class="settings-panel-title">"Supervisor"</h2>
 
-        <div class="settings-field">
-            <div class="settings-toggle-row">
-                <div>
-                    <label class="settings-label">"Enable agent supervisor"</label>
-                    <p class="settings-description">
-                        "When an agent goes idle, a background model call checks whether it actually finished the last request. If the agent stopped on an error or quit mid-task, the supervisor sends it a follow-up message to keep it working. This runs an extra model call per idle transition and costs money. Off by default."
-                    </p>
-                </div>
-                <label class="settings-toggle">
-                    <input
-                        type="checkbox"
-                        prop:checked=enabled_checked
-                        disabled=enabled_disabled
-                        on:change=enabled_on_toggle
-                    />
-                    <span class="settings-toggle-slider"></span>
-                </label>
-            </div>
-        </div>
+        <SupervisorToggleField
+            label="Enable agent supervisor"
+            description="When an agent goes idle, a background model call checks whether it actually finished the last request. If the agent stopped on an error or quit mid-task, the supervisor sends it a follow-up message to keep it working. This runs an extra model call per idle transition and costs money. Off by default."
+            checked=enabled_toggle.0
+            disabled=enabled_toggle.1
+            on_toggle=enabled_toggle.2
+        />
 
-        <div class="settings-field">
-            <div class="settings-toggle-row">
-                <div>
-                    <label class="settings-label">"Auto-compact on success"</label>
-                    <p class="settings-description">
-                        "After the supervisor confirms the requested work is truly complete, automatically compact only after the inactivity delay has elapsed and the latest completed assistant turn reports a known current context strictly above the configured minimum."
-                    </p>
-                </div>
-                <label class="settings-toggle">
-                    <input
-                        type="checkbox"
-                        prop:checked=compact_checked
-                        disabled=compact_disabled
-                        on:change=compact_on_toggle
-                    />
-                    <span class="settings-toggle-slider"></span>
-                </label>
-            </div>
-        </div>
+        <SupervisorToggleField
+            label="Supervise restored agents"
+            description="Reopening a saved session replays its transcript, which looks exactly like an agent that just went idle. Off by default, the supervisor leaves that history alone and waits for the agent's first live turn. Turn this on to have it judge — and possibly follow up on — sessions as soon as they are restored."
+            checked=restored_toggle.0
+            disabled=restored_toggle.1
+            on_toggle=restored_toggle.2
+        />
 
-        <div class="settings-field">
-            <label class="settings-label">"Auto-compact inactivity delay"</label>
-            <p class="settings-description">
-                "Default 300 seconds (5 minutes); agent activity restarts the timer. Compaction starts only after true completion, this full quiet period, and a known current context strictly above the configured minimum."
-            </p>
-            <div class="settings-form-row" style="align-items: center;">
-                <input
-                    class="settings-input settings-supervisor-number-input"
-                    type="number"
-                    min=SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN
-                    max=SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX
-                    step="1"
-                    prop:value=compact_delay_value
-                    disabled=compact_delay_disabled
-                    aria-label="Supervisor auto-compact inactivity delay seconds"
-                    on:change=compact_delay_on_change
-                />
-                <span class="settings-supervisor-number-unit">"seconds"</span>
-            </div>
-        </div>
+        <SupervisorToggleField
+            label="Interrupt stalled turns"
+            description="Cancel a running turn that has produced nothing at all for the stall timeout below, then let the supervisor decide how to make progress. Any output — text, a tool call, a status change — resets the timer, so a slow agent that is still working is never cut off. This cancels real work, so it is off by default, and it only fires while a supervisor follow-up is still available under the kick limit."
+            checked=stall_toggle.0
+            disabled=stall_toggle.1
+            on_toggle=stall_toggle.2
+        />
 
-        <div class="settings-field">
-            <label class="settings-label">"Auto-compact minimum context"</label>
-            <p class="settings-description">
-                "Automatically compact only when the latest completed assistant turn reports a context larger than this many tokens. The default is 200,000. Set 0 for no positive minimum; automatic compaction still waits for reported current-context data and skips the turn when that data is unavailable."
-            </p>
-            <div class="settings-form-row" style="align-items: center;">
-                <input
-                    class="settings-input settings-supervisor-number-input"
-                    type="number"
-                    min="0"
-                    step="1000"
-                    prop:value=compact_min_value
-                    disabled=compact_min_disabled
-                    aria-label="Supervisor auto-compact minimum context tokens"
-                    on:change=compact_min_on_change
-                />
-                <span class="settings-supervisor-number-unit">"tokens"</span>
-            </div>
-        </div>
+        <SupervisorNumberField
+            label="Stall timeout"
+            description="How long a turn may produce nothing before it is interrupted. Default 1800 seconds (30 minutes); 900 is 15 minutes and 3600 is an hour."
+            aria_label="Supervisor stall timeout seconds"
+            min=f64::from(SUPERVISOR_STALL_TIMEOUT_SECONDS_MIN)
+            max=Some(f64::from(SUPERVISOR_STALL_TIMEOUT_SECONDS_MAX))
+            step="60"
+            unit=Some("seconds")
+            value=stall_seconds.0
+            disabled=stall_seconds.1
+            on_change=stall_seconds.2
+        />
+
+        <SupervisorToggleField
+            label="Auto-compact on success"
+            description="After the supervisor confirms the requested work is truly complete, automatically compact only after the inactivity delay has elapsed and the latest completed assistant turn reports a known current context strictly above the configured minimum."
+            checked=compact_toggle.0
+            disabled=compact_toggle.1
+            on_toggle=compact_toggle.2
+        />
+
+        <SupervisorNumberField
+            label="Auto-compact inactivity delay"
+            description="Default 300 seconds (5 minutes); agent activity restarts the timer. Compaction starts only after true completion, this full quiet period, and a known current context strictly above the configured minimum."
+            aria_label="Supervisor auto-compact inactivity delay seconds"
+            min=f64::from(SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN)
+            max=Some(f64::from(SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX))
+            step="1"
+            unit=Some("seconds")
+            value=compact_delay.0
+            disabled=compact_delay.1
+            on_change=compact_delay.2
+        />
+
+        <SupervisorNumberField
+            label="Auto-compact minimum context"
+            description="Automatically compact only when the latest completed assistant turn reports a context larger than this many tokens. The default is 200,000. Set 0 for no positive minimum; automatic compaction still waits for reported current-context data and skips the turn when that data is unavailable."
+            aria_label="Supervisor auto-compact minimum context tokens"
+            min=0.0
+            max=None
+            step="1000"
+            unit=Some("tokens")
+            value=compact_min.0
+            disabled=compact_min.1
+            on_change=compact_min.2
+        />
 
         <div class="settings-field">
             <label class="settings-label">"Verdict model tier"</label>
@@ -2331,38 +2359,119 @@ fn SupervisorTab() -> impl IntoView {
             </select>
         </div>
 
-        <div class="settings-field">
-            <label class="settings-label">"Kick limit"</label>
-            <p class="settings-description">
-                "Maximum consecutive supervisor follow-ups without a new message from you. Prevents the supervisor and the agent from looping forever on a task that cannot finish."
-            </p>
-            <input
-                class="settings-input settings-supervisor-number-input"
-                type="number"
-                min="1"
-                max="20"
-                prop:value=kicks_value
-                disabled=kicks_disabled
-                aria-label="Supervisor kick limit"
-                on:change=kicks_on_change
-            />
-        </div>
+        <SupervisorNumberField
+            label="Kick limit"
+            description="Maximum consecutive supervisor follow-ups without a new message from you. Prevents the supervisor and the agent from looping forever on a task that cannot finish."
+            aria_label="Supervisor kick limit"
+            min=1.0
+            max=Some(20.0)
+            step="1"
+            unit=None
+            value=kicks.0
+            disabled=kicks.1
+            on_change=kicks.2
+        />
 
+        <SupervisorNumberField
+            label="Extra delayed attempts"
+            description="Extra delayed attempts after a supervisor verdict call fails or returns an invalid verdict. Each attempt is a fresh paid model call with automatic backoff. 0 disables extra attempts; maximum 5. The default 1 means two total calls."
+            aria_label="Supervisor extra delayed attempts"
+            min=f64::from(SUPERVISOR_RETRY_ATTEMPTS_MIN)
+            max=Some(f64::from(SUPERVISOR_RETRY_ATTEMPTS_MAX))
+            step="1"
+            unit=None
+            value=retries.0
+            disabled=retries.1
+            on_change=retries.2
+        />
+    }
+}
+
+/// One labelled supervisor toggle. Every field on the tab funnels through this
+/// and [`SupervisorNumberField`] with erased signal/callback props, so the tab
+/// compiles to two field view types instead of one per field.
+#[component]
+fn SupervisorToggleField(
+    label: &'static str,
+    description: &'static str,
+    checked: Signal<bool>,
+    disabled: Signal<bool>,
+    on_toggle: Callback<bool>,
+) -> impl IntoView {
+    let on_change = move |ev: web_sys::Event| {
+        let target = ev.target().unwrap();
+        let input: web_sys::HtmlInputElement = target.unchecked_into();
+        on_toggle.run(input.checked());
+    };
+    view! {
         <div class="settings-field">
-            <label class="settings-label">"Extra delayed attempts"</label>
-            <p class="settings-description">
-                "Extra delayed attempts after a supervisor verdict call fails or returns an invalid verdict. Each attempt is a fresh paid model call with automatic backoff. 0 disables extra attempts; maximum 5. The default 1 means two total calls."
-            </p>
-            <input
-                class="settings-input settings-supervisor-number-input"
-                type="number"
-                min=SUPERVISOR_RETRY_ATTEMPTS_MIN
-                max=SUPERVISOR_RETRY_ATTEMPTS_MAX
-                prop:value=retries_value
-                disabled=retries_disabled
-                aria-label="Supervisor extra delayed attempts"
-                on:change=retries_on_change
-            />
+            <div class="settings-toggle-row">
+                <div>
+                    <label class="settings-label">{label}</label>
+                    <p class="settings-description">{description}</p>
+                </div>
+                <label class="settings-toggle">
+                    <input
+                        type="checkbox"
+                        prop:checked=move || checked.get()
+                        disabled=move || disabled.get()
+                        on:change=on_change
+                    />
+                    <span class="settings-toggle-slider"></span>
+                </label>
+            </div>
+        </div>
+    }
+}
+
+/// One labelled supervisor number input, with an optional visible unit.
+#[component]
+fn SupervisorNumberField(
+    label: &'static str,
+    description: &'static str,
+    aria_label: &'static str,
+    min: f64,
+    /// `None` renders no `max`, which the token minimum needs: the setting is a
+    /// `u64` and must not be capped by an attribute the field never had.
+    max: Option<f64>,
+    step: &'static str,
+    unit: Option<&'static str>,
+    value: Signal<String>,
+    disabled: Signal<bool>,
+    on_change: Callback<String>,
+) -> impl IntoView {
+    let on_input_change = move |ev: web_sys::Event| {
+        let target = ev.target().unwrap();
+        let input: web_sys::HtmlInputElement = target.unchecked_into();
+        on_change.run(input.value());
+    };
+    let input = view! {
+        <input
+            class="settings-input settings-supervisor-number-input"
+            type="number"
+            min=min
+            max=max
+            step=step
+            prop:value=move || value.get()
+            disabled=move || disabled.get()
+            aria-label=aria_label
+            on:change=on_input_change
+        />
+    };
+    view! {
+        <div class="settings-field">
+            <label class="settings-label">{label}</label>
+            <p class="settings-description">{description}</p>
+            {match unit {
+                Some(unit) => view! {
+                    <div class="settings-form-row" style="align-items: center;">
+                        {input}
+                        <span class="settings-supervisor-number-unit">{unit}</span>
+                    </div>
+                }
+                    .into_any(),
+                None => input.into_any(),
+            }}
         </div>
     }
 }
@@ -9159,6 +9268,44 @@ mod wasm_tests {
             }),
             "toggling auto-compact must emit a SupervisorAutoCompactOnSuccess SetSetting: {settings:?}"
         );
+
+        // The restore opt-in and stall interrupts each authorize something the
+        // user would not want by accident — a paid verdict on reopened history
+        // and a cancelled turn — so both must render off and commit only their
+        // own typed setting.
+        let restored = toggle_for_label(&container, "Supervise restored agents");
+        let stall = toggle_for_label(&container, "Interrupt stalled turns");
+        assert!(
+            !restored.checked(),
+            "restored agents are skipped by default"
+        );
+        assert!(
+            !stall.checked(),
+            "stalled turns are left running by default"
+        );
+        restored.set_checked(true);
+        dispatch_change(&restored);
+        stall.set_checked(true);
+        dispatch_change(&stall);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let settings = recorded_set_setting_payloads(&calls);
+        assert!(
+            settings.iter().any(|s| {
+                s.get("kind").and_then(|k| k.as_str())
+                    == Some("supervisor_supervise_restored_agents")
+                    && s.get("enabled").and_then(|v| v.as_bool()) == Some(true)
+            }),
+            "the restore opt-in must commit its own typed setting: {settings:?}"
+        );
+        assert!(
+            settings.iter().any(|s| {
+                s.get("kind").and_then(|k| k.as_str()) == Some("supervisor_stall_timeout_enabled")
+                    && s.get("enabled").and_then(|v| v.as_bool()) == Some(true)
+            }),
+            "enabling stall interrupts must commit its own typed setting: {settings:?}"
+        );
     }
 
     /// The Supervisor tab number inputs must reflect the host defaults and
@@ -9245,6 +9392,33 @@ mod wasm_tests {
         kicks.set_value("5");
         dispatch_change(&kicks);
 
+        let stall_seconds: web_sys::HtmlInputElement = container
+            .query_selector("input[aria-label='Supervisor stall timeout seconds']")
+            .unwrap()
+            .expect("stall timeout input renders")
+            .dyn_into()
+            .expect("stall timeout is an input");
+        assert_eq!(
+            stall_seconds.value(),
+            "1800",
+            "the stall timeout shows the 30-minute server default"
+        );
+        let stall_unit = stall_seconds
+            .parent_element()
+            .expect("stall timeout input has a form row")
+            .query_selector(".settings-supervisor-number-unit")
+            .unwrap()
+            .expect("stall timeout renders a visible unit");
+        assert_eq!(stall_unit.text_content().as_deref(), Some("seconds"));
+        stall_seconds.set_value("600");
+        dispatch_change(&stall_seconds);
+        stall_seconds.set_value("0");
+        dispatch_change(&stall_seconds);
+        stall_seconds.set_value("86401");
+        dispatch_change(&stall_seconds);
+        stall_seconds.set_value("not-a-number");
+        dispatch_change(&stall_seconds);
+
         let retries: web_sys::HtmlInputElement = container
             .query_selector("input[aria-label='Supervisor extra delayed attempts']")
             .unwrap()
@@ -9321,6 +9495,24 @@ mod wasm_tests {
             }),
             "out-of-range delayed attempts must emit nothing: {settings:?}"
         );
+        assert!(
+            settings.iter().any(|s| {
+                s.get("kind").and_then(|k| k.as_str()) == Some("supervisor_stall_timeout_seconds")
+                    && s.get("seconds").and_then(|v| v.as_u64()) == Some(600)
+            }),
+            "editing the stall window must commit the exact typed seconds: {settings:?}"
+        );
+        assert_eq!(
+            settings
+                .iter()
+                .filter(|s| {
+                    s.get("kind").and_then(|k| k.as_str())
+                        == Some("supervisor_stall_timeout_seconds")
+                })
+                .count(),
+            1,
+            "zero, over-max, and unparsable stall windows must commit nothing: {settings:?}"
+        );
 
         let tier: web_sys::HtmlSelectElement = container
             .query_selector("select[aria-label='Supervisor verdict model tier']")
@@ -9364,6 +9556,14 @@ mod wasm_tests {
         next_tick().await;
 
         let auto_compact = toggle_for_label(&container, "Auto-compact on success");
+        let restored = toggle_for_label(&container, "Supervise restored agents");
+        let stall = toggle_for_label(&container, "Interrupt stalled turns");
+        let stall_seconds: web_sys::HtmlInputElement = container
+            .query_selector("input[aria-label='Supervisor stall timeout seconds']")
+            .unwrap()
+            .expect("stall timeout input")
+            .dyn_into()
+            .expect("stall timeout input element");
         let delay: web_sys::HtmlInputElement = container
             .query_selector("input[aria-label='Supervisor auto-compact inactivity delay seconds']")
             .unwrap()
@@ -9379,6 +9579,9 @@ mod wasm_tests {
         assert!(auto_compact.disabled());
         assert!(delay.disabled());
         assert!(threshold.disabled());
+        assert!(restored.disabled());
+        assert!(stall.disabled());
+        assert!(stall_seconds.disabled());
         assert_eq!(delay.value(), "300");
 
         state.host_settings_by_host.update(|settings_by_host| {
@@ -9387,12 +9590,24 @@ mod wasm_tests {
                 .expect("same selected host settings");
             settings.supervisor.enabled = true;
             settings.supervisor.auto_compact_inactivity_delay_seconds = 41;
+            settings.supervisor.stall_timeout_seconds = 900;
         });
         next_tick().await;
         assert!(!auto_compact.disabled());
         assert!(delay.disabled());
         assert!(threshold.disabled());
         assert_eq!(delay.value(), "41", "disabled values remain server-owned");
+        assert!(!restored.disabled());
+        assert!(!stall.disabled());
+        assert!(
+            stall_seconds.disabled(),
+            "enabling the supervisor alone must not open the stall window"
+        );
+        assert_eq!(
+            stall_seconds.value(),
+            "900",
+            "the stall window stays server-owned while unreachable"
+        );
 
         state.host_settings_by_host.update(|settings_by_host| {
             let settings = settings_by_host
@@ -9409,6 +9624,21 @@ mod wasm_tests {
             "57",
             "same-host same-key updates must replace the displayed delay"
         );
+
+        state.host_settings_by_host.update(|settings_by_host| {
+            let settings = settings_by_host
+                .get_mut("host-general")
+                .expect("same selected host settings");
+            settings.supervisor.stall_timeout_enabled = true;
+            settings.supervisor.supervise_restored_agents = true;
+        });
+        next_tick().await;
+        assert!(
+            !stall_seconds.disabled(),
+            "the stall window unlocks only behind its own toggle"
+        );
+        assert!(restored.checked());
+        assert!(stall.checked());
     }
 
     /// The Background agent features section must reflect the host's current

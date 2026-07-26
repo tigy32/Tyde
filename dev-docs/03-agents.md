@@ -898,6 +898,56 @@ unchanged idle agents, paid calls are therefore finite but `O(N)`: at most
 `2N` by default or `6N` at the configured maximum, serialized to one in flight
 per host.
 
+A session reopened from history replays its transcript, including the user side
+of it, so a restored agent settles into idle looking exactly like one that just
+finished a turn. The agent actor marks that state — set when a resumed agent
+starts and cleared by its first live turn — and the scheduler parks such an
+agent in a distinct restore-deferred phase with no deadline. Judging replayed
+history is opt-in through `supervise_restored_agents`, which defaults off
+because reopening a session to read it should not spend a verdict or deliver a
+follow-up. Enabling it live arms exactly the agents waiting in that phase, from
+the edit rather than from their original restore instant, and disabling it again
+does not retract an agent already armed. Any real turn on a restored agent makes
+it ordinary: the gate applies to replayed history, never to work the agent did
+under observation.
+
+Interrupting a stalled turn is a separate, also opt-in control:
+`stall_timeout_enabled` with `stall_timeout_seconds` (`1..=86_400`, default
+1800). The clock measures *silence*, not turn length — every live backend event
+restarts it, so a slow but working agent is never cut off, and a legitimately
+long turn is only interrupted once it produces nothing at all for the whole
+window. Waiting on a plan approval pauses the clock outright, since waiting on a
+person is not stalling.
+
+The agent actor owns the stall decision because it is the only place that sees
+every backend event: stream deltas are progress but never reach the status
+watch, so a scheduler-side clock would run early. The scheduler's deadline is
+therefore a prompt to re-evaluate, and the actor answers with the interrupt, a
+"not yet" carrying the remaining time, or a rejection. A "not yet" only raises
+the scheduler's floor for the next question; it never moves the observed
+progress instant, so a live timeout edit still recomputes from real activity.
+Interrupts spend no paid call, so they are not gated on the verdict slot, carry
+no attempt cost, and one is issued at most once per window — a backend that
+swallows the first gets another a full window later rather than a tight loop.
+
+The interrupt is checked against the kick budget *before* it fires: cutting a
+turn short with no follow-up left to send would destroy work and offer nothing
+back. The actor records one visible warning card attributing the cancel to the
+supervisor before interrupting:
+
+> [Tyde Supervisor] Interrupted this turn after no progress for N minutes. The
+> supervisor is deciding how to make progress.
+
+That card is the only place the distinction lives, deliberately: the supervision
+context is a projection of the event log, so a scheduler restart cannot desync
+it. The reader treats the card as excusing exactly the one cancel it precedes —
+a user cancel still suppresses supervision, a second cancel still counts, and
+any new message closes the window — and reports the judged turn as truncated so
+the verdict prompt asks for a smaller concrete step or a different approach
+instead of a repeat of what stalled. Any later input, a real message or a
+supervisor kick, clears that truncation flag, so the follow-up turn is judged as
+ordinary work.
+
 Automatic compaction requires all four live conditions: the supervisor and
 auto-compact setting are enabled; the accepted verdict for the unchanged
 generation is `Done`; the full inactivity delay has elapsed; and the latest

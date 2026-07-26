@@ -176,6 +176,10 @@ struct MockLoopConfig {
     initial_message: Option<String>,
     slow_initial_turn: bool,
     hold_initial_turn: bool,
+    /// A resumed session has no initial message, but its replayed transcript
+    /// can still have opted into user bubbles. Real backends keep echoing the
+    /// user side after a resume, so the mock must too.
+    user_bubbles_from_history: bool,
     agent_control_await_mcp: Option<MockAgentControlAwaitMcp>,
 }
 
@@ -260,6 +264,7 @@ impl Backend for MockBackend {
                 initial_message: Some(initial_message),
                 slow_initial_turn,
                 hold_initial_turn,
+                user_bubbles_from_history: false,
                 agent_control_await_mcp,
             },
         );
@@ -351,6 +356,9 @@ impl Backend for MockBackend {
                 initial_message: None,
                 slow_initial_turn: false,
                 hold_initial_turn: false,
+                user_bubbles_from_history: replay_prompts
+                    .iter()
+                    .any(|prompt| prompt.contains(MOCK_USER_BUBBLES_SENTINEL)),
                 agent_control_await_mcp,
             },
         );
@@ -438,6 +446,7 @@ impl Backend for MockBackend {
                 initial_message: Some(initial_message),
                 slow_initial_turn: false,
                 hold_initial_turn: false,
+                user_bubbles_from_history: false,
                 agent_control_await_mcp,
             },
         );
@@ -520,15 +529,17 @@ fn start_mock_command_loop(
         initial_message,
         slow_initial_turn,
         hold_initial_turn,
+        user_bubbles_from_history,
         agent_control_await_mcp,
     } = config;
     tokio::spawn(async move {
         let mut active_subagents = Vec::new();
         let mut pending_exit_plan_mode = None;
         let mut holding_until_interrupt = false;
-        let mut emit_user_bubbles = initial_message
-            .as_deref()
-            .is_some_and(|message| message.contains(MOCK_USER_BUBBLES_SENTINEL));
+        let mut emit_user_bubbles = user_bubbles_from_history
+            || initial_message
+                .as_deref()
+                .is_some_and(|message| message.contains(MOCK_USER_BUBBLES_SENTINEL));
         if let Some(initial_message) = initial_message {
             if initial_message.contains(MOCK_DIE_AFTER_BUSY_SENTINEL) {
                 // Send TypingStatusChanged(true) so the actor sets in_turn=true,
@@ -919,6 +930,12 @@ fn emit_mock_resume_history(
     prompts: &[String],
 ) {
     for prompt in prompts {
+        // Real backends replay the user side of a resumed transcript too, and
+        // that replayed request is exactly what makes a restored agent look
+        // like one that just finished work.
+        if prompt.contains(MOCK_USER_BUBBLES_SENTINEL) {
+            emit_mock_user_bubble(events_tx, prompt);
+        }
         let content = format!(
             "{}mock backend response to: {prompt}",
             startup_mcp_response_prefix(session_id)

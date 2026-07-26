@@ -9,7 +9,8 @@
 
 use protocol::{
     ChatEvent, ChatMessage, Envelope, FrameKind, MessageSender, SUPERVISOR_MESSAGE_PREFIX,
-    SendMessagePayload, SessionSettingsValues, Task, TaskList, TaskStatus,
+    SUPERVISOR_STALL_INTERRUPT_NOTICE_PREFIX, SendMessagePayload, SessionSettingsValues, Task,
+    TaskList, TaskStatus,
 };
 use tokio::sync::mpsc;
 
@@ -91,6 +92,16 @@ pub(crate) struct SupervisionContextSnapshot {
     /// message arrived after the cancel). Supervising past an intentional
     /// stop would fight the user, so the scheduler skips these turns.
     pub cancelled_since_user_message: bool,
+    /// The turn now awaiting a verdict was cut short by the supervisor's stall
+    /// timeout, so its final message is a truncation rather than a considered
+    /// stopping point. Any later input — a real message or a supervisor kick —
+    /// starts a turn of its own and clears this.
+    pub last_turn_was_stall_interrupted: bool,
+    /// A recorded stall-interrupt notice whose cancel event has not been seen
+    /// yet. It disarms the very next cancel so the supervisor's own interrupt
+    /// is not mistaken for the user pressing stop. Any new message closes the
+    /// window, so this can never swallow a later user cancel.
+    stall_interrupt_awaiting_cancel: bool,
 }
 
 pub(crate) fn supervision_context_snapshot(event_log: &[Envelope]) -> SupervisionContextSnapshot {
@@ -120,7 +131,11 @@ pub(crate) fn supervision_context_snapshot(event_log: &[Envelope]) -> Supervisio
                 }
             }
             ChatEvent::OperationCancelled(_) => {
-                snapshot.cancelled_since_user_message = true;
+                if snapshot.stall_interrupt_awaiting_cancel {
+                    snapshot.stall_interrupt_awaiting_cancel = false;
+                } else {
+                    snapshot.cancelled_since_user_message = true;
+                }
             }
             _ => {}
         }
@@ -147,6 +162,8 @@ fn observe_message(
             // Any new message (real or kick) supersedes an earlier cancel:
             // work is running again on purpose.
             snapshot.cancelled_since_user_message = false;
+            snapshot.stall_interrupt_awaiting_cancel = false;
+            snapshot.last_turn_was_stall_interrupted = false;
         }
         MessageSender::Assistant { .. } => {
             *latest_assistant_message_id = message.message_id.clone();
@@ -161,6 +178,14 @@ fn observe_message(
         MessageSender::Error => {
             snapshot.last_error_since_user_message = Some(message.content.clone());
         }
+        MessageSender::Warning
+            if message
+                .content
+                .starts_with(SUPERVISOR_STALL_INTERRUPT_NOTICE_PREFIX) =>
+        {
+            snapshot.last_turn_was_stall_interrupted = true;
+            snapshot.stall_interrupt_awaiting_cancel = true;
+        }
         MessageSender::System | MessageSender::Warning => {}
     }
 }
@@ -174,6 +199,9 @@ pub(crate) struct GenerateSupervisionVerdictRequest {
     pub task_list: Option<TaskList>,
     pub last_assistant_message: Option<String>,
     pub last_error: Option<String>,
+    /// The turn under review was cut short by the supervisor's stall timeout,
+    /// so its final message is a truncation rather than a decision to stop.
+    pub stall_interrupted: bool,
     pub kicks_so_far: u32,
     pub max_kicks: u32,
     /// Model tier for the verdict call; `None` runs the backend's default.
@@ -351,7 +379,9 @@ fn generate_mock_supervision_verdict(
     if request.last_user_message.contains(MOCK_SUPERVISOR_DONE) {
         return Ok(SupervisionVerdict::Done);
     }
-    if request.last_user_message.contains(MOCK_SUPERVISOR_CONTINUE) || request.last_error.is_some()
+    if request.last_user_message.contains(MOCK_SUPERVISOR_CONTINUE)
+        || request.last_error.is_some()
+        || request.stall_interrupted
     {
         return Ok(SupervisionVerdict::Continue {
             message: "Please continue working on the task until it is complete.".to_owned(),
@@ -378,6 +408,14 @@ fn build_supervision_prompt(request: &GenerateSupervisionVerdictRequest) -> Stri
         .map(|text| cap_text(text, SUPERVISION_ERROR_MAX_BYTES))
         .unwrap_or_else(|| "None".to_owned());
     let user_message = cap_text(&request.last_user_message, SUPERVISION_SECTION_MAX_BYTES);
+    let stall_interrupt_section = if request.stall_interrupted {
+        "\nThis turn did not end on its own: it stopped making observable progress, so it was \
+cancelled automatically. Treat the agent's final message as truncated. Answer continue unless the \
+user must decide something first, and name a smaller concrete next step or a different approach \
+rather than repeating the action that stalled.\n"
+    } else {
+        ""
+    };
     format!(
         "You supervise a coding agent that just went idle. Decide whether it finished the user's \
 request, is awaiting user feedback, clarification, approval, a choice, or plan review, or stopped \
@@ -399,7 +437,8 @@ awaiting_user.\n\
 task list still has pending or in-progress items covered by the user's request and the agent can \
 continue without user input.\n\
 - The follow-up message is sent verbatim to the agent. Keep it short and specific.\n\
-- Never invent new work or expand scope beyond the user's request.\n\n\
+- Never invent new work or expand scope beyond the user's request.\n\
+{stall_interrupt_section}\n\
 User request:\n{user_message}\n\n\
 Agent task list:\n{task_list}\n\n\
 Agent's final message:\n{last_agent_message}\n\n\
@@ -741,6 +780,129 @@ mod tests {
         );
     }
 
+    /// A user cancel must keep suppressing supervision, but the supervisor's
+    /// own stall interrupt must not: the cancel it provokes is the supervisor's
+    /// doing, and the whole point is to judge the truncated turn afterwards.
+    #[test]
+    fn snapshot_separates_a_stall_interrupt_from_a_user_cancel() {
+        let notice = format!(
+            "{SUPERVISOR_STALL_INTERRUPT_NOTICE_PREFIX} 30 minutes. Checking how to make progress."
+        );
+        let log = vec![
+            envelope(1, ChatEvent::MessageAdded(user_message("do the task"))),
+            envelope(
+                2,
+                ChatEvent::MessageAdded(chat_message(MessageSender::Warning, &notice)),
+            ),
+            envelope(
+                3,
+                ChatEvent::OperationCancelled(protocol::OperationCancelledData {
+                    message: "cancelled".to_owned(),
+                }),
+            ),
+        ];
+        let snapshot = supervision_context_snapshot(&log);
+        assert!(
+            !snapshot.cancelled_since_user_message,
+            "the supervisor's own interrupt must not read as a user cancel"
+        );
+        assert!(snapshot.last_turn_was_stall_interrupted);
+
+        let mut user_cancel = log.clone();
+        user_cancel.push(envelope(
+            4,
+            ChatEvent::OperationCancelled(protocol::OperationCancelledData {
+                message: "cancelled".to_owned(),
+            }),
+        ));
+        assert!(
+            supervision_context_snapshot(&user_cancel).cancelled_since_user_message,
+            "only the one cancel the notice armed is excused; a second cancel still counts"
+        );
+
+        let mut next_request = log.clone();
+        next_request.push(envelope(
+            4,
+            ChatEvent::MessageAdded(user_message("new ask")),
+        ));
+        next_request.push(envelope(
+            5,
+            ChatEvent::OperationCancelled(protocol::OperationCancelledData {
+                message: "cancelled".to_owned(),
+            }),
+        ));
+        let snapshot = supervision_context_snapshot(&next_request);
+        assert!(
+            snapshot.cancelled_since_user_message,
+            "a new user message closes the excuse window, so their next stop counts"
+        );
+        assert!(!snapshot.last_turn_was_stall_interrupted);
+    }
+
+    #[test]
+    fn snapshot_ignores_unrelated_warning_cards() {
+        let log = vec![
+            envelope(1, ChatEvent::MessageAdded(user_message("do the task"))),
+            envelope(
+                2,
+                ChatEvent::MessageAdded(chat_message(
+                    MessageSender::Warning,
+                    "Supervisor could not verify whether this task was complete after 2 attempts",
+                )),
+            ),
+            envelope(
+                3,
+                ChatEvent::OperationCancelled(protocol::OperationCancelledData {
+                    message: "cancelled".to_owned(),
+                }),
+            ),
+        ];
+        let snapshot = supervision_context_snapshot(&log);
+        assert!(!snapshot.last_turn_was_stall_interrupted);
+        assert!(
+            snapshot.cancelled_since_user_message,
+            "an unrelated warning must not excuse a user cancel"
+        );
+    }
+
+    #[test]
+    fn stall_interrupt_prompt_reports_the_truncated_turn() {
+        let mut request = GenerateSupervisionVerdictRequest {
+            verdict_agent_id: AgentId("test".to_owned()),
+            backend_kind: BackendKind::Claude,
+            last_user_message: "implement the parser".to_owned(),
+            task_list: None,
+            last_assistant_message: Some("Reading the lexer".to_owned()),
+            last_error: None,
+            stall_interrupted: true,
+            kicks_so_far: 0,
+            max_kicks: 3,
+            cost_hint: Some(SpawnCostHint::Low),
+            session_settings: None,
+            use_mock_backend: true,
+            capacity_tx: mpsc::unbounded_channel().0,
+        };
+        let prompt = build_supervision_prompt(&request);
+        assert!(prompt.contains("stopped making observable progress"));
+        assert!(prompt.contains("truncated"));
+        assert!(prompt.contains("smaller concrete next step"));
+        assert!(
+            prompt.contains("VERDICT: continue"),
+            "the interrupt notice must not displace the verdict contract"
+        );
+        assert_eq!(
+            generate_mock_supervision_verdict(&request),
+            Ok(SupervisionVerdict::Continue {
+                message: "Please continue working on the task until it is complete.".to_owned()
+            })
+        );
+
+        request.stall_interrupted = false;
+        let prompt = build_supervision_prompt(&request);
+        assert!(!prompt.contains("stopped making observable progress"));
+        assert!(prompt.contains("implement the parser"));
+    }
+
     #[test]
     fn parse_accepts_all_exact_verdicts() {
         assert_eq!(
@@ -818,6 +980,7 @@ mod tests {
             }),
             last_assistant_message: Some("I stopped".to_owned()),
             last_error: None,
+            stall_interrupted: false,
             kicks_so_far: 1,
             max_kicks: 3,
             cost_hint: Some(SpawnCostHint::Low),
@@ -848,6 +1011,7 @@ mod tests {
                 task_list: None,
                 last_assistant_message: None,
                 last_error: None,
+                stall_interrupted: false,
                 kicks_so_far: 0,
                 max_kicks: 3,
                 cost_hint: Some(SpawnCostHint::Low),
