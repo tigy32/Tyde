@@ -1413,6 +1413,26 @@ struct CodexThreadResponseConfig<'a> {
     execution_mode: BackendExecutionMode,
 }
 
+struct CodexSelectedSkillContext<'a> {
+    skills: &'a [ResolvedSkill],
+    selection: SkillSelection,
+}
+
+impl CodexSelectedSkillContext<'_> {
+    fn empty() -> Self {
+        Self {
+            skills: &[],
+            selection: SkillSelection::Explicit,
+        }
+    }
+}
+
+struct CodexThreadResources {
+    steering_tempfile: Option<PathBuf>,
+    skill_projection: Option<CodexSkillProjection>,
+    skill_setup: CodexSkillSetup,
+}
+
 struct CodexSessionSpawnOptions<'a> {
     ephemeral: bool,
     access_mode: BackendAccessMode,
@@ -1642,9 +1662,11 @@ impl CodexSession {
         Self::from_thread_response(
             rpc,
             inbound_rx,
-            steering_tempfile,
-            skill_projection,
-            skill_setup,
+            CodexThreadResources {
+                steering_tempfile,
+                skill_projection,
+                skill_setup,
+            },
             CodexThreadResponseConfig {
                 startup_mcp_servers,
                 access_mode,
@@ -1672,8 +1694,7 @@ impl CodexSession {
             steering_content,
             access_mode,
             from_thread_id,
-            &[],
-            SkillSelection::Explicit,
+            CodexSelectedSkillContext::empty(),
         )
         .await
     }
@@ -1685,9 +1706,12 @@ impl CodexSession {
         steering_content: Option<&str>,
         access_mode: BackendAccessMode,
         from_thread_id: &str,
-        selected_skills: &[ResolvedSkill],
-        skill_selection: SkillSelection,
+        selected_skill_context: CodexSelectedSkillContext<'_>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
+        let CodexSelectedSkillContext {
+            skills: selected_skills,
+            selection: skill_selection,
+        } = selected_skill_context;
         if let Some(err) = codex_selected_skills_ssh_error(ssh_host.as_deref(), selected_skills) {
             return Err(err);
         }
@@ -1806,9 +1830,11 @@ impl CodexSession {
         Self::from_thread_response(
             rpc,
             inbound_rx,
-            steering_tempfile,
-            skill_projection,
-            skill_setup,
+            CodexThreadResources {
+                steering_tempfile,
+                skill_projection,
+                skill_setup,
+            },
             CodexThreadResponseConfig {
                 startup_mcp_servers,
                 access_mode,
@@ -1824,14 +1850,17 @@ impl CodexSession {
     async fn from_thread_response(
         rpc: CodexRpc,
         inbound_rx: mpsc::UnboundedReceiver<CodexInbound>,
-        steering_tempfile: Option<std::path::PathBuf>,
-        skill_projection: Option<CodexSkillProjection>,
-        skill_setup: CodexSkillSetup,
+        resources: CodexThreadResources,
         config: CodexThreadResponseConfig<'_>,
         thread_response: Value,
         method: &str,
         subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
+        let CodexThreadResources {
+            steering_tempfile,
+            skill_projection,
+            skill_setup,
+        } = resources;
         let thread_id = thread_response
             .get("thread")
             .and_then(|t| t.get("id"))
@@ -13705,8 +13734,10 @@ impl Backend for CodexBackend {
                 combined_instructions.as_deref(),
                 config.resolved_spawn_config.access_mode,
                 &from_session_id.0,
-                &config.resolved_spawn_config.skills,
-                config.resolved_spawn_config.skill_selection,
+                CodexSelectedSkillContext {
+                    skills: &config.resolved_spawn_config.skills,
+                    selection: config.resolved_spawn_config.skill_selection,
+                },
             )
             .await
             {
@@ -14035,12 +14066,10 @@ mod tests {
                     .expect("codex test native home mutex poisoned"),
                 native_home,
             );
-            let previous_skill_temp_parent = std::mem::replace(
-                &mut *codex_test_skill_temp_parent_override()
-                    .lock()
-                    .expect("Codex test skill temp parent mutex poisoned"),
-                Some(skill_temp_parent),
-            );
+            let previous_skill_temp_parent = codex_test_skill_temp_parent_override()
+                .lock()
+                .expect("Codex test skill temp parent mutex poisoned")
+                .replace(skill_temp_parent);
             let previous_resource_link_failure = codex_test_resource_link_failure_override()
                 .lock()
                 .expect("Codex test resource-link failure mutex poisoned")
@@ -16360,8 +16389,10 @@ for line in sys.stdin:
             None,
             BackendAccessMode::Unrestricted,
             "parent-thread",
-            &selected,
-            SkillSelection::Explicit,
+            CodexSelectedSkillContext {
+                skills: &selected,
+                selection: SkillSelection::Explicit,
+            },
         )
         .await
         .expect("fork with selected skills");
