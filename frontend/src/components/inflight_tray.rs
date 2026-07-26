@@ -1050,8 +1050,8 @@ mod wasm_tests {
     use crate::state::{AgentInfo, ToolCallId};
     use leptos::mount::mount_to;
     use protocol::{
-        AgentControlProgressKind, AgentId, AgentOrigin, BackendKind, QueuedMessageEntry, StreamPath,
-        ToolProgressData,
+        AgentControlProgressKind, AgentId, AgentOrigin, BackendKind, QueuedMessageEntry,
+        StreamPath, ToolProgressData,
     };
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
