@@ -361,87 +361,6 @@ impl CodexSkillProjection {
         self.root.path()
     }
 
-    fn materialize(&self, skill: &ResolvedSkill, ordinal: usize) -> Result<PathBuf, String> {
-        let wrapper_dir = self.path().join(format!("skill-{ordinal:05}"));
-        std::fs::create_dir(&wrapper_dir).map_err(|err| {
-            format!(
-                "Failed to create Codex wrapper for selected skill '{}': {err}",
-                skill.name
-            )
-        })?;
-
-        let original = skill.load_body()?;
-        let instructional_body = codex_skill_instructional_body(&original);
-        let description = skill.description.as_deref().unwrap_or(&skill.name);
-        let name = serde_json::to_string(&skill.name)
-            .map_err(|err| format!("Failed to quote Codex skill name '{}': {err}", skill.name))?;
-        let description = serde_json::to_string(description).map_err(|err| {
-            format!(
-                "Failed to quote Codex skill description '{}': {err}",
-                skill.name
-            )
-        })?;
-        let wrapper_body =
-            format!("---\nname: {name}\ndescription: {description}\n---\n{instructional_body}");
-        let wrapper_skill_md = wrapper_dir.join("SKILL.md");
-        std::fs::write(&wrapper_skill_md, wrapper_body).map_err(|err| {
-            format!(
-                "Failed to write Codex wrapper for selected skill '{}': {err}",
-                skill.name
-            )
-        })?;
-
-        let source_dir = std::fs::canonicalize(&skill.source_dir).map_err(|err| {
-            format!(
-                "Failed to inspect selected skill resources {}: {err}",
-                skill.source_dir.display()
-            )
-        })?;
-        for entry in std::fs::read_dir(&source_dir).map_err(|err| {
-            format!(
-                "Failed to read selected skill resources {}: {err}",
-                source_dir.display()
-            )
-        })? {
-            let entry = entry.map_err(|err| {
-                format!(
-                    "Failed to read selected skill resources {}: {err}",
-                    source_dir.display()
-                )
-            })?;
-            if entry.file_name() == std::ffi::OsStr::new("SKILL.md") {
-                continue;
-            }
-            create_codex_resource_link(&entry.path(), &wrapper_dir.join(entry.file_name()))
-                .map_err(|err| {
-                    format!(
-                        "Failed to link resource for selected Codex skill '{}': {err}",
-                        skill.name
-                    )
-                })?;
-        }
-
-        let wrapper_skill_md = std::fs::canonicalize(&wrapper_skill_md).map_err(|err| {
-            format!(
-                "Failed to inspect Codex wrapper for selected skill '{}': {err}",
-                skill.name
-            )
-        })?;
-        Ok(wrapper_skill_md)
-    }
-
-    fn discard_wrapper(&self, ordinal: usize) -> Result<(), String> {
-        let wrapper_dir = self.path().join(format!("skill-{ordinal:05}"));
-        match std::fs::remove_dir_all(&wrapper_dir) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(format!(
-                "Failed to remove incomplete Codex skill wrapper {}: {err}",
-                wrapper_dir.display()
-            )),
-        }
-    }
-
     fn remove(self) {
         let path = self.path().to_path_buf();
         if let Err(err) = self.root.close() {
@@ -466,33 +385,186 @@ fn create_codex_skill_tempdir() -> Result<tempfile::TempDir, String> {
                 parent.display()
             )
         })?;
-        return tempfile::Builder::new()
+        let root = tempfile::Builder::new()
             .prefix(CODEX_SKILLS_ROOT_PREFIX)
             .tempdir_in(&parent)
-            .map_err(|err| format!("Failed to create Codex session skill root: {err}"));
+            .map_err(|err| format!("Failed to create Codex session skill root: {err}"))?;
+        restrict_codex_directory(root.path())?;
+        return Ok(root);
     }
 
-    tempfile::Builder::new()
+    let root = tempfile::Builder::new()
         .prefix(CODEX_SKILLS_ROOT_PREFIX)
         .tempdir()
-        .map_err(|err| format!("Failed to create Codex session skill root: {err}"))
+        .map_err(|err| format!("Failed to create Codex session skill root: {err}"))?;
+    restrict_codex_directory(root.path())?;
+    Ok(root)
 }
 
-fn codex_skill_instructional_body(body: &str) -> &str {
-    let Some(first_newline) = body.find('\n') else {
-        return body;
-    };
-    if body[..first_newline].trim_end_matches('\r') != "---" {
-        return body;
-    }
-    let mut offset = first_newline + 1;
-    for line in body[offset..].split_inclusive('\n') {
-        if line.trim_end_matches(&['\r', '\n'][..]) == "---" {
-            return &body[offset + line.len()..];
+fn materialize_codex_skill(
+    projection_root: &Path,
+    skill: &ResolvedSkill,
+    ordinal: usize,
+) -> Result<PathBuf, String> {
+    let wrapper_dir = projection_root.join(format!("skill-{ordinal:05}"));
+    std::fs::create_dir(&wrapper_dir).map_err(|err| {
+        format!(
+            "Failed to create Codex wrapper for selected skill '{}': {err}",
+            skill.name
+        )
+    })?;
+    restrict_codex_directory(&wrapper_dir)?;
+
+    let original = skill.load_body()?;
+    let instructional_body = parse_codex_skill_instructional_body(&original)
+        .map_err(|err| format!("Selected Codex skill '{}': {err}", skill.name))?;
+    let description = skill.description.as_deref().unwrap_or(&skill.name);
+    let name = serde_json::to_string(&skill.name)
+        .map_err(|err| format!("Failed to quote Codex skill name '{}': {err}", skill.name))?;
+    let description = serde_json::to_string(description).map_err(|err| {
+        format!(
+            "Failed to quote Codex skill description '{}': {err}",
+            skill.name
+        )
+    })?;
+    let wrapper_body =
+        format!("---\nname: {name}\ndescription: {description}\n---\n{instructional_body}");
+    let wrapper_skill_md = wrapper_dir.join("SKILL.md");
+    std::fs::write(&wrapper_skill_md, wrapper_body).map_err(|err| {
+        format!(
+            "Failed to write Codex wrapper for selected skill '{}': {err}",
+            skill.name
+        )
+    })?;
+    restrict_codex_file(&wrapper_skill_md)?;
+
+    let source_dir = std::fs::canonicalize(&skill.source_dir).map_err(|err| {
+        format!(
+            "Failed to inspect selected skill resources {}: {err}",
+            skill.source_dir.display()
+        )
+    })?;
+    for entry in std::fs::read_dir(&source_dir).map_err(|err| {
+        format!(
+            "Failed to read selected skill resources {}: {err}",
+            source_dir.display()
+        )
+    })? {
+        let entry = entry.map_err(|err| {
+            format!(
+                "Failed to read selected skill resources {}: {err}",
+                source_dir.display()
+            )
+        })?;
+        if entry.file_name() == std::ffi::OsStr::new("SKILL.md") {
+            continue;
         }
-        offset += line.len();
+        create_codex_resource_link(&entry.path(), &wrapper_dir.join(entry.file_name())).map_err(
+            |err| {
+                format!(
+                    "Failed to link resource for selected Codex skill '{}': {err}",
+                    skill.name
+                )
+            },
+        )?;
     }
-    body
+
+    std::fs::canonicalize(&wrapper_skill_md).map_err(|err| {
+        format!(
+            "Failed to inspect Codex wrapper for selected skill '{}': {err}",
+            skill.name
+        )
+    })
+}
+
+fn discard_codex_skill_wrapper(projection_root: &Path, ordinal: usize) -> Result<(), String> {
+    let wrapper_dir = projection_root.join(format!("skill-{ordinal:05}"));
+    match std::fs::remove_dir_all(&wrapper_dir) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!(
+            "Failed to remove incomplete Codex skill wrapper {}: {err}",
+            wrapper_dir.display()
+        )),
+    }
+}
+
+fn parse_codex_skill_instructional_body(body: &str) -> Result<&str, String> {
+    let body = body.strip_prefix('\u{feff}').unwrap_or(body);
+    let Some(rest) = body
+        .strip_prefix("---\n")
+        .or_else(|| body.strip_prefix("---\r\n"))
+    else {
+        return Ok(body);
+    };
+    let (frontmatter, instructional_body) = if let Some(index) = rest.find("\n---\n") {
+        (&rest[..index], &rest[index + 5..])
+    } else if let Some(index) = rest.find("\n---\r\n") {
+        (&rest[..index], &rest[index + 6..])
+    } else if let Some(frontmatter) = rest.strip_suffix("\n---") {
+        (frontmatter, "")
+    } else {
+        return Err("its SKILL.md opens a '---' frontmatter block that is never closed".to_owned());
+    };
+    let value: serde_yaml::Value = serde_yaml::from_str(frontmatter)
+        .map_err(|err| format!("its SKILL.md frontmatter is not valid YAML: {err}"))?;
+    let mapping = match value {
+        serde_yaml::Value::Mapping(mapping) => mapping,
+        serde_yaml::Value::Null => serde_yaml::Mapping::new(),
+        _ => return Err("its SKILL.md frontmatter is not a YAML mapping".to_owned()),
+    };
+    let mut unsupported = Vec::new();
+    for key in mapping.keys() {
+        let Some(key) = key.as_str() else {
+            return Err("its SKILL.md frontmatter has a non-string key".to_owned());
+        };
+        if !matches!(
+            key.trim().to_ascii_lowercase().as_str(),
+            "name" | "description"
+        ) {
+            unsupported.push(key.trim().to_owned());
+        }
+    }
+    if !unsupported.is_empty() {
+        unsupported.sort();
+        return Err(format!(
+            "its SKILL.md frontmatter declares {}, which Tyde cannot prove is inert. Only 'name' and 'description' are carried into a Tyde wrapper",
+            unsupported.join(", ")
+        ));
+    }
+    Ok(instructional_body)
+}
+
+#[cfg(unix)]
+fn restrict_codex_directory(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|err| {
+        format!(
+            "Failed to make Codex skill directory private {}: {err}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn restrict_codex_directory(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_codex_file(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|err| {
+        format!(
+            "Failed to make Codex skill file private {}: {err}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn restrict_codex_file(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 fn create_codex_resource_link(source: &Path, link: &Path) -> Result<(), String> {
@@ -536,17 +608,40 @@ fn create_codex_resource_link(source: &Path, link: &Path) -> Result<(), String> 
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct CodexListedSkill {
     name: String,
     locator: Option<String>,
     enabled: Option<bool>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
+struct CodexSkillCatalogError {
+    name: Option<String>,
+    locator: Option<String>,
+    message: String,
+}
+
+impl CodexSkillCatalogError {
+    fn display(&self) -> String {
+        match self.locator.as_deref() {
+            Some(locator) => format!("{locator}: {}", self.message),
+            None => self.message.clone(),
+        }
+    }
+
+    fn relates_to(&self, name: &str, expected_skill_md: Option<&Path>) -> bool {
+        self.name.as_deref() == Some(name)
+            || self.locator.as_deref().is_some_and(|locator| {
+                expected_skill_md.is_some_and(|expected| Path::new(locator) == expected)
+            })
+    }
+}
+
+#[derive(Clone, Debug)]
 struct CodexSkillCatalog {
     skills: Vec<CodexListedSkill>,
-    errors: Vec<String>,
+    errors: Vec<CodexSkillCatalogError>,
 }
 
 fn parse_codex_skill_catalog(response: &Value) -> Result<CodexSkillCatalog, String> {
@@ -564,16 +659,24 @@ fn parse_codex_skill_catalog(response: &Value) -> Result<CodexSkillCatalog, Stri
             .cloned()
             .unwrap_or_default();
         for skill in listed {
+            let locator = skill.get("path").and_then(Value::as_str).map(str::to_owned);
             let Some(name) = skill.get("name").and_then(Value::as_str) else {
-                errors.push("Codex skills/list entry omitted its name".to_owned());
+                errors.push(CodexSkillCatalogError {
+                    name: locator.as_deref().and_then(codex_skill_name_from_locator),
+                    locator,
+                    message: "Codex skills/list entry omitted or malformed its name".to_owned(),
+                });
                 continue;
             };
-            let locator = skill.get("path").and_then(Value::as_str).map(str::to_owned);
             let enabled = skill.get("enabled").and_then(Value::as_bool);
             if enabled.is_none() {
-                errors.push(format!(
-                    "Codex skills/list entry '{name}' omitted its enabled state"
-                ));
+                errors.push(CodexSkillCatalogError {
+                    name: Some(name.to_owned()),
+                    locator: locator.clone(),
+                    message: format!(
+                        "Codex skills/list entry '{name}' omitted or malformed its enabled state"
+                    ),
+                });
             }
             skills.push(CodexListedSkill {
                 name: name.to_owned(),
@@ -583,20 +686,34 @@ fn parse_codex_skill_catalog(response: &Value) -> Result<CodexSkillCatalog, Stri
         }
         if let Some(listed_errors) = entry.get("errors").and_then(Value::as_array) {
             for error in listed_errors {
-                let path = error
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .unwrap_or("<unknown>");
+                let path = error.get("path").and_then(Value::as_str).map(str::to_owned);
                 let message = error
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown discovery error");
-                errors.push(format!("{path}: {message}"));
+                errors.push(CodexSkillCatalogError {
+                    name: path.as_deref().and_then(codex_skill_name_from_locator),
+                    locator: path,
+                    message: message.to_owned(),
+                });
             }
         }
     }
 
     Ok(CodexSkillCatalog { skills, errors })
+}
+
+fn codex_skill_name_from_locator(locator: &str) -> Option<String> {
+    let path = Path::new(locator);
+    if !path.is_absolute() {
+        return None;
+    }
+    let parent = if path.file_name() == Some(std::ffi::OsStr::new("SKILL.md")) {
+        path.parent()?
+    } else {
+        path
+    };
+    parent.file_name()?.to_str().map(str::to_owned)
 }
 
 fn codex_listed_filesystem_skill_md(skill: &CodexListedSkill) -> Result<Option<PathBuf>, String> {
@@ -829,18 +946,68 @@ struct CodexSkillSetup {
     diagnostics: Vec<String>,
 }
 
+#[derive(Clone)]
 enum CodexExpectedSkillVisibility {
     Native(PathBuf),
     Projected(PathBuf),
+}
+
+impl CodexExpectedSkillVisibility {
+    fn skill_md(&self) -> &Path {
+        match self {
+            Self::Native(path) | Self::Projected(path) => path,
+        }
+    }
+
+    fn is_projected(&self) -> bool {
+        matches!(self, Self::Projected(_))
+    }
+}
+
+#[derive(Clone)]
+struct CodexPreparedSkill {
+    ordinal: usize,
+    skill: ResolvedSkill,
+    visibility: CodexExpectedSkillVisibility,
+}
+
+struct CodexSkillPreparation {
+    prepared: Vec<CodexPreparedSkill>,
+    diagnostics: Vec<String>,
 }
 
 fn prepare_codex_selected_skill(
     selected: &ResolvedSkill,
     ordinal: usize,
     baseline: &CodexSkillCatalog,
-    projection: &CodexSkillProjection,
+    projection_root: &Path,
     manifests: &mut HashMap<PathBuf, CodexSkillTreeManifest>,
 ) -> Result<CodexExpectedSkillVisibility, String> {
+    let related_errors = baseline
+        .errors
+        .iter()
+        .filter(|error| error.relates_to(&selected.name, None))
+        .map(CodexSkillCatalogError::display)
+        .collect::<Vec<_>>();
+    if !related_errors.is_empty() {
+        return Err(format!(
+            "Selected Tyde skill '{}' is ambiguous because Codex reported related discovery errors: {}",
+            selected.name,
+            related_errors.join("; ")
+        ));
+    }
+    let unknown = baseline
+        .skills
+        .iter()
+        .filter(|skill| skill.name == selected.name && skill.enabled.is_none())
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "Selected Tyde skill '{}' conflicts with {} same-name Codex catalog entry or entries whose enabled state is unknown",
+            selected.name,
+            unknown.len()
+        ));
+    }
     let same_name = baseline
         .skills
         .iter()
@@ -878,68 +1045,152 @@ fn prepare_codex_selected_skill(
 
     match equivalent_visible {
         Some(native_skill_md) => Ok(CodexExpectedSkillVisibility::Native(native_skill_md)),
-        None => projection
-            .materialize(selected, ordinal)
+        None => materialize_codex_skill(projection_root, selected, ordinal)
             .map(CodexExpectedSkillVisibility::Projected),
     }
 }
 
-async fn configure_codex_native_skills(
-    rpc: &CodexRpc,
-    cwd: &str,
-    projection: &CodexSkillProjection,
-    selected_skills: &[ResolvedSkill],
+fn prepare_codex_skills_blocking(
+    selected_skills: Vec<ResolvedSkill>,
+    baseline: CodexSkillCatalog,
+    projection_root: PathBuf,
     selection: SkillSelection,
-) -> Result<CodexSkillSetup, String> {
-    let baseline = codex_list_skills(rpc, cwd).await?;
-    let mut diagnostics = codex_skill_catalog_diagnostics("baseline", &baseline.errors);
-    let mut projected = 0usize;
+) -> Result<CodexSkillPreparation, String> {
     let mut manifests = HashMap::<PathBuf, CodexSkillTreeManifest>::new();
-    let mut expected = HashMap::<String, CodexExpectedSkillVisibility>::new();
     let mut prepared = Vec::new();
-
-    for (ordinal, selected) in selected_skills.iter().enumerate() {
-        let visibility = match prepare_codex_selected_skill(
-            selected,
+    let mut diagnostics = Vec::new();
+    for (ordinal, selected) in selected_skills.into_iter().enumerate() {
+        match prepare_codex_selected_skill(
+            &selected,
             ordinal,
             &baseline,
-            projection,
+            &projection_root,
             &mut manifests,
         ) {
-            Ok(visibility) => visibility,
-            Err(err) if selection == SkillSelection::Explicit => return Err(err),
+            Ok(visibility) => prepared.push(CodexPreparedSkill {
+                ordinal,
+                skill: selected,
+                visibility,
+            }),
+            Err(err) if selection == SkillSelection::Explicit => {
+                discard_codex_skill_wrapper(&projection_root, ordinal)?;
+                return Err(err);
+            }
             Err(err) => {
-                projection.discard_wrapper(ordinal)?;
+                discard_codex_skill_wrapper(&projection_root, ordinal)?;
                 tracing::warn!("Default Codex skill selection degraded: {err}");
                 diagnostics.push(format!(
                     "Default Codex session omitted Tyde skill '{}': {err}",
                     selected.name
                 ));
-                continue;
-            }
-        };
-        match visibility {
-            CodexExpectedSkillVisibility::Native(native_skill_md) => {
-                expected.insert(
-                    selected.name.clone(),
-                    CodexExpectedSkillVisibility::Native(native_skill_md),
-                );
-            }
-            CodexExpectedSkillVisibility::Projected(wrapper_skill_md) => {
-                expected.insert(
-                    selected.name.clone(),
-                    CodexExpectedSkillVisibility::Projected(wrapper_skill_md),
-                );
-                projected += 1;
             }
         }
-        prepared.push(selected);
     }
+    Ok(CodexSkillPreparation {
+        prepared,
+        diagnostics,
+    })
+}
 
-    let extra_roots = if projected == 0 {
-        Vec::new()
+fn verify_codex_prepared_skills_blocking(
+    prepared: &[CodexPreparedSkill],
+    catalog: &CodexSkillCatalog,
+) -> Vec<(usize, String)> {
+    prepared
+        .iter()
+        .enumerate()
+        .filter_map(|(index, prepared)| {
+            verify_codex_prepared_skill(prepared, catalog)
+                .err()
+                .map(|err| (index, err))
+        })
+        .collect()
+}
+
+fn verify_codex_prepared_skill(
+    prepared: &CodexPreparedSkill,
+    catalog: &CodexSkillCatalog,
+) -> Result<(), String> {
+    let selected = &prepared.skill;
+    let expected_skill_md = prepared.visibility.skill_md();
+    let related_errors = catalog
+        .errors
+        .iter()
+        .filter(|error| error.relates_to(&selected.name, Some(expected_skill_md)))
+        .map(CodexSkillCatalogError::display)
+        .collect::<Vec<_>>();
+    if !related_errors.is_empty() {
+        return Err(format!(
+            "Selected Codex skill '{}' is ambiguous because final discovery reported related errors: {}",
+            selected.name,
+            related_errors.join("; ")
+        ));
+    }
+    let same_name = catalog
+        .skills
+        .iter()
+        .filter(|skill| skill.name == selected.name)
+        .collect::<Vec<_>>();
+    if same_name.iter().any(|skill| skill.enabled.is_none()) {
+        return Err(format!(
+            "Selected Codex skill '{}' is ambiguous because a same-name catalog entry has an unknown enabled state",
+            selected.name
+        ));
+    }
+    let enabled = same_name
+        .iter()
+        .copied()
+        .filter(|skill| skill.enabled == Some(true))
+        .collect::<Vec<_>>();
+    if enabled.len() != 1 {
+        let matches = same_name
+            .iter()
+            .map(|skill| {
+                format!(
+                    "{} ({})",
+                    skill.locator.as_deref().unwrap_or("<opaque>"),
+                    match skill.enabled {
+                        Some(true) => "enabled",
+                        Some(false) => "disabled",
+                        None => "unknown",
+                    }
+                )
+            })
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "Selected Codex skill '{}' must resolve to exactly one enabled entry after skills/extraRoots/set; found {} [{}]",
+            selected.name,
+            enabled.len(),
+            matches.join(", ")
+        ));
+    }
+    let visible_skill_md = codex_listed_filesystem_skill_md(enabled[0])?.ok_or_else(|| {
+        format!(
+            "Selected Codex skill '{}' resolved to non-filesystem locator {}",
+            selected.name,
+            enabled[0].locator.as_deref().unwrap_or("<opaque>")
+        )
+    })?;
+    if visible_skill_md != expected_skill_md {
+        return Err(format!(
+            "Selected Tyde skill '{}' resolved to unexpected Codex skill path {} instead of {}",
+            selected.name,
+            visible_skill_md.display(),
+            expected_skill_md.display()
+        ));
+    }
+    Ok(())
+}
+
+async fn set_codex_skill_extra_roots(
+    rpc: &CodexRpc,
+    projection_root: &Path,
+    prepared: &[CodexPreparedSkill],
+) -> Result<(), String> {
+    let extra_roots = if prepared.iter().any(|skill| skill.visibility.is_projected()) {
+        vec![projection_root.to_string_lossy().into_owned()]
     } else {
-        vec![projection.path().to_string_lossy().into_owned()]
+        Vec::new()
     };
     if let Err(err) = rpc
         .request(
@@ -955,77 +1206,111 @@ async fn configure_codex_native_skills(
             "Codex skills/extraRoots/set failed before thread creation: {err}"
         ));
     }
+    Ok(())
+}
 
-    let final_catalog = codex_list_skills(rpc, cwd).await?;
-    diagnostics.extend(codex_skill_catalog_diagnostics(
-        "final",
-        &final_catalog.errors,
-    ));
-    for selected in &prepared {
-        let enabled = final_catalog
-            .skills
-            .iter()
-            .filter(|skill| skill.enabled == Some(true) && skill.name == selected.name)
-            .collect::<Vec<_>>();
-        if enabled.len() != 1 {
-            let matches = final_catalog
-                .skills
-                .iter()
-                .filter(|skill| skill.name == selected.name)
-                .map(|skill| {
-                    format!(
-                        "{} ({})",
-                        skill.locator.as_deref().unwrap_or("<opaque>"),
-                        match skill.enabled {
-                            Some(true) => "enabled",
-                            Some(false) => "disabled",
-                            None => "unknown",
-                        }
-                    )
-                })
-                .collect::<Vec<_>>();
-            let errors = if final_catalog.errors.is_empty() {
-                String::new()
-            } else {
-                format!(" Discovery errors: {}", final_catalog.errors.join("; "))
-            };
-            return Err(format!(
-                "Selected Codex skill '{}' must resolve to exactly one enabled entry after skills/extraRoots/set; found {} [{}].{}",
-                selected.name,
-                enabled.len(),
-                matches.join(", "),
-                errors
-            ));
-        }
-        let visible_skill_md = codex_listed_filesystem_skill_md(enabled[0])?.ok_or_else(|| {
-            format!(
-                "Selected Codex skill '{}' resolved to non-filesystem locator {}",
-                selected.name,
-                enabled[0].locator.as_deref().unwrap_or("<opaque>")
-            )
-        })?;
-        let expected_skill_md = match expected.get(&selected.name) {
-            Some(CodexExpectedSkillVisibility::Native(path))
-            | Some(CodexExpectedSkillVisibility::Projected(path)) => path,
-            None => {
-                return Err(format!(
-                    "Codex selected skill '{}' lost its startup verification state",
-                    selected.name
-                ));
+async fn configure_codex_native_skills(
+    rpc: &CodexRpc,
+    cwd: &str,
+    projection: &CodexSkillProjection,
+    selected_skills: &[ResolvedSkill],
+    selection: SkillSelection,
+) -> Result<CodexSkillSetup, String> {
+    let baseline = codex_list_skills(rpc, cwd).await?;
+    let mut diagnostics = codex_skill_catalog_diagnostics("baseline", &baseline.errors);
+    let selected = selected_skills.to_vec();
+    let projection_root = projection.path().to_path_buf();
+    let preparation = tokio::task::spawn_blocking(move || {
+        prepare_codex_skills_blocking(selected, baseline, projection_root, selection)
+    })
+    .await
+    .map_err(|err| format!("Codex skill preparation task failed: {err}"))??;
+    diagnostics.extend(preparation.diagnostics);
+    let mut prepared = preparation.prepared;
+
+    if prepared.is_empty() && selection == SkillSelection::AllInstalled {
+        tracing::debug!(
+            "Codex Default selection exposed no Tyde skills; skipping skills/extraRoots/set"
+        );
+        return Ok(CodexSkillSetup {
+            exposed_names: Vec::new(),
+            diagnostics,
+        });
+    }
+
+    set_codex_skill_extra_roots(rpc, projection.path(), &prepared).await?;
+    let maximum_verifications = selected_skills.len() + 1;
+    for verification in 0..maximum_verifications {
+        let final_catalog = codex_list_skills(rpc, cwd).await?;
+        for diagnostic in codex_skill_catalog_diagnostics("final", &final_catalog.errors) {
+            if !diagnostics.contains(&diagnostic) {
+                diagnostics.push(diagnostic);
             }
-        };
-        if &visible_skill_md != expected_skill_md {
+        }
+        let prepared_for_verification = prepared.clone();
+        let catalog_for_verification = final_catalog.clone();
+        let failures = tokio::task::spawn_blocking(move || {
+            verify_codex_prepared_skills_blocking(
+                &prepared_for_verification,
+                &catalog_for_verification,
+            )
+        })
+        .await
+        .map_err(|err| format!("Codex skill verification task failed: {err}"))?;
+        if failures.is_empty() {
+            break;
+        }
+        if selection == SkillSelection::Explicit {
+            return Err(failures[0].1.clone());
+        }
+        if verification + 1 == maximum_verifications {
             return Err(format!(
-                "Selected Tyde skill '{}' resolved to unexpected Codex skill path {} instead of {}",
-                selected.name,
-                visible_skill_md.display(),
-                expected_skill_md.display()
+                "Codex skill verification did not converge after {maximum_verifications} catalog checks"
             ));
         }
+
+        let failed_indices = failures
+            .iter()
+            .map(|(index, _)| *index)
+            .collect::<HashSet<_>>();
+        for (index, err) in &failures {
+            let selected = &prepared[*index].skill;
+            let diagnostic = format!(
+                "Default Codex session omitted Tyde skill '{}': {err}",
+                selected.name
+            );
+            tracing::warn!("{diagnostic}");
+            diagnostics.push(diagnostic);
+        }
+        let projection_root = projection.path().to_path_buf();
+        let failed_wrappers = failures
+            .iter()
+            .filter_map(|(index, _)| {
+                let prepared = &prepared[*index];
+                prepared
+                    .visibility
+                    .is_projected()
+                    .then_some(prepared.ordinal)
+            })
+            .collect::<Vec<_>>();
+        tokio::task::spawn_blocking(move || {
+            for ordinal in failed_wrappers {
+                discard_codex_skill_wrapper(&projection_root, ordinal)?;
+            }
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|err| format!("Codex skill cleanup task failed: {err}"))??;
+        prepared = prepared
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, prepared)| (!failed_indices.contains(&index)).then_some(prepared))
+            .collect();
+        set_codex_skill_extra_roots(rpc, projection.path(), &prepared).await?;
     }
     let exposed_names = prepared
         .into_iter()
-        .map(|skill| skill.name.clone())
+        .map(|prepared| prepared.skill.name)
         .collect::<Vec<_>>();
     tracing::debug!(
         "Codex session exposed {} selected skill(s): {}",
@@ -1038,10 +1323,10 @@ async fn configure_codex_native_skills(
     })
 }
 
-fn codex_skill_catalog_diagnostics(phase: &str, errors: &[String]) -> Vec<String> {
+fn codex_skill_catalog_diagnostics(phase: &str, errors: &[CodexSkillCatalogError]) -> Vec<String> {
     errors
         .iter()
-        .map(|error| format!("Codex {phase} skills/list diagnostic: {error}"))
+        .map(|error| format!("Codex {phase} skills/list diagnostic: {}", error.display()))
         .collect()
 }
 
@@ -13981,6 +14266,20 @@ for line in sys.stdin:
                 extra_skill_roots,
                 enabled=(MODE != "skills_final_disabled")
             )
+        if MODE == "skills_final_missing_default" and skills_list_count > 1:
+            skills = [skill for skill in skills if skill.get("name") != "broken"]
+        if MODE == "skills_final_disabled_default" and skills_list_count > 1:
+            for skill in skills:
+                if skill.get("name") == "broken":
+                    skill["enabled"] = False
+        if MODE == "skills_final_name_shape_default" and skills_list_count > 1:
+            for skill in skills:
+                if skill.get("name") == "broken":
+                    skill["name"] = {"malformed": True}
+        if MODE == "skills_native_enabled_shape":
+            for skill in skills:
+                if skill.get("name") == "broken":
+                    skill["enabled"] = "unknown"
         if MODE == "skills_nonfilesystem_locator":
             skills.append({
                 "name": "opaque-native",
@@ -14742,6 +15041,18 @@ for line in sys.stdin:
             .map(|entry| entry.expect("projection entry").path())
             .collect::<Vec<_>>();
         assert_eq!(wrappers.len(), 2);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&projection)
+                    .expect("projection metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
         for (ordinal, skill) in selected.iter().enumerate() {
             let wrapper = projection.join(format!("skill-{ordinal:05}"));
             let wrapper_body =
@@ -14758,6 +15069,26 @@ for line in sys.stdin:
                     .expect("resolve wrapper resource directory"),
                 skill.source_dir.join("scripts")
             );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&wrapper)
+                        .expect("wrapper metadata")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o700
+                );
+                assert_eq!(
+                    std::fs::metadata(wrapper.join("SKILL.md"))
+                        .expect("wrapper SKILL.md metadata")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
         }
         assert!(!wrappers.iter().any(|wrapper| {
             std::fs::read_to_string(wrapper.join("SKILL.md"))
@@ -14858,6 +15189,281 @@ for line in sys.stdin:
         session.shutdown().await;
         assert!(!projection.exists());
         assert!(selected.iter().all(|skill| skill.skill_md_path.exists()));
+    }
+
+    #[tokio::test]
+    async fn codex_malformed_frontmatter_is_policy_aware_and_empty_default_skips_capability() {
+        {
+            let fake = CodexFakeAppServer::new("ok", "unused");
+            let native_home = tempfile::tempdir().expect("native Codex home");
+            let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
+                fake.binary.clone(),
+                Some(native_home.path().to_path_buf()),
+            );
+            let workspace = tempfile::tempdir().expect("workspace");
+            let store = tempfile::tempdir().expect("Tyde skill store");
+            let selected = vec![write_codex_raw_skill(
+                store.path(),
+                "broken",
+                Some("Broken fixture"),
+                "---\nname: broken\ndescription: never closed\ninstructions\n",
+            )];
+
+            let (session, mut raw_events) = CodexSession::spawn_with_mode(
+                &[workspace.path().to_string_lossy().to_string()],
+                None,
+                &[],
+                None,
+                codex_native_skill_spawn_options_with_selection(
+                    &selected,
+                    SkillSelection::AllInstalled,
+                ),
+            )
+            .await
+            .expect("Default must omit malformed source frontmatter");
+            let diagnostic = raw_events
+                .try_recv()
+                .expect("malformed frontmatter degradation diagnostic");
+            assert!(
+                diagnostic
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains("frontmatter block that is never closed"))
+            );
+            let methods = fake
+                .requests()
+                .into_iter()
+                .filter_map(|request| {
+                    request
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(methods, vec!["initialize", "skills/list", "thread/start"]);
+            session.shutdown().await;
+        }
+
+        {
+            let fake = CodexFakeAppServer::new("ok", "unused");
+            let native_home = tempfile::tempdir().expect("native Codex home");
+            let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
+                fake.binary.clone(),
+                Some(native_home.path().to_path_buf()),
+            );
+            let workspace = tempfile::tempdir().expect("workspace");
+            let store = tempfile::tempdir().expect("Tyde skill store");
+            let selected = vec![write_codex_raw_skill(
+                store.path(),
+                "broken",
+                Some("Broken fixture"),
+                "---\nname: broken\ndescription: never closed\ninstructions\n",
+            )];
+
+            let result = CodexSession::spawn_with_mode(
+                &[workspace.path().to_string_lossy().to_string()],
+                None,
+                &[],
+                None,
+                codex_native_skill_spawn_options(&selected),
+            )
+            .await;
+            let err = match result {
+                Ok((session, _)) => {
+                    session.shutdown().await;
+                    panic!("Explicit must refuse malformed source frontmatter")
+                }
+                Err(err) => err,
+            };
+            assert!(err.contains("frontmatter block that is never closed"));
+            assert!(!fake.requests().iter().any(|request| {
+                request.get("method").and_then(Value::as_str) == Some("skills/extraRoots/set")
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_final_catalog_failures_degrade_default_and_fail_explicit() {
+        for (mode, expected) in [
+            (
+                "skills_final_missing_default",
+                "must resolve to exactly one enabled entry",
+            ),
+            (
+                "skills_final_disabled_default",
+                "must resolve to exactly one enabled entry",
+            ),
+            (
+                "skills_final_name_shape_default",
+                "final discovery reported related errors",
+            ),
+        ] {
+            {
+                let fake = CodexFakeAppServer::new(mode, "unused");
+                let native_home = tempfile::tempdir().expect("native Codex home");
+                let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
+                    fake.binary.clone(),
+                    Some(native_home.path().to_path_buf()),
+                );
+                let workspace = tempfile::tempdir().expect("workspace");
+                let store = tempfile::tempdir().expect("Tyde skill store");
+                let selected = vec![
+                    write_codex_skill(store.path(), "broken", "broken body"),
+                    write_codex_skill(store.path(), "available", "available body"),
+                ];
+
+                let (session, mut raw_events) = CodexSession::spawn_with_mode(
+                    &[workspace.path().to_string_lossy().to_string()],
+                    None,
+                    &[],
+                    None,
+                    codex_native_skill_spawn_options_with_selection(
+                        &selected,
+                        SkillSelection::AllInstalled,
+                    ),
+                )
+                .await
+                .expect("Default must omit a final-invalid skill and reverify the remainder");
+                let diagnostics = std::iter::from_fn(|| raw_events.try_recv().ok())
+                    .filter_map(|event| {
+                        event.get("data").and_then(Value::as_str).map(str::to_owned)
+                    })
+                    .collect::<Vec<_>>();
+                assert!(diagnostics.iter().any(|diagnostic| {
+                    diagnostic.contains("omitted Tyde skill 'broken'")
+                        && diagnostic.contains(expected)
+                }));
+                assert!(
+                    !diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.contains("omitted Tyde skill 'available'"))
+                );
+
+                let requests = fake.requests();
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|request| {
+                            request.get("method").and_then(Value::as_str)
+                                == Some("skills/extraRoots/set")
+                        })
+                        .count(),
+                    2
+                );
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|request| {
+                            request.get("method").and_then(Value::as_str) == Some("skills/list")
+                        })
+                        .count(),
+                    3
+                );
+                let projection = codex_extra_root(&requests).expect("projection root");
+                assert!(!projection.join("skill-00000").exists());
+                assert!(projection.join("skill-00001").join("SKILL.md").exists());
+                assert!(requests.iter().any(|request| {
+                    request.get("method").and_then(Value::as_str) == Some("thread/start")
+                }));
+                session.shutdown().await;
+            }
+
+            {
+                let fake = CodexFakeAppServer::new(mode, "unused");
+                let native_home = tempfile::tempdir().expect("native Codex home");
+                let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
+                    fake.binary.clone(),
+                    Some(native_home.path().to_path_buf()),
+                );
+                let workspace = tempfile::tempdir().expect("workspace");
+                let store = tempfile::tempdir().expect("Tyde skill store");
+                let selected = vec![write_codex_skill(store.path(), "broken", "broken body")];
+
+                let result = CodexSession::spawn_with_mode(
+                    &[workspace.path().to_string_lossy().to_string()],
+                    None,
+                    &[],
+                    None,
+                    codex_native_skill_spawn_options(&selected),
+                )
+                .await;
+                let err = match result {
+                    Ok((session, _)) => {
+                        session.shutdown().await;
+                        panic!("Explicit must fail final verification in mode {mode}")
+                    }
+                    Err(err) => err,
+                };
+                assert!(err.contains(expected), "{mode}: {err}");
+                assert!(!fake.requests().iter().any(|request| {
+                    request.get("method").and_then(Value::as_str) == Some("thread/start")
+                }));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_unknown_enabled_state_is_selected_skill_ambiguity() {
+        for selection in [SkillSelection::AllInstalled, SkillSelection::Explicit] {
+            let fake = CodexFakeAppServer::new("skills_native_enabled_shape", "unused");
+            let native_home = tempfile::tempdir().expect("native Codex home");
+            let native_root = native_home.path().join("skills");
+            std::fs::create_dir_all(&native_root).expect("native skill root");
+            let _native = write_codex_skill(&native_root, "broken", "native body");
+            let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
+                fake.binary.clone(),
+                Some(native_home.path().to_path_buf()),
+            );
+            let workspace = tempfile::tempdir().expect("workspace");
+            let store = tempfile::tempdir().expect("Tyde skill store");
+            let mut selected = vec![write_codex_skill(store.path(), "broken", "selected body")];
+            if selection == SkillSelection::AllInstalled {
+                selected.push(write_codex_skill(
+                    store.path(),
+                    "available",
+                    "available body",
+                ));
+            }
+
+            let result = CodexSession::spawn_with_mode(
+                &[workspace.path().to_string_lossy().to_string()],
+                None,
+                &[],
+                None,
+                codex_native_skill_spawn_options_with_selection(&selected, selection),
+            )
+            .await;
+            match selection {
+                SkillSelection::AllInstalled => {
+                    let (session, mut raw_events) =
+                        result.expect("Default must omit unknown-enabled collision");
+                    let diagnostics = std::iter::from_fn(|| raw_events.try_recv().ok())
+                        .filter_map(|event| {
+                            event.get("data").and_then(Value::as_str).map(str::to_owned)
+                        })
+                        .collect::<Vec<_>>();
+                    assert!(diagnostics.iter().any(|diagnostic| {
+                        diagnostic.contains("omitted Tyde skill 'broken'")
+                            && diagnostic.contains("enabled")
+                    }));
+                    session.shutdown().await;
+                }
+                SkillSelection::Explicit => {
+                    let err = match result {
+                        Ok((session, _)) => {
+                            session.shutdown().await;
+                            panic!("Explicit must fail unknown-enabled collision")
+                        }
+                        Err(err) => err,
+                    };
+                    assert!(err.contains("discovery errors") || err.contains("enabled state"));
+                    assert!(!fake.requests().iter().any(|request| {
+                        request.get("method").and_then(Value::as_str)
+                            == Some("skills/extraRoots/set")
+                    }));
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -19519,6 +20125,90 @@ for line in sys.stdin:
             );
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+    }
+
+    #[test]
+    #[ignore = "Required live Codex native-skill wrapper identity/resource smoke. Use --ignored and TYDE_RUN_REAL_AI_TESTS=1."]
+    fn live_codex_native_skill_wrapper_identity_and_resource_smoke() {
+        if !live_codex_tests_enabled() {
+            skip_live_codex_test();
+            return;
+        }
+        assert!(
+            std::process::Command::new("codex")
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success()),
+            "required live Codex native-skill smoke needs an installed Codex CLI"
+        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let workspace = tempfile::tempdir().expect("live skill workspace");
+            let store = tempfile::tempdir().expect("live skill store");
+            let selected = write_codex_raw_skill(
+                store.path(),
+                "live-wrapper-smoke",
+                Some("Required wrapper identity and linked-resource smoke"),
+                "---\nname: deliberately-wrong-source-name\ndescription: stale source metadata\n---\nWhen invoked, read reference.md and reply with exactly one line in this format: IDENTITY=live-wrapper-smoke RESOURCE=<the complete contents of reference.md>\n",
+            );
+            std::fs::write(
+                selected.source_dir.join("reference.md"),
+                "LIVE_WRAPPER_RESOURCE_7F31",
+            )
+            .expect("write live linked-resource sentinel");
+            let selected_skills = vec![selected];
+            let (session, mut event_rx) = CodexSession::spawn_with_mode(
+                &[workspace.path().to_string_lossy().to_string()],
+                None,
+                &[],
+                None,
+                codex_native_skill_spawn_options(&selected_skills),
+            )
+            .await
+            .expect("spawn live Codex session with native selected skill");
+            let model = live_test_select_model(&session)
+                .await
+                .expect("gpt-5.6-luna is required for the live native-skill smoke");
+            session
+                .command_handle()
+                .update_runtime_settings(json!({
+                    "model": model,
+                    "reasoning_effort": "low"
+                }))
+                .await
+                .expect("apply required Luna live-smoke settings");
+            session
+                .command_handle()
+                .execute(SessionCommand::SendMessage {
+                    message:
+                        "Invoke $live-wrapper-smoke now and follow its instructions exactly."
+                            .to_owned(),
+                    images: None,
+                })
+                .await
+                .expect("send live native-skill prompt");
+
+            let expected =
+                "IDENTITY=live-wrapper-smoke RESOURCE=LIVE_WRAPPER_RESOURCE_7F31";
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+            let mut observed = String::new();
+            while tokio::time::Instant::now() < deadline && !observed.contains(expected) {
+                match tokio::time::timeout(Duration::from_secs(3), event_rx.recv()).await {
+                    Ok(Some(event)) => observed.push_str(&event.to_string()),
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
+            }
+            session.shutdown().await;
+            assert!(
+                observed.contains(expected),
+                "live Codex did not expose the normalized wrapper identity and linked resource; events={observed}"
+            );
+        });
     }
 
     #[test]
