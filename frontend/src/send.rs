@@ -66,8 +66,7 @@ thread_local! {
 
 #[cfg(all(test, target_arch = "wasm32"))]
 fn current_seq(host_id: &str, stream: &StreamPath) -> u64 {
-    let host_epoch =
-        HOST_EPOCHS.with(|epochs| epochs.borrow().get(host_id).copied().unwrap_or(0));
+    let host_epoch = HOST_EPOCHS.with(|epochs| epochs.borrow().get(host_id).copied().unwrap_or(0));
     SEQ_MAP.with(|map| {
         map.borrow()
             .get(&(host_id.to_owned(), stream.clone()))
@@ -78,8 +77,7 @@ fn current_seq(host_id: &str, stream: &StreamPath) -> u64 {
 }
 
 fn reserve_seq(host_id: &str, stream: &StreamPath) -> SequenceReservation {
-    let host_epoch =
-        HOST_EPOCHS.with(|epochs| epochs.borrow().get(host_id).copied().unwrap_or(0));
+    let host_epoch = HOST_EPOCHS.with(|epochs| epochs.borrow().get(host_id).copied().unwrap_or(0));
     SEQ_MAP.with(|map| {
         let mut map = map.borrow_mut();
         let cursor = map
@@ -100,11 +98,7 @@ fn reserve_seq(host_id: &str, stream: &StreamPath) -> SequenceReservation {
     })
 }
 
-fn release_seq_if_last(
-    host_id: &str,
-    stream: &StreamPath,
-    reservation: SequenceReservation,
-) {
+fn release_seq_if_last(host_id: &str, stream: &StreamPath, reservation: SequenceReservation) {
     SEQ_MAP.with(|map| {
         let mut map = map.borrow_mut();
         let key = (host_id.to_owned(), stream.clone());
