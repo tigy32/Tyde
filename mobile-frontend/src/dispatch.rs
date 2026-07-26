@@ -583,34 +583,7 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                     local_host_id: host.clone(),
                     agent_id: payload.agent_id.clone(),
                 };
-                if payload.fatal {
-                    state.agents.update(|agents| {
-                        if let Some(agent) = agents
-                            .iter_mut()
-                            .find(|a| a.local_host_id == *host && a.agent_id == payload.agent_id)
-                        {
-                            agent.fatal_error = Some(payload.message.clone());
-                        }
-                    });
-                }
-                let entry = ChatMessageEntry {
-                    message: protocol::ChatMessage {
-                        message_id: None,
-                        timestamp: js_sys::Date::now() as u64,
-                        sender: protocol::MessageSender::Error,
-                        content: payload.message,
-                        reasoning: None,
-                        tool_calls: Vec::new(),
-                        model_info: None,
-                        token_usage: None,
-                        context_breakdown: None,
-                        images: None,
-                    },
-                    tool_requests: Vec::new(),
-                };
-                state.chat_messages.update(|map| {
-                    map.entry(agent_ref).or_default().push(entry);
-                });
+                apply_agent_error(state, &agent_ref, &payload);
             }
         }
         FrameKind::ChatEvent => dispatch_chat_event(state, host, &envelope.stream, &envelope),
@@ -1105,6 +1078,86 @@ fn has_compaction_in_progress_for_host(state: &AppState, host: &LocalHostId) -> 
             agent_ref.local_host_id == *host && payload.status == AgentCompactStatus::Started
         })
     })
+}
+
+/// Idempotent terminal settlement for an agent that died with
+/// `AgentError { fatal: true }`.
+///
+/// A fatal error *is* the terminal event (dev-docs/03-agents.md "Termination"):
+/// the stream is dead, so the `TypingStatusChanged(false)` and
+/// `OperationCancelled` that normally close a turn can never arrive. Without
+/// this, the streaming bubble, the "Responding" header, and the Stop control
+/// all stay live forever on an agent that cannot answer them.
+///
+/// Scoped to exactly one `AgentRef`, so a same-named agent on another host is
+/// untouched. Retained server-owned state (`agent_message_queue`,
+/// `task_lists`, session history) is deliberately *not* dropped — the client
+/// does not own it. Its non-viable action surfaces are gated in the
+/// components instead.
+fn settle_fatal_agent_ui(state: &AppState, agent_ref: &AgentRef) {
+    state.streaming_text.update(|m| {
+        m.remove(agent_ref);
+    });
+    state.agent_turn_active.update(|m| {
+        m.remove(agent_ref);
+    });
+    // Cancelled/Retry cards claim live activity ("Retrying in 800ms…") that a
+    // dead agent can never follow through on. Terminated supersedes them.
+    state.transient_events.update(|m| {
+        m.remove(agent_ref);
+    });
+}
+
+/// True when the exact `(host, agent_id)` registry row is marked fatal.
+fn agent_is_fatal(state: &AppState, agent_ref: &AgentRef) -> bool {
+    state.agents.with_untracked(|agents| {
+        agents.iter().any(|a| {
+            a.local_host_id == agent_ref.local_host_id
+                && a.agent_id == agent_ref.agent_id
+                && a.fatal_error.is_some()
+        })
+    })
+}
+
+/// The single reducer for `AgentErrorPayload`, shared by the live frame and
+/// bootstrap replay so the two cannot drift.
+///
+/// Fatal-only: a non-fatal error appends its Error row and changes nothing
+/// else. That boundary is load-bearing — the recoverable strict-identity
+/// fallback reports `fatal: false` and must stay Idle and reusable.
+///
+/// `agent_ref` is passed in rather than derived from `payload.agent_id`: the
+/// bootstrap replay is already scoped to one agent and must stay on it, so a
+/// payload naming some other agent cannot retarget the snapshot.
+fn apply_agent_error(state: &AppState, agent_ref: &AgentRef, payload: &AgentErrorPayload) {
+    if payload.fatal {
+        state.agents.update(|agents| {
+            if let Some(agent) = agents.iter_mut().find(|a| {
+                a.local_host_id == agent_ref.local_host_id && a.agent_id == agent_ref.agent_id
+            }) {
+                agent.fatal_error = Some(payload.message.clone());
+            }
+        });
+        settle_fatal_agent_ui(state, agent_ref);
+    }
+    let entry = ChatMessageEntry {
+        message: protocol::ChatMessage {
+            message_id: None,
+            timestamp: js_sys::Date::now() as u64,
+            sender: protocol::MessageSender::Error,
+            content: payload.message.clone(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            model_info: None,
+            token_usage: None,
+            context_breakdown: None,
+            images: None,
+        },
+        tool_requests: Vec::new(),
+    };
+    state.chat_messages.update(|map| {
+        map.entry(agent_ref.clone()).or_default().push(entry);
+    });
 }
 
 fn drop_agent_state(state: &AppState, agent_ref: &AgentRef) {
@@ -2335,34 +2388,7 @@ fn apply_agent_bootstrap(
                 });
             }
             AgentBootstrapEvent::AgentError(inner) => {
-                if inner.fatal {
-                    state.agents.update(|agents| {
-                        if let Some(agent) = agents
-                            .iter_mut()
-                            .find(|a| a.local_host_id == *host && a.agent_id == agent_ref.agent_id)
-                        {
-                            agent.fatal_error = Some(inner.message.clone());
-                        }
-                    });
-                }
-                let entry = ChatMessageEntry {
-                    message: protocol::ChatMessage {
-                        message_id: None,
-                        timestamp: js_sys::Date::now() as u64,
-                        sender: protocol::MessageSender::Error,
-                        content: inner.message,
-                        reasoning: None,
-                        tool_calls: Vec::new(),
-                        model_info: None,
-                        token_usage: None,
-                        context_breakdown: None,
-                        images: None,
-                    },
-                    tool_requests: Vec::new(),
-                };
-                state.chat_messages.update(|map| {
-                    map.entry(agent_ref.clone()).or_default().push(entry);
-                });
+                apply_agent_error(state, &agent_ref, &inner);
             }
             AgentBootstrapEvent::SessionSettings(inner) => {
                 state.agent_session_settings.update(|map| {
@@ -2400,6 +2426,21 @@ fn apply_agent_bootstrap(
             // `AgentActivitySummary` frame above.
             AgentBootstrapEvent::AgentActivityStats(_) => {}
         }
+    }
+    // Fatal is terminal authority, and it wins over the snapshot's own
+    // `turn_active`. Two reasons this settles *after* the whole replay rather
+    // than trusting a loop-local flag:
+    //
+    // 1. replayed events that follow the fatal record (a trailing StreamStart,
+    //    a Typing(true)) would otherwise recreate exactly the state the fatal
+    //    error is supposed to have closed;
+    // 2. the agent can already be fatal from an earlier frame, so this
+    //    bootstrap need not carry the original fatal event at all.
+    //
+    // `settle_fatal_agent_ui` is idempotent, so running it again here is free.
+    if agent_is_fatal(state, &agent_ref) {
+        settle_fatal_agent_ui(state, &agent_ref);
+        return;
     }
     state.agent_turn_active.update(|map| {
         if payload.turn_active {
@@ -2533,6 +2574,299 @@ fn chat_event_label(event: &ChatEvent) -> &'static str {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+
+    fn seed_agent(state: &AppState, host: &LocalHostId, agent_id: &str) -> AgentRef {
+        let agent_id = AgentId(agent_id.to_owned());
+        state.agents.update(|agents| {
+            agents.push(AgentInfo {
+                local_host_id: host.clone(),
+                agent_id: agent_id.clone(),
+                name: "Agent".to_owned(),
+                origin: protocol::AgentOrigin::User,
+                backend_kind: protocol::BackendKind::Codex,
+                workspace_roots: Vec::new(),
+                project_id: None,
+                parent_agent_id: None,
+                session_id: None,
+                custom_agent_id: None,
+                created_at_ms: 0,
+                instance_stream: StreamPath(format!("/agent/{}/inst", agent_id.0)),
+                started: true,
+                fatal_error: None,
+            });
+        });
+        AgentRef {
+            local_host_id: host.clone(),
+            agent_id,
+        }
+    }
+
+    /// Put an agent in the exact shape a live turn leaves behind: an open
+    /// stream, an active turn, and a rendered transient card.
+    fn seed_live_turn(state: &AppState, agent_ref: &AgentRef) {
+        state.streaming_text.update(|m| {
+            m.insert(
+                agent_ref.clone(),
+                StreamingState {
+                    agent_name: "Agent".to_owned(),
+                    model: None,
+                    text: leptos::prelude::ArcRwSignal::new("half a thought".to_owned()),
+                    reasoning: leptos::prelude::ArcRwSignal::new(String::new()),
+                    tool_requests: leptos::prelude::ArcRwSignal::new(Vec::new()),
+                },
+            );
+        });
+        state.agent_turn_active.update(|m| {
+            m.insert(agent_ref.clone(), true);
+        });
+        state.transient_events.update(|m| {
+            m.entry(agent_ref.clone())
+                .or_default()
+                .push(TransientEvent::RetryAttempt {
+                    attempt: 1,
+                    max_retries: 3,
+                    error: "rate limited".to_owned(),
+                    backoff_ms: 800,
+                });
+        });
+    }
+
+    fn fatal_error_payload(agent_id: &AgentId, message: &str) -> AgentErrorPayload {
+        AgentErrorPayload {
+            agent_id: agent_id.clone(),
+            code: protocol::AgentErrorCode::BackendFailed,
+            message: message.to_owned(),
+            fatal: true,
+        }
+    }
+
+    fn is_settled(state: &AppState, agent_ref: &AgentRef) -> bool {
+        !state
+            .streaming_text
+            .with_untracked(|m| m.contains_key(agent_ref))
+            && !state
+                .agent_turn_active
+                .with_untracked(|m| m.contains_key(agent_ref))
+            && !state
+                .transient_events
+                .with_untracked(|m| m.contains_key(agent_ref))
+    }
+
+    /// A fatal error *is* the terminal event — the stream dies with it, so the
+    /// `TypingStatusChanged(false)` that normally closes a turn never arrives.
+    /// Without settlement the composer keeps a live streaming bubble, the header
+    /// keeps offering Stop, and both address an agent that cannot answer.
+    #[test]
+    fn fatal_agent_error_settles_the_turn_and_nonfatal_leaves_it_running() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host = LocalHostId("host-a".to_owned());
+            let dead = seed_agent(&state, &host, "a-dead");
+            let alive = seed_agent(&state, &host, "a-alive");
+            seed_live_turn(&state, &dead);
+            seed_live_turn(&state, &alive);
+
+            apply_agent_error(
+                &state,
+                &dead,
+                &fatal_error_payload(&dead.agent_id, "backend crashed"),
+            );
+            // The recoverable strict-identity fallback reports `fatal: false`
+            // and must stay Idle and reusable. If this boundary ever slips, a
+            // routine retry starts killing live agents.
+            apply_agent_error(
+                &state,
+                &alive,
+                &AgentErrorPayload {
+                    agent_id: alive.agent_id.clone(),
+                    code: protocol::AgentErrorCode::Internal,
+                    message: "recoverable identity mismatch".to_owned(),
+                    fatal: false,
+                },
+            );
+
+            assert!(is_settled(&state, &dead), "fatal must settle the dead agent");
+            assert_eq!(
+                state.agents.with_untracked(|agents| agents
+                    .iter()
+                    .find(|a| a.agent_id == dead.agent_id)
+                    .and_then(|a| a.fatal_error.clone())),
+                Some("backend crashed".to_owned()),
+            );
+
+            assert!(
+                state
+                    .agent_turn_active
+                    .with_untracked(|m| m.get(&alive).copied().unwrap_or(false)),
+                "a nonfatal error must not end the turn"
+            );
+            assert!(
+                state
+                    .streaming_text
+                    .with_untracked(|m| m.contains_key(&alive)),
+                "a nonfatal error must not close the open stream"
+            );
+            assert!(
+                state
+                    .agents
+                    .with_untracked(|agents| agents
+                        .iter()
+                        .find(|a| a.agent_id == alive.agent_id)
+                        .is_some_and(|a| a.fatal_error.is_none())),
+                "a nonfatal error must not mark the agent dead"
+            );
+
+            // Both errors are still visible as transcript rows — settlement
+            // clears live UI, it never edits history.
+            assert_eq!(
+                state
+                    .chat_messages
+                    .with_untracked(|m| m.get(&dead).map(|rows| rows.len())),
+                Some(1),
+            );
+            assert_eq!(
+                state
+                    .chat_messages
+                    .with_untracked(|m| m.get(&alive).map(|rows| rows.len())),
+                Some(1),
+            );
+
+            // Settlement is idempotent: a repeat fatal frame adds a second Error
+            // row but cannot corrupt already-settled state.
+            apply_agent_error(
+                &state,
+                &dead,
+                &fatal_error_payload(&dead.agent_id, "backend crashed"),
+            );
+            assert!(is_settled(&state, &dead));
+        });
+    }
+
+    /// Mobile runtime state is host-scoped. Two hosts can hand out the same
+    /// textual `AgentId`, and a crash on one must not silently terminate the
+    /// other's chat — the user would watch a healthy agent go dead.
+    #[test]
+    fn fatal_agent_error_does_not_touch_a_same_named_agent_on_another_host() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host_a = LocalHostId("host-a".to_owned());
+            let host_b = LocalHostId("host-b".to_owned());
+            let on_a = seed_agent(&state, &host_a, "same-id");
+            let on_b = seed_agent(&state, &host_b, "same-id");
+            seed_live_turn(&state, &on_a);
+            seed_live_turn(&state, &on_b);
+
+            apply_agent_error(
+                &state,
+                &on_a,
+                &fatal_error_payload(&on_a.agent_id, "host-a backend crashed"),
+            );
+
+            assert!(is_settled(&state, &on_a));
+            assert!(
+                state
+                    .agent_turn_active
+                    .with_untracked(|m| m.get(&on_b).copied().unwrap_or(false)),
+                "host-b's identically-named agent keeps its turn"
+            );
+            assert!(
+                state.streaming_text.with_untracked(|m| m.contains_key(&on_b)),
+                "host-b's identically-named agent keeps its open stream"
+            );
+            assert!(
+                state.agents.with_untracked(|agents| agents
+                    .iter()
+                    .find(|a| a.local_host_id == host_b)
+                    .is_some_and(|a| a.fatal_error.is_none())),
+                "host-b's identically-named agent is not marked dead"
+            );
+        });
+    }
+
+    /// Bootstrap writes `turn_active` *after* replaying its events, so a
+    /// contradictory snapshot — or a replayed stream event that lands after the
+    /// fatal record — would otherwise resurrect exactly the state the fatal
+    /// error is supposed to have closed. Reconnecting to a crashed agent would
+    /// show it thinking again.
+    #[test]
+    fn fatal_bootstrap_cannot_rearm_the_turn() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host = LocalHostId("host-a".to_owned());
+            let agent_ref = seed_agent(&state, &host, "a-dead");
+            let stream = StreamPath("/agent/a-dead/inst".to_owned());
+
+            apply_agent_bootstrap(
+                &state,
+                &host,
+                &stream,
+                AgentBootstrapPayload {
+                    events: vec![
+                        AgentBootstrapEvent::AgentError(fatal_error_payload(
+                            &agent_ref.agent_id,
+                            "backend crashed",
+                        )),
+                        // Deliberately after the fatal record, and deliberately
+                        // contradicted by `turn_active: true` below.
+                        AgentBootstrapEvent::ChatEvent(ChatEvent::TypingStatusChanged(true)),
+                        AgentBootstrapEvent::ChatEvent(ChatEvent::StreamStart(
+                            protocol::StreamStartData {
+                                message_id: Some("m-1".to_owned()),
+                                agent: "Agent".to_owned(),
+                                model: None,
+                            },
+                        )),
+                    ],
+                    latest_output: Default::default(),
+                    turn_active: true,
+                },
+            );
+
+            assert!(
+                is_settled(&state, &agent_ref),
+                "fatal is terminal authority over the snapshot's own turn_active"
+            );
+        });
+    }
+
+    /// The agent can already be fatal from an earlier live frame, so a later
+    /// bootstrap need not carry the fatal event at all. Deriving fatality from a
+    /// loop-local flag would miss this and re-arm the turn.
+    #[test]
+    fn bootstrap_for_an_already_fatal_agent_stays_settled() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host = LocalHostId("host-a".to_owned());
+            let agent_ref = seed_agent(&state, &host, "a-dead");
+            let stream = StreamPath("/agent/a-dead/inst".to_owned());
+            apply_agent_error(
+                &state,
+                &agent_ref,
+                &fatal_error_payload(&agent_ref.agent_id, "backend crashed"),
+            );
+
+            apply_agent_bootstrap(
+                &state,
+                &host,
+                &stream,
+                AgentBootstrapPayload {
+                    // No AgentError in this payload — the registry is the only
+                    // record that the agent is dead.
+                    events: vec![AgentBootstrapEvent::ChatEvent(
+                        ChatEvent::TypingStatusChanged(true),
+                    )],
+                    latest_output: Default::default(),
+                    turn_active: true,
+                },
+            );
+
+            assert!(is_settled(&state, &agent_ref));
+        });
+    }
 
     #[test]
     fn agent_bootstrap_mid_turn_keeps_live_stream_end_visible() {
