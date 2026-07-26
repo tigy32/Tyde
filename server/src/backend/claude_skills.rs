@@ -62,12 +62,23 @@ pub(crate) const TYDE_SKILLS_PLUGIN_NAME: &str = "tyde-skills";
 /// config for the CLI to read either way.
 pub(crate) const CLAUDE_PLUGIN_DIR_FLAG: &str = "--plugin-dir";
 
-/// Frontmatter keys that would let a skill contribute an executable or
-/// long-lived component rather than instructions. Refused rather than silently
-/// stripped: a skill declaring one is a signal worth surfacing, not noise to
-/// discard. The generated snapshot emits only `name` and `description`, so
-/// these could never reach Claude regardless — this check exists to report.
-const REFUSED_FRONTMATTER_KEYS: &[&str] = &[
+/// The **only** frontmatter keys a Tyde wrapper will carry over.
+///
+/// This is an allowlist, not a denylist, and that is the whole point: a denylist
+/// silently changes a skill's semantics whenever Claude grows a field nobody
+/// added to the list. `name` and `description` are the two fields Claude
+/// documents for a skill and the two that are inert — they say what the skill is
+/// called and what it is for, and nothing else. Everything else, whether it is a
+/// known behaviour-changing field (`allowed-tools`, `model`,
+/// `disable-model-invocation`), a known activation field (`hooks`,
+/// `mcpServers`, `lsp`), or a field this version of Tyde has never heard of, is
+/// a **refusal**. Refusing is visible; quietly dropping a field that changed the
+/// skill's behaviour is not.
+const ALLOWED_FRONTMATTER_KEYS: &[&str] = &["name", "description"];
+
+/// Known activation keys, named separately only so the refusal message can say
+/// *why* rather than "unrecognized". Not a gate — the allowlist is the gate.
+const KNOWN_ACTIVATION_KEYS: &[&str] = &[
     "hooks",
     "mcp",
     "mcpservers",
@@ -83,6 +94,11 @@ const REFUSED_FRONTMATTER_KEYS: &[&str] = &[
     "output_styles",
     "statusline",
     "permissions",
+    "allowed-tools",
+    "allowed_tools",
+    "disable-model-invocation",
+    "disable_model_invocation",
+    "model",
 ];
 
 /// Top-level resource names never linked into a wrapper, because they name
@@ -106,10 +122,16 @@ impl SkillRefusal {
 /// One skill that was successfully materialized.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedSkill {
-    /// Store directory name, proven addressable in the plugin namespace.
+    /// Synthesized wrapper name: the directory name, the frontmatter `name`, and
+    /// the id the model addresses. Safe by construction and unique within the
+    /// session.
     pub(crate) name: String,
     /// `tyde-skills:<name>` — what the CLI must report in its `init` frame.
     pub(crate) namespaced: String,
+    /// The store directory name the user knows this skill by. Shown alongside
+    /// the exposed name when the two differ, so a renamed skill is never a
+    /// mystery.
+    pub(crate) source_name: String,
     /// Description used in the overlay and in the generated frontmatter.
     pub(crate) description: Option<String>,
 }
@@ -154,10 +176,9 @@ impl ClaudeSkillPlugin {
         let mut inspected: Vec<InspectedSkill> = Vec::new();
         let mut claimed: BTreeSet<String> = BTreeSet::new();
 
-        // Inspect everything first. Nothing is written until the whole
-        // selection has been validated, so a per-skill problem is a refusal the
-        // caller can weigh against its selection policy, never a half-built
-        // root.
+        // Inspect everything first, so a per-skill problem is a refusal the
+        // caller can weigh against its selection policy rather than a
+        // half-built root.
         for skill in skills {
             match inspect_skill(skill, &mut claimed) {
                 Ok(entry) => inspected.push(entry),
@@ -176,40 +197,53 @@ impl ClaudeSkillPlugin {
             });
         }
 
-        // The guard exists before the first write; dropping it on any `?` below
-        // removes everything written so far.
-        let guard = tempfile::Builder::new()
-            .prefix("tyde-claude-skills-")
-            .tempdir_in(parent.map(Path::to_path_buf).unwrap_or_else(std::env::temp_dir))
-            .map_err(|err| format!("Failed to create a private Claude plugin root: {err}"))?;
-        restrict_dir(guard.path())?;
-
+        // Creating the root, the manifest, or the skills directory is a
+        // *global* failure: without them there is no plugin at all, and no
+        // per-skill degradation can rescue that. The guard exists before the
+        // first write, so any `?` here removes everything written so far.
+        let guard = create_private_root(parent)?;
         let manifest_dir = guard.path().join(".claude-plugin");
         create_private_dir(&manifest_dir)?;
         write_private_file(&manifest_dir.join("plugin.json"), &plugin_manifest_json())?;
-
         let skills_dir = guard.path().join("skills");
         create_private_dir(&skills_dir)?;
 
         let mut prepared = Vec::new();
         let mut exposed = Vec::new();
         for (index, entry) in inspected.into_iter().enumerate() {
-            fail_injection_point(index)?;
-            let wrapper = skills_dir.join(&entry.prepared.name);
-            create_private_dir(&wrapper)?;
-            write_private_file(&wrapper.join("SKILL.md"), &entry.contents)?;
-            for (link_name, target) in &entry.resources {
-                symlink_path(target, &wrapper.join(link_name)).map_err(|err| {
-                    format!(
-                        "Failed to link resource '{link_name}' of skill '{}': {err}",
-                        entry.prepared.name
-                    )
-                })?;
+            // A *per-skill* write failure omits that skill and keeps the rest,
+            // matching how an inspection failure behaves. The caller's selection
+            // policy — fail-closed for explicit, best-effort for Default — then
+            // applies uniformly to every reason a skill did not make it.
+            match write_wrapper(&skills_dir, &entry, index) {
+                Ok(()) => {
+                    exposed.push(entry.prepared.namespaced.clone());
+                    prepared.push(entry.prepared);
+                }
+                Err(reason) => {
+                    // Remove the partial wrapper so the CLI never sees half a
+                    // skill; the root itself stays valid for the others.
+                    let wrapper = skills_dir.join(&entry.prepared.name);
+                    let _ = std::fs::remove_dir_all(&wrapper);
+                    refusals.push(SkillRefusal {
+                        name: entry.source_name,
+                        reason,
+                    });
+                }
             }
-            exposed.push(entry.prepared.namespaced.clone());
-            prepared.push(entry.prepared);
         }
         exposed.sort();
+
+        if prepared.is_empty() {
+            // Every skill failed during the write phase. Drop the root rather
+            // than pointing the CLI at an empty plugin.
+            drop(guard);
+            return Ok(PreparedPlugin {
+                plugin: None,
+                prepared: Vec::new(),
+                refusals,
+            });
+        }
 
         Ok(PreparedPlugin {
             plugin: Some(Self { guard, exposed }),
@@ -218,70 +252,77 @@ impl ClaudeSkillPlugin {
         })
     }
 
-    /// Remove the root's contents and the root, without ever following a
-    /// resource symlink.
+    /// Remove the session root.
     ///
-    /// Every wrapper entry other than the generated `SKILL.md` is a symlink into
-    /// the user's skill store. Each is checked with `symlink_metadata` (which
-    /// does not follow) and unlinked with `remove_file`; a recursive delete is
-    /// never issued against one, so a bug here cannot reach a target. Anything
-    /// unexpected is left in place and reported.
+    /// The root is **entirely Tyde-owned**: Tyde created it, wrote every regular
+    /// file in it, and created every link in it. So it is removed recursively,
+    /// which is the honest contract — there is nothing in there that belongs to
+    /// anyone else, and pretending otherwise led to a "left in place" branch
+    /// that promised more than it could deliver.
     ///
-    /// Idempotent: shutdown calls this so the root does not linger until the
-    /// last handle drops, and the `TempDir` drop that follows is a no-op.
+    /// The safety property that actually matters is narrower and is what the
+    /// tests pin: `std::fs::remove_dir_all` **unlinks symlinks rather than
+    /// following them**, so removing a root full of links into the user's skill
+    /// store cannot touch anything in that store. `cleanup_never_follows_links`,
+    /// `dropping_the_plugin_spares_every_canonical_source`, and the
+    /// partial-failure and unexpected-entry tests each plant a sentinel behind a
+    /// link and assert it survives.
+    ///
+    /// Idempotent, so the `TempDir` drop that follows an explicit shutdown is a
+    /// no-op.
     pub(crate) fn cleanup(&self) -> Result<(), String> {
         let root = self.guard.path();
         if !root.exists() {
             return Ok(());
         }
-        let skills_dir = root.join("skills");
-        let mut unexpected = Vec::new();
-        if let Ok(wrappers) = std::fs::read_dir(&skills_dir) {
-            for wrapper in wrappers.flatten() {
-                let wrapper_path = wrapper.path();
-                if !is_real_dir(&wrapper_path) {
-                    unexpected.push(wrapper_path);
-                    continue;
-                }
-                if let Ok(entries) = std::fs::read_dir(&wrapper_path) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-                            unexpected.push(path);
-                            continue;
-                        };
-                        // A symlink is unlinked, never descended into. The only
-                        // regular file we ever wrote here is SKILL.md.
-                        if meta.file_type().is_symlink() || meta.file_type().is_file() {
-                            if std::fs::remove_file(&path).is_err() {
-                                unexpected.push(path);
-                            }
-                        } else {
-                            unexpected.push(path);
-                        }
-                    }
-                }
-                let _ = std::fs::remove_dir(&wrapper_path);
-            }
-        }
-        if !unexpected.is_empty() {
-            return Err(format!(
-                "Claude plugin root {} kept {} unexpected entry/entries; left in place rather \
-                 than deleted",
-                root.display(),
-                unexpected.len()
-            ));
-        }
-        let _ = std::fs::remove_dir(&skills_dir);
-        let _ = std::fs::remove_file(root.join(".claude-plugin").join("plugin.json"));
-        let _ = std::fs::remove_dir(root.join(".claude-plugin"));
-        std::fs::remove_dir(root).map_err(|err| format!("Failed to remove {}: {err}", root.display()))
+        std::fs::remove_dir_all(root)
+            .map_err(|err| format!("Failed to remove {}: {err}", root.display()))
     }
+}
+
+/// Create the private session root, or fail visibly.
+///
+/// On unix this is a `TempDir` restricted to `0700`. On any other platform Tyde
+/// cannot currently prove the root is private or that resource links can be
+/// created, so it refuses **before the CLI process starts** rather than
+/// materializing a world-readable plugin and hoping. A visible "not supported
+/// here" beats a silent insecure fallback.
+fn create_private_root(parent: Option<&Path>) -> Result<tempfile::TempDir, String> {
+    let guard = tempfile::Builder::new()
+        .prefix("tyde-claude-skills-")
+        .tempdir_in(
+            parent
+                .map(Path::to_path_buf)
+                .unwrap_or_else(std::env::temp_dir),
+        )
+        .map_err(|err| format!("Failed to create a private Claude plugin root: {err}"))?;
+    restrict_dir(guard.path())?;
+    Ok(guard)
+}
+
+/// Write one wrapper. Every failure here names a single skill.
+fn write_wrapper(
+    skills_dir: &Path,
+    entry: &InspectedSkill,
+    index: usize,
+) -> Result<(), String> {
+    fail_injection_point(index)?;
+    let wrapper = skills_dir.join(&entry.prepared.name);
+    create_private_dir(&wrapper)?;
+    write_private_file(&wrapper.join("SKILL.md"), &entry.contents)?;
+    for (link_name, target) in &entry.resources {
+        symlink_path(target, &wrapper.join(link_name))
+            .map_err(|err| format!("its resource '{link_name}' could not be linked: {err}"))?;
+    }
+    Ok(())
 }
 
 /// One skill that passed inspection: the bytes to write and the links to make.
 struct InspectedSkill {
     prepared: PreparedSkill,
+    /// Store directory name, kept so a later failure can name the skill the way
+    /// the user knows it rather than by its synthesized wrapper name.
+    source_name: String,
     contents: String,
     /// `(link name, target)` for each top-level resource, `SKILL.md` excluded.
     resources: Vec<(String, PathBuf)>,
@@ -295,31 +336,30 @@ fn inspect_skill(
     skill: &ResolvedSkill,
     claimed: &mut BTreeSet<String>,
 ) -> Result<InspectedSkill, String> {
-    skill_name_is_addressable(&skill.name)?;
-    if !claimed.insert(skill.name.clone()) {
-        return Err(format!(
-            "another selected skill already claims that name in the \
-             '{TYDE_SKILLS_PLUGIN_NAME}' namespace"
-        ));
-    }
     // One read. These bytes are what gets validated and what gets written, so
     // a later rewrite of the store file cannot change what Claude loads.
     let raw = std::fs::read_to_string(&skill.skill_md_path)
         .map_err(|err| format!("could not read {}: {err}", skill.skill_md_path.display()))?;
     let parsed = parse_skill_md(&raw)?;
+    let resources = inspect_resources(skill)?;
     let description = parsed
         .description
         .or_else(|| skill.description.clone())
         .map(|text| collapse_to_one_line(&text))
         .filter(|text| !text.is_empty());
-    let contents = render_skill_md(&skill.name, description.as_deref(), parsed.body);
-    let resources = inspect_resources(skill)?;
+    // Synthesized last, and only for a skill that is otherwise going to be
+    // exposed, so a refused skill never consumes an ordinal and the numbering
+    // stays a function of what actually materializes.
+    let exposed = synthesize_exposed_name(&skill.name, claimed);
+    let contents = render_skill_md(&exposed, description.as_deref(), parsed.body);
     Ok(InspectedSkill {
         prepared: PreparedSkill {
-            name: skill.name.clone(),
-            namespaced: namespaced_skill_name(&skill.name),
+            name: exposed.clone(),
+            namespaced: namespaced_skill_name(&exposed),
+            source_name: skill.name.clone(),
             description,
         },
+        source_name: skill.name.clone(),
         contents,
         resources,
     })
@@ -424,29 +464,48 @@ fn parse_skill_md(raw: &str) -> Result<ParsedSkillMd<'_>, String> {
         _ => return Err("its SKILL.md frontmatter is not a YAML mapping".to_string()),
     };
 
-    let mut refused = Vec::new();
+    let mut activation = Vec::new();
+    let mut unknown = Vec::new();
     let mut description = None;
     for (key, value) in &mapping {
         let Some(key) = key.as_str() else {
             return Err("its SKILL.md frontmatter has a non-string key".to_string());
         };
         let normalized = key.trim().to_ascii_lowercase();
-        if REFUSED_FRONTMATTER_KEYS.contains(&normalized.as_str()) {
-            refused.push(key.trim().to_string());
+        if ALLOWED_FRONTMATTER_KEYS.contains(&normalized.as_str()) {
+            if normalized == "description"
+                && let Some(text) = value.as_str()
+            {
+                description = Some(text.to_string());
+            }
             continue;
         }
-        if normalized == "description"
-            && let Some(text) = value.as_str()
-        {
-            description = Some(text.to_string());
+        if KNOWN_ACTIVATION_KEYS.contains(&normalized.as_str()) {
+            activation.push(key.trim().to_string());
+        } else {
+            unknown.push(key.trim().to_string());
         }
     }
-    if !refused.is_empty() {
-        refused.sort();
+    if !activation.is_empty() || !unknown.is_empty() {
+        activation.sort();
+        unknown.sort();
+        let mut reasons = Vec::new();
+        if !activation.is_empty() {
+            reasons.push(format!(
+                "declares {}, which changes what the skill may do",
+                activation.join(", ")
+            ));
+        }
+        if !unknown.is_empty() {
+            reasons.push(format!(
+                "declares {}, which Tyde cannot prove is inert",
+                unknown.join(", ")
+            ));
+        }
         return Err(format!(
-            "its SKILL.md frontmatter declares {}, which would activate an executable plugin \
-             component",
-            refused.join(", ")
+            "its SKILL.md frontmatter {}. Only 'name' and 'description' are carried into a \
+             Tyde wrapper; dropping anything else would silently change the skill's behaviour",
+            reasons.join(", and ")
         ));
     }
     Ok(ParsedSkillMd { description, body })
@@ -475,17 +534,70 @@ fn split_frontmatter_close(rest: &str) -> Option<(&str, &str)> {
 /// Build the sanitized snapshot: synthesized frontmatter plus the body as read.
 ///
 /// `name` must equal the wrapper directory name so Claude addresses the skill as
-/// `tyde-skills:<name>`. Both scalars are emitted as YAML double-quoted strings
-/// via JSON escaping, which YAML accepts, so no name or description can break
-/// out of the block.
+/// `tyde-skills:<name>` whichever of the two the loader keys on. Both scalars are
+/// emitted as YAML double-quoted strings via JSON escaping, which YAML accepts,
+/// so no name or description can break out of the block.
+///
+/// The body is appended **byte for byte**. Nothing is trimmed: leading blank
+/// lines, indentation, and trailing whitespace are all part of a Markdown
+/// document's meaning, and a wrapper that quietly reflowed a skill would be
+/// changing instructions the user wrote.
 fn render_skill_md(name: &str, description: Option<&str>, body: &str) -> String {
     let description = description.unwrap_or("A skill installed in Tyde.");
     format!(
-        "---\nname: {}\ndescription: {}\n---\n\n{}",
+        "---\nname: {}\ndescription: {}\n---\n{}",
         yaml_quote(name),
         yaml_quote(description),
-        body.trim_start_matches('\n')
+        body
     )
+}
+
+/// Derive a wrapper name that is safe to use as both a directory name and a
+/// plugin-namespaced skill id, and that cannot be confused with another one.
+///
+/// Source names come from the user's store and are only guaranteed to be
+/// directory names. On a case-insensitive or Unicode-normalizing filesystem
+/// `Build-Games`, `build-games`, and a decomposed-accent variant can all be the
+/// same directory, so using them verbatim would let one wrapper silently
+/// overwrite another. Synthesis maps every source name into a restricted ASCII
+/// alphabet and disambiguates by **ordinal suffix**, deterministically, in
+/// selection order.
+///
+/// The result is used for the directory, the frontmatter `name`, and the exposed
+/// `tyde-skills:<name>` id, so all three agree by construction.
+fn synthesize_exposed_name(source: &str, claimed: &mut BTreeSet<String>) -> String {
+    let mut base: String = source
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else if ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    base = base.trim_matches('-').to_string();
+    while base.contains("--") {
+        base = base.replace("--", "-");
+    }
+    if base.is_empty() || base.starts_with(|ch: char| ch.is_ascii_digit()) {
+        base = format!("skill-{base}");
+        base = base.trim_end_matches('-').to_string();
+    }
+    if claimed.insert(base.clone()) {
+        return base;
+    }
+    // Deterministic: the second `build-games` becomes `build-games-2`, the
+    // third `build-games-3`, in the order the selection listed them.
+    for ordinal in 2u32.. {
+        let candidate = format!("{base}-{ordinal}");
+        if claimed.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+    unreachable!("an ordinal suffix always terminates")
 }
 
 fn yaml_quote(value: &str) -> String {
@@ -511,38 +623,6 @@ pub(crate) fn namespaced_skill_name(name: &str) -> String {
     format!("{TYDE_SKILLS_PLUGIN_NAME}:{name}")
 }
 
-/// Can Claude address this skill name inside the `tyde-skills` namespace?
-///
-/// The shared store deliberately does not pre-filter names — a leading `.` or a
-/// `:` stays valid there, because rejecting one would silently drop a skill a
-/// user already has. Deciding addressability is this adapter's job, per session.
-pub(crate) fn skill_name_is_addressable(name: &str) -> Result<(), String> {
-    if name.is_empty() {
-        return Err("the name is empty".to_string());
-    }
-    if name.trim() != name {
-        return Err("the name has leading or trailing whitespace".to_string());
-    }
-    if name.contains(':') {
-        return Err(
-            "the name contains ':', which Claude reserves for plugin namespacing".to_string(),
-        );
-    }
-    if name.contains('/') || name.contains('\\') {
-        return Err("the name contains a path separator".to_string());
-    }
-    if name == "." || name == ".." {
-        return Err("the name is a relative path segment".to_string());
-    }
-    if name.starts_with('.') {
-        return Err("the name starts with '.', which Claude's skill loader skips".to_string());
-    }
-    if name.chars().any(char::is_whitespace) {
-        return Err("the name contains whitespace".to_string());
-    }
-    Ok(())
-}
-
 /// Does this CLI's `--help` advertise plugin sideloading?
 pub(crate) fn help_text_supports_plugin_dir(help: &str) -> bool {
     help.contains(CLAUDE_PLUGIN_DIR_FLAG)
@@ -559,6 +639,71 @@ pub(crate) fn unsupported_plugin_dir_error() -> String {
          into the prompt. Upgrade the Claude CLI, or remove Tyde skills from this agent to \
          start without them."
     )
+}
+
+/// Verify `claude plugin list --json` output against the root Tyde built.
+///
+/// This is the **stable machine-readable** surface, and it is the only one:
+/// `plugin list --json` is a documented flag emitting a JSON array with `id`,
+/// `enabled`, and `installPath`. It proves the CLI accepted `--plugin-dir`, read
+/// the manifest, and enabled the plugin — every *global* failure mode — at zero
+/// provider cost, before the session process starts.
+///
+/// It deliberately does **not** enumerate skills. `plugin details` does, but only
+/// as human-readable text (`Skills (2)  a, b`) with no documented format and no
+/// `--json`, and `plugin validate --strict` prints "Validation failed" while
+/// exiting 0. Parsing either would be building a gate on an unstable surface, so
+/// per-skill verification is left to the `init`-frame consistency check.
+pub(crate) fn verify_plugin_inventory(output: &str, expected_root: &Path) -> Result<(), String> {
+    let parsed: serde_json::Value = serde_json::from_str(output).map_err(|err| {
+        format!("Claude's plugin inventory was not valid JSON, so Tyde cannot confirm the \
+                 session plugin loaded: {err}")
+    })?;
+    let entries = parsed.as_array().ok_or_else(|| {
+        "Claude's plugin inventory was not a JSON array, so Tyde cannot confirm the session \
+         plugin loaded"
+            .to_string()
+    })?;
+    let expected_id = format!("{TYDE_SKILLS_PLUGIN_NAME}@inline");
+    let entry = entries
+        .iter()
+        .find(|entry| entry.get("id").and_then(|id| id.as_str()) == Some(expected_id.as_str()))
+        .ok_or_else(|| {
+            format!(
+                "Claude did not load the '{expected_id}' plugin from {}, so this session's \
+                 skills would be missing",
+                expected_root.display()
+            )
+        })?;
+    if entry.get("enabled").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(format!(
+            "Claude loaded '{expected_id}' but reported it as disabled, so this session's \
+             skills would be unavailable"
+        ));
+    }
+    // The path is compared canonically: TMPDIR is a symlink on macOS, so the CLI
+    // may echo `/tmp/...` where Tyde holds `/private/tmp/...`, or the reverse.
+    let reported = entry
+        .get("installPath")
+        .and_then(|path| path.as_str())
+        .ok_or_else(|| {
+            format!("Claude reported '{expected_id}' without an install path, so Tyde cannot \
+                     confirm it loaded this session's root")
+        })?;
+    let same = match (
+        std::fs::canonicalize(reported),
+        std::fs::canonicalize(expected_root),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => Path::new(reported) == expected_root,
+    };
+    if !same {
+        return Err(format!(
+            "Claude loaded '{expected_id}' from {reported}, not from this session's root {}",
+            expected_root.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Result of checking a CLI `init` frame against what Tyde materialized.
@@ -646,11 +791,18 @@ pub(crate) fn native_skill_overlay(selection: SkillSelection, prepared: &[Prepar
                  `{TYDE_SKILLS_PLUGIN_NAME}` plugin as `{TYDE_SKILLS_PLUGIN_NAME}:<name>`:"
             )];
             for skill in prepared {
+                // Show the store name too when synthesis renamed the skill, so
+                // the id the model uses is never a mystery.
+                let label = if skill.name == skill.source_name {
+                    skill.name.clone()
+                } else {
+                    format!("{} (installed as '{}')", skill.name, skill.source_name)
+                };
                 match skill.description.as_deref() {
                     Some(description) if !description.is_empty() => {
-                        lines.push(format!("- {} — {description}", skill.name));
+                        lines.push(format!("- {label} — {description}"));
                     }
-                    _ => lines.push(format!("- {}", skill.name)),
+                    _ => lines.push(format!("- {label}")),
                 }
             }
             lines.join("\n")
@@ -673,12 +825,6 @@ pub(crate) fn degraded_default_notice(refusals: &[SkillRefusal]) -> String {
             .to_string(),
     );
     lines.join("\n")
-}
-
-fn is_real_dir(path: &Path) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|meta| meta.file_type().is_dir())
-        .unwrap_or(false)
 }
 
 fn create_private_dir(path: &Path) -> Result<(), String> {
@@ -707,14 +853,32 @@ fn restrict_file(path: &Path) -> Result<(), String> {
         .map_err(|err| format!("Failed to restrict {}: {err}", path.display()))
 }
 
+/// On a platform where Tyde cannot make the root private, refuse.
+///
+/// These are deliberately hard errors rather than no-ops. A no-op would leave a
+/// plugin root containing the user's skill instructions readable by every other
+/// account on the machine, and would do so silently. Failing here happens
+/// **before the CLI process starts**, so the session reports "skills are not
+/// supported on this platform" instead of quietly running insecurely.
 #[cfg(not(unix))]
-fn restrict_dir(_path: &Path) -> Result<(), String> {
-    Ok(())
+fn restrict_dir(path: &Path) -> Result<(), String> {
+    Err(unsupported_platform_error(path))
 }
 
 #[cfg(not(unix))]
-fn restrict_file(_path: &Path) -> Result<(), String> {
-    Ok(())
+fn restrict_file(path: &Path) -> Result<(), String> {
+    Err(unsupported_platform_error(path))
+}
+
+#[cfg(not(unix))]
+fn unsupported_platform_error(path: &Path) -> String {
+    format!(
+        "Tyde cannot create a private Claude plugin root at {} on this platform: restricting \
+         it to the current user is not implemented here, and Tyde will not materialize skill \
+         instructions into a world-readable directory. Claude skills are unavailable until \
+         this platform gains a secure temporary-directory path.",
+        path.display()
+    )
 }
 
 #[cfg(unix)]
@@ -765,7 +929,7 @@ mod tests {
         let skills = vec![store_skill(
             &store,
             "alpha",
-            "---\nname: something-else\ndescription: Original text.\nextra: dropped\n---\n\nBODY-11aa22\n",
+            "---\nname: something-else\ndescription: Original text.\n---\n\nBODY-11aa22\n",
         )];
 
         let plugin = prepare_ok(tmp.path(), &skills);
@@ -785,8 +949,8 @@ mod tests {
         );
         assert!(written.contains("description: \"Original text.\""), "{written}");
         assert!(
-            !written.contains("extra"),
-            "non name/description frontmatter must be dropped: {written}"
+            !written.contains("something-else"),
+            "the snapshot's name is the wrapper name, not whatever the store claimed: {written}"
         );
         assert!(written.contains("BODY-11aa22"), "the body is preserved: {written}");
     }
@@ -961,39 +1125,98 @@ mod tests {
     }
 
     #[test]
-    fn unaddressable_names_are_refused_visibly() {
-        for (name, expected) in [
-            ("build:games", "':'"),
-            (".hidden", "'.'"),
-            ("..", "relative path segment"),
-            ("nested/skill", "path separator"),
-            ("", "empty"),
-        ] {
-            let err = skill_name_is_addressable(name).expect_err("must be refused");
-            assert!(err.contains(expected), "{name:?} -> {err:?}");
-        }
-        skill_name_is_addressable("build-games").expect("ordinary names stay addressable");
+    fn unsafe_source_names_are_synthesized_not_refused() {
+        let mut claimed = BTreeSet::new();
+        assert_eq!(synthesize_exposed_name("build-games", &mut claimed), "build-games");
+        assert_eq!(synthesize_exposed_name("build:games", &mut claimed), "build-games-2");
+        assert_eq!(synthesize_exposed_name(".hidden", &mut claimed), "hidden");
+        assert_eq!(synthesize_exposed_name("nested/skill", &mut claimed), "nested-skill");
+        assert_eq!(synthesize_exposed_name("..", &mut claimed), "skill");
+        assert_eq!(synthesize_exposed_name("", &mut claimed), "skill-2");
+        assert_eq!(synthesize_exposed_name("Ünïcødé Skîll", &mut claimed), "n-c-d-sk-ll");
+        assert_eq!(synthesize_exposed_name("2fast", &mut claimed), "skill-2fast");
     }
 
     #[test]
-    fn duplicate_names_collide_visibly_instead_of_overwriting() {
+    fn case_and_unicode_equivalent_names_cannot_overwrite_each_other() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        let store = tmp.path().join("store");
+        // On a case-insensitive filesystem these three source directories would
+        // collapse onto one wrapper if the source name were used verbatim.
         let skills = vec![
-            store_skill(&tmp.path().join("a"), "dup", "---\nname: dup\n---\nfirst\n"),
-            store_skill(&tmp.path().join("b"), "dup", "---\nname: dup\n---\nsecond\n"),
+            store_skill(&store, "Alpha", "---\nname: Alpha\n---\nFIRST\n"),
+            store_skill(&store, "alpha", "---\nname: alpha\n---\nSECOND\n"),
+            store_skill(&store, "ALPHA", "---\nname: ALPHA\n---\nTHIRD\n"),
         ];
 
         let outcome = ClaudeSkillPlugin::prepare(Some(tmp.path()), &skills).expect("prepare");
 
-        let plugin = outcome.plugin.expect("the first skill materializes");
-        assert_eq!(plugin.exposed(), ["tyde-skills:dup"]);
-        assert_eq!(outcome.refusals.len(), 1, "{:?}", outcome.refusals);
-        assert!(outcome.refusals[0].reason.contains("already claims that name"));
-        assert!(
-            std::fs::read_to_string(plugin.root().join("skills").join("dup").join("SKILL.md"))
+        let plugin = outcome.plugin.expect("a plugin");
+        assert!(outcome.refusals.is_empty(), "{:?}", outcome.refusals);
+        assert_eq!(
+            plugin.exposed(),
+            ["tyde-skills:alpha", "tyde-skills:alpha-2", "tyde-skills:alpha-3"],
+            "each source must get its own exposed name"
+        );
+        // Every body survived: nothing was overwritten.
+        let read = |name: &str| {
+            std::fs::read_to_string(plugin.root().join("skills").join(name).join("SKILL.md"))
                 .expect("snapshot")
-                .contains("first"),
-            "the first selected skill wins"
+        };
+        assert!(read("alpha").contains("FIRST"));
+        assert!(read("alpha-2").contains("SECOND"));
+        assert!(read("alpha-3").contains("THIRD"));
+        assert_eq!(
+            outcome.prepared.iter().map(|s| s.source_name.as_str()).collect::<Vec<_>>(),
+            ["Alpha", "alpha", "ALPHA"],
+            "the store name each wrapper came from is retained"
+        );
+    }
+
+    #[test]
+    fn ordinal_assignment_is_deterministic_in_selection_order() {
+        let mut first = BTreeSet::new();
+        let mut second = BTreeSet::new();
+        for claimed in [&mut first, &mut second] {
+            assert_eq!(synthesize_exposed_name("dup", claimed), "dup");
+            assert_eq!(synthesize_exposed_name("DUP", claimed), "dup-2");
+            assert_eq!(synthesize_exposed_name("d.u.p", claimed), "d-u-p");
+        }
+        assert_eq!(first, second, "the same selection must produce the same names");
+    }
+
+    #[test]
+    fn an_unknown_frontmatter_field_is_refused_rather_than_silently_dropped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = tmp.path().join("store");
+        let skills = vec![
+            store_skill(&store, "plain", "---\nname: plain\ndescription: d\n---\nbody\n"),
+            store_skill(
+                &store,
+                "gated",
+                "---\nname: gated\nallowed-tools: [Bash]\n---\nbody\n",
+            ),
+            store_skill(
+                &store,
+                "novel",
+                "---\nname: novel\nsome-future-field: true\n---\nbody\n",
+            ),
+        ];
+
+        let outcome = ClaudeSkillPlugin::prepare(Some(tmp.path()), &skills).expect("prepare");
+
+        let plugin = outcome.plugin.expect("the plain skill materializes");
+        assert_eq!(plugin.exposed(), ["tyde-skills:plain"]);
+        assert_eq!(outcome.refusals.len(), 2, "{:?}", outcome.refusals);
+        let gated = outcome.refusals.iter().find(|r| r.name == "gated").expect("gated");
+        assert!(
+            gated.reason.contains("allowed-tools") && gated.reason.contains("changes what"),
+            "{gated:?}"
+        );
+        let novel = outcome.refusals.iter().find(|r| r.name == "novel").expect("novel");
+        assert!(
+            novel.reason.contains("some-future-field") && novel.reason.contains("cannot prove"),
+            "a field Tyde has never heard of must be refused, not dropped: {novel:?}"
         );
     }
 
@@ -1001,7 +1224,7 @@ mod tests {
     fn every_skill_refused_yields_no_root_at_all() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = tmp.path().join("store");
-        let skills = vec![store_skill(&store, "build:games", "---\nname: x\n---\nbody\n")];
+        let skills = vec![store_skill(&store, "hooky", "---\nname: x\nhooks:\n  - y\n---\nb\n")];
 
         let outcome = ClaudeSkillPlugin::prepare(Some(tmp.path()), &skills).expect("prepare");
 
@@ -1059,103 +1282,181 @@ mod tests {
         );
     }
 
+    /// Plant a sentinel behind a linked resource directory. Every cleanup path
+    /// below asserts it survives, which is the property that actually matters:
+    /// removing a root full of links must never reach the user's skill store.
+    fn store_with_sentinel(tmp: &Path) -> (Vec<ResolvedSkill>, PathBuf) {
+        let store = tmp.join("store");
+        let skills = vec![store_skill(&store, "alpha", "---\nname: alpha\n---\nbody\n")];
+        let assets = store.join("alpha").join("assets");
+        std::fs::create_dir_all(&assets).expect("assets dir");
+        let sentinel = assets.join("keep.txt");
+        std::fs::write(&sentinel, "SENTINEL").expect("sentinel");
+        (skills, sentinel)
+    }
+
+    fn sentinel_survives(sentinel: &Path) {
+        assert_eq!(
+            std::fs::read_to_string(sentinel).expect("the canonical source must survive"),
+            "SENTINEL"
+        );
+    }
+
     #[test]
-    fn a_partial_write_failure_rolls_the_whole_root_back() {
+    fn a_per_skill_write_failure_omits_only_that_skill() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = tmp.path().join("store");
         let skills = vec![
             store_skill(&store, "first", "---\nname: first\n---\nbody\n"),
             store_skill(&store, "second", "---\nname: second\n---\nbody\n"),
+            store_skill(&store, "third", "---\nname: third\n---\nbody\n"),
         ];
-        // Fail after the root, the manifest, and the first wrapper are on disk.
+        // Fail the middle wrapper, after the root and the first are on disk.
         FAIL_WRITE_AT.with(|slot| slot.set(Some(1)));
-        let result = ClaudeSkillPlugin::prepare(Some(tmp.path()), &skills);
+        let outcome = ClaudeSkillPlugin::prepare(Some(tmp.path()), &skills);
         FAIL_WRITE_AT.with(|slot| slot.set(None));
 
-        let err = result.expect_err("the injected write failure must propagate");
-        assert!(err.contains("injected write failure"), "{err}");
+        let outcome = outcome.expect("a per-skill write failure is not a global failure");
+        let plugin = outcome.plugin.expect("the other skills still materialize");
+        assert_eq!(
+            plugin.exposed(),
+            ["tyde-skills:first", "tyde-skills:third"],
+            "only the failing skill is omitted"
+        );
+        assert_eq!(outcome.refusals.len(), 1, "{:?}", outcome.refusals);
+        assert_eq!(outcome.refusals[0].name, "second");
+        assert!(
+            !plugin.root().join("skills").join("second").exists(),
+            "a partial wrapper must not be left for the CLI to load"
+        );
+    }
+
+    #[test]
+    fn a_root_with_no_surviving_skill_is_dropped_entirely() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (skills, sentinel) = store_with_sentinel(tmp.path());
+        // Failing the only skill leaves no wrapper, so no root is handed back.
+        FAIL_WRITE_AT.with(|slot| slot.set(Some(0)));
+        let outcome = ClaudeSkillPlugin::prepare(Some(tmp.path()), &skills);
+        FAIL_WRITE_AT.with(|slot| slot.set(None));
+
+        let outcome = outcome.expect("prepare");
+        assert!(outcome.plugin.is_none(), "an empty root is never handed back");
+        assert_eq!(outcome.refusals.len(), 1);
         let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
             .expect("scan parent")
             .flatten()
             .filter(|entry| {
-                entry.file_name().to_string_lossy().starts_with("tyde-claude-skills-")
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("tyde-claude-skills-")
             })
             .collect();
-        assert!(
-            leftovers.is_empty(),
-            "a partial failure must roll the whole root back, found {leftovers:?}"
-        );
+        assert!(leftovers.is_empty(), "the root must be dropped, found {leftovers:?}");
+        sentinel_survives(&sentinel);
     }
 
     #[test]
-    fn cleanup_unlinks_resources_without_following_them() {
+    fn cleanup_never_follows_links() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let store = tmp.path().join("store");
-        let skills = vec![store_skill(&store, "alpha", "---\nname: alpha\n---\nbody\n")];
-        std::fs::create_dir_all(store.join("alpha").join("assets")).expect("assets");
-        std::fs::write(store.join("alpha").join("assets").join("keep.txt"), "keep")
-            .expect("asset file");
+        let (skills, sentinel) = store_with_sentinel(tmp.path());
 
-        let root = {
-            let plugin = prepare_ok(tmp.path(), &skills);
-            let root = plugin.root().to_path_buf();
-            plugin.cleanup().expect("cleanup");
-            assert!(!root.exists(), "the session root must be gone");
-            root
-        };
-
-        assert!(!root.exists());
-        assert!(
-            store.join("alpha").join("SKILL.md").exists(),
-            "cleanup must never reach the store"
-        );
+        let plugin = prepare_ok(tmp.path(), &skills);
+        let root = plugin.root().to_path_buf();
+        // The wrapper really does reach the sentinel through a directory link.
         assert_eq!(
-            std::fs::read_to_string(store.join("alpha").join("assets").join("keep.txt"))
-                .expect("linked resource survives"),
-            "keep",
-            "unlinking a resource link must not delete its target"
+            std::fs::read_to_string(
+                root.join("skills").join("alpha").join("assets").join("keep.txt")
+            )
+            .expect("reachable through the link"),
+            "SENTINEL"
         );
+
+        plugin.cleanup().expect("cleanup");
+
+        assert!(!root.exists(), "the Tyde-owned root is removed whole");
+        sentinel_survives(&sentinel);
+        assert!(skills[0].skill_md_path.exists(), "the store SKILL.md survives");
     }
 
     #[test]
-    fn dropping_the_plugin_removes_the_root_and_spares_the_store() {
+    fn dropping_the_plugin_spares_every_canonical_source() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let store = tmp.path().join("store");
-        let skills = vec![store_skill(&store, "alpha", "---\nname: alpha\n---\nbody\n")];
-        std::fs::write(store.join("alpha").join("art.md"), "art").expect("resource");
+        let (skills, sentinel) = store_with_sentinel(tmp.path());
 
         let root = {
             let plugin = prepare_ok(tmp.path(), &skills);
             plugin.root().to_path_buf()
         };
 
-        assert!(!root.exists(), "drop must remove the session root");
-        assert_eq!(
-            std::fs::read_to_string(store.join("alpha").join("art.md")).expect("target survives"),
-            "art"
-        );
+        assert!(!root.exists(), "Drop removes the root");
+        sentinel_survives(&sentinel);
     }
 
     #[test]
-    fn cleanup_is_idempotent_and_reports_unexpected_entries() {
+    fn cleanup_is_idempotent_and_survives_unexpected_entries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (skills, sentinel) = store_with_sentinel(tmp.path());
+
+        let plugin = prepare_ok(tmp.path(), &skills);
+        plugin.cleanup().expect("first cleanup");
+        plugin.cleanup().expect("a second cleanup is a no-op");
+        sentinel_survives(&sentinel);
+
+        // A fresh root with entries Tyde did not write. The root is Tyde-owned,
+        // so they go with it — but a link planted among them must be unlinked
+        // rather than followed to its target.
+        let plugin = prepare_ok(tmp.path(), &skills);
+        let wrapper = plugin.root().join("skills").join("alpha");
+        std::fs::create_dir_all(wrapper.join("nested")).expect("intruder dir");
+        std::fs::write(wrapper.join("nested").join("junk.txt"), "junk").expect("intruder file");
+        symlink_path(&sentinel, &wrapper.join("planted-link")).expect("planted link");
+        let root = plugin.root().to_path_buf();
+
+        plugin.cleanup().expect("cleanup removes a Tyde-owned root whole");
+
+        assert!(!root.exists());
+        sentinel_survives(&sentinel);
+    }
+
+    /// The security contract, asserted per platform rather than assumed.
+    ///
+    /// On unix the root is `0700` and files are `0600` (see
+    /// `the_root_and_its_files_are_private`). Anywhere else Tyde cannot yet
+    /// prove that, so `prepare` must **refuse before the CLI process starts**
+    /// rather than materialize a world-readable copy of the user's skill
+    /// instructions. These two tests are mutually exclusive by `cfg`, so exactly
+    /// one of them runs and neither platform is left silently untested.
+    #[cfg(not(unix))]
+    #[test]
+    fn a_platform_without_private_directories_refuses_before_startup() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = tmp.path().join("store");
         let skills = vec![store_skill(&store, "alpha", "---\nname: alpha\n---\nbody\n")];
-        let plugin = prepare_ok(tmp.path(), &skills);
-        plugin.cleanup().expect("first cleanup");
-        plugin.cleanup().expect("second cleanup is a no-op");
 
-        // A fresh root with something that is neither our file nor a link.
-        let plugin = prepare_ok(tmp.path(), &skills);
-        let intruder = plugin.root().join("skills").join("alpha").join("nested");
-        std::fs::create_dir_all(&intruder).expect("intruder");
-        std::fs::write(intruder.join("keep.txt"), "keep").expect("intruder file");
+        let err = ClaudeSkillPlugin::prepare(Some(tmp.path()), &skills)
+            .expect_err("an unprovable platform must fail, not fall back");
 
-        let err = plugin.cleanup().expect_err("must refuse");
-        assert!(err.contains("unexpected"), "{err}");
+        assert!(err.contains("private"), "{err}");
         assert!(
-            intruder.join("keep.txt").exists(),
-            "an unexpected entry is reported, never recursively deleted"
+            err.contains("world-readable"),
+            "the reason must name the risk: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_supports_private_roots_so_preparation_is_allowed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = tmp.path().join("store");
+        let skills = vec![store_skill(&store, "alpha", "---\nname: alpha\n---\nbody\n")];
+
+        let plugin = prepare_ok(tmp.path(), &skills);
+
+        assert!(
+            plugin.root().exists(),
+            "unix has the primitives, so preparation proceeds"
         );
     }
 
@@ -1213,6 +1514,7 @@ mod tests {
             .map(|n| PreparedSkill {
                 name: format!("skill{n}"),
                 namespaced: namespaced_skill_name(&format!("skill{n}")),
+                source_name: format!("skill{n}"),
                 description: Some(format!("summary {n}")),
             })
             .collect();
@@ -1246,10 +1548,22 @@ mod tests {
     }
 
     #[test]
-    fn body_bytes_survive_verbatim_including_relative_links() {
-        let body = "# Heading\n\nSee [art](art.md) and `scripts/run.sh`.\n\n- item\n";
+    fn body_bytes_survive_verbatim_including_whitespace() {
+        // Leading blank lines, indentation, and trailing whitespace are all part
+        // of a Markdown document's meaning; a wrapper must not reflow them.
+        let body = "\n\n# Heading\n\n    indented block\n\nSee [art](art.md).\n\n- item\n   \n";
         let rendered = render_skill_md("x", Some("d"), body);
-        assert!(rendered.ends_with(body), "the body must be preserved exactly: {rendered}");
+
+        assert!(
+            rendered.ends_with(body),
+            "the body must be appended byte for byte: {rendered:?}"
+        );
+        assert_eq!(
+            &rendered[rendered.len() - body.len()..],
+            body,
+            "not one leading or trailing byte may be trimmed"
+        );
         assert!(rendered.contains("](art.md)"));
+        assert!(rendered.contains("    indented block"));
     }
 }

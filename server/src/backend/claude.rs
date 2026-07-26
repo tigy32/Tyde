@@ -32,7 +32,7 @@ use crate::agent::customization::{ResolvedSkill, SkillSelection};
 use crate::backend::claude_skills::{
     CLAUDE_PLUGIN_DIR_FLAG, ClaudeSkillPlugin, InitFrameVerdict, PreparedSkill,
     degraded_default_notice, help_text_supports_plugin_dir, native_skill_overlay,
-    unsupported_plugin_dir_error, verify_init_frame,
+    unsupported_plugin_dir_error, verify_init_frame, verify_plugin_inventory,
 };
 use crate::backend::{
     AgentIdentity, READ_ONLY_ACCESS_MODE_INSTRUCTIONS, SessionCommand, StartupMcpServer,
@@ -296,6 +296,12 @@ async fn claude_prepare_skills(
             ClaudeSkillSteering::None,
         ));
     };
+
+    // Zero-provider, pre-start, machine-readable: prove the CLI actually loaded
+    // this root before the session process exists. Catches every *global*
+    // failure — a rejected flag, an unreadable manifest, a disabled plugin —
+    // while it is still a clean startup error rather than a mid-turn surprise.
+    claude_verify_plugin_loaded(plugin.root()).await?;
 
     let expected = plugin.exposed().to_vec();
     tracing::debug!(
@@ -2115,8 +2121,9 @@ impl ClaudeInner {
             }
         };
 
-        // Re-armed per process: a respawn gets a new `init` frame and must be
-        // confirmed again before it is used.
+        // Re-armed per process: each process emits its own `init` frame, and a
+        // respawn must be checked against its own rather than inheriting the
+        // previous one's verdict.
         self.reset_skill_readiness().await;
         let runtime = self.spawn_process(config).await?;
         #[cfg(test)]
@@ -2144,28 +2151,6 @@ impl ClaudeInner {
         {
             Ok(Ok(response)) => {
                 self.configure_capacity_from_initialize(&response).await;
-                // The first prompt must not go out until the CLI has confirmed
-                // every skill Tyde materialized. Bounded, because a CLI that
-                // never reports one must fail the session rather than hang it.
-                match tokio::time::timeout(
-                    CLAUDE_INITIALIZE_TIMEOUT,
-                    self.await_skill_readiness(),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => {
-                        self.shutdown_process().await;
-                        return Err(err);
-                    }
-                    Err(_) => {
-                        self.shutdown_process().await;
-                        return Err(
-                            "Timed out waiting for Claude to report the skills it loaded"
-                                .to_string(),
-                        );
-                    }
-                }
                 self.schedule_capacity_refresh().await;
                 Ok(())
             }
@@ -2438,6 +2423,48 @@ impl ClaudeInner {
         }
     }
 
+    /// Terminate the session because the CLI did not load the skills Tyde
+    /// materialized.
+    ///
+    /// The `init` frame arrives at the head of the CLI's response to the first
+    /// user message, so by the time this runs the first provider request is
+    /// already in flight — that race is unavoidable without a pre-start skill
+    /// inventory the CLI does not expose (see `verify_plugin_inventory`). What
+    /// is avoidable is *acting* on a session whose skills are wrong, so this
+    /// suppresses everything the model says, fails the turn, and kills the
+    /// process rather than letting a half-equipped agent continue.
+    async fn terminate_for_skill_mismatch(&self, message: &str) {
+        let full = format!(
+            "{message} Tyde stopped this Claude session before using its response, because a \
+             session missing a skill it was configured with will silently do the wrong thing."
+        );
+        tracing::error!("{full}");
+        self.emit_error(&full);
+        if let Some(turn_id) = self.active_turn_pending_outcome_id().await {
+            self.complete_active_turn_with_outcome(
+                turn_id,
+                TurnOutcome::Failed {
+                    summary: ClaudeStdoutSummary::default(),
+                    error: full,
+                },
+            )
+            .await;
+        }
+        self.shutdown_process().await;
+    }
+
+    /// Has this session been terminated for a skill mismatch?
+    ///
+    /// Read by the stdout reader before forwarding anything, so no model output
+    /// from a mis-equipped session reaches the user even if frames were already
+    /// buffered when the mismatch was detected.
+    fn skills_mismatched(&self) -> bool {
+        matches!(
+            *self.skill_readiness.borrow(),
+            ClaudeSkillReadiness::Failed(_)
+        )
+    }
+
     /// Record the CLI's `init` frame against what Tyde materialized.
     ///
     /// The frame is produced locally before any provider request, so this costs
@@ -2462,42 +2489,30 @@ impl ClaudeInner {
             Ok(reported) => verify_init_frame(&expected, reported.as_deref()),
             Err(message) => InitFrameVerdict::Failed(message),
         };
-        let next = match verdict {
+        match verdict {
             InitFrameVerdict::Verified => {
                 tracing::debug!(
                     "Claude reported all {} Tyde skill(s) in its init frame",
                     expected.len()
                 );
-                ClaudeSkillReadiness::Ready
+                let _ = self.skill_readiness.send(ClaudeSkillReadiness::Ready);
             }
             InitFrameVerdict::Failed(message) => {
-                tracing::error!("Claude skill verification failed: {message}");
-                ClaudeSkillReadiness::Failed(message)
-            }
-        };
-        let _ = self.skill_readiness.send(next);
-    }
-
-    /// Block until the CLI's `init` frame has confirmed this session's skills.
-    ///
-    /// Returns immediately when the session materialized none. A session that
-    /// did materialize skills must not reach its first prompt until every one is
-    /// confirmed loaded.
-    async fn await_skill_readiness(&self) -> Result<(), String> {
-        let mut readiness = self.skill_readiness.subscribe();
-        loop {
-            let current = readiness.borrow_and_update().clone();
-            match current {
-                ClaudeSkillReadiness::NotRequired | ClaudeSkillReadiness::Ready => return Ok(()),
-                ClaudeSkillReadiness::Failed(message) => return Err(message),
-                ClaudeSkillReadiness::Pending => {}
-            }
-            if readiness.changed().await.is_err() {
-                return Err(
-                    "Claude exited before reporting which skills it loaded".to_string()
-                );
+                let _ = self
+                    .skill_readiness
+                    .send(ClaudeSkillReadiness::Failed(message.clone()));
+                self.terminate_for_skill_mismatch(&message).await;
             }
         }
+    }
+
+    /// Current verification state, for tests and for the stdout suppression
+    /// check. There is deliberately no *blocking* variant: the `init` frame only
+    /// arrives in response to a user message, so waiting for it before sending
+    /// one would deadlock.
+    #[cfg(test)]
+    fn skill_readiness_state(&self) -> ClaudeSkillReadiness {
+        self.skill_readiness.borrow().clone()
     }
 
     /// Re-arm verification for a process that is about to start.
@@ -3137,6 +3152,43 @@ fn claude_binary() -> String {
         .unwrap_or_else(|| "claude".to_string())
 }
 
+/// Run `claude --plugin-dir <root> plugin list --json` and check the result.
+///
+/// This spends no provider tokens — it is a local inventory command — and runs
+/// **before** the session process starts. `plugin list --json` is the only
+/// stable machine-readable plugin surface the CLI exposes: `plugin details`
+/// prints skills as unstructured text with no `--json`, and
+/// `plugin validate --strict` prints "Validation failed" while exiting 0, so
+/// neither can carry a gate. Per-skill verification therefore happens later,
+/// against the `init` frame.
+async fn claude_verify_plugin_loaded(root: &Path) -> Result<(), String> {
+    let mut cmd = Command::new(claude_binary());
+    cmd.arg(CLAUDE_PLUGIN_DIR_FLAG)
+        .arg(root)
+        .arg("plugin")
+        .arg("list")
+        .arg("--json");
+    if let Some(path) = process_env::resolved_child_process_path() {
+        cmd.env("PATH", path);
+    }
+    let output = tokio::time::timeout(CLAUDE_INITIALIZE_TIMEOUT, cmd.output())
+        .await
+        .map_err(|_| {
+            "Timed out asking the Claude CLI which plugins it loaded; Tyde cannot confirm this \
+             session's skills"
+                .to_string()
+        })?
+        .map_err(|err| format!("Failed to run the Claude CLI plugin inventory: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "The Claude CLI refused to list plugins for this session's root {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    verify_plugin_inventory(&String::from_utf8_lossy(&output.stdout), root)
+}
+
 /// Does the local CLI advertise `--plugin-dir`?
 ///
 /// Cached per server process. A missing binary or a failed probe is reported as
@@ -3585,6 +3637,12 @@ async fn read_claude_stdout_persistent(
         // `continue`d: the frame still flows to the per-turn reducer.
         if let Some(reported) = claude_init_frame_skills(&value) {
             inner.record_skill_init_frame(reported).await;
+        }
+        // Once a mismatch is known, nothing this process says is trustworthy.
+        // The process has been killed, but frames already buffered would
+        // otherwise still be rendered as if the session were fine.
+        if inner.skills_mismatched() {
+            continue;
         }
 
         if handle_workflow_task_frame(&value, &mut workflow_runs, &inner.emitter) {
@@ -9739,7 +9797,7 @@ impl ClaudeBackend {
             // silently has no skills.
             // `ClaudeBackend` spawns the CLI locally; the low-level session is
             // the only layer that takes an ssh host, and it is given none here.
-            let (skills, skill_steering) = match claude_prepare_skills(&config, None).await {
+            let (mut skills, skill_steering) = match claude_prepare_skills(&config, None).await {
                 Ok(prepared) => prepared,
                 Err(err) => {
                     tracing::error!("Failed to prepare Claude skills: {err}");
@@ -9747,7 +9805,7 @@ impl ClaudeBackend {
                     return;
                 }
             };
-            let steering_content = match claude_steering_content(&config, skill_steering) {
+            let steering = match claude_steering_content(&config, skill_steering) {
                 Ok(steering) => steering,
                 Err(err) => {
                     tracing::error!("Failed to prepare Claude skills: {err}");
@@ -9755,6 +9813,10 @@ impl ClaudeBackend {
                     return;
                 }
             };
+            if let Some(notice) = steering.notice {
+                skills.degraded_notice = Some(notice);
+            }
+            let steering_content = steering.content;
             let agent_identity = claude_agent_identity(&config);
             let session_result = if let Some(from_session_id) = fork_from_session_id.as_ref() {
                 ClaudeSession::fork(
@@ -10066,10 +10128,20 @@ enum ClaudeSkillSteering {
     LegacyInlineBodies(SkillSelection),
 }
 
+/// Steering text plus anything the user should be told about it.
+#[derive(Debug, Default)]
+struct ClaudeSteering {
+    content: Option<String>,
+    /// Skills omitted from this session. Surfaced as a user event as well as in
+    /// the prompt, so a degraded session is visible in the UI and not only to
+    /// the model.
+    notice: Option<String>,
+}
+
 fn claude_steering_content(
     config: &BackendSpawnConfig,
     skills: ClaudeSkillSteering,
-) -> Result<Option<String>, String> {
+) -> Result<ClaudeSteering, String> {
     let mut sections = Vec::new();
     if config.resolved_spawn_config.access_mode == BackendAccessMode::ReadOnly {
         sections.push(READ_ONLY_ACCESS_MODE_INSTRUCTIONS.to_string());
@@ -10084,6 +10156,7 @@ fn claude_steering_content(
         );
     }
     let selected = &config.resolved_spawn_config.skills;
+    let mut notice = None;
     if !selected.is_empty() {
         match skills {
             ClaudeSkillSteering::None => {}
@@ -10093,17 +10166,25 @@ fn claude_steering_content(
                 }
             }
             ClaudeSkillSteering::LegacyInlineBodies(selection) => {
-                if let Some(block) = claude_legacy_inline_skill_block(selected, selection)? {
+                let remote = claude_legacy_inline_skill_block(selected, selection)?;
+                if let Some(block) = remote.block {
                     sections.push(block);
                 }
+                notice = remote.notice;
             }
         }
     }
-    if sections.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(sections.join("\n\n")))
-    }
+    Ok(ClaudeSteering {
+        content: (!sections.is_empty()).then(|| sections.join("\n\n")),
+        notice,
+    })
+}
+
+/// The remote skill block, plus the omissions worth telling the user about.
+#[derive(Debug, Default)]
+struct ClaudeRemoteSkills {
+    block: Option<String>,
+    notice: Option<String>,
 }
 
 /// Inline every selected skill body, for SSH sessions only.
@@ -10122,7 +10203,7 @@ fn claude_steering_content(
 fn claude_legacy_inline_skill_block(
     skills: &[ResolvedSkill],
     selection: SkillSelection,
-) -> Result<Option<String>, String> {
+) -> Result<ClaudeRemoteSkills, String> {
     tracing::warn!(
         "Claude session is remote (SSH): inlining {} skill body/bodies into the system \
          prompt because a locally materialized plugin directory is invisible to the remote \
@@ -10131,6 +10212,7 @@ fn claude_legacy_inline_skill_block(
     );
     let mut blocks = Vec::new();
     let mut omitted = Vec::new();
+    let mut notice = None;
     for skill in skills {
         match skill.load_body() {
             Ok(body) if !body.trim().is_empty() => {
@@ -10158,12 +10240,24 @@ fn claude_legacy_inline_skill_block(
         for line in &omitted {
             tracing::warn!("Remote Claude session degraded: {line}");
         }
+        // A Default remote session keeps going, but the omission is stated in
+        // the prompt itself rather than only in a log: over SSH the bodies *are*
+        // the delivery mechanism, so a missing one changes what the model can do
+        // and the model should know which skills it does not have.
+        blocks.push(format!(
+            "Some Tyde skills could not be included in this remote session:\n{}",
+            omitted.join("\n")
+        ));
+        notice = Some(format!(
+            "Tyde started this remote Claude session without {} skill(s):\n{}",
+            omitted.len(),
+            omitted.join("\n")
+        ));
     }
-    if blocks.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(blocks.join("\n\n")))
-    }
+    Ok(ClaudeRemoteSkills {
+        block: (!blocks.is_empty()).then(|| blocks.join("\n\n")),
+        notice,
+    })
 }
 
 fn spawn_claude_subagent_event_bridge(
@@ -10776,8 +10870,12 @@ impl Backend for ClaudeBackend {
 
         // A resumed session gets its own plugin root: the previous session's
         // was unlinked when it shut down.
-        let (skills, skill_steering) = claude_prepare_skills(&config, None).await?;
-        let steering_content = claude_steering_content(&config, skill_steering)?;
+        let (mut skills, skill_steering) = claude_prepare_skills(&config, None).await?;
+        let steering = claude_steering_content(&config, skill_steering)?;
+        if let Some(notice) = steering.notice {
+            skills.degraded_notice = Some(notice);
+        }
+        let steering_content = steering.content;
         let agent_identity = claude_agent_identity(&config);
         let (session, mut raw_events) = ClaudeSession::spawn_with_skills(
             &workspace_roots,
@@ -11598,6 +11696,7 @@ mod tests {
             ClaudeSkillSteering::None,
         )
         .expect("steering")
+        .content
         .expect("read-only advisory");
 
         assert!(steering.contains("Backend access mode is read-only (best effort)"));
@@ -11660,6 +11759,7 @@ mod tests {
         PreparedSkill {
             name: name.to_string(),
             namespaced: format!("tyde-skills:{name}"),
+            source_name: name.to_string(),
             description: Some(format!("{name} summary")),
         }
     }
@@ -11712,6 +11812,7 @@ mod tests {
             ),
         )
         .expect("steering")
+        .content
         .expect("skill guidance");
 
         assert!(steering.contains("tyde-skills:<name>"));
@@ -11744,6 +11845,7 @@ mod tests {
             ClaudeSkillSteering::Native(SkillSelection::Explicit, vec![prepared("lint")]),
         )
         .expect("steering")
+        .content
         .expect("skill listing");
 
         assert!(steering.contains("lint"), "{steering}");
@@ -11767,6 +11869,7 @@ mod tests {
             ClaudeSkillSteering::Native(SkillSelection::Explicit, vec![prepared("good")]),
         )
         .expect("steering")
+        .content
         .expect("skill listing");
 
         assert!(steering.contains("good"), "{steering}");
@@ -11789,6 +11892,7 @@ mod tests {
         assert!(
             claude_steering_content(&config, ClaudeSkillSteering::None)
                 .expect("steering")
+                .content
                 .is_none(),
             "a refused-everything session must not invent a skills section"
         );
@@ -11933,6 +12037,7 @@ mod tests {
 
         let rendered = claude_steering_content(&config, steering)
             .expect("steering")
+            .content
             .expect("inline bodies");
         assert!(rendered.contains("Skill: alpha"), "{rendered}");
         assert!(rendered.contains("BODYMARK-99ee00"), "{rendered}");
@@ -11973,6 +12078,7 @@ mod tests {
             ClaudeSkillSteering::LegacyInlineBodies(SkillSelection::AllInstalled),
         )
         .expect("steering")
+        .content
         .expect("the readable skill still inlines");
 
         assert!(steering.contains("BODY-ddeeff"), "{steering}");
@@ -12031,20 +12137,22 @@ mod tests {
     }
 
     /// Build an inner whose session expects `expected`, as materialization would.
-    async fn inner_expecting_skills(expected: &[&str]) -> Arc<ClaudeInner> {
-        let (inner, _rx) = make_test_inner();
+    async fn inner_expecting_skills(
+        expected: &[&str],
+    ) -> (Arc<ClaudeInner>, mpsc::UnboundedReceiver<Value>) {
+        let (inner, rx) = make_test_inner();
         let inner = Arc::new(inner);
         {
             let mut state = inner.state.lock().await;
             state.expected_skills = expected.iter().map(|name| name.to_string()).collect();
         }
         inner.reset_skill_readiness().await;
-        inner
+        (inner, rx)
     }
 
     #[tokio::test]
-    async fn readiness_clears_only_when_every_expected_skill_is_reported() {
-        let inner = inner_expecting_skills(&["tyde-skills:a", "tyde-skills:b"]).await;
+    async fn a_confirmed_init_frame_leaves_the_session_running() {
+        let (inner, _rx) = inner_expecting_skills(&["tyde-skills:a", "tyde-skills:b"]).await;
 
         inner
             .record_skill_init_frame(Ok(Some(vec![
@@ -12054,92 +12162,106 @@ mod tests {
             ])))
             .await;
 
-        inner
-            .await_skill_readiness()
-            .await
-            .expect("all skills reported");
+        assert_eq!(inner.skill_readiness_state(), ClaudeSkillReadiness::Ready);
+        assert!(
+            !inner.skills_mismatched(),
+            "a confirmed session must keep rendering model output"
+        );
+    }
+
+    /// Each of these is a mismatch, and every one must terminate the session
+    /// rather than warn: a session that believes it has a skill it does not have
+    /// will silently do the wrong thing.
+    #[tokio::test]
+    async fn every_init_frame_mismatch_terminates_the_session() {
+        for (label, reported, expected_fragment) in [
+            (
+                "a dropped skill",
+                Ok(Some(vec!["tyde-skills:a".to_string()])),
+                "tyde-skills:b",
+            ),
+            ("no skills field at all", Ok(None), "'skills' field"),
+            (
+                "a namespace collision",
+                Ok(Some(vec![
+                    "tyde-skills:a".to_string(),
+                    "tyde-skills:a".to_string(),
+                    "tyde-skills:b".to_string(),
+                ])),
+                "collides",
+            ),
+            (
+                "a malformed skills field",
+                Err("Claude's init frame reported a 'skills' field that is not an array"
+                    .to_string()),
+                "not an array",
+            ),
+        ] {
+            let (inner, mut rx) = inner_expecting_skills(&["tyde-skills:a", "tyde-skills:b"]).await;
+
+            inner.record_skill_init_frame(reported).await;
+
+            match inner.skill_readiness_state() {
+                ClaudeSkillReadiness::Failed(message) => assert!(
+                    message.contains(expected_fragment),
+                    "{label}: {message:?} lacks {expected_fragment:?}"
+                ),
+                other => panic!("{label}: expected Failed, got {other:?}"),
+            }
+            assert!(
+                inner.skills_mismatched(),
+                "{label}: subsequent model output must be suppressed"
+            );
+            let mut saw_error = false;
+            while let Ok(event) = rx.try_recv() {
+                if event_kind(&event) == Some("Error") {
+                    saw_error = true;
+                }
+            }
+            assert!(saw_error, "{label}: the user must be told, not just the log");
+        }
     }
 
     #[tokio::test]
-    async fn a_missing_skill_in_the_init_frame_fails_startup() {
-        let inner = inner_expecting_skills(&["tyde-skills:a", "tyde-skills:b"]).await;
+    async fn a_mismatch_fails_the_turn_in_flight() {
+        let (inner, _rx) = inner_expecting_skills(&["tyde-skills:a"]).await;
+        let (outcome_tx, outcome_rx) = oneshot::channel();
+        {
+            let mut state = inner.state.lock().await;
+            state.active_turn = Some(ActiveTurn {
+                id: 77,
+                outcome_tx: Some(outcome_tx),
+                interrupt_requested: false,
+                pending_ask_user_question: None,
+                pending_exit_plan_mode: None,
+                quiesced_waiters: Vec::new(),
+            });
+        }
 
-        inner
-            .record_skill_init_frame(Ok(Some(vec!["tyde-skills:a".to_string()])))
-            .await;
+        inner.record_skill_init_frame(Ok(Some(Vec::new()))).await;
 
-        let err = inner
-            .await_skill_readiness()
-            .await
-            .expect_err("a dropped skill must fail startup, not warn");
-        assert!(err.contains("tyde-skills:b"), "{err}");
-        assert!(err.contains("collision"), "{err}");
+        match outcome_rx.await.expect("the turn must be resolved") {
+            TurnOutcome::Failed { error, .. } => {
+                assert!(error.contains("tyde-skills:a"), "{error}");
+                assert!(error.contains("stopped this Claude session"), "{error}");
+            }
+            TurnOutcome::Completed { .. } => panic!("a mismatched session must not complete"),
+            TurnOutcome::Cancelled { .. } => panic!("a mismatch is a failure, not a cancellation"),
+        }
     }
 
     #[tokio::test]
-    async fn an_init_frame_without_a_skills_field_fails_startup() {
-        let inner = inner_expecting_skills(&["tyde-skills:a"]).await;
-
-        inner.record_skill_init_frame(Ok(None)).await;
-
-        let err = inner
-            .await_skill_readiness()
-            .await
-            .expect_err("an unverifiable session must not start");
-        assert!(err.contains("'skills' field"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn a_malformed_skills_field_fails_startup() {
-        let inner = inner_expecting_skills(&["tyde-skills:a"]).await;
-
-        inner
-            .record_skill_init_frame(Err("Claude's init frame reported a 'skills' field that is \
-                                          not an array"
-                .to_string()))
-            .await;
-
-        let err = inner
-            .await_skill_readiness()
-            .await
-            .expect_err("a malformed frame must not be treated as success");
-        assert!(err.contains("not an array"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn a_namespace_collision_in_the_init_frame_fails_startup() {
-        let inner = inner_expecting_skills(&["tyde-skills:a"]).await;
-
-        inner
-            .record_skill_init_frame(Ok(Some(vec![
-                "tyde-skills:a".to_string(),
-                "tyde-skills:a".to_string(),
-            ])))
-            .await;
-
-        let err = inner
-            .await_skill_readiness()
-            .await
-            .expect_err("an ambiguous namespace must fail startup");
-        assert!(err.contains("collides"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn a_session_without_skills_never_waits_on_verification() {
+    async fn a_session_without_skills_ignores_init_frames_entirely() {
         let (inner, _rx) = make_test_inner();
         let inner = Arc::new(inner);
 
-        inner
-            .await_skill_readiness()
-            .await
-            .expect("nothing to verify means nothing to wait for");
-
-        // An init frame for such a session is simply ignored.
         inner.record_skill_init_frame(Ok(None)).await;
-        inner
-            .await_skill_readiness()
-            .await
-            .expect("still nothing to verify");
+
+        assert_eq!(
+            inner.skill_readiness_state(),
+            ClaudeSkillReadiness::NotRequired
+        );
+        assert!(!inner.skills_mismatched());
     }
 
     #[tokio::test]
@@ -12150,22 +12272,18 @@ mod tests {
         let plugin = Arc::new(outcome.plugin.expect("a plugin"));
         let root = plugin.root().to_path_buf();
 
-        let inner = inner_expecting_skills(&["tyde-skills:alpha"]).await;
+        let (inner, _rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
         inner.state.lock().await.skill_plugin = Some(Arc::clone(&plugin));
 
         inner
             .record_skill_init_frame(Ok(Some(vec!["tyde-skills:alpha".to_string()])))
             .await;
-        inner.await_skill_readiness().await.expect("first process");
+        assert_eq!(inner.skill_readiness_state(), ClaudeSkillReadiness::Ready);
 
-        // A respawn re-arms: the previous process's confirmation does not carry.
+        // A respawn re-arms: the previous process's confirmation does not carry,
+        // and the new process is judged on its own frame.
         inner.reset_skill_readiness().await;
-        let pending = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            inner.await_skill_readiness(),
-        )
-        .await;
-        assert!(pending.is_err(), "a respawn must wait for its own init frame");
+        assert_eq!(inner.skill_readiness_state(), ClaudeSkillReadiness::Pending);
 
         // ...and it points at the same root the session already materialized.
         let rebuilt = inner
@@ -12181,26 +12299,54 @@ mod tests {
         inner
             .record_skill_init_frame(Ok(Some(vec!["tyde-skills:alpha".to_string()])))
             .await;
-        inner.await_skill_readiness().await.expect("second process");
+        assert_eq!(inner.skill_readiness_state(), ClaudeSkillReadiness::Ready);
     }
 
-    /// End-to-end against a real child process: a session whose skills the CLI
-    /// confirms in its `init` frame reaches its first prompt, and one whose
-    /// skills the CLI drops never does.
-    ///
-    /// The fake speaks the same stream-json control protocol Tyde uses: it emits
-    /// a `system`/`init` frame on startup and answers `initialize`. It logs the
-    /// order it saw things in, so the test can assert the init frame really did
-    /// precede the prompt rather than merely coexist with it.
+    #[test]
+    fn the_plugin_inventory_check_accepts_only_this_sessions_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&root).expect("root");
+        let ok = format!(
+            r#"[{{"id":"rust-analyzer-lsp@claude-plugins-official","enabled":true}},
+                {{"id":"tyde-skills@inline","enabled":true,"installPath":{}}}]"#,
+            serde_json::to_string(&root.to_string_lossy().to_string()).expect("json")
+        );
+        verify_plugin_inventory(&ok, &root).expect("a loaded plugin at our root passes");
+
+        let missing = r#"[{"id":"rust-analyzer-lsp@claude-plugins-official","enabled":true}]"#;
+        let err = verify_plugin_inventory(missing, &root).expect_err("absent plugin");
+        assert!(err.contains("did not load"), "{err}");
+
+        let disabled = format!(
+            r#"[{{"id":"tyde-skills@inline","enabled":false,"installPath":{}}}]"#,
+            serde_json::to_string(&root.to_string_lossy().to_string()).expect("json")
+        );
+        let err = verify_plugin_inventory(&disabled, &root).expect_err("disabled plugin");
+        assert!(err.contains("disabled"), "{err}");
+
+        let elsewhere = r#"[{"id":"tyde-skills@inline","enabled":true,"installPath":"/somewhere/else"}]"#;
+        let err = verify_plugin_inventory(elsewhere, &root).expect_err("another root");
+        assert!(err.contains("not from this session's root"), "{err}");
+
+        let err = verify_plugin_inventory("not json", &root).expect_err("unparseable");
+        assert!(err.contains("not valid JSON"), "{err}");
+
+        let err = verify_plugin_inventory(r#"{"id":"x"}"#, &root).expect_err("not an array");
+        assert!(err.contains("not a JSON array"), "{err}");
+    }
+
+    /// A fake CLI that behaves the way the real one does: it emits its
+    /// `system`/`init` frame **in response to the first user message**, not at
+    /// boot. Anything that waited for the frame before writing a prompt would
+    /// deadlock against this, which is exactly why the wait was removed.
     #[cfg(unix)]
-    async fn run_init_gate_fake(
-        reported_skills: &str,
-    ) -> (Result<(), String>, String) {
+    async fn run_init_after_prompt_fake(reported_skills: &str) -> (String, Vec<Value>) {
         let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let claude_home = tempfile::tempdir().expect("claude home tempdir");
-        let fake = workspace.path().join("fake-claude-init-gate.py");
-        let log = workspace.path().join("fake-claude-init-gate.log");
+        let fake = workspace.path().join("fake-claude-init-after-prompt.py");
+        let log = workspace.path().join("fake-claude-init-after-prompt.log");
         std::fs::write(
             &fake,
             format!(
@@ -12214,15 +12360,6 @@ log_path = os.environ["TYDE_FAKE_CLAUDE_LOG"]
 def note(entry):
     with open(log_path, "a", encoding="utf-8") as handle:
         handle.write(entry + "\n")
-
-# The CLI emits its init frame at startup, before any prompt is written.
-print(json.dumps({{
-    "type": "system",
-    "subtype": "init",
-    "session_id": "init-gate-session",
-    "skills": {reported_skills},
-}}), flush=True)
-note("INIT_FRAME")
 
 for raw_line in sys.stdin:
     value = json.loads(raw_line)
@@ -12242,10 +12379,28 @@ for raw_line in sys.stdin:
         continue
     if value.get("type") == "user":
         note("PROMPT")
+        # The real CLI reports its loaded skills here, at the head of the
+        # response to the first user message -- never before one.
+        print(json.dumps({{
+            "type": "system",
+            "subtype": "init",
+            "session_id": "init-after-prompt",
+            "skills": {reported_skills},
+        }}), flush=True)
+        note("INIT_FRAME")
+        print(json.dumps({{
+            "type": "assistant",
+            "message": {{
+                "id": "msg_fake",
+                "role": "assistant",
+                "content": [{{"type": "text", "text": "MODEL-OUTPUT-SENTINEL"}}],
+            }},
+        }}), flush=True)
+        note("MODEL_OUTPUT")
 "#
             ),
         )
-        .expect("write init-gate fake");
+        .expect("write init-after-prompt fake");
         make_executable(&fake);
 
         let previous_claude_bin = std::env::var_os(TYDE_CLAUDE_BIN_ENV);
@@ -12257,15 +12412,47 @@ for raw_line in sys.stdin:
             std::env::set_var("CLAUDE_CONFIG_DIR", claude_home.path());
         }
 
-        let (inner, _rx) = make_test_inner_with_workspace(
-            workspace.path().to_string_lossy().to_string(),
-        );
+        let (inner, mut rx) =
+            make_test_inner_with_workspace(workspace.path().to_string_lossy().to_string());
         let inner = Arc::new(inner);
         {
             let mut state = inner.state.lock().await;
             state.expected_skills = vec!["tyde-skills:alpha".to_string()];
         }
-        let outcome = inner.ensure_process_ready().await;
+
+        // Startup must complete without ever waiting on the init frame.
+        let ready = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            inner.ensure_process_ready(),
+        )
+        .await
+        .expect("startup must not deadlock waiting for an init frame");
+        ready.expect("startup succeeds; skills are checked after the first prompt");
+
+        // Now send the first user message, which is what makes the CLI report.
+        inner
+            .write_process_json_line(&build_stream_json_user_message("hello", &[]))
+            .await
+            .expect("write the first prompt");
+
+        // Give the fake's response time to arrive and be consumed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains("MODEL_OUTPUT")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        let state = inner.skill_readiness_state();
         inner.shutdown().await;
 
         unsafe {
@@ -12286,35 +12473,44 @@ for raw_line in sys.stdin:
             }
         }
         let log_contents = std::fs::read_to_string(&log).unwrap_or_default();
-        (outcome, log_contents)
+        assert!(
+            matches!(state, ClaudeSkillReadiness::Ready | ClaudeSkillReadiness::Failed(_)),
+            "the init frame must have been consumed, state was {state:?}"
+        );
+        (log_contents, events)
     }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
-    async fn a_confirmed_init_frame_lets_the_session_reach_its_first_prompt() {
-        let (outcome, log) = run_init_gate_fake(r#"["tyde-skills:alpha", "code-review"]"#).await;
+    async fn startup_does_not_deadlock_when_init_follows_the_first_prompt() {
+        let (log, _events) = run_init_after_prompt_fake(r#"["tyde-skills:alpha"]"#).await;
 
-        outcome.expect("a confirmed session must become ready");
+        // The ordering the real CLI uses: prompt first, then the init frame.
+        let prompt = log.find("PROMPT").expect("a prompt was written");
+        let init = log.find("INIT_FRAME").expect("an init frame followed it");
         assert!(
-            log.starts_with("INIT_FRAME\n"),
-            "the CLI reports its skills before anything else: {log:?}"
+            prompt < init,
+            "this fake reports skills only after a prompt; startup must not wait for it: {log:?}"
         );
-        assert!(log.contains("INITIALIZE"), "{log:?}");
     }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
-    async fn a_dropped_skill_fails_startup_before_any_prompt_is_written() {
-        let (outcome, log) = run_init_gate_fake(r#"["code-review"]"#).await;
+    async fn a_mismatch_detected_after_the_prompt_terminates_the_session() {
+        let (log, events) = run_init_after_prompt_fake(r#"["something-else"]"#).await;
 
-        let err = outcome.expect_err("a session missing a skill must not become ready");
-        assert!(err.contains("tyde-skills:alpha"), "{err}");
+        assert!(log.contains("INIT_FRAME"), "{log:?}");
+        let kinds: Vec<Option<&str>> = events.iter().map(event_kind).collect();
         assert!(
-            !log.contains("PROMPT"),
-            "startup must fail before anything is written to the CLI: {log:?}"
+            kinds.contains(&Some("Error")),
+            "the mismatch must reach the user: {kinds:?}"
+        );
+        let rendered = serde_json::to_string(&events).expect("events");
+        assert!(
+            !rendered.contains("MODEL-OUTPUT-SENTINEL"),
+            "output from a mis-equipped session must be suppressed: {rendered}"
         );
     }
-
     #[tokio::test]
     async fn shutdown_unlinks_the_plugin_root_but_not_its_targets() {
         let tmp = tempfile::tempdir().expect("tempdir");
