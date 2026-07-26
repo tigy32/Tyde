@@ -46,6 +46,13 @@ const MOCK_COMPACT_SENTINEL: &str = "/compact";
 /// connect a second client and verify state.
 pub(crate) const MOCK_SLOW_TURN_SENTINEL: &str = "__mock_slow__";
 const MOCK_HOLD_UNTIL_INTERRUPT_SENTINEL: &str = "__mock_hold_until_interrupt__";
+/// Holds the turn open like [`MOCK_HOLD_UNTIL_INTERRUPT_SENTINEL`] but ignores
+/// interrupts entirely, so the turn never reports idle.
+///
+/// Models the backend that made a close hang forever: one that accepts the
+/// interrupt and then does nothing with it. The only way out is the actor's
+/// own close deadline, which is exactly what this exists to exercise.
+pub(crate) const MOCK_IGNORE_INTERRUPT_SENTINEL: &str = "__mock_ignore_interrupt__";
 pub(crate) const MOCK_DUPLICATE_IDLE_SENTINEL: &str = "__mock_duplicate_idle__";
 /// Emits an additional ordinary active→idle status cycle after a completed
 /// turn so scheduler tests can advance the inactivity generation without
@@ -536,6 +543,7 @@ fn start_mock_command_loop(
         let mut active_subagents = Vec::new();
         let mut pending_exit_plan_mode = None;
         let mut holding_until_interrupt = false;
+        let mut ignore_interrupts = false;
         let mut emit_user_bubbles = user_bubbles_from_history
             || initial_message
                 .as_deref()
@@ -553,7 +561,10 @@ fn start_mock_command_loop(
             if emit_user_bubbles {
                 emit_mock_user_bubble(&events_tx, &initial_message);
             }
-            if hold_initial_turn || initial_message.contains(MOCK_HOLD_UNTIL_INTERRUPT_SENTINEL) {
+            if hold_initial_turn
+                || initial_message.contains(MOCK_HOLD_UNTIL_INTERRUPT_SENTINEL)
+                || initial_message.contains(MOCK_IGNORE_INTERRUPT_SENTINEL)
+            {
                 if !emit_held_turn(&events_tx, &session_id_for_task, &initial_message).await {
                     return;
                 }
@@ -563,6 +574,7 @@ fn start_mock_command_loop(
                     &mut active_subagents,
                 )
                 .await;
+                ignore_interrupts = initial_message.contains(MOCK_IGNORE_INTERRUPT_SENTINEL);
                 holding_until_interrupt = true;
             } else if let Some((agent_id, message)) =
                 parse_mock_agent_control_send_message(&initial_message)
@@ -763,6 +775,11 @@ fn start_mock_command_loop(
                     }
                 }
                 MockCommand::Interrupt => {
+                    if ignore_interrupts {
+                        // Deliberately no idle transition: this models the
+                        // backend whose silence used to strand a close.
+                        continue;
+                    }
                     if holding_until_interrupt {
                         for child in &active_subagents {
                             let _ = child.event_tx.send(ChatEvent::StreamEnd(StreamEndData {

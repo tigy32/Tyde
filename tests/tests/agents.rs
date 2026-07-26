@@ -503,6 +503,36 @@ async fn mcp_spawn_agent_as(
     mcp_spawn_agent_with_request(&caller.url, Some(&caller.authorization), arguments).await
 }
 
+/// Calls `tyde_spawn_agent` expecting a refusal, returning the error text.
+///
+/// The counterpart to [`mcp_spawn_agent_as`], which asserts success. A refused
+/// spawn has to explain itself to the calling agent, so the message is the
+/// value under test, not just the failure.
+async fn mcp_spawn_agent_error_as(
+    caller: &server::AgentControlMcpCaller,
+    arguments: Value,
+) -> String {
+    let response = post_json_with_headers(
+        &caller.url,
+        &[("Authorization", caller.authorization.as_str())],
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "tyde_spawn_agent",
+                "arguments": arguments
+            }
+        }),
+    )
+    .await;
+    assert!(
+        mcp_result_is_error(&response),
+        "expected the spawn to be refused, got: {response}"
+    );
+    mcp_result_text(&response).to_owned()
+}
+
 async fn mcp_spawn_agent_with_request(
     url: &str,
     authorization: Option<&str>,
@@ -3559,6 +3589,274 @@ async fn close_agent_recursively_closes_descendants_first() {
             "closed descendant {closed} should not replay to late clients"
         );
     }
+}
+
+/// Waits for the next `NewAgent`, setting aside unrelated frames.
+///
+/// A held turn keeps emitting on the parent's stream, so a spawn's `NewAgent`
+/// is not necessarily the next frame on the connection.
+async fn expect_new_agent(client: &mut client::Connection, context: &str) -> NewAgentPayload {
+    loop {
+        let env = expect_next_event(client, context).await;
+        if env.kind == FrameKind::NewAgent {
+            return env.parse_payload().expect("parse NewAgent");
+        }
+        push_pending_agent_event(env);
+    }
+}
+
+/// Spawns a child whose turn stays open until it is interrupted.
+///
+/// [`spawn_user_child`] waits for the child's turn to complete, so it cannot
+/// produce the busy child this test needs.
+async fn spawn_busy_user_child(
+    client: &mut client::Connection,
+    parent_agent_id: &protocol::AgentId,
+    name: &str,
+    workspace_root: &str,
+) -> NewAgentPayload {
+    client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some(name.to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: Some(parent_agent_id.clone()),
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec![workspace_root.to_owned()],
+                prompt: format!("__mock_hold_until_interrupt__ {name} working"),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .unwrap_or_else(|error| panic!("spawn {name} failed: {error:?}"));
+
+    let child_new = expect_new_agent(client, &format!("{name} NewAgent")).await;
+    let _ =
+        expect_agent_start_on_stream(client, &child_new.instance_stream, &format!("{name} start"))
+            .await;
+
+    let env = expect_chat_event_on_stream(
+        client,
+        &child_new.instance_stream,
+        &format!("{name} TypingStatusChanged(true)"),
+    )
+    .await;
+    let event: ChatEvent = env.parse_payload().expect("parse busy child typing true");
+    assert!(
+        matches!(event, ChatEvent::TypingStatusChanged(true)),
+        "{name} must be mid-turn before the close"
+    );
+
+    child_new
+}
+
+/// Closing a parent whose sub-agents are still running must actually close it.
+///
+/// This is the shape of a real wedge: an orchestrator held a turn open while
+/// awaiting its children, so the close waited on an idle transition that could
+/// not arrive. Nothing was removed from the registry, the agent stayed in the
+/// Agents tab, and every later close was equally inert.
+///
+/// [`close_agent_recursively_closes_descendants_first`] covers the same
+/// traversal with idle agents, which is why it never caught this: the deferred
+/// close always resolved because those turns ended on their own. Every agent
+/// here is deliberately mid-turn.
+#[tokio::test]
+async fn close_agent_with_busy_subagents_completes_and_removes_the_subtree() {
+    let mut fixture = Fixture::new().await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("busy-close-parent".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/busy-close-parent".to_owned()],
+                prompt: "__mock_hold_until_interrupt__ parent awaiting children".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn busy-close parent failed");
+
+    let parent_new = expect_new_agent(&mut fixture.client, "busy-close parent NewAgent").await;
+    let _ = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &parent_new.instance_stream,
+        "busy-close parent start",
+    )
+    .await;
+    let env = expect_chat_event_on_stream(
+        &mut fixture.client,
+        &parent_new.instance_stream,
+        "busy-close parent TypingStatusChanged(true)",
+    )
+    .await;
+    let event: ChatEvent = env.parse_payload().expect("parse parent typing true");
+    assert!(matches!(event, ChatEvent::TypingStatusChanged(true)));
+
+    let first_child = spawn_busy_user_child(
+        &mut fixture.client,
+        &parent_new.agent_id,
+        "busy-close-child-one",
+        "/tmp/busy-close-child-one",
+    )
+    .await;
+    let second_child = spawn_busy_user_child(
+        &mut fixture.client,
+        &parent_new.agent_id,
+        "busy-close-child-two",
+        "/tmp/busy-close-child-two",
+    )
+    .await;
+
+    let expected_closed = [
+        &parent_new.agent_id,
+        &first_child.agent_id,
+        &second_child.agent_id,
+    ];
+    let ids_before_close = fixture.agent_ids().await;
+    for expected in expected_closed {
+        assert!(
+            ids_before_close.contains(expected),
+            "agent {expected} should be registered before close"
+        );
+    }
+
+    fixture
+        .client
+        .close_agent(&parent_new.instance_stream)
+        .await
+        .expect("close busy parent failed");
+
+    // `expect_next_event` bounds each wait, so a close that defers to a turn
+    // that never ends fails here instead of hanging the suite.
+    let mut closed = Vec::new();
+    loop {
+        let env = expect_next_event(&mut fixture.client, "busy-close AgentClosed").await;
+        if env.kind != FrameKind::AgentClosed {
+            continue;
+        }
+        let payload: AgentClosedPayload = env.parse_payload().expect("parse AgentClosed");
+        let is_parent = payload.agent_id == parent_new.agent_id;
+        closed.push(payload.agent_id);
+        if is_parent {
+            break;
+        }
+    }
+    for expected in expected_closed {
+        assert!(
+            closed.contains(expected),
+            "busy agent {expected} must be closed with the subtree: {closed:?}"
+        );
+    }
+
+    // The registry removal and session-list refresh run after the close loop,
+    // so a deferred close left every one of these agents visible in the UI with
+    // no way to dismiss them.
+    let ids_after_close = fixture.agent_ids().await;
+    for expected in expected_closed {
+        assert!(
+            !ids_after_close.contains(expected),
+            "busy agent {expected} must be removed from the registry after close"
+        );
+    }
+
+    let (_late_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    for expected in expected_closed {
+        assert!(
+            !bootstrap
+                .agents
+                .iter()
+                .any(|agent| &agent.agent_id == expected),
+            "closed busy agent {expected} must not replay to late clients"
+        );
+    }
+}
+
+/// A closing agent must not be able to grow the subtree being torn down.
+///
+/// `close_agent` snapshots the subtree once, so a child spawned after that
+/// snapshot is never part of the teardown — it outlives the parent that owns
+/// it. A real orchestrator spawned a fresh child 69 seconds after it was told
+/// to close.
+#[tokio::test]
+async fn agent_control_spawn_is_rejected_while_the_parent_is_closing() {
+    let mut fixture = Fixture::new().await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("closing-spawn-parent".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/closing-spawn-parent".to_owned()],
+                prompt: "__mock_ignore_interrupt__ parent never settles".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn closing-spawn parent failed");
+
+    let parent_new = expect_new_agent(&mut fixture.client, "closing-spawn parent NewAgent").await;
+    let _ = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &parent_new.instance_stream,
+        "closing-spawn parent start",
+    )
+    .await;
+    let env = expect_chat_event_on_stream(
+        &mut fixture.client,
+        &parent_new.instance_stream,
+        "closing-spawn parent TypingStatusChanged(true)",
+    )
+    .await;
+    let event: ChatEvent = env.parse_payload().expect("parse parent typing true");
+    assert!(matches!(event, ChatEvent::TypingStatusChanged(true)));
+
+    let caller = fixture.agent_control_caller(&parent_new.agent_id).await;
+
+    // The mock ignores the close interrupt, so the parent stays closing for the
+    // whole grace period — the window in which it used to keep spawning.
+    fixture
+        .client
+        .close_agent(&parent_new.instance_stream)
+        .await
+        .expect("close closing-spawn parent failed");
+
+    let error = mcp_spawn_agent_error_as(
+        &caller,
+        json!({
+            "workspace_roots": ["/tmp/closing-spawn-child"],
+            "prompt": "__mock_slow__ child of a closing parent",
+            "backend_kind": "claude",
+            "name": "closing-spawn-child"
+        }),
+    )
+    .await;
+    assert!(
+        error.contains("closing"),
+        "a spawn under a closing parent must say why it was refused, got: {error}"
+    );
 }
 
 #[tokio::test]

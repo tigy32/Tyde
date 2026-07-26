@@ -403,6 +403,14 @@ const ACTIVITY_SUMMARY_MAX_FREQUENCY: Duration = Duration::from_secs(60);
 const ACTIVITY_SUMMARY_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 const ACTIVITY_SUMMARY_GENERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const AGENT_NAME_GENERATION_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a subtree teardown waits on one agent before moving on.
+///
+/// Comfortably longer than the actor's own close grace plus its backend
+/// shutdown budget, so a healthy agent always answers first and this only
+/// fires for an actor that is genuinely stuck. Teardown must finish either
+/// way: the registry removal and session-list refresh that make a closed agent
+/// disappear from the UI run after the loop.
+const AGENT_CLOSE_TIMEOUT: Duration = Duration::from_secs(20);
 /// One supervision verdict reads more context than naming, so it gets a
 /// longer budget per attempt.
 const SUPERVISION_GENERATION_TIMEOUT: Duration = Duration::from_secs(60);
@@ -8707,7 +8715,24 @@ impl HostHandle {
         }
 
         for (target_agent_id, agent_handle) in close_targets {
-            let _ = agent_handle.close().await;
+            // Targets close in post-order so children are torn down before the
+            // parents that may be awaiting them, which is why this stays
+            // sequential. The timeout is what keeps that ordering safe: one
+            // actor that never answers used to strand every later target,
+            // including the parent, so nothing was removed from the registry
+            // and the session list never refreshed. The agent's own close
+            // deadline should always fire first; this is the backstop for when
+            // it does not.
+            if tokio::time::timeout(AGENT_CLOSE_TIMEOUT, agent_handle.close())
+                .await
+                .is_err()
+            {
+                tracing::error!(
+                    agent_id = %target_agent_id,
+                    timeout_ms = AGENT_CLOSE_TIMEOUT.as_millis(),
+                    "agent did not acknowledge close; continuing teardown without it"
+                );
+            }
 
             let payload = AgentClosedPayload {
                 agent_id: target_agent_id,
@@ -9124,6 +9149,27 @@ impl HostHandle {
         mut payload: SpawnAgentPayload,
         caller_agent_id: Option<&AgentId>,
     ) -> Result<AgentId, String> {
+        // A closing agent must not grow the subtree being torn down.
+        // `close_agent` snapshots the subtree once, so a child spawned after
+        // that snapshot is never part of the teardown: it outlives the parent
+        // that owns it and nothing subsequently closes it.
+        //
+        // Scoped to `closing` deliberately. A merely terminated parent is a
+        // different situation: parked actors still host a valid agent-control
+        // caller, and refusing them would break spawns that have always been
+        // legitimate. Only an in-progress teardown has a subtree snapshot that
+        // a new child can escape.
+        if let Some(parent_agent_id) = payload.parent_agent_id.as_ref().or(caller_agent_id) {
+            let agent_handle = {
+                let state = self.state.lock().await;
+                state.registry.agent_handle(parent_agent_id)
+            };
+            if agent_handle.is_some_and(|handle| handle.is_closing()) {
+                return Err(format!(
+                    "cannot spawn a child of agent {parent_agent_id}: the agent is closing"
+                ));
+            }
+        }
         let workflow = if let Some(caller_agent_id) = caller_agent_id {
             self.workflow_metadata_for_agent(caller_agent_id).await
         } else {

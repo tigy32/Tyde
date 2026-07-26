@@ -247,6 +247,25 @@ section. Record a timestamped status ledger for each root agent and child.
 | Backend fails | Failed/error with a visible explanation |
 | Agent closes | Terminated/removed consistently on every client |
 
+### Lifecycle control is unconditional and bounded
+
+Cancel and close are the user's authority over an agent, so they must work no
+matter what the agent is doing. Two rules apply everywhere below:
+
+- **Bounded.** Cancel and close must reach their terminal state within seconds
+  of the request, independent of how long the agent's current work would take
+  on its own. Time the ones taken during long tool calls and awaits. A control
+  that only takes effect once the underlying work finishes has not worked; it
+  was overtaken by an outcome that would have happened anyway.
+- **Truthful.** Neither control may describe a running agent as absent. Any
+  `agent not running`, `agent not found`, or equivalent message about an agent
+  still shown as active is a failure on its own, whatever happens afterwards —
+  it sends the user hunting for a crash that did not occur, and it usually
+  means a control is refusing precisely when it is needed.
+
+An agent that cannot be cancelled or closed is unrecoverable through the UI,
+so treat either failure as blocking rather than cosmetic.
+
 The exact label may differ by surface, but meaning must not conflict. A check
 icon, completed styling, finished-only placement, enabled Compact action, or
 absence from the Active view all count as a completed claim. None may appear
@@ -449,10 +468,22 @@ truly content-free completion must not create an empty chat message.
    denial, rejected tool input, command failure, or successful completion.
    Backend control prompts or synthetic rejection instructions must never be
    exposed as user-facing stdout, stderr, or assistant text.
-6. Force one safe backend error and one tool error. Confirm each is attributed
+6. Cancel a genuinely long-running command. Ask the agent to run something that
+   occupies the turn for at least sixty seconds (for example `sleep 120`), wait
+   until it is visibly executing, then cancel. Confirm the turn reaches a
+   terminal cancelled state **within seconds, not when the command would have
+   finished**, that the underlying process is actually gone rather than left
+   running in the background, and that the agent accepts a follow-up
+   afterwards. A cancel that only takes effect once the work completes on its
+   own is a failure, not a slow success.
+7. Repeat the previous step but **close** the agent instead of cancelling it,
+   while the long command is still running. Confirm the agent disappears from
+   the Agents tab promptly, no further frames arrive on its stream, and it does
+   not reappear on reload or in a new client's bootstrap.
+8. Force one safe backend error and one tool error. Confirm each is attributed
    to the correct agent and turn, preserves prior history, and leaves controls
    recoverable.
-7. After every denial, cancellation, and failure, send a normal follow-up.
+9. After every denial, cancellation, and failure, send a normal follow-up.
    Confirm the same session remains usable unless the backend explicitly made
    it non-resumable.
 
@@ -573,6 +604,35 @@ unique name, prompt marker, command marker, and final-answer marker.
    the correct request, and no foreign/duplicate identity error appears.
 7. Reopen **Task usage** and confirm root, native child, and Tyde-managed
    children have separate correctly attributed rows without double-counting.
+
+### Cancelling and closing a parent that is awaiting children
+
+An orchestrator blocked on an await holds its turn open indefinitely. That is
+the state in which cancel and close have historically failed, so exercise it
+explicitly rather than inferring it from the idle-agent cases above.
+
+8. With the parent still blocked on `await` and at least two children running,
+   press **Cancel** on the parent. Confirm the parent reaches a terminal
+   cancelled state within seconds. Confirm specifically that Cancel does **not**
+   report `agent not running`, `agent not found`, or any other message implying
+   the agent is dead — the parent is running, and saying otherwise is a
+   failure even if the turn later settles.
+9. Repeat with a fresh parent and children, but **close** the parent from the
+   Agents tab while it is awaiting. Confirm the parent and every descendant
+   disappear from the Agents tab within seconds, and that the in-flight tray
+   stops listing them.
+10. After that close, confirm the tree does not resurrect: reload the frontend
+    and connect a second client, and verify neither shows the closed parent or
+    any child. A row that survives reload means the registry was never updated.
+11. While the parent is closing, confirm it cannot spawn more children. Any
+    spawn attempted after the close must be refused with a message naming the
+    closing state, and the Agents tab must not gain a new child mid-teardown.
+12. Press **Cancel** and **Close** several times in a row on the awaiting
+    parent. Confirm repeated presses are harmless and still converge on a
+    closed agent; a second press that does nothing at all, or that reports the
+    agent as not running, is a failure.
+13. Verify the children are genuinely gone, not merely hidden — their backend
+    processes must exit, and no orphan may keep streaming into a closed parent.
 
 ## 11. Exercise ordering, queueing, and interruption races
 

@@ -57,6 +57,15 @@ use self::registry::{
 const IMAGE_ONLY_AGENT_NAME: &str = "Image Review Task";
 const BACKEND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const RESUME_REPLAY_BARRIER_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a close waits for an interrupted turn to reach idle before it
+/// tears the actor down anyway.
+///
+/// Closing a busy agent interrupts its turn, and a healthy backend reports
+/// idle well inside this window. The deadline exists for the backends that
+/// never answer: without it a close waits on an idle transition that may never
+/// arrive, which parks the actor in [`ActorLifecycle::Closing`] forever and
+/// leaves an agent the user cannot cancel, close, or message.
+const CLOSE_TURN_GRACE: Duration = Duration::from_secs(10);
 const INITIAL_HISTORY_TAIL_LIMIT: usize = 15;
 pub(crate) const DEFAULT_COMPACTION_SUMMARY_MAX_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_COMPACTION_SUMMARY_BYTES: usize = 128 * 1024;
@@ -1041,6 +1050,21 @@ impl AgentHandle {
             return false;
         }
         self.tx.send(AgentCommand::SendInput(input)).is_ok()
+    }
+
+    /// Whether this handle has been closed.
+    ///
+    /// Exists so a caller that just saw [`AgentHandle::send_input`] fail can
+    /// tell the user *why* rather than defaulting to "agent not running" — a
+    /// closing agent is still running, and saying otherwise sends people
+    /// looking for a crash that never happened.
+    ///
+    /// The flag is monotonic: [`AgentHandle::close`] is the only writer and
+    /// only ever sets it. Reading it after a failed send is therefore not a
+    /// race — if it reads true now it was already true when the send was
+    /// refused.
+    pub(crate) fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::SeqCst)
     }
 
     /// Delivers an agent-control follow-up and waits for the actor's own
@@ -2623,6 +2647,7 @@ pub(crate) fn spawn_agent_actor(
         let mut pending_tool_response_ids: HashSet<String> = HashSet::new();
         let mut lifecycle = ActorLifecycle::Running;
         let mut close_reply: Option<oneshot::Sender<()>> = None;
+        let mut close_deadline: Option<tokio::time::Instant> = None;
         let mut active_compaction: Option<ActiveCompaction> = None;
         let mut compaction_blocked = false;
         current_session_id = Some(actor_session_id.clone());
@@ -3626,10 +3651,27 @@ pub(crate) fn spawn_agent_actor(
                                 continue;
                             }
                             if matches!(lifecycle, ActorLifecycle::Closing) {
-                                reject_agent_delivery(
+                                // An acknowledged delivery has a caller to
+                                // answer. Fire-and-forget input has a human
+                                // watching the chat instead, so it needs a
+                                // transcript rejection — dropping it silently
+                                // left a typed message with no trace at all.
+                                if !reject_agent_delivery(
                                     delivery_ack.take(),
                                     DELIVERY_REJECTED_CLOSING,
-                                );
+                                ) {
+                                    let payload = closing_input_rejected_payload(
+                                        &current_start.agent_id,
+                                    );
+                                    append_event(
+                                        &canonical_stream,
+                                        &mut event_log,
+                                        &mut subscribers,
+                                        FrameKind::AgentError,
+                                        &payload,
+                                    )
+                                    .await;
+                                }
                                 continue;
                             }
                             if active_compaction.is_some() || compaction_blocked {
@@ -4769,10 +4811,12 @@ pub(crate) fn spawn_agent_actor(
                             ));
                         }
                         AgentCommand::Interrupt { reply } => {
-                            if matches!(lifecycle, ActorLifecycle::Closing) {
-                                let _ = reply.send(InterruptOutcome::NotRunning);
-                                continue;
-                            }
+                            // A closing agent is still running, and interrupting
+                            // it is exactly what ends the turn the close is
+                            // waiting on. Reporting `NotRunning` here used to
+                            // both misdescribe the state and withhold the one
+                            // action that could unwedge it, so `Closing` falls
+                            // through to the real interrupt below.
                             if active_compaction.is_some() || compaction_blocked {
                                 let payload =
                                     compaction_input_rejected_payload(&current_start.agent_id);
@@ -4849,6 +4893,25 @@ pub(crate) fn spawn_agent_actor(
                                 finish_actor_close(&accepting_input_task, &status_handle, reply).await;
                                 return;
                             }
+                            // Closing a busy agent has to end its turn, not
+                            // wait politely for one. A turn can stay open
+                            // indefinitely — an orchestrator blocked on
+                            // `tyde_await_agents` is the common case — so the
+                            // idle transition this close needs may never come
+                            // on its own. Interrupt first, then bound the wait.
+                            if !backend
+                                .as_ref()
+                                .expect("backend must exist while closing a live actor")
+                                .interrupt()
+                                .await
+                            {
+                                tracing::warn!(
+                                    agent_id = %current_start.agent_id,
+                                    "agent backend does not support interrupt; close will wait for the grace period"
+                                );
+                            }
+                            close_deadline =
+                                Some(tokio::time::Instant::now() + CLOSE_TURN_GRACE);
                         }
                         AgentCommand::Attach { stream, reply } => {
                             if resume_replay_gate_pending {
@@ -4866,6 +4929,26 @@ pub(crate) fn spawn_agent_actor(
                             let _ = reply.send(attached);
                         }
                     }
+                }
+                () = close_grace_elapsed(&close_deadline) => {
+                    // The interrupt issued when this close began never produced
+                    // an idle transition. Waiting longer only preserves an
+                    // agent the user can no longer cancel, close, or message,
+                    // so tear it down and say plainly that we did.
+                    let reply = close_reply
+                        .take()
+                        .expect("close deadline armed without pending close reply");
+                    tracing::warn!(
+                        agent_id = %current_start.agent_id,
+                        grace_ms = CLOSE_TURN_GRACE.as_millis(),
+                        "agent turn did not settle after close interrupt; forcing shutdown"
+                    );
+                    if let Some(backend) = backend.take() {
+                        shutdown_backend_with_timeout(backend, &current_start.agent_id).await;
+                    }
+                    abort_resume_replay_barrier_task(&mut resume_replay_barrier_task);
+                    finish_actor_close(&accepting_input_task, &status_handle, reply).await;
+                    return;
                 }
             }
         }
@@ -5121,6 +5204,7 @@ pub(crate) fn spawn_relay_agent_actor(
         let mut pending_tool_response_ids: HashSet<String> = HashSet::new();
         let mut lifecycle = ActorLifecycle::Running;
         let mut close_reply: Option<oneshot::Sender<()>> = None;
+        let mut close_deadline: Option<tokio::time::Instant> = None;
         let mut model_usage_open = true;
         let mut total_usage_open = true;
 
@@ -5596,6 +5680,13 @@ pub(crate) fn spawn_relay_agent_actor(
                                 finish_actor_close(&accepting_input_task, &status_handle, reply).await;
                                 return;
                             }
+                            // A relay mirrors a backend-native child and owns no
+                            // backend to interrupt, so the deadline is the only
+                            // guarantee it has. Without it a mirrored turn that
+                            // never reports idle parks the relay in `Closing`
+                            // for good.
+                            close_deadline =
+                                Some(tokio::time::Instant::now() + CLOSE_TURN_GRACE);
                         }
                         AgentCommand::Attach { stream, reply } => {
                             let attached = attach_subscriber_with_latest_output(
@@ -5609,6 +5700,20 @@ pub(crate) fn spawn_relay_agent_actor(
                             let _ = reply.send(attached);
                         }
                     }
+                }
+                () = close_grace_elapsed(&close_deadline) => {
+                    // The mirrored turn never reported idle. Holding the relay
+                    // open only preserves a row the user cannot dismiss.
+                    let reply = close_reply
+                        .take()
+                        .expect("close deadline armed without pending close reply");
+                    tracing::warn!(
+                        agent_id = %current_start.agent_id,
+                        grace_ms = CLOSE_TURN_GRACE.as_millis(),
+                        "relay turn did not settle after close; forcing shutdown"
+                    );
+                    finish_actor_close(&accepting_input_task, &status_handle, reply).await;
+                    return;
                 }
             }
         }
@@ -5686,6 +5791,18 @@ fn supervisor_failure_warning_event(attempts_started: u8) -> ChatEvent {
     })
 }
 
+/// Resolves when a pending close's grace period expires.
+///
+/// Stays pending forever while `deadline` is `None`, so the select arm this
+/// feeds is inert outside [`ActorLifecycle::Closing`] and never competes with
+/// the backend-event or command arms during normal operation.
+async fn close_grace_elapsed(deadline: &Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(*deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn shutdown_backend_with_timeout(backend: BackendHandle, agent_id: &AgentId) {
     if tokio::time::timeout(BACKEND_SHUTDOWN_TIMEOUT, backend.shutdown())
         .await
@@ -5760,6 +5877,15 @@ fn terminal_input_rejected_payload(agent_id: &AgentId) -> AgentErrorPayload {
         agent_id: agent_id.clone(),
         code: AgentErrorCode::Internal,
         message: "agent not running".to_owned(),
+        fatal: false,
+    }
+}
+
+fn closing_input_rejected_payload(agent_id: &AgentId) -> AgentErrorPayload {
+    AgentErrorPayload {
+        agent_id: agent_id.clone(),
+        code: AgentErrorCode::Internal,
+        message: DELIVERY_REJECTED_CLOSING.to_owned(),
         fatal: false,
     }
 }
@@ -8506,9 +8632,10 @@ mod tests {
         AGENT_STARTUP_SELECTION_TEST_GATE, AGENT_STARTUP_TEST_GATE, AgentActivityStatsTracker,
         AgentActorRuntimeContext, AgentCommand, AgentHandle, AgentNameChangeContext,
         AgentReplayState, AgentStartupFailure, AgentStartupTestGate,
-        AppendSupervisorWarningOutcome, GenerateAgentActivitySummaryRequest, InterruptOutcome,
-        RelayEventReceivers, ResolvedSpawnRequest, SupervisorStallInterruptOutcome,
-        SupervisorVerdictStart, SupervisorVerdictStartRejection, activity_history_snapshot,
+        AppendSupervisorWarningOutcome, CLOSE_TURN_GRACE, DELIVERY_REJECTED_CLOSING,
+        GenerateAgentActivitySummaryRequest, InterruptOutcome, RelayEventReceivers,
+        ResolvedSpawnRequest, SupervisorStallInterruptOutcome, SupervisorVerdictStart,
+        SupervisorVerdictStartRejection, activity_history_snapshot,
         agent_name_generation_spawn_config, agent_usage_snapshot_from_log, append_chat_event,
         append_event, apply_generated_agent_name, apply_runtime_session_updates, attach_subscriber,
         attach_subscriber_with_latest_output, collect_agent_activity_summary_events,
@@ -13909,8 +14036,261 @@ mod tests {
             status.is_active() && !status.turn_completed,
             "an acknowledged delivery must leave the agent active, never idle with unrun work"
         );
-        // No close here: the held turn never ends, so `close` would wait out a
-        // turn the mock only releases on interrupt.
+        // Closing here is safe now: `close` interrupts the held turn rather
+        // than waiting for an idle transition the mock only produces on
+        // interrupt. See `close_interrupts_a_held_turn_instead_of_waiting`.
+        assert!(handle.close().await);
+    }
+
+    /// Waits for a `QueuedMessages` frame carrying exactly `expected` messages.
+    async fn expect_queued_message_count(
+        rx: &mut mpsc::UnboundedReceiver<protocol::Envelope>,
+        expected: usize,
+        context: &str,
+    ) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let envelope = rx.recv().await.expect("agent stream stays open");
+                if envelope.kind != FrameKind::QueuedMessages {
+                    continue;
+                }
+                let payload = envelope
+                    .parse_payload::<QueuedMessagesPayload>()
+                    .expect("queued messages payload");
+                if payload.messages.len() == expected {
+                    return;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{context}: never saw {expected} queued messages"));
+    }
+
+    /// Closing a busy agent must end its turn, not wait for one that never ends.
+    ///
+    /// This is the regression that stranded a real orchestrator: the agent was
+    /// mid-turn on a long-running await, `Close` parked its reply waiting for an
+    /// idle transition that could not arrive, and the agent became impossible to
+    /// cancel, close, or message. The held mock turn is the same shape — it ends
+    /// only on interrupt — so a close that does not interrupt hangs here.
+    #[tokio::test]
+    async fn close_interrupts_a_held_turn_instead_of_waiting() {
+        let _startup_test_guard = AGENT_STARTUP_ACTOR_TEST_LOCK.lock().await;
+        let (_dir, start, mut request, runtime, status_handle) =
+            startup_actor_fixture("agent-close-held-turn", None);
+        request.initial_input = Some(delivery_payload("__mock_hold_until_interrupt__ hold"));
+        let (handle, startup_rx) =
+            spawn_agent_actor(start.agent_id.clone(), start, request, runtime);
+        startup_rx
+            .await
+            .expect("actor startup reply")
+            .expect("mock actor startup");
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if status_handle.snapshot().await.is_thinking {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("held mock turn opens");
+
+        // The bound is the assertion: before the fix this waited forever, and
+        // any regression puts it back to hanging rather than failing loudly.
+        let closed = timeout(Duration::from_secs(5), handle.close())
+            .await
+            .expect("close must not wait on a turn that only ends when interrupted");
+        assert!(closed, "close must be acknowledged by the actor");
+
+        let status = status_handle.snapshot().await;
+        assert!(status.terminated, "a closed agent must publish terminated");
+        assert!(
+            !status.is_thinking,
+            "closing must settle the turn, not leave the agent thinking forever"
+        );
+    }
+
+    /// A backend that swallows the interrupt must not be able to wedge a close.
+    ///
+    /// The interrupt in `close_interrupts_a_held_turn_instead_of_waiting` is the
+    /// fast path. This covers the backstop: when no idle transition follows,
+    /// the close deadline tears the actor down anyway.
+    #[tokio::test(start_paused = true)]
+    async fn close_completes_when_the_backend_ignores_the_interrupt() {
+        let _startup_test_guard = AGENT_STARTUP_ACTOR_TEST_LOCK.lock().await;
+        let (_dir, start, mut request, runtime, status_handle) =
+            startup_actor_fixture("agent-close-ignored-interrupt", None);
+        request.initial_input = Some(delivery_payload("__mock_ignore_interrupt__ never settles"));
+        let (handle, startup_rx) =
+            spawn_agent_actor(start.agent_id.clone(), start, request, runtime);
+        startup_rx
+            .await
+            .expect("actor startup reply")
+            .expect("mock actor startup");
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if status_handle.snapshot().await.is_thinking {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("held mock turn opens");
+
+        // Paused time auto-advances to the close deadline, so this asserts the
+        // deadline exists without spending its wall-clock duration.
+        let closed = timeout(CLOSE_TURN_GRACE * 3, handle.close())
+            .await
+            .expect("the close deadline must fire when no idle transition arrives");
+        assert!(closed, "close must be acknowledged after the grace period");
+        assert!(
+            status_handle.snapshot().await.terminated,
+            "a forced close must still publish terminated"
+        );
+    }
+
+    /// Cancel must keep working while an agent is closing.
+    ///
+    /// Reporting `NotRunning` here was doubly wrong: the agent is running, and
+    /// interrupting is precisely what ends the turn the close is waiting on —
+    /// so the misreport also withheld the user's only manual escape.
+    #[tokio::test]
+    async fn interrupt_during_close_interrupts_instead_of_reporting_not_running() {
+        let _startup_test_guard = AGENT_STARTUP_ACTOR_TEST_LOCK.lock().await;
+        let (_dir, start, mut request, runtime, status_handle) =
+            startup_actor_fixture("agent-interrupt-while-closing", None);
+        request.initial_input = Some(delivery_payload(
+            "__mock_ignore_interrupt__ closing stays busy",
+        ));
+        let (handle, startup_rx) =
+            spawn_agent_actor(start.agent_id.clone(), start, request, runtime);
+        startup_rx
+            .await
+            .expect("actor startup reply")
+            .expect("mock actor startup");
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if status_handle.snapshot().await.is_thinking {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("held mock turn opens");
+
+        // Queue a message so the actor has an observable side effect when it
+        // enters `Closing`: the close clears the queue and republishes it.
+        // Waiting on that snapshot is what makes this test deterministic —
+        // without it the interrupt could be answered by the still-`Running`
+        // actor and pass vacuously.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert!(handle.attach(replay_stream(tx)).await);
+        let _ = recv_agent_bootstrap_events(&mut rx, "interrupt-while-closing bootstrap").await;
+        assert_eq!(
+            handle
+                .deliver_message(delivery_payload("queued before close"))
+                .await,
+            Ok(())
+        );
+        expect_queued_message_count(&mut rx, 1, "message queued behind the held turn").await;
+
+        let close_handle = handle.clone();
+        let closing = tokio::spawn(async move { close_handle.close().await });
+        expect_queued_message_count(&mut rx, 0, "close clears the queue on entering Closing").await;
+
+        let outcome = timeout(Duration::from_secs(5), handle.interrupt())
+            .await
+            .expect("interrupt must be answered while closing");
+        assert_ne!(
+            outcome,
+            InterruptOutcome::NotRunning,
+            "a closing agent is still running; reporting NotRunning hides a live agent"
+        );
+        assert_eq!(
+            outcome,
+            InterruptOutcome::Interrupted,
+            "interrupt during close must reach the backend"
+        );
+
+        closing.abort();
+    }
+
+    /// Input that reaches a closing actor must be reported, not swallowed.
+    ///
+    /// A user can type and then close, so a `SendInput` enqueued before the
+    /// close flag is set still arrives after the actor has entered `Closing`.
+    /// That case appended nothing at all, leaving a typed message with no trace
+    /// in the transcript. This sends on the actor mailbox directly because the
+    /// handle's closing gate is what normally shields this arm.
+    #[tokio::test]
+    async fn input_arriving_after_close_reports_that_the_agent_is_closing() {
+        let _startup_test_guard = AGENT_STARTUP_ACTOR_TEST_LOCK.lock().await;
+        let (_dir, start, mut request, runtime, status_handle) =
+            startup_actor_fixture("agent-input-after-close", None);
+        request.initial_input = Some(delivery_payload(
+            "__mock_ignore_interrupt__ closing stays busy",
+        ));
+        let (handle, startup_rx) =
+            spawn_agent_actor(start.agent_id.clone(), start, request, runtime);
+        startup_rx
+            .await
+            .expect("actor startup reply")
+            .expect("mock actor startup");
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if status_handle.snapshot().await.is_thinking {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("held mock turn opens");
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert!(handle.attach(replay_stream(tx)).await);
+        let _ = recv_agent_bootstrap_events(&mut rx, "input-after-close bootstrap").await;
+        assert_eq!(
+            handle
+                .deliver_message(delivery_payload("queued before close"))
+                .await,
+            Ok(())
+        );
+        expect_queued_message_count(&mut rx, 1, "message queued behind the held turn").await;
+
+        let close_handle = handle.clone();
+        let closing = tokio::spawn(async move { close_handle.close().await });
+        expect_queued_message_count(&mut rx, 0, "close clears the queue on entering Closing").await;
+
+        handle
+            .tx
+            .send(AgentCommand::SendInput(AgentInput::SendMessage(
+                delivery_payload("typed just before close"),
+            )))
+            .expect("actor mailbox accepts input while closing");
+
+        let error = timeout(Duration::from_secs(5), async {
+            loop {
+                let envelope = rx.recv().await.expect("agent stream stays open");
+                if envelope.kind == FrameKind::AgentError {
+                    return envelope
+                        .parse_payload::<protocol::AgentErrorPayload>()
+                        .expect("agent error payload");
+                }
+            }
+        })
+        .await
+        .expect("input to a closing actor must append a transcript rejection");
+        assert_eq!(
+            error.message, DELIVERY_REJECTED_CLOSING,
+            "a closing agent is running; reporting it as not running misdescribes the state"
+        );
+        assert!(!error.fatal, "a refused input must not be a fatal error");
+
+        closing.abort();
     }
 
     #[tokio::test]

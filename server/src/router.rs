@@ -484,16 +484,14 @@ pub(crate) async fn route_client_envelope(
                 let agent_id = parse_agent_id(&stream_path)?;
                 let payload: SendMessagePayload = parse_payload(&envelope, "send_message")?;
 
-                let sent = if let Some(agent) = host.agent_handle(&agent_id).await {
-                    agent.send_input(AgentInput::SendMessage(payload)).await
-                } else {
-                    false
-                };
-
-                if !sent {
-                    let stream = host_output_stream.with_path(stream_path);
-                    send_agent_not_running_error(stream, agent_id).await;
-                }
+                deliver_agent_input(
+                    host,
+                    agent_id,
+                    AgentInput::SendMessage(payload),
+                    stream_path,
+                    host_output_stream,
+                )
+                .await;
             }
             FrameKind::EditQueuedMessage => {
                 let stream_path = envelope.stream.clone();
@@ -501,18 +499,14 @@ pub(crate) async fn route_client_envelope(
                 let payload: EditQueuedMessagePayload =
                     parse_payload(&envelope, "edit_queued_message")?;
 
-                let sent = if let Some(agent) = host.agent_handle(&agent_id).await {
-                    agent
-                        .send_input(AgentInput::EditQueuedMessage(payload))
-                        .await
-                } else {
-                    false
-                };
-
-                if !sent {
-                    let stream = host_output_stream.with_path(stream_path);
-                    send_agent_not_running_error(stream, agent_id).await;
-                }
+                deliver_agent_input(
+                    host,
+                    agent_id,
+                    AgentInput::EditQueuedMessage(payload),
+                    stream_path,
+                    host_output_stream,
+                )
+                .await;
             }
             FrameKind::CancelQueuedMessage => {
                 let stream_path = envelope.stream.clone();
@@ -520,18 +514,14 @@ pub(crate) async fn route_client_envelope(
                 let payload: CancelQueuedMessagePayload =
                     parse_payload(&envelope, "cancel_queued_message")?;
 
-                let sent = if let Some(agent) = host.agent_handle(&agent_id).await {
-                    agent
-                        .send_input(AgentInput::CancelQueuedMessage(payload))
-                        .await
-                } else {
-                    false
-                };
-
-                if !sent {
-                    let stream = host_output_stream.with_path(stream_path);
-                    send_agent_not_running_error(stream, agent_id).await;
-                }
+                deliver_agent_input(
+                    host,
+                    agent_id,
+                    AgentInput::CancelQueuedMessage(payload),
+                    stream_path,
+                    host_output_stream,
+                )
+                .await;
             }
             FrameKind::SendQueuedMessageNow => {
                 let stream_path = envelope.stream.clone();
@@ -539,18 +529,14 @@ pub(crate) async fn route_client_envelope(
                 let payload: SendQueuedMessageNowPayload =
                     parse_payload(&envelope, "send_queued_message_now")?;
 
-                let sent = if let Some(agent) = host.agent_handle(&agent_id).await {
-                    agent
-                        .send_input(AgentInput::SendQueuedMessageNow(payload))
-                        .await
-                } else {
-                    false
-                };
-
-                if !sent {
-                    let stream = host_output_stream.with_path(stream_path);
-                    send_agent_not_running_error(stream, agent_id).await;
-                }
+                deliver_agent_input(
+                    host,
+                    agent_id,
+                    AgentInput::SendQueuedMessageNow(payload),
+                    stream_path,
+                    host_output_stream,
+                )
+                .await;
             }
             FrameKind::SetAgentName => {
                 let stream_path = envelope.stream.clone();
@@ -607,18 +593,14 @@ pub(crate) async fn route_client_envelope(
                 let payload: SetSessionSettingsPayload =
                     parse_payload(&envelope, "set_session_settings")?;
 
-                let sent = if let Some(agent) = host.agent_handle(&agent_id).await {
-                    agent
-                        .send_input(AgentInput::UpdateSessionSettings(payload))
-                        .await
-                } else {
-                    false
-                };
-
-                if !sent {
-                    let stream = host_output_stream.with_path(stream_path);
-                    send_agent_not_running_error(stream, agent_id).await;
-                }
+                deliver_agent_input(
+                    host,
+                    agent_id,
+                    AgentInput::UpdateSessionSettings(payload),
+                    stream_path,
+                    host_output_stream,
+                )
+                .await;
             }
             other => {
                 return Err(AppError::protocol(
@@ -1429,10 +1411,64 @@ fn parse_review_id(stream: &StreamPath) -> AppResult<ReviewId> {
 }
 
 async fn send_agent_not_running_error(stream: Stream, agent_id: AgentId) {
+    send_agent_unavailable_error(stream, agent_id, AgentUnavailable::NotRunning).await;
+}
+
+/// Hands a client frame to an agent actor, reporting an accurate reason when
+/// it cannot be delivered.
+///
+/// Every fire-and-forget agent input shares this path so the closing case is
+/// distinguished once rather than at five call sites that each defaulted to
+/// "agent not running".
+async fn deliver_agent_input(
+    host: &HostHandle,
+    agent_id: AgentId,
+    input: AgentInput,
+    stream_path: StreamPath,
+    host_output_stream: &Stream,
+) {
+    let reason = match host.agent_handle(&agent_id).await {
+        Some(agent) => {
+            if agent.send_input(input).await {
+                return;
+            }
+            if agent.is_closing() {
+                AgentUnavailable::Closing
+            } else {
+                AgentUnavailable::NotRunning
+            }
+        }
+        None => AgentUnavailable::NotRunning,
+    };
+    let stream = host_output_stream.with_path(stream_path);
+    send_agent_unavailable_error(stream, agent_id, reason).await;
+}
+
+/// Why the router could not hand an agent frame to its actor.
+///
+/// The distinction is user-facing: "not running" sends someone looking for a
+/// crashed agent, while a closing agent is alive and mid-teardown. Collapsing
+/// the two is what made a wedged close read as a dead agent.
+#[derive(Clone, Copy)]
+enum AgentUnavailable {
+    NotRunning,
+    Closing,
+}
+
+impl AgentUnavailable {
+    fn message(self) -> &'static str {
+        match self {
+            Self::NotRunning => "agent not running",
+            Self::Closing => "agent is closing",
+        }
+    }
+}
+
+async fn send_agent_unavailable_error(stream: Stream, agent_id: AgentId, reason: AgentUnavailable) {
     let payload = AgentErrorPayload {
         agent_id,
         code: AgentErrorCode::Internal,
-        message: "agent not running".to_owned(),
+        message: reason.message().to_owned(),
         fatal: false,
     };
     match serde_json::to_value(&payload) {
