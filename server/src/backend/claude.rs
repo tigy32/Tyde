@@ -111,6 +111,17 @@ const CLAUDE_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
 const CLAUDE_SKILL_VERIFICATION_TIMEOUT: Duration = CLAUDE_INITIALIZE_TIMEOUT;
 #[cfg(test)]
 const CLAUDE_SKILL_VERIFICATION_TIMEOUT: Duration = Duration::from_millis(750);
+/// How much output a session will hold while waiting to learn whether it has
+/// its skills. Generous enough that a normal first response never trips it, and
+/// bounded so a CLI that never reports cannot grow the buffer without limit.
+#[cfg(not(test))]
+const CLAUDE_HELD_BACK_FRAME_LIMIT: usize = 512;
+#[cfg(not(test))]
+const CLAUDE_HELD_BACK_BYTE_LIMIT: usize = 4 * 1024 * 1024;
+#[cfg(test)]
+const CLAUDE_HELD_BACK_FRAME_LIMIT: usize = 8;
+#[cfg(test)]
+const CLAUDE_HELD_BACK_BYTE_LIMIT: usize = 64 * 1024;
 
 #[cfg(test)]
 pub(crate) static FAKE_CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -486,6 +497,8 @@ impl ClaudeSession {
                 tool_policy: mode.tool_policy,
                 skill_plugin,
                 expected_skills,
+                skill_verification_generation: 0,
+                skill_watchdog: None,
                 cumulative_usage: None,
                 cumulative_usage_complete: true,
                 conversation_bytes_total: 0,
@@ -645,6 +658,13 @@ struct ClaudeState {
     /// `tyde-skills:<name>` for every skill Tyde materialized, checked against
     /// the CLI's `init` frame.
     expected_skills: Vec<String>,
+    /// Bumped every time a process is about to start. A verification watchdog
+    /// captures this at arm time and refuses to act if it no longer matches, so
+    /// a timer left over from a killed process cannot kill its replacement.
+    skill_verification_generation: u64,
+    /// The live watchdog, cancelled the moment verification settles or the
+    /// session shuts down.
+    skill_watchdog: Option<JoinHandle<()>>,
     cumulative_usage: Option<Value>,
     cumulative_usage_complete: bool,
     conversation_bytes_total: u64,
@@ -687,6 +707,8 @@ impl Default for ClaudeState {
             tool_policy: ToolPolicy::Unrestricted,
             skill_plugin: None,
             expected_skills: Vec::new(),
+            skill_verification_generation: 0,
+            skill_watchdog: None,
             cumulative_usage: None,
             cumulative_usage_complete: true,
             conversation_bytes_total: 0,
@@ -2469,6 +2491,15 @@ impl ClaudeInner {
             "{message} Tyde stopped this Claude session before using its response, because a \
              session missing a skill it was configured with will silently do the wrong thing."
         );
+        // Record the verdict *before* killing anything. Every terminal path
+        // routes through here — the init frame, a turn that ended without one,
+        // EOF, the watchdog, buffer overflow — and each must leave the session
+        // in `Failed` with a reason rather than in `Pending`, or a later reader
+        // of the state cannot tell "still waiting" from "already dead".
+        let _ = self
+            .skill_readiness
+            .send(ClaudeSkillReadiness::Failed(full.clone()));
+        self.cancel_skill_watchdog().await;
         tracing::error!("{full}");
         self.emit_error(&full);
         if let Some(turn_id) = self.active_turn_pending_outcome_id().await {
@@ -2527,6 +2558,7 @@ impl ClaudeInner {
                     expected.len()
                 );
                 let _ = self.skill_readiness.send(ClaudeSkillReadiness::Ready);
+                self.cancel_skill_watchdog().await;
             }
             InitFrameVerdict::Failed(message) => {
                 let _ = self
@@ -2572,21 +2604,83 @@ impl ClaudeInner {
         }
         let inner = Arc::clone(self);
         tokio::spawn(async move {
-            tokio::time::sleep(CLAUDE_SKILL_VERIFICATION_TIMEOUT).await;
-            if inner.skills_awaiting_verification() {
-                inner
-                    .terminate_for_skill_mismatch(
-                        "Claude did not report which skills it loaded within the startup \
-                         timeout.",
-                    )
-                    .await;
+            // Capture the generation this timer belongs to. A respawn bumps it,
+            // so a timer that outlives its process becomes inert instead of
+            // killing whatever is running when it finally fires.
+            let generation = inner.state.lock().await.skill_verification_generation;
+            let handle = {
+                let inner = Arc::clone(&inner);
+                tokio::spawn(async move {
+                    tokio::time::sleep(CLAUDE_SKILL_VERIFICATION_TIMEOUT).await;
+                    if !inner.skills_awaiting_verification() {
+                        return;
+                    }
+                    if inner.state.lock().await.skill_verification_generation != generation {
+                        tracing::debug!(
+                            "Skipping a Claude skill watchdog from generation {generation}; \
+                             the session has respawned since"
+                        );
+                        return;
+                    }
+                    inner
+                        .terminate_for_skill_mismatch(
+                            "Claude did not report which skills it loaded within the startup \
+                             timeout.",
+                        )
+                        .await;
+                })
+            };
+            let previous = inner.state.lock().await.skill_watchdog.replace(handle);
+            if let Some(previous) = previous {
+                previous.abort();
             }
         });
     }
 
+    /// Stop the verification watchdog, if one is armed.
+    async fn cancel_skill_watchdog(&self) {
+        let handle = self.state.lock().await.skill_watchdog.take();
+        if let Some(handle) = handle {
+            handle.abort();
+        }
+    }
+
+    /// Forget a pending verification because the turn was cancelled.
+    ///
+    /// A cancelled turn is not a skill failure, and reporting one would blame
+    /// the skills for something the user did. The watchdog is stopped, the
+    /// generation is bumped so any in-flight timer is inert, and readiness is
+    /// left `Pending` for whichever process starts next.
+    async fn abandon_skill_verification_for_cancel(&self) {
+        {
+            let mut state = self.state.lock().await;
+            state.skill_verification_generation =
+                state.skill_verification_generation.wrapping_add(1);
+        }
+        self.cancel_skill_watchdog().await;
+    }
+
+    /// Was the turn currently in flight interrupted by the user?
+    async fn active_turn_is_interrupted(&self) -> bool {
+        self.state
+            .lock()
+            .await
+            .active_turn
+            .as_ref()
+            .is_some_and(|active| active.interrupt_requested)
+    }
+
     /// Re-arm verification for a process that is about to start.
     async fn reset_skill_readiness(&self) {
-        let required = !self.state.lock().await.expected_skills.is_empty();
+        self.cancel_skill_watchdog().await;
+        let required = {
+            let mut state = self.state.lock().await;
+            // A new process gets a new generation, so any watchdog still
+            // sleeping for the old one can no longer act.
+            state.skill_verification_generation =
+                state.skill_verification_generation.wrapping_add(1);
+            !state.expected_skills.is_empty()
+        };
         if required {
             let _ = self.skill_readiness.send(ClaudeSkillReadiness::Pending);
         }
@@ -2617,6 +2711,10 @@ impl ClaudeInner {
     }
 
     async fn cancel_active_turn(&self) {
+        // A cancelled turn is the user's doing, not the skills'. Drop any
+        // pending verification so the terminal frames that follow a cancel are
+        // not mistaken for a CLI that failed to report.
+        self.abandon_skill_verification_for_cancel().await;
         let (turn_id, quiesced_rx) = {
             let mut state = self.state.lock().await;
             let Some(active) = state.active_turn.as_mut() else {
@@ -2926,6 +3024,7 @@ impl ClaudeInner {
 
     async fn shutdown(&self) {
         self.state.lock().await.closing = true;
+        self.cancel_skill_watchdog().await;
         self.cancel_active_turn().await;
         self.shutdown_process().await;
         // Unlink the session plugin root once the CLI that was reading it is
@@ -3697,6 +3796,10 @@ async fn read_claude_stdout_persistent(
     // late, so it waits here and is replayed in order once the frame confirms
     // the session — or dropped entirely if it does not.
     let mut held_back: Vec<Value> = Vec::new();
+    // Held-back frames are bounded in both count and size. A CLI that streams a
+    // long answer and never reports would otherwise grow this without limit,
+    // turning a verification problem into a memory problem.
+    let mut held_back_bytes: usize = 0;
     // Frames still to process. Normally one line at a time, but a flush after
     // verification pushes the held-back frames back to the front, so replay
     // reuses exactly the same handling as live frames.
@@ -3708,14 +3811,21 @@ async fn read_claude_stdout_persistent(
             None => {
                 let Ok(Some(line)) = lines.next_line().await else {
                     // EOF. A session that never confirmed its skills must not
-                    // look like a clean end-of-stream.
+                    // look like a clean end-of-stream — unless the user
+                    // cancelled, in which case this is the cancel taking effect
+                    // and blaming the skills would be wrong.
                     if inner.skills_awaiting_verification() {
-                        inner
-                            .terminate_for_skill_mismatch(
-                                "Claude exited before reporting which skills it loaded.",
-                            )
-                            .await;
+                        if inner.active_turn_is_interrupted().await {
+                            inner.abandon_skill_verification_for_cancel().await;
+                        } else {
+                            inner
+                                .terminate_for_skill_mismatch(
+                                    "Claude exited before reporting which skills it loaded.",
+                                )
+                                .await;
+                        }
                     }
+                    held_back.clear();
                     break;
                 };
                 let trimmed = line.trim();
@@ -3732,12 +3842,48 @@ async fn read_claude_stdout_persistent(
             }
         };
 
-        // Control traffic is never held back: the `initialize` handshake and
-        // permission round-trips have to keep flowing or the CLI stalls and no
-        // `init` frame is ever produced.
+        // Control *responses* are the only inbound traffic that must flow
+        // before verification: the `initialize` handshake Tyde itself issued is
+        // answered this way, and blocking it would stall the CLI before it
+        // could ever emit an `init` frame.
         if route_control_response(&value, &control_waiters).await {
             continue;
         }
+
+        // A cancelled turn is checked before anything below can call this a
+        // skill problem. The user stopping a turn is not the skills failing,
+        // and the terminal frames that follow a cancel must report cancellation.
+        if inner.skills_awaiting_verification() && inner.active_turn_is_interrupted().await {
+            inner.abandon_skill_verification_for_cancel().await;
+            held_back.clear();
+            held_back_bytes = 0;
+        }
+
+        // Inbound control *requests* — permission prompts, ExitPlanMode,
+        // AskUserQuestion — are turn-time actions. The real protocol does not
+        // send them before the `init` frame, and acting on one would be taking
+        // an action on behalf of a session whose skills are still unverified.
+        // Fail fast rather than buffer: these carry a request id the CLI is
+        // blocking on, so holding one is a hang, and answering one is exactly
+        // the bypass this check exists to prevent.
+        if inner.skills_awaiting_verification()
+            && value.get("type").and_then(Value::as_str) == Some("control_request")
+        {
+            let subtype = value
+                .pointer("/request/subtype")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            inner
+                .terminate_for_skill_mismatch(&format!(
+                    "Claude asked Tyde to act on a '{subtype}' control request before reporting \
+                     which skills it loaded."
+                ))
+                .await;
+            held_back.clear();
+            held_back_bytes = 0;
+            continue;
+        }
+
         if handle_exit_plan_mode_control_request(&value, &inner, &mut turn_state, &stdin).await {
             continue;
         }
@@ -3759,8 +3905,12 @@ async fn read_claude_stdout_persistent(
                     for held in held_back.drain(..).rev() {
                         queue.push_front(held);
                     }
+                    held_back_bytes = 0;
                 }
-                ClaudeSkillReadiness::Failed(_) => held_back.clear(),
+                ClaudeSkillReadiness::Failed(_) => {
+                    held_back.clear();
+                    held_back_bytes = 0;
+                }
                 _ => {}
             }
         }
@@ -3778,8 +3928,25 @@ async fn read_claude_stdout_persistent(
                     )
                     .await;
                 held_back.clear();
+                held_back_bytes = 0;
                 continue;
             }
+            let frame_bytes = value.to_string().len();
+            if held_back.len() + 1 > CLAUDE_HELD_BACK_FRAME_LIMIT
+                || held_back_bytes + frame_bytes > CLAUDE_HELD_BACK_BYTE_LIMIT
+            {
+                inner
+                    .terminate_for_skill_mismatch(&format!(
+                        "Claude produced more than {} frames or {} bytes of output without \
+                         reporting which skills it loaded.",
+                        CLAUDE_HELD_BACK_FRAME_LIMIT, CLAUDE_HELD_BACK_BYTE_LIMIT
+                    ))
+                    .await;
+                held_back.clear();
+                held_back_bytes = 0;
+                continue;
+            }
+            held_back_bytes += frame_bytes;
             held_back.push(value);
             continue;
         }
@@ -11256,7 +11423,9 @@ mod tests {
                 tool_policy: ToolPolicy::Unrestricted,
                 skill_plugin: None,
                 expected_skills: Vec::new(),
-                    cumulative_usage: None,
+                skill_verification_generation: 0,
+                skill_watchdog: None,
+                cumulative_usage: None,
                 cumulative_usage_complete: true,
                 conversation_bytes_total: 0,
                 active_turn: None,
@@ -12559,10 +12728,17 @@ sys.exit(1)
         ResultBeforeInit,
         /// Say nothing at all: no init frame, no output, no result.
         SaysNothing,
+        /// Send an inbound control request before the init frame — an action
+        /// the session would be taking on unverified skills.
+        ControlRequestBeforeInit,
+        /// Flood output and never report, to trip the hold-back bounds.
+        FloodsWithoutInit,
     }
 
     #[cfg(unix)]
-    async fn run_init_after_prompt_fake(reported_skills: &str) -> (String, Vec<Value>) {
+    async fn run_init_after_prompt_fake(
+        reported_skills: &str,
+    ) -> (String, Vec<Value>, ClaudeSkillReadiness) {
         run_fake_with_behaviour(FakeInitBehaviour::Reports(match reported_skills {
             r#"["tyde-skills:alpha"]"# => r#"["tyde-skills:alpha"]"#,
             _ => r#"["something-else"]"#,
@@ -12575,6 +12751,8 @@ sys.exit(1)
         fn tag(self) -> &'static str {
             match self {
                 Self::Reports(_) => "reports",
+                Self::ControlRequestBeforeInit => "control_before_init",
+                Self::FloodsWithoutInit => "floods_without_init",
                 Self::OmitsInit => "omits_init",
                 Self::AssistantBeforeInit(_) => "assistant_before_init",
                 Self::ResultBeforeInit => "result_before_init",
@@ -12595,13 +12773,17 @@ sys.exit(1)
             match self {
                 Self::Reports(_) | Self::AssistantBeforeInit(_) | Self::OmitsInit => Some("RESULT"),
                 Self::ResultBeforeInit => Some("RESULT"),
+                Self::ControlRequestBeforeInit => Some("CONTROL_REQUEST"),
+                Self::FloodsWithoutInit => Some("FLOOD_DONE"),
                 Self::SaysNothing => None,
             }
         }
     }
 
     #[cfg(unix)]
-    async fn run_fake_with_behaviour(behaviour: FakeInitBehaviour) -> (String, Vec<Value>) {
+    async fn run_fake_with_behaviour(
+        behaviour: FakeInitBehaviour,
+    ) -> (String, Vec<Value>, ClaudeSkillReadiness) {
         let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let claude_home = tempfile::tempdir().expect("claude home tempdir");
@@ -12670,6 +12852,17 @@ for raw_line in sys.stdin:
             print(result, flush=True); note("RESULT")
         elif behaviour == "result_before_init":
             print(result, flush=True); note("RESULT")
+        elif behaviour == "control_before_init":
+            print(json.dumps({{
+                "type": "control_request",
+                "request_id": "req_pre_init",
+                "request": {{"subtype": "can_use_tool", "tool_name": "Bash"}},
+            }}), flush=True)
+            note("CONTROL_REQUEST")
+        elif behaviour == "floods_without_init":
+            for n in range(40):
+                print(assistant, flush=True)
+            note("FLOOD_DONE")
         # "says_nothing" falls through: no frames at all.
 "#,
                 behaviour = behaviour.tag(),
@@ -12760,17 +12953,13 @@ for raw_line in sys.stdin:
             }
         }
         let log_contents = std::fs::read_to_string(&log).unwrap_or_default();
-        assert!(
-            !matches!(state, ClaudeSkillReadiness::Pending),
-            "verification must resolve one way or the other, state was {state:?}"
-        );
-        (log_contents, events)
+        (log_contents, events, state)
     }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn startup_does_not_deadlock_when_init_follows_the_first_prompt() {
-        let (log, _events) = run_init_after_prompt_fake(r#"["tyde-skills:alpha"]"#).await;
+        let (log, _events, _state) = run_init_after_prompt_fake(r#"["tyde-skills:alpha"]"#).await;
 
         // The ordering the real CLI uses: prompt first, then the init frame.
         let prompt = log.find("PROMPT").expect("a prompt was written");
@@ -12784,7 +12973,7 @@ for raw_line in sys.stdin:
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn output_emitted_before_the_init_frame_is_held_back_and_then_replayed() {
-        let (log, events) =
+        let (log, events, _state) =
             run_fake_with_behaviour(FakeInitBehaviour::AssistantBeforeInit(
                 r#"["tyde-skills:alpha"]"#,
             ))
@@ -12813,7 +13002,7 @@ for raw_line in sys.stdin:
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn output_held_back_before_a_mismatch_is_discarded_not_replayed() {
-        let (log, events) =
+        let (log, events, _state) =
             run_fake_with_behaviour(FakeInitBehaviour::AssistantBeforeInit(r#"["other"]"#)).await;
 
         assert!(log.contains("MODEL_OUTPUT") && log.contains("INIT_FRAME"), "{log:?}");
@@ -12829,7 +13018,7 @@ for raw_line in sys.stdin:
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn a_cli_that_never_reports_skills_fails_rather_than_rendering() {
-        let (log, events) = run_fake_with_behaviour(FakeInitBehaviour::OmitsInit).await;
+        let (log, events, _state) = run_fake_with_behaviour(FakeInitBehaviour::OmitsInit).await;
 
         assert!(log.contains("MODEL_OUTPUT"), "the fake did speak: {log:?}");
         assert!(!log.contains("INIT_FRAME"), "but never reported: {log:?}");
@@ -12845,7 +13034,7 @@ for raw_line in sys.stdin:
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn a_turn_that_ends_without_an_init_frame_fails_the_session() {
-        let (log, events) = run_fake_with_behaviour(FakeInitBehaviour::ResultBeforeInit).await;
+        let (log, events, _state) = run_fake_with_behaviour(FakeInitBehaviour::ResultBeforeInit).await;
 
         assert!(log.contains("RESULT"), "{log:?}");
         assert!(!log.contains("INIT_FRAME"), "{log:?}");
@@ -12861,7 +13050,7 @@ for raw_line in sys.stdin:
     async fn a_silent_cli_is_failed_by_the_verification_watchdog() {
         // Nothing at all comes back after the prompt: no init frame, no output,
         // no result. Only the timeout can resolve this.
-        let (log, events) = run_fake_with_behaviour(FakeInitBehaviour::SaysNothing).await;
+        let (log, events, _state) = run_fake_with_behaviour(FakeInitBehaviour::SaysNothing).await;
 
         assert!(log.contains("PROMPT"), "{log:?}");
         assert!(!log.contains("INIT_FRAME"), "{log:?}");
@@ -12872,10 +13061,166 @@ for raw_line in sys.stdin:
         );
     }
 
+    /// Every terminal path must leave a *reason*, not just a dead process.
+    /// `Pending` after the fact would mean a later reader cannot tell "still
+    /// waiting" from "already gave up".
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_terminal_pending_path_records_a_failure_reason() {
+        for (label, behaviour, fragment) in [
+            (
+                "a silent CLI",
+                FakeInitBehaviour::SaysNothing,
+                "within the startup timeout",
+            ),
+            (
+                "a turn that ends unverified",
+                FakeInitBehaviour::ResultBeforeInit,
+                "without reporting",
+            ),
+            (
+                "a CLI that never reports",
+                FakeInitBehaviour::OmitsInit,
+                "without reporting",
+            ),
+        ] {
+            let (_log, _events, state) = run_fake_with_behaviour(behaviour).await;
+
+            match state {
+                ClaudeSkillReadiness::Failed(message) => assert!(
+                    message.contains(fragment),
+                    "{label}: {message:?} lacks {fragment:?}"
+                ),
+                other => panic!("{label}: expected Failed with a reason, got {other:?}"),
+            }
+        }
+    }
+
+    /// An inbound control request before the init frame would have Tyde act on
+    /// behalf of a session whose skills are unverified. It carries a request id
+    /// the CLI blocks on, so buffering it is a hang and answering it is the
+    /// bypass; failing fast is the only honest option.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_control_request_before_the_init_frame_fails_the_session() {
+        let (log, events, state) =
+            run_fake_with_behaviour(FakeInitBehaviour::ControlRequestBeforeInit).await;
+
+        assert!(log.contains("CONTROL_REQUEST"), "{log:?}");
+        assert!(!log.contains("INIT_FRAME"), "{log:?}");
+        match state {
+            ClaudeSkillReadiness::Failed(message) => {
+                assert!(message.contains("control request"), "{message}");
+                assert!(message.contains("can_use_tool"), "{message}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let kinds: Vec<Option<&str>> = events.iter().map(event_kind).collect();
+        assert!(kinds.contains(&Some("Error")), "{kinds:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn unbounded_output_without_an_init_frame_fails_rather_than_growing() {
+        let (log, events, state) =
+            run_fake_with_behaviour(FakeInitBehaviour::FloodsWithoutInit).await;
+
+        assert!(log.contains("FLOOD_DONE"), "{log:?}");
+        match state {
+            ClaudeSkillReadiness::Failed(message) => assert!(
+                message.contains("frames or") && message.contains("bytes of output"),
+                "{message}"
+            ),
+            other => panic!("expected Failed once the buffer bound was hit, got {other:?}"),
+        }
+        let rendered = serde_json::to_string(&events).expect("events");
+        assert!(
+            !rendered.contains("MODEL-OUTPUT-SENTINEL"),
+            "nothing unverified may be rendered, even on overflow: {rendered}"
+        );
+    }
+
+    /// A watchdog from a killed process must not kill its replacement.
+    #[tokio::test]
+    async fn a_stale_watchdog_cannot_terminate_a_later_process() {
+        let (inner, mut rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
+
+        // Arm a watchdog, then respawn: `reset_skill_readiness` bumps the
+        // generation, which is what makes the old timer inert.
+        inner.watch_for_skill_verification();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let armed_generation = inner.state.lock().await.skill_verification_generation;
+        inner.reset_skill_readiness().await;
+        let new_generation = inner.state.lock().await.skill_verification_generation;
+        assert_ne!(
+            armed_generation, new_generation,
+            "a respawn must move the generation on"
+        );
+
+        // Well past the watchdog interval, the replacement is untouched.
+        tokio::time::sleep(CLAUDE_SKILL_VERIFICATION_TIMEOUT * 3).await;
+        assert_eq!(
+            inner.skill_readiness_state(),
+            ClaudeSkillReadiness::Pending,
+            "the replacement process must still be waiting on its own init frame"
+        );
+        let kinds: Vec<Option<&str>> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|event| event_kind(&event).map(str::to_string))
+            .collect::<Vec<_>>()
+            .iter()
+            .map(|kind| kind.as_deref())
+            .collect();
+        assert!(
+            !kinds.contains(&Some("Error")),
+            "a stale watchdog must not report anything: {kinds:?}"
+        );
+    }
+
+    /// Cancelling a turn is the user's doing. The terminal frames that follow
+    /// must report cancellation, never a skill failure.
+    #[tokio::test]
+    async fn cancelling_before_the_init_frame_is_never_a_skill_error() {
+        let (inner, mut rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
+        inner.watch_for_skill_verification();
+        {
+            let mut state = inner.state.lock().await;
+            state.active_turn = Some(ActiveTurn {
+                id: 91,
+                outcome_tx: None,
+                interrupt_requested: true,
+                pending_ask_user_question: None,
+                pending_exit_plan_mode: None,
+                quiesced_waiters: Vec::new(),
+            });
+        }
+
+        inner.abandon_skill_verification_for_cancel().await;
+
+        // The watchdog is gone and cannot fire on the cancelled turn.
+        tokio::time::sleep(CLAUDE_SKILL_VERIFICATION_TIMEOUT * 3).await;
+        assert_eq!(
+            inner.skill_readiness_state(),
+            ClaudeSkillReadiness::Pending,
+            "a cancel leaves verification unresolved, not failed"
+        );
+        assert!(
+            inner.state.lock().await.skill_watchdog.is_none(),
+            "a cancel must stop the watchdog"
+        );
+        let mut kinds = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            kinds.push(event_kind(&event).map(str::to_string));
+        }
+        assert!(
+            !kinds.iter().any(|kind| kind.as_deref() == Some("Error")),
+            "cancellation must not surface as a skill error: {kinds:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn a_mismatch_detected_after_the_prompt_terminates_the_session() {
-        let (log, events) = run_init_after_prompt_fake(r#"["something-else"]"#).await;
+        let (log, events, _state) = run_init_after_prompt_fake(r#"["something-else"]"#).await;
 
         assert!(log.contains("INIT_FRAME"), "{log:?}");
         let kinds: Vec<Option<&str>> = events.iter().map(event_kind).collect();
@@ -19896,7 +20241,9 @@ for raw_line in sys.stdin:
                     tool_policy: ToolPolicy::Unrestricted,
                     skill_plugin: None,
                     expected_skills: Vec::new(),
-                            cumulative_usage: None,
+                    skill_verification_generation: 0,
+                    skill_watchdog: None,
+                    cumulative_usage: None,
                     cumulative_usage_complete: true,
                     conversation_bytes_total: 0,
                     active_turn: None,
