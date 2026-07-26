@@ -472,7 +472,6 @@ impl ClaudeSession {
             expected: expected_skills,
             degraded_notice,
         } = mode.skills;
-        let skills_require_verification = !expected_skills.is_empty();
 
         let inner = Arc::new(ClaudeInner {
             emitter: Arc::new(TurnEmitter::new_for_agent(
@@ -496,7 +495,8 @@ impl ClaudeSession {
                 agent_identity: mode.agent_identity.cloned(),
                 tool_policy: mode.tool_policy,
                 skill_plugin,
-                expected_skills,
+                // Populated by `arm_skill_verification` below.
+                expected_skills: Vec::new(),
                 skill_verification_generation: 0,
                 skill_watchdog: None,
                 cumulative_usage: None,
@@ -514,15 +514,14 @@ impl ClaudeSession {
             runtime: Mutex::new(None),
             turn_event_gate: Mutex::new(()),
             task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
-            // Armed here, not later: a session that materialized skills must not
-            // reach its first prompt before the CLI confirms them.
-            skill_readiness: watch::channel(if skills_require_verification {
-                ClaudeSkillReadiness::Pending
-            } else {
-                ClaudeSkillReadiness::NotRequired
-            })
-            .0,
+            skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
         });
+
+        // Armed through the same call every other caller uses, immediately after
+        // construction and long before any prompt can be written. Setting the
+        // initial channel value here instead would have been a second arming
+        // path that tests could not exercise.
+        inner.arm_skill_verification(expected_skills).await;
 
         // A Default session that dropped a skill says so. The channel is
         // unbounded and the receiver is handed back below, so this arrives even
@@ -2496,23 +2495,49 @@ impl ClaudeInner {
         // EOF, the watchdog, buffer overflow — and each must leave the session
         // in `Failed` with a reason rather than in `Pending`, or a later reader
         // of the state cannot tell "still waiting" from "already dead".
-        let _ = self
-            .skill_readiness
-            .send(ClaudeSkillReadiness::Failed(full.clone()));
+        self.skill_readiness
+            .send_replace(ClaudeSkillReadiness::Failed(full.clone()));
         self.cancel_skill_watchdog().await;
         tracing::error!("{full}");
         self.emit_error(&full);
-        if let Some(turn_id) = self.active_turn_pending_outcome_id().await {
-            self.complete_active_turn_with_outcome(
-                turn_id,
-                TurnOutcome::Failed {
-                    summary: ClaudeStdoutSummary::default(),
-                    error: full,
-                },
-            )
-            .await;
-        }
+        // Settle the in-flight turn unconditionally. A caller awaiting
+        // `outcome_rx` has no other way to learn the session died: if the
+        // sender is neither sent nor dropped it waits forever, which is exactly
+        // how the mismatch path deadlocked. `settle_active_turn_with_failure`
+        // sends when it can and drops the sender when it cannot, so the
+        // receiver always resolves.
+        self.settle_active_turn_with_failure(full).await;
         self.shutdown_process().await;
+    }
+
+    /// Resolve whatever turn is in flight as failed, however that has to happen.
+    ///
+    /// Sending is preferred because it carries the reason. When there is no
+    /// sender left to send on — already taken, or a turn recorded without one —
+    /// the receiver is already unblocked or was never blocked, and dropping the
+    /// slot guarantees it cannot become blocked later.
+    async fn settle_active_turn_with_failure(&self, error: String) {
+        let sender = {
+            let mut state = self.state.lock().await;
+            state
+                .active_turn
+                .as_mut()
+                .and_then(|active| active.outcome_tx.take())
+        };
+        match sender {
+            Some(sender) => {
+                let _ = sender.send(TurnOutcome::Failed {
+                    summary: ClaudeStdoutSummary::default(),
+                    error,
+                });
+            }
+            None => {
+                tracing::debug!(
+                    "No pending Claude turn outcome to settle for a skill failure; nothing is \
+                     waiting on one"
+                );
+            }
+        }
     }
 
     /// Has this session been terminated for a skill mismatch?
@@ -2557,13 +2582,13 @@ impl ClaudeInner {
                     "Claude reported all {} Tyde skill(s) in its init frame",
                     expected.len()
                 );
-                let _ = self.skill_readiness.send(ClaudeSkillReadiness::Ready);
+                self.skill_readiness
+                    .send_replace(ClaudeSkillReadiness::Ready);
                 self.cancel_skill_watchdog().await;
             }
             InitFrameVerdict::Failed(message) => {
-                let _ = self
-                    .skill_readiness
-                    .send(ClaudeSkillReadiness::Failed(message.clone()));
+                self.skill_readiness
+                    .send_replace(ClaudeSkillReadiness::Failed(message.clone()));
                 self.terminate_for_skill_mismatch(&message).await;
             }
         }
@@ -2670,6 +2695,26 @@ impl ClaudeInner {
             .is_some_and(|active| active.interrupt_requested)
     }
 
+    /// Arm skill verification for a session that materialized `expected`.
+    ///
+    /// This is the **only** place a session's expected set and its initial
+    /// readiness are established, so a test that arms a session takes exactly
+    /// the path production does. Setting the two independently — a struct field
+    /// here, a channel value there — is what let production and the tests drift
+    /// into different states.
+    async fn arm_skill_verification(&self, expected: Vec<String>) {
+        let required = {
+            let mut state = self.state.lock().await;
+            state.expected_skills = expected;
+            !state.expected_skills.is_empty()
+        };
+        self.skill_readiness.send_replace(if required {
+            ClaudeSkillReadiness::Pending
+        } else {
+            ClaudeSkillReadiness::NotRequired
+        });
+    }
+
     /// Re-arm verification for a process that is about to start.
     async fn reset_skill_readiness(&self) {
         self.cancel_skill_watchdog().await;
@@ -2682,7 +2727,8 @@ impl ClaudeInner {
             !state.expected_skills.is_empty()
         };
         if required {
-            let _ = self.skill_readiness.send(ClaudeSkillReadiness::Pending);
+            self.skill_readiness
+                .send_replace(ClaudeSkillReadiness::Pending);
         }
     }
 
@@ -12519,11 +12565,12 @@ sys.exit(1)
     ) -> (Arc<ClaudeInner>, mpsc::UnboundedReceiver<Value>) {
         let (inner, rx) = make_test_inner();
         let inner = Arc::new(inner);
-        {
-            let mut state = inner.state.lock().await;
-            state.expected_skills = expected.iter().map(|name| name.to_string()).collect();
-        }
-        inner.reset_skill_readiness().await;
+        // The same call `spawn_with_mode` makes. Setting `expected_skills` by
+        // hand and then nudging readiness separately is what let the harness
+        // report a state production never produces.
+        inner
+            .arm_skill_verification(expected.iter().map(|name| name.to_string()).collect())
+            .await;
         (inner, rx)
     }
 
@@ -12622,7 +12669,15 @@ sys.exit(1)
 
         inner.record_skill_init_frame(Ok(Some(Vec::new()))).await;
 
-        match outcome_rx.await.expect("the turn must be resolved") {
+        // Bounded purely as a diagnostic: an unsettled sender used to hang this
+        // test until nextest's global timeout, taking 987 unrelated tests with
+        // it. The assertions below are unchanged — this only turns "wedge the
+        // suite" into "report which contract broke".
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), outcome_rx)
+            .await
+            .expect("a skill mismatch must settle the in-flight turn, not leave it pending")
+            .expect("the turn must be resolved");
+        match outcome {
             TurnOutcome::Failed { error, .. } => {
                 assert!(error.contains("tyde-skills:a"), "{error}");
                 assert!(error.contains("stopped this Claude session"), "{error}");
@@ -12927,10 +12982,9 @@ for raw_line in sys.stdin:
         let (inner, mut rx) =
             make_test_inner_with_workspace(workspace.path().to_string_lossy().to_string());
         let inner = Arc::new(inner);
-        {
-            let mut state = inner.state.lock().await;
-            state.expected_skills = vec!["tyde-skills:alpha".to_string()];
-        }
+        inner
+            .arm_skill_verification(vec!["tyde-skills:alpha".to_string()])
+            .await;
 
         // Startup must complete without ever waiting on the init frame.
         let ready = tokio::time::timeout(

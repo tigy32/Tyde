@@ -321,7 +321,18 @@ fn create_private_root(parent: Option<&Path>) -> Result<tempfile::TempDir, Strin
 fn write_wrapper(skills_dir: &Path, entry: &InspectedSkill, index: usize) -> Result<(), String> {
     fail_injection_point(index)?;
     let wrapper = skills_dir.join(&entry.prepared.name);
-    create_private_dir(&wrapper)?;
+    // Exclusive, not `create_dir_all`. If two skills ever did land on the same
+    // wrapper name — a bug in synthesis, or a filesystem that considers two
+    // distinct names equal — the second would otherwise overwrite the first's
+    // SKILL.md silently. Failing here turns that into a visible per-skill
+    // refusal instead.
+    std::fs::create_dir(&wrapper).map_err(|err| {
+        format!(
+            "its wrapper directory {} could not be created exclusively: {err}",
+            wrapper.display()
+        )
+    })?;
+    restrict_dir(&wrapper)?;
     write_private_file(&wrapper.join("SKILL.md"), &entry.contents)?;
     for (link_name, target) in &entry.resources {
         symlink_path(target, &wrapper.join(link_name))
@@ -608,7 +619,7 @@ fn synthesize_exposed_name(source: &str, claimed: &mut BTreeSet<String>) -> Stri
         base = base.trim_end_matches('-').to_string();
     }
     base = truncate_to_limit(&base, EXPOSED_NAME_MAX_LEN);
-    if claimed.insert(base.clone()) {
+    if claimed.insert(collision_key(&base)) {
         return base;
     }
     // Deterministic: the second `build-games` becomes `build-games-2`, the
@@ -619,7 +630,7 @@ fn synthesize_exposed_name(source: &str, claimed: &mut BTreeSet<String>) -> Stri
         let suffix = format!("-{ordinal}");
         let room = EXPOSED_NAME_MAX_LEN.saturating_sub(suffix.len());
         let candidate = format!("{}{suffix}", truncate_to_limit(&base, room));
-        if claimed.insert(candidate.clone()) {
+        if claimed.insert(collision_key(&candidate)) {
             return candidate;
         }
     }
@@ -632,6 +643,19 @@ fn yaml_quote(value: &str) -> String {
 
 fn collapse_to_one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The key two exposed names are compared under.
+///
+/// Names are already a conservative ASCII slug — `[a-z0-9-]` — so this is an
+/// identity today. It exists as a named step so the equivalence being enforced
+/// is explicit rather than an emergent property of the alphabet: two sources
+/// that differ only by case, by Unicode normal form, or by any character the
+/// slug folds to `-` must land on the same key and therefore be given distinct
+/// names. If the alphabet is ever widened, this is the one place that has to
+/// grow a real casefold/NFC step with it.
+fn collision_key(name: &str) -> String {
+    name.to_lowercase()
 }
 
 /// Cut to `limit` characters without leaving a trailing separator.
@@ -763,30 +787,31 @@ pub(crate) fn verify_plugin_inventory(output: &str, expected_root: &Path) -> Res
                  confirm it loaded this session's root"
             )
         })?;
-    // Exact canonical equality, and both sides must canonicalize. TMPDIR is a
-    // symlink on macOS, so the CLI may echo `/tmp/...` where Tyde holds
-    // `/private/tmp/...`; resolving both is the only correct comparison, and a
-    // path that will not resolve is a failure rather than something to fall
-    // back from.
-    let reported_canonical = std::fs::canonicalize(reported).map_err(|err| {
-        format!(
-            "Claude reported '{expected_id}' at {reported}, which Tyde could not resolve: {err}"
-        )
-    })?;
+    // Exact canonical equality. Tyde's own root must resolve — it was just
+    // created, so a failure there is a real error. The *reported* root is a
+    // value the CLI handed us: a path that does not exist cannot be the root
+    // Tyde built, so that is a rejection of the entry, not an OS error to
+    // propagate. Reporting `ENOENT` for a foreign root described the syscall
+    // rather than the finding.
     let expected_canonical = std::fs::canonicalize(expected_root).map_err(|err| {
         format!(
             "Tyde could not resolve this session's plugin root {}: {err}",
             expected_root.display()
         )
     })?;
-    if reported_canonical != expected_canonical {
-        return Err(format!(
+    match std::fs::canonicalize(reported) {
+        Ok(reported_canonical) if reported_canonical == expected_canonical => Ok(()),
+        Ok(reported_canonical) => Err(format!(
             "Claude loaded '{expected_id}' from {}, not from this session's root {}",
             reported_canonical.display(),
             expected_canonical.display()
-        ));
+        )),
+        Err(_) => Err(format!(
+            "Claude loaded '{expected_id}' from {reported}, which Tyde could not resolve, so \
+             it is not from this session's root {}",
+            expected_canonical.display()
+        )),
     }
-    Ok(())
 }
 
 /// Result of checking a CLI `init` frame against what Tyde materialized.
@@ -1304,13 +1329,31 @@ mod tests {
     #[test]
     fn case_and_unicode_equivalent_names_cannot_overwrite_each_other() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let store = tmp.path().join("store");
-        // On a case-insensitive filesystem these three source directories would
-        // collapse onto one wrapper if the source name were used verbatim.
+        // Each source gets its own parent. The three names differ only by case,
+        // which is the condition under test — but on a case-insensitive
+        // filesystem (APFS, NTFS) `store/Alpha`, `store/alpha`, and
+        // `store/ALPHA` are *one* directory, so a shared parent silently made
+        // this three handles on a single skill whose body was whichever the
+        // fixture wrote last. The assertions below then demanded bytes that no
+        // longer existed on disk, which no production change could satisfy.
+        // Separate parents make the three sources genuinely distinct on every
+        // filesystem, which is what "three skills whose names collide" means.
         let skills = vec![
-            store_skill(&store, "Alpha", "---\nname: Alpha\n---\nFIRST\n"),
-            store_skill(&store, "alpha", "---\nname: alpha\n---\nSECOND\n"),
-            store_skill(&store, "ALPHA", "---\nname: ALPHA\n---\nTHIRD\n"),
+            store_skill(
+                &tmp.path().join("a"),
+                "Alpha",
+                "---\nname: Alpha\n---\nFIRST\n",
+            ),
+            store_skill(
+                &tmp.path().join("b"),
+                "alpha",
+                "---\nname: alpha\n---\nSECOND\n",
+            ),
+            store_skill(
+                &tmp.path().join("c"),
+                "ALPHA",
+                "---\nname: ALPHA\n---\nTHIRD\n",
+            ),
         ];
 
         let outcome = ClaudeSkillPlugin::prepare(Some(tmp.path()), &skills).expect("prepare");
@@ -1334,6 +1377,19 @@ mod tests {
         assert!(read("alpha").contains("FIRST"));
         assert!(read("alpha-2").contains("SECOND"));
         assert!(read("alpha-3").contains("THIRD"));
+        // ...and they are three directories, not one reused three times. This
+        // is the property the test is named for, now asserted directly rather
+        // than inferred from the bodies.
+        let wrappers = plugin.root().join("skills");
+        let distinct: BTreeSet<_> = ["alpha", "alpha-2", "alpha-3"]
+            .iter()
+            .map(|name| std::fs::canonicalize(wrappers.join(name)).expect("each wrapper exists"))
+            .collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "each source must own a distinct wrapper directory"
+        );
         assert_eq!(
             outcome
                 .prepared
