@@ -492,14 +492,13 @@ fn validate_skill(skill: &Skill) -> Result<(), String> {
     if skill.name.trim().is_empty() {
         return Err(format!("skill {} name must not be empty", skill.id));
     }
-    // Only separators are rejected here. A name that a native skill loader
-    // dislikes — a leading `.`, or a `:` that collides with plugin namespacing
-    // — is still a skill the user installed and has been using: rejecting it
-    // would make an upgrade silently drop it from `list()` and from every
-    // session. Whether such a name can be exposed to a given backend is that
-    // adapter's call, per session, and must be normalized or reported there.
-    // Path safety does not depend on this check: `skill_paths` proves
-    // containment against the real filesystem.
+    // Separators and the two relative path segments are rejected, because
+    // `name` is joined onto the store root by the mutating paths: `upsert`
+    // writes into `<root>/<name>` and `delete` calls `remove_dir_all` on it.
+    // `.` would target the store root itself and `..` its parent — for a
+    // default store, the whole of `~/.tyde`. No real skill can be named either
+    // one, since a directory scan never yields them, so rejecting them drops
+    // nothing a user has.
     if skill.name.contains(std::path::MAIN_SEPARATOR)
         || skill.name.contains('/')
         || skill.name.contains('\\')
@@ -509,6 +508,18 @@ fn validate_skill(skill: &Skill) -> Result<(), String> {
             skill.id, skill.name
         ));
     }
+    if skill.name == "." || skill.name == ".." {
+        return Err(format!(
+            "skill {} name '{}' must be a directory name, not a relative path segment",
+            skill.id, skill.name
+        ));
+    }
+    // Anything else is left alone. A name a native skill loader dislikes — a
+    // leading `.`, or a `:` that collides with plugin namespacing — is still a
+    // skill the user installed and has been using: rejecting it would make an
+    // upgrade silently drop it from `list()` and from every session. Whether
+    // such a name can be exposed to a given backend is that adapter's call,
+    // per session, and must be normalized or reported there.
     if skill
         .title
         .as_ref()
@@ -754,10 +765,8 @@ mod tests {
     fn validate_skill_keeps_accepting_names_existing_stores_already_use() {
         // Rejecting a leading `.` or a `:` would make an upgrade silently drop
         // a skill the user installed and has been using; adapters normalize or
-        // report those per session instead. `.` and `..` cannot come from a
-        // disk scan at all, and `skill_paths` containment is what makes them
-        // harmless if one reaches the index by other means.
-        for name in [".hidden", "build:games", "..", "."] {
+        // report those per session instead.
+        for name in [".hidden", "build:games", "...", "..a"] {
             let skill = Skill {
                 id: SkillId("candidate".to_string()),
                 name: name.to_string(),
@@ -770,13 +779,80 @@ mod tests {
             );
         }
 
-        let nested = Skill {
-            id: SkillId("candidate".to_string()),
-            name: "nested/skill".to_string(),
-            title: None,
-            description: None,
-        };
-        assert!(validate_skill(&nested).is_err());
+        // `.` and `..` are the exception: they are path segments, not names,
+        // and `upsert`/`delete` join them onto the store root.
+        for name in [".", "..", "nested/skill"] {
+            let skill = Skill {
+                id: SkillId("candidate".to_string()),
+                name: name.to_string(),
+                title: None,
+                description: None,
+            };
+            assert!(
+                validate_skill(&skill).is_err(),
+                "skill name '{name}' must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_names_cannot_mutate_outside_the_store_root() {
+        let fixture = TestDir::new("mutation-safety");
+        let index_path = fixture.path.join("skills.json");
+        let root_dir = fixture.path.join("skills");
+        write_skill_body(&root_dir, "lint", "# lint\n");
+
+        // The fixture directory *is* `<root>/..`, so a sentinel in it proves
+        // whether a `..` name reached `remove_dir_all`.
+        let sentinel = fixture.path.join("do-not-touch.txt");
+        std::fs::write(&sentinel, "sentinel").expect("write sentinel");
+
+        let store =
+            SkillStore::load(index_path.clone(), root_dir.clone()).expect("load skill store");
+
+        for name in [".", ".."] {
+            let err = store
+                .upsert(
+                    Skill {
+                        id: SkillId("escape".to_string()),
+                        name: name.to_string(),
+                        title: None,
+                        description: None,
+                    },
+                    "# escape\n".to_string(),
+                )
+                .expect_err("upsert must refuse a relative path segment");
+            assert!(err.contains("relative path segment"), "{err}");
+        }
+
+        // `delete` takes the name from the index rather than from its caller,
+        // so a hand-edited index is its untrusted input. Reading it must reject
+        // the record instead of joining '..' onto the root and removing it.
+        std::fs::write(
+            &index_path,
+            r#"{"records":{"escape":{"id":"escape","name":".."}}}"#,
+        )
+        .expect("write poisoned index");
+        assert!(
+            store.delete(&SkillId("escape".to_string())).is_err(),
+            "a poisoned index must not reach remove_dir_all"
+        );
+
+        assert!(
+            sentinel.is_file(),
+            "the store's parent directory was mutated"
+        );
+        assert!(root_dir.join("lint").join(SKILL_BODY_FILENAME).is_file());
+        for stray in [
+            fixture.path.join(SKILL_BODY_FILENAME),
+            fixture.path.join(SKILL_METADATA_FILENAME),
+            // `.` resolves to the root itself, which would leave a bogus skill
+            // sitting directly in the store rather than in a skill directory.
+            root_dir.join(SKILL_BODY_FILENAME),
+            root_dir.join(SKILL_METADATA_FILENAME),
+        ] {
+            assert!(!stray.exists(), "wrote {}", stray.display());
+        }
     }
 
     #[test]
