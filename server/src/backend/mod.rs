@@ -26,7 +26,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
 use self::subprocess::ImageAttachment;
-use crate::agent::customization::ResolvedSpawnConfig;
+use crate::agent::customization::{ResolvedSpawnConfig, SkillDelivery};
 
 pub(crate) const READ_ONLY_ACCESS_MODE_INSTRUCTIONS: &str = concat!(
     "Backend access mode is read-only (best effort). Treat the workspace as ",
@@ -772,7 +772,10 @@ pub(crate) fn render_combined_spawn_instructions(config: &ResolvedSpawnConfig) -
     if !config.steering_body.trim().is_empty() {
         sections.push(format!("Steering:\n{}", config.steering_body.trim()));
     }
-    if !config.skills.is_empty() {
+    // Under native discovery the adapter points the backend at each skill's
+    // directory, so the bodies belong in the backend's own on-demand loader,
+    // not in the spawn instructions.
+    if config.skill_delivery == SkillDelivery::InlineBodies && !config.skills.is_empty() {
         let skill_blocks = config
             .skills
             .iter()
@@ -1008,6 +1011,33 @@ mod tests {
             err.contains("does not support backend configuration"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn native_discovery_keeps_skill_bodies_out_of_spawn_instructions() {
+        use crate::agent::customization::{ResolvedSkill, SkillDelivery};
+
+        let sentinel = "SHARED_RENDERER_BODY_SENTINEL";
+        let skills = vec![ResolvedSkill::test_fixture("lint", sentinel)];
+
+        let native = render_combined_spawn_instructions(&ResolvedSpawnConfig {
+            skills: skills.clone(),
+            skill_delivery: SkillDelivery::NativeDiscovery,
+            ..ResolvedSpawnConfig::default()
+        });
+        assert_eq!(
+            native, None,
+            "a native-discovery backend must receive no skill section here"
+        );
+
+        let inline = render_combined_spawn_instructions(&ResolvedSpawnConfig {
+            skills,
+            skill_delivery: SkillDelivery::InlineBodies,
+            ..ResolvedSpawnConfig::default()
+        })
+        .expect("inline-body instructions");
+        assert!(inline.contains("Skill: lint"));
+        assert!(inline.contains(sentinel));
     }
 
     #[test]

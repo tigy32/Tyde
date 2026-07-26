@@ -19,6 +19,19 @@ pub struct SkillSyncResult {
     pub deletes: Vec<SkillId>,
 }
 
+/// Canonical on-disk locations for one installed skill.
+///
+/// Backends that discover skills natively are handed these paths instead of a
+/// body, so both are canonicalized and proven to stay inside the store root
+/// before they leave `SkillStore`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillPaths {
+    /// The skill's directory, `<root_dir>/<name>` resolved through symlinks.
+    pub source_dir: PathBuf,
+    /// `<source_dir>/SKILL.md`.
+    pub skill_md: PathBuf,
+}
+
 #[derive(Debug)]
 pub struct SkillStore {
     index_path: PathBuf,
@@ -72,11 +85,28 @@ impl SkillStore {
             .and_then(|records| records.get(&id.0).cloned())
     }
 
-    pub fn load_body(&self, id: &SkillId) -> Result<String, String> {
+    /// Resolve the canonical directory and `SKILL.md` path for `id`.
+    ///
+    /// Fails when the skill is unknown or its directory is missing, and when
+    /// the directory resolves outside the store root. Containment is checked
+    /// after canonicalization, so neither a `..` segment in a stored name nor a
+    /// symlinked skill directory can point a backend at files outside the
+    /// store.
+    pub fn skill_paths(&self, id: &SkillId) -> Result<SkillPaths, String> {
         let skill = self
             .get(id)
             .ok_or_else(|| format!("cannot resolve missing skill {}", id))?;
-        let path = self.root_dir.join(&skill.name).join(SKILL_BODY_FILENAME);
+        let source_dir = canonical_within(&self.root_dir, &self.root_dir.join(&skill.name))
+            .map_err(|err| format!("cannot resolve skill {} directory: {err}", skill.id))?;
+        let skill_md = source_dir.join(SKILL_BODY_FILENAME);
+        Ok(SkillPaths {
+            source_dir,
+            skill_md,
+        })
+    }
+
+    pub fn load_body(&self, id: &SkillId) -> Result<String, String> {
+        let path = self.skill_paths(id)?.skill_md;
         std::fs::read_to_string(&path)
             .map_err(|err| format!("Failed to read skill body {}: {err}", path.display()))
     }
@@ -219,7 +249,7 @@ impl SkillStore {
     }
 
     fn scan_disk(&self) -> Result<HashMap<String, Skill>, String> {
-        let mut records = HashMap::new();
+        let mut dir_names = Vec::new();
         match std::fs::read_dir(&self.root_dir) {
             Ok(entries) => {
                 for entry in entries {
@@ -249,17 +279,7 @@ impl SkillStore {
                         continue;
                     }
 
-                    let dir_name = entry.file_name().to_string_lossy().to_string();
-                    let Some(skill) = load_skill_from_dir(&entry.path(), &dir_name) else {
-                        continue;
-                    };
-                    if records.insert(skill.id.0.clone(), skill.clone()).is_some() {
-                        tracing::warn!(
-                            skill_id = %skill.id,
-                            path = %entry.path().display(),
-                            "duplicate skill id discovered on disk; skipping duplicate"
-                        );
-                    }
+                    dir_names.push(entry.file_name().to_string_lossy().to_string());
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -268,6 +288,35 @@ impl SkillStore {
                     "Failed to read skills directory {}: {err}",
                     self.root_dir.display()
                 ));
+            }
+        }
+
+        // `read_dir` yields entries in an unspecified order, so two directories
+        // whose `metadata.json` claims the same id used to resolve to whichever
+        // one the filesystem happened to return last. Sort first and keep the
+        // first directory by name, so the surviving skill is the same on every
+        // scan and on every machine.
+        dir_names.sort();
+
+        let mut records: HashMap<String, Skill> = HashMap::new();
+        for dir_name in dir_names {
+            let path = self.root_dir.join(&dir_name);
+            let Some(skill) = load_skill_from_dir(&path, &dir_name) else {
+                continue;
+            };
+            match records.entry(skill.id.0.clone()) {
+                std::collections::hash_map::Entry::Occupied(occupied) => {
+                    tracing::warn!(
+                        skill_id = %skill.id,
+                        kept = %occupied.get().name,
+                        skipped = %dir_name,
+                        path = %path.display(),
+                        "duplicate skill id on disk; keeping the first directory by name"
+                    );
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(skill);
+                }
             }
         }
         Ok(records)
@@ -305,6 +354,31 @@ impl SkillStore {
         })?;
         Ok(())
     }
+}
+
+/// Canonicalize `candidate` and prove it stays inside `root`.
+///
+/// Both sides are canonicalized so `..` segments and symlinks are resolved
+/// before the comparison. `Path::starts_with` then matches whole components, so
+/// a sibling such as `<root>-elsewhere` is rejected rather than mistaken for a
+/// nested path.
+fn canonical_within(
+    root: &std::path::Path,
+    candidate: &std::path::Path,
+) -> Result<PathBuf, String> {
+    let canonical_root = std::fs::canonicalize(root)
+        .map_err(|err| format!("Failed to resolve skills root {}: {err}", root.display()))?;
+    let canonical_candidate = std::fs::canonicalize(candidate)
+        .map_err(|err| format!("Failed to resolve {}: {err}", candidate.display()))?;
+    if !canonical_candidate.starts_with(&canonical_root) {
+        return Err(format!(
+            "{} resolves to {}, which is outside the skills root {}",
+            candidate.display(),
+            canonical_candidate.display(),
+            canonical_root.display()
+        ));
+    }
+    Ok(canonical_candidate)
 }
 
 fn write_atomic(path: &std::path::Path, contents: &[u8]) -> Result<(), String> {
@@ -402,12 +476,30 @@ fn validate_skill(skill: &Skill) -> Result<(), String> {
     if skill.name.trim().is_empty() {
         return Err(format!("skill {} name must not be empty", skill.id));
     }
+    // `name` is the directory joined onto the store root, and — once a backend
+    // discovers skills natively rather than receiving an inlined body — it is
+    // also the name the model addresses the skill by. Both roles make these
+    // characters load-bearing: separators and `..` escape the root, a leading
+    // `.` hides the directory from native skill loaders, and `:` is reserved
+    // for plugin namespacing.
     if skill.name.contains(std::path::MAIN_SEPARATOR)
         || skill.name.contains('/')
         || skill.name.contains('\\')
     {
         return Err(format!(
             "skill {} name '{}' must be a single directory name",
+            skill.id, skill.name
+        ));
+    }
+    if skill.name.starts_with('.') {
+        return Err(format!(
+            "skill {} name '{}' must not start with '.'",
+            skill.id, skill.name
+        ));
+    }
+    if skill.name.contains(':') {
+        return Err(format!(
+            "skill {} name '{}' must not contain ':'",
             skill.id, skill.name
         ));
     }
@@ -520,6 +612,141 @@ mod tests {
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].id, SkillId("good".to_string()));
         assert_eq!(skills[0].name, "good-skill");
+    }
+
+    fn write_skill_metadata(root: &std::path::Path, dir_name: &str, skill: &Skill) {
+        std::fs::write(
+            root.join(dir_name).join(SKILL_METADATA_FILENAME),
+            serde_json::to_string_pretty(skill).expect("serialize metadata"),
+        )
+        .unwrap_or_else(|err| panic!("failed to write metadata for {dir_name}: {err}"));
+    }
+
+    #[test]
+    fn skill_paths_resolve_inside_the_store_root() {
+        let fixture = TestDir::new("skill-paths");
+        let index_path = fixture.path.join("skills.json");
+        let root_dir = fixture.path.join("skills");
+        write_skill_body(&root_dir, "lint", "# lint\n");
+
+        let store = SkillStore::load(index_path, root_dir.clone()).expect("load skill store");
+        let paths = store
+            .skill_paths(&SkillId("lint".to_string()))
+            .expect("resolve skill paths");
+
+        let canonical_root = std::fs::canonicalize(&root_dir).expect("canonicalize root");
+        assert!(
+            paths.source_dir.starts_with(&canonical_root),
+            "source dir {} must stay under {}",
+            paths.source_dir.display(),
+            canonical_root.display()
+        );
+        assert_eq!(paths.source_dir, canonical_root.join("lint"));
+        assert_eq!(paths.skill_md, canonical_root.join("lint").join("SKILL.md"));
+        assert!(paths.skill_md.is_file());
+    }
+
+    #[test]
+    fn skill_paths_report_a_missing_directory_instead_of_guessing() {
+        let fixture = TestDir::new("skill-paths-missing");
+        let index_path = fixture.path.join("skills.json");
+        let root_dir = fixture.path.join("skills");
+        write_skill_body(&root_dir, "lint", "# lint\n");
+
+        let store = SkillStore::load(index_path, root_dir.clone()).expect("load skill store");
+        std::fs::remove_dir_all(root_dir.join("lint")).expect("remove skill directory");
+
+        let err = store
+            .skill_paths(&SkillId("lint".to_string()))
+            .expect_err("a missing skill directory must fail visibly");
+        assert!(
+            err.contains("cannot resolve skill lint directory"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn canonical_within_rejects_a_symlink_that_escapes_the_root() {
+        let fixture = TestDir::new("containment");
+        let root_dir = fixture.path.join("skills");
+        let outside_dir = fixture.path.join("outside");
+        std::fs::create_dir_all(&root_dir).expect("create root");
+        std::fs::create_dir_all(&outside_dir).expect("create outside dir");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_dir, root_dir.join("escapee")).expect("symlink");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&outside_dir, root_dir.join("escapee")).expect("symlink");
+
+        let err = canonical_within(&root_dir, &root_dir.join("escapee"))
+            .expect_err("a symlink out of the store must be refused");
+        assert!(
+            err.contains("outside the skills root"),
+            "unexpected error: {err}"
+        );
+
+        // A sibling directory sharing the root's prefix is not "inside" it.
+        let sibling = fixture.path.join("skills-elsewhere");
+        std::fs::create_dir_all(&sibling).expect("create sibling");
+        assert!(canonical_within(&root_dir, &sibling).is_err());
+    }
+
+    #[test]
+    fn validate_skill_rejects_traversal_and_namespace_names() {
+        for name in ["..", ".", ".hidden", "build:games", "nested/skill"] {
+            let skill = Skill {
+                id: SkillId("candidate".to_string()),
+                name: name.to_string(),
+                title: None,
+                description: None,
+            };
+            assert!(
+                validate_skill(&skill).is_err(),
+                "skill name '{name}' must be rejected"
+            );
+        }
+
+        let ok = Skill {
+            id: SkillId("build-games".to_string()),
+            name: "build-games".to_string(),
+            title: None,
+            description: None,
+        };
+        assert!(validate_skill(&ok).is_ok());
+    }
+
+    #[test]
+    fn duplicate_skill_ids_resolve_to_the_first_directory_by_name() {
+        let fixture = TestDir::new("duplicate-ids");
+        let root_dir = fixture.path.join("skills");
+
+        // Three directories whose metadata all claim the same skill id.
+        for dir_name in ["zebra-copy", "alpha-copy", "middle-copy"] {
+            write_skill_body(&root_dir, dir_name, &format!("# {dir_name}\n"));
+            write_skill_metadata(
+                &root_dir,
+                dir_name,
+                &Skill {
+                    id: SkillId("shared".to_string()),
+                    name: dir_name.to_string(),
+                    title: None,
+                    description: None,
+                },
+            );
+        }
+
+        // A fresh store per scan: the winner must not depend on `read_dir`
+        // order, so repeated independent scans must agree.
+        for attempt in 0..3 {
+            let store = SkillStore::load(
+                fixture.path.join(format!("skills-{attempt}.json")),
+                root_dir.clone(),
+            )
+            .expect("load skill store");
+            let skills = store.list().expect("list skills");
+            assert_eq!(skills.len(), 1, "attempt {attempt}");
+            assert_eq!(skills[0].name, "alpha-copy", "attempt {attempt}");
+        }
     }
 
     #[test]

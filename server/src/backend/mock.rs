@@ -246,7 +246,7 @@ impl Backend for MockBackend {
                     skills: resolved_spawn_config
                         .skills
                         .into_iter()
-                        .map(|skill| format!("{}={}", skill.name, summarize_text(&skill.body)))
+                        .map(|skill| summarize_skill(&skill))
                         .collect(),
                     tool_policy: resolved_spawn_config.tool_policy,
                     access_mode: resolved_spawn_config.access_mode,
@@ -317,7 +317,7 @@ impl Backend for MockBackend {
             record.skills = resolved_spawn_config
                 .skills
                 .into_iter()
-                .map(|skill| format!("{}={}", skill.name, summarize_text(&skill.body)))
+                .map(|skill| summarize_skill(&skill))
                 .collect();
             record.tool_policy = resolved_spawn_config.tool_policy;
             record.access_mode = resolved_spawn_config.access_mode;
@@ -429,7 +429,7 @@ impl Backend for MockBackend {
                     skills: resolved_spawn_config
                         .skills
                         .into_iter()
-                        .map(|skill| format!("{}={}", skill.name, summarize_text(&skill.body)))
+                        .map(|skill| summarize_skill(&skill))
                         .collect(),
                     tool_policy: resolved_spawn_config.tool_policy,
                     access_mode: resolved_spawn_config.access_mode,
@@ -2040,6 +2040,17 @@ fn startup_mcp_response_prefix(session_id: &SessionId) -> String {
 
 fn summarize_text(text: &str) -> String {
     text.trim().replace('\n', "\\n")
+}
+
+/// Record what the backend was actually handed for a skill: the name alone
+/// under native discovery, and `name=body` when the resolver inlined a body.
+/// Tests read this to tell the two deliveries apart.
+fn summarize_skill(skill: &crate::agent::customization::ResolvedSkill) -> String {
+    if skill.body.trim().is_empty() {
+        skill.name.clone()
+    } else {
+        format!("{}={}", skill.name, summarize_text(&skill.body))
+    }
 }
 
 fn now_ms() -> u64 {

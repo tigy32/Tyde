@@ -7207,14 +7207,14 @@ with open({survived:?}, "w") as output:
         let body_sentinel = "BODY_SENTINEL_SHOULD_NOT_BE_EAGERLY_INJECTED";
         let resolved = ResolvedSpawnConfig {
             skills: vec![
-                crate::agent::customization::ResolvedSkill {
-                    name: "Review changes".to_string(),
-                    body: format!("{body_sentinel}\n{}", "x".repeat(20_000)),
-                },
-                crate::agent::customization::ResolvedSkill {
-                    name: "Trace failures".to_string(),
-                    body: "another private body".to_string(),
-                },
+                crate::agent::customization::ResolvedSkill::test_fixture(
+                    "Review changes",
+                    &format!("{body_sentinel}\n{}", "x".repeat(20_000)),
+                ),
+                crate::agent::customization::ResolvedSkill::test_fixture(
+                    "Trace failures",
+                    "another private body",
+                ),
             ],
             ..ResolvedSpawnConfig::default()
         };
@@ -7261,10 +7261,11 @@ for line in sys.stdin:
         let _guard = TestHermesPythonGuard::set(&fake);
         let mut config = BackendSpawnConfig::default();
         config.resolved_spawn_config.access_mode = BackendAccessMode::ReadOnly;
-        config.resolved_spawn_config.skills = vec![crate::agent::customization::ResolvedSkill {
-            name: "Review changes".to_string(),
-            body: "PRIVATE_SKILL_BODY".to_string(),
-        }];
+        config.resolved_spawn_config.skills =
+            vec![crate::agent::customization::ResolvedSkill::test_fixture(
+                "Review changes",
+                "PRIVATE_SKILL_BODY",
+            )];
 
         let (backend, _events) =
             HermesBackend::resume(Vec::new(), config, SessionId("stored".to_string()))

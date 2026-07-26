@@ -76,8 +76,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::agent::customization::{
-    ResolveSpawnConfigRequest, ResolvedSpawnConfig, protocol_mcp_servers_to_startup,
-    resolve_spawn_config,
+    ResolveSpawnConfigRequest, ResolvedSpawnConfig, SkillDelivery, SkillSelection,
+    protocol_mcp_servers_to_startup, resolve_spawn_config,
 };
 use crate::agent::registry::{
     AgentRegistry, AgentStartupFailure, InitialAgentAlias, InitialAgentAliasPersistence,
@@ -11970,6 +11970,8 @@ impl HostHandle {
             instructions: Some(reviewer_system_prompt),
             steering_body: String::new(),
             skills: Vec::new(),
+            skill_selection: SkillSelection::Explicit,
+            skill_delivery: SkillDelivery::for_backend(backend_kind),
             mcp_servers: vec![McpServerConfig {
                 id: McpServerId("tyde-review-feedback".to_owned()),
                 name: REVIEW_FEEDBACK_MCP_SERVER_NAME.to_owned(),
