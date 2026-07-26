@@ -14099,7 +14099,7 @@ mod tests {
             let previous_native_home = codex_test_native_home_override()
                 .lock()
                 .expect("codex test native home mutex poisoned")
-                .replace(Some(home.path().to_path_buf()));
+                .replace(home.path().to_path_buf());
             Ok(Self {
                 _serial: serial,
                 previous_native_home,
