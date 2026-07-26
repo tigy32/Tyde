@@ -38,6 +38,43 @@ fn report_interrupt_error(state: &AppState, message: String) {
         }));
 }
 
+/// True when the exact `(host, agent_id)` behind an [`ActiveAgentRef`] died
+/// with `AgentError { fatal: true }`.
+///
+/// Host-scoped on purpose: two hosts can hand out the same textual `AgentId`,
+/// and a crash on one must never terminate the other's chat header.
+///
+/// Takes the `agents` signal rather than `&AppState` so callers inside a
+/// reactive closure capture only that `Copy` signal. Passing the whole
+/// `AppState` would defeat Rust's disjoint closure capture and move the entire
+/// struct in, which downgrades the surrounding view closure to `FnOnce`.
+fn agent_is_terminated(
+    agents: RwSignal<Vec<crate::state::AgentInfo>>,
+    active: &crate::state::ActiveAgentRef,
+) -> bool {
+    agents.with_untracked(|agents| {
+        agents.iter().any(|a| {
+            a.local_host_id == active.local_host_id
+                && a.agent_id == active.agent_id
+                && a.fatal_error.is_some()
+        })
+    })
+}
+
+/// Tracked twin of [`agent_is_terminated`] for render-time predicates.
+fn agent_is_terminated_tracked(
+    agents: RwSignal<Vec<crate::state::AgentInfo>>,
+    active: &crate::state::ActiveAgentRef,
+) -> bool {
+    agents.with(|agents| {
+        agents.iter().any(|a| {
+            a.local_host_id == active.local_host_id
+                && a.agent_id == active.agent_id
+                && a.fatal_error.is_some()
+        })
+    })
+}
+
 /// The terminal state of a conversation that could not be loaded.
 ///
 /// This is what the spinner turns into. It is an `alert`, not a status: the
@@ -241,6 +278,15 @@ pub fn ChatView() -> impl IntoView {
         let Some(ar) = s_interrupt.active_agent.get_untracked() else {
             return;
         };
+        // A fatal agent's stream is dead: an Interrupt sent to it can never be
+        // answered. Stop is already hidden for this state, so this only catches
+        // a tap that was already in flight when the fatal error landed — but a
+        // hidden control is not a transport guard. Silent by design: the
+        // transcript's fatal Error row is the explanation, and reporting
+        // "could not stop the turn" here would imply a turn is still running.
+        if agent_is_terminated(s_interrupt.agents, &ar) {
+            return;
+        }
         let agent_stream = s_interrupt.agents.with_untracked(|agents| {
             agents
                 .iter()
@@ -285,14 +331,21 @@ pub fn ChatView() -> impl IntoView {
     });
 
     let s_turn = state.clone();
+    // Drives both the Stop control and the "Responding" subtitle. Fatal wins
+    // before `agent_turn_active` is read: the reducer normally clears the turn,
+    // but a stale or late-arriving turn flag must never offer to stop an agent
+    // that is already dead, nor claim it is still responding.
     let is_turn_active = move || {
         s_turn.active_agent.with(|ar| {
-            ar.as_ref()
-                .and_then(|ar| {
-                    s_turn
-                        .agent_turn_active
-                        .with(|m| m.get(&ar.as_agent_ref()).copied())
-                })
+            let Some(ar) = ar.as_ref() else {
+                return false;
+            };
+            if agent_is_terminated_tracked(s_turn.agents, ar) {
+                return false;
+            }
+            s_turn
+                .agent_turn_active
+                .with(|m| m.get(&ar.as_agent_ref()).copied())
                 .unwrap_or(false)
         })
     };
@@ -400,9 +453,11 @@ pub fn ChatView() -> impl IntoView {
             parts.push(label);
         }
         let active = s_subtitle.active_agent.get()?;
-        let turn_active = s_subtitle
-            .agent_turn_active
-            .with(|m| m.get(&active.as_agent_ref()).copied().unwrap_or(false));
+        // A dead agent is not responding, whatever a stale turn flag says.
+        let turn_active = !agent_is_terminated_tracked(s_subtitle.agents, &active)
+            && s_subtitle
+                .agent_turn_active
+                .with(|m| m.get(&active.as_agent_ref()).copied().unwrap_or(false));
         if turn_active {
             parts.push("Responding".to_string());
         }
@@ -1282,6 +1337,81 @@ mod wasm_tests {
             "nothing may claim the turn was interrupted: {}",
             surfaced.message
         );
+    }
+
+    /// **A dead agent is not responding, and cannot be stopped.**
+    ///
+    /// The header used to read `agent_turn_active` alone, so a fatal error that
+    /// arrived mid-turn left Stop armed and the subtitle claiming "Responding".
+    /// Tapping Stop then sent an Interrupt to a stream nobody was reading and,
+    /// on failure, told the user "the agent is still running" — about an agent
+    /// that had already crashed.
+    ///
+    /// The stale `agent_turn_active` here is deliberate: the reducer clears it,
+    /// but the header must not depend on that having happened first.
+    #[wasm_bindgen_test]
+    async fn a_terminated_agent_offers_no_stop_and_does_not_claim_it_is_responding() {
+        let _guard = crate::bridge::test_capture_sends();
+        let container = make_container();
+        let state = mount_active_chat(container.clone());
+        let agent_ref = state
+            .active_agent
+            .get_untracked()
+            .expect("active agent")
+            .as_agent_ref();
+        state.agent_turn_active.update(|m| {
+            m.insert(agent_ref.clone(), true);
+        });
+        settle_autoscroll().await;
+
+        // Precondition: with a live turn the header does offer Stop.
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-stop']")
+                .unwrap()
+                .is_some(),
+            "precondition: a running turn renders Stop"
+        );
+
+        state.agents.update(|agents| {
+            for agent in agents.iter_mut() {
+                agent.fatal_error = Some("backend crashed".to_owned());
+            }
+        });
+        settle_autoscroll().await;
+
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-stop']")
+                .unwrap()
+                .is_none(),
+            "a dead agent has no turn to stop, whatever the stale turn flag says"
+        );
+        let subtitle = container
+            .query_selector("[data-mobile-test='chat-subtitle']")
+            .unwrap()
+            .expect("subtitle")
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            !subtitle.contains("Responding"),
+            "a crashed agent must not be described as responding, got: {subtitle}"
+        );
+
+        assert_eq!(
+            crate::bridge::test_send_attempts(),
+            0,
+            "no Interrupt may be emitted while the agent dies under an open turn"
+        );
+        assert!(
+            state.mobile_shell_error.get_untracked().is_none(),
+            "and nothing may claim the turn could not be stopped — it already ended"
+        );
+        // `on_interrupt` carries its own fatal guard for a tap already in flight
+        // when the fatal frame lands. That race is unreachable through the DOM
+        // once Stop is unmounted, so it is not asserted here; the guard exists
+        // because a hidden control is not a transport guard.
+        let _ = agent_ref;
     }
 
     /// Admission is not interruption. A successfully *queued* Interrupt says
