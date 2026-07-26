@@ -14151,7 +14151,10 @@ mod tests {
         if before == after {
             Ok(())
         } else {
-            Err(format!("Codex file changed during live test: {}", path.display()))
+            Err(format!(
+                "Codex file changed during live test: {}",
+                path.display()
+            ))
         }
     }
 
@@ -14236,8 +14239,7 @@ mod tests {
             isolated_home_path = guard.path().to_path_buf();
             let isolated_auth = guard.path().join("auth.json");
             assert!(
-                std::fs::read(&isolated_auth)
-                    .expect("read isolated auth")
+                std::fs::read(&isolated_auth).expect("read isolated auth")
                     == br#"{"tokens":{"access":"fixture"}}"#
             );
             assert!(!guard.path().join("config.toml").exists());
@@ -14274,10 +14276,12 @@ mod tests {
         let result = CodexLiveHomeGuard::from_auth_path(&source_home.path().join("auth.json"));
 
         assert!(result.is_err());
-        assert!(codex_test_native_home_override()
-            .lock()
-            .expect("codex test native home mutex poisoned")
-            .is_none());
+        assert!(
+            codex_test_native_home_override()
+                .lock()
+                .expect("codex test native home mutex poisoned")
+                .is_none()
+        );
     }
 
     #[test]
