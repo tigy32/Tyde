@@ -8,12 +8,12 @@ use hmac::{Hmac, Mac};
 use protocol::{
     AGENT_CONTROL_DEFAULT_READ_LIMIT, AGENT_CONTROL_DEFAULT_READ_MAX_BYTES,
     AGENT_CONTROL_MAX_READ_LIMIT, AGENT_CONTROL_MAX_READ_MAX_BYTES, AgentControlReadDebugResult,
-    AgentControlReadResult, AgentControlStatus, AgentId, AgentInput, AgentOrigin,
-    BackendAccessMode, BackendKind, CustomAgentId, GitBranchName, ImageData, LaunchProfileCatalog,
-    LaunchProfileId, ProjectId, ProjectSource, SendMessagePayload, SessionSchemaEntry,
-    SessionSettingsValues, SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, Team, TeamMember,
-    TeamMemberBindingPayload, TeamMemberId, WorkbenchCreatePayload, WorkbenchRemovePayload,
-    WorkflowSaveRequest, WorkflowSaveResponse, WorkflowTargetsResponse, cap_agent_control_events,
+    AgentControlReadResult, AgentControlStatus, AgentId, AgentOrigin, BackendAccessMode, BackendKind,
+    CustomAgentId, GitBranchName, ImageData, LaunchProfileCatalog, LaunchProfileId, ProjectId,
+    ProjectSource, SendMessagePayload, SessionSchemaEntry, SessionSettingsValues, SpawnAgentParams,
+    SpawnAgentPayload, SpawnCostHint, Team, TeamMember, TeamMemberBindingPayload, TeamMemberId,
+    WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowSaveRequest, WorkflowSaveResponse,
+    WorkflowTargetsResponse, cap_agent_control_events,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
@@ -1429,28 +1429,14 @@ async fn do_send_message(
         .await
         .ok_or_else(|| format!("unknown agent_id {}", agent_id.0))?;
 
-    // Mark the agent active again before forwarding the follow-up turn.
-    if let Some(status_handle) = host.agent_status_handle(agent_id).await {
-        status_handle
-            .update(|s| {
-                s.turn_completed = false;
-                s.activity_counter = s.activity_counter.saturating_add(1);
-            })
-            .await;
-    }
-
-    let sent = handle
-        .send_input(AgentInput::SendMessage(SendMessagePayload {
+    handle
+        .deliver_message(SendMessagePayload {
             message,
             images: None,
             origin: None,
             tool_response: None,
-        }))
-        .await;
-    if !sent {
-        return Err("agent backend is closed".to_string());
-    }
-    Ok(())
+        })
+        .await
 }
 
 async fn reject_mutating_tool_for_read_only_caller(
@@ -1749,10 +1735,13 @@ async fn await_result_from_snapshot(
     let mut still_thinking = Vec::new();
 
     for agent_id in agent_ids {
-        let status = host
-            .agent_status_snapshot(agent_id)
-            .await
-            .ok_or_else(|| format!("unknown agent_id {}", agent_id.0))?;
+        let Some(status) = host.agent_status_snapshot(agent_id).await else {
+            ready.push(AwaitAgentStatus {
+                agent_id: agent_id.0.clone(),
+                status: AgentControlStatus::Idle,
+            });
+            continue;
+        };
         let entry = AwaitAgentStatus {
             agent_id: agent_id.0.clone(),
             status: status.status(),
@@ -2590,6 +2579,318 @@ mod tests {
             result.still_thinking[0].status,
             AgentControlStatus::Thinking
         );
+    }
+
+    #[tokio::test]
+    async fn blocked_await_wakes_on_fatal_backend_closure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = crate::host::spawn_host_with_mock_backend(
+            dir.path().join("sessions.json"),
+            dir.path().join("projects.json"),
+            dir.path().join("settings.json"),
+        )
+        .expect("mock host");
+        let spawned = do_spawn_agent(&host, mock_spawn_input("fatal-await", None), None)
+            .await
+            .expect("spawn fatal-await agent");
+        let agent_id = AgentId(spawned.agent_id);
+        let initially_ready =
+            do_await_agents_with_progress(&host, vec![agent_id.clone()], None, None)
+                .await
+                .expect("initial mock turn becomes idle");
+        assert_eq!(initially_ready.ready[0].status, AgentControlStatus::Idle);
+
+        do_send_message(
+            &host,
+            &agent_id,
+            crate::backend::mock::MOCK_DIE_AFTER_BUSY_SENTINEL.to_owned(),
+            None,
+        )
+        .await
+        .expect("actor accepts fatal follow-up before backend closure");
+        let active = host
+            .agent_status_snapshot(&agent_id)
+            .await
+            .expect("active fatal-await status");
+        assert!(active.is_active());
+        assert_eq!(active.status(), AgentControlStatus::Thinking);
+
+        let await_future =
+            do_await_agents_with_progress(&host, vec![agent_id.clone()], None, None);
+        tokio::pin!(await_future);
+        assert!(
+            timeout(Duration::from_millis(50), &mut await_future)
+                .await
+                .is_err(),
+            "await must be blocked before the deterministic backend closure"
+        );
+
+        let failed = timeout(Duration::from_secs(2), &mut await_future)
+            .await
+            .expect("fatal status notification must wake the blocked await")
+            .expect("fatal await result");
+        assert!(failed.still_thinking.is_empty());
+        assert_eq!(failed.ready.len(), 1);
+        assert_eq!(failed.ready[0].agent_id, agent_id.0);
+        assert_eq!(failed.ready[0].status, AgentControlStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn send_agent_message_commits_actor_status_before_success() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = crate::host::spawn_host_with_mock_backend(
+            dir.path().join("sessions.json"),
+            dir.path().join("projects.json"),
+            dir.path().join("settings.json"),
+        )
+        .expect("mock host");
+        let spawned = do_spawn_agent(&host, mock_spawn_input("ordered-send", None), None)
+            .await
+            .expect("spawn ordered-send agent");
+        let agent_id = AgentId(spawned.agent_id);
+        do_await_agents_with_progress(&host, vec![agent_id.clone()], None, None)
+            .await
+            .expect("initial mock turn becomes idle");
+
+        do_send_message(
+            &host,
+            &agent_id,
+            crate::backend::mock::MOCK_SLOW_TURN_SENTINEL.to_owned(),
+            None,
+        )
+        .await
+        .expect("checked delivery succeeds");
+        let committed = host
+            .agent_status_snapshot(&agent_id)
+            .await
+            .expect("ordered-send status");
+        assert!(committed.is_active());
+        assert!(committed.is_thinking);
+        assert!(!committed.turn_completed);
+        assert_eq!(committed.status(), AgentControlStatus::Thinking);
+
+        let completed = timeout(
+            Duration::from_secs(6),
+            do_await_agents_with_progress(&host, vec![agent_id], None, None),
+        )
+        .await
+        .expect("slow mock follow-up completes")
+        .expect("completed follow-up status");
+        assert!(completed.still_thinking.is_empty());
+        assert_eq!(completed.ready[0].status, AgentControlStatus::Idle);
+    }
+
+    #[tokio::test]
+    async fn rejected_terminal_delivery_preserves_failed_status_and_output() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = crate::host::spawn_host_with_mock_backend(
+            dir.path().join("sessions.json"),
+            dir.path().join("projects.json"),
+            dir.path().join("settings.json"),
+        )
+        .expect("mock host");
+        let spawned = do_spawn_agent(&host, mock_spawn_input("terminal-send", None), None)
+            .await
+            .expect("spawn terminal-send agent");
+        let agent_id = AgentId(spawned.agent_id);
+        do_await_agents_with_progress(&host, vec![agent_id.clone()], None, None)
+            .await
+            .expect("initial mock turn becomes idle");
+        do_send_message(
+            &host,
+            &agent_id,
+            crate::backend::mock::MOCK_DIE_AFTER_BUSY_SENTINEL.to_owned(),
+            None,
+        )
+        .await
+        .expect("actor accepts fatal follow-up");
+        let failed = timeout(
+            Duration::from_secs(2),
+            do_await_agents_with_progress(&host, vec![agent_id.clone()], None, None),
+        )
+        .await
+        .expect("backend closure becomes terminal")
+        .expect("terminal status result");
+        assert_eq!(failed.ready[0].status, AgentControlStatus::Failed);
+        let fatal_output = timeout(Duration::from_secs(1), async {
+            loop {
+                let output = do_read_agent(&host, &agent_id)
+                    .await
+                    .expect("read terminal output");
+                if matches!(&output.output, AgentControlOutput::Error { .. }) {
+                    return output;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fatal output is appended after terminal status");
+
+        let rejection = do_send_message(
+            &host,
+            &agent_id,
+            "rejected terminal follow-up".to_owned(),
+            None,
+        )
+        .await
+        .expect_err("parked terminal actor must reject checked delivery");
+        assert_eq!(rejection, "agent not running");
+
+        let status = host
+            .agent_status_snapshot(&agent_id)
+            .await
+            .expect("terminal status remains registered");
+        assert!(!status.is_active());
+        assert_eq!(status.status(), AgentControlStatus::Failed);
+        assert_eq!(
+            do_read_agent(&host, &agent_id)
+                .await
+                .expect("read output after rejected delivery"),
+            fatal_output,
+            "rejection must not append a secondary transcript error"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_blocked_compaction_delivery_remains_ready_idle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = crate::host::spawn_host_with_mock_backend(
+            dir.path().join("sessions.json"),
+            dir.path().join("projects.json"),
+            dir.path().join("settings.json"),
+        )
+        .expect("mock host");
+        let spawned = do_spawn_agent(&host, mock_spawn_input("compacting-send", None), None)
+            .await
+            .expect("spawn compacting-send agent");
+        let agent_id = AgentId(spawned.agent_id);
+        do_await_agents_with_progress(&host, vec![agent_id.clone()], None, None)
+            .await
+            .expect("initial mock turn becomes idle");
+        let handle = host
+            .agent_handle(&agent_id)
+            .await
+            .expect("compacting agent handle");
+        let compaction_rx = match handle.begin_compact("summarize this session".to_owned(), 4096) {
+            crate::agent::CompactionStart::Started(reply) => reply,
+            crate::agent::CompactionStart::Rejected(error) => {
+                panic!("compaction unexpectedly rejected: {error}")
+            }
+            crate::agent::CompactionStart::Closed => panic!("compaction actor unexpectedly closed"),
+        };
+        timeout(Duration::from_secs(2), compaction_rx)
+            .await
+            .expect("mock compaction completes")
+            .expect("compaction reply channel")
+            .expect("mock compaction succeeds");
+        let before_rejection = do_read_agent(&host, &agent_id)
+            .await
+            .expect("read compacted actor output");
+
+        let rejection = do_send_message(
+            &host,
+            &agent_id,
+            "must not enter compacted actor".to_owned(),
+            None,
+        )
+        .await
+        .expect_err("blocked compaction must reject checked delivery");
+        assert_eq!(rejection, "agent compaction is in progress");
+
+        let status = host
+            .agent_status_snapshot(&agent_id)
+            .await
+            .expect("compaction-blocked status");
+        assert!(!status.is_active());
+        assert_eq!(status.status(), AgentControlStatus::Idle);
+        let ready =
+            do_await_agents_with_progress(&host, vec![agent_id.clone()], None, None)
+                .await
+                .expect("compaction-blocked actor remains awaitable");
+        assert!(ready.still_thinking.is_empty());
+        assert_eq!(ready.ready[0].status, AgentControlStatus::Idle);
+        assert_eq!(
+            do_read_agent(&host, &agent_id)
+                .await
+                .expect("read output after compaction rejection"),
+            before_rejection,
+            "compaction rejection must not append a secondary transcript error"
+        );
+        assert!(handle.release_compaction().await);
+    }
+
+    #[tokio::test]
+    async fn await_snapshot_treats_removed_watched_agent_as_ready_idle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = crate::host::spawn_host_with_mock_backend(
+            dir.path().join("sessions.json"),
+            dir.path().join("projects.json"),
+            dir.path().join("settings.json"),
+        )
+        .expect("mock host");
+        let removed = do_spawn_agent(&host, mock_spawn_input("removed-watched", None), None)
+            .await
+            .expect("spawn removed-watched agent");
+        let removed_id = AgentId(removed.agent_id);
+        do_await_agents_with_progress(&host, vec![removed_id.clone()], None, None)
+            .await
+            .expect("removed candidate becomes idle");
+
+        let thinking = do_spawn_agent(
+            &host,
+            SpawnAgentToolInput {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "__mock_hold_until_interrupt__ mixed snapshot".to_owned(),
+                launch_profile_id: None,
+                backend_kind: Some(BackendKindInput::Claude),
+                session_settings: None,
+                parent_agent_id: None,
+                project_id: None,
+                name: Some("thinking-watched".to_owned()),
+                cost_hint: None,
+                access_mode: None,
+            }
+            .into(),
+            None,
+        )
+        .await
+        .expect("spawn thinking-watched agent");
+        let thinking_id = AgentId(thinking.agent_id);
+        let thinking_handle = host
+            .agent_handle(&thinking_id)
+            .await
+            .expect("thinking agent handle");
+
+        assert!(host.close_agent(&removed_id).await);
+        let snapshot =
+            await_result_from_snapshot(&host, &[removed_id.clone(), thinking_id.clone()])
+                .await
+                .expect("post-validation disappearance is a lifecycle result");
+        assert_eq!(snapshot.ready.len(), 1);
+        assert_eq!(snapshot.ready[0].agent_id, removed_id.0);
+        assert_eq!(snapshot.ready[0].status, AgentControlStatus::Idle);
+        assert_eq!(snapshot.still_thinking.len(), 1);
+        assert_eq!(snapshot.still_thinking[0].agent_id, thinking_id.0);
+        assert_eq!(
+            snapshot.still_thinking[0].status,
+            AgentControlStatus::Thinking
+        );
+
+        let unknown = do_await_agents_with_progress(
+            &host,
+            vec![removed_id.clone()],
+            Some(CancellationToken::new()),
+            None,
+        )
+        .await
+        .expect_err("upfront unknown-id validation remains strict");
+        assert_eq!(unknown, format!("unknown agent_id {}", removed_id.0));
+
+        assert_eq!(
+            thinking_handle.interrupt().await,
+            crate::agent::InterruptOutcome::Interrupted
+        );
+        assert!(host.close_agent(&thinking_id).await);
     }
 
     #[test]

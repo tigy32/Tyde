@@ -5466,6 +5466,84 @@ async fn backend_native_child_is_first_class_and_replays_to_late_subscribers() {
 }
 
 #[tokio::test]
+async fn agent_control_rejects_relay_delivery_without_wedging_await() {
+    let mut fixture = Fixture::new().await;
+    let (parent, _parent_start, child, _child_start) =
+        spawn_parent_with_native_child(&mut fixture.client).await;
+    let caller = fixture.agent_control_caller(&parent.agent_id).await;
+    let initially_ready = mcp_await_agent(&caller, &child.agent_id).await;
+    assert_eq!(initially_ready["ready"][0]["status"], "idle");
+    assert_eq!(
+        initially_ready["still_thinking"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let before_debug = mcp_tool_call_as(
+        &caller,
+        false,
+        "tyde_read_agent_debug",
+        json!({
+            "agent_id": child.agent_id.0.clone(),
+            "after_seq": 0,
+            "limit": 200,
+            "max_bytes": 262144
+        }),
+    )
+    .await;
+    let before_debug = mcp_success_json(&before_debug);
+    let cursor = before_debug["next_after_seq"]
+        .as_u64()
+        .expect("relay debug cursor");
+
+    let rejected = mcp_tool_call_as(
+        &caller,
+        false,
+        "tyde_send_agent_message",
+        json!({
+            "agent_id": child.agent_id.0.clone(),
+            "message": "relay must reject this checked delivery"
+        }),
+    )
+    .await;
+    assert!(mcp_result_is_error(&rejected));
+    assert!(
+        mcp_result_text(&rejected)
+            .contains("backend-native relay agents do not accept direct input")
+    );
+
+    let after_rejection = mcp_await_agent(&caller, &child.agent_id).await;
+    assert_eq!(after_rejection["ready"][0]["status"], "idle");
+    assert_eq!(
+        after_rejection["still_thinking"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "rejected relay delivery must not leave a speculative Thinking status"
+    );
+
+    let after_debug = mcp_tool_call_as(
+        &caller,
+        false,
+        "tyde_read_agent_debug",
+        json!({
+            "agent_id": child.agent_id.0.clone(),
+            "after_seq": cursor,
+            "limit": 200,
+            "max_bytes": 262144
+        }),
+    )
+    .await;
+    let after_debug = mcp_success_json(&after_debug);
+    assert_eq!(
+        after_debug["events"].as_array().map(Vec::len),
+        Some(0),
+        "checked relay rejection must not append a secondary transcript error"
+    );
+}
+
+#[tokio::test]
 async fn backend_native_child_does_not_emit_completion_notice_to_parent() {
     let mut fixture = Fixture::new().await;
 
