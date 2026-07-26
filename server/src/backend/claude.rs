@@ -1361,6 +1361,24 @@ async fn pause_after_ask_answer_control_response_write_for_test() {
     }
 }
 
+/// Identity a skill failure was decided against.
+///
+/// A failure is decided at one moment and committed at another, with awaits in
+/// between; a cancel can land in that gap. Carrying the process generation and
+/// the exact turn the decision was made for lets the commit revalidate rather
+/// than assume, so a stale decision can never settle a turn it was not about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SkillFailureTarget {
+    generation: u64,
+    turn_id: Option<u64>,
+}
+
+/// What a committed skill failure hands back for the caller to finish.
+struct CommittedSkillFailure {
+    outcome_tx: Option<oneshot::Sender<TurnOutcome>>,
+    watchdog: Option<JoinHandle<()>>,
+}
+
 impl ClaudeInner {
     async fn execute_arc(this: Arc<Self>, command: SessionCommand) -> Result<(), String> {
         match command {
@@ -2495,53 +2513,120 @@ impl ClaudeInner {
     /// is avoidable is *acting* on a session whose skills are wrong, so this
     /// suppresses everything the model says, fails the turn, and kills the
     /// process rather than letting a half-equipped agent continue.
-    async fn terminate_for_skill_mismatch(&self, message: &str) {
+    /// The identity to decide a skill failure against, taken now.
+    async fn current_skill_failure_target(&self) -> SkillFailureTarget {
+        let state = self.state.lock().await;
+        SkillFailureTarget {
+            generation: state.skill_verification_generation,
+            turn_id: state.active_turn.as_ref().map(|active| active.id),
+        }
+    }
+
+    /// Commit a skill failure, or decline it.
+    ///
+    /// Every check and every mutation happens in one critical section under the
+    /// state lock — the same lock a cancel takes. That makes the two linearize:
+    /// whichever acquires it first wins, and the loser's revalidation fails
+    /// rather than half-applying. A failure declines when the process has moved
+    /// on, when verification is no longer pending, when a cancel already marked
+    /// abandonment, when the active turn is not the exact one the failure was
+    /// decided for, or when that turn has been interrupted.
+    ///
+    /// Declining emits nothing and takes nothing: a cancelled turn must not be
+    /// reported as a skill failure, and a turn this failure was not about must
+    /// not have its sender taken.
+    async fn commit_skill_failure(
+        &self,
+        target: &SkillFailureTarget,
+        reason: &str,
+    ) -> Option<CommittedSkillFailure> {
+        let mut state = self.state.lock().await;
+
+        if state.skill_verification_generation != target.generation {
+            tracing::debug!(
+                "Declining a Claude skill failure from generation {}; the session is on {}",
+                target.generation,
+                state.skill_verification_generation
+            );
+            return None;
+        }
+        if self.skill_verification_abandoned.load(Ordering::Relaxed) {
+            tracing::debug!("Declining a Claude skill failure; the turn was cancelled first");
+            return None;
+        }
+        if !matches!(
+            *self.skill_readiness.borrow(),
+            ClaudeSkillReadiness::Pending
+        ) {
+            tracing::debug!("Declining a Claude skill failure; verification already settled");
+            return None;
+        }
+
+        let active_turn_id = state.active_turn.as_ref().map(|active| active.id);
+        if active_turn_id != target.turn_id {
+            tracing::debug!(
+                "Declining a Claude skill failure decided for turn {:?}; turn {:?} is active",
+                target.turn_id,
+                active_turn_id
+            );
+            return None;
+        }
+        if state
+            .active_turn
+            .as_ref()
+            .is_some_and(|active| active.interrupt_requested)
+        {
+            tracing::debug!("Declining a Claude skill failure; that turn was interrupted");
+            return None;
+        }
+
+        // Committed. Transition, disown the watchdog, and take *this* turn's
+        // sender — never whichever turn happens to be current.
+        self.skill_readiness
+            .send_replace(ClaudeSkillReadiness::Failed(reason.to_string()));
+        let watchdog = state.skill_watchdog.take();
+        let outcome_tx = state
+            .active_turn
+            .as_mut()
+            .and_then(|active| active.outcome_tx.take());
+        Some(CommittedSkillFailure {
+            outcome_tx,
+            watchdog,
+        })
+    }
+
+    /// Terminate the session for a skill failure decided against `target`.
+    ///
+    /// `abort_watchdog` is false when the caller *is* the watchdog: aborting its
+    /// own handle would cancel it at the next await, which is how an earlier
+    /// revision lost the settle.
+    async fn terminate_for_skill_mismatch(
+        &self,
+        target: &SkillFailureTarget,
+        message: &str,
+        abort_watchdog: bool,
+    ) {
         let full = format!(
             "{message} Tyde stopped this Claude session before using its response, because a \
              session missing a skill it was configured with will silently do the wrong thing."
         );
-        // Order is load-bearing. The verdict is recorded, then the waiter is
-        // released, and only then is anything aborted or killed. Aborting first
-        // meant that when this ran *inside* the watchdog task, `abort()` on its
-        // own handle cancelled it at the next await — which was the settle —
-        // so the verdict was recorded and the turn was left hanging.
-        self.skill_readiness
-            .send_replace(ClaudeSkillReadiness::Failed(full.clone()));
+        let Some(committed) = self.commit_skill_failure(target, &full).await else {
+            return;
+        };
         tracing::error!("{full}");
         self.emit_error(&full);
-        self.settle_active_turn_with_failure(full).await;
-        self.cancel_skill_watchdog().await;
-        self.shutdown_process().await;
-    }
-
-    /// Resolve whatever turn is in flight as failed, however that has to happen.
-    ///
-    /// Sending is preferred because it carries the reason. When there is no
-    /// sender left to send on — already taken, or a turn recorded without one —
-    /// the receiver is already unblocked or was never blocked, and dropping the
-    /// slot guarantees it cannot become blocked later.
-    async fn settle_active_turn_with_failure(&self, error: String) {
-        let sender = {
-            let mut state = self.state.lock().await;
-            state
-                .active_turn
-                .as_mut()
-                .and_then(|active| active.outcome_tx.take())
-        };
-        match sender {
-            Some(sender) => {
-                let _ = sender.send(TurnOutcome::Failed {
-                    summary: ClaudeStdoutSummary::default(),
-                    error,
-                });
-            }
-            None => {
-                tracing::debug!(
-                    "No pending Claude turn outcome to settle for a skill failure; nothing is \
-                     waiting on one"
-                );
-            }
+        if let Some(sender) = committed.outcome_tx {
+            let _ = sender.send(TurnOutcome::Failed {
+                summary: ClaudeStdoutSummary::default(),
+                error: full,
+            });
         }
+        if let Some(handle) = committed.watchdog
+            && abort_watchdog
+        {
+            handle.abort();
+        }
+        self.shutdown_process().await;
     }
 
     /// Has this session been terminated for a skill mismatch?
@@ -2591,9 +2676,13 @@ impl ClaudeInner {
                 self.cancel_skill_watchdog().await;
             }
             InitFrameVerdict::Failed(message) => {
-                self.skill_readiness
-                    .send_replace(ClaudeSkillReadiness::Failed(message.clone()));
-                self.terminate_for_skill_mismatch(&message).await;
+                // The transition is left to `commit_skill_failure`. Setting it
+                // here would both pre-empt the atomic check and guarantee the
+                // commit declines, since it requires readiness to still be
+                // `Pending` — the very condition a cancel races it for.
+                let target = self.current_skill_failure_target().await;
+                self.terminate_for_skill_mismatch(&target, &message, true)
+                    .await;
             }
         }
     }
@@ -2647,32 +2736,24 @@ impl ClaudeInner {
         {
             return;
         }
-        let generation = state.skill_verification_generation;
+        // The identity this timer is for, captured now under the same lock that
+        // arms it. Revalidated by `commit_skill_failure` when it fires, so a
+        // timer that outlives its process or its turn declines instead of
+        // settling something it was never about.
+        let target = SkillFailureTarget {
+            generation: state.skill_verification_generation,
+            turn_id: state.active_turn.as_ref().map(|active| active.id),
+        };
         let inner = Arc::clone(self);
         let handle = tokio::spawn(async move {
             tokio::time::sleep(CLAUDE_SKILL_VERIFICATION_TIMEOUT).await;
-            // Re-checked at fire time as well: abort is the primary mechanism,
-            // these are the backstop for a timer that slipped past it.
-            if !inner.skills_awaiting_verification() {
-                return;
-            }
-            {
-                let mut state = inner.state.lock().await;
-                if state.skill_verification_generation != generation {
-                    tracing::debug!(
-                        "Skipping a Claude skill watchdog from generation {generation}; the \
-                         session has moved on since"
-                    );
-                    return;
-                }
-                // This watchdog has won: disown its own handle before running
-                // termination, so the cleanup inside termination finds nothing
-                // to abort and cannot cancel the very task doing the work.
-                state.skill_watchdog = None;
-            }
+            // `abort_watchdog: false` — this task owns the handle it would be
+            // aborting, and cancelling itself would drop the settle.
             inner
                 .terminate_for_skill_mismatch(
+                    &target,
                     "Claude did not report which skills it loaded within the startup timeout.",
+                    false,
                 )
                 .await;
         });
@@ -3946,7 +4027,9 @@ async fn read_claude_stdout_persistent(
                         } else {
                             inner
                                 .terminate_for_skill_mismatch(
+                                    &inner.current_skill_failure_target().await,
                                     "Claude exited before reporting which skills it loaded.",
+                                    true,
                                 )
                                 .await;
                         }
@@ -4000,10 +4083,14 @@ async fn read_claude_stdout_persistent(
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
             inner
-                .terminate_for_skill_mismatch(&format!(
-                    "Claude asked Tyde to act on a '{subtype}' control request before reporting \
-                     which skills it loaded."
-                ))
+                .terminate_for_skill_mismatch(
+                    &inner.current_skill_failure_target().await,
+                    &format!(
+                        "Claude asked Tyde to act on a '{subtype}' control request before \
+                         reporting which skills it loaded."
+                    ),
+                    true,
+                )
                 .await;
             held_back.clear();
             held_back_bytes = 0;
@@ -4056,7 +4143,9 @@ async fn read_claude_stdout_persistent(
             if claude_frame_is_turn_terminal(&value) {
                 inner
                     .terminate_for_skill_mismatch(
+                        &inner.current_skill_failure_target().await,
                         "Claude finished its turn without reporting which skills it loaded.",
+                        true,
                     )
                     .await;
                 held_back.clear();
@@ -4068,11 +4157,15 @@ async fn read_claude_stdout_persistent(
                 || held_back_bytes + frame_bytes > CLAUDE_HELD_BACK_BYTE_LIMIT
             {
                 inner
-                    .terminate_for_skill_mismatch(&format!(
-                        "Claude produced more than {} frames or {} bytes of output without \
-                         reporting which skills it loaded.",
-                        CLAUDE_HELD_BACK_FRAME_LIMIT, CLAUDE_HELD_BACK_BYTE_LIMIT
-                    ))
+                    .terminate_for_skill_mismatch(
+                        &inner.current_skill_failure_target().await,
+                        &format!(
+                            "Claude produced more than {} frames or {} bytes of output without \
+                             reporting which skills it loaded.",
+                            CLAUDE_HELD_BACK_FRAME_LIMIT, CLAUDE_HELD_BACK_BYTE_LIMIT
+                        ),
+                        true,
+                    )
                     .await;
                 held_back.clear();
                 held_back_bytes = 0;
@@ -12897,7 +12990,7 @@ sys.exit(1)
     /// deadlock against this, which is exactly why the wait was removed.
     /// What the fake CLI does when it receives the first user frame.
     #[cfg(unix)]
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     enum FakeInitBehaviour {
         /// Report these skills, then produce model output. The normal case.
         Reports(&'static str),
@@ -12949,6 +13042,30 @@ sys.exit(1)
             }
         }
 
+        /// The terminal outcome this behaviour must deliver, as a class plus a
+        /// fragment of its reason. Asserting the class is what stops a dropped
+        /// sender from passing as delivery: `Ok(Err(RecvError))` is a drop, and
+        /// a drop carries no outcome at all.
+        fn expected_terminal(self) -> ExpectedTerminal {
+            let confirmed = self.reported_skills().contains("tyde-skills:alpha");
+            match self {
+                // A confirmed session runs to its own `result`.
+                Self::Reports(_) | Self::AssistantBeforeInit(_) if confirmed => {
+                    ExpectedTerminal::Completed
+                }
+                // An unconfirmed one is failed by the init-frame verdict.
+                Self::Reports(_) | Self::AssistantBeforeInit(_) => {
+                    ExpectedTerminal::Failed("did not load")
+                }
+                Self::OmitsInit | Self::ResultBeforeInit => {
+                    ExpectedTerminal::Failed("without reporting")
+                }
+                Self::ControlRequestBeforeInit => ExpectedTerminal::Failed("control request"),
+                Self::FloodsWithoutInit => ExpectedTerminal::Failed("bytes of output"),
+                Self::SaysNothing => ExpectedTerminal::Failed("startup timeout"),
+            }
+        }
+
         /// The last log entry this behaviour is expected to write, or `None`
         /// when it writes nothing after the prompt.
         fn final_marker(self) -> Option<&'static str> {
@@ -12960,6 +13077,15 @@ sys.exit(1)
                 Self::SaysNothing => None,
             }
         }
+    }
+
+    /// What a fake behaviour's turn must resolve to.
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug)]
+    enum ExpectedTerminal {
+        Completed,
+        /// Failed, with this fragment in its reason.
+        Failed(&'static str),
     }
 
     /// Turn id the fake harness registers. Named so the clear-up at the end of
@@ -13167,15 +13293,40 @@ for raw_line in sys.stdin:
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
-        // Terminal delivery, bounded. Every behaviour reaches one: the CLI
-        // ends the turn with a `result`, or a terminal skill path fails it, or
-        // the process exits. A behaviour that reached none would be a defect,
-        // and the timeout reports that rather than hanging the suite.
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), outcome_rx).await;
-        assert!(
-            outcome.is_ok(),
-            "every fake behaviour must deliver a terminal outcome for its turn"
-        );
+        // Terminal delivery, bounded, and unwrapped through *both* layers. The
+        // timeout layer says the turn resolved at all; the oneshot layer says
+        // it resolved by being *sent*. `Ok(Err(RecvError))` is a dropped
+        // sender — the turn died without an outcome — and treating that as
+        // delivery is exactly how a lost settle would go unnoticed.
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(20), outcome_rx)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("{behaviour:?}: the turn must reach a terminal outcome, not hang")
+            })
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{behaviour:?}: the turn's outcome sender was dropped; a drop is not a \
+                     delivery"
+                )
+            });
+        match (behaviour.expected_terminal(), delivered) {
+            (ExpectedTerminal::Completed, TurnOutcome::Completed { .. }) => {}
+            (ExpectedTerminal::Failed(fragment), TurnOutcome::Failed { error, .. }) => {
+                assert!(
+                    error.contains(fragment),
+                    "{behaviour:?}: expected a failure mentioning {fragment:?}, got {error:?}"
+                );
+            }
+            (expected, TurnOutcome::Completed { .. }) => {
+                panic!("{behaviour:?}: expected {expected:?}, got a completed turn")
+            }
+            (expected, TurnOutcome::Failed { error, .. }) => {
+                panic!("{behaviour:?}: expected {expected:?}, got a failure {error:?}")
+            }
+            (expected, TurnOutcome::Cancelled { .. }) => {
+                panic!("{behaviour:?}: expected {expected:?}, got a cancelled turn")
+            }
+        }
 
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -13520,6 +13671,172 @@ for raw_line in sys.stdin:
             quiesced_waiters: Vec::new(),
         });
         outcome_rx
+    }
+
+    /// Install a turn that can deliver, not yet interrupted.
+    async fn install_live_turn(
+        inner: &Arc<ClaudeInner>,
+        id: u64,
+    ) -> oneshot::Receiver<TurnOutcome> {
+        let (outcome_tx, outcome_rx) = oneshot::channel();
+        let mut state = inner.state.lock().await;
+        state.active_turn = Some(ActiveTurn {
+            id,
+            outcome_tx: Some(outcome_tx),
+            interrupt_requested: false,
+            pending_ask_user_question: None,
+            pending_exit_plan_mode: None,
+            quiesced_waiters: Vec::new(),
+        });
+        outcome_rx
+    }
+
+    /// Cancel and skill-failure both take the state lock, so they linearize.
+    /// This is the interleaving where the cancel gets there first: the failure
+    /// must decline outright — no error to the user, and the turn's sender left
+    /// for the cancel path to resolve.
+    #[tokio::test]
+    async fn a_cancel_that_wins_the_race_blocks_the_skill_failure() {
+        let (inner, mut rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
+        let mut outcome_rx = install_live_turn(&inner, 31).await;
+        // The failure is decided against this identity...
+        let target = inner.current_skill_failure_target().await;
+
+        // ...but the cancel commits first.
+        inner
+            .state
+            .lock()
+            .await
+            .active_turn
+            .as_mut()
+            .unwrap()
+            .interrupt_requested = true;
+        assert!(inner.abandon_skill_verification_for_cancelled_turn().await);
+
+        inner
+            .terminate_for_skill_mismatch(&target, "stale decision", true)
+            .await;
+
+        assert_eq!(
+            inner.skill_readiness_state(),
+            ClaudeSkillReadiness::Pending,
+            "a cancel that wins must leave verification unresolved, not failed"
+        );
+        assert!(
+            matches!(
+                outcome_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "the losing failure must not take the cancelled turn's sender"
+        );
+        let mut kinds = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            kinds.push(event_kind(&event).map(str::to_string));
+        }
+        assert!(
+            !kinds.iter().any(|kind| kind.as_deref() == Some("Error")),
+            "a losing failure must emit nothing: {kinds:?}"
+        );
+    }
+
+    /// The other interleaving: the failure commits first, so the cancel finds
+    /// nothing left to abandon.
+    #[tokio::test]
+    async fn a_skill_failure_that_wins_the_race_blocks_the_cancel() {
+        let (inner, _rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
+        let outcome_rx = install_live_turn(&inner, 32).await;
+        let target = inner.current_skill_failure_target().await;
+
+        inner
+            .terminate_for_skill_mismatch(&target, "the CLI dropped a skill", true)
+            .await;
+
+        match inner.skill_readiness_state() {
+            ClaudeSkillReadiness::Failed(message) => {
+                assert!(message.contains("the CLI dropped a skill"), "{message}")
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        match outcome_rx
+            .await
+            .expect("the winning failure settles the turn")
+        {
+            TurnOutcome::Failed { error, .. } => {
+                assert!(error.contains("the CLI dropped a skill"), "{error}")
+            }
+            TurnOutcome::Completed { .. } => panic!("a skill failure is not a completion"),
+            TurnOutcome::Cancelled { .. } => panic!("a skill failure is not a cancellation"),
+        }
+
+        // The cancel arrives second and finds verification already settled.
+        inner
+            .state
+            .lock()
+            .await
+            .active_turn
+            .as_mut()
+            .unwrap()
+            .interrupt_requested = true;
+        assert!(
+            !inner.abandon_skill_verification_for_cancelled_turn().await,
+            "there is nothing pending left to abandon"
+        );
+    }
+
+    /// A decision made for an earlier process, or an earlier turn, must never
+    /// settle whatever happens to be current when it finally commits.
+    #[tokio::test]
+    async fn a_stale_skill_failure_cannot_settle_a_newer_turn() {
+        let (inner, mut rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
+        let _old_turn = install_live_turn(&inner, 41).await;
+        let stale = inner.current_skill_failure_target().await;
+
+        // A new process: new generation, re-armed verification.
+        inner.reset_skill_readiness().await;
+        // ...carrying a different turn.
+        let mut new_turn = install_live_turn(&inner, 42).await;
+
+        inner
+            .terminate_for_skill_mismatch(&stale, "decided for the previous process", true)
+            .await;
+
+        assert_eq!(
+            inner.skill_readiness_state(),
+            ClaudeSkillReadiness::Pending,
+            "a stale decision must not fail the new process"
+        );
+        assert!(
+            matches!(
+                new_turn.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "a stale decision must not take the new turn's sender"
+        );
+        let mut kinds = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            kinds.push(event_kind(&event).map(str::to_string));
+        }
+        assert!(
+            !kinds.iter().any(|kind| kind.as_deref() == Some("Error")),
+            "{kinds:?}"
+        );
+
+        // Same generation, different turn: also declined.
+        let same_generation_wrong_turn = SkillFailureTarget {
+            generation: inner.state.lock().await.skill_verification_generation,
+            turn_id: Some(41),
+        };
+        inner
+            .terminate_for_skill_mismatch(&same_generation_wrong_turn, "wrong turn", true)
+            .await;
+        assert!(
+            matches!(
+                new_turn.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "a decision about turn 41 must not settle turn 42"
+        );
+        assert_eq!(inner.skill_readiness_state(), ClaudeSkillReadiness::Pending);
     }
 
     /// Abandonment must never fire without a turn that was actually cancelled.
