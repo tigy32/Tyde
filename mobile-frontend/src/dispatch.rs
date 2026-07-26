@@ -4366,6 +4366,7 @@ mod wasm_tests {
             id: "tool-call".to_owned(),
             name: "tool".to_owned(),
             arguments: serde_json::json!({}),
+            content_offset: None,
         }];
         authoritative.images = Some(vec![protocol::ImageData {
             media_type: "image/png".to_owned(),
