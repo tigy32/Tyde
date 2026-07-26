@@ -75,6 +75,65 @@ fn agent_is_terminated_tracked(
     })
 }
 
+/// Send an `Interrupt` for the header's Stop control.
+///
+/// A free function rather than a closure body so the fatal guard is reachable
+/// from a test. Once the agent dies the Stop control unmounts, so no DOM click
+/// can drive this path afterwards — yet that is exactly the race the guard
+/// exists for: a tap already dispatched when the fatal frame lands. Calling
+/// this directly is the honest way to prove the guard holds; asserting on a
+/// button that is no longer rendered would prove nothing.
+fn interrupt_active_agent(state: &AppState, active: &crate::state::ActiveAgentRef) {
+    // A fatal agent's stream is dead: an Interrupt sent to it can never be
+    // answered. Silent by design — the transcript's fatal Error row is the
+    // explanation, and reporting "could not stop the turn" would imply a turn
+    // is still running.
+    if agent_is_terminated(state.agents, active) {
+        return;
+    }
+    let agent_stream = state.agents.with_untracked(|agents| {
+        agents
+            .iter()
+            .find(|a| a.local_host_id == active.local_host_id && a.agent_id == active.agent_id)
+            .map(|a| a.instance_stream.clone())
+    });
+    let Some(stream) = agent_stream else {
+        report_interrupt_error(
+            state,
+            "Could not stop the turn: this agent's stream is no longer available.".to_owned(),
+        );
+        return;
+    };
+    let host_id = active.local_host_id.clone();
+    let state = state.clone();
+    spawn_local(async move {
+        // The result used to be dropped with `let _ =`. A rejected admission
+        // is exactly the case that matters here: the user taps Stop, the
+        // frame never enters the outbound queue, the turn keeps running — and
+        // nothing at all appears on screen. They are left believing they
+        // stopped an agent that is still spending money.
+        //
+        // Admission is also *only* admission. Nothing here claims the turn
+        // was interrupted: the agent stops when the server says it stopped,
+        // which the UI already reflects through `agent_turn_active`. There is
+        // no success message to make, so the success arm is silent — the
+        // failure arm is the whole point.
+        if let Err(error) = crate::send::send_frame(
+            &host_id,
+            stream,
+            protocol::FrameKind::Interrupt,
+            &protocol::InterruptPayload {},
+        )
+        .await
+        {
+            report_interrupt_error(
+                &state,
+                format!("Could not stop the turn: {error}. The agent is still running."),
+            );
+        }
+    });
+}
+
 /// The terminal state of a conversation that could not be loaded.
 ///
 /// This is what the spinner turns into. It is an `alert`, not a status: the
@@ -278,56 +337,7 @@ pub fn ChatView() -> impl IntoView {
         let Some(ar) = s_interrupt.active_agent.get_untracked() else {
             return;
         };
-        // A fatal agent's stream is dead: an Interrupt sent to it can never be
-        // answered. Stop is already hidden for this state, so this only catches
-        // a tap that was already in flight when the fatal error landed — but a
-        // hidden control is not a transport guard. Silent by design: the
-        // transcript's fatal Error row is the explanation, and reporting
-        // "could not stop the turn" here would imply a turn is still running.
-        if agent_is_terminated(s_interrupt.agents, &ar) {
-            return;
-        }
-        let agent_stream = s_interrupt.agents.with_untracked(|agents| {
-            agents
-                .iter()
-                .find(|a| a.local_host_id == ar.local_host_id && a.agent_id == ar.agent_id)
-                .map(|a| a.instance_stream.clone())
-        });
-        let Some(stream) = agent_stream else {
-            report_interrupt_error(
-                &s_interrupt,
-                "Could not stop the turn: this agent's stream is no longer available.".to_owned(),
-            );
-            return;
-        };
-        let host_id = ar.local_host_id.clone();
-        let state = s_interrupt.clone();
-        spawn_local(async move {
-            // The result used to be dropped with `let _ =`. A rejected admission
-            // is exactly the case that matters here: the user taps Stop, the
-            // frame never enters the outbound queue, the turn keeps running — and
-            // nothing at all appears on screen. They are left believing they
-            // stopped an agent that is still spending money.
-            //
-            // Admission is also *only* admission. Nothing here claims the turn
-            // was interrupted: the agent stops when the server says it stopped,
-            // which the UI already reflects through `agent_turn_active`. There is
-            // no success message to make, so the success arm is silent — the
-            // failure arm is the whole point.
-            if let Err(error) = crate::send::send_frame(
-                &host_id,
-                stream,
-                protocol::FrameKind::Interrupt,
-                &protocol::InterruptPayload {},
-            )
-            .await
-            {
-                report_interrupt_error(
-                    &state,
-                    format!("Could not stop the turn: {error}. The agent is still running."),
-                );
-            }
-        });
+        interrupt_active_agent(&s_interrupt, &ar);
     });
 
     let s_turn = state.clone();
@@ -1407,11 +1417,68 @@ mod wasm_tests {
             state.mobile_shell_error.get_untracked().is_none(),
             "and nothing may claim the turn could not be stopped — it already ended"
         );
-        // `on_interrupt` carries its own fatal guard for a tap already in flight
-        // when the fatal frame lands. That race is unreachable through the DOM
-        // once Stop is unmounted, so it is not asserted here; the guard exists
-        // because a hidden control is not a transport guard.
         let _ = agent_ref;
+    }
+
+    /// **The tap that was already in flight when the agent died.**
+    ///
+    /// This is the race the guard in `interrupt_active_agent` exists for, and
+    /// the DOM cannot reach it: Stop unmounts the instant the agent goes fatal,
+    /// so no click after that point dispatches anything. Asserting zero sends
+    /// against an unmounted button proves nothing — it would pass with the
+    /// guard deleted.
+    ///
+    /// So drive the callback path directly, which is why it is a free function.
+    /// The precondition half runs the same call on a *live* agent and requires
+    /// exactly one frame, so this cannot pass by the send stub being broken or
+    /// the call being a no-op for some unrelated reason.
+    #[wasm_bindgen_test]
+    async fn an_interrupt_dispatched_before_the_fatal_frame_never_reaches_the_dead_stream() {
+        let _guard = crate::bridge::test_capture_sends();
+        let container = make_container();
+        let state = mount_active_chat(container.clone());
+        let active = state.active_agent.get_untracked().expect("active agent");
+        state.agent_turn_active.update(|m| {
+            m.insert(active.as_agent_ref(), true);
+        });
+        settle_autoscroll().await;
+
+        // Precondition: this exact call does send, while the agent is alive.
+        interrupt_active_agent(&state, &active);
+        settle_autoscroll().await;
+        assert_eq!(
+            crate::bridge::test_send_attempts(),
+            1,
+            "precondition: the interrupt path emits one frame for a live agent"
+        );
+
+        // The agent dies. The stale turn flag stays set on purpose: the guard
+        // must key on fatal, not on the turn having been cleared first.
+        state.agents.update(|agents| {
+            for agent in agents.iter_mut() {
+                agent.fatal_error = Some("backend crashed".to_owned());
+            }
+        });
+        settle_autoscroll().await;
+        assert!(
+            state
+                .agent_turn_active
+                .with_untracked(|m| m.get(&active.as_agent_ref()).copied().unwrap_or(false)),
+            "the stale turn flag must still be set, or this proves nothing"
+        );
+
+        interrupt_active_agent(&state, &active);
+        settle_autoscroll().await;
+
+        assert_eq!(
+            crate::bridge::test_send_attempts(),
+            1,
+            "the retained tap must emit no second frame at the dead stream"
+        );
+        assert!(
+            state.mobile_shell_error.get_untracked().is_none(),
+            "and must not claim the turn could not be stopped — it already ended"
+        );
     }
 
     /// Admission is not interruption. A successfully *queued* Interrupt says
