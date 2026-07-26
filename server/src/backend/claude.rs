@@ -13114,6 +13114,16 @@ for raw_line in sys.stdin:
                 quiesced_waiters: Vec::new(),
             });
         }
+        // `start_turn` opens the turn's stream before the process is allowed to
+        // speak, which is why `SegmentState::default()` has
+        // `awaiting_stream_start: false` — the reducer ends its first phase into
+        // a stream that is already open. This helper stands in for `start_turn`,
+        // so it has to open that stream too, under the same id
+        // `prepare_persistent_stdout_turn` will derive
+        // (`claude-msg-{turn_id}`). Without it the first `StreamEnd` has no
+        // stream to close and the emitter reports a stream-identity violation
+        // instead of the model's output.
+        inner.emit_stream_start(&format!("claude-msg-{FAKE_TURN_ID}"), None);
 
         // Startup must complete without ever waiting on the init frame.
         let ready = tokio::time::timeout(
@@ -13243,14 +13253,21 @@ for raw_line in sys.stdin:
         );
     }
 
-    /// The existing replay test pins *presence*. This pins the two properties
-    /// presence cannot distinguish: the held output is replayed **exactly
-    /// once**, and it lands **before** anything derived from the frames that
-    /// followed it. A requeue that duplicated the buffer, or that let the
-    /// confirming frame overtake it, would satisfy `contains` and fail here.
+    /// The existing replay test pins *presence*. This pins what presence cannot
+    /// distinguish: replayed frames keep the stream identity they would have
+    /// had live, they arrive exactly once, and they arrive before anything
+    /// derived from the frames that followed them.
+    ///
+    /// The fake emits two assistant messages with **explicitly distinct ids**
+    /// (`msg_fake_1`, `msg_fake_2`) before the init frame. Both are held back;
+    /// the second closes the first's phase on replay, which is the only thing
+    /// that turns buffered text into an emitted `StreamEnd`. A replay that lost
+    /// or rewrote the id would surface as a stream-identity violation rather
+    /// than as output, so asserting no such error is asserting identity
+    /// survived the round trip.
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
-    async fn replayed_output_arrives_once_and_before_what_followed_it() {
+    async fn replayed_output_keeps_its_identity_arrives_once_and_in_order() {
         let (_log, events, _state) = run_fake_with_behaviour(
             FakeInitBehaviour::AssistantBeforeInit(r#"["tyde-skills:alpha"]"#),
         )
@@ -13260,6 +13277,16 @@ for raw_line in sys.stdin:
             .iter()
             .map(|event| serde_json::to_string(event).expect("event"))
             .collect();
+
+        // Identity survived: no violation reached the user in place of output.
+        let violations: Vec<&String> = rendered
+            .iter()
+            .filter(|event| event.contains("Stream identity violation"))
+            .collect();
+        assert!(
+            violations.is_empty(),
+            "replayed frames must keep a usable stream identity: {violations:?}"
+        );
 
         let sentinel_positions: Vec<usize> = rendered
             .iter()
@@ -13273,7 +13300,7 @@ for raw_line in sys.stdin:
             "held output must be replayed exactly once, got {sentinel_positions:?} in {rendered:?}"
         );
 
-        // The init frame is the one that carries `session_id`, so the
+        // The init frame is the only one carrying `session_id`, so the
         // `SessionStarted` it produces marks where the confirming frame was
         // handled. The replayed output must precede it.
         let session_started = rendered
