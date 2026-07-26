@@ -28,7 +28,7 @@ use protocol::{
     ToolProgressUpdate, ValueProvenance,
 };
 
-use crate::agent::customization::ResolvedSkill;
+use crate::agent::customization::{ResolvedSkill, SkillSelection};
 use crate::agent_control_mcp::AGENT_CONTROL_AWAIT_MCP_SERVER_NAME;
 use crate::backend::agent_control_progress::{
     PendingToolNormalizationFailure, is_tyde_agent_control_await_tool_name,
@@ -789,21 +789,30 @@ async fn initialize_codex_rpc(rpc: &CodexRpc) -> Result<(), String> {
     .map(|_| ())
 }
 
+#[derive(Default)]
+struct CodexSkillSetup {
+    exposed_names: Vec<String>,
+    diagnostics: Vec<String>,
+}
+
 async fn configure_codex_native_skills(
     rpc: &CodexRpc,
     cwd: &str,
     projection: &CodexSkillProjection,
     selected_skills: &[ResolvedSkill],
-) -> Result<(), String> {
+    selection: SkillSelection,
+) -> Result<CodexSkillSetup, String> {
     enum ExpectedVisibility {
         Native(PathBuf),
         Projected(PathBuf),
     }
 
     let baseline = codex_list_skills(rpc, cwd).await?;
+    let mut diagnostics = codex_skill_catalog_diagnostics("baseline", &baseline.errors);
     let mut projected = 0usize;
     let mut manifests = HashMap::<PathBuf, CodexSkillTreeManifest>::new();
     let mut expected = HashMap::<String, ExpectedVisibility>::new();
+    let mut prepared = Vec::new();
 
     for (ordinal, selected) in selected_skills.iter().enumerate() {
         let same_name = baseline
@@ -812,13 +821,15 @@ async fn configure_codex_native_skills(
             .filter(|skill| skill.enabled == Some(true) && skill.name == selected.name)
             .collect::<Vec<_>>();
         let mut equivalent_visible = None;
+        let mut collision = None;
         for native in same_name {
             let Some(native_skill_md) = codex_listed_filesystem_skill_md(native)? else {
-                return Err(format!(
+                collision = Some(format!(
                     "Selected Tyde skill '{}' conflicts with enabled non-filesystem Codex skill locator {}; native invocation would be ambiguous",
                     selected.name,
                     native.locator.as_deref().unwrap_or("<opaque>")
                 ));
+                break;
             };
             let native_dir = native_skill_md.parent().ok_or_else(|| {
                 format!(
@@ -833,13 +844,25 @@ async fn configure_codex_native_skills(
             if selected_manifest == native_manifest {
                 equivalent_visible = Some(native_skill_md);
             } else {
-                return Err(format!(
+                collision = Some(format!(
                     "Selected Tyde skill '{}' at {} conflicts with a different enabled Codex skill at {}; rename or reconcile one of the complete skill trees",
                     selected.name,
                     selected.source_dir.display(),
                     native_dir.display()
                 ));
+                break;
             }
+        }
+        if let Some(collision) = collision {
+            if selection == SkillSelection::Explicit {
+                return Err(collision);
+            }
+            tracing::warn!("Default Codex skill selection degraded: {collision}");
+            diagnostics.push(format!(
+                "Default Codex session omitted Tyde skill '{}': {collision}",
+                selected.name
+            ));
+            continue;
         }
         if let Some(native_skill_md) = equivalent_visible {
             expected.insert(
@@ -854,6 +877,7 @@ async fn configure_codex_native_skills(
             );
             projected += 1;
         }
+        prepared.push(selected);
     }
 
     let extra_roots = if projected == 0 {
@@ -877,7 +901,11 @@ async fn configure_codex_native_skills(
     }
 
     let final_catalog = codex_list_skills(rpc, cwd).await?;
-    for selected in selected_skills {
+    diagnostics.extend(codex_skill_catalog_diagnostics(
+        "final",
+        &final_catalog.errors,
+    ));
+    for selected in &prepared {
         let enabled = final_catalog
             .skills
             .iter()
@@ -940,7 +968,26 @@ async fn configure_codex_native_skills(
             ));
         }
     }
-    Ok(())
+    let exposed_names = prepared
+        .into_iter()
+        .map(|skill| skill.name.clone())
+        .collect::<Vec<_>>();
+    tracing::debug!(
+        "Codex session exposed {} selected skill(s): {}",
+        exposed_names.len(),
+        exposed_names.join(", ")
+    );
+    Ok(CodexSkillSetup {
+        exposed_names,
+        diagnostics,
+    })
+}
+
+fn codex_skill_catalog_diagnostics(phase: &str, errors: &[String]) -> Vec<String> {
+    errors
+        .iter()
+        .map(|error| format!("Codex {phase} skills/list diagnostic: {error}"))
+        .collect()
 }
 
 fn codex_cached_skill_manifest(
@@ -990,14 +1037,26 @@ fn codex_selected_skills_remote_workspace_error(
     if selected_skills.is_empty() {
         return None;
     }
-    let host = match crate::remote::parse_remote_workspace_roots(workspace_roots) {
-        Ok(Some((host, _))) => host,
-        Ok(None) => return None,
-        Err(err) => format!("<invalid remote routing: {err}>"),
-    };
+    let detail = codex_ssh_workspace_detail(workspace_roots)?;
     Some(format!(
-        "Codex native selected skills are not supported for SSH host '{host}': Tyde will not send local skill paths to a remote app-server"
+        "Codex native selected skills are not supported {detail}: Tyde will not send local skill paths to a remote app-server"
     ))
+}
+
+fn codex_ssh_workspace_detail(workspace_roots: &[String]) -> Option<String> {
+    if !workspace_roots
+        .iter()
+        .any(|root| root.trim_start().starts_with("ssh://"))
+    {
+        return None;
+    }
+    Some(
+        match crate::remote::parse_remote_workspace_roots(workspace_roots) {
+            Ok(Some((host, _))) => format!("for SSH host '{host}'"),
+            Ok(None) => "for malformed SSH workspace roots".to_owned(),
+            Err(err) => format!("for SSH workspace roots ({err})"),
+        },
+    )
 }
 
 pub struct CodexSession {
@@ -1020,6 +1079,7 @@ struct CodexSessionSpawnOptions<'a> {
     subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
     execution_mode: BackendExecutionMode,
     selected_skills: &'a [ResolvedSkill],
+    skill_selection: SkillSelection,
 }
 
 impl CodexSession {
@@ -1041,6 +1101,7 @@ impl CodexSession {
                 subagent_emitter: None,
                 execution_mode: BackendExecutionMode::Agent,
                 selected_skills: &[],
+                skill_selection: SkillSelection::Explicit,
             },
         )
         .await
@@ -1064,6 +1125,7 @@ impl CodexSession {
                 subagent_emitter: None,
                 execution_mode: BackendExecutionMode::Agent,
                 selected_skills: &[],
+                skill_selection: SkillSelection::Explicit,
             },
         )
         .await
@@ -1087,6 +1149,7 @@ impl CodexSession {
                 subagent_emitter: None,
                 execution_mode: BackendExecutionMode::Agent,
                 selected_skills: &[],
+                skill_selection: SkillSelection::Explicit,
             },
         )
         .await
@@ -1105,6 +1168,7 @@ impl CodexSession {
             subagent_emitter,
             execution_mode,
             selected_skills,
+            skill_selection,
         } = options;
         if let Some(err) = codex_selected_skills_ssh_error(ssh_host.as_deref(), selected_skills) {
             return Err(err);
@@ -1179,13 +1243,26 @@ impl CodexSession {
                 }
             }
         };
-        if let Some(projection) = skill_projection.as_ref()
-            && let Err(err) =
-                configure_codex_native_skills(&rpc, &cwd, projection, selected_skills).await
-        {
-            cleanup_codex_startup_failure(rpc, &mut skill_projection, &steering_tempfile).await;
-            return Err(err);
-        }
+        let skill_setup = if let Some(projection) = skill_projection.as_ref() {
+            match configure_codex_native_skills(
+                &rpc,
+                &cwd,
+                projection,
+                selected_skills,
+                skill_selection,
+            )
+            .await
+            {
+                Ok(setup) => setup,
+                Err(err) => {
+                    cleanup_codex_startup_failure(rpc, &mut skill_projection, &steering_tempfile)
+                        .await;
+                    return Err(err);
+                }
+            }
+        } else {
+            CodexSkillSetup::default()
+        };
 
         let mut thread_start_params = json!({
             "cwd": cwd,
@@ -1227,6 +1304,7 @@ impl CodexSession {
             inbound_rx,
             steering_tempfile,
             skill_projection,
+            skill_setup,
             CodexThreadResponseConfig {
                 startup_mcp_servers,
                 access_mode,
@@ -1255,6 +1333,7 @@ impl CodexSession {
             access_mode,
             from_thread_id,
             &[],
+            SkillSelection::Explicit,
         )
         .await
     }
@@ -1267,6 +1346,7 @@ impl CodexSession {
         access_mode: BackendAccessMode,
         from_thread_id: &str,
         selected_skills: &[ResolvedSkill],
+        skill_selection: SkillSelection,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         if let Some(err) = codex_selected_skills_ssh_error(ssh_host.as_deref(), selected_skills) {
             return Err(err);
@@ -1333,13 +1413,26 @@ impl CodexSession {
                 }
             }
         };
-        if let Some(projection) = skill_projection.as_ref()
-            && let Err(err) =
-                configure_codex_native_skills(&rpc, &cwd, projection, selected_skills).await
-        {
-            cleanup_codex_startup_failure(rpc, &mut skill_projection, &steering_tempfile).await;
-            return Err(err);
-        }
+        let skill_setup = if let Some(projection) = skill_projection.as_ref() {
+            match configure_codex_native_skills(
+                &rpc,
+                &cwd,
+                projection,
+                selected_skills,
+                skill_selection,
+            )
+            .await
+            {
+                Ok(setup) => setup,
+                Err(err) => {
+                    cleanup_codex_startup_failure(rpc, &mut skill_projection, &steering_tempfile)
+                        .await;
+                    return Err(err);
+                }
+            }
+        } else {
+            CodexSkillSetup::default()
+        };
 
         let mut fork_params = json!({
             "threadId": from_thread_id,
@@ -1375,6 +1468,7 @@ impl CodexSession {
             inbound_rx,
             steering_tempfile,
             skill_projection,
+            skill_setup,
             CodexThreadResponseConfig {
                 startup_mcp_servers,
                 access_mode,
@@ -1392,6 +1486,7 @@ impl CodexSession {
         inbound_rx: mpsc::UnboundedReceiver<CodexInbound>,
         steering_tempfile: Option<std::path::PathBuf>,
         skill_projection: Option<CodexSkillProjection>,
+        skill_setup: CodexSkillSetup,
         config: CodexThreadResponseConfig<'_>,
         thread_response: Value,
         method: &str,
@@ -1469,6 +1564,18 @@ impl CodexSession {
             steering_tempfile,
             skill_projection: std::sync::Mutex::new(skill_projection),
         });
+
+        if !skill_setup.exposed_names.is_empty() {
+            tracing::debug!(
+                "Codex session retained exposed skills: {}",
+                skill_setup.exposed_names.join(", ")
+            );
+        }
+        for diagnostic in skill_setup.diagnostics {
+            inner
+                .emitter
+                .subprocess_stderr(&format!("Codex warning: {diagnostic}"));
+        }
 
         let forward_inner = Arc::clone(&inner);
         tokio::spawn(async move {
@@ -12099,6 +12206,11 @@ impl CodexBackend {
                     subagent_emitter: initial_emitter,
                     execution_mode: config.execution_mode,
                     selected_skills,
+                    skill_selection: if inference_only {
+                        SkillSelection::Explicit
+                    } else {
+                        config.resolved_spawn_config.skill_selection
+                    },
                 },
             )
             .await;
@@ -12553,20 +12665,9 @@ fn codex_thread_fork_unsupported_message() -> String {
 }
 
 fn codex_ssh_fork_unsupported_error(workspace_roots: &[String]) -> Option<BackendStartupError> {
-    if !workspace_roots
-        .iter()
-        .any(|root| root.trim_start().starts_with("ssh://"))
-    {
-        return None;
-    }
-
-    let detail = match crate::remote::parse_remote_workspace_roots(workspace_roots) {
-        Ok(Some((host, _))) => format!(" for SSH host '{host}'"),
-        Ok(None) => " for SSH workspace roots".to_string(),
-        Err(err) => format!(" for SSH workspace roots ({err})"),
-    };
+    let detail = codex_ssh_workspace_detail(workspace_roots)?;
     Some(BackendStartupError::unsupported(format!(
-        "Codex backend does not support session fork{detail} yet"
+        "Codex backend does not support session fork {detail} yet"
     )))
 }
 
@@ -13049,6 +13150,7 @@ impl Backend for CodexBackend {
                     subagent_emitter: None,
                     execution_mode: BackendExecutionMode::Agent,
                     selected_skills: &config.resolved_spawn_config.skills,
+                    skill_selection: config.resolved_spawn_config.skill_selection,
                 },
             )
             .await
@@ -13264,6 +13366,7 @@ impl Backend for CodexBackend {
                 config.resolved_spawn_config.access_mode,
                 &from_session_id.0,
                 &config.resolved_spawn_config.skills,
+                config.resolved_spawn_config.skill_selection,
             )
             .await
             {
@@ -13587,8 +13690,8 @@ mod tests {
                 .replace(binary);
             let previous_native_home = std::mem::replace(
                 &mut *codex_test_native_home_override()
-                .lock()
-                .expect("codex test native home mutex poisoned"),
+                    .lock()
+                    .expect("codex test native home mutex poisoned"),
                 native_home,
             );
             let previous_skill_temp_parent = std::mem::replace(
@@ -13821,6 +13924,12 @@ for line in sys.stdin:
                 "scope": "user",
                 "enabled": True
             })
+        catalog_errors = []
+        if MODE == "skills_catalog_errors":
+            catalog_errors.append({
+                "path": "/catalog/" + ("baseline" if skills_list_count == 1 else "final"),
+                "message": ("baseline" if skills_list_count == 1 else "final") + " catalog fixture"
+            })
         send({
             "jsonrpc": "2.0",
             "id": request_id,
@@ -13828,7 +13937,7 @@ for line in sys.stdin:
                 "data": [{
                     "cwd": (params.get("cwds") or [""])[0],
                     "skills": skills,
-                    "errors": []
+                    "errors": catalog_errors
                 }]
             }
         })
@@ -14447,12 +14556,20 @@ for line in sys.stdin:
     fn codex_native_skill_spawn_options<'a>(
         selected_skills: &'a [ResolvedSkill],
     ) -> CodexSessionSpawnOptions<'a> {
+        codex_native_skill_spawn_options_with_selection(selected_skills, SkillSelection::Explicit)
+    }
+
+    fn codex_native_skill_spawn_options_with_selection<'a>(
+        selected_skills: &'a [ResolvedSkill],
+        skill_selection: SkillSelection,
+    ) -> CodexSessionSpawnOptions<'a> {
         CodexSessionSpawnOptions {
             ephemeral: false,
             access_mode: BackendAccessMode::Unrestricted,
             subagent_emitter: None,
             execution_mode: BackendExecutionMode::Agent,
             selected_skills,
+            skill_selection,
         }
     }
 
@@ -14699,6 +14816,62 @@ for line in sys.stdin:
         session.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn codex_catalog_errors_are_forwarded_as_visible_diagnostics() {
+        let fake = CodexFakeAppServer::new("skills_catalog_errors", "unused");
+        let native_home = tempfile::tempdir().expect("native Codex home");
+        let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
+            fake.binary.clone(),
+            Some(native_home.path().to_path_buf()),
+        );
+        let workspace = tempfile::tempdir().expect("workspace");
+        let store = tempfile::tempdir().expect("Tyde skill store");
+        let selected = vec![write_codex_skill(store.path(), "selected", "body")];
+
+        let (session, mut raw_events) = CodexSession::spawn_with_mode(
+            &[workspace.path().to_string_lossy().to_string()],
+            None,
+            &[],
+            None,
+            codex_native_skill_spawn_options(&selected),
+        )
+        .await
+        .expect("catalog diagnostics must not block a valid selection");
+
+        let diagnostics = [raw_events.try_recv(), raw_events.try_recv()]
+            .into_iter()
+            .map(|event| event.expect("queued catalog diagnostic"))
+            .collect::<Vec<_>>();
+        assert!(diagnostics.iter().any(|event| {
+            event
+                .get("data")
+                .and_then(Value::as_str)
+                .is_some_and(|text| {
+                    text.contains("baseline skills/list diagnostic")
+                        && text.contains("baseline catalog fixture")
+                })
+        }));
+        assert!(diagnostics.iter().any(|event| {
+            event
+                .get("data")
+                .and_then(Value::as_str)
+                .is_some_and(|text| {
+                    text.contains("final skills/list diagnostic")
+                        && text.contains("final catalog fixture")
+                })
+        }));
+        for diagnostic in diagnostics {
+            let mut normalization_failures = HashMap::new();
+            let forwarded = codex_backend_event_from_raw(&diagnostic, &mut normalization_failures)
+                .expect("diagnostic must be user-visible");
+            let ChatEvent::MessageAdded(message) = forwarded.chat_event else {
+                panic!("catalog diagnostic must become a visible message");
+            };
+            assert!(matches!(message.sender, MessageSender::Warning));
+        }
+        session.shutdown().await;
+    }
+
     #[test]
     fn codex_skill_manifest_is_complete_and_bounded() {
         let left = tempfile::tempdir().expect("left tree");
@@ -14785,7 +14958,7 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn codex_native_skills_reject_divergent_same_name_before_setting_roots() {
+    async fn codex_explicit_skills_reject_divergent_same_name_before_setting_roots() {
         let fake = CodexFakeAppServer::new("ok", "unused");
         let native_home = tempfile::tempdir().expect("native Codex home");
         let native_root = native_home.path().join("skills");
@@ -14832,6 +15005,67 @@ for line in sys.stdin:
         assert_eq!(fake.skill_projection_dirs(), before);
         assert!(native.skill_md_path.exists());
         assert!(selected[0].skill_md_path.exists());
+    }
+
+    #[tokio::test]
+    async fn codex_default_skills_omit_divergent_collision_and_keep_remaining_selection() {
+        let fake = CodexFakeAppServer::new("ok", "unused");
+        let native_home = tempfile::tempdir().expect("native Codex home");
+        let native_root = native_home.path().join("skills");
+        std::fs::create_dir_all(&native_root).expect("native skill root");
+        let native = write_codex_skill(&native_root, "collision", "native body");
+        let store = tempfile::tempdir().expect("Tyde skill store");
+        let selected = vec![
+            write_codex_skill(store.path(), "collision", "selected body"),
+            write_codex_skill(store.path(), "available", "available body"),
+        ];
+        let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
+            fake.binary.clone(),
+            Some(native_home.path().to_path_buf()),
+        );
+        let workspace = tempfile::tempdir().expect("workspace");
+
+        let (session, mut raw_events) = CodexSession::spawn_with_mode(
+            &[workspace.path().to_string_lossy().to_string()],
+            None,
+            &[],
+            None,
+            codex_native_skill_spawn_options_with_selection(
+                &selected,
+                SkillSelection::AllInstalled,
+            ),
+        )
+        .await
+        .expect("Default must omit one collision without blocking the session");
+
+        let diagnostic = raw_events
+            .try_recv()
+            .expect("Default collision degradation diagnostic");
+        let diagnostic = diagnostic
+            .get("data")
+            .and_then(Value::as_str)
+            .expect("diagnostic text");
+        assert!(diagnostic.contains("Default Codex session omitted Tyde skill 'collision'"));
+        assert!(diagnostic.contains(&native.source_dir.display().to_string()));
+        assert!(!diagnostic.contains("omitted Tyde skill 'available'"));
+
+        let projection = codex_extra_root(&fake.requests()).expect("remaining projection root");
+        let wrappers = std::fs::read_dir(&projection)
+            .expect("read remaining wrappers")
+            .map(|entry| entry.expect("remaining wrapper").path())
+            .collect::<Vec<_>>();
+        assert_eq!(wrappers.len(), 1);
+        let wrapper = std::fs::read_to_string(wrappers[0].join("SKILL.md"))
+            .expect("remaining wrapper SKILL.md");
+        assert!(wrapper.contains("name: \"available\""));
+        assert!(!wrapper.contains("name: \"collision\""));
+        assert!(fake.requests().iter().any(|request| {
+            request.get("method").and_then(Value::as_str) == Some("thread/start")
+        }));
+
+        session.shutdown().await;
+        assert!(!projection.exists());
+        assert!(selected.iter().all(|skill| skill.skill_md_path.exists()));
     }
 
     #[tokio::test]
@@ -15241,6 +15475,7 @@ for line in sys.stdin:
             BackendAccessMode::Unrestricted,
             "parent-thread",
             &selected,
+            SkillSelection::Explicit,
         )
         .await
         .expect("fork with selected skills");
@@ -15305,6 +15540,25 @@ for line in sys.stdin:
         assert!(err.contains("example.com"));
         assert!(err.contains("will not send local skill paths"));
         assert!(codex_selected_skills_ssh_error(None, &selected).is_none());
+    }
+
+    #[test]
+    fn codex_selected_skill_and_fork_gates_share_malformed_ssh_detection() {
+        let store = tempfile::tempdir().expect("Tyde skill store");
+        let selected = vec![write_codex_skill(store.path(), "selected", "body")];
+        let malformed = ["ssh://missing-remote-path".to_owned()];
+
+        let selected_error = codex_selected_skills_remote_workspace_error(&malformed, &selected)
+            .expect("selected skills must reject malformed SSH roots");
+        let fork_error = codex_ssh_fork_unsupported_error(&malformed)
+            .expect("fork must reject the same malformed SSH roots");
+
+        assert!(selected_error.contains("malformed SSH workspace roots"));
+        assert!(fork_error.message.contains("malformed SSH workspace roots"));
+        assert!(
+            codex_selected_skills_remote_workspace_error(&malformed, &[]).is_none(),
+            "no-skill SSH behavior remains unchanged"
+        );
     }
 
     #[tokio::test]
