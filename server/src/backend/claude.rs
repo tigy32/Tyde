@@ -11935,17 +11935,19 @@ mod tests {
         std::fs::create_dir_all(&source_dir).expect("create skill dir");
         let skill_md_path = source_dir.join("SKILL.md");
         std::fs::write(&skill_md_path, body).expect("write SKILL.md");
-        ResolvedSkill {
-            id: protocol::SkillId(name.to_string()),
-            name: name.to_string(),
-            title: None,
-            description: Some(format!("{name} summary")),
+        // `path_only` is the only public constructor: a natively discovered
+        // skill carries locations, never text. The fixture used to pass an
+        // empty body, which said the same thing less precisely.
+        ResolvedSkill::path_only(
+            protocol::Skill {
+                id: protocol::SkillId(name.to_string()),
+                name: name.to_string(),
+                title: None,
+                description: Some(format!("{name} summary")),
+            },
             source_dir,
             skill_md_path,
-            // Native delivery never populates this; the tests below prove the
-            // adapter does not depend on it either.
-            body: String::new(),
-        }
+        )
     }
 
     fn spawn_config_with_skills(
@@ -12785,6 +12787,11 @@ sys.exit(1)
         behaviour: FakeInitBehaviour,
     ) -> (String, Vec<Value>, ClaudeSkillReadiness) {
         let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
+        // Serialized rather than interpolated raw: a JSON string literal is also
+        // a valid Python literal, so the tag cannot terminate the string or
+        // inject anything into the generated script.
+        let quoted_behaviour =
+            serde_json::to_string(behaviour.tag()).expect("quote behaviour tag");
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let claude_home = tempfile::tempdir().expect("claude home tempdir");
         let fake = workspace.path().join("fake-claude-init-after-prompt.py");
@@ -12821,7 +12828,7 @@ for raw_line in sys.stdin:
         continue
     if value.get("type") == "user":
         note("PROMPT")
-        behaviour = {behaviour!r}
+        behaviour = {quoted_behaviour}
         init_frame = json.dumps({{
             "type": "system",
             "subtype": "init",
@@ -12865,7 +12872,7 @@ for raw_line in sys.stdin:
             note("FLOOD_DONE")
         # "says_nothing" falls through: no frames at all.
 "#,
-                behaviour = behaviour.tag(),
+                quoted_behaviour = quoted_behaviour,
                 reported_skills = behaviour.reported_skills(),
             ),
         )
@@ -13164,9 +13171,13 @@ for raw_line in sys.stdin:
             ClaudeSkillReadiness::Pending,
             "the replacement process must still be waiting on its own init frame"
         );
-        let kinds: Vec<Option<&str>> = std::iter::from_fn(|| rx.try_recv().ok())
+        // Bind the owner before borrowing from it: the intermediate
+        // `Vec<Option<String>>` used to be a temporary, dropped at the end of
+        // the statement while `kinds` still referenced it.
+        let owned_kinds: Vec<Option<String>> = std::iter::from_fn(|| rx.try_recv().ok())
             .map(|event| event_kind(&event).map(str::to_string))
-            .collect::<Vec<_>>()
+            .collect();
+        let kinds: Vec<Option<&str>> = owned_kinds
             .iter()
             .map(|kind| kind.as_deref())
             .collect();
