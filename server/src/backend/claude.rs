@@ -25,14 +25,14 @@ use protocol::{
     WorkflowRunStatus,
 };
 
-use crate::backend::turn_emitter::{
-    AgentName, AssistantMessagePayload, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
-};
 use crate::agent::customization::{ResolvedSkill, SkillSelection};
 use crate::backend::claude_skills::{
     CLAUDE_PLUGIN_DIR_FLAG, ClaudeSkillPlugin, InitFrameVerdict, PreparedSkill,
     degraded_default_notice, help_text_supports_plugin_dir, native_skill_overlay,
     unsupported_plugin_dir_error, verify_init_frame, verify_plugin_inventory,
+};
+use crate::backend::turn_emitter::{
+    AgentName, AssistantMessagePayload, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
 };
 use crate::backend::{
     AgentIdentity, READ_ONLY_ACCESS_MODE_INSTRUCTIONS, SessionCommand, StartupMcpServer,
@@ -309,8 +309,8 @@ async fn claude_prepare_skills(
         ));
     }
 
-    let degraded_notice = (!outcome.refusals.is_empty())
-        .then(|| degraded_default_notice(&outcome.refusals));
+    let degraded_notice =
+        (!outcome.refusals.is_empty()).then(|| degraded_default_notice(&outcome.refusals));
 
     let Some(plugin) = outcome.plugin else {
         // Every installed skill was refused. A Default session still starts, but
@@ -10112,14 +10112,15 @@ impl ClaudeBackend {
             // that silently has no skills.
             // `ClaudeBackend` spawns the CLI locally; the low-level session is
             // the only layer that takes an ssh host, and it is given none here.
-            let (skills, skill_steering) = match claude_prepare_skills(&config, None, &probe_workspace_root).await {
-                Ok(prepared) => prepared,
-                Err(err) => {
-                    tracing::error!("Failed to prepare Claude skills: {err}");
-                    let _ = ready_tx.send(Err(err));
-                    return;
-                }
-            };
+            let (skills, skill_steering) =
+                match claude_prepare_skills(&config, None, &probe_workspace_root).await {
+                    Ok(prepared) => prepared,
+                    Err(err) => {
+                        tracing::error!("Failed to prepare Claude skills: {err}");
+                        let _ = ready_tx.send(Err(err));
+                        return;
+                    }
+                };
             let steering = match claude_steering_content(&config, skill_steering) {
                 Ok(steering) => steering,
                 Err(err) => {
@@ -11079,7 +11080,8 @@ impl Backend for ClaudeBackend {
         // A resumed session gets its own plugin root: the previous session's
         // was unlinked when it shut down.
         let probe_workspace_root = pick_workspace_root(&workspace_roots)?;
-        let (skills, skill_steering) = claude_prepare_skills(&config, None, &probe_workspace_root).await?;
+        let (skills, skill_steering) =
+            claude_prepare_skills(&config, None, &probe_workspace_root).await?;
         let steering = claude_steering_content(&config, skill_steering)?;
         let steering_content = steering;
         let agent_identity = claude_agent_identity(&config);
@@ -12008,8 +12010,16 @@ mod tests {
     fn default_sessions_get_guidance_without_bodies_or_enumeration() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let skills = vec![
-            skill_fixture(tmp.path(), "alpha", "---\nname: alpha\n---\nBODYMARK-11aa22\n"),
-            skill_fixture(tmp.path(), "beta", "---\nname: beta\n---\nBODYMARK-33bb44\n"),
+            skill_fixture(
+                tmp.path(),
+                "alpha",
+                "---\nname: alpha\n---\nBODYMARK-11aa22\n",
+            ),
+            skill_fixture(
+                tmp.path(),
+                "beta",
+                "---\nname: beta\n---\nBODYMARK-33bb44\n",
+            ),
         ];
         let config = spawn_config_with_skills(skills, SkillSelection::AllInstalled);
 
@@ -12240,8 +12250,11 @@ sys.exit(1)
         let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
         let cli = FakeClaudeCli::install(true, None);
         let tmp = tempfile::tempdir().expect("tempdir");
-        let broken =
-            skill_fixture(tmp.path(), "broken", "---\nname: b\nmcpServers:\n  x: {}\n---\nb\n");
+        let broken = skill_fixture(
+            tmp.path(),
+            "broken",
+            "---\nname: b\nmcpServers:\n  x: {}\n---\nb\n",
+        );
         let config = spawn_config_with_skills(vec![broken], SkillSelection::Explicit);
 
         let err = claude_prepare_skills(&config, None, cli.workspace())
@@ -12296,7 +12309,11 @@ sys.exit(1)
         let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
         let cli = FakeClaudeCli::install(true, None);
         let tmp = tempfile::tempdir().expect("tempdir");
-        let broken = skill_fixture(tmp.path(), "broken", "---\nname: b\nhooks:\n  - x\n---\nb\n");
+        let broken = skill_fixture(
+            tmp.path(),
+            "broken",
+            "---\nname: b\nhooks:\n  - x\n---\nb\n",
+        );
         let config = spawn_config_with_skills(vec![broken], SkillSelection::AllInstalled);
 
         let (exposure, steering) = claude_prepare_skills(&config, None, cli.workspace())
@@ -12355,7 +12372,10 @@ sys.exit(1)
             .await
             .expect_err("a plugin loaded from elsewhere is not this session's");
 
-        assert!(err.contains("could not resolve") || err.contains("not from this session's root"), "{err}");
+        assert!(
+            err.contains("could not resolve") || err.contains("not from this session's root"),
+            "{err}"
+        );
     }
 
     #[cfg(unix)]
@@ -12364,7 +12384,9 @@ sys.exit(1)
         let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
         let cli = FakeClaudeCli::install(
             true,
-            Some(r#"[{"id": "tyde-skills@inline", "enabled": true, "errors": ["skill alpha is invalid"]}]"#),
+            Some(
+                r#"[{"id": "tyde-skills@inline", "enabled": true, "errors": ["skill alpha is invalid"]}]"#,
+            ),
         );
         let tmp = tempfile::tempdir().expect("tempdir");
         let skill = skill_fixture(tmp.path(), "alpha", "---\nname: alpha\n---\nbody\n");
@@ -12411,7 +12433,11 @@ sys.exit(1)
     #[tokio::test]
     async fn a_remote_skill_bearing_session_fails_visibly() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let skills = vec![skill_fixture(tmp.path(), "alpha", "---\nname: alpha\n---\nb\n")];
+        let skills = vec![skill_fixture(
+            tmp.path(),
+            "alpha",
+            "---\nname: alpha\n---\nb\n",
+        )];
         let config = spawn_config_with_skills(skills, SkillSelection::AllInstalled);
 
         // No fake CLI needed: this fails before any local command runs.
@@ -12542,8 +12568,10 @@ sys.exit(1)
             ),
             (
                 "a malformed skills field",
-                Err("Claude's init frame reported a 'skills' field that is not an array"
-                    .to_string()),
+                Err(
+                    "Claude's init frame reported a 'skills' field that is not an array"
+                        .to_string(),
+                ),
                 "not an array",
             ),
         ] {
@@ -12568,7 +12596,10 @@ sys.exit(1)
                     saw_error = true;
                 }
             }
-            assert!(saw_error, "{label}: the user must be told, not just the log");
+            assert!(
+                saw_error,
+                "{label}: the user must be told, not just the log"
+            );
         }
     }
 
@@ -12617,7 +12648,11 @@ sys.exit(1)
     #[tokio::test]
     async fn a_respawn_re_arms_verification_and_reuses_the_same_root() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let skills = vec![skill_fixture(tmp.path(), "alpha", "---\nname: alpha\n---\nb\n")];
+        let skills = vec![skill_fixture(
+            tmp.path(),
+            "alpha",
+            "---\nname: alpha\n---\nb\n",
+        )];
         let outcome = ClaudeSkillPlugin::prepare(Some(tmp.path()), &skills).expect("prepare");
         let plugin = Arc::new(outcome.plugin.expect("a plugin"));
         let root = plugin.root().to_path_buf();
@@ -12675,7 +12710,8 @@ sys.exit(1)
         let err = verify_plugin_inventory(&disabled, &root).expect_err("disabled plugin");
         assert!(err.contains("disabled"), "{err}");
 
-        let elsewhere = r#"[{"id":"tyde-skills@inline","enabled":true,"installPath":"/somewhere/else"}]"#;
+        let elsewhere =
+            r#"[{"id":"tyde-skills@inline","enabled":true,"installPath":"/somewhere/else"}]"#;
         let err = verify_plugin_inventory(elsewhere, &root).expect_err("another root");
         assert!(err.contains("not from this session's root"), "{err}");
 
@@ -12790,8 +12826,7 @@ sys.exit(1)
         // Serialized rather than interpolated raw: a JSON string literal is also
         // a valid Python literal, so the tag cannot terminate the string or
         // inject anything into the generated script.
-        let quoted_behaviour =
-            serde_json::to_string(behaviour.tag()).expect("quote behaviour tag");
+        let quoted_behaviour = serde_json::to_string(behaviour.tag()).expect("quote behaviour tag");
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let claude_home = tempfile::tempdir().expect("claude home tempdir");
         let fake = workspace.path().join("fake-claude-init-after-prompt.py");
@@ -12918,7 +12953,10 @@ for raw_line in sys.stdin:
         if let Some(marker) = behaviour.final_marker() {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while std::time::Instant::now() < deadline {
-                if std::fs::read_to_string(&log).unwrap_or_default().contains(marker) {
+                if std::fs::read_to_string(&log)
+                    .unwrap_or_default()
+                    .contains(marker)
+                {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -12980,11 +13018,10 @@ for raw_line in sys.stdin:
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn output_emitted_before_the_init_frame_is_held_back_and_then_replayed() {
-        let (log, events, _state) =
-            run_fake_with_behaviour(FakeInitBehaviour::AssistantBeforeInit(
-                r#"["tyde-skills:alpha"]"#,
-            ))
-            .await;
+        let (log, events, _state) = run_fake_with_behaviour(
+            FakeInitBehaviour::AssistantBeforeInit(r#"["tyde-skills:alpha"]"#),
+        )
+        .await;
 
         // The CLI spoke before it reported, which is the case the hold-back
         // buffer exists for.
@@ -13012,14 +13049,20 @@ for raw_line in sys.stdin:
         let (log, events, _state) =
             run_fake_with_behaviour(FakeInitBehaviour::AssistantBeforeInit(r#"["other"]"#)).await;
 
-        assert!(log.contains("MODEL_OUTPUT") && log.contains("INIT_FRAME"), "{log:?}");
+        assert!(
+            log.contains("MODEL_OUTPUT") && log.contains("INIT_FRAME"),
+            "{log:?}"
+        );
         let rendered = serde_json::to_string(&events).expect("events");
         assert!(
             !rendered.contains("MODEL-OUTPUT-SENTINEL"),
             "output held back before a mismatch must be discarded: {rendered}"
         );
         let kinds: Vec<Option<&str>> = events.iter().map(event_kind).collect();
-        assert!(kinds.contains(&Some("Error")), "the user must be told: {kinds:?}");
+        assert!(
+            kinds.contains(&Some("Error")),
+            "the user must be told: {kinds:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -13041,7 +13084,8 @@ for raw_line in sys.stdin:
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn a_turn_that_ends_without_an_init_frame_fails_the_session() {
-        let (log, events, _state) = run_fake_with_behaviour(FakeInitBehaviour::ResultBeforeInit).await;
+        let (log, events, _state) =
+            run_fake_with_behaviour(FakeInitBehaviour::ResultBeforeInit).await;
 
         assert!(log.contains("RESULT"), "{log:?}");
         assert!(!log.contains("INIT_FRAME"), "{log:?}");
@@ -13177,10 +13221,7 @@ for raw_line in sys.stdin:
         let owned_kinds: Vec<Option<String>> = std::iter::from_fn(|| rx.try_recv().ok())
             .map(|event| event_kind(&event).map(str::to_string))
             .collect();
-        let kinds: Vec<Option<&str>> = owned_kinds
-            .iter()
-            .map(|kind| kind.as_deref())
-            .collect();
+        let kinds: Vec<Option<&str>> = owned_kinds.iter().map(|kind| kind.as_deref()).collect();
         assert!(
             !kinds.contains(&Some("Error")),
             "a stale watchdog must not report anything: {kinds:?}"
@@ -13248,7 +13289,11 @@ for raw_line in sys.stdin:
     #[tokio::test]
     async fn shutdown_unlinks_the_plugin_root_but_not_its_targets() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let skills = vec![skill_fixture(tmp.path(), "alpha", "---\nname: alpha\n---\nb\n")];
+        let skills = vec![skill_fixture(
+            tmp.path(),
+            "alpha",
+            "---\nname: alpha\n---\nb\n",
+        )];
         std::fs::write(skills[0].source_dir.join("art.md"), "art").expect("resource");
         let outcome = ClaudeSkillPlugin::prepare(Some(tmp.path()), &skills).expect("prepare");
         let plugin = Arc::new(outcome.plugin.expect("a plugin"));

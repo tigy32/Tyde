@@ -318,11 +318,7 @@ fn create_private_root(parent: Option<&Path>) -> Result<tempfile::TempDir, Strin
 }
 
 /// Write one wrapper. Every failure here names a single skill.
-fn write_wrapper(
-    skills_dir: &Path,
-    entry: &InspectedSkill,
-    index: usize,
-) -> Result<(), String> {
+fn write_wrapper(skills_dir: &Path, entry: &InspectedSkill, index: usize) -> Result<(), String> {
     fail_injection_point(index)?;
     let wrapper = skills_dir.join(&entry.prepared.name);
     create_private_dir(&wrapper)?;
@@ -396,7 +392,8 @@ fn inspect_resources(skill: &ResolvedSkill) -> Result<Vec<(String, PathBuf)>, St
         .map_err(|err| format!("its directory could not be resolved: {err}"))?;
     let mut resources = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|err| format!("one of its resources could not be read: {err}"))?;
+        let entry =
+            entry.map_err(|err| format!("one of its resources could not be read: {err}"))?;
         let file_name = entry.file_name();
         let Some(as_str) = file_name.to_str() else {
             return Err("it has a resource whose name is not valid UTF-8".to_string());
@@ -415,9 +412,10 @@ fn inspect_resources(skill: &ResolvedSkill) -> Result<Vec<(String, PathBuf)>, St
         // directory is refused rather than linked. The link Tyde creates still
         // resolves at load time, so this narrows the surface without pretending
         // to be a containment proof — only copying would be that.
-        let resolved = entry.path().canonicalize().map_err(|err| {
-            format!("its resource '{as_str}' could not be resolved: {err}")
-        })?;
+        let resolved = entry
+            .path()
+            .canonicalize()
+            .map_err(|err| format!("its resource '{as_str}' could not be resolved: {err}"))?;
         if !resolved.starts_with(&canonical_source) {
             return Err(format!(
                 "its resource '{as_str}' resolves outside its own directory"
@@ -642,7 +640,11 @@ fn truncate_to_limit(value: &str, limit: usize) -> String {
         return value.to_string();
     }
     let cut = value[..limit].trim_end_matches('-').to_string();
-    if cut.is_empty() { "skill".to_string() } else { cut }
+    if cut.is_empty() {
+        "skill".to_string()
+    } else {
+        cut
+    }
 }
 
 /// Minimal manifest. `skills` is deliberately absent: declaring it shadows the
@@ -857,7 +859,10 @@ pub(crate) fn verify_init_frame(
 /// carries every name and description, and re-listing them would rebuild the
 /// duplication this work removes. `Explicit` enumerates, because a custom
 /// agent's selection is a deliberate statement of intent. Neither carries a body.
-pub(crate) fn native_skill_overlay(selection: SkillSelection, prepared: &[PreparedSkill]) -> String {
+pub(crate) fn native_skill_overlay(
+    selection: SkillSelection,
+    prepared: &[PreparedSkill],
+) -> String {
     match selection {
         SkillSelection::AllInstalled => format!(
             "Skills installed in Tyde are available through the \
@@ -1029,12 +1034,18 @@ mod tests {
             written.starts_with("---\nname: \"alpha\"\n"),
             "the snapshot's name must match the wrapper directory: {written}"
         );
-        assert!(written.contains("description: \"Original text.\""), "{written}");
+        assert!(
+            written.contains("description: \"Original text.\""),
+            "{written}"
+        );
         assert!(
             !written.contains("something-else"),
             "the snapshot's name is the wrapper name, not whatever the store claimed: {written}"
         );
-        assert!(written.contains("BODY-11aa22"), "the body is preserved: {written}");
+        assert!(
+            written.contains("BODY-11aa22"),
+            "the body is preserved: {written}"
+        );
     }
 
     #[test]
@@ -1055,8 +1066,9 @@ mod tests {
         )
         .expect("rewrite store SKILL.md");
 
-        let loaded = std::fs::read_to_string(plugin.root().join("skills").join("alpha").join("SKILL.md"))
-            .expect("read snapshot");
+        let loaded =
+            std::fs::read_to_string(plugin.root().join("skills").join("alpha").join("SKILL.md"))
+                .expect("read snapshot");
         assert!(loaded.contains("SAFE-BODY"), "{loaded}");
         assert!(
             !loaded.contains("EVIL-BODY") && !loaded.contains("hooks"),
@@ -1068,11 +1080,18 @@ mod tests {
     fn resources_are_linked_so_relative_paths_resolve() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = tmp.path().join("store");
-        let skills = vec![store_skill(&store, "guide", "---\nname: guide\n---\nsee art.md\n")];
+        let skills = vec![store_skill(
+            &store,
+            "guide",
+            "---\nname: guide\n---\nsee art.md\n",
+        )];
         std::fs::write(store.join("guide").join("art.md"), "RES-9f8e7d").expect("resource");
         std::fs::create_dir_all(store.join("guide").join("scripts")).expect("scripts dir");
-        std::fs::write(store.join("guide").join("scripts").join("run.sh"), "echo hi")
-            .expect("script");
+        std::fs::write(
+            store.join("guide").join("scripts").join("run.sh"),
+            "echo hi",
+        )
+        .expect("script");
 
         let plugin = prepare_ok(tmp.path(), &skills);
         let wrapper = plugin.root().join("skills").join("guide");
@@ -1100,9 +1119,21 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = tmp.path().join("store");
         for (name, body, expected) in [
-            ("unterminated", "---\nname: x\nbody with no close\n", "never closed"),
-            ("badyaml", "---\n\tname: [unclosed\n---\nbody\n", "not valid YAML"),
-            ("scalar", "---\njust a string\n---\nbody\n", "not a YAML mapping"),
+            (
+                "unterminated",
+                "---\nname: x\nbody with no close\n",
+                "never closed",
+            ),
+            (
+                "badyaml",
+                "---\n\tname: [unclosed\n---\nbody\n",
+                "not valid YAML",
+            ),
+            (
+                "scalar",
+                "---\njust a string\n---\nbody\n",
+                "not a YAML mapping",
+            ),
         ] {
             let skills = vec![store_skill(&store, name, body)];
             let outcome = ClaudeSkillPlugin::prepare(Some(tmp.path()), &skills).expect("prepare");
@@ -1121,9 +1152,21 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = tmp.path().join("store");
         let skills = vec![
-            store_skill(&store, "inert", "---\nname: inert\ndescription: d\n---\nbody\n"),
-            store_skill(&store, "hooky", "---\nname: hooky\nHooks:\n  - x\n---\nbody\n"),
-            store_skill(&store, "serverish", "---\nname: s\nmcpServers:\n  x: {}\n---\nbody\n"),
+            store_skill(
+                &store,
+                "inert",
+                "---\nname: inert\ndescription: d\n---\nbody\n",
+            ),
+            store_skill(
+                &store,
+                "hooky",
+                "---\nname: hooky\nHooks:\n  - x\n---\nbody\n",
+            ),
+            store_skill(
+                &store,
+                "serverish",
+                "---\nname: s\nmcpServers:\n  x: {}\n---\nbody\n",
+            ),
         ];
 
         let outcome = ClaudeSkillPlugin::prepare(Some(tmp.path()), &skills).expect("prepare");
@@ -1131,9 +1174,17 @@ mod tests {
         let plugin = outcome.plugin.expect("the inert skill materializes");
         assert_eq!(plugin.exposed(), ["tyde-skills:inert"]);
         assert_eq!(outcome.refusals.len(), 2, "{:?}", outcome.refusals);
-        assert!(outcome.refusals.iter().any(|r| r.name == "hooky" && r.reason.contains("Hooks")));
         assert!(
-            outcome.refusals.iter().any(|r| r.name == "serverish" && r.reason.contains("mcpServers"))
+            outcome
+                .refusals
+                .iter()
+                .any(|r| r.name == "hooky" && r.reason.contains("Hooks"))
+        );
+        assert!(
+            outcome
+                .refusals
+                .iter()
+                .any(|r| r.name == "serverish" && r.reason.contains("mcpServers"))
         );
         assert!(!plugin.root().join("skills").join("hooky").exists());
     }
@@ -1150,7 +1201,10 @@ mod tests {
             std::fs::read_to_string(plugin.root().join("skills").join("bare").join("SKILL.md"))
                 .expect("snapshot");
         assert!(written.starts_with("---\nname: \"bare\"\n"), "{written}");
-        assert!(written.contains("description: \"bare description\""), "{written}");
+        assert!(
+            written.contains("description: \"bare description\""),
+            "{written}"
+        );
         assert!(written.contains("Just instructions."), "{written}");
     }
 
@@ -1181,7 +1235,11 @@ mod tests {
         assert_eq!(plugin.exposed(), ["tyde-skills:ok"]);
         assert_eq!(outcome.refusals.len(), 1, "{:?}", outcome.refusals);
         assert_eq!(outcome.refusals[0].name, "sneaky");
-        assert!(outcome.refusals[0].reason.contains(".mcp.json"), "{:?}", outcome.refusals[0]);
+        assert!(
+            outcome.refusals[0].reason.contains(".mcp.json"),
+            "{:?}",
+            outcome.refusals[0]
+        );
     }
 
     #[test]
@@ -1191,16 +1249,25 @@ mod tests {
         let outside = tmp.path().join("outside");
         std::fs::create_dir_all(&outside).expect("outside dir");
         std::fs::write(outside.join("secret.txt"), "secret").expect("secret");
-        let skills = vec![store_skill(&store, "escaper", "---\nname: escaper\n---\nbody\n")];
-        symlink_path(&outside.join("secret.txt"), &store.join("escaper").join("leak.txt"))
-            .expect("escaping resource");
+        let skills = vec![store_skill(
+            &store,
+            "escaper",
+            "---\nname: escaper\n---\nbody\n",
+        )];
+        symlink_path(
+            &outside.join("secret.txt"),
+            &store.join("escaper").join("leak.txt"),
+        )
+        .expect("escaping resource");
 
         let outcome = ClaudeSkillPlugin::prepare(Some(tmp.path()), &skills).expect("prepare");
 
         assert!(outcome.plugin.is_none());
         assert_eq!(outcome.refusals.len(), 1, "{:?}", outcome.refusals);
         assert!(
-            outcome.refusals[0].reason.contains("outside its own directory"),
+            outcome.refusals[0]
+                .reason
+                .contains("outside its own directory"),
             "{:?}",
             outcome.refusals[0]
         );
@@ -1209,14 +1276,29 @@ mod tests {
     #[test]
     fn unsafe_source_names_are_synthesized_not_refused() {
         let mut claimed = BTreeSet::new();
-        assert_eq!(synthesize_exposed_name("build-games", &mut claimed), "build-games");
-        assert_eq!(synthesize_exposed_name("build:games", &mut claimed), "build-games-2");
+        assert_eq!(
+            synthesize_exposed_name("build-games", &mut claimed),
+            "build-games"
+        );
+        assert_eq!(
+            synthesize_exposed_name("build:games", &mut claimed),
+            "build-games-2"
+        );
         assert_eq!(synthesize_exposed_name(".hidden", &mut claimed), "hidden");
-        assert_eq!(synthesize_exposed_name("nested/skill", &mut claimed), "nested-skill");
+        assert_eq!(
+            synthesize_exposed_name("nested/skill", &mut claimed),
+            "nested-skill"
+        );
         assert_eq!(synthesize_exposed_name("..", &mut claimed), "skill");
         assert_eq!(synthesize_exposed_name("", &mut claimed), "skill-2");
-        assert_eq!(synthesize_exposed_name("Ünïcødé Skîll", &mut claimed), "n-c-d-sk-ll");
-        assert_eq!(synthesize_exposed_name("2fast", &mut claimed), "skill-2fast");
+        assert_eq!(
+            synthesize_exposed_name("Ünïcødé Skîll", &mut claimed),
+            "n-c-d-sk-ll"
+        );
+        assert_eq!(
+            synthesize_exposed_name("2fast", &mut claimed),
+            "skill-2fast"
+        );
     }
 
     #[test]
@@ -1237,7 +1319,11 @@ mod tests {
         assert!(outcome.refusals.is_empty(), "{:?}", outcome.refusals);
         assert_eq!(
             plugin.exposed(),
-            ["tyde-skills:alpha", "tyde-skills:alpha-2", "tyde-skills:alpha-3"],
+            [
+                "tyde-skills:alpha",
+                "tyde-skills:alpha-2",
+                "tyde-skills:alpha-3"
+            ],
             "each source must get its own exposed name"
         );
         // Every body survived: nothing was overwritten.
@@ -1249,7 +1335,11 @@ mod tests {
         assert!(read("alpha-2").contains("SECOND"));
         assert!(read("alpha-3").contains("THIRD"));
         assert_eq!(
-            outcome.prepared.iter().map(|s| s.source_name.as_str()).collect::<Vec<_>>(),
+            outcome
+                .prepared
+                .iter()
+                .map(|s| s.source_name.as_str())
+                .collect::<Vec<_>>(),
             ["Alpha", "alpha", "ALPHA"],
             "the store name each wrapper came from is retained"
         );
@@ -1269,14 +1359,21 @@ mod tests {
         for case in cases {
             let name = synthesize_exposed_name(case, &mut claimed);
             assert!(
-                name.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-'),
+                name.chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-'),
                 "{case:?} produced {name:?}, outside [a-z0-9-]"
             );
             assert!(name.len() <= 64, "{case:?} produced {} chars", name.len());
-            assert!(!name.is_empty() && !name.starts_with('-') && !name.ends_with('-'), "{name:?}");
+            assert!(
+                !name.is_empty() && !name.starts_with('-') && !name.ends_with('-'),
+                "{name:?}"
+            );
             assert!(!name.contains("--"), "{name:?}");
         }
-        assert_eq!(synthesize_exposed_name("under_score", &mut claimed), "under-score");
+        assert_eq!(
+            synthesize_exposed_name("under_score", &mut claimed),
+            "under-score"
+        );
     }
 
     #[test]
@@ -1294,21 +1391,32 @@ mod tests {
             assert!(name.len() <= 64, "{name:?} is {} chars", name.len());
             assert!(!name.ends_with('-'), "{name:?}");
         }
-        assert!(second.ends_with("-2") && third.ends_with("-3"), "{second:?} {third:?}");
+        assert!(
+            second.ends_with("-2") && third.ends_with("-3"),
+            "{second:?} {third:?}"
+        );
     }
 
     #[test]
     fn a_resource_link_points_at_the_canonical_target_that_was_checked() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = tmp.path().join("store");
-        let skills = vec![store_skill(&store, "alpha", "---\nname: alpha\n---\nbody\n")];
+        let skills = vec![store_skill(
+            &store,
+            "alpha",
+            "---\nname: alpha\n---\nbody\n",
+        )];
         let real = store.join("alpha").join("real.txt");
         std::fs::write(&real, "ORIGINAL").expect("real resource");
         // The store entry is itself a link to the real file, inside the skill.
         symlink_path(&real, &store.join("alpha").join("via-link.txt")).expect("entry link");
 
         let plugin = prepare_ok(tmp.path(), &skills);
-        let wrapper_link = plugin.root().join("skills").join("alpha").join("via-link.txt");
+        let wrapper_link = plugin
+            .root()
+            .join("skills")
+            .join("alpha")
+            .join("via-link.txt");
         assert_eq!(
             std::fs::read_link(&wrapper_link).expect("wrapper link target"),
             real.canonicalize().expect("canonical real"),
@@ -1338,7 +1446,10 @@ mod tests {
             assert_eq!(synthesize_exposed_name("DUP", claimed), "dup-2");
             assert_eq!(synthesize_exposed_name("d.u.p", claimed), "d-u-p");
         }
-        assert_eq!(first, second, "the same selection must produce the same names");
+        assert_eq!(
+            first, second,
+            "the same selection must produce the same names"
+        );
     }
 
     #[test]
@@ -1346,7 +1457,11 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = tmp.path().join("store");
         let skills = vec![
-            store_skill(&store, "plain", "---\nname: plain\ndescription: d\n---\nbody\n"),
+            store_skill(
+                &store,
+                "plain",
+                "---\nname: plain\ndescription: d\n---\nbody\n",
+            ),
             store_skill(
                 &store,
                 "gated",
@@ -1364,12 +1479,20 @@ mod tests {
         let plugin = outcome.plugin.expect("the plain skill materializes");
         assert_eq!(plugin.exposed(), ["tyde-skills:plain"]);
         assert_eq!(outcome.refusals.len(), 2, "{:?}", outcome.refusals);
-        let gated = outcome.refusals.iter().find(|r| r.name == "gated").expect("gated");
+        let gated = outcome
+            .refusals
+            .iter()
+            .find(|r| r.name == "gated")
+            .expect("gated");
         assert!(
             gated.reason.contains("allowed-tools") && gated.reason.contains("changes what"),
             "{gated:?}"
         );
-        let novel = outcome.refusals.iter().find(|r| r.name == "novel").expect("novel");
+        let novel = outcome
+            .refusals
+            .iter()
+            .find(|r| r.name == "novel")
+            .expect("novel");
         assert!(
             novel.reason.contains("some-future-field") && novel.reason.contains("cannot prove"),
             "a field Tyde has never heard of must be refused, not dropped: {novel:?}"
@@ -1380,7 +1503,11 @@ mod tests {
     fn every_skill_refused_yields_no_root_at_all() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = tmp.path().join("store");
-        let skills = vec![store_skill(&store, "hooky", "---\nname: x\nhooks:\n  - y\n---\nb\n")];
+        let skills = vec![store_skill(
+            &store,
+            "hooky",
+            "---\nname: x\nhooks:\n  - y\n---\nb\n",
+        )];
 
         let outcome = ClaudeSkillPlugin::prepare(Some(tmp.path()), &skills).expect("prepare");
 
@@ -1391,10 +1518,16 @@ mod tests {
             .expect("scan parent")
             .flatten()
             .filter(|entry| {
-                entry.file_name().to_string_lossy().starts_with("tyde-claude-skills-")
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("tyde-claude-skills-")
             })
             .collect();
-        assert!(leftovers.is_empty(), "no root may be created when nothing survives");
+        assert!(
+            leftovers.is_empty(),
+            "no root may be created when nothing survives"
+        );
     }
 
     #[test]
@@ -1417,14 +1550,26 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = tmp.path().join("store");
-        let skills = vec![store_skill(&store, "alpha", "---\nname: alpha\n---\nbody\n")];
+        let skills = vec![store_skill(
+            &store,
+            "alpha",
+            "---\nname: alpha\n---\nbody\n",
+        )];
 
         let plugin = prepare_ok(tmp.path(), &skills);
 
         let mode = |path: &Path| {
-            std::fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+            std::fs::metadata(path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777
         };
-        assert_eq!(mode(plugin.root()), 0o700, "the session root must be private");
+        assert_eq!(
+            mode(plugin.root()),
+            0o700,
+            "the session root must be private"
+        );
         assert_eq!(mode(&plugin.root().join("skills")), 0o700);
         assert_eq!(mode(&plugin.root().join("skills").join("alpha")), 0o700);
         assert_eq!(
@@ -1443,7 +1588,11 @@ mod tests {
     /// removing a root full of links must never reach the user's skill store.
     fn store_with_sentinel(tmp: &Path) -> (Vec<ResolvedSkill>, PathBuf) {
         let store = tmp.join("store");
-        let skills = vec![store_skill(&store, "alpha", "---\nname: alpha\n---\nbody\n")];
+        let skills = vec![store_skill(
+            &store,
+            "alpha",
+            "---\nname: alpha\n---\nbody\n",
+        )];
         let assets = store.join("alpha").join("assets");
         std::fs::create_dir_all(&assets).expect("assets dir");
         let sentinel = assets.join("keep.txt");
@@ -1497,7 +1646,10 @@ mod tests {
         FAIL_WRITE_AT.with(|slot| slot.set(None));
 
         let outcome = outcome.expect("prepare");
-        assert!(outcome.plugin.is_none(), "an empty root is never handed back");
+        assert!(
+            outcome.plugin.is_none(),
+            "an empty root is never handed back"
+        );
         assert_eq!(outcome.refusals.len(), 1);
         let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
             .expect("scan parent")
@@ -1509,7 +1661,10 @@ mod tests {
                     .starts_with("tyde-claude-skills-")
             })
             .collect();
-        assert!(leftovers.is_empty(), "the root must be dropped, found {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "the root must be dropped, found {leftovers:?}"
+        );
         sentinel_survives(&sentinel);
     }
 
@@ -1523,7 +1678,10 @@ mod tests {
         // The wrapper really does reach the sentinel through a directory link.
         assert_eq!(
             std::fs::read_to_string(
-                root.join("skills").join("alpha").join("assets").join("keep.txt")
+                root.join("skills")
+                    .join("alpha")
+                    .join("assets")
+                    .join("keep.txt")
             )
             .expect("reachable through the link"),
             "SENTINEL"
@@ -1533,7 +1691,10 @@ mod tests {
 
         assert!(!root.exists(), "the Tyde-owned root is removed whole");
         sentinel_survives(&sentinel);
-        assert!(skills[0].skill_md_path.exists(), "the store SKILL.md survives");
+        assert!(
+            skills[0].skill_md_path.exists(),
+            "the store SKILL.md survives"
+        );
     }
 
     #[test]
@@ -1570,7 +1731,9 @@ mod tests {
         symlink_path(&sentinel, &wrapper.join("planted-link")).expect("planted link");
         let root = plugin.root().to_path_buf();
 
-        plugin.cleanup().expect("cleanup removes a Tyde-owned root whole");
+        plugin
+            .cleanup()
+            .expect("cleanup removes a Tyde-owned root whole");
 
         assert!(!root.exists());
         sentinel_survives(&sentinel);
@@ -1589,7 +1752,11 @@ mod tests {
     fn a_platform_without_private_directories_refuses_before_startup() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = tmp.path().join("store");
-        let skills = vec![store_skill(&store, "alpha", "---\nname: alpha\n---\nbody\n")];
+        let skills = vec![store_skill(
+            &store,
+            "alpha",
+            "---\nname: alpha\n---\nbody\n",
+        )];
 
         let err = ClaudeSkillPlugin::prepare(Some(tmp.path()), &skills)
             .expect_err("an unprovable platform must fail, not fall back");
@@ -1606,7 +1773,11 @@ mod tests {
     fn unix_supports_private_roots_so_preparation_is_allowed() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = tmp.path().join("store");
-        let skills = vec![store_skill(&store, "alpha", "---\nname: alpha\n---\nbody\n")];
+        let skills = vec![store_skill(
+            &store,
+            "alpha",
+            "---\nname: alpha\n---\nbody\n",
+        )];
 
         let plugin = prepare_ok(tmp.path(), &skills);
 
@@ -1659,7 +1830,9 @@ mod tests {
     #[test]
     fn plugin_flag_is_the_documented_one_only() {
         assert_eq!(CLAUDE_PLUGIN_DIR_FLAG, "--plugin-dir");
-        assert!(help_text_supports_plugin_dir("  --plugin-dir <path>   Load a plugin"));
+        assert!(help_text_supports_plugin_dir(
+            "  --plugin-dir <path>   Load a plugin"
+        ));
         assert!(!help_text_supports_plugin_dir("  --add-dir <path>"));
         assert!(unsupported_plugin_dir_error().contains("--plugin-dir"));
     }
@@ -1680,27 +1853,48 @@ mod tests {
         assert_eq!(one, many, "the Default overlay must be constant size");
         assert!(many.contains("tyde-skills:<name>"));
         for skill in &prepared {
-            assert!(!many.contains(&skill.name), "Default must not enumerate: {many}");
+            assert!(
+                !many.contains(&skill.name),
+                "Default must not enumerate: {many}"
+            );
         }
 
         let explicit = native_skill_overlay(SkillSelection::Explicit, &prepared[..2]);
         assert!(explicit.contains("skill0") && explicit.contains("summary 0"));
-        assert!(!explicit.contains("skill2"), "only prepared skills appear: {explicit}");
+        assert!(
+            !explicit.contains("skill2"),
+            "only prepared skills appear: {explicit}"
+        );
         for overlay in [&one, &explicit] {
-            assert!(!overlay.contains("Skill: "), "no legacy body block: {overlay}");
+            assert!(
+                !overlay.contains("Skill: "),
+                "no legacy body block: {overlay}"
+            );
         }
     }
 
     #[test]
     fn the_degraded_notice_names_every_omitted_skill_and_reason() {
         let notice = degraded_default_notice(&[
-            SkillRefusal { name: "a".to_string(), reason: "bad frontmatter".to_string() },
-            SkillRefusal { name: "b".to_string(), reason: "unreadable".to_string() },
+            SkillRefusal {
+                name: "a".to_string(),
+                reason: "bad frontmatter".to_string(),
+            },
+            SkillRefusal {
+                name: "b".to_string(),
+                reason: "unreadable".to_string(),
+            },
         ]);
 
         assert!(notice.contains("without 2 installed skill(s)"), "{notice}");
-        assert!(notice.contains("skill 'a' was not exposed: bad frontmatter"), "{notice}");
-        assert!(notice.contains("skill 'b' was not exposed: unreadable"), "{notice}");
+        assert!(
+            notice.contains("skill 'a' was not exposed: bad frontmatter"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("skill 'b' was not exposed: unreadable"),
+            "{notice}"
+        );
     }
 
     #[test]
