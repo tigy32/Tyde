@@ -1526,6 +1526,9 @@ mod wasm_tests {
         state.connection_statuses.update(|m| {
             m.insert(HOST.to_owned(), ConnectionStatus::Connected);
         });
+        state.host_streams.update(|streams| {
+            streams.insert(HOST.to_owned(), StreamPath("/host/host-1".to_owned()));
+        });
         if running {
             state.agent_turn_active.update(|m| {
                 m.insert(agent_id.clone(), true);
