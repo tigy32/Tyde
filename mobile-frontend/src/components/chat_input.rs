@@ -12,6 +12,18 @@ use crate::state::{
 const CHAT_INPUT_MIN_HEIGHT_PX: i32 = 36;
 const CHAT_INPUT_MAX_HEIGHT_PX: i32 = 132;
 
+/// Visible recovery copy shown once the composer target has died. Kept
+/// character-identical to the desktop composer
+/// (`frontend/src/components/chat_input.rs`) so the two clients name the same
+/// three routes in the same words — a user who learns the phrasing on one
+/// should recognise it on the other.
+const TERMINATED_COMPOSER_HINT: &str =
+    "Agent stopped — use Fork + send, Resume in Sessions, or New Chat";
+/// Sentence-form variant of [`TERMINATED_COMPOSER_HINT`] for `aria-label`,
+/// where the text is read aloud rather than skimmed.
+const TERMINATED_COMPOSER_LABEL: &str =
+    "Agent stopped. Use Fork + send, Resume in Sessions, or New Chat.";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingImage {
     name: String,
@@ -334,9 +346,6 @@ fn QueuedMessageControlRow(row: QueuedRowRef) -> impl IntoView {
         // "Send Now" is a same-actor send. The row is already hidden for a dead
         // owner, so this only catches a click that was already in flight when
         // the fatal error landed — but a hidden control is not a guard.
-        //
-        // Delete is deliberately *not* gated: it is not a send, and it is the
-        // only way to clear a queue entry stranded behind a dead agent.
         if agent_ref_is_fatal(&state, &agent_ref) {
             return;
         }
@@ -359,6 +368,19 @@ fn QueuedMessageControlRow(row: QueuedRowRef) -> impl IntoView {
         let state = delete_state.clone();
         let agent_ref = delete_agent.clone();
         let id = delete_id.clone();
+        // Delete is gated on the same exact owner as Send Now.
+        //
+        // It is tempting to leave it live "so a stranded entry can still be
+        // cleared", but that is not what happens: the whole row unmounts when
+        // the owner dies, so no user can reach Delete afterwards. The only
+        // behavior the ungated callback actually had was the stale-click race —
+        // firing `CancelQueuedMessage` at a terminal instance stream through
+        // `agent_instance_stream`, which is deliberately fatal-unfiltered
+        // because Rename/Close/Load still need it. So the component callback is
+        // the required guard, and this also restores desktop parity.
+        if agent_ref_is_fatal(&state, &agent_ref) {
+            return;
+        }
         spawn_local(async move {
             if let Err(error) = crate::actions::cancel_queued_message(&state, &agent_ref, id).await
             {
@@ -943,7 +965,14 @@ pub fn ChatInput() -> impl IntoView {
                 </button>
                 <textarea
                     class="chat-input-field"
-                    placeholder="Message..."
+                    // Visible, not just a tooltip. On a touch UI `title` never
+                    // appears, so the placeholder is the only place the Resume
+                    // and New Chat routes can actually be read. The field stays
+                    // editable — the draft is the payload for Fork + send.
+                    placeholder=move || {
+                        if is_terminated.get() { TERMINATED_COMPOSER_HINT }
+                        else { "Message..." }
+                    }
                     aria-label="Message composer"
                     enterkeyhint="enter"
                     rows=1
@@ -969,17 +998,13 @@ pub fn ChatInput() -> impl IntoView {
                         type="button"
                         class="send-button chat-send-split-primary"
                         aria-label={move || {
-                            if is_terminated.get() {
-                                "Agent stopped — use Fork + send, Resume in Sessions, or New chat"
-                            }
+                            if is_terminated.get() { TERMINATED_COMPOSER_LABEL }
                             else if is_running.get() && !has_input.get() { "Cancel current turn" }
                             else if is_steer.get() { "Queue message" }
                             else { "Send message" }
                         }}
                         title=move || {
-                            if is_terminated.get() {
-                                "Agent stopped — use Fork + send, Resume in Sessions, or New chat"
-                            } else { "" }
+                            if is_terminated.get() { TERMINATED_COMPOSER_HINT } else { "" }
                         }
                         data-mobile-test="chat-send"
                         on:click={
@@ -1425,6 +1450,37 @@ mod wasm_tests {
             .filter_map(|i| nodes.item(i))
             .map(|n| n.text_content().unwrap_or_default().trim().to_owned())
             .collect()
+    }
+
+    /// Dispatch a real `keydown` on `target`. The composer's Cmd/Ctrl+Enter send
+    /// runs off this event and is not gated by the button's `disabled`
+    /// attribute, so it is the send path a fatal guard actually has to stop.
+    fn dispatch_keydown(target: &web_sys::Element, key: &str, meta: bool, ctrl: bool) {
+        // Constructed through `Reflect` rather than `KeyboardEventInit`, mirroring
+        // the desktop composer's helper: it does not depend on which init-dict
+        // setters the pinned web-sys exposes.
+        let init = js_sys::Object::new();
+        js_sys::Reflect::set(&init, &"key".into(), &key.into()).unwrap();
+        js_sys::Reflect::set(
+            &init,
+            &"metaKey".into(),
+            &wasm_bindgen::JsValue::from_bool(meta),
+        )
+        .unwrap();
+        js_sys::Reflect::set(
+            &init,
+            &"ctrlKey".into(),
+            &wasm_bindgen::JsValue::from_bool(ctrl),
+        )
+        .unwrap();
+        js_sys::Reflect::set(&init, &"bubbles".into(), &wasm_bindgen::JsValue::TRUE).unwrap();
+        js_sys::Reflect::set(&init, &"cancelable".into(), &wasm_bindgen::JsValue::TRUE).unwrap();
+        let ctor = js_sys::Reflect::get(&js_sys::global(), &"KeyboardEvent".into()).unwrap();
+        let ctor: js_sys::Function = ctor.unchecked_into();
+        let args = js_sys::Array::of2(&"keydown".into(), &init);
+        let event = js_sys::Reflect::construct(&ctor, &args).unwrap();
+        let event: web_sys::Event = event.unchecked_into();
+        target.dispatch_event(&event).unwrap();
     }
 
     fn type_text(container: &HtmlElement, text: &str) {
@@ -2116,7 +2172,7 @@ mod wasm_tests {
     /// is the whole recovery route.
     #[wasm_bindgen_test]
     async fn terminated_agent_disables_send_but_keeps_the_draft_and_fork() {
-        let _guard = crate::bridge::test_defer_sends();
+        let _guard = crate::bridge::test_capture_sends();
         let container = make_container();
         let state = mount_terminated_agent(&container, true);
         next_tick().await;
@@ -2131,12 +2187,30 @@ mod wasm_tests {
             p.has_attribute("disabled"),
             "Terminated is a state, not an action — the control must be disabled"
         );
+        // The recovery routes must be *visible*, not only in a tooltip: `title`
+        // never renders on a touch UI, so the placeholder is the only place
+        // Resume and New Chat can actually be read. Exact copy, so mobile and
+        // desktop cannot drift into naming the same routes differently.
+        assert_eq!(
+            p.get_attribute("aria-label").as_deref(),
+            Some(TERMINATED_COMPOSER_LABEL)
+        );
+        assert_eq!(
+            p.get_attribute("title").as_deref(),
+            Some(TERMINATED_COMPOSER_HINT)
+        );
+        let field = container
+            .query_selector("[data-mobile-test='chat-input']")
+            .unwrap()
+            .expect("composer field");
+        assert_eq!(
+            field.get_attribute("placeholder").as_deref(),
+            Some(TERMINATED_COMPOSER_HINT),
+            "the terminal guidance must be visible in the composer itself"
+        );
         assert!(
-            p.get_attribute("aria-label")
-                .unwrap_or_default()
-                .contains("Fork + send"),
-            "the accessible label must point at the recovery routes, got: {:?}",
-            p.get_attribute("aria-label")
+            !field.has_attribute("disabled"),
+            "the field stays editable — the draft is the payload for Fork + send"
         );
 
         // A draft arrives. Send stays shut; the draft is untouched.
@@ -2150,24 +2224,29 @@ mod wasm_tests {
         );
         assert!(p.has_attribute("disabled"));
 
-        let before = crate::bridge::test_send_attempts();
-        let p_el: HtmlElement = primary(&container).dyn_into().unwrap();
-        p_el.click();
+        // Clicking a disabled button is not a real test — the browser never
+        // dispatches it. The keyboard path is not gated by `disabled` at all,
+        // so Cmd/Ctrl+Enter is the send route that actually has to be guarded.
+        assert_eq!(crate::bridge::test_send_attempts(), 0);
+        dispatch_keydown(&field, "Enter", true, false);
+        next_tick().await;
+        dispatch_keydown(&field, "Enter", false, true);
         next_tick().await;
         assert_eq!(
             crate::bridge::test_send_attempts(),
-            before,
-            "clicking a dead agent's primary must emit no frame at all"
+            0,
+            "no keyboard send may reach a dead agent's stream"
         );
         assert_eq!(
             state.chat_input.get_untracked(),
             "please continue",
-            "the draft must survive — it is the payload for Fork + send"
+            "and a refused send must leave the draft intact"
         );
 
         // Fork + send is the escape hatch and stays reachable: it spawns a new
         // agent from the retained session on the *host* stream, never on the
-        // dead instance stream.
+        // dead instance stream. Invoke it for real rather than only reading the
+        // menu label — a Fork that was itself broken would pass a label check.
         let c = caret(&container);
         assert!(
             !c.has_attribute("disabled"),
@@ -2178,6 +2257,40 @@ mod wasm_tests {
             menu_item_texts(&container),
             vec!["Fork + send".to_owned()],
             "a dead agent's menu offers recovery only — never Steer or Cancel"
+        );
+
+        let fork: HtmlElement = container
+            .query_selector("[data-mobile-test='chat-send-menu-ask-aside']")
+            .unwrap()
+            .expect("Fork + send item")
+            .dyn_into()
+            .unwrap();
+        fork.click();
+        next_tick().await;
+        next_tick().await;
+        assert_eq!(
+            crate::bridge::test_send_attempts(),
+            1,
+            "Fork + send must emit exactly one frame on a dead agent"
+        );
+        let line = crate::bridge::test_sent_lines()
+            .last()
+            .cloned()
+            .expect("the fork frame must be captured");
+        let frame: serde_json::Value = serde_json::from_str(&line).expect("fork frame json");
+        let stream = frame
+            .get("stream")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        assert_eq!(
+            stream, "/host/h1",
+            "the fork must go to the host stream, never the dead instance stream"
+        );
+        assert!(
+            !stream.contains("/agent/agent-1/inst"),
+            "a fork addressed to the dead instance stream would be the very bug \
+             this recovery route exists to avoid: {stream}"
         );
     }
 
@@ -2203,10 +2316,160 @@ mod wasm_tests {
                 .is_none(),
             "Send Now on a dead agent is a send that can never be delivered"
         );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-input-queued-delete']")
+                .unwrap()
+                .is_none(),
+            "and no Delete either — the whole row goes"
+        );
         assert_eq!(
             state.agent_message_queue.get_untracked().values().len(),
             1,
             "hiding the rows must not discard the server-owned queue"
+        );
+    }
+
+    /// **The queued-row tap that was already in flight when the owner died.**
+    ///
+    /// Hiding the row is a *visibility* guard; it says nothing about the
+    /// callbacks a dispatched tap still holds. So mount the row component
+    /// directly — bypassing the memo that hides it — and click both controls for
+    /// real with the exact owner fatal.
+    ///
+    /// The fixture also puts a healthy agent with the *same textual `AgentId`*
+    /// on a second host. If the guard ever degrades to an id-only comparison,
+    /// the healthy agent starts being treated as dead, and this test is where
+    /// that shows up.
+    #[wasm_bindgen_test]
+    async fn queued_row_callbacks_refuse_a_fatal_owner_without_touching_other_hosts() {
+        let _guard = crate::bridge::test_capture_sends();
+        let container = make_container();
+        let dead_host = LocalHostId("host-1".to_owned());
+        let live_host = LocalHostId("host-2".to_owned());
+        let shared_id = AgentId("agent-1".to_owned());
+        let dead_ref = AgentRef {
+            local_host_id: dead_host.clone(),
+            agent_id: shared_id.clone(),
+        };
+        let live_ref = AgentRef {
+            local_host_id: live_host.clone(),
+            agent_id: shared_id.clone(),
+        };
+
+        let row_for_mount = QueuedRowRef {
+            agent_ref: dead_ref.clone(),
+            id: QueuedMessageId("q-1".to_owned()),
+        };
+        let handle: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let handle_for_mount = handle.clone();
+        let (dead_host_m, live_host_m, id_m) =
+            (dead_host.clone(), live_host.clone(), shared_id.clone());
+        let h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let dead = AgentInfo {
+                local_host_id: dead_host_m.clone(),
+                agent_id: id_m.clone(),
+                name: "Dead".to_owned(),
+                origin: AgentOrigin::User,
+                backend_kind: BackendKind::Claude,
+                workspace_roots: Vec::new(),
+                project_id: None,
+                parent_agent_id: None,
+                session_id: None,
+                custom_agent_id: None,
+                created_at_ms: 0,
+                instance_stream: StreamPath("/agent/dead/inst".to_owned()),
+                started: true,
+                fatal_error: Some("backend crashed".to_owned()),
+            };
+            // Same textual AgentId, different host, still alive.
+            let live = AgentInfo {
+                local_host_id: live_host_m.clone(),
+                name: "Live twin".to_owned(),
+                instance_stream: StreamPath("/agent/live/inst".to_owned()),
+                fatal_error: None,
+                ..dead.clone()
+            };
+            state.agents.set(vec![dead, live]);
+            state.host_streams.update(|m| {
+                m.insert(dead_host_m.clone(), StreamPath("/host/h1".to_owned()));
+                m.insert(live_host_m.clone(), StreamPath("/host/h2".to_owned()));
+            });
+            state.agent_message_queue.update(|m| {
+                m.insert(
+                    AgentRef {
+                        local_host_id: dead_host_m.clone(),
+                        agent_id: id_m.clone(),
+                    },
+                    vec![QueuedMessageEntry {
+                        id: QueuedMessageId("q-1".to_owned()),
+                        message: "still queued behind the dead agent".to_owned(),
+                        images: Vec::new(),
+                        origin: None,
+                    }],
+                );
+            });
+            *handle_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! { <QueuedMessageControlRow row=row_for_mount.clone() /> }
+        });
+        std::mem::forget(h);
+        next_tick().await;
+
+        let send_now: HtmlElement = container
+            .query_selector("[data-mobile-test='chat-input-queued-send-now']")
+            .unwrap()
+            .expect("row is mounted directly, so Send Now is present")
+            .dyn_into()
+            .unwrap();
+        let delete: HtmlElement = container
+            .query_selector("[data-mobile-test='chat-input-queued-delete']")
+            .unwrap()
+            .expect("row is mounted directly, so Delete is present")
+            .dyn_into()
+            .unwrap();
+
+        send_now.click();
+        next_tick().await;
+        delete.click();
+        next_tick().await;
+        next_tick().await;
+
+        assert_eq!(
+            crate::bridge::test_send_attempts(),
+            0,
+            "neither SendQueuedMessageNow nor CancelQueuedMessage may reach a \
+             terminal instance stream"
+        );
+        let state = handle.borrow().as_ref().unwrap().clone();
+        assert!(
+            state.mobile_shell_error.get_untracked().is_none(),
+            "a refused queued action must not surface a transport error either"
+        );
+        assert_eq!(
+            state
+                .agent_message_queue
+                .with_untracked(|m| m.get(&dead_ref).map(|entries| entries.len())),
+            Some(1),
+            "refusing the actions must not mutate the server-owned queue"
+        );
+
+        // The same-id agent on the other host is untouched and still live, so
+        // the guard cannot have matched on AgentId alone.
+        assert!(
+            state.agents.with_untracked(|agents| agents
+                .iter()
+                .any(|a| a.local_host_id == live_ref.local_host_id
+                    && a.agent_id == live_ref.agent_id
+                    && a.fatal_error.is_none())),
+            "the identically-named agent on host-2 must remain live"
+        );
+        assert!(agent_ref_is_fatal(&state, &dead_ref));
+        assert!(
+            !agent_ref_is_fatal(&state, &live_ref),
+            "fatality is host-scoped; an id-only check would fail here"
         );
     }
 
