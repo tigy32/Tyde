@@ -1541,7 +1541,7 @@ impl CodexSession {
         let mut skill_projection = CodexSkillProjection::new(selected_skills)?;
         let steering_tempfile = match steering_content {
             Some(content) if !content.trim().is_empty() => {
-                Some(crate::steering::write_codex_steering_tempfile(content)?)
+                Some(write_codex_session_steering_tempfile(content)?)
             }
             _ => None,
         };
@@ -1723,7 +1723,7 @@ impl CodexSession {
         let mut skill_projection = CodexSkillProjection::new(selected_skills)?;
         let steering_tempfile = match steering_content {
             Some(content) if !content.trim().is_empty() => {
-                Some(crate::steering::write_codex_steering_tempfile(content)?)
+                Some(write_codex_session_steering_tempfile(content)?)
             }
             _ => None,
         };
@@ -13350,6 +13350,11 @@ static CODEX_FORK_STARTUP_CANCEL_OBSERVER: std::sync::Mutex<Option<oneshot::Send
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
+static CODEX_STEERING_TEMPFILE_CREATED_OBSERVER: std::sync::Mutex<
+    Option<oneshot::Sender<PathBuf>>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
 fn install_codex_request_observer(method: &str) -> oneshot::Receiver<()> {
     let (sender, receiver) = oneshot::channel();
     let mut observer = CODEX_REQUEST_SENT_OBSERVER
@@ -13364,6 +13369,38 @@ fn install_codex_request_observer(method: &str) -> oneshot::Receiver<()> {
         sender,
     });
     receiver
+}
+
+#[cfg(test)]
+fn install_codex_steering_tempfile_observer() -> oneshot::Receiver<PathBuf> {
+    let (sender, receiver) = oneshot::channel();
+    let mut observer = CODEX_STEERING_TEMPFILE_CREATED_OBSERVER
+        .lock()
+        .expect("Codex steering tempfile observer mutex poisoned");
+    assert!(
+        observer.is_none(),
+        "a Codex steering tempfile observer is already installed"
+    );
+    *observer = Some(sender);
+    receiver
+}
+
+#[cfg(not(test))]
+fn write_codex_session_steering_tempfile(content: &str) -> Result<PathBuf, String> {
+    crate::steering::write_codex_steering_tempfile(content)
+}
+
+#[cfg(test)]
+fn write_codex_session_steering_tempfile(content: &str) -> Result<PathBuf, String> {
+    let path = crate::steering::write_codex_steering_tempfile(content)?;
+    if let Some(observer) = CODEX_STEERING_TEMPFILE_CREATED_OBSERVER
+        .lock()
+        .expect("Codex steering tempfile observer mutex poisoned")
+        .take()
+    {
+        let _ = observer.send(path.clone());
+    }
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -15043,21 +15080,6 @@ for line in sys.stdin:
         fn skill_projection_dirs(&self) -> HashSet<PathBuf> {
             skill_projection_dirs_under(&self.skill_temp_parent)
         }
-    }
-
-    fn codex_steering_tempfiles() -> HashSet<std::path::PathBuf> {
-        std::fs::read_dir(std::env::temp_dir())
-            .expect("read temp dir")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        name.starts_with("tyde-codex-steering-") && name.ends_with(".md")
-                    })
-            })
-            .collect()
     }
 
     fn skill_projection_dirs_under(parent: &Path) -> HashSet<PathBuf> {
@@ -18327,7 +18349,7 @@ for line in sys.stdin:
         let _guard = CodexTestAppServerBinaryGuard::set(
             missing_binary_dir.path().join("missing-codex-app-server"),
         );
-        let before = codex_steering_tempfiles();
+        let steering_tempfile_rx = install_codex_steering_tempfile_observer();
 
         let result = CodexSession::fork(
             &["/tmp".to_string()],
@@ -18350,11 +18372,13 @@ for line in sys.stdin:
             err.contains("Failed to spawn Codex app-server"),
             "unexpected fork spawn error: {err}"
         );
-        let after = codex_steering_tempfiles();
-        let leaked = after.difference(&before).collect::<Vec<_>>();
+        let steering_tempfile = steering_tempfile_rx
+            .await
+            .expect("fork should report the exact steering tempfile it created");
         assert!(
-            leaked.is_empty(),
-            "CodexSession::fork should remove steering tempfiles when app-server spawn fails; leaked={leaked:?}"
+            !steering_tempfile.exists(),
+            "CodexSession::fork should remove its own steering tempfile when app-server spawn fails: {}",
+            steering_tempfile.display()
         );
     }
 
