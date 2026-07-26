@@ -2500,23 +2500,17 @@ impl ClaudeInner {
             "{message} Tyde stopped this Claude session before using its response, because a \
              session missing a skill it was configured with will silently do the wrong thing."
         );
-        // Record the verdict *before* killing anything. Every terminal path
-        // routes through here — the init frame, a turn that ended without one,
-        // EOF, the watchdog, buffer overflow — and each must leave the session
-        // in `Failed` with a reason rather than in `Pending`, or a later reader
-        // of the state cannot tell "still waiting" from "already dead".
+        // Order is load-bearing. The verdict is recorded, then the waiter is
+        // released, and only then is anything aborted or killed. Aborting first
+        // meant that when this ran *inside* the watchdog task, `abort()` on its
+        // own handle cancelled it at the next await — which was the settle —
+        // so the verdict was recorded and the turn was left hanging.
         self.skill_readiness
             .send_replace(ClaudeSkillReadiness::Failed(full.clone()));
-        self.cancel_skill_watchdog().await;
         tracing::error!("{full}");
         self.emit_error(&full);
-        // Settle the in-flight turn unconditionally. A caller awaiting
-        // `outcome_rx` has no other way to learn the session died: if the
-        // sender is neither sent nor dropped it waits forever, which is exactly
-        // how the mismatch path deadlocked. `settle_active_turn_with_failure`
-        // sends when it can and drops the sender when it cannot, so the
-        // receiver always resolves.
         self.settle_active_turn_with_failure(full).await;
+        self.cancel_skill_watchdog().await;
         self.shutdown_process().await;
     }
 
@@ -2662,12 +2656,19 @@ impl ClaudeInner {
             if !inner.skills_awaiting_verification() {
                 return;
             }
-            if inner.state.lock().await.skill_verification_generation != generation {
-                tracing::debug!(
-                    "Skipping a Claude skill watchdog from generation {generation}; the \
-                     session has moved on since"
-                );
-                return;
+            {
+                let mut state = inner.state.lock().await;
+                if state.skill_verification_generation != generation {
+                    tracing::debug!(
+                        "Skipping a Claude skill watchdog from generation {generation}; the \
+                         session has moved on since"
+                    );
+                    return;
+                }
+                // This watchdog has won: disown its own handle before running
+                // termination, so the cleanup inside termination finds nothing
+                // to abort and cannot cancel the very task doing the work.
+                state.skill_watchdog = None;
             }
             inner
                 .terminate_for_skill_mismatch(
@@ -2694,10 +2695,31 @@ impl ClaudeInner {
     /// the skills for something the user did. The watchdog is stopped, the
     /// generation is bumped so any in-flight timer is inert, and readiness is
     /// left `Pending` for whichever process starts next.
-    async fn abandon_skill_verification_for_cancel(&self) {
-        // Order matters: mark first, so a watchdog that fires between the mark
-        // and the abort still sees `skills_awaiting_verification() == false`
-        // and returns without failing the session.
+    /// Abandon verification because *this* turn was cancelled.
+    ///
+    /// Only ever acts when there is an active turn that has actually been
+    /// interrupted. Marking abandonment with no such turn would suppress the
+    /// terminal paths for a session nobody cancelled — a silent way to lose a
+    /// real skill failure. Returns whether it marked, so the caller can retire
+    /// the process that will now never report.
+    async fn abandon_skill_verification_for_cancelled_turn(&self) -> bool {
+        let matching = {
+            let state = self.state.lock().await;
+            state
+                .active_turn
+                .as_ref()
+                .is_some_and(|active| active.interrupt_requested)
+        };
+        if !matching {
+            return false;
+        }
+        if !self.skills_awaiting_verification() {
+            // Nothing pending to abandon; a cancel does not need to suppress
+            // anything, and marking would outlive this turn for no reason.
+            return false;
+        }
+        // Mark first, so a watchdog firing between the mark and the abort sees
+        // it and returns instead of failing the session.
         self.skill_verification_abandoned
             .store(true, Ordering::Relaxed);
         {
@@ -2706,6 +2728,7 @@ impl ClaudeInner {
                 state.skill_verification_generation.wrapping_add(1);
         }
         self.cancel_skill_watchdog().await;
+        true
     }
 
     /// Was the turn currently in flight interrupted by the user?
@@ -2786,10 +2809,6 @@ impl ClaudeInner {
     }
 
     async fn cancel_active_turn(&self) {
-        // A cancelled turn is the user's doing, not the skills'. Drop any
-        // pending verification so the terminal frames that follow a cancel are
-        // not mistaken for a CLI that failed to report.
-        self.abandon_skill_verification_for_cancel().await;
         let (turn_id, quiesced_rx) = {
             let mut state = self.state.lock().await;
             let Some(active) = state.active_turn.as_mut() else {
@@ -2800,6 +2819,10 @@ impl ClaudeInner {
             active.interrupt_requested = true;
             (active.id, quiesced_rx)
         };
+
+        // Only now, with the turn confirmed interrupted, may verification be
+        // abandoned — a cancelled turn is the user's doing, not the skills'.
+        let abandoned_verification = self.abandon_skill_verification_for_cancelled_turn().await;
 
         if self.runtime.lock().await.is_some()
             && let Err(err) = self.send_control_request("interrupt").await
@@ -2834,9 +2857,37 @@ impl ClaudeInner {
                 )
                 .await;
                 if let Some(rx) = fallback_rx {
-                    let _ = rx.await;
+                    // Bounded. This waiter is only ever signalled by
+                    // `clear_active_turn`, which runs from `run_turn` and
+                    // `finalize_turn`. If the owning turn task is gone — the
+                    // process died, the task was aborted — nothing will call
+                    // it, and an unbounded wait here wedges shutdown forever.
+                    if tokio::time::timeout(CLAUDE_INTERRUPT_QUIESCE_TIMEOUT, rx)
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            "No owner left to quiesce Claude turn {turn_id}; clearing it here"
+                        );
+                        for waiter in self.clear_active_turn(turn_id).await {
+                            let _ = waiter.send(());
+                        }
+                    }
                 }
             }
+        }
+
+        // A process whose pending verification was abandoned can never report
+        // its skills: the init frame only follows the first user message, and
+        // that turn is now cancelled. Retire it so the next turn spawns a fresh
+        // process, which re-arms with a new generation rather than inheriting a
+        // session that is permanently unverifiable.
+        if abandoned_verification {
+            tracing::debug!(
+                "Retiring the Claude process for cancelled turn {turn_id}; its verification \
+                 was abandoned and it can no longer report"
+            );
+            self.shutdown_process().await;
         }
     }
 
@@ -3891,7 +3942,7 @@ async fn read_claude_stdout_persistent(
                     // and blaming the skills would be wrong.
                     if inner.skills_awaiting_verification() {
                         if inner.active_turn_is_interrupted().await {
-                            inner.abandon_skill_verification_for_cancel().await;
+                            inner.abandon_skill_verification_for_cancelled_turn().await;
                         } else {
                             inner
                                 .terminate_for_skill_mismatch(
@@ -3929,7 +3980,7 @@ async fn read_claude_stdout_persistent(
         // skill problem. The user stopping a turn is not the skills failing,
         // and the terminal frames that follow a cancel must report cancellation.
         if inner.skills_awaiting_verification() && inner.active_turn_is_interrupted().await {
-            inner.abandon_skill_verification_for_cancel().await;
+            inner.abandon_skill_verification_for_cancelled_turn().await;
             held_back.clear();
             held_back_bytes = 0;
         }
@@ -12911,6 +12962,11 @@ sys.exit(1)
         }
     }
 
+    /// Turn id the fake harness registers. Named so the clear-up at the end of
+    /// the helper cannot drift from the registration at the start.
+    #[cfg(unix)]
+    const FAKE_TURN_ID: u64 = 1;
+
     #[cfg(unix)]
     async fn run_fake_with_behaviour(
         behaviour: FakeInitBehaviour,
@@ -13023,15 +13079,19 @@ for raw_line in sys.stdin:
             .arm_skill_verification(vec!["tyde-skills:alpha".to_string()])
             .await;
         // The stdout reducer drops every assistant frame when no turn is
-        // active (`prepare_persistent_stdout_turn` returns `None`), so without
-        // this the replay assertion could never observe anything regardless of
-        // whether replay worked. This helper writes the prompt directly instead
-        // of going through `run_turn`, so it has to register the turn itself.
+        // active (`prepare_persistent_stdout_turn` returns `None`), so this
+        // helper has to register one. It writes its prompt directly rather than
+        // through `run_turn`, so it also has to take on `run_turn`'s
+        // responsibilities: own the outcome receiver, wait for terminal
+        // delivery, and clear the turn — notifying its quiesced waiters —
+        // before shutting down. A turn installed with `outcome_tx: None` can
+        // never deliver, and leaving one behind is what wedged `shutdown`.
+        let (outcome_tx, outcome_rx) = oneshot::channel();
         {
             let mut state = inner.state.lock().await;
             state.active_turn = Some(ActiveTurn {
-                id: 1,
-                outcome_tx: None,
+                id: FAKE_TURN_ID,
+                outcome_tx: Some(outcome_tx),
                 interrupt_requested: false,
                 pending_ask_user_question: None,
                 pending_exit_plan_mode: None,
@@ -13081,11 +13141,27 @@ for raw_line in sys.stdin:
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
+        // Terminal delivery, bounded. Every behaviour reaches one: the CLI
+        // ends the turn with a `result`, or a terminal skill path fails it, or
+        // the process exits. A behaviour that reached none would be a defect,
+        // and the timeout reports that rather than hanging the suite.
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), outcome_rx).await;
+        assert!(
+            outcome.is_ok(),
+            "every fake behaviour must deliver a terminal outcome for its turn"
+        );
+
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
             events.push(event);
         }
         let state = inner.skill_readiness_state();
+
+        // Clear the turn and release its waiters, exactly as `run_turn` does,
+        // so `shutdown` has nothing left to wait on.
+        for waiter in inner.clear_active_turn(FAKE_TURN_ID).await {
+            let _ = waiter.send(());
+        }
         inner.shutdown().await;
 
         unsafe {
@@ -13338,6 +13414,124 @@ for raw_line in sys.stdin:
 
     /// Cancelling a turn is the user's doing. The terminal frames that follow
     /// must report cancellation, never a skill failure.
+    /// Register an interrupted turn that can actually deliver its outcome.
+    ///
+    /// The receiver is handed back so the caller keeps it alive: a turn whose
+    /// receiver has been dropped is indistinguishable from one that delivered,
+    /// which is the confusion this helper exists to prevent.
+    async fn install_interrupted_turn(
+        inner: &Arc<ClaudeInner>,
+        id: u64,
+    ) -> oneshot::Receiver<TurnOutcome> {
+        let (outcome_tx, outcome_rx) = oneshot::channel();
+        let mut state = inner.state.lock().await;
+        state.active_turn = Some(ActiveTurn {
+            id,
+            outcome_tx: Some(outcome_tx),
+            interrupt_requested: true,
+            pending_ask_user_question: None,
+            pending_exit_plan_mode: None,
+            quiesced_waiters: Vec::new(),
+        });
+        outcome_rx
+    }
+
+    /// Abandonment must never fire without a turn that was actually cancelled.
+    /// Doing so would suppress the terminal paths for a session nobody
+    /// cancelled — a silent way to lose a real skill failure.
+    #[tokio::test]
+    async fn abandonment_refuses_to_act_without_a_cancelled_turn() {
+        let (inner, _rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
+
+        assert!(
+            !inner.abandon_skill_verification_for_cancelled_turn().await,
+            "no active turn at all means nothing to abandon"
+        );
+        assert!(
+            inner.skills_awaiting_verification(),
+            "verification must still be live"
+        );
+
+        // An active turn that has *not* been interrupted is equally not a cancel.
+        let (outcome_tx, _outcome_rx) = oneshot::channel();
+        {
+            let mut state = inner.state.lock().await;
+            state.active_turn = Some(ActiveTurn {
+                id: 7,
+                outcome_tx: Some(outcome_tx),
+                interrupt_requested: false,
+                pending_ask_user_question: None,
+                pending_exit_plan_mode: None,
+                quiesced_waiters: Vec::new(),
+            });
+        }
+
+        assert!(
+            !inner.abandon_skill_verification_for_cancelled_turn().await,
+            "an uninterrupted turn is not a cancel"
+        );
+        assert!(inner.skills_awaiting_verification());
+    }
+
+    /// A watchdog that wins must run termination to completion — including
+    /// settling the turn — rather than aborting itself partway through.
+    #[tokio::test]
+    async fn a_watchdog_termination_settles_the_turn_it_kills() {
+        let (inner, _rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
+        let (outcome_tx, outcome_rx) = oneshot::channel();
+        {
+            let mut state = inner.state.lock().await;
+            state.active_turn = Some(ActiveTurn {
+                id: 55,
+                outcome_tx: Some(outcome_tx),
+                interrupt_requested: false,
+                pending_ask_user_question: None,
+                pending_exit_plan_mode: None,
+                quiesced_waiters: Vec::new(),
+            });
+        }
+        inner.watch_for_skill_verification().await;
+
+        let outcome = tokio::time::timeout(CLAUDE_SKILL_VERIFICATION_TIMEOUT * 8, outcome_rx)
+            .await
+            .expect("the watchdog must settle the turn, not abort itself mid-termination")
+            .expect("the sender must be sent, not dropped");
+
+        match outcome {
+            TurnOutcome::Failed { error, .. } => {
+                assert!(error.contains("within the startup timeout"), "{error}");
+            }
+            TurnOutcome::Completed { .. } => panic!("a watchdog kill is not a completion"),
+            TurnOutcome::Cancelled { .. } => panic!("a watchdog kill is not a cancellation"),
+        }
+        assert!(
+            inner.state.lock().await.skill_watchdog.is_none(),
+            "the watchdog must have disowned its own handle"
+        );
+    }
+
+    /// A process whose verification was abandoned can never report, so it must
+    /// not be reused by a later turn.
+    #[tokio::test]
+    async fn a_cancelled_process_is_retired_rather_than_reused() {
+        let (inner, _rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
+        let _outcome_rx = install_interrupted_turn(&inner, 71).await;
+        assert!(inner.abandon_skill_verification_for_cancelled_turn().await);
+
+        // A new process arms afresh: abandonment is cleared and the generation
+        // moves on, so the retired process's state cannot leak into it.
+        let before = inner.state.lock().await.skill_verification_generation;
+        inner.reset_skill_readiness().await;
+        let after = inner.state.lock().await.skill_verification_generation;
+
+        assert_ne!(before, after, "a new process must get a new generation");
+        assert!(
+            inner.skills_awaiting_verification(),
+            "a fresh process is verifiable again; abandonment does not carry over"
+        );
+        assert_eq!(inner.skill_readiness_state(), ClaudeSkillReadiness::Pending);
+    }
+
     /// The terminal paths — a `result` frame, EOF, the watchdog — all gate on
     /// `skills_awaiting_verification`. After a cancel that must be false, or
     /// each of them would turn the user's own cancel into a skill failure.
@@ -13345,12 +13539,16 @@ for raw_line in sys.stdin:
     async fn no_terminal_path_fires_after_a_cancel() {
         let (inner, mut rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
         inner.watch_for_skill_verification().await;
+        let _outcome_rx = install_interrupted_turn(&inner, 92).await;
         assert!(
             inner.skills_awaiting_verification(),
             "armed and waiting before the cancel"
         );
 
-        inner.abandon_skill_verification_for_cancel().await;
+        assert!(
+            inner.abandon_skill_verification_for_cancelled_turn().await,
+            "an interrupted turn is exactly the condition abandonment acts on"
+        );
 
         assert!(
             !inner.skills_awaiting_verification(),
@@ -13380,7 +13578,8 @@ for raw_line in sys.stdin:
     #[tokio::test]
     async fn a_cancel_cannot_be_undone_by_re_arming_the_same_process() {
         let (inner, _rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
-        inner.abandon_skill_verification_for_cancel().await;
+        let _outcome_rx = install_interrupted_turn(&inner, 93).await;
+        assert!(inner.abandon_skill_verification_for_cancelled_turn().await);
 
         inner.watch_for_skill_verification().await;
 
@@ -13396,19 +13595,9 @@ for raw_line in sys.stdin:
     async fn cancelling_before_the_init_frame_is_never_a_skill_error() {
         let (inner, mut rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
         inner.watch_for_skill_verification().await;
-        {
-            let mut state = inner.state.lock().await;
-            state.active_turn = Some(ActiveTurn {
-                id: 91,
-                outcome_tx: None,
-                interrupt_requested: true,
-                pending_ask_user_question: None,
-                pending_exit_plan_mode: None,
-                quiesced_waiters: Vec::new(),
-            });
-        }
+        let _outcome_rx = install_interrupted_turn(&inner, 91).await;
 
-        inner.abandon_skill_verification_for_cancel().await;
+        inner.abandon_skill_verification_for_cancelled_turn().await;
 
         // The watchdog is gone and cannot fire on the cancelled turn.
         tokio::time::sleep(CLAUDE_SKILL_VERIFICATION_TIMEOUT * 3).await;
