@@ -30,13 +30,23 @@ thread_local! {
     static SEQ_MAP: RefCell<HashMap<(String, StreamPath), u64>> = RefCell::new(HashMap::new());
 }
 
-fn next_seq(host_id: &str, stream: &StreamPath) -> u64 {
+fn current_seq(host_id: &str, stream: &StreamPath) -> u64 {
+    SEQ_MAP.with(|map| {
+        map.borrow()
+            .get(&(host_id.to_owned(), stream.clone()))
+            .copied()
+            .unwrap_or(0)
+    })
+}
+
+fn commit_seq(host_id: &str, stream: &StreamPath, accepted_seq: u64) {
     SEQ_MAP.with(|map| {
         let mut map = map.borrow_mut();
-        let counter = map.entry((host_id.to_owned(), stream.clone())).or_insert(0);
-        let v = *counter;
-        *counter += 1;
-        v
+        let counter = map
+            .entry((host_id.to_owned(), stream.clone()))
+            .or_insert(0);
+        debug_assert_eq!(*counter, accepted_seq);
+        *counter = accepted_seq.wrapping_add(1);
     })
 }
 
@@ -55,7 +65,7 @@ pub async fn send_frame<T: Serialize>(
     kind: FrameKind,
     payload: &T,
 ) -> Result<(), String> {
-    let seq = next_seq(host_id, &stream);
+    let seq = current_seq(host_id, &stream);
     log::info!(
         "host_frame_tx host={} stream={} seq={} kind={}",
         host_id,
@@ -72,7 +82,10 @@ pub async fn send_frame<T: Serialize>(
     })
     .await
     {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            commit_seq(host_id, &stream, seq);
+            Ok(())
+        }
         Err(e) => {
             log::error!(
                 "host_frame_tx_err host={} stream={} seq={} kind={} error={}",
@@ -678,4 +691,79 @@ pub async fn team_draft_discard(
         &TeamDraftDiscardPayload { draft_id },
     )
     .await
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+
+    fn install_reject_once_send_stub() {
+        js_sys::eval(
+            r#"
+            (function() {
+                window.__test_send_lines = [];
+                window.__test_reject_sends = 1;
+                window.__TAURI__ = window.__TAURI__ || {};
+                window.__TAURI__.core = window.__TAURI__.core || {};
+                window.__TAURI__.core.invoke = function(cmd, args) {
+                    if (cmd !== "send_host_line") {
+                        return Promise.resolve();
+                    }
+                    window.__test_send_lines.push(args.line);
+                    if (window.__test_reject_sends > 0) {
+                        window.__test_reject_sends -= 1;
+                        return Promise.reject("simulated bridge rejection");
+                    }
+                    return Promise.resolve();
+                };
+            })();
+            "#,
+        )
+        .expect("install reject-once send stub");
+    }
+
+    fn sent_envelopes() -> Vec<Envelope> {
+        let raw = js_sys::eval("JSON.stringify(window.__test_send_lines || [])")
+            .expect("read captured host lines")
+            .as_string()
+            .unwrap_or_else(|| "[]".to_owned());
+        let lines: Vec<String> = serde_json::from_str(&raw).expect("captured lines are strings");
+        lines
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("captured line is an envelope"))
+            .collect()
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    async fn rejected_send_does_not_consume_protocol_sequence() {
+        let host_id = "host-sequence";
+        let stream = StreamPath("/host/sequence".to_owned());
+        clear_host_seqs(host_id);
+        install_reject_once_send_stub();
+
+        let rejected = send_frame(
+            host_id,
+            stream.clone(),
+            FrameKind::ClientError,
+            &serde_json::json!({"attempt": 1}),
+        )
+        .await;
+        assert!(rejected.is_err());
+        assert_eq!(current_seq(host_id, &stream), 0);
+
+        send_frame(
+            host_id,
+            stream.clone(),
+            FrameKind::ClientError,
+            &serde_json::json!({"attempt": 2}),
+        )
+        .await
+        .expect("the second bridge send succeeds");
+
+        let envelopes = sent_envelopes();
+        assert_eq!(envelopes.len(), 2);
+        assert_eq!(envelopes[0].seq, 0);
+        assert_eq!(envelopes[1].seq, 0);
+        assert_eq!(current_seq(host_id, &stream), 1);
+    }
 }
