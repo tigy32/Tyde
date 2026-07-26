@@ -2686,7 +2686,10 @@ mod tests {
                 },
             );
 
-            assert!(is_settled(&state, &dead), "fatal must settle the dead agent");
+            assert!(
+                is_settled(&state, &dead),
+                "fatal must settle the dead agent"
+            );
             assert_eq!(
                 state.agents.with_untracked(|agents| agents
                     .iter()
@@ -2708,12 +2711,10 @@ mod tests {
                 "a nonfatal error must not close the open stream"
             );
             assert!(
-                state
-                    .agents
-                    .with_untracked(|agents| agents
-                        .iter()
-                        .find(|a| a.agent_id == alive.agent_id)
-                        .is_some_and(|a| a.fatal_error.is_none())),
+                state.agents.with_untracked(|agents| agents
+                    .iter()
+                    .find(|a| a.agent_id == alive.agent_id)
+                    .is_some_and(|a| a.fatal_error.is_none())),
                 "a nonfatal error must not mark the agent dead"
             );
             // Settlement of the transient map must be fatal-only too. Without
@@ -2782,7 +2783,9 @@ mod tests {
                 "host-b's identically-named agent keeps its turn"
             );
             assert!(
-                state.streaming_text.with_untracked(|m| m.contains_key(&on_b)),
+                state
+                    .streaming_text
+                    .with_untracked(|m| m.contains_key(&on_b)),
                 "host-b's identically-named agent keeps its open stream"
             );
             assert!(
