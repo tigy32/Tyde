@@ -1747,7 +1747,7 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    fn resume_session_opens_focused_draft_for_spawn_echo() {
+    async fn resume_session_opens_focused_draft_for_spawn_echo() {
         let owner = leptos::reactive::owner::Owner::new();
         owner.with(|| {
             let state = AppState::new();
@@ -1776,6 +1776,9 @@ mod wasm_tests {
                 );
             });
         });
+        // Keep the owner alive until `resume_session`'s spawned host-stream
+        // lookup has run, rather than leaking a disposed signal into later tests.
+        tick().await;
     }
 
     fn install_send_stub() -> js_sys::Array {
