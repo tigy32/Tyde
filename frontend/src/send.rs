@@ -193,9 +193,7 @@ impl Drop for SendLockFuture {
         };
         let wake = SEND_LOCKS.with(|locks| {
             let mut locks = locks.borrow_mut();
-            let Some(state) = locks.get_mut(&self.key) else {
-                return None;
-            };
+            let state = locks.get_mut(&self.key)?;
             let was_first = state.waiters.front().map(|waiter| waiter.id) == Some(waiter_id);
             state.waiters.retain(|waiter| waiter.id != waiter_id);
             let wake = if was_first && !state.held {
@@ -218,9 +216,7 @@ impl Drop for SendLockGuard {
     fn drop(&mut self) {
         let wake = SEND_LOCKS.with(|locks| {
             let mut locks = locks.borrow_mut();
-            let Some(state) = locks.get_mut(&self.key) else {
-                return None;
-            };
+            let state = locks.get_mut(&self.key)?;
             state.held = false;
             let wake = state.waiters.front().map(|waiter| waiter.waker.clone());
             if state.waiters.is_empty() {
