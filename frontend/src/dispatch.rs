@@ -5890,9 +5890,7 @@ fn apply_agent_bootstrap(
     }
     let fatal = state.agents.with_untracked(|agents| {
         agents.iter().any(|agent| {
-            agent.host_id == host_id
-                && agent.agent_id == agent_id
-                && agent.fatal_error.is_some()
+            agent.host_id == host_id && agent.agent_id == agent_id && agent.fatal_error.is_some()
         })
     });
     if fatal {
@@ -7262,10 +7260,26 @@ mod tests {
                 }),
                 Some("backend crashed".to_owned())
             );
-            assert!(!state.streaming_text.with_untracked(|map| map.contains_key(&fatal_id)));
-            assert!(!state.agent_turn_active.with_untracked(|map| map.contains_key(&fatal_id)));
-            assert!(!state.interrupt_pending.with_untracked(|set| set.contains(&fatal_id)));
-            assert!(!state.transient_events.with_untracked(|map| map.contains_key(&fatal_id)));
+            assert!(
+                !state
+                    .streaming_text
+                    .with_untracked(|map| map.contains_key(&fatal_id))
+            );
+            assert!(
+                !state
+                    .agent_turn_active
+                    .with_untracked(|map| map.contains_key(&fatal_id))
+            );
+            assert!(
+                !state
+                    .interrupt_pending
+                    .with_untracked(|set| set.contains(&fatal_id))
+            );
+            assert!(
+                !state
+                    .transient_events
+                    .with_untracked(|map| map.contains_key(&fatal_id))
+            );
             state.orchestration.with_untracked(|map| {
                 let log = map.get(&fatal_id).expect("fatal orchestration history");
                 assert_eq!(log.len(), 2, "fatal settlement appends one marker");
@@ -7289,16 +7303,30 @@ mod tests {
                     .find(|agent| agent.agent_id == recoverable_id)
                     .is_some_and(|agent| agent.fatal_error.is_none())
             }));
-            assert!(state.streaming_text.with_untracked(|map| map.contains_key(&recoverable_id)));
-            assert!(state.agent_turn_active.with_untracked(|map| map.contains_key(&recoverable_id)));
-            assert!(state.interrupt_pending.with_untracked(|set| set.contains(&recoverable_id)));
-            assert!(state.transient_events.with_untracked(|map| map.contains_key(&recoverable_id)));
+            assert!(
+                state
+                    .streaming_text
+                    .with_untracked(|map| map.contains_key(&recoverable_id))
+            );
+            assert!(
+                state
+                    .agent_turn_active
+                    .with_untracked(|map| map.contains_key(&recoverable_id))
+            );
+            assert!(
+                state
+                    .interrupt_pending
+                    .with_untracked(|set| set.contains(&recoverable_id))
+            );
+            assert!(
+                state
+                    .transient_events
+                    .with_untracked(|map| map.contains_key(&recoverable_id))
+            );
             assert!(state.orchestration.with_untracked(|map| {
-                map.get(&recoverable_id)
-                    .is_some_and(|log| {
-                        log.len() == 1
-                            && matches!(log.first(), Some(OrchestrationRecord::Event(_)))
-                    })
+                map.get(&recoverable_id).is_some_and(|log| {
+                    log.len() == 1 && matches!(log.first(), Some(OrchestrationRecord::Event(_)))
+                })
             }));
         });
     }
@@ -7358,10 +7386,26 @@ mod tests {
                     .find(|agent| agent.agent_id == agent_id)
                     .is_some_and(|agent| agent.fatal_error.as_deref() == Some("backend crashed"))
             }));
-            assert!(!state.streaming_text.with_untracked(|map| map.contains_key(&agent_id)));
-            assert!(!state.agent_turn_active.with_untracked(|map| map.contains_key(&agent_id)));
-            assert!(!state.interrupt_pending.with_untracked(|set| set.contains(&agent_id)));
-            assert!(!state.transient_events.with_untracked(|map| map.contains_key(&agent_id)));
+            assert!(
+                !state
+                    .streaming_text
+                    .with_untracked(|map| map.contains_key(&agent_id))
+            );
+            assert!(
+                !state
+                    .agent_turn_active
+                    .with_untracked(|map| map.contains_key(&agent_id))
+            );
+            assert!(
+                !state
+                    .interrupt_pending
+                    .with_untracked(|set| set.contains(&agent_id))
+            );
+            assert!(
+                !state
+                    .transient_events
+                    .with_untracked(|map| map.contains_key(&agent_id))
+            );
             state.orchestration.with_untracked(|map| {
                 let log = map.get(&agent_id).expect("replayed orchestration history");
                 assert!(matches!(log.first(), Some(OrchestrationRecord::Event(_))));

@@ -138,10 +138,7 @@ fn target_agent_is_initializing_tracked(
     })
 }
 
-fn target_agent_is_terminated(
-    state: &AppState,
-    agent_ref: Signal<Option<ActiveAgentRef>>,
-) -> bool {
+fn target_agent_is_terminated(state: &AppState, agent_ref: Signal<Option<ActiveAgentRef>>) -> bool {
     let Some(active_agent) = agent_ref.get_untracked() else {
         return false;
     };
@@ -846,8 +843,7 @@ pub fn ChatInput(
     // The dropdown holds items only in specific states (see state matrix):
     // - Fork + send: idle or thinking + input + session
     // - Steer + Cancel: thinking + input (with or without session)
-    let menu_has_items =
-        Memo::new(move |_| can_btw.get() || (can_interrupt() && is_steer.get()));
+    let menu_has_items = Memo::new(move |_| can_btw.get() || (can_interrupt() && is_steer.get()));
     let menu_open = RwSignal::new(false);
     // Auto-dismiss a stale-open menu when its items disappear.
     Effect::new(move |_| {
@@ -1886,7 +1882,10 @@ mod wasm_tests {
             "Terminated",
             "fatal state must outrank stale turn and interrupt state"
         );
-        assert!(p.has_attribute("disabled"), "dead actor cannot be submitted to");
+        assert!(
+            p.has_attribute("disabled"),
+            "dead actor cannot be submitted to"
+        );
         assert!(
             textarea(&container)
                 .get_attribute("placeholder")

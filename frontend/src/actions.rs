@@ -1673,10 +1673,7 @@ mod wasm_tests {
             let state = AppState::new();
             let session_id = SessionId("terminated-session".to_owned());
             state.host_streams.update(|streams| {
-                streams.insert(
-                    "host-a".to_owned(),
-                    StreamPath("/host/host-a".to_owned()),
-                );
+                streams.insert("host-a".to_owned(), StreamPath("/host/host-a".to_owned()));
             });
             state.agents.update(|agents| {
                 agents.push(crate::state::AgentInfo {

@@ -102,8 +102,7 @@ fn AskUserQuestionCard(
     let sending = RwSignal::new(false);
     let send_error = RwSignal::new(None::<String>);
     let fatal_state = state.clone();
-    let target_is_fatal =
-        Memo::new(move |_| target_is_fatal_tracked(&fatal_state, agent_ref));
+    let target_is_fatal = Memo::new(move |_| target_is_fatal_tracked(&fatal_state, agent_ref));
 
     let all_answered = {
         let states = states.clone();
@@ -278,10 +277,7 @@ fn render_question(
 
     let custom = qstate.custom;
     let on_custom_input = move |ev: leptos::ev::Event| {
-        if submitted.get_untracked()
-            || sending.get_untracked()
-            || target_is_fatal.get_untracked()
-        {
+        if submitted.get_untracked() || sending.get_untracked() || target_is_fatal.get_untracked() {
             return;
         }
         custom.set(event_target_value(&ev));
@@ -318,7 +314,7 @@ fn answer_target(
         (a.host_id == agent_ref.host_id
             && a.agent_id == agent_ref.agent_id
             && a.fatal_error.is_none())
-            .then(|| a.instance_stream.clone())
+        .then(|| a.instance_stream.clone())
     });
     let Some(stream) = stream else {
         log::error!(

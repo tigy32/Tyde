@@ -90,8 +90,7 @@ fn ExitPlanModeCard(
         send_error,
     };
     let fatal_state = state.clone();
-    let target_is_fatal =
-        Memo::new(move |_| target_is_fatal_tracked(&fatal_state, agent_ref));
+    let target_is_fatal = Memo::new(move |_| target_is_fatal_tracked(&fatal_state, agent_ref));
 
     let tool_call_id = Arc::new(tool_call_id);
 
@@ -229,7 +228,7 @@ fn decision_target(
         (a.host_id == agent_ref.host_id
             && a.agent_id == agent_ref.agent_id
             && a.fatal_error.is_none())
-            .then(|| a.instance_stream.clone())
+        .then(|| a.instance_stream.clone())
     });
     let Some(stream) = stream else {
         log::error!(

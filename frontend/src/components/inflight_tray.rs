@@ -847,14 +847,11 @@ fn QueuedMessageRow(
             return;
         };
         let agents = state_send.agents.get_untracked();
-        let Some(agent) = agents
-            .iter()
-            .find(|agent| {
-                agent.host_id == active.host_id
-                    && agent.agent_id == active.agent_id
-                    && agent.fatal_error.is_none()
-            })
-        else {
+        let Some(agent) = agents.iter().find(|agent| {
+            agent.host_id == active.host_id
+                && agent.agent_id == active.agent_id
+                && agent.fatal_error.is_none()
+        }) else {
             return;
         };
         let host_id = agent.host_id.clone();
@@ -879,14 +876,11 @@ fn QueuedMessageRow(
             return;
         };
         let agents = state_cancel.agents.get_untracked();
-        let Some(agent) = agents
-            .iter()
-            .find(|agent| {
-                agent.host_id == active.host_id
-                    && agent.agent_id == active.agent_id
-                    && agent.fatal_error.is_none()
-            })
-        else {
+        let Some(agent) = agents.iter().find(|agent| {
+            agent.host_id == active.host_id
+                && agent.agent_id == active.agent_id
+                && agent.fatal_error.is_none()
+        }) else {
             return;
         };
         let host_id = agent.host_id.clone();
@@ -1357,10 +1351,7 @@ mod wasm_tests {
             });
             state.tool_progress.update(|map| {
                 map.insert(
-                    (
-                        parent_ref().agent_id,
-                        ToolCallId("call-fatal".to_owned()),
-                    ),
+                    (parent_ref().agent_id, ToolCallId("call-fatal".to_owned())),
                     ArcRwSignal::new(ToolProgressData {
                         tool_call_id: "call-fatal".to_owned(),
                         tool_name: "Workflow".to_owned(),
