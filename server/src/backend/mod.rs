@@ -2,6 +2,7 @@ pub mod acp;
 pub mod agent_control_progress;
 pub mod antigravity;
 pub mod claude;
+pub mod claude_skills;
 pub mod codex;
 pub mod hermes;
 pub mod hermes_config;

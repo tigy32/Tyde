@@ -28,6 +28,11 @@ use protocol::{
 use crate::backend::turn_emitter::{
     AgentName, AssistantMessagePayload, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
 };
+use crate::agent::customization::{ResolvedSkill, SkillSelection};
+use crate::backend::claude_skills::{
+    ClaudePluginFlag, ClaudeSkillPlugin, help_text_supports_plugin_dir, missing_from_init_frame,
+    native_skill_overlay, stderr_rejects_no_mcp_flag, unsupported_plugin_dir_error,
+};
 use crate::backend::{
     AgentIdentity, READ_ONLY_ACCESS_MODE_INSTRUCTIONS, SessionCommand, StartupMcpServer,
     StartupMcpTransport,
@@ -188,6 +193,7 @@ struct ClaudeSpawnMode<'a> {
     agent_identity: Option<&'a AgentIdentity>,
     tool_policy: ToolPolicy,
     access_mode: BackendAccessMode,
+    skills: ClaudeSkillExposure,
 }
 
 struct ClaudeForkConfig<'a> {
@@ -198,6 +204,85 @@ struct ClaudeForkConfig<'a> {
     agent_identity: Option<&'a AgentIdentity>,
     tool_policy: ToolPolicy,
     access_mode: BackendAccessMode,
+    skills: ClaudeSkillExposure,
+}
+
+/// What the session ended up doing about skills, carried from the one place
+/// that materializes into the session state that outlives every respawn.
+#[derive(Default)]
+struct ClaudeSkillExposure {
+    plugin: Option<Arc<ClaudeSkillPlugin>>,
+    expected: Vec<String>,
+    /// Skills that were selected but not exposed, and why. Reported to the
+    /// user once the session is up; never swallowed.
+    warnings: Vec<String>,
+}
+
+/// Decide how a Claude session exposes its selected skills, and materialize the
+/// session plugin when it is a local session.
+///
+/// Failure to materialize fails the spawn. There is deliberately no fallback to
+/// pasting bodies into a local prompt: that is the behaviour this work removes,
+/// and doing it silently on a capability miss would make the regression
+/// invisible.
+async fn claude_prepare_skills(
+    config: &BackendSpawnConfig,
+    workspace_roots: &[String],
+) -> Result<(ClaudeSkillExposure, ClaudeSkillSteering), String> {
+    let selected = &config.resolved_spawn_config.skills;
+    if selected.is_empty() {
+        return Ok((ClaudeSkillExposure::default(), ClaudeSkillSteering::None));
+    }
+
+    // A plugin root materialized on this machine is invisible to a remote CLI,
+    // so remote sessions keep inline bodies rather than losing their skills.
+    if crate::remote::parse_remote_workspace_roots(workspace_roots)?.is_some() {
+        return Ok((
+            ClaudeSkillExposure::default(),
+            ClaudeSkillSteering::LegacyInlineBodies,
+        ));
+    }
+
+    if !claude_supports_plugin_dir().await {
+        return Err(unsupported_plugin_dir_error());
+    }
+
+    let parent = std::env::temp_dir();
+    let dir_name = format!("tyde-claude-skills-{}", uuid::Uuid::new_v4());
+    let (plugin, warnings) =
+        ClaudeSkillPlugin::materialize_with_warnings(&parent, &dir_name, selected)?;
+    for warning in &warnings {
+        tracing::warn!("Claude skill materialization: {warning}");
+    }
+
+    let Some(plugin) = plugin else {
+        // Every selected skill was refused. Start without skills rather than
+        // pointing the CLI at an empty root, but keep the reasons.
+        return Ok((
+            ClaudeSkillExposure {
+                plugin: None,
+                expected: Vec::new(),
+                warnings,
+            },
+            ClaudeSkillSteering::None,
+        ));
+    };
+
+    let expected = plugin.exposed().to_vec();
+    tracing::debug!(
+        "Claude session exposes {} skill(s) via {}: {}",
+        expected.len(),
+        plugin.root().display(),
+        expected.join(", ")
+    );
+    Ok((
+        ClaudeSkillExposure {
+            plugin: Some(Arc::new(plugin)),
+            expected,
+            warnings,
+        },
+        ClaudeSkillSteering::Native(config.resolved_spawn_config.skill_selection),
+    ))
 }
 
 impl ClaudeSession {
@@ -210,6 +295,32 @@ impl ClaudeSession {
         tool_policy: ToolPolicy,
         access_mode: BackendAccessMode,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
+        Self::spawn_with_skills(
+            workspace_roots,
+            ssh_host,
+            startup_mcp_servers,
+            steering_content,
+            agent_identity,
+            tool_policy,
+            access_mode,
+            ClaudeSkillExposure::default(),
+        )
+        .await
+    }
+
+    /// [`spawn`](Self::spawn), taking ownership of the session's inline skill
+    /// plugin so the root outlives every process the session starts.
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_with_skills(
+        workspace_roots: &[String],
+        ssh_host: Option<String>,
+        startup_mcp_servers: &[StartupMcpServer],
+        steering_content: Option<&str>,
+        agent_identity: Option<&AgentIdentity>,
+        tool_policy: ToolPolicy,
+        access_mode: BackendAccessMode,
+        skills: ClaudeSkillExposure,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
             ClaudeSpawnMode {
@@ -221,6 +332,7 @@ impl ClaudeSession {
                 agent_identity,
                 tool_policy,
                 access_mode,
+                skills,
             },
         )
         .await
@@ -246,6 +358,7 @@ impl ClaudeSession {
                 agent_identity,
                 tool_policy,
                 access_mode,
+                skills: ClaudeSkillExposure::default(),
             },
         )
         .await
@@ -268,6 +381,7 @@ impl ClaudeSession {
                 agent_identity: fork_config.agent_identity,
                 tool_policy: fork_config.tool_policy,
                 access_mode: fork_config.access_mode,
+                skills: fork_config.skills,
             },
         )
         .await
@@ -290,6 +404,11 @@ impl ClaudeSession {
             (pick_workspace_root(workspace_roots)?, None)
         };
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let ClaudeSkillExposure {
+            plugin: skill_plugin,
+            expected: expected_skills,
+            warnings: skill_warnings,
+        } = mode.skills;
 
         let inner = Arc::new(ClaudeInner {
             emitter: Arc::new(TurnEmitter::new_for_agent(
@@ -312,6 +431,9 @@ impl ClaudeSession {
                 steering_content: mode.steering_content.map(|s| s.to_string()),
                 agent_identity: mode.agent_identity.cloned(),
                 tool_policy: mode.tool_policy,
+                skill_plugin,
+                expected_skills,
+                skills_verified: false,
                 cumulative_usage: None,
                 cumulative_usage_complete: true,
                 conversation_bytes_total: 0,
@@ -327,7 +449,15 @@ impl ClaudeSession {
             runtime: Mutex::new(None),
             turn_event_gate: Mutex::new(()),
             task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
+            plugin_flag_rejection_seen: std::sync::atomic::AtomicBool::new(false),
         });
+
+        // A refused skill is a user-visible fact, not a log line. The channel
+        // is unbounded and the receiver is handed back below, so these arrive
+        // even though nothing is listening yet.
+        for warning in &skill_warnings {
+            inner.emitter.subprocess_stderr(warning);
+        }
 
         Ok((Self { inner }, event_rx))
     }
@@ -449,6 +579,16 @@ struct ClaudeState {
     steering_content: Option<String>,
     agent_identity: Option<AgentIdentity>,
     tool_policy: ToolPolicy,
+    /// This session's inline skill plugin, owned for the whole session so a
+    /// respawn or a post-turn restart reuses the same root. Dropping the state
+    /// unlinks it.
+    skill_plugin: Option<Arc<ClaudeSkillPlugin>>,
+    /// `tyde-skills:<name>` for every skill Tyde materialized, checked against
+    /// the CLI's `init` frame.
+    expected_skills: Vec<String>,
+    /// Set once the first `init` frame has been checked, so a respawn does not
+    /// re-warn about the same session.
+    skills_verified: bool,
     cumulative_usage: Option<Value>,
     cumulative_usage_complete: bool,
     conversation_bytes_total: u64,
@@ -489,6 +629,9 @@ impl Default for ClaudeState {
             steering_content: None,
             agent_identity: None,
             tool_policy: ToolPolicy::Unrestricted,
+            skill_plugin: None,
+            expected_skills: Vec::new(),
+            skills_verified: false,
             cumulative_usage: None,
             cumulative_usage_complete: true,
             conversation_bytes_total: 0,
@@ -514,6 +657,10 @@ struct ClaudeInner {
     runtime: Mutex<Option<ClaudeProcessRuntime>>,
     turn_event_gate: Mutex<()>,
     task_tracker: StdMutex<ClaudeTaskTracker>,
+    /// Set by the stderr reader when the CLI names `--plugin-dir-no-mcp` as an
+    /// unknown option. Read and cleared by the spawn path, which is the only
+    /// place that can act on it.
+    plugin_flag_rejection_seen: std::sync::atomic::AtomicBool,
 }
 
 struct ClaudeProcessRuntime {
@@ -684,6 +831,11 @@ struct ClaudeSystemFrame {
     path: Option<String>,
     #[serde(default)]
     workflow_name: Option<String>,
+    /// Skills the CLI actually loaded, on `init` frames. Emitted locally
+    /// before any provider request, so checking it against what Tyde
+    /// materialized costs nothing.
+    #[serde(default)]
+    skills: Option<Vec<String>>,
     /// Partial-update object on `task_updated` frames. Only `status` is
     /// consumed; the CLI also sends fields like `end_time`.
     #[serde(default)]
@@ -785,6 +937,17 @@ impl ClaudeSystemFrame {
             other => ClaudeSystemEvent::Unknown(other.to_string()),
         }
     }
+}
+
+/// Skills reported by a `system`/`init` frame, or `None` for any other frame.
+fn claude_init_frame_skills(value: &Value) -> Option<Vec<String>> {
+    if value.get("type").and_then(Value::as_str) != Some("system")
+        || value.get("subtype").and_then(Value::as_str) != Some("init")
+    {
+        return None;
+    }
+    let frame = parse_claude_system_frame(value).ok()?;
+    frame.skills
 }
 
 fn parse_claude_system_frame(value: &Value) -> Result<ClaudeSystemFrame, String> {
@@ -1023,6 +1186,11 @@ struct ClaudeProcessSpawnConfig {
     steering_content: Option<String>,
     agent_identity: Option<AgentIdentity>,
     tool_policy: ToolPolicy,
+    /// Root of this session's inline skill plugin. Rebuilt into every process
+    /// config from `ClaudeState`, so a respawned or forked process points at
+    /// the same root the session already materialized. `None` for SSH sessions
+    /// and for sessions with no exposable skill.
+    skill_plugin_root: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1871,9 +2039,17 @@ impl ClaudeInner {
                 steering_content: state.steering_content.clone(),
                 agent_identity: state.agent_identity.clone(),
                 tool_policy: state.tool_policy.clone(),
+                // Rebuilt from session state on every process start, so a
+                // respawn after a crash or a post-turn restart points at the
+                // root this session already materialized.
+                skill_plugin_root: state
+                    .skill_plugin
+                    .as_ref()
+                    .map(|plugin| plugin.root().to_string_lossy().into_owned()),
             }
         };
 
+        let flag_before_spawn = active_plugin_flag();
         let runtime = self.spawn_process(config).await?;
         #[cfg(test)]
         let spawned_pid = {
@@ -1905,10 +2081,16 @@ impl ClaudeInner {
             }
             Ok(Err(err)) => {
                 self.shutdown_process().await;
+                if self.should_retry_after_plugin_flag_downgrade(flag_before_spawn) {
+                    return Box::pin(self.ensure_process_ready()).await;
+                }
                 Err(err)
             }
             Err(_) => {
                 self.shutdown_process().await;
+                if self.should_retry_after_plugin_flag_downgrade(flag_before_spawn) {
+                    return Box::pin(self.ensure_process_ready()).await;
+                }
                 Err("Timed out initializing Claude CLI control protocol".to_string())
             }
         }
@@ -2170,6 +2352,70 @@ impl ClaudeInner {
         } else {
             false
         }
+    }
+
+    /// Did this attempt's failure come from the CLI rejecting
+    /// `--plugin-dir-no-mcp` by name, leaving a downgraded flag to retry with?
+    ///
+    /// Only the caller that observed the latch flip retries, and only when it
+    /// spawned with the flag that was rejected, so a genuine startup failure is
+    /// never retried and a concurrent session never retries on another's
+    /// behalf.
+    fn should_retry_after_plugin_flag_downgrade(&self, flag_before_spawn: ClaudePluginFlag) -> bool {
+        if flag_before_spawn != ClaudePluginFlag::NoMcp {
+            return false;
+        }
+        if !self.plugin_flag_rejection_seen.swap(false, Ordering::Relaxed) {
+            return false;
+        }
+        if !latch_plugin_flag_rejection() {
+            // Another session already downgraded; it owns the retry, but this
+            // one still needs a process, so retry here too rather than
+            // reporting a failure caused by a flag we no longer pass.
+            tracing::warn!(
+                "Claude CLI rejected --plugin-dir-no-mcp; retrying with --plugin-dir"
+            );
+            return true;
+        }
+        tracing::warn!(
+            "Claude CLI rejected --plugin-dir-no-mcp; falling back to --plugin-dir \
+             for the rest of this process"
+        );
+        true
+    }
+
+    /// Check the CLI's `init` frame against what Tyde materialized.
+    ///
+    /// The frame is produced locally before any provider request, so this costs
+    /// nothing. A missing name means the CLI dropped the skill — most likely a
+    /// collision with a user-owned skill of the same name, which the CLI
+    /// resolves in the user's favour and logs only at debug level.
+    async fn verify_skills_from_init_frame(&self, reported: &[String]) {
+        let expected = {
+            let mut state = self.state.lock().await;
+            if state.skills_verified || state.expected_skills.is_empty() {
+                return;
+            }
+            state.skills_verified = true;
+            state.expected_skills.clone()
+        };
+        let missing = missing_from_init_frame(&expected, reported);
+        if missing.is_empty() {
+            tracing::debug!(
+                "Claude reported all {} Tyde skill(s) in its init frame",
+                expected.len()
+            );
+            return;
+        }
+        let message = format!(
+            "Claude did not load {} Tyde skill(s): {}. The most likely cause is a name \
+             collision with a skill already installed in Claude, which Claude resolves in \
+             favour of its own copy. Rename the Tyde skill to expose it.",
+            missing.len(),
+            missing.join(", ")
+        );
+        tracing::warn!("{message}");
+        self.emitter.subprocess_stderr(&message);
     }
 
     async fn take_restart_process_after_turn(&self) -> bool {
@@ -2508,6 +2754,16 @@ impl ClaudeInner {
         self.state.lock().await.closing = true;
         self.cancel_active_turn().await;
         self.shutdown_process().await;
+        // Unlink the session plugin root once the CLI that was reading it is
+        // gone. Dropping the last `Arc` would do this anyway, but a session can
+        // outlive its shutdown in a caller's hands, and leaving a root in
+        // TMPDIR until then is a leak the user can see.
+        let plugin = self.state.lock().await.skill_plugin.take();
+        if let Some(plugin) = plugin
+            && let Err(err) = plugin.cleanup()
+        {
+            tracing::warn!("Failed to clean up Claude skill plugin: {err}");
+        }
     }
 
     fn emit_typing_status(&self, typing: bool) {
@@ -2791,6 +3047,68 @@ fn claude_binary() -> String {
         .unwrap_or_else(|| "claude".to_string())
 }
 
+/// Latched when a CLI rejects `--plugin-dir-no-mcp` by name. The hidden flag
+/// cannot be probed from `--help` (it is undocumented in 2.1.220 even though it
+/// works), so preference plus a named-rejection fallback is the only honest
+/// detection. One latch per server process: a CLI does not change under us, and
+/// re-learning it per session would spend a failed spawn every time.
+static CLAUDE_PLUGIN_FLAG_REJECTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn active_plugin_flag() -> ClaudePluginFlag {
+    if CLAUDE_PLUGIN_FLAG_REJECTED.load(Ordering::Relaxed) {
+        ClaudePluginFlag::PluginDir
+    } else {
+        ClaudePluginFlag::NoMcp
+    }
+}
+
+/// Returns true when this call is the one that flipped the latch, so exactly
+/// one caller retries the spawn.
+fn latch_plugin_flag_rejection() -> bool {
+    !CLAUDE_PLUGIN_FLAG_REJECTED.swap(true, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+fn reset_plugin_flag_latch() {
+    CLAUDE_PLUGIN_FLAG_REJECTED.store(false, Ordering::Relaxed);
+}
+
+/// Does the local CLI advertise `--plugin-dir`?
+///
+/// Cached per server process. A missing binary or a failed probe is reported as
+/// "unsupported" rather than assumed working, so the failure surfaces as a
+/// named capability error instead of an opaque CLI exit at spawn time.
+async fn claude_supports_plugin_dir() -> bool {
+    static SUPPORTED: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+    *SUPPORTED
+        .get_or_init(|| async {
+            let mut cmd = Command::new(claude_binary());
+            cmd.arg("--help");
+            if let Some(path) = process_env::resolved_child_process_path() {
+                cmd.env("PATH", path);
+            }
+            match cmd.output().await {
+                Ok(output) => {
+                    let help = String::from_utf8_lossy(&output.stdout);
+                    let supported = help_text_supports_plugin_dir(&help);
+                    if !supported {
+                        tracing::warn!(
+                            "Claude CLI --help does not advertise --plugin-dir; \
+                             Tyde skills cannot be exposed natively"
+                        );
+                    }
+                    supported
+                }
+                Err(err) => {
+                    tracing::warn!("Failed to probe Claude CLI for --plugin-dir support: {err}");
+                    false
+                }
+            }
+        })
+        .await
+}
+
 async fn write_json_line_to_stdin(
     stdin: &Arc<Mutex<ChildStdin>>,
     value: &Value,
@@ -2843,6 +3161,15 @@ fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Vec<String> {
     if let Some(model_name) = config.model.as_deref().and_then(normalize_nonempty) {
         cli_args.push("--model".to_string());
         cli_args.push(model_name);
+    }
+
+    if let Some(plugin_root) = config
+        .skill_plugin_root
+        .as_deref()
+        .and_then(normalize_nonempty)
+    {
+        cli_args.push(active_plugin_flag().as_str().to_string());
+        cli_args.push(plugin_root);
     }
 
     if let Some(effort_level) = config.effort {
@@ -3187,6 +3514,14 @@ async fn read_claude_stdout_persistent(
         }
         if respond_to_control_request(&value, &stdin).await {
             continue;
+        }
+
+        // The `init` frame is produced locally before any provider request and
+        // lists the skills the CLI actually loaded, so this is a free check
+        // that what Tyde materialized survived collision resolution. It is not
+        // `continue`d: the frame still flows to the per-turn reducer.
+        if let Some(reported) = claude_init_frame_skills(&value) {
+            inner.verify_skills_from_init_frame(&reported).await;
         }
 
         if handle_workflow_task_frame(&value, &mut workflow_runs, &inner.emitter) {
@@ -4047,6 +4382,11 @@ async fn read_claude_stderr_persistent(stderr: ChildStderr, inner: Arc<ClaudeInn
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         tracing::debug!("Claude stderr: {line}");
+        if stderr_rejects_no_mcp_flag(&line) {
+            inner
+                .plugin_flag_rejection_seen
+                .store(true, Ordering::Relaxed);
+        }
         inner.emitter.subprocess_stderr(&line);
     }
 }
@@ -4185,6 +4525,7 @@ async fn ensure_subagent_stream(
         runtime: Mutex::new(None),
         turn_event_gate: Mutex::new(()),
         task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
+            plugin_flag_rejection_seen: std::sync::atomic::AtomicBool::new(false),
     });
     let sa_message_id = format!("subagent-{}", tool_use_id);
 
@@ -9335,7 +9676,19 @@ impl ClaudeBackend {
         let command_handle_task = Arc::clone(&command_handle);
 
         tokio::spawn(async move {
-            let steering_content = claude_steering_content(&config);
+            // Materialize before the process starts: a capability miss or a
+            // failed symlink farm must fail the spawn, not start a session that
+            // silently has no skills.
+            let (skills, skill_steering) =
+                match claude_prepare_skills(&config, &workspace_roots).await {
+                    Ok(prepared) => prepared,
+                    Err(err) => {
+                        tracing::error!("Failed to prepare Claude skills: {err}");
+                        let _ = ready_tx.send(Err(err));
+                        return;
+                    }
+                };
+            let steering_content = claude_steering_content(&config, skill_steering);
             let agent_identity = claude_agent_identity(&config);
             let session_result = if let Some(from_session_id) = fork_from_session_id.as_ref() {
                 ClaudeSession::fork(
@@ -9348,11 +9701,14 @@ impl ClaudeBackend {
                         agent_identity: agent_identity.as_ref(),
                         tool_policy: config.resolved_spawn_config.tool_policy.clone(),
                         access_mode: config.resolved_spawn_config.access_mode,
+                        // A fork is a new CLI process, so it needs its own
+                        // handle on the same root the session materialized.
+                        skills,
                     },
                 )
                 .await
             } else {
-                ClaudeSession::spawn(
+                ClaudeSession::spawn_with_skills(
                     &workspace_roots,
                     None,
                     &config.startup_mcp_servers,
@@ -9360,6 +9716,7 @@ impl ClaudeBackend {
                     agent_identity.as_ref(),
                     config.resolved_spawn_config.tool_policy.clone(),
                     config.resolved_spawn_config.access_mode,
+                    skills,
                 )
                 .await
             };
@@ -9625,7 +9982,26 @@ fn claude_agent_identity(config: &BackendSpawnConfig) -> Option<AgentIdentity> {
     })
 }
 
-fn claude_steering_content(config: &BackendSpawnConfig) -> Option<String> {
+/// How this session tells the model about skills.
+///
+/// Locally the model discovers them itself and the overlay is guidance only —
+/// no names for the Default agent, compact names for an explicit selection, and
+/// never a body. Over SSH there is no discovery seam, so the bodies are the
+/// message.
+enum ClaudeSkillSteering {
+    /// No skill was exposed. Emits nothing.
+    None,
+    /// Local session with a materialized plugin.
+    Native(SkillSelection),
+    /// SSH session: bodies inline, because a locally materialized plugin
+    /// directory does not exist on the remote host.
+    LegacyInlineBodies,
+}
+
+fn claude_steering_content(
+    config: &BackendSpawnConfig,
+    skills: ClaudeSkillSteering,
+) -> Option<String> {
     let mut sections = Vec::new();
     if config.resolved_spawn_config.access_mode == BackendAccessMode::ReadOnly {
         sections.push(READ_ONLY_ACCESS_MODE_INSTRUCTIONS.to_string());
@@ -9639,20 +10015,66 @@ fn claude_steering_content(config: &BackendSpawnConfig) -> Option<String> {
                 .to_string(),
         );
     }
-    if !config.resolved_spawn_config.skills.is_empty() {
-        let skills = config
-            .resolved_spawn_config
-            .skills
-            .iter()
-            .map(|skill| format!("Skill: {}\n{}", skill.name, skill.body.trim()))
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        sections.push(skills);
+    let selected = &config.resolved_spawn_config.skills;
+    if !selected.is_empty() {
+        match skills {
+            ClaudeSkillSteering::None => {}
+            ClaudeSkillSteering::Native(selection) => {
+                sections.push(native_skill_overlay(selection, selected));
+            }
+            ClaudeSkillSteering::LegacyInlineBodies => {
+                if let Some(block) = claude_legacy_inline_skill_block(selected) {
+                    sections.push(block);
+                }
+            }
+        }
     }
     if sections.is_empty() {
         None
     } else {
         Some(sections.join("\n\n"))
+    }
+}
+
+/// Inline every selected skill body, for SSH sessions only.
+///
+/// A session plugin is materialized on the machine Tyde runs on, and the remote
+/// CLI cannot see it, so remote sessions keep the pre-native behaviour rather
+/// than silently losing their skills. This is the one path that still pays for
+/// bodies; it reads them explicitly through `load_body` so it stays greppable,
+/// and warns once so the cost is never invisible. Remote materialization is the
+/// fix.
+fn claude_legacy_inline_skill_block(skills: &[ResolvedSkill]) -> Option<String> {
+    tracing::warn!(
+        "Claude session is remote (SSH): inlining {} skill body/bodies into the system \
+         prompt because a locally materialized plugin directory is invisible to the remote \
+         CLI. Remote skill materialization would remove this cost.",
+        skills.len()
+    );
+    let mut blocks = Vec::new();
+    for skill in skills {
+        match skill.load_body() {
+            Ok(body) if !body.trim().is_empty() => {
+                blocks.push(format!("Skill: {}\n{}", skill.name, body.trim()));
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    "Skill '{}' has an empty SKILL.md; not inlining an empty block",
+                    skill.name
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to read skill '{}' for a remote Claude session: {err}",
+                    skill.name
+                );
+            }
+        }
+    }
+    if blocks.is_empty() {
+        None
+    } else {
+        Some(blocks.join("\n\n"))
     }
 }
 
@@ -10264,9 +10686,12 @@ impl Backend for ClaudeBackend {
             Arc::new(std::sync::Mutex::new(Some(SessionId(session_id.clone()))));
         let backend_session_id_task = Arc::clone(&backend_session_id);
 
-        let steering_content = claude_steering_content(&config);
+        // A resumed session gets its own plugin root: the previous session's
+        // was unlinked when it shut down.
+        let (skills, skill_steering) = claude_prepare_skills(&config, &workspace_roots).await?;
+        let steering_content = claude_steering_content(&config, skill_steering);
         let agent_identity = claude_agent_identity(&config);
-        let (session, mut raw_events) = ClaudeSession::spawn(
+        let (session, mut raw_events) = ClaudeSession::spawn_with_skills(
             &workspace_roots,
             None,
             &config.startup_mcp_servers,
@@ -10274,6 +10699,7 @@ impl Backend for ClaudeBackend {
             agent_identity.as_ref(),
             config.resolved_spawn_config.tool_policy.clone(),
             config.resolved_spawn_config.access_mode,
+            skills,
         )
         .await
         .map_err(|err| format!("Failed to spawn Claude resume session: {err}"))?;
@@ -10603,6 +11029,9 @@ mod tests {
                 steering_content: None,
                 agent_identity: None,
                 tool_policy: ToolPolicy::Unrestricted,
+                skill_plugin: None,
+                expected_skills: Vec::new(),
+                skills_verified: false,
                 cumulative_usage: None,
                 cumulative_usage_complete: true,
                 conversation_bytes_total: 0,
@@ -10618,6 +11047,7 @@ mod tests {
             runtime: Mutex::new(None),
             turn_event_gate: Mutex::new(()),
             task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
+            plugin_flag_rejection_seen: std::sync::atomic::AtomicBool::new(false),
         };
         (inner, event_rx)
     }
@@ -11070,17 +11500,323 @@ mod tests {
 
     #[test]
     fn claude_read_only_steering_includes_shared_advisory() {
-        let steering = claude_steering_content(&BackendSpawnConfig {
-            resolved_spawn_config: crate::agent::customization::ResolvedSpawnConfig {
-                access_mode: BackendAccessMode::ReadOnly,
+        let steering = claude_steering_content(
+            &BackendSpawnConfig {
+                resolved_spawn_config: crate::agent::customization::ResolvedSpawnConfig {
+                    access_mode: BackendAccessMode::ReadOnly,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
-            ..Default::default()
-        })
+            ClaudeSkillSteering::None,
+        )
         .expect("read-only advisory");
 
         assert!(steering.contains("Backend access mode is read-only (best effort)"));
         assert!(steering.contains("do not create, edit, or delete files"));
+    }
+
+    /// A spawn config with only the fields a skill test cares about set.
+    fn skill_spawn_config(skill_plugin_root: Option<String>) -> ClaudeProcessSpawnConfig {
+        ClaudeProcessSpawnConfig {
+            workspace_root: "/tmp/workspace".to_string(),
+            ssh_host: None,
+            session_id: None,
+            fork_from_session_id: None,
+            resume_existing_session: false,
+            ephemeral: false,
+            model: None,
+            effort: None,
+            permission_mode: None,
+            startup_mcp_config_json: None,
+            steering_content: None,
+            agent_identity: None,
+            tool_policy: ToolPolicy::Unrestricted,
+            skill_plugin_root,
+        }
+    }
+
+    fn skill_fixture(dir: &std::path::Path, name: &str, body: &str) -> ResolvedSkill {
+        let source_dir = dir.join(name);
+        std::fs::create_dir_all(&source_dir).expect("create skill dir");
+        let skill_md_path = source_dir.join("SKILL.md");
+        std::fs::write(&skill_md_path, body).expect("write SKILL.md");
+        ResolvedSkill {
+            id: protocol::SkillId(name.to_string()),
+            name: name.to_string(),
+            title: None,
+            description: Some(format!("{name} summary")),
+            source_dir,
+            skill_md_path,
+            // Native delivery never populates this; the tests below prove the
+            // adapter does not depend on it either.
+            body: String::new(),
+        }
+    }
+
+    fn spawn_config_with_skills(
+        skills: Vec<ResolvedSkill>,
+        skill_selection: SkillSelection,
+    ) -> BackendSpawnConfig {
+        BackendSpawnConfig {
+            resolved_spawn_config: crate::agent::customization::ResolvedSpawnConfig {
+                skills,
+                skill_selection,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn claude_cli_args_pass_the_session_plugin_root() {
+        reset_plugin_flag_latch();
+        let args = build_claude_cli_args(&skill_spawn_config(Some(
+            "/tmp/tyde-claude-skills-abc".to_string(),
+        )));
+
+        assert!(
+            args.windows(2).any(|pair| pair[0] == "--plugin-dir-no-mcp"
+                && pair[1] == "/tmp/tyde-claude-skills-abc"),
+            "expected the no-MCP plugin flag by default, got {args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "--add-dir"),
+            "the plugin root must not also be granted as a filesystem root"
+        );
+    }
+
+    #[test]
+    fn claude_cli_args_omit_the_plugin_flag_without_a_root() {
+        reset_plugin_flag_latch();
+        let args = build_claude_cli_args(&skill_spawn_config(None));
+
+        assert!(
+            !args.iter().any(|arg| arg.starts_with("--plugin-dir")),
+            "a session with no exposed skill must not point the CLI at a root: {args:?}"
+        );
+    }
+
+    #[test]
+    fn claude_cli_args_downgrade_after_the_cli_rejects_the_hidden_flag() {
+        reset_plugin_flag_latch();
+        assert_eq!(active_plugin_flag(), ClaudePluginFlag::NoMcp);
+        assert!(
+            latch_plugin_flag_rejection(),
+            "the first rejection owns the downgrade"
+        );
+        assert!(
+            !latch_plugin_flag_rejection(),
+            "a second rejection must not claim the downgrade again"
+        );
+
+        let args = build_claude_cli_args(&skill_spawn_config(Some("/tmp/root".to_string())));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--plugin-dir" && pair[1] == "/tmp/root"),
+            "after a named rejection the documented flag is used: {args:?}"
+        );
+        assert!(!args.iter().any(|arg| arg == "--plugin-dir-no-mcp"));
+        reset_plugin_flag_latch();
+    }
+
+    #[test]
+    fn default_sessions_get_guidance_without_bodies_or_enumeration() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skills = vec![
+            skill_fixture(tmp.path(), "alpha", "---\nname: alpha\n---\nBODYMARK-11aa22\n"),
+            skill_fixture(tmp.path(), "beta", "---\nname: beta\n---\nBODYMARK-33bb44\n"),
+        ];
+        let config = spawn_config_with_skills(skills, SkillSelection::AllInstalled);
+
+        let steering = claude_steering_content(
+            &config,
+            ClaudeSkillSteering::Native(SkillSelection::AllInstalled),
+        )
+        .expect("skill guidance");
+
+        assert!(steering.contains("tyde-skills:<name>"));
+        assert!(
+            !steering.contains("BODYMARK-11aa22") && !steering.contains("BODYMARK-33bb44"),
+            "no body may reach the system prompt: {steering}"
+        );
+        assert!(
+            !steering.contains("Skill: "),
+            "the legacy per-skill block must be gone: {steering}"
+        );
+        assert!(
+            !steering.contains("alpha") && !steering.contains("beta"),
+            "the Default overlay must not enumerate installed skills: {steering}"
+        );
+    }
+
+    #[test]
+    fn explicit_selections_name_their_skills_without_bodies() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skills = vec![skill_fixture(
+            tmp.path(),
+            "lint",
+            "---\nname: lint\n---\nBODYMARK-55cc66\n",
+        )];
+        let config = spawn_config_with_skills(skills, SkillSelection::Explicit);
+
+        let steering =
+            claude_steering_content(&config, ClaudeSkillSteering::Native(SkillSelection::Explicit))
+                .expect("skill listing");
+
+        assert!(steering.contains("lint"), "{steering}");
+        assert!(steering.contains("lint summary"), "{steering}");
+        assert!(!steering.contains("BODYMARK-55cc66"), "{steering}");
+        assert!(!steering.contains("Skill: "), "{steering}");
+    }
+
+    #[test]
+    fn a_session_with_no_exposed_skill_emits_no_skill_section() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skills = vec![skill_fixture(
+            tmp.path(),
+            "alpha",
+            "---\nname: alpha\n---\nBODYMARK-77dd88\n",
+        )];
+        let config = spawn_config_with_skills(skills, SkillSelection::AllInstalled);
+
+        assert!(
+            claude_steering_content(&config, ClaudeSkillSteering::None).is_none(),
+            "a refused-everything session must not invent a skills section"
+        );
+    }
+
+    #[test]
+    fn ssh_sessions_keep_inline_bodies_rather_than_losing_skills() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skills = vec![
+            skill_fixture(tmp.path(), "alpha", "---\nname: alpha\n---\nBODYMARK-99ee00\n"),
+            skill_fixture(tmp.path(), "beta", "---\nname: beta\n---\nBODYMARK-aabbcc\n"),
+        ];
+        let config = spawn_config_with_skills(skills, SkillSelection::AllInstalled);
+
+        let steering =
+            claude_steering_content(&config, ClaudeSkillSteering::LegacyInlineBodies)
+                .expect("inline bodies for the remote branch");
+
+        // A local plugin dir is invisible to a remote CLI, so the remote branch
+        // must still carry the text — read through load_body, not from the
+        // resolved config, which no longer holds one.
+        assert!(steering.contains("Skill: alpha"), "{steering}");
+        assert!(steering.contains("BODYMARK-99ee00"), "{steering}");
+        assert!(steering.contains("Skill: beta"), "{steering}");
+        assert!(steering.contains("BODYMARK-aabbcc"), "{steering}");
+    }
+
+    #[test]
+    fn a_remote_skill_that_cannot_be_read_does_not_emit_an_empty_block() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let readable = skill_fixture(tmp.path(), "alpha", "---\nname: alpha\n---\nBODYMARK-ddeeff\n");
+        let missing = skill_fixture(tmp.path(), "gone", "---\nname: gone\n---\nbody\n");
+        std::fs::remove_file(&missing.skill_md_path).expect("remove SKILL.md");
+        let config = spawn_config_with_skills(vec![readable, missing], SkillSelection::AllInstalled);
+
+        let steering = claude_steering_content(&config, ClaudeSkillSteering::LegacyInlineBodies)
+            .expect("the readable skill still inlines");
+
+        assert!(steering.contains("BODYMARK-ddeeff"), "{steering}");
+        assert!(
+            !steering.contains("Skill: gone"),
+            "an unreadable skill must not become an empty 'Skill: <name>' block: {steering}"
+        );
+    }
+
+    #[test]
+    fn init_frame_skills_are_read_only_from_init_frames() {
+        let init = json!({
+            "type": "system",
+            "subtype": "init",
+            "skills": ["tyde-skills:alpha", "code-review"],
+        });
+        assert_eq!(
+            claude_init_frame_skills(&init),
+            Some(vec![
+                "tyde-skills:alpha".to_string(),
+                "code-review".to_string()
+            ])
+        );
+
+        assert_eq!(
+            claude_init_frame_skills(&json!({"type": "system", "subtype": "status"})),
+            None
+        );
+        assert_eq!(
+            claude_init_frame_skills(&json!({"type": "assistant", "skills": ["x"]})),
+            None,
+            "only the CLI's own init frame reports loaded skills"
+        );
+        assert_eq!(
+            claude_init_frame_skills(&json!({"type": "system", "subtype": "init"})),
+            None,
+            "an init frame from a CLI that does not report skills is not a failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_respawn_reuses_the_session_plugin_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skills = vec![skill_fixture(tmp.path(), "alpha", "---\nname: alpha\n---\nb\n")];
+        let runtime = tmp.path().join("runtime");
+        std::fs::create_dir_all(&runtime).expect("runtime dir");
+        let (plugin, warnings) =
+            ClaudeSkillPlugin::materialize_with_warnings(&runtime, "session", &skills)
+                .expect("materialize");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let plugin = Arc::new(plugin.expect("a plugin"));
+        let root = plugin.root().to_path_buf();
+
+        let (inner, _rx) = make_test_inner();
+        let inner = Arc::new(inner);
+        inner.state.lock().await.skill_plugin = Some(Arc::clone(&plugin));
+
+        // Two independent process configs, as a respawn would build them.
+        for _ in 0..2 {
+            let state = inner.state.lock().await;
+            let rebuilt = state
+                .skill_plugin
+                .as_ref()
+                .map(|plugin| plugin.root().to_string_lossy().into_owned());
+            assert_eq!(
+                rebuilt,
+                Some(root.to_string_lossy().into_owned()),
+                "every process this session starts must point at the same root"
+            );
+        }
+        assert!(root.exists(), "a respawn must not have unlinked the root");
+    }
+
+    #[tokio::test]
+    async fn shutdown_unlinks_the_plugin_root_but_not_its_targets() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skills = vec![skill_fixture(tmp.path(), "alpha", "---\nname: alpha\n---\nb\n")];
+        let runtime = tmp.path().join("runtime");
+        std::fs::create_dir_all(&runtime).expect("runtime dir");
+        let (plugin, _) =
+            ClaudeSkillPlugin::materialize_with_warnings(&runtime, "session", &skills)
+                .expect("materialize");
+        let plugin = Arc::new(plugin.expect("a plugin"));
+        let root = plugin.root().to_path_buf();
+
+        let (inner, _rx) = make_test_inner();
+        let inner = Arc::new(inner);
+        inner.state.lock().await.skill_plugin = Some(plugin);
+
+        inner.shutdown().await;
+
+        assert!(!root.exists(), "shutdown must unlink the session root");
+        assert!(
+            skills[0].skill_md_path.exists(),
+            "cleanup must never follow a link into the skill store"
+        );
+        assert!(
+            inner.state.lock().await.skill_plugin.is_none(),
+            "shutdown must release the plugin so a later drop is a no-op"
+        );
     }
 
     #[test]
@@ -11099,6 +11835,7 @@ mod tests {
             steering_content: None,
             agent_identity: None,
             tool_policy: ToolPolicy::Unrestricted,
+            skill_plugin_root: None,
         });
 
         assert!(
@@ -11129,6 +11866,7 @@ mod tests {
             steering_content: None,
             agent_identity: None,
             tool_policy: ToolPolicy::Unrestricted,
+            skill_plugin_root: None,
         });
 
         let effort_pairs = args
@@ -11159,6 +11897,7 @@ mod tests {
             steering_content: None,
             agent_identity: None,
             tool_policy: ToolPolicy::Unrestricted,
+            skill_plugin_root: None,
         });
 
         assert!(!args.iter().any(|arg| arg == "--effort"));
@@ -11180,6 +11919,7 @@ mod tests {
             steering_content: None,
             agent_identity: None,
             tool_policy: ToolPolicy::Unrestricted,
+            skill_plugin_root: None,
         });
 
         assert!(
@@ -11211,6 +11951,7 @@ mod tests {
             steering_content: None,
             agent_identity: None,
             tool_policy: ToolPolicy::Unrestricted,
+            skill_plugin_root: None,
         });
 
         assert!(
@@ -18053,6 +18794,9 @@ for raw_line in sys.stdin:
                     steering_content: None,
                     agent_identity: None,
                     tool_policy: ToolPolicy::Unrestricted,
+                    skill_plugin: None,
+                    expected_skills: Vec::new(),
+                    skills_verified: false,
                     cumulative_usage: None,
                     cumulative_usage_complete: true,
                     conversation_bytes_total: 0,
@@ -18068,6 +18812,7 @@ for raw_line in sys.stdin:
                 runtime: Mutex::new(None),
                 turn_event_gate: Mutex::new(()),
                 task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
+            plugin_flag_rejection_seen: std::sync::atomic::AtomicBool::new(false),
             }),
             event_rx,
         )
@@ -20029,6 +20774,7 @@ for raw_line in sys.stdin:
                     runtime: Mutex::new(None),
                     turn_event_gate: Mutex::new(()),
                     task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
+            plugin_flag_rejection_seen: std::sync::atomic::AtomicBool::new(false),
                 }),
                 parent_tool_use_id: "toolu_spawn".to_string(),
                 parent_tool_name: "Task".to_string(),
