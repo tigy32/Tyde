@@ -7373,13 +7373,7 @@ impl HostHandle {
                         format!("unknown host stream {}", host_output_stream.path()),
                     )
                 })?;
-            page_existing_session_list_snapshot(
-                subscriber,
-                cursor,
-                scope,
-                limit,
-                OPERATION,
-            )?
+            page_existing_session_list_snapshot(subscriber, cursor, scope, limit, OPERATION)?
         } else {
             let scope = {
                 let subscriber = state
@@ -19444,9 +19438,9 @@ mod tests {
                     .await
                     .unwrap_or_else(|| panic!("{context} stream closed"));
                 if envelope.kind == FrameKind::SessionSummaryCountUpdated {
-                    return envelope
-                        .parse_payload()
-                        .unwrap_or_else(|error| panic!("invalid {context} count payload: {error}"));
+                    return envelope.parse_payload().unwrap_or_else(|error| {
+                        panic!("invalid {context} count payload: {error}")
+                    });
                 }
             }
         })
@@ -23158,8 +23152,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         while rx.try_recv().is_ok() {}
 
         let (observer_tx, mut observer_rx) = mpsc::unbounded_channel();
-        let observer_path =
-            StreamPath(format!("/host/session-count-observer-{}", Uuid::new_v4()));
+        let observer_path = StreamPath(format!("/host/session-count-observer-{}", Uuid::new_v4()));
         let observer_stream = Stream::new(observer_path.clone(), observer_tx);
         assert!(
             fixture
@@ -23183,11 +23176,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .await
             .expect("subscribe observer");
         loop {
-            if observer_rx
-                .recv()
-                .await
-                .expect("observer SessionList")
-                .kind
+            if observer_rx.recv().await.expect("observer SessionList").kind
                 == FrameKind::SessionList
             {
                 break;
