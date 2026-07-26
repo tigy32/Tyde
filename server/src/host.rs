@@ -22802,6 +22802,21 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .expect("host bootstrap")
             .expect("host stream remains open");
         assert_eq!(bootstrap.kind, FrameKind::HostBootstrap);
+        fixture
+            .host
+            .list_sessions(&host_stream, ListSessionsPayload::default())
+            .await
+            .expect("subscribe to session summary updates");
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let envelope = rx.recv().await.expect("host stream remains open");
+                if envelope.kind == FrameKind::SessionList {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("initial session list");
 
         let (agent_id, session_id) =
             spawn_idle_user_agent(&fixture.host, "count persisted assistant responses").await;
@@ -22902,24 +22917,11 @@ Rules: Record only what remains true and useful for future work; drop transient 
             rebuilt_session_lists, 0,
             "response persistence must not rebuild the full session list"
         );
-        let bootstrap_count = timeout(Duration::from_secs(1), async {
-            loop {
-                let envelope = bootstrap_rx
-                    .recv()
-                    .await
-                    .expect("second host stream remains open");
-                if envelope.kind == FrameKind::SessionSummaryCountUpdated {
-                    let payload: SessionSummaryCountUpdatedPayload =
-                        envelope.parse_payload().expect("second host count payload");
-                    if payload.session_id == session_id && payload.assistant_turn_count == 2 {
-                        break payload;
-                    }
-                }
-            }
-        })
-        .await
-        .expect("bootstrap session list subscribes the second host stream");
-        assert_eq!(bootstrap_count, count_update);
+        assert_no_session_summary_count(
+            &mut bootstrap_rx,
+            "bootstrap-only response-count subscriber",
+        )
+        .await;
         {
             let state = fixture.host.state.lock().await;
             let summary = state
