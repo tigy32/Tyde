@@ -8,12 +8,12 @@ use hmac::{Hmac, Mac};
 use protocol::{
     AGENT_CONTROL_DEFAULT_READ_LIMIT, AGENT_CONTROL_DEFAULT_READ_MAX_BYTES,
     AGENT_CONTROL_MAX_READ_LIMIT, AGENT_CONTROL_MAX_READ_MAX_BYTES, AgentControlReadDebugResult,
-    AgentControlReadResult, AgentControlStatus, AgentId, AgentOrigin, BackendAccessMode, BackendKind,
-    CustomAgentId, GitBranchName, ImageData, LaunchProfileCatalog, LaunchProfileId, ProjectId,
-    ProjectSource, SendMessagePayload, SessionSchemaEntry, SessionSettingsValues, SpawnAgentParams,
-    SpawnAgentPayload, SpawnCostHint, Team, TeamMember, TeamMemberBindingPayload, TeamMemberId,
-    WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowSaveRequest, WorkflowSaveResponse,
-    WorkflowTargetsResponse, cap_agent_control_events,
+    AgentControlReadResult, AgentControlStatus, AgentId, AgentOrigin, BackendAccessMode,
+    BackendKind, CustomAgentId, GitBranchName, ImageData, LaunchProfileCatalog, LaunchProfileId,
+    ProjectId, ProjectSource, SendMessagePayload, SessionSchemaEntry, SessionSettingsValues,
+    SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, Team, TeamMember, TeamMemberBindingPayload,
+    TeamMemberId, WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowSaveRequest,
+    WorkflowSaveResponse, WorkflowTargetsResponse, cap_agent_control_events,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
@@ -2615,8 +2615,7 @@ mod tests {
         assert!(active.is_active());
         assert_eq!(active.status(), AgentControlStatus::Thinking);
 
-        let await_future =
-            do_await_agents_with_progress(&host, vec![agent_id.clone()], None, None);
+        let await_future = do_await_agents_with_progress(&host, vec![agent_id.clone()], None, None);
         tokio::pin!(await_future);
         assert!(
             timeout(Duration::from_millis(50), &mut await_future)
@@ -2802,10 +2801,9 @@ mod tests {
             .expect("compaction-blocked status");
         assert!(!status.is_active());
         assert_eq!(status.status(), AgentControlStatus::Idle);
-        let ready =
-            do_await_agents_with_progress(&host, vec![agent_id.clone()], None, None)
-                .await
-                .expect("compaction-blocked actor remains awaitable");
+        let ready = do_await_agents_with_progress(&host, vec![agent_id.clone()], None, None)
+            .await
+            .expect("compaction-blocked actor remains awaitable");
         assert!(ready.still_thinking.is_empty());
         assert_eq!(ready.ready[0].status, AgentControlStatus::Idle);
         assert_eq!(

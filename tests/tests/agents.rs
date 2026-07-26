@@ -5474,9 +5474,7 @@ async fn agent_control_rejects_relay_delivery_without_wedging_await() {
     let initially_ready = mcp_await_agent(&caller, &child.agent_id).await;
     assert_eq!(initially_ready["ready"][0]["status"], "idle");
     assert_eq!(
-        initially_ready["still_thinking"]
-            .as_array()
-            .map(Vec::len),
+        initially_ready["still_thinking"].as_array().map(Vec::len),
         Some(0)
     );
 
@@ -5516,9 +5514,7 @@ async fn agent_control_rejects_relay_delivery_without_wedging_await() {
     let after_rejection = mcp_await_agent(&caller, &child.agent_id).await;
     assert_eq!(after_rejection["ready"][0]["status"], "idle");
     assert_eq!(
-        after_rejection["still_thinking"]
-            .as_array()
-            .map(Vec::len),
+        after_rejection["still_thinking"].as_array().map(Vec::len),
         Some(0),
         "rejected relay delivery must not leave a speculative Thinking status"
     );
