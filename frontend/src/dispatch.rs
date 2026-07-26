@@ -1176,33 +1176,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     payload.code,
                     payload.message
                 );
-                let error_agent_id = payload.agent_id.clone();
-                if payload.fatal {
-                    state.agents.update(|agents| {
-                        if let Some(agent) = agents.iter_mut().find(|agent| {
-                            agent.host_id == host_id && agent.agent_id == payload.agent_id
-                        }) {
-                            agent.fatal_error = Some(payload.message.clone());
-                        }
-                    });
-                }
-
-                let entry = ChatMessageEntry {
-                    message: protocol::ChatMessage {
-                        message_id: None,
-                        timestamp: js_sys::Date::now() as u64,
-                        sender: protocol::MessageSender::Error,
-                        content: payload.message,
-                        reasoning: None,
-                        tool_calls: Vec::new(),
-                        model_info: None,
-                        token_usage: None,
-                        context_breakdown: None,
-                        images: None,
-                    },
-                    tool_requests: Vec::new(),
-                };
-                state.push_chat_entry(error_agent_id, entry);
+                apply_agent_error(state, host_id, payload);
             }
             Err(error) => report_dispatch_error(
                 state,
@@ -4187,6 +4161,62 @@ fn apply_agent_closed(state: &AppState, host_id: &str, agent_id: AgentId) {
     state.forget_removed_tab_occurrence_state(&removed_from_memory);
 }
 
+fn settle_fatal_agent_ui(state: &AppState, agent_id: &AgentId) {
+    state.streaming_text.update(|map| {
+        map.remove(agent_id);
+    });
+    state.agent_turn_active.update(|map| {
+        map.remove(agent_id);
+    });
+    state.interrupt_pending.update(|pending| {
+        pending.remove(agent_id);
+    });
+    state.transient_events.update(|events| {
+        events.remove(agent_id);
+    });
+    state.orchestration.update(|map| {
+        if let Some(log) = map.get_mut(agent_id)
+            && !matches!(log.last(), Some(OrchestrationRecord::Cancelled))
+        {
+            log.push(OrchestrationRecord::Cancelled);
+        }
+    });
+}
+
+fn apply_agent_error(state: &AppState, host_id: &str, payload: AgentErrorPayload) {
+    let agent_id = payload.agent_id.clone();
+    if payload.fatal {
+        state.agents.update(|agents| {
+            if let Some(agent) = agents
+                .iter_mut()
+                .find(|agent| agent.host_id == host_id && agent.agent_id == agent_id)
+            {
+                agent.fatal_error = Some(payload.message.clone());
+            }
+        });
+        settle_fatal_agent_ui(state, &agent_id);
+    }
+
+    state.push_chat_entry(
+        agent_id,
+        ChatMessageEntry {
+            message: protocol::ChatMessage {
+                message_id: None,
+                timestamp: js_sys::Date::now() as u64,
+                sender: protocol::MessageSender::Error,
+                content: payload.message,
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            },
+            tool_requests: Vec::new(),
+        },
+    );
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TabViewLocation {
     Current {
@@ -5820,32 +5850,7 @@ fn apply_agent_bootstrap(
                 apply_agent_started(state, host_id, &agent_id, inner.session_id);
             }
             AgentBootstrapEvent::AgentError(inner) => {
-                if inner.fatal {
-                    state.agents.update(|agents| {
-                        if let Some(agent) = agents
-                            .iter_mut()
-                            .find(|agent| agent.host_id == host_id && agent.agent_id == agent_id)
-                        {
-                            agent.fatal_error = Some(inner.message.clone());
-                        }
-                    });
-                }
-                let entry = ChatMessageEntry {
-                    message: protocol::ChatMessage {
-                        message_id: None,
-                        timestamp: js_sys::Date::now() as u64,
-                        sender: protocol::MessageSender::Error,
-                        content: inner.message,
-                        reasoning: None,
-                        tool_calls: Vec::new(),
-                        model_info: None,
-                        token_usage: None,
-                        context_breakdown: None,
-                        images: None,
-                    },
-                    tool_requests: Vec::new(),
-                };
-                state.push_chat_entry(agent_id.clone(), entry);
+                apply_agent_error(state, host_id, inner);
             }
             AgentBootstrapEvent::SessionSettings(inner) => {
                 state.agent_session_settings.update(|map| {
@@ -5883,17 +5888,28 @@ fn apply_agent_bootstrap(
             }
         }
     }
-    state.agent_turn_active.update(|map| {
-        if payload.turn_active {
-            map.insert(agent_id.clone(), true);
-        } else {
-            map.remove(&agent_id);
-        }
+    let fatal = state.agents.with_untracked(|agents| {
+        agents.iter().any(|agent| {
+            agent.host_id == host_id
+                && agent.agent_id == agent_id
+                && agent.fatal_error.is_some()
+        })
     });
-    if !payload.turn_active {
-        state.streaming_text.update(|map| {
-            map.remove(&agent_id);
+    if fatal {
+        settle_fatal_agent_ui(state, &agent_id);
+    } else {
+        state.agent_turn_active.update(|map| {
+            if payload.turn_active {
+                map.insert(agent_id.clone(), true);
+            } else {
+                map.remove(&agent_id);
+            }
         });
+        if !payload.turn_active {
+            state.streaming_text.update(|map| {
+                map.remove(&agent_id);
+            });
+        }
     }
 }
 
@@ -7137,6 +7153,220 @@ mod tests {
                     .with_untracked(|map| map.contains_key(&agent_id)),
                 "the authoritative idle marker must not leave the UI thinking forever"
             );
+        });
+    }
+
+    fn fatal_test_agent(host_id: &str, agent_id: &AgentId, stream: &StreamPath) -> AgentInfo {
+        AgentInfo {
+            host_id: host_id.to_owned(),
+            agent_id: agent_id.clone(),
+            name: "Fatal test agent".to_owned(),
+            origin: AgentOrigin::User,
+            backend_kind: protocol::BackendKind::Codex,
+            workspace_roots: Vec::new(),
+            project_id: None,
+            parent_agent_id: None,
+            session_id: None,
+            custom_agent_id: None,
+            workflow: None,
+            created_at_ms: 0,
+            instance_stream: stream.clone(),
+            started: true,
+            fatal_error: None,
+            activity_summary: Default::default(),
+        }
+    }
+
+    fn running_orchestration_event(label: &str) -> protocol::OrchestrationEvent {
+        protocol::OrchestrationEvent {
+            agent_id: protocol::OrchestrationId(label.to_owned()),
+            agent_type: protocol::OrchestrationAgentType("worker".to_owned()),
+            payload: protocol::OrchestrationPayload::AgentStarted {
+                parent_agent_id: None,
+                task_preview: "finish the task".to_owned(),
+                origin: protocol::OrchestrationAgentOrigin::Root,
+                depth: 0,
+                interactive: true,
+                model: None,
+            },
+        }
+    }
+
+    #[test]
+    fn fatal_agent_error_settles_desktop_ui_and_nonfatal_does_not() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host_id = "fatal-host";
+            let fatal_id = AgentId("fatal-agent".to_owned());
+            let recoverable_id = AgentId("recoverable-agent".to_owned());
+            let fatal_stream = StreamPath("/agent/fatal/instance".to_owned());
+            let recoverable_stream = StreamPath("/agent/recoverable/instance".to_owned());
+            state.agents.set(vec![
+                fatal_test_agent(host_id, &fatal_id, &fatal_stream),
+                fatal_test_agent(host_id, &recoverable_id, &recoverable_stream),
+            ]);
+
+            for agent_id in [&fatal_id, &recoverable_id] {
+                state.streaming_text.update(|map| {
+                    map.insert(
+                        agent_id.clone(),
+                        StreamingState {
+                            agent_name: "Codex".to_owned(),
+                            model: None,
+                            text: leptos::prelude::ArcRwSignal::new("partial".to_owned()),
+                            reasoning: leptos::prelude::ArcRwSignal::new(String::new()),
+                            tool_requests: leptos::prelude::ArcRwSignal::new(Vec::new()),
+                        },
+                    );
+                });
+                state.agent_turn_active.update(|map| {
+                    map.insert(agent_id.clone(), true);
+                });
+                state.interrupt_pending.update(|pending| {
+                    pending.insert(agent_id.clone());
+                });
+                state.transient_events.update(|events| {
+                    events.insert(
+                        agent_id.clone(),
+                        vec![TransientEvent::OperationCancelled {
+                            message: "old cancellation".to_owned(),
+                        }],
+                    );
+                });
+                state.orchestration.update(|map| {
+                    map.insert(
+                        agent_id.clone(),
+                        vec![OrchestrationRecord::Event(running_orchestration_event(
+                            &agent_id.0,
+                        ))],
+                    );
+                });
+            }
+
+            let fatal_payload = AgentErrorPayload {
+                agent_id: fatal_id.clone(),
+                code: protocol::AgentErrorCode::BackendFailed,
+                message: "backend crashed".to_owned(),
+                fatal: true,
+            };
+            apply_agent_error(&state, host_id, fatal_payload.clone());
+            apply_agent_error(&state, host_id, fatal_payload);
+
+            assert_eq!(
+                state.agents.with_untracked(|agents| {
+                    agents
+                        .iter()
+                        .find(|agent| agent.agent_id == fatal_id)
+                        .and_then(|agent| agent.fatal_error.clone())
+                }),
+                Some("backend crashed".to_owned())
+            );
+            assert!(!state.streaming_text.with_untracked(|map| map.contains_key(&fatal_id)));
+            assert!(!state.agent_turn_active.with_untracked(|map| map.contains_key(&fatal_id)));
+            assert!(!state.interrupt_pending.with_untracked(|set| set.contains(&fatal_id)));
+            assert!(!state.transient_events.with_untracked(|map| map.contains_key(&fatal_id)));
+            state.orchestration.with_untracked(|map| {
+                let log = map.get(&fatal_id).expect("fatal orchestration history");
+                assert_eq!(log.len(), 2, "fatal settlement appends one marker");
+                assert!(matches!(log.first(), Some(OrchestrationRecord::Event(_))));
+                assert!(matches!(log.last(), Some(OrchestrationRecord::Cancelled)));
+            });
+
+            apply_agent_error(
+                &state,
+                host_id,
+                AgentErrorPayload {
+                    agent_id: recoverable_id.clone(),
+                    code: protocol::AgentErrorCode::BackendFailed,
+                    message: "recoverable error".to_owned(),
+                    fatal: false,
+                },
+            );
+            assert!(state.agents.with_untracked(|agents| {
+                agents
+                    .iter()
+                    .find(|agent| agent.agent_id == recoverable_id)
+                    .is_some_and(|agent| agent.fatal_error.is_none())
+            }));
+            assert!(state.streaming_text.with_untracked(|map| map.contains_key(&recoverable_id)));
+            assert!(state.agent_turn_active.with_untracked(|map| map.contains_key(&recoverable_id)));
+            assert!(state.interrupt_pending.with_untracked(|set| set.contains(&recoverable_id)));
+            assert!(state.transient_events.with_untracked(|map| map.contains_key(&recoverable_id)));
+            assert!(state.orchestration.with_untracked(|map| {
+                map.get(&recoverable_id)
+                    .is_some_and(|log| {
+                        log.len() == 1
+                            && matches!(log.first(), Some(OrchestrationRecord::Event(_)))
+                    })
+            }));
+        });
+    }
+
+    #[test]
+    fn fatal_bootstrap_cannot_rearm_desktop_turn() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host_id = "bootstrap-fatal-host";
+            let agent_id = AgentId("bootstrap-fatal-agent".to_owned());
+            let stream = StreamPath("/agent/bootstrap-fatal/instance".to_owned());
+            state
+                .agents
+                .set(vec![fatal_test_agent(host_id, &agent_id, &stream)]);
+
+            apply_agent_bootstrap(
+                &state,
+                host_id,
+                &stream,
+                AgentBootstrapPayload {
+                    events: vec![
+                        AgentBootstrapEvent::AgentError(AgentErrorPayload {
+                            agent_id: agent_id.clone(),
+                            code: protocol::AgentErrorCode::BackendFailed,
+                            message: "backend crashed".to_owned(),
+                            fatal: true,
+                        }),
+                        AgentBootstrapEvent::ChatEvent(ChatEvent::StreamStart(
+                            protocol::StreamStartData {
+                                message_id: Some("late-stream".to_owned()),
+                                agent: "Codex".to_owned(),
+                                model: None,
+                            },
+                        )),
+                        AgentBootstrapEvent::ChatEvent(ChatEvent::TypingStatusChanged(true)),
+                        AgentBootstrapEvent::ChatEvent(ChatEvent::RetryAttempt(
+                            protocol::RetryAttemptData {
+                                attempt: 2,
+                                max_retries: 3,
+                                error: "still retrying".to_owned(),
+                                backoff_ms: 10,
+                            },
+                        )),
+                        AgentBootstrapEvent::ChatEvent(ChatEvent::Orchestration(
+                            running_orchestration_event("late-worker"),
+                        )),
+                    ],
+                    latest_output: Default::default(),
+                    turn_active: true,
+                },
+            );
+
+            assert!(state.agents.with_untracked(|agents| {
+                agents
+                    .iter()
+                    .find(|agent| agent.agent_id == agent_id)
+                    .is_some_and(|agent| agent.fatal_error.as_deref() == Some("backend crashed"))
+            }));
+            assert!(!state.streaming_text.with_untracked(|map| map.contains_key(&agent_id)));
+            assert!(!state.agent_turn_active.with_untracked(|map| map.contains_key(&agent_id)));
+            assert!(!state.interrupt_pending.with_untracked(|set| set.contains(&agent_id)));
+            assert!(!state.transient_events.with_untracked(|map| map.contains_key(&agent_id)));
+            state.orchestration.with_untracked(|map| {
+                let log = map.get(&agent_id).expect("replayed orchestration history");
+                assert!(matches!(log.first(), Some(OrchestrationRecord::Event(_))));
+                assert!(matches!(log.last(), Some(OrchestrationRecord::Cancelled)));
+            });
         });
     }
 

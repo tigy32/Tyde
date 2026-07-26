@@ -193,6 +193,17 @@ impl TraySnapshot {
 }
 
 fn compute_snapshot(state: &AppState, parent: &ActiveAgentRef) -> TraySnapshot {
+    let parent_is_fatal = state.agents.with(|agents| {
+        agents.iter().any(|agent| {
+            agent.host_id == parent.host_id
+                && agent.agent_id == parent.agent_id
+                && agent.fatal_error.is_some()
+        })
+    });
+    if parent_is_fatal {
+        return TraySnapshot::default();
+    }
+
     let mut snapshot = TraySnapshot::default();
     let mut child_ids: HashSet<AgentId> = HashSet::new();
 
@@ -838,7 +849,11 @@ fn QueuedMessageRow(
         let agents = state_send.agents.get_untracked();
         let Some(agent) = agents
             .iter()
-            .find(|agent| agent.host_id == active.host_id && agent.agent_id == active.agent_id)
+            .find(|agent| {
+                agent.host_id == active.host_id
+                    && agent.agent_id == active.agent_id
+                    && agent.fatal_error.is_none()
+            })
         else {
             return;
         };
@@ -866,7 +881,11 @@ fn QueuedMessageRow(
         let agents = state_cancel.agents.get_untracked();
         let Some(agent) = agents
             .iter()
-            .find(|agent| agent.host_id == active.host_id && agent.agent_id == active.agent_id)
+            .find(|agent| {
+                agent.host_id == active.host_id
+                    && agent.agent_id == active.agent_id
+                    && agent.fatal_error.is_none()
+            })
         else {
             return;
         };
@@ -1312,6 +1331,63 @@ mod wasm_tests {
             0,
             "a failed child renders no tray at all"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn fatal_parent_hides_all_retained_inflight_state() {
+        let (container, _state) = mount_tray(|state| {
+            let mut parent = child_agent("agent-parent", "Terminated Parent");
+            parent.parent_agent_id = None;
+            parent.fatal_error = Some("backend crashed".to_owned());
+            state.agents.update(|agents| {
+                agents.push(parent);
+                agents.push(child_agent("agent-child", "Running Child"));
+            });
+            set_turn_active(state, "agent-child");
+            state.agent_message_queue.update(|queue| {
+                queue.insert(
+                    parent_ref().agent_id,
+                    vec![QueuedMessageEntry {
+                        id: QueuedMessageId("q-fatal".to_owned()),
+                        message: "do not send to the dead actor".to_owned(),
+                        images: Vec::new(),
+                        origin: None,
+                    }],
+                );
+            });
+            state.tool_progress.update(|map| {
+                map.insert(
+                    (
+                        parent_ref().agent_id,
+                        ToolCallId("call-fatal".to_owned()),
+                    ),
+                    ArcRwSignal::new(ToolProgressData {
+                        tool_call_id: "call-fatal".to_owned(),
+                        tool_name: "Workflow".to_owned(),
+                        update: ToolProgressUpdate::Workflow(WorkflowRunState {
+                            workflow_name: "stale-workflow".to_owned(),
+                            description: None,
+                            script: None,
+                            status: WorkflowRunStatus::Running,
+                            summary: None,
+                            total_tokens: 0,
+                            tool_uses: 0,
+                            duration_ms: 0,
+                            agents: Vec::new(),
+                        }),
+                    }),
+                );
+            });
+        });
+        next_tick().await;
+
+        assert_eq!(
+            count(&container, ".inflight-tray"),
+            0,
+            "a fatal parent has no actionable work in flight"
+        );
+        assert_eq!(count(&container, ".queued-message-send-now"), 0);
+        assert_eq!(count(&container, ".queued-message-cancel"), 0);
     }
 
     /// A running workflow surfaces as a live row with its name and status,

@@ -2184,16 +2184,16 @@ pub enum TransientEvent {
 /// One entry in an agent's Tycode orchestration log, in chronological order.
 /// The log stores the typed events the server emitted verbatim, plus a
 /// locally-injected [`OrchestrationRecord::Cancelled`] marker for turn
-/// cancellations. The orchestration panel folds this log into a presentation
-/// tree at render time (see `components::orchestration_view`) — no aggregated
-/// state is cached; the events are the source of truth.
+/// cancellations or fatal agent failure. The orchestration panel folds this log
+/// into a presentation tree at render time (see `components::orchestration_view`)
+/// — no aggregated state is cached; the events are the source of truth.
 #[derive(Clone, Debug)]
 pub enum OrchestrationRecord {
     Event(protocol::OrchestrationEvent),
-    /// A `ChatEvent::OperationCancelled` at this point in the stream. Tycode
-    /// drops any in-flight fan-out/worker/sub-agent without terminal events on
-    /// cancel, so the fold closes everything still running at this marker
-    /// instead of leaving it stuck "running".
+    /// A `ChatEvent::OperationCancelled` or fatal agent failure at this point in
+    /// the stream. Tycode drops any in-flight fan-out/worker/sub-agent without
+    /// terminal events on either path, so the fold closes everything still
+    /// running at this marker instead of leaving it stuck "running".
     Cancelled,
 }
 

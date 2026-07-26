@@ -90,6 +90,7 @@ fn open_existing_session_agent(
                 agent.host_id == host_id
                     && agent.backend_kind == backend_kind
                     && agent.session_id.as_ref() == Some(session_id)
+                    && agent.fatal_error.is_none()
             })
             .cloned()
     });
@@ -1662,6 +1663,90 @@ mod wasm_tests {
                 })
             );
         });
+    }
+
+    #[wasm_bindgen_test]
+    async fn resume_session_spawns_replacement_for_terminated_agent() {
+        let calls = install_send_stub();
+        let owner = leptos::reactive::owner::Owner::new();
+        let state = owner.with(|| {
+            let state = AppState::new();
+            let session_id = SessionId("terminated-session".to_owned());
+            state.host_streams.update(|streams| {
+                streams.insert(
+                    "host-a".to_owned(),
+                    StreamPath("/host/host-a".to_owned()),
+                );
+            });
+            state.agents.update(|agents| {
+                agents.push(crate::state::AgentInfo {
+                    host_id: "host-a".to_owned(),
+                    agent_id: AgentId("terminated-agent".to_owned()),
+                    name: "Terminated chat".to_owned(),
+                    origin: protocol::AgentOrigin::User,
+                    backend_kind: BackendKind::Codex,
+                    workspace_roots: vec!["/repo".to_owned()],
+                    project_id: Some(ProjectId("project-a".to_owned())),
+                    parent_agent_id: None,
+                    session_id: Some(session_id.clone()),
+                    custom_agent_id: None,
+                    workflow: None,
+                    created_at_ms: 0,
+                    instance_stream: StreamPath("/agent/terminated".to_owned()),
+                    started: true,
+                    fatal_error: Some("backend crashed".to_owned()),
+                    activity_summary: Default::default(),
+                });
+            });
+
+            assert!(
+                !open_existing_session_agent(
+                    &state,
+                    "host-a",
+                    BackendKind::Codex,
+                    &session_id,
+                    Some(ProjectId("project-a".to_owned())),
+                ),
+                "a terminated actor cannot satisfy Resume by local focus"
+            );
+            resume_session(
+                &state,
+                "host-a".to_owned(),
+                BackendKind::Codex,
+                session_id,
+                Some(ProjectId("project-a".to_owned())),
+            );
+            state
+        });
+
+        for _ in 0..4 {
+            tick().await;
+        }
+
+        assert_eq!(
+            state.active_agent.get_untracked(),
+            None,
+            "Resume must leave the terminated actor and focus the replacement draft"
+        );
+        let params = recorded_spawn_params(&calls);
+        let resume = params
+            .iter()
+            .find(|params| params.get("kind").and_then(|kind| kind.as_str()) == Some("resume"))
+            .expect("one SpawnAgent Resume frame");
+        assert_eq!(
+            resume.get("session_id").and_then(|value| value.as_str()),
+            Some("terminated-session")
+        );
+        assert_eq!(
+            params
+                .iter()
+                .filter(|params| {
+                    params.get("kind").and_then(|kind| kind.as_str()) == Some("resume")
+                })
+                .count(),
+            1,
+            "Resume emits exactly one replacement spawn"
+        );
     }
 
     #[wasm_bindgen_test]

@@ -68,6 +68,19 @@ struct QuestionState {
     custom: RwSignal<String>,
 }
 
+fn target_is_fatal_tracked(state: &AppState, agent_ref: Signal<Option<ActiveAgentRef>>) -> bool {
+    let Some(target) = agent_ref.get() else {
+        return false;
+    };
+    state.agents.with(|agents| {
+        agents.iter().any(|agent| {
+            agent.host_id == target.host_id
+                && agent.agent_id == target.agent_id
+                && agent.fatal_error.is_some()
+        })
+    })
+}
+
 #[component]
 fn AskUserQuestionCard(
     agent_ref: Signal<Option<ActiveAgentRef>>,
@@ -88,6 +101,9 @@ fn AskUserQuestionCard(
     let submitted = RwSignal::new(false);
     let sending = RwSignal::new(false);
     let send_error = RwSignal::new(None::<String>);
+    let fatal_state = state.clone();
+    let target_is_fatal =
+        Memo::new(move |_| target_is_fatal_tracked(&fatal_state, agent_ref));
 
     let all_answered = {
         let states = states.clone();
@@ -101,14 +117,25 @@ fn AskUserQuestionCard(
     let question_views = questions
         .iter()
         .enumerate()
-        .map(|(idx, question)| render_question(question.clone(), states[idx], submitted, sending))
+        .map(|(idx, question)| {
+            render_question(
+                question.clone(),
+                states[idx],
+                submitted,
+                sending,
+                target_is_fatal,
+            )
+        })
         .collect::<Vec<_>>();
 
     let on_submit = {
         let questions = questions.clone();
         let states = states.clone();
         move |_| {
-            if submitted.get_untracked() || sending.get_untracked() {
+            if submitted.get_untracked()
+                || sending.get_untracked()
+                || target_is_fatal.get_untracked()
+            {
                 return;
             }
             send_error.set(None);
@@ -141,7 +168,7 @@ fn AskUserQuestionCard(
 
     let submit_disabled = {
         let all_answered = all_answered.clone();
-        move || submitted.get() || sending.get() || !all_answered()
+        move || submitted.get() || sending.get() || target_is_fatal.get() || !all_answered()
     };
 
     view! {
@@ -183,6 +210,7 @@ fn render_question(
     qstate: QuestionState,
     submitted: RwSignal<bool>,
     sending: RwSignal<bool>,
+    target_is_fatal: Memo<bool>,
 ) -> AnyView {
     let multi_select = question.multi_select;
     let header = question
@@ -201,7 +229,10 @@ fn render_question(
             let selected = qstate.selected;
             let is_selected = move || selected.get().contains(&idx);
             let on_click = move |_| {
-                if submitted.get_untracked() || sending.get_untracked() {
+                if submitted.get_untracked()
+                    || sending.get_untracked()
+                    || target_is_fatal.get_untracked()
+                {
                     return;
                 }
                 selected.update(|current| {
@@ -230,7 +261,9 @@ fn render_question(
                 <button
                     class="ask-question-option"
                     class:selected=is_selected
-                    prop:disabled=move || submitted.get() || sending.get()
+                    prop:disabled=move || {
+                        submitted.get() || sending.get() || target_is_fatal.get()
+                    }
                     aria-pressed=move || if is_selected() { "true" } else { "false" }
                     on:click=on_click
                 >
@@ -245,7 +278,10 @@ fn render_question(
 
     let custom = qstate.custom;
     let on_custom_input = move |ev: leptos::ev::Event| {
-        if submitted.get_untracked() || sending.get_untracked() {
+        if submitted.get_untracked()
+            || sending.get_untracked()
+            || target_is_fatal.get_untracked()
+        {
             return;
         }
         custom.set(event_target_value(&ev));
@@ -264,7 +300,9 @@ fn render_question(
                 class="ask-question-custom"
                 r#type="text"
                 placeholder="Or type your own answer"
-                prop:disabled=move || submitted.get() || sending.get()
+                prop:disabled=move || {
+                    submitted.get() || sending.get() || target_is_fatal.get()
+                }
                 on:input=on_custom_input
             />
         </div>
@@ -277,7 +315,9 @@ fn answer_target(
     agent_ref: &ActiveAgentRef,
 ) -> Result<(String, StreamPath), &'static str> {
     let stream = state.agents.get_untracked().iter().find_map(|a| {
-        (a.host_id == agent_ref.host_id && a.agent_id == agent_ref.agent_id)
+        (a.host_id == agent_ref.host_id
+            && a.agent_id == agent_ref.agent_id
+            && a.fatal_error.is_none())
             .then(|| a.instance_stream.clone())
     });
     let Some(stream) = stream else {
@@ -938,6 +978,46 @@ mod wasm_tests {
         assert!(
             !submit_button(&container).disabled(),
             "answer should remain retryable"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn fatal_question_owner_disables_every_reply_control() {
+        let calls = install_send_capture_stub();
+        let req = single_select_req();
+        let container = mount_with_state_setup(
+            |state| {
+                configure_active_agent(state);
+                state.agents.update(|agents| {
+                    agents[0].fatal_error = Some("backend crashed".to_owned());
+                });
+                assert!(
+                    answer_target(
+                        state,
+                        &ActiveAgentRef {
+                            host_id: "host-1".to_owned(),
+                            agent_id: AgentId("agent-1".to_owned()),
+                        },
+                    )
+                    .is_err(),
+                    "the callback target resolver must reject a fatal owner"
+                );
+            },
+            move || render(test_agent_ref(), &req, None, ToolOutputMode::Summary),
+        );
+        next_tick().await;
+
+        assert_answer_controls_disabled(&container);
+        assert!(
+            submit_button(&container).disabled(),
+            "a fatal question owner cannot accept an answer"
+        );
+        submit_button(&container).click();
+        next_tick().await;
+        assert_eq!(
+            calls.length(),
+            0,
+            "no SendMessage frame may target a dead owner"
         );
     }
 

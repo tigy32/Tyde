@@ -57,6 +57,19 @@ pub(crate) fn render(
     .into_any()
 }
 
+fn target_is_fatal_tracked(state: &AppState, agent_ref: Signal<Option<ActiveAgentRef>>) -> bool {
+    let Some(target) = agent_ref.get() else {
+        return false;
+    };
+    state.agents.with(|agents| {
+        agents.iter().any(|agent| {
+            agent.host_id == target.host_id
+                && agent.agent_id == target.agent_id
+                && agent.fatal_error.is_some()
+        })
+    })
+}
+
 #[component]
 fn ExitPlanModeCard(
     agent_ref: Signal<Option<ActiveAgentRef>>,
@@ -76,6 +89,9 @@ fn ExitPlanModeCard(
         sending,
         send_error,
     };
+    let fatal_state = state.clone();
+    let target_is_fatal =
+        Memo::new(move |_| target_is_fatal_tracked(&fatal_state, agent_ref));
 
     let tool_call_id = Arc::new(tool_call_id);
 
@@ -83,7 +99,10 @@ fn ExitPlanModeCard(
         let state = state.clone();
         let tool_call_id = tool_call_id.clone();
         move |decision: ExitPlanModeDecision| {
-            if decision_sent.get_untracked().is_some() || sending.get_untracked() {
+            if decision_sent.get_untracked().is_some()
+                || sending.get_untracked()
+                || target_is_fatal.get_untracked()
+            {
                 return;
             }
             send_error.set(None);
@@ -124,7 +143,8 @@ fn ExitPlanModeCard(
     };
     let on_reject = move |_| submit(ExitPlanModeDecision::Reject);
 
-    let controls_disabled = move || decision_sent.get().is_some() || sending.get();
+    let controls_disabled =
+        move || decision_sent.get().is_some() || sending.get() || target_is_fatal.get();
 
     // `completed` is a fixed prop for this card instance, so a plain Rust
     // conditional (rather than a reactive `<Show>`) decides whether to render
@@ -206,7 +226,9 @@ fn decision_target(
     agent_ref: &ActiveAgentRef,
 ) -> Result<(String, StreamPath), &'static str> {
     let stream = state.agents.get_untracked().iter().find_map(|a| {
-        (a.host_id == agent_ref.host_id && a.agent_id == agent_ref.agent_id)
+        (a.host_id == agent_ref.host_id
+            && a.agent_id == agent_ref.agent_id
+            && a.fatal_error.is_none())
             .then(|| a.instance_stream.clone())
     });
     let Some(stream) = stream else {
@@ -732,6 +754,57 @@ mod wasm_tests {
         assert!(
             reject_button(&container).is_some(),
             "reject control present"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn fatal_plan_owner_disables_every_decision_control() {
+        let calls = install_send_capture_stub();
+        let container = mount_with_state(
+            |state| {
+                configure_active_agent(state);
+                state.agents.update(|agents| {
+                    agents[0].fatal_error = Some("backend crashed".to_owned());
+                });
+                assert!(
+                    decision_target(
+                        state,
+                        &ActiveAgentRef {
+                            host_id: "host-1".to_owned(),
+                            agent_id: AgentId("agent-1".to_owned()),
+                        },
+                    )
+                    .is_err(),
+                    "the callback target resolver must reject a fatal owner"
+                );
+            },
+            || {
+                render(
+                    test_agent_ref(),
+                    "toolu_plan",
+                    &exit_plan_req(),
+                    None,
+                    ToolOutputMode::Full,
+                )
+            },
+        );
+        next_tick().await;
+
+        let approve = approve_button(&container).expect("approve control");
+        let reject = reject_button(&container).expect("reject control");
+        assert!(approve.disabled(), "fatal owner disables Approve");
+        assert!(reject.disabled(), "fatal owner disables Reject");
+        assert!(
+            feedback_area(&container).disabled(),
+            "fatal owner disables feedback"
+        );
+        approve.click();
+        reject.click();
+        next_tick().await;
+        assert_eq!(
+            calls.length(),
+            0,
+            "no plan decision may target a dead owner"
         );
     }
 

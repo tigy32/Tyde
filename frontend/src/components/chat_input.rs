@@ -31,7 +31,11 @@ fn target_instance_stream(
     let agents = state.agents.get_untracked();
     agents
         .iter()
-        .find(|a| a.host_id == active_agent.host_id && a.agent_id == active_agent.agent_id)
+        .find(|a| {
+            a.host_id == active_agent.host_id
+                && a.agent_id == active_agent.agent_id
+                && a.fatal_error.is_none()
+        })
         .map(|a| a.instance_stream.clone())
 }
 
@@ -43,7 +47,11 @@ fn target_instance_stream_tracked(
     state.agents.with(|agents| {
         agents
             .iter()
-            .find(|a| a.host_id == active_agent.host_id && a.agent_id == active_agent.agent_id)
+            .find(|a| {
+                a.host_id == active_agent.host_id
+                    && a.agent_id == active_agent.agent_id
+                    && a.fatal_error.is_none()
+            })
             .map(|a| a.instance_stream.clone())
     })
 }
@@ -126,6 +134,38 @@ fn target_agent_is_initializing_tracked(
                 && agent.agent_id == active_agent.agent_id
                 && !agent.started
                 && agent.fatal_error.is_none()
+        })
+    })
+}
+
+fn target_agent_is_terminated(
+    state: &AppState,
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+) -> bool {
+    let Some(active_agent) = agent_ref.get_untracked() else {
+        return false;
+    };
+    state.agents.with_untracked(|agents| {
+        agents.iter().any(|agent| {
+            agent.host_id == active_agent.host_id
+                && agent.agent_id == active_agent.agent_id
+                && agent.fatal_error.is_some()
+        })
+    })
+}
+
+fn target_agent_is_terminated_tracked(
+    state: &AppState,
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+) -> bool {
+    let Some(active_agent) = agent_ref.get() else {
+        return false;
+    };
+    state.agents.with(|agents| {
+        agents.iter().any(|agent| {
+            agent.host_id == active_agent.host_id
+                && agent.agent_id == active_agent.agent_id
+                && agent.fatal_error.is_some()
         })
     })
 }
@@ -361,6 +401,9 @@ fn submit_chat_input(
         Some(active_agent) => active_agent,
         None => return,
     };
+    if target_agent_is_terminated(state, agent_ref) {
+        return;
+    }
     let host_id = active_agent.host_id.clone();
 
     let instance_stream = match target_instance_stream(state, agent_ref) {
@@ -762,12 +805,23 @@ pub fn ChatInput(
     let readonly_state = state.clone();
     let is_readonly =
         Memo::new(move |_| target_agent_is_backend_native(&readonly_state, agent_ref));
+    let terminated_state = state.clone();
+    let is_terminated =
+        Memo::new(move |_| target_agent_is_terminated_tracked(&terminated_state, agent_ref));
 
     let btw_state = state.clone();
     let active_has_session =
         Memo::new(move |_| target_agent_has_session_id_tracked(&btw_state, agent_ref));
-    // A "Fork + send" needs draft input and a forkable backend session.
-    let can_btw = move || ui_mode.get().0 && active_has_session.get();
+    let fork_state = state.clone();
+    let fork_images = pending_images;
+    let can_btw = Memo::new(move |_| {
+        matches!(
+            fork_state.chat_context_connection_status(),
+            ConnectionStatus::Connected
+        ) && (fork_state.chat_input.with(|s| !s.trim().is_empty())
+            || fork_images.with(|images| !images.is_empty()))
+            && active_has_session.get()
+    });
 
     let can_send = move || ui_mode.get().0 && !is_readonly.get();
     let can_interrupt = move || ui_mode.get().1 && !is_readonly.get();
@@ -792,7 +846,8 @@ pub fn ChatInput(
     // The dropdown holds items only in specific states (see state matrix):
     // - Fork + send: idle or thinking + input + session
     // - Steer + Cancel: thinking + input (with or without session)
-    let menu_has_items = Memo::new(move |_| can_btw() || (can_interrupt() && is_steer.get()));
+    let menu_has_items =
+        Memo::new(move |_| can_btw.get() || (can_interrupt() && is_steer.get()));
     let menu_open = RwSignal::new(false);
     // Auto-dismiss a stale-open menu when its items disappear.
     Effect::new(move |_| {
@@ -803,6 +858,9 @@ pub fn ChatInput(
 
     let thinking_state = state.clone();
     let is_thinking = move || {
+        if is_terminated.get() {
+            return false;
+        }
         if target_agent_is_initializing_tracked(&thinking_state, agent_ref) {
             return true;
         }
@@ -844,7 +902,7 @@ pub fn ChatInput(
             ev.prevent_default();
             if ev.shift_key() {
                 // Cmd/Ctrl+Shift+Enter → Fork + send, when available.
-                if ui_mode.get_untracked().0 && active_has_session.get_untracked() {
+                if can_btw.get_untracked() {
                     submit_side_question(&on_keydown_state, agent_ref, on_keydown_images);
                 }
             } else if is_steer.get_untracked() {
@@ -891,6 +949,9 @@ pub fn ChatInput(
         let mode = ui_mode.get_untracked();
         let is_steer_now = is_steer.get_untracked();
         let readonly = is_readonly.get_untracked();
+        if is_terminated.get_untracked() {
+            return;
+        }
         if mode.1 && !is_steer_now && !readonly {
             primary_interrupt_stored.with_value(|state| interrupt_target_turn(state, agent_ref));
         } else {
@@ -1200,7 +1261,13 @@ pub fn ChatInput(
             <div class="chat-input-row">
                 <textarea
                     class="chat-textarea"
-                    placeholder="Type a message or drop images..."
+                    placeholder=move || {
+                        if is_terminated.get() {
+                            "Agent stopped — use Fork + send, Resume in Sessions, or New Chat"
+                        } else {
+                            "Type a message or drop images..."
+                        }
+                    }
                     prop:disabled=move || is_readonly.get()
                     on:input=on_input
                     on:keydown=on_keydown
@@ -1221,6 +1288,9 @@ pub fn ChatInput(
                         class="chat-send-btn chat-send-btn-text chat-send-split-primary"
                         data-test="chat-send-primary"
                         disabled=move || {
+                            if is_terminated.get() {
+                                return true;
+                            }
                             let mode = ui_mode.get();
                             let is_steer_now = is_steer.get();
                             let readonly = is_readonly.get();
@@ -1234,7 +1304,26 @@ pub fn ChatInput(
                             }
                         }
                         on:click=on_click_primary
+                        aria-label=move || {
+                            if is_terminated.get() {
+                                "Agent stopped. Use Fork + send, Resume in Sessions, or New Chat."
+                            } else {
+                                let mode = ui_mode.get();
+                                let is_steer_now = is_steer.get();
+                                let readonly = is_readonly.get();
+                                if mode.1 && !is_steer_now && !readonly {
+                                    "Cancel current turn"
+                                } else if is_steer_now && !readonly {
+                                    "Queue message"
+                                } else {
+                                    "Send message"
+                                }
+                            }
+                        }
                         title=move || {
+                            if is_terminated.get() {
+                                return "Agent stopped — use Fork + send, Resume in Sessions, or New Chat";
+                            }
                             let mode = ui_mode.get();
                             let is_steer_now = is_steer.get();
                             let readonly = is_readonly.get();
@@ -1250,6 +1339,9 @@ pub fn ChatInput(
                         }
                     >
                         <span>{move || {
+                            if is_terminated.get() {
+                                return "Terminated";
+                            }
                             let mode = ui_mode.get();
                             let is_steer_now = is_steer.get();
                             let readonly = is_readonly.get();
@@ -1301,7 +1393,7 @@ pub fn ChatInput(
                                     </span>
                                 </button>
                             </Show>
-                            <Show when=move || can_btw()>
+                            <Show when=move || can_btw.get()>
                                 <button
                                     type="button"
                                     class="chat-send-menu-item"
@@ -1766,6 +1858,91 @@ mod wasm_tests {
             state.chat_input.get_untracked(),
             "hello",
             "keyboard submit must not clear a draft that has no live agent stream"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn terminated_agent_blocks_same_actor_actions_and_preserves_fork_send() {
+        let state = AppState::new();
+        configure(&state, true, true, "continue from a fork");
+        state.agents.update(|agents| {
+            agents[0].fatal_error = Some("backend crashed".to_owned());
+        });
+        state.interrupt_pending.update(|pending| {
+            pending.insert(AgentId(AGENT.to_owned()));
+        });
+        let calls = stub_send_recording();
+        let mount_state = state.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        let p = primary(&container);
+        assert_eq!(
+            p.text_content().unwrap_or_default().trim(),
+            "Terminated",
+            "fatal state must outrank stale turn and interrupt state"
+        );
+        assert!(p.has_attribute("disabled"), "dead actor cannot be submitted to");
+        assert!(
+            textarea(&container)
+                .get_attribute("placeholder")
+                .unwrap_or_default()
+                .contains("Fork + send"),
+            "the editable draft must direct recovery toward a replacement agent"
+        );
+        assert!(
+            !caret(&container).has_attribute("disabled"),
+            "a forkable fatal session must retain Fork + send"
+        );
+
+        open_menu(&container).await;
+        assert_eq!(
+            menu_item_texts(&container),
+            vec!["Fork + send".to_owned()],
+            "a fatal actor offers no Steer or Cancel action"
+        );
+
+        dispatch_keydown(&textarea(&container), "Enter", true, false);
+        next_tick().await;
+        assert_eq!(
+            state.chat_input.get_untracked(),
+            "continue from a fork",
+            "same-actor keyboard send must preserve the draft"
+        );
+        assert_eq!(calls.length(), 0, "same-actor send emits no frame");
+
+        dispatch_keydown(&textarea(&container), "Enter", true, true);
+        next_tick().await;
+        assert_eq!(
+            state.chat_input.get_untracked(),
+            "",
+            "Fork + send owns and clears the retained draft"
+        );
+        assert_eq!(
+            calls.length(),
+            1,
+            "the only emitted frame is the host-level fork"
+        );
+
+        state.chat_input.set("new draft".to_owned());
+        state.agents.update(|agents| {
+            agents[0].session_id = None;
+        });
+        next_tick().await;
+        assert!(
+            caret(&container).has_attribute("disabled"),
+            "without a session the composer must direct recovery to Resume or New Chat"
+        );
+        assert_eq!(
+            primary(&container)
+                .text_content()
+                .unwrap_or_default()
+                .trim(),
+            "Terminated"
         );
     }
 
