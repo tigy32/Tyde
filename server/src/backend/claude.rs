@@ -515,6 +515,7 @@ impl ClaudeSession {
             turn_event_gate: Mutex::new(()),
             task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
             skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
+            skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
         });
 
         // Armed through the same call every other caller uses, immediately after
@@ -736,6 +737,15 @@ struct ClaudeInner {
     /// Gates the first prompt on the CLI confirming this session's skills.
     /// A `watch` rather than a one-shot because a respawn re-arms it.
     skill_readiness: watch::Sender<ClaudeSkillReadiness>,
+    /// Set when a turn was cancelled before its `init` frame arrived.
+    ///
+    /// Readiness deliberately stays `Pending` — the session did not fail, it
+    /// simply never learned — but nothing may act on that pending state
+    /// afterwards. The frame only ever arrives in response to the first user
+    /// message, so once that turn is cancelled this process will never report
+    /// one; the flag clears when the next process arms. Atomic because the
+    /// hot-path predicate that reads it is synchronous.
+    skill_verification_abandoned: std::sync::atomic::AtomicBool,
 }
 
 /// Whether the CLI has confirmed the skills Tyde materialized for this session.
@@ -1787,7 +1797,7 @@ impl ClaudeInner {
             .await
             .map_err(TurnStartError::Failed);
         if written.is_ok() {
-            self.watch_for_skill_verification();
+            self.watch_for_skill_verification().await;
         }
         written
     }
@@ -2611,10 +2621,16 @@ impl ClaudeInner {
     /// While true, the stdout reader holds model output back rather than
     /// rendering something it may have to retract.
     fn skills_awaiting_verification(&self) -> bool {
-        matches!(
+        if !matches!(
             *self.skill_readiness.borrow(),
             ClaudeSkillReadiness::Pending
-        )
+        ) {
+            return false;
+        }
+        // A cancelled turn leaves readiness pending but nothing to act on: no
+        // hold-back, no terminal failure, no watchdog. Checked here rather than
+        // at each call site so no pending path can be added later that forgets.
+        !self.skill_verification_abandoned.load(Ordering::Relaxed)
     }
 
     /// Bound the wait for an `init` frame once a prompt has gone out.
@@ -2623,43 +2639,45 @@ impl ClaudeInner {
     /// produces no `init` frame at all — an older CLI, a changed frame shape —
     /// would otherwise leave the session holding its output forever. This turns
     /// that into a visible failure on the same timeout the handshake uses.
-    fn watch_for_skill_verification(self: &Arc<Self>) {
-        if !self.skills_awaiting_verification() {
+    async fn watch_for_skill_verification(self: &Arc<Self>) {
+        // Everything under one lock, in the caller's task. The previous version
+        // spawned a task to read the generation and register the handle, which
+        // left a window: a cancel landing inside it found no handle to abort
+        // and then the spawned task read the *post-cancel* generation, so both
+        // guards passed and the timer fired on a cancelled turn.
+        let mut state = self.state.lock().await;
+        if !matches!(
+            *self.skill_readiness.borrow(),
+            ClaudeSkillReadiness::Pending
+        ) || self.skill_verification_abandoned.load(Ordering::Relaxed)
+        {
             return;
         }
+        let generation = state.skill_verification_generation;
         let inner = Arc::clone(self);
-        tokio::spawn(async move {
-            // Capture the generation this timer belongs to. A respawn bumps it,
-            // so a timer that outlives its process becomes inert instead of
-            // killing whatever is running when it finally fires.
-            let generation = inner.state.lock().await.skill_verification_generation;
-            let handle = {
-                let inner = Arc::clone(&inner);
-                tokio::spawn(async move {
-                    tokio::time::sleep(CLAUDE_SKILL_VERIFICATION_TIMEOUT).await;
-                    if !inner.skills_awaiting_verification() {
-                        return;
-                    }
-                    if inner.state.lock().await.skill_verification_generation != generation {
-                        tracing::debug!(
-                            "Skipping a Claude skill watchdog from generation {generation}; \
-                             the session has respawned since"
-                        );
-                        return;
-                    }
-                    inner
-                        .terminate_for_skill_mismatch(
-                            "Claude did not report which skills it loaded within the startup \
-                             timeout.",
-                        )
-                        .await;
-                })
-            };
-            let previous = inner.state.lock().await.skill_watchdog.replace(handle);
-            if let Some(previous) = previous {
-                previous.abort();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(CLAUDE_SKILL_VERIFICATION_TIMEOUT).await;
+            // Re-checked at fire time as well: abort is the primary mechanism,
+            // these are the backstop for a timer that slipped past it.
+            if !inner.skills_awaiting_verification() {
+                return;
             }
+            if inner.state.lock().await.skill_verification_generation != generation {
+                tracing::debug!(
+                    "Skipping a Claude skill watchdog from generation {generation}; the \
+                     session has moved on since"
+                );
+                return;
+            }
+            inner
+                .terminate_for_skill_mismatch(
+                    "Claude did not report which skills it loaded within the startup timeout.",
+                )
+                .await;
         });
+        if let Some(previous) = state.skill_watchdog.replace(handle) {
+            previous.abort();
+        }
     }
 
     /// Stop the verification watchdog, if one is armed.
@@ -2677,6 +2695,11 @@ impl ClaudeInner {
     /// generation is bumped so any in-flight timer is inert, and readiness is
     /// left `Pending` for whichever process starts next.
     async fn abandon_skill_verification_for_cancel(&self) {
+        // Order matters: mark first, so a watchdog that fires between the mark
+        // and the abort still sees `skills_awaiting_verification() == false`
+        // and returns without failing the session.
+        self.skill_verification_abandoned
+            .store(true, Ordering::Relaxed);
         {
             let mut state = self.state.lock().await;
             state.skill_verification_generation =
@@ -2703,6 +2726,8 @@ impl ClaudeInner {
     /// here, a channel value there — is what let production and the tests drift
     /// into different states.
     async fn arm_skill_verification(&self, expected: Vec<String>) {
+        self.skill_verification_abandoned
+            .store(false, Ordering::Relaxed);
         let required = {
             let mut state = self.state.lock().await;
             state.expected_skills = expected;
@@ -2717,6 +2742,10 @@ impl ClaudeInner {
 
     /// Re-arm verification for a process that is about to start.
     async fn reset_skill_readiness(&self) {
+        // A new process may report, so a cancel on the previous one stops
+        // suppressing.
+        self.skill_verification_abandoned
+            .store(false, Ordering::Relaxed);
         self.cancel_skill_watchdog().await;
         let required = {
             let mut state = self.state.lock().await;
@@ -3945,13 +3974,19 @@ async fn read_claude_stdout_persistent(
         if let Some(reported) = claude_init_frame_skills(&value) {
             inner.record_skill_init_frame(reported).await;
             match inner.skill_readiness_snapshot() {
-                ClaudeSkillReadiness::Ready => {
-                    // Confirmed: everything held back is genuine output and is
-                    // replayed ahead of whatever comes next, in arrival order.
+                ClaudeSkillReadiness::Ready if !held_back.is_empty() => {
+                    // Confirmed: everything held back is genuine output. It
+                    // arrived *before* this frame, so it goes in front of it and
+                    // this frame is requeued behind — replaying in true arrival
+                    // order rather than letting the confirming frame overtake
+                    // the output it confirmed. Guarded on a non-empty buffer so
+                    // the requeued frame cannot loop through here forever.
+                    queue.push_front(value);
                     for held in held_back.drain(..).rev() {
                         queue.push_front(held);
                     }
                     held_back_bytes = 0;
+                    continue;
                 }
                 ClaudeSkillReadiness::Failed(_) => {
                     held_back.clear();
@@ -4994,6 +5029,7 @@ async fn ensure_subagent_stream(
         turn_event_gate: Mutex::new(()),
         task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
         skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
+        skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
     });
     let sa_message_id = format!("subagent-{}", tool_use_id);
 
@@ -11490,6 +11526,7 @@ mod tests {
             turn_event_gate: Mutex::new(()),
             task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
             skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
+            skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
         };
         (inner, event_rx)
     }
@@ -12985,6 +13022,22 @@ for raw_line in sys.stdin:
         inner
             .arm_skill_verification(vec!["tyde-skills:alpha".to_string()])
             .await;
+        // The stdout reducer drops every assistant frame when no turn is
+        // active (`prepare_persistent_stdout_turn` returns `None`), so without
+        // this the replay assertion could never observe anything regardless of
+        // whether replay worked. This helper writes the prompt directly instead
+        // of going through `run_turn`, so it has to register the turn itself.
+        {
+            let mut state = inner.state.lock().await;
+            state.active_turn = Some(ActiveTurn {
+                id: 1,
+                outcome_tx: None,
+                interrupt_requested: false,
+                pending_ask_user_question: None,
+                pending_exit_plan_mode: None,
+                quiesced_waiters: Vec::new(),
+            });
+        }
 
         // Startup must complete without ever waiting on the init frame.
         let ready = tokio::time::timeout(
@@ -13002,7 +13055,7 @@ for raw_line in sys.stdin:
             .expect("write the first prompt");
         // The production turn path arms this immediately after the write; this
         // helper bypasses that path, so it arms it explicitly.
-        inner.watch_for_skill_verification();
+        inner.watch_for_skill_verification().await;
 
         // Wait for the fake to finish speaking, then let the reader drain.
         if let Some(marker) = behaviour.final_marker() {
@@ -13253,7 +13306,7 @@ for raw_line in sys.stdin:
 
         // Arm a watchdog, then respawn: `reset_skill_readiness` bumps the
         // generation, which is what makes the old timer inert.
-        inner.watch_for_skill_verification();
+        inner.watch_for_skill_verification().await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let armed_generation = inner.state.lock().await.skill_verification_generation;
         inner.reset_skill_readiness().await;
@@ -13285,10 +13338,64 @@ for raw_line in sys.stdin:
 
     /// Cancelling a turn is the user's doing. The terminal frames that follow
     /// must report cancellation, never a skill failure.
+    /// The terminal paths — a `result` frame, EOF, the watchdog — all gate on
+    /// `skills_awaiting_verification`. After a cancel that must be false, or
+    /// each of them would turn the user's own cancel into a skill failure.
+    #[tokio::test]
+    async fn no_terminal_path_fires_after_a_cancel() {
+        let (inner, mut rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
+        inner.watch_for_skill_verification().await;
+        assert!(
+            inner.skills_awaiting_verification(),
+            "armed and waiting before the cancel"
+        );
+
+        inner.abandon_skill_verification_for_cancel().await;
+
+        assert!(
+            !inner.skills_awaiting_verification(),
+            "a cancelled turn leaves nothing for a result frame, EOF, or the watchdog to act on"
+        );
+        assert_eq!(
+            inner.skill_readiness_state(),
+            ClaudeSkillReadiness::Pending,
+            "suppressing the terminal paths must not be done by failing the session"
+        );
+        // Well past the watchdog interval, nothing has fired.
+        tokio::time::sleep(CLAUDE_SKILL_VERIFICATION_TIMEOUT * 3).await;
+        assert_eq!(inner.skill_readiness_state(), ClaudeSkillReadiness::Pending);
+        let mut kinds = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            kinds.push(event_kind(&event).map(str::to_string));
+        }
+        assert!(
+            !kinds.iter().any(|kind| kind.as_deref() == Some("Error")),
+            "no terminal path may report a skill error after a cancel: {kinds:?}"
+        );
+    }
+
+    /// Arming after a cancel must not resurrect the watchdog for the same
+    /// process: the `init` frame only follows the first user message, so a
+    /// cancelled turn's process will never report one.
+    #[tokio::test]
+    async fn a_cancel_cannot_be_undone_by_re_arming_the_same_process() {
+        let (inner, _rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
+        inner.abandon_skill_verification_for_cancel().await;
+
+        inner.watch_for_skill_verification().await;
+
+        assert!(
+            inner.state.lock().await.skill_watchdog.is_none(),
+            "arming must be refused while a cancel is in effect"
+        );
+        tokio::time::sleep(CLAUDE_SKILL_VERIFICATION_TIMEOUT * 3).await;
+        assert_eq!(inner.skill_readiness_state(), ClaudeSkillReadiness::Pending);
+    }
+
     #[tokio::test]
     async fn cancelling_before_the_init_frame_is_never_a_skill_error() {
         let (inner, mut rx) = inner_expecting_skills(&["tyde-skills:alpha"]).await;
-        inner.watch_for_skill_verification();
+        inner.watch_for_skill_verification().await;
         {
             let mut state = inner.state.lock().await;
             state.active_turn = Some(ActiveTurn {
@@ -20370,6 +20477,7 @@ for raw_line in sys.stdin:
                 turn_event_gate: Mutex::new(()),
                 task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
                 skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
+                skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
             }),
             event_rx,
         )
@@ -22332,6 +22440,7 @@ for raw_line in sys.stdin:
                     turn_event_gate: Mutex::new(()),
                     task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
                     skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
+                    skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
                 }),
                 parent_tool_use_id: "toolu_spawn".to_string(),
                 parent_tool_name: "Task".to_string(),
