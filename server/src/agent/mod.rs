@@ -13560,7 +13560,8 @@ mod tests {
             start: start_rx.clone(),
         };
         assert_eq!(
-            dead.deliver_message(delivery_payload("into the void")).await,
+            dead.deliver_message(delivery_payload("into the void"))
+                .await,
             Err(super::DELIVERY_REJECTED_MAILBOX_CLOSED.to_owned())
         );
 
@@ -13572,7 +13573,9 @@ mod tests {
             start: start_rx,
         };
         assert_eq!(
-            closing.deliver_message(delivery_payload("during close")).await,
+            closing
+                .deliver_message(delivery_payload("during close"))
+                .await,
             Err(super::DELIVERY_REJECTED_CLOSING.to_owned())
         );
         assert!(
@@ -13610,15 +13613,16 @@ mod tests {
         let before = status_handle.snapshot().await;
 
         assert_eq!(
-            handle.deliver_message(delivery_payload("relay follow-up")).await,
+            handle
+                .deliver_message(delivery_payload("relay follow-up"))
+                .await,
             Err(super::DELIVERY_REJECTED_RELAY.to_owned()),
             "a relay mirrors a backend-native child and cannot take direct input"
         );
 
         let after = status_handle.snapshot().await;
         assert_eq!(
-            after.activity_counter,
-            before.activity_counter,
+            after.activity_counter, before.activity_counter,
             "a refused relay delivery must leave the target's status exactly as it was"
         );
         assert_eq!(after.is_active(), before.is_active());
@@ -13658,7 +13662,9 @@ mod tests {
         let _ = recv_agent_bootstrap_events(&mut rx, "queued delivery bootstrap").await;
 
         assert_eq!(
-            handle.deliver_message(delivery_payload("queued follow-up")).await,
+            handle
+                .deliver_message(delivery_payload("queued follow-up"))
+                .await,
             Ok(()),
             "a message queued behind an open turn is accepted, not refused"
         );
@@ -13714,7 +13720,9 @@ mod tests {
         let agent_id = start.agent_id.clone();
         let (entered, release) = install_agent_startup_gate(agent_id.clone());
         let (handle, startup_rx) = spawn_agent_actor(agent_id, start, request, runtime);
-        entered.await.expect("resumed actor reached the startup gate");
+        entered
+            .await
+            .expect("resumed actor reached the startup gate");
 
         // Attach before releasing the gate so this subscriber is flushed by
         // barrier completion itself. Its bootstrap is a snapshot taken at that
@@ -13728,7 +13736,9 @@ mod tests {
         // The actor is parked in its startup command loop, so this delivery is
         // provably accepted before the backend resumes and the barrier can fire.
         assert_eq!(
-            handle.deliver_message(delivery_payload("gated follow-up")).await,
+            handle
+                .deliver_message(delivery_payload("gated follow-up"))
+                .await,
             Ok(()),
             "a delivery accepted behind the startup gate must be acknowledged"
         );
@@ -13749,8 +13759,9 @@ mod tests {
             .expect("barrier completion must flush the resume-gated attachment")
             .expect("resume-gated subscriber stays open");
         assert_eq!(first.kind, FrameKind::AgentBootstrap);
-        let bootstrap: AgentBootstrapPayload =
-            first.parse_payload().expect("resumed AgentBootstrap payload");
+        let bootstrap: AgentBootstrapPayload = first
+            .parse_payload()
+            .expect("resumed AgentBootstrap payload");
         assert!(
             bootstrap.turn_active,
             "barrier completion must not publish Idle over an acknowledged queued delivery"
@@ -13758,7 +13769,9 @@ mod tests {
         assert!(
             !matches!(
                 bootstrap.events.last(),
-                Some(AgentBootstrapEvent::ChatEvent(ChatEvent::TypingStatusChanged(false)))
+                Some(AgentBootstrapEvent::ChatEvent(
+                    ChatEvent::TypingStatusChanged(false)
+                ))
             ),
             "a resumed agent with queued acknowledged work must not settle to idle"
         );
