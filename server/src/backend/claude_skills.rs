@@ -986,15 +986,16 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create skill dir");
         let skill_md_path = dir.join("SKILL.md");
         std::fs::write(&skill_md_path, skill_md).expect("write SKILL.md");
-        ResolvedSkill {
-            id: SkillId(name.to_string()),
-            name: name.to_string(),
-            title: None,
-            description: Some(format!("{name} description")),
-            source_dir: dir,
+        ResolvedSkill::path_only(
+            protocol::Skill {
+                id: SkillId(name.to_string()),
+                name: name.to_string(),
+                title: None,
+                description: Some(format!("{name} description")),
+            },
+            dir,
             skill_md_path,
-            body: String::new(),
-        }
+        )
     }
 
     fn prepare_ok(parent: &Path, skills: &[ResolvedSkill]) -> ClaudeSkillPlugin {

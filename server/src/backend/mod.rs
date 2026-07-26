@@ -782,7 +782,7 @@ pub(crate) fn render_combined_spawn_instructions(config: &ResolvedSpawnConfig) -
             .filter_map(|skill| {
                 skill
                     .inline_body()
-                    .map(|body| format!("Skill: {}\n{}", skill.name, body))
+                    .map(|body| format!("Skill: {}\n{}", skill.name, body.trim()))
             })
             .collect::<Vec<_>>();
         if !skill_blocks.is_empty() {

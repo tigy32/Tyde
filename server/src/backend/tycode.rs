@@ -617,6 +617,16 @@ fn materialize_tycode_customization(
         )?;
     }
     for skill in &config.resolved_spawn_config.skills {
+        // Tycode has no skill discovery, so it is resolved with inline bodies.
+        // A skill without one means the resolver and this materializer
+        // disagree; write nothing rather than an empty SKILL.md that reads as
+        // "this skill has no instructions".
+        let body = skill.inline_body().ok_or_else(|| {
+            format!(
+                "Tycode skill '{}' was resolved without an inline body",
+                skill.name
+            )
+        })?;
         write_text_file(
             &root
                 .path
@@ -624,7 +634,7 @@ fn materialize_tycode_customization(
                 .join("skills")
                 .join(&skill.name)
                 .join("SKILL.md"),
-            &skill.body,
+            body,
         )?;
     }
     Ok(Some(root))

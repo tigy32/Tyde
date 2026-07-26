@@ -36,41 +36,64 @@ pub struct ResolvedSkill {
     /// Canonical `<source_dir>/SKILL.md`, proven to be a regular file inside
     /// `source_dir`.
     pub skill_md_path: PathBuf,
-    /// Inline body, non-empty only when the session's [`SkillDelivery`] loads
-    /// bodies. Prefer [`ResolvedSkill::inline_body`], which cannot be read as
-    /// "the body happens to be empty".
-    pub body: String,
+    payload: SkillPayload,
+}
+
+/// What a session was handed for one skill.
+///
+/// Private, and the only way to reach it is [`ResolvedSkill::inline_body`].
+/// That is the whole point: no caller outside this module can put inline text
+/// into a skill its backend is supposed to discover for itself, or add text to
+/// one after the fact, because there is no public constructor that takes a body
+/// and no field to assign.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SkillPayload {
+    /// The backend opens `skill_md_path` itself when the model invokes the
+    /// skill. No text travels with the session.
+    Path,
+    /// The backend has no discovery seam, so the text travels with the skill.
+    Inline(String),
 }
 
 impl ResolvedSkill {
-    /// The only place a `ResolvedSkill` is built from the store, so `body`
-    /// cannot disagree with the delivery the session was resolved under.
-    fn new(
-        skill: protocol::Skill,
-        paths: crate::store::skills::SkillPaths,
-        delivery: SkillDelivery,
-    ) -> Result<Self, String> {
-        let mut resolved = Self {
+    /// A skill the backend finds for itself: identity and canonical locations,
+    /// never any text. This is the only public constructor, so a
+    /// `NativeDiscovery` or `NamesOnly` skill carrying inline text is not a
+    /// state a caller can express.
+    pub fn path_only(skill: protocol::Skill, source_dir: PathBuf, skill_md_path: PathBuf) -> Self {
+        Self {
             id: skill.id,
             name: skill.name,
             title: skill.title,
             description: skill.description,
-            source_dir: paths.source_dir,
-            skill_md_path: paths.skill_md,
-            body: String::new(),
-        };
+            source_dir,
+            skill_md_path,
+            payload: SkillPayload::Path,
+        }
+    }
+
+    /// The only place a skill is built from the store, so its payload cannot
+    /// disagree with the delivery the session was resolved under.
+    fn resolved(
+        skill: protocol::Skill,
+        paths: crate::store::skills::SkillPaths,
+        delivery: SkillDelivery,
+    ) -> Result<Self, String> {
+        let mut resolved = Self::path_only(skill, paths.source_dir, paths.skill_md);
         if delivery.loads_bodies() {
-            resolved.body = resolved.load_body()?;
+            resolved.payload = SkillPayload::Inline(resolved.load_body()?);
         }
         Ok(resolved)
     }
 
     /// The inline body, or `None` when this session's delivery never loaded
-    /// one. The store rejects empty bodies, so an empty `body` always means
-    /// "not delivered" rather than "delivered and blank".
+    /// one. Absence is a distinct state rather than an empty string, so
+    /// "discovered on demand" cannot be misread as "has no instructions".
     pub fn inline_body(&self) -> Option<&str> {
-        let body = self.body.trim();
-        (!body.is_empty()).then_some(body)
+        match &self.payload {
+            SkillPayload::Path => None,
+            SkillPayload::Inline(body) => Some(body.as_str()),
+        }
     }
 
     /// Read this skill's `SKILL.md` on demand.
@@ -93,8 +116,9 @@ impl ResolvedSkill {
 
 #[cfg(test)]
 impl ResolvedSkill {
-    /// A skill fixture with an inline body and no store behind it, for tests
-    /// that exercise rendering rather than resolution.
+    /// A skill fixture with no store behind it, for tests that exercise
+    /// rendering rather than resolution. An empty `body` yields a path-only
+    /// skill, matching what resolution produces for a discovering backend.
     pub(crate) fn test_fixture(name: &str, body: &str) -> Self {
         let source_dir = PathBuf::from("/nonexistent/tyde-test-skills").join(name);
         Self {
@@ -104,7 +128,11 @@ impl ResolvedSkill {
             description: None,
             skill_md_path: source_dir.join("SKILL.md"),
             source_dir,
-            body: body.to_string(),
+            payload: if body.is_empty() {
+                SkillPayload::Path
+            } else {
+                SkillPayload::Inline(body.to_string())
+            },
         }
     }
 }
@@ -430,7 +458,7 @@ fn resolve_skill(
         .get(skill_id)
         .ok_or_else(|| format!("cannot resolve missing skill {}", skill_id))?;
     let paths = skill_store.skill_paths(skill_id)?;
-    ResolvedSkill::new(skill, paths, delivery)
+    ResolvedSkill::resolved(skill, paths, delivery)
 }
 
 fn resolve_steering_body(
@@ -644,28 +672,94 @@ mod tests {
         }
     }
 
+    /// Every `BackendKind`, so adding one cannot quietly acquire the wrong
+    /// payload: `for_backend` already fails to compile until it is classified,
+    /// and this fails at runtime if the classification and the payload
+    /// disagree.
+    const EVERY_BACKEND_KIND: [BackendKind; 6] = [
+        BackendKind::Claude,
+        BackendKind::Codex,
+        BackendKind::Hermes,
+        BackendKind::Kiro,
+        BackendKind::Tycode,
+        BackendKind::Antigravity,
+    ];
+
     #[test]
     fn resolved_bodies_never_contradict_the_session_delivery() {
         let fixture = StoreFixture::new("delivery-invariant");
         fixture.install_skill("lint", BODY_SENTINEL);
 
-        for backend_kind in [
-            BackendKind::Claude,
-            BackendKind::Codex,
-            BackendKind::Hermes,
-            BackendKind::Kiro,
-            BackendKind::Tycode,
-            BackendKind::Antigravity,
-        ] {
+        for backend_kind in EVERY_BACKEND_KIND {
             let resolved = fixture
                 .resolve(backend_kind, None)
                 .unwrap_or_else(|err| panic!("{backend_kind:?} resolution: {err}"));
+            assert_eq!(
+                resolved.skill_delivery,
+                SkillDelivery::for_backend(backend_kind)
+            );
+            assert!(!resolved.skills.is_empty(), "{backend_kind:?}");
             for skill in &resolved.skills {
                 assert_eq!(
                     skill.inline_body().is_some(),
                     resolved.skill_delivery.loads_bodies(),
                     "{backend_kind:?} body presence disagrees with {:?}",
                     resolved.skill_delivery
+                );
+                // A discovering backend must not be able to see the text at
+                // all, in any field of the skill.
+                if !resolved.skill_delivery.loads_bodies() {
+                    assert!(
+                        !format!("{skill:?}").contains(BODY_SENTINEL),
+                        "{backend_kind:?} carried body text for {}",
+                        skill.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_path_only_skill_can_never_report_inline_text() {
+        let fixture = StoreFixture::new("path-only-payload");
+        fixture.install_skill("lint", BODY_SENTINEL);
+        let paths = fixture
+            .skills
+            .skill_paths(&SkillId("lint".to_string()))
+            .expect("skill paths");
+
+        // `path_only` is the only public constructor, and it takes no body.
+        // There is no field to assign and no setter, so the sole way to reach
+        // the text is the explicit `load_body` call.
+        let skill = ResolvedSkill::path_only(
+            Skill {
+                id: SkillId("lint".to_string()),
+                name: "lint".to_string(),
+                title: None,
+                description: Some("lint description".to_string()),
+            },
+            paths.source_dir.clone(),
+            paths.skill_md.clone(),
+        );
+
+        assert_eq!(skill.inline_body(), None);
+        assert!(!format!("{skill:?}").contains(BODY_SENTINEL));
+        assert_eq!(skill.load_body().expect("explicit read"), BODY_SENTINEL);
+        // Reading it does not change what the session carries.
+        assert_eq!(skill.inline_body(), None);
+    }
+
+    #[test]
+    fn rendering_a_body_always_implies_loading_one() {
+        // The two policies are allowed to diverge — a backend could load a body
+        // to write it somewhere other than a prompt — but rendering one it
+        // never loaded would emit an empty block.
+        for backend_kind in EVERY_BACKEND_KIND {
+            let delivery = SkillDelivery::for_backend(backend_kind);
+            if delivery.renders_inline_bodies() {
+                assert!(
+                    delivery.loads_bodies(),
+                    "{backend_kind:?} renders bodies it never loads"
                 );
             }
         }

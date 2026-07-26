@@ -14887,15 +14887,16 @@ for line in sys.stdin:
             .expect("write skill reference");
         let source_dir = std::fs::canonicalize(source_dir).expect("canonical skill dir");
         let skill_md_path = std::fs::canonicalize(skill_md_path).expect("canonical skill body");
-        ResolvedSkill {
-            id: protocol::SkillId(name.to_owned()),
-            name: name.to_owned(),
-            title: None,
-            description: Some(format!("{name} fixture")),
+        ResolvedSkill::path_only(
+            protocol::Skill {
+                id: protocol::SkillId(name.to_owned()),
+                name: name.to_owned(),
+                title: None,
+                description: Some(format!("{name} fixture")),
+            },
             source_dir,
             skill_md_path,
-            body: String::new(),
-        }
+        )
     }
 
     fn write_codex_raw_skill(
@@ -14912,15 +14913,16 @@ for line in sys.stdin:
             .expect("write raw skill reference");
         let source_dir = std::fs::canonicalize(source_dir).expect("canonical raw skill dir");
         let skill_md_path = std::fs::canonicalize(skill_md_path).expect("canonical raw skill body");
-        ResolvedSkill {
-            id: protocol::SkillId(name.to_owned()),
-            name: name.to_owned(),
-            title: None,
-            description: description.map(str::to_owned),
+        ResolvedSkill::path_only(
+            protocol::Skill {
+                id: protocol::SkillId(name.to_owned()),
+                name: name.to_owned(),
+                title: None,
+                description: description.map(str::to_owned),
+            },
             source_dir,
             skill_md_path,
-            body: String::new(),
-        }
+        )
     }
 
     fn codex_native_skill_spawn_options<'a>(
