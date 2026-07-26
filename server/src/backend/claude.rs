@@ -103,6 +103,14 @@ const CLAUDE_DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
 const CLAUDE_READ_ONLY_PERMISSION_MODE: &str = "acceptEdits";
 const CLAUDE_CONVERSATION_COMPACTED_NOTICE: &str = "Conversation compacted.";
 const CLAUDE_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a session will hold its output waiting for the CLI to report which
+/// skills it loaded. Matches the handshake timeout in production; shortened in
+/// tests so the silent-CLI regression does not spend half a minute proving the
+/// watchdog fires.
+#[cfg(not(test))]
+const CLAUDE_SKILL_VERIFICATION_TIMEOUT: Duration = CLAUDE_INITIALIZE_TIMEOUT;
+#[cfg(test)]
+const CLAUDE_SKILL_VERIFICATION_TIMEOUT: Duration = Duration::from_millis(750);
 
 #[cfg(test)]
 pub(crate) static FAKE_CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -240,6 +248,7 @@ struct ClaudeSkillExposure {
 async fn claude_prepare_skills(
     config: &BackendSpawnConfig,
     ssh_host: Option<&str>,
+    workspace_root: &str,
 ) -> Result<(ClaudeSkillExposure, ClaudeSkillSteering), String> {
     let selected = &config.resolved_spawn_config.skills;
     let selection = config.resolved_spawn_config.skill_selection;
@@ -248,13 +257,21 @@ async fn claude_prepare_skills(
     }
 
     // Keyed on the host actually handed to the low-level spawn, not on the shape
-    // of the workspace roots. A root list that merely mentions `ssh://` does not
-    // make this process remote, and must not push a local session back onto
-    // eager bodies.
-    if ssh_host.is_some() {
-        return Ok((
-            ClaudeSkillExposure::default(),
-            ClaudeSkillSteering::LegacyInlineBodies(selection),
+    // of the workspace roots: a root list that merely mentions `ssh://` does not
+    // make this process remote, and must not change how a local session works.
+    //
+    // Remote native skills are not supported. A plugin root materialized on this
+    // machine is invisible to a CLI running somewhere else, and Tyde has no
+    // remote materialization path. Earlier revisions inlined bodies here
+    // instead; that branch was unreachable from any production entry point, so
+    // it documented a fallback that did not exist. A skill-bearing remote
+    // session now fails visibly.
+    if let Some(host) = ssh_host {
+        return Err(format!(
+            "Claude skills are not available over SSH. This session selected {} skill(s), but \
+             Tyde materializes them into a directory on the machine it runs on, which the CLI \
+             on '{host}' cannot read. Remove the skills from this agent to run it remotely.",
+            selected.len()
         ));
     }
 
@@ -301,7 +318,7 @@ async fn claude_prepare_skills(
     // this root before the session process exists. Catches every *global*
     // failure — a rejected flag, an unreadable manifest, a disabled plugin —
     // while it is still a clean startup error rather than a mid-turn surprise.
-    claude_verify_plugin_loaded(plugin.root()).await?;
+    claude_verify_plugin_loaded(plugin.root(), workspace_root).await?;
 
     let expected = plugin.exposed().to_vec();
     tracing::debug!(
@@ -982,6 +999,15 @@ impl ClaudeSystemFrame {
             other => ClaudeSystemEvent::Unknown(other.to_string()),
         }
     }
+}
+
+/// Does this frame end the CLI's turn?
+///
+/// Used only while skill verification is still pending: a turn that reaches its
+/// `result` without ever emitting an `init` frame is never going to emit one, so
+/// the session must fail rather than hold its output indefinitely.
+fn claude_frame_is_turn_terminal(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("result")
 }
 
 /// Skills reported by a `system`/`init` frame.
@@ -1735,9 +1761,14 @@ impl ClaudeInner {
         }
 
         let input_message = build_stream_json_user_message(prompt, images);
-        self.write_process_json_line(&input_message)
+        let written = self
+            .write_process_json_line(&input_message)
             .await
-            .map_err(TurnStartError::Failed)
+            .map_err(TurnStartError::Failed);
+        if written.is_ok() {
+            self.watch_for_skill_verification();
+        }
+        written
     }
 
     async fn begin_ask_user_question_control_request(
@@ -2506,13 +2537,51 @@ impl ClaudeInner {
         }
     }
 
-    /// Current verification state, for tests and for the stdout suppression
-    /// check. There is deliberately no *blocking* variant: the `init` frame only
-    /// arrives in response to a user message, so waiting for it before sending
-    /// one would deadlock.
+    /// Current verification state. There is deliberately no *blocking* variant:
+    /// the `init` frame only arrives in response to a user message, so waiting
+    /// for it before sending one would deadlock.
+    fn skill_readiness_snapshot(&self) -> ClaudeSkillReadiness {
+        self.skill_readiness.borrow().clone()
+    }
+
     #[cfg(test)]
     fn skill_readiness_state(&self) -> ClaudeSkillReadiness {
-        self.skill_readiness.borrow().clone()
+        self.skill_readiness_snapshot()
+    }
+
+    /// Is this session still waiting to learn whether it has its skills?
+    ///
+    /// While true, the stdout reader holds model output back rather than
+    /// rendering something it may have to retract.
+    fn skills_awaiting_verification(&self) -> bool {
+        matches!(
+            *self.skill_readiness.borrow(),
+            ClaudeSkillReadiness::Pending
+        )
+    }
+
+    /// Bound the wait for an `init` frame once a prompt has gone out.
+    ///
+    /// The CLI reports its skills at the head of its response, so a prompt that
+    /// produces no `init` frame at all — an older CLI, a changed frame shape —
+    /// would otherwise leave the session holding its output forever. This turns
+    /// that into a visible failure on the same timeout the handshake uses.
+    fn watch_for_skill_verification(self: &Arc<Self>) {
+        if !self.skills_awaiting_verification() {
+            return;
+        }
+        let inner = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(CLAUDE_SKILL_VERIFICATION_TIMEOUT).await;
+            if inner.skills_awaiting_verification() {
+                inner
+                    .terminate_for_skill_mismatch(
+                        "Claude did not report which skills it loaded within the startup \
+                         timeout.",
+                    )
+                    .await;
+            }
+        });
     }
 
     /// Re-arm verification for a process that is about to start.
@@ -3161,13 +3230,20 @@ fn claude_binary() -> String {
 /// `plugin validate --strict` prints "Validation failed" while exiting 0, so
 /// neither can carry a gate. Per-skill verification therefore happens later,
 /// against the `init` frame.
-async fn claude_verify_plugin_loaded(root: &Path) -> Result<(), String> {
+async fn claude_verify_plugin_loaded(root: &Path, workspace_root: &str) -> Result<(), String> {
     let mut cmd = Command::new(claude_binary());
     cmd.arg(CLAUDE_PLUGIN_DIR_FLAG)
         .arg(root)
         .arg("plugin")
         .arg("list")
         .arg("--json");
+    // Same provenance as the session process, or the answer is about a
+    // different configuration than the one that will run. Plugin resolution is
+    // cwd-sensitive (project-scoped plugins) and config-sensitive
+    // (`CLAUDE_CONFIG_DIR`), so the probe runs in the session's workspace and
+    // inherits the same environment, with only `PATH` overridden the same way
+    // `spawn_process` overrides it.
+    cmd.current_dir(workspace_root);
     if let Some(path) = process_env::resolved_child_process_path() {
         cmd.env("PATH", path);
     }
@@ -3195,33 +3271,43 @@ async fn claude_verify_plugin_loaded(root: &Path) -> Result<(), String> {
 /// "unsupported" rather than assumed working, so the failure surfaces as a
 /// named capability error instead of an opaque CLI exit at spawn time.
 async fn claude_supports_plugin_dir() -> bool {
-    static SUPPORTED: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
-    *SUPPORTED
-        .get_or_init(|| async {
-            let mut cmd = Command::new(claude_binary());
-            cmd.arg("--help");
-            if let Some(path) = process_env::resolved_child_process_path() {
-                cmd.env("PATH", path);
+    // Cached in production because the CLI does not change under a running
+    // server, and uncached in tests because each test points the binary at its
+    // own fake and a shared cache would leak one test's CLI into another's.
+    #[cfg(not(test))]
+    {
+        static SUPPORTED: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+        *SUPPORTED.get_or_init(probe_plugin_dir_support).await
+    }
+    #[cfg(test)]
+    {
+        probe_plugin_dir_support().await
+    }
+}
+
+async fn probe_plugin_dir_support() -> bool {
+    let mut cmd = Command::new(claude_binary());
+    cmd.arg("--help");
+    if let Some(path) = process_env::resolved_child_process_path() {
+        cmd.env("PATH", path);
+    }
+    match cmd.output().await {
+        Ok(output) => {
+            let help = String::from_utf8_lossy(&output.stdout);
+            let supported = help_text_supports_plugin_dir(&help);
+            if !supported {
+                tracing::warn!(
+                    "Claude CLI --help does not advertise --plugin-dir; Tyde skills cannot be \
+                     exposed natively"
+                );
             }
-            match cmd.output().await {
-                Ok(output) => {
-                    let help = String::from_utf8_lossy(&output.stdout);
-                    let supported = help_text_supports_plugin_dir(&help);
-                    if !supported {
-                        tracing::warn!(
-                            "Claude CLI --help does not advertise --plugin-dir; \
-                             Tyde skills cannot be exposed natively"
-                        );
-                    }
-                    supported
-                }
-                Err(err) => {
-                    tracing::warn!("Failed to probe Claude CLI for --plugin-dir support: {err}");
-                    false
-                }
-            }
-        })
-        .await
+            supported
+        }
+        Err(err) => {
+            tracing::warn!("Failed to probe Claude CLI for --plugin-dir support: {err}");
+            false
+        }
+    }
 }
 
 async fn write_json_line_to_stdin(
@@ -3603,21 +3689,52 @@ async fn read_claude_stdout_persistent(
     // Keyed by task_id; loop scope for the same reason — a backgrounded
     // command's terminal frames arrive after the launching turn ends.
     let mut background_tasks: HashMap<String, BackgroundTaskEntry> = HashMap::new();
+    // Frames held back while skill verification is still Pending. The `init`
+    // frame arrives at the head of the CLI's response to the first user
+    // message, so anything the model says can reach this reader *before* Tyde
+    // knows whether the session has the skills it was configured with.
+    // Rendering that and retracting it later is worse than showing it a beat
+    // late, so it waits here and is replayed in order once the frame confirms
+    // the session — or dropped entirely if it does not.
+    let mut held_back: Vec<Value> = Vec::new();
+    // Frames still to process. Normally one line at a time, but a flush after
+    // verification pushes the held-back frames back to the front, so replay
+    // reuses exactly the same handling as live frames.
+    let mut queue: std::collections::VecDeque<Value> = std::collections::VecDeque::new();
 
-    while let Ok(Some(line)) = lines.next_line().await {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let value = match serde_json::from_str::<Value>(trimmed) {
-            Ok(value) => value,
-            Err(_) => {
-                tracing::warn!("Non-JSON line from Claude CLI: {trimmed}");
-                continue;
+    loop {
+        let value = match queue.pop_front() {
+            Some(value) => value,
+            None => {
+                let Ok(Some(line)) = lines.next_line().await else {
+                    // EOF. A session that never confirmed its skills must not
+                    // look like a clean end-of-stream.
+                    if inner.skills_awaiting_verification() {
+                        inner
+                            .terminate_for_skill_mismatch(
+                                "Claude exited before reporting which skills it loaded.",
+                            )
+                            .await;
+                    }
+                    break;
+                };
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<Value>(trimmed) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        tracing::warn!("Non-JSON line from Claude CLI: {trimmed}");
+                        continue;
+                    }
+                }
             }
         };
 
+        // Control traffic is never held back: the `initialize` handshake and
+        // permission round-trips have to keep flowing or the CLI stalls and no
+        // `init` frame is ever produced.
         if route_control_response(&value, &control_waiters).await {
             continue;
         }
@@ -3631,17 +3748,39 @@ async fn read_claude_stdout_persistent(
             continue;
         }
 
-        // The `init` frame is produced locally before any provider request and
-        // lists the skills the CLI actually loaded, so this is a free check
-        // that what Tyde materialized survived collision resolution. It is not
+        // The `init` frame lists the skills the CLI actually loaded. It is not
         // `continue`d: the frame still flows to the per-turn reducer.
         if let Some(reported) = claude_init_frame_skills(&value) {
             inner.record_skill_init_frame(reported).await;
+            match inner.skill_readiness_snapshot() {
+                ClaudeSkillReadiness::Ready => {
+                    // Confirmed: everything held back is genuine output and is
+                    // replayed ahead of whatever comes next, in arrival order.
+                    for held in held_back.drain(..).rev() {
+                        queue.push_front(held);
+                    }
+                }
+                ClaudeSkillReadiness::Failed(_) => held_back.clear(),
+                _ => {}
+            }
         }
         // Once a mismatch is known, nothing this process says is trustworthy.
-        // The process has been killed, but frames already buffered would
-        // otherwise still be rendered as if the session were fine.
         if inner.skills_mismatched() {
+            continue;
+        }
+        if inner.skills_awaiting_verification() {
+            // A terminal frame while still unverified means the confirmation is
+            // never coming.
+            if claude_frame_is_turn_terminal(&value) {
+                inner
+                    .terminate_for_skill_mismatch(
+                        "Claude finished its turn without reporting which skills it loaded.",
+                    )
+                    .await;
+                held_back.clear();
+                continue;
+            }
+            held_back.push(value);
             continue;
         }
 
@@ -9792,12 +9931,21 @@ impl ClaudeBackend {
         let command_handle_task = Arc::clone(&command_handle);
 
         tokio::spawn(async move {
+            // The probe must run where the session will run, so resolve the
+            // workspace the same way `spawn_with_mode` does.
+            let probe_workspace_root = match pick_workspace_root(&workspace_roots) {
+                Ok(root) => root,
+                Err(err) => {
+                    let _ = ready_tx.send(Err(err));
+                    return;
+                }
+            };
             // Materialize before the process starts: a capability miss or a
-            // failed symlink farm must fail the spawn, not start a session that
-            // silently has no skills.
+            // failed materialization must fail the spawn, not start a session
+            // that silently has no skills.
             // `ClaudeBackend` spawns the CLI locally; the low-level session is
             // the only layer that takes an ssh host, and it is given none here.
-            let (mut skills, skill_steering) = match claude_prepare_skills(&config, None).await {
+            let (skills, skill_steering) = match claude_prepare_skills(&config, None, &probe_workspace_root).await {
                 Ok(prepared) => prepared,
                 Err(err) => {
                     tracing::error!("Failed to prepare Claude skills: {err}");
@@ -9813,10 +9961,7 @@ impl ClaudeBackend {
                     return;
                 }
             };
-            if let Some(notice) = steering.notice {
-                skills.degraded_notice = Some(notice);
-            }
-            let steering_content = steering.content;
+            let steering_content = steering;
             let agent_identity = claude_agent_identity(&config);
             let session_result = if let Some(from_session_id) = fork_from_session_id.as_ref() {
                 ClaudeSession::fork(
@@ -10123,25 +10268,12 @@ enum ClaudeSkillSteering {
     /// Local session with a materialized plugin. Carries the skills that
     /// actually materialized, so the overlay can never name one that did not.
     Native(SkillSelection, Vec<PreparedSkill>),
-    /// SSH session: bodies inline, because a locally materialized plugin
-    /// directory does not exist on the remote host.
-    LegacyInlineBodies(SkillSelection),
-}
-
-/// Steering text plus anything the user should be told about it.
-#[derive(Debug, Default)]
-struct ClaudeSteering {
-    content: Option<String>,
-    /// Skills omitted from this session. Surfaced as a user event as well as in
-    /// the prompt, so a degraded session is visible in the UI and not only to
-    /// the model.
-    notice: Option<String>,
 }
 
 fn claude_steering_content(
     config: &BackendSpawnConfig,
     skills: ClaudeSkillSteering,
-) -> Result<ClaudeSteering, String> {
+) -> Result<Option<String>, String> {
     let mut sections = Vec::new();
     if config.resolved_spawn_config.access_mode == BackendAccessMode::ReadOnly {
         sections.push(READ_ONLY_ACCESS_MODE_INSTRUCTIONS.to_string());
@@ -10156,7 +10288,6 @@ fn claude_steering_content(
         );
     }
     let selected = &config.resolved_spawn_config.skills;
-    let mut notice = None;
     if !selected.is_empty() {
         match skills {
             ClaudeSkillSteering::None => {}
@@ -10165,99 +10296,9 @@ fn claude_steering_content(
                     sections.push(native_skill_overlay(selection, &prepared));
                 }
             }
-            ClaudeSkillSteering::LegacyInlineBodies(selection) => {
-                let remote = claude_legacy_inline_skill_block(selected, selection)?;
-                if let Some(block) = remote.block {
-                    sections.push(block);
-                }
-                notice = remote.notice;
-            }
         }
     }
-    Ok(ClaudeSteering {
-        content: (!sections.is_empty()).then(|| sections.join("\n\n")),
-        notice,
-    })
-}
-
-/// The remote skill block, plus the omissions worth telling the user about.
-#[derive(Debug, Default)]
-struct ClaudeRemoteSkills {
-    block: Option<String>,
-    notice: Option<String>,
-}
-
-/// Inline every selected skill body, for SSH sessions only.
-///
-/// **This backend cannot expose skills natively to a remote CLI.** A session
-/// plugin is materialized on the machine Tyde runs on, and the remote host
-/// cannot see that directory, so remote sessions keep the pre-native behaviour
-/// rather than silently losing their skills. That is a real limitation, not a
-/// design: remote materialization is the fix, and until it exists remote
-/// sessions pay the full prompt cost of every selected skill.
-///
-/// This is the one path that still reads bodies; it does so explicitly through
-/// `load_body` so it stays greppable. An **explicit** selection that cannot be
-/// read fails the session, for the same reason it does locally: a custom agent
-/// configured with a skill must not quietly run without it.
-fn claude_legacy_inline_skill_block(
-    skills: &[ResolvedSkill],
-    selection: SkillSelection,
-) -> Result<ClaudeRemoteSkills, String> {
-    tracing::warn!(
-        "Claude session is remote (SSH): inlining {} skill body/bodies into the system \
-         prompt because a locally materialized plugin directory is invisible to the remote \
-         CLI. Remote skill materialization would remove this cost.",
-        skills.len()
-    );
-    let mut blocks = Vec::new();
-    let mut omitted = Vec::new();
-    let mut notice = None;
-    for skill in skills {
-        match skill.load_body() {
-            Ok(body) if !body.trim().is_empty() => {
-                blocks.push(format!("Skill: {}\n{}", skill.name, body.trim()));
-            }
-            Ok(_) => omitted.push(format!(
-                "- skill '{}' was not included: its SKILL.md is empty",
-                skill.name
-            )),
-            Err(err) => omitted.push(format!(
-                "- skill '{}' was not included: {err}",
-                skill.name
-            )),
-        }
-    }
-    if !omitted.is_empty() {
-        if selection == SkillSelection::Explicit {
-            return Err(format!(
-                "This agent explicitly selected {} skill(s) and Tyde could not read all of \
-                 them for a remote Claude session, so the session was not started:\n{}",
-                skills.len(),
-                omitted.join("\n")
-            ));
-        }
-        for line in &omitted {
-            tracing::warn!("Remote Claude session degraded: {line}");
-        }
-        // A Default remote session keeps going, but the omission is stated in
-        // the prompt itself rather than only in a log: over SSH the bodies *are*
-        // the delivery mechanism, so a missing one changes what the model can do
-        // and the model should know which skills it does not have.
-        blocks.push(format!(
-            "Some Tyde skills could not be included in this remote session:\n{}",
-            omitted.join("\n")
-        ));
-        notice = Some(format!(
-            "Tyde started this remote Claude session without {} skill(s):\n{}",
-            omitted.len(),
-            omitted.join("\n")
-        ));
-    }
-    Ok(ClaudeRemoteSkills {
-        block: (!blocks.is_empty()).then(|| blocks.join("\n\n")),
-        notice,
-    })
+    Ok((!sections.is_empty()).then(|| sections.join("\n\n")))
 }
 
 fn spawn_claude_subagent_event_bridge(
@@ -10870,12 +10911,10 @@ impl Backend for ClaudeBackend {
 
         // A resumed session gets its own plugin root: the previous session's
         // was unlinked when it shut down.
-        let (mut skills, skill_steering) = claude_prepare_skills(&config, None).await?;
+        let probe_workspace_root = pick_workspace_root(&workspace_roots)?;
+        let (skills, skill_steering) = claude_prepare_skills(&config, None, &probe_workspace_root).await?;
         let steering = claude_steering_content(&config, skill_steering)?;
-        if let Some(notice) = steering.notice {
-            skills.degraded_notice = Some(notice);
-        }
-        let steering_content = steering.content;
+        let steering_content = steering;
         let agent_identity = claude_agent_identity(&config);
         let (session, mut raw_events) = ClaudeSession::spawn_with_skills(
             &workspace_roots,
@@ -11696,7 +11735,6 @@ mod tests {
             ClaudeSkillSteering::None,
         )
         .expect("steering")
-        .content
         .expect("read-only advisory");
 
         assert!(steering.contains("Backend access mode is read-only (best effort)"));
@@ -11812,7 +11850,6 @@ mod tests {
             ),
         )
         .expect("steering")
-        .content
         .expect("skill guidance");
 
         assert!(steering.contains("tyde-skills:<name>"));
@@ -11845,7 +11882,6 @@ mod tests {
             ClaudeSkillSteering::Native(SkillSelection::Explicit, vec![prepared("lint")]),
         )
         .expect("steering")
-        .content
         .expect("skill listing");
 
         assert!(steering.contains("lint"), "{steering}");
@@ -11869,7 +11905,6 @@ mod tests {
             ClaudeSkillSteering::Native(SkillSelection::Explicit, vec![prepared("good")]),
         )
         .expect("steering")
-        .content
         .expect("skill listing");
 
         assert!(steering.contains("good"), "{steering}");
@@ -11892,14 +11927,124 @@ mod tests {
         assert!(
             claude_steering_content(&config, ClaudeSkillSteering::None)
                 .expect("steering")
-                .content
                 .is_none(),
             "a refused-everything session must not invent a skills section"
         );
     }
 
+    /// A fake `claude` that answers only the two zero-provider local commands
+    /// `claude_prepare_skills` runs: `--help` (capability probe) and
+    /// `plugin list --json` (pre-start inventory).
+    ///
+    /// Every `claude_prepare_skills` test goes through this, so none of them
+    /// depends on a Claude CLI being installed, on its version, or on the user's
+    /// real plugin configuration. `--plugin-dir <root>` is echoed straight back
+    /// as the loaded plugin's `installPath`, which is what the real CLI reports.
+    #[cfg(unix)]
+    struct FakeClaudeCli {
+        _workspace: tempfile::TempDir,
+        _claude_home: tempfile::TempDir,
+        workspace_root: String,
+        previous_bin: Option<std::ffi::OsString>,
+        previous_config_dir: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl FakeClaudeCli {
+        /// `supports_plugin_dir` controls the `--help` answer; `inventory`
+        /// controls what `plugin list --json` prints (`None` = report the root
+        /// that was passed, which is the success case).
+        fn install(supports_plugin_dir: bool, inventory: Option<&str>) -> Self {
+            let workspace = tempfile::tempdir().expect("workspace tempdir");
+            let claude_home = tempfile::tempdir().expect("claude home tempdir");
+            let fake = workspace.path().join("fake-claude-prepare.py");
+            let help_line = if supports_plugin_dir {
+                "  --plugin-dir <path>   Load a plugin from a directory"
+            } else {
+                "  --add-dir <path>      Additional directories"
+            };
+            // Both are emitted as JSON string literals, which are also valid
+            // Python literals, so nothing in a path or a fixture can break the
+            // generated script.
+            let quoted_help = serde_json::to_string(help_line).expect("quote help line");
+            let inventory_expr = match inventory {
+                Some(literal) => serde_json::to_string(literal).expect("quote inventory"),
+                None => "json.dumps([{\"id\": \"tyde-skills@inline\", \"version\": \"0.0.0\", \
+                         \"scope\": \"session\", \"enabled\": True, \"installPath\": plugin_dir}])"
+                    .to_string(),
+            };
+            std::fs::write(
+                &fake,
+                format!(
+                    r#"#!/usr/bin/env python3
+import json
+import sys
+
+argv = sys.argv[1:]
+plugin_dir = None
+if "--plugin-dir" in argv:
+    plugin_dir = argv[argv.index("--plugin-dir") + 1]
+
+if "--help" in argv:
+    print("Usage: claude [options]")
+    print({quoted_help})
+    sys.exit(0)
+
+if "plugin" in argv and "list" in argv:
+    print({inventory_expr})
+    sys.exit(0)
+
+sys.exit(1)
+"#,
+                    quoted_help = quoted_help,
+                    inventory_expr = inventory_expr,
+                ),
+            )
+            .expect("write fake claude");
+            make_executable(&fake);
+
+            let previous_bin = std::env::var_os(TYDE_CLAUDE_BIN_ENV);
+            let previous_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
+            unsafe {
+                std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
+                std::env::set_var("CLAUDE_CONFIG_DIR", claude_home.path());
+            }
+            let workspace_root = workspace.path().to_string_lossy().to_string();
+            Self {
+                _workspace: workspace,
+                _claude_home: claude_home,
+                workspace_root,
+                previous_bin,
+                previous_config_dir,
+            }
+        }
+
+        fn workspace(&self) -> &str {
+            &self.workspace_root
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeClaudeCli {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous_bin.take() {
+                    Some(value) => std::env::set_var(TYDE_CLAUDE_BIN_ENV, value),
+                    None => std::env::remove_var(TYDE_CLAUDE_BIN_ENV),
+                }
+                match self.previous_config_dir.take() {
+                    Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+                    None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn an_explicit_selection_fails_closed_when_a_skill_cannot_be_exposed() {
+        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
+        let cli = FakeClaudeCli::install(true, None);
         let tmp = tempfile::tempdir().expect("tempdir");
         let good = skill_fixture(tmp.path(), "good", "---\nname: good\n---\nbody\n");
         let broken = skill_fixture(
@@ -11909,7 +12054,7 @@ mod tests {
         );
         let config = spawn_config_with_skills(vec![good, broken], SkillSelection::Explicit);
 
-        let err = claude_prepare_skills(&config, None)
+        let err = claude_prepare_skills(&config, None, cli.workspace())
             .await
             .expect_err("an explicit selection must not start partially");
 
@@ -11918,13 +12063,17 @@ mod tests {
         assert!(err.contains("hooks"), "{err}");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn an_explicit_selection_fails_closed_when_every_skill_is_refused() {
+        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
+        let cli = FakeClaudeCli::install(true, None);
         let tmp = tempfile::tempdir().expect("tempdir");
-        let broken = skill_fixture(tmp.path(), "broken", "---\nname: b\nmcpServers:\n  x: {}\n---\nb\n");
+        let broken =
+            skill_fixture(tmp.path(), "broken", "---\nname: b\nmcpServers:\n  x: {}\n---\nb\n");
         let config = spawn_config_with_skills(vec![broken], SkillSelection::Explicit);
 
-        let err = claude_prepare_skills(&config, None)
+        let err = claude_prepare_skills(&config, None, cli.workspace())
             .await
             .expect_err("an explicit selection must fail closed");
 
@@ -11932,8 +12081,11 @@ mod tests {
         assert!(err.contains("mcpServers"), "{err}");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_default_selection_degrades_visibly_and_keeps_the_rest() {
+        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
+        let cli = FakeClaudeCli::install(true, None);
         let tmp = tempfile::tempdir().expect("tempdir");
         let good = skill_fixture(tmp.path(), "good", "---\nname: good\n---\nbody\n");
         let broken = skill_fixture(
@@ -11943,7 +12095,7 @@ mod tests {
         );
         let config = spawn_config_with_skills(vec![good, broken], SkillSelection::AllInstalled);
 
-        let (exposure, steering) = claude_prepare_skills(&config, None)
+        let (exposure, steering) = claude_prepare_skills(&config, None, cli.workspace())
             .await
             .expect("Default must not be blocked by one broken skill");
 
@@ -11967,13 +12119,16 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_default_selection_with_nothing_usable_still_reports_why() {
+        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
+        let cli = FakeClaudeCli::install(true, None);
         let tmp = tempfile::tempdir().expect("tempdir");
         let broken = skill_fixture(tmp.path(), "broken", "---\nname: b\nhooks:\n  - x\n---\nb\n");
         let config = spawn_config_with_skills(vec![broken], SkillSelection::AllInstalled);
 
-        let (exposure, steering) = claude_prepare_skills(&config, None)
+        let (exposure, steering) = claude_prepare_skills(&config, None, cli.workspace())
             .await
             .expect("Default still starts");
 
@@ -11990,8 +12145,73 @@ mod tests {
         assert!(matches!(steering, ClaudeSkillSteering::None));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn a_local_session_is_never_pushed_onto_inline_bodies_by_a_remote_looking_root() {
+    async fn a_cli_without_plugin_dir_fails_the_spawn_rather_than_inlining() {
+        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
+        let cli = FakeClaudeCli::install(false, None);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skill = skill_fixture(tmp.path(), "alpha", "---\nname: alpha\n---\nbody\n");
+        let config = spawn_config_with_skills(vec![skill], SkillSelection::AllInstalled);
+
+        let err = claude_prepare_skills(&config, None, cli.workspace())
+            .await
+            .expect_err("an incapable CLI must fail visibly");
+
+        assert!(err.contains("--plugin-dir"), "{err}");
+        assert!(
+            err.contains("will not fall back"),
+            "the error must say there is no body-inlining fallback: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_preflight_that_does_not_report_our_root_fails_the_spawn() {
+        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
+        // The CLI claims to have loaded the plugin from somewhere else.
+        let cli = FakeClaudeCli::install(
+            true,
+            Some(
+                r#"[{"id": "tyde-skills@inline", "enabled": true, "installPath": "/definitely/elsewhere"}]"#,
+            ),
+        );
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skill = skill_fixture(tmp.path(), "alpha", "---\nname: alpha\n---\nbody\n");
+        let config = spawn_config_with_skills(vec![skill], SkillSelection::AllInstalled);
+
+        let err = claude_prepare_skills(&config, None, cli.workspace())
+            .await
+            .expect_err("a plugin loaded from elsewhere is not this session's");
+
+        assert!(err.contains("could not resolve") || err.contains("not from this session's root"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_preflight_reporting_plugin_errors_fails_the_spawn() {
+        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
+        let cli = FakeClaudeCli::install(
+            true,
+            Some(r#"[{"id": "tyde-skills@inline", "enabled": true, "errors": ["skill alpha is invalid"]}]"#),
+        );
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skill = skill_fixture(tmp.path(), "alpha", "---\nname: alpha\n---\nbody\n");
+        let config = spawn_config_with_skills(vec![skill], SkillSelection::AllInstalled);
+
+        let err = claude_prepare_skills(&config, None, cli.workspace())
+            .await
+            .expect_err("reported problems must fail the spawn");
+
+        assert!(err.contains("problem(s) loading"), "{err}");
+        assert!(err.contains("skill alpha is invalid"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_local_session_is_never_changed_by_a_remote_looking_root() {
+        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
+        let cli = FakeClaudeCli::install(true, None);
         let tmp = tempfile::tempdir().expect("tempdir");
         let skills = vec![skill_fixture(
             tmp.path(),
@@ -12001,8 +12221,9 @@ mod tests {
         let config = spawn_config_with_skills(skills, SkillSelection::AllInstalled);
 
         // Remoteness is the ssh host the low-level spawn was given, not the
-        // shape of the workspace roots. `None` here means local.
-        let (_, steering) = claude_prepare_skills(&config, None)
+        // shape of the workspace roots. `None` here means local, and a local
+        // session gets native discovery whatever the roots look like.
+        let (_, steering) = claude_prepare_skills(&config, None, cli.workspace())
             .await
             .expect("local preparation");
 
@@ -12012,82 +12233,40 @@ mod tests {
         );
     }
 
+    /// Remote Claude sessions cannot have native skills, and Tyde no longer
+    /// pretends otherwise: there is no inline-body fallback, because the branch
+    /// that claimed to provide one was unreachable from every production entry
+    /// point. A skill-bearing remote session fails visibly instead.
     #[tokio::test]
-    async fn an_ssh_session_keeps_inline_bodies() {
+    async fn a_remote_skill_bearing_session_fails_visibly() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let skills = vec![skill_fixture(
-            tmp.path(),
-            "alpha",
-            "---\nname: alpha\n---\nBODYMARK-99ee00\n",
-        )];
+        let skills = vec![skill_fixture(tmp.path(), "alpha", "---\nname: alpha\n---\nb\n")];
         let config = spawn_config_with_skills(skills, SkillSelection::AllInstalled);
 
-        let (exposure, steering) = claude_prepare_skills(&config, Some("build-host"))
+        // No fake CLI needed: this fails before any local command runs.
+        let err = claude_prepare_skills(&config, Some("build-host"), "/tmp")
             .await
-            .expect("remote preparation");
+            .expect_err("remote native skills are not supported");
 
+        assert!(err.contains("not available over SSH"), "{err}");
+        assert!(err.contains("build-host"), "{err}");
         assert!(
-            exposure.plugin.is_none(),
-            "a local plugin root is invisible to a remote CLI, so none is made"
-        );
-        assert!(matches!(
-            steering,
-            ClaudeSkillSteering::LegacyInlineBodies(SkillSelection::AllInstalled)
-        ));
-
-        let rendered = claude_steering_content(&config, steering)
-            .expect("steering")
-            .content
-            .expect("inline bodies");
-        assert!(rendered.contains("Skill: alpha"), "{rendered}");
-        assert!(rendered.contains("BODYMARK-99ee00"), "{rendered}");
-    }
-
-    #[test]
-    fn a_remote_explicit_selection_fails_when_a_body_cannot_be_read() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let readable = skill_fixture(tmp.path(), "alpha", "---\nname: alpha\n---\nBODY-ddeeff\n");
-        let missing = skill_fixture(tmp.path(), "gone", "---\nname: gone\n---\nbody\n");
-        std::fs::remove_file(&missing.skill_md_path).expect("remove SKILL.md");
-        let config = spawn_config_with_skills(
-            vec![readable.clone(), missing],
-            SkillSelection::Explicit,
-        );
-
-        let err = claude_steering_content(
-            &config,
-            ClaudeSkillSteering::LegacyInlineBodies(SkillSelection::Explicit),
-        )
-        .expect_err("an explicit remote selection must fail closed");
-
-        assert!(err.contains("explicitly selected"), "{err}");
-        assert!(err.contains("gone"), "{err}");
-    }
-
-    #[test]
-    fn a_remote_default_selection_skips_an_unreadable_body_without_an_empty_block() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let readable = skill_fixture(tmp.path(), "alpha", "---\nname: alpha\n---\nBODY-ddeeff\n");
-        let missing = skill_fixture(tmp.path(), "gone", "---\nname: gone\n---\nbody\n");
-        std::fs::remove_file(&missing.skill_md_path).expect("remove SKILL.md");
-        let config =
-            spawn_config_with_skills(vec![readable, missing], SkillSelection::AllInstalled);
-
-        let steering = claude_steering_content(
-            &config,
-            ClaudeSkillSteering::LegacyInlineBodies(SkillSelection::AllInstalled),
-        )
-        .expect("steering")
-        .content
-        .expect("the readable skill still inlines");
-
-        assert!(steering.contains("BODY-ddeeff"), "{steering}");
-        assert!(
-            !steering.contains("Skill: gone"),
-            "an unreadable skill must not become an empty 'Skill: <name>' block: {steering}"
+            !err.contains("Skill: "),
+            "no inline-body fallback is offered: {err}"
         );
     }
 
+    #[tokio::test]
+    async fn a_remote_session_without_skills_is_unaffected() {
+        let config = spawn_config_with_skills(Vec::new(), SkillSelection::AllInstalled);
+
+        let (exposure, steering) = claude_prepare_skills(&config, Some("build-host"), "/tmp")
+            .await
+            .expect("a remote session with no skills is fine");
+
+        assert!(exposure.plugin.is_none());
+        assert!(matches!(steering, ClaudeSkillSteering::None));
+    }
     #[test]
     fn init_frame_skills_distinguish_absent_from_malformed() {
         let with_skills = json!({
@@ -12329,6 +12508,31 @@ mod tests {
         let err = verify_plugin_inventory(elsewhere, &root).expect_err("another root");
         assert!(err.contains("not from this session's root"), "{err}");
 
+        let duplicated = format!(
+            r#"[{{"id":"tyde-skills@inline","enabled":true,"installPath":{root}}},
+                {{"id":"tyde-skills@inline","enabled":true,"installPath":{root}}}]"#,
+            root = serde_json::to_string(&root.to_string_lossy().to_string()).expect("json")
+        );
+        let err = verify_plugin_inventory(&duplicated, &root).expect_err("ambiguous inventory");
+        assert!(
+            err.contains("2 plugins under the id"),
+            "two entries under our id is ambiguous, not a pass: {err}"
+        );
+
+        let with_errors = format!(
+            r#"[{{"id":"tyde-skills@inline","enabled":true,"installPath":{root},
+                 "errors":["skill alpha is invalid"]}}]"#,
+            root = serde_json::to_string(&root.to_string_lossy().to_string()).expect("json")
+        );
+        let err = verify_plugin_inventory(&with_errors, &root).expect_err("reported problems");
+        assert!(err.contains("problem(s) loading"), "{err}");
+        assert!(err.contains("skill alpha is invalid"), "{err}");
+
+        let unresolvable =
+            r#"[{"id":"tyde-skills@inline","enabled":true,"installPath":"/no/such/path/here"}]"#;
+        let err = verify_plugin_inventory(unresolvable, &root).expect_err("unresolvable path");
+        assert!(err.contains("could not resolve"), "{err}");
+
         let err = verify_plugin_inventory("not json", &root).expect_err("unparseable");
         assert!(err.contains("not valid JSON"), "{err}");
 
@@ -12340,8 +12544,64 @@ mod tests {
     /// `system`/`init` frame **in response to the first user message**, not at
     /// boot. Anything that waited for the frame before writing a prompt would
     /// deadlock against this, which is exactly why the wait was removed.
+    /// What the fake CLI does when it receives the first user frame.
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum FakeInitBehaviour {
+        /// Report these skills, then produce model output. The normal case.
+        Reports(&'static str),
+        /// Produce model output and never report skills at all.
+        OmitsInit,
+        /// Produce model output *before* the init frame, so the reader must
+        /// hold that output back and replay it after verification.
+        AssistantBeforeInit(&'static str),
+        /// End the turn with a `result` and no init frame.
+        ResultBeforeInit,
+        /// Say nothing at all: no init frame, no output, no result.
+        SaysNothing,
+    }
+
     #[cfg(unix)]
     async fn run_init_after_prompt_fake(reported_skills: &str) -> (String, Vec<Value>) {
+        run_fake_with_behaviour(FakeInitBehaviour::Reports(match reported_skills {
+            r#"["tyde-skills:alpha"]"# => r#"["tyde-skills:alpha"]"#,
+            _ => r#"["something-else"]"#,
+        }))
+        .await
+    }
+
+    #[cfg(unix)]
+    impl FakeInitBehaviour {
+        fn tag(self) -> &'static str {
+            match self {
+                Self::Reports(_) => "reports",
+                Self::OmitsInit => "omits_init",
+                Self::AssistantBeforeInit(_) => "assistant_before_init",
+                Self::ResultBeforeInit => "result_before_init",
+                Self::SaysNothing => "says_nothing",
+            }
+        }
+
+        fn reported_skills(self) -> &'static str {
+            match self {
+                Self::Reports(skills) | Self::AssistantBeforeInit(skills) => skills,
+                _ => "[]",
+            }
+        }
+
+        /// The last log entry this behaviour is expected to write, or `None`
+        /// when it writes nothing after the prompt.
+        fn final_marker(self) -> Option<&'static str> {
+            match self {
+                Self::Reports(_) | Self::AssistantBeforeInit(_) | Self::OmitsInit => Some("RESULT"),
+                Self::ResultBeforeInit => Some("RESULT"),
+                Self::SaysNothing => None,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    async fn run_fake_with_behaviour(behaviour: FakeInitBehaviour) -> (String, Vec<Value>) {
         let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let claude_home = tempfile::tempdir().expect("claude home tempdir");
@@ -12379,25 +12639,41 @@ for raw_line in sys.stdin:
         continue
     if value.get("type") == "user":
         note("PROMPT")
-        # The real CLI reports its loaded skills here, at the head of the
-        # response to the first user message -- never before one.
-        print(json.dumps({{
+        behaviour = {behaviour!r}
+        init_frame = json.dumps({{
             "type": "system",
             "subtype": "init",
             "session_id": "init-after-prompt",
             "skills": {reported_skills},
-        }}), flush=True)
-        note("INIT_FRAME")
-        print(json.dumps({{
+        }})
+        assistant = json.dumps({{
             "type": "assistant",
             "message": {{
                 "id": "msg_fake",
                 "role": "assistant",
                 "content": [{{"type": "text", "text": "MODEL-OUTPUT-SENTINEL"}}],
             }},
-        }}), flush=True)
-        note("MODEL_OUTPUT")
-"#
+        }})
+        result = json.dumps({{"type": "result", "subtype": "success", "is_error": False}})
+        if behaviour == "reports":
+            # The real CLI reports its loaded skills at the head of the
+            # response to the first user message -- never before one.
+            print(init_frame, flush=True); note("INIT_FRAME")
+            print(assistant, flush=True); note("MODEL_OUTPUT")
+            print(result, flush=True); note("RESULT")
+        elif behaviour == "assistant_before_init":
+            print(assistant, flush=True); note("MODEL_OUTPUT")
+            print(init_frame, flush=True); note("INIT_FRAME")
+            print(result, flush=True); note("RESULT")
+        elif behaviour == "omits_init":
+            print(assistant, flush=True); note("MODEL_OUTPUT")
+            print(result, flush=True); note("RESULT")
+        elif behaviour == "result_before_init":
+            print(result, flush=True); note("RESULT")
+        # "says_nothing" falls through: no frames at all.
+"#,
+                behaviour = behaviour.tag(),
+                reported_skills = behaviour.reported_skills(),
             ),
         )
         .expect("write init-after-prompt fake");
@@ -12434,14 +12710,25 @@ for raw_line in sys.stdin:
             .write_process_json_line(&build_stream_json_user_message("hello", &[]))
             .await
             .expect("write the first prompt");
+        // The production turn path arms this immediately after the write; this
+        // helper bypasses that path, so it arms it explicitly.
+        inner.watch_for_skill_verification();
 
-        // Give the fake's response time to arrive and be consumed.
+        // Wait for the fake to finish speaking, then let the reader drain.
+        if let Some(marker) = behaviour.final_marker() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                if std::fs::read_to_string(&log).unwrap_or_default().contains(marker) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }
+        // A silent CLI is resolved by the watchdog rather than by a frame, so
+        // wait for the state to settle instead of for a log line.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
-            if std::fs::read_to_string(&log)
-                .unwrap_or_default()
-                .contains("MODEL_OUTPUT")
-            {
+            if !inner.skills_awaiting_verification() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -12474,8 +12761,8 @@ for raw_line in sys.stdin:
         }
         let log_contents = std::fs::read_to_string(&log).unwrap_or_default();
         assert!(
-            matches!(state, ClaudeSkillReadiness::Ready | ClaudeSkillReadiness::Failed(_)),
-            "the init frame must have been consumed, state was {state:?}"
+            !matches!(state, ClaudeSkillReadiness::Pending),
+            "verification must resolve one way or the other, state was {state:?}"
         );
         (log_contents, events)
     }
@@ -12491,6 +12778,97 @@ for raw_line in sys.stdin:
         assert!(
             prompt < init,
             "this fake reports skills only after a prompt; startup must not wait for it: {log:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn output_emitted_before_the_init_frame_is_held_back_and_then_replayed() {
+        let (log, events) =
+            run_fake_with_behaviour(FakeInitBehaviour::AssistantBeforeInit(
+                r#"["tyde-skills:alpha"]"#,
+            ))
+            .await;
+
+        // The CLI spoke before it reported, which is the case the hold-back
+        // buffer exists for.
+        let output = log.find("MODEL_OUTPUT").expect("the model spoke");
+        let init = log.find("INIT_FRAME").expect("the init frame followed");
+        assert!(output < init, "this fake speaks before reporting: {log:?}");
+
+        // Verification passed, so the held-back output is not lost — it is
+        // replayed once the session is known to be sound.
+        let rendered = serde_json::to_string(&events).expect("events");
+        assert!(
+            rendered.contains("MODEL-OUTPUT-SENTINEL"),
+            "confirmed output must be replayed, not dropped: {rendered}"
+        );
+        let kinds: Vec<Option<&str>> = events.iter().map(event_kind).collect();
+        assert!(
+            !kinds.contains(&Some("Error")),
+            "a confirmed session must not report an error: {kinds:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn output_held_back_before_a_mismatch_is_discarded_not_replayed() {
+        let (log, events) =
+            run_fake_with_behaviour(FakeInitBehaviour::AssistantBeforeInit(r#"["other"]"#)).await;
+
+        assert!(log.contains("MODEL_OUTPUT") && log.contains("INIT_FRAME"), "{log:?}");
+        let rendered = serde_json::to_string(&events).expect("events");
+        assert!(
+            !rendered.contains("MODEL-OUTPUT-SENTINEL"),
+            "output held back before a mismatch must be discarded: {rendered}"
+        );
+        let kinds: Vec<Option<&str>> = events.iter().map(event_kind).collect();
+        assert!(kinds.contains(&Some("Error")), "the user must be told: {kinds:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cli_that_never_reports_skills_fails_rather_than_rendering() {
+        let (log, events) = run_fake_with_behaviour(FakeInitBehaviour::OmitsInit).await;
+
+        assert!(log.contains("MODEL_OUTPUT"), "the fake did speak: {log:?}");
+        assert!(!log.contains("INIT_FRAME"), "but never reported: {log:?}");
+        let rendered = serde_json::to_string(&events).expect("events");
+        assert!(
+            !rendered.contains("MODEL-OUTPUT-SENTINEL"),
+            "unverified output must never reach the user: {rendered}"
+        );
+        let kinds: Vec<Option<&str>> = events.iter().map(event_kind).collect();
+        assert!(kinds.contains(&Some("Error")), "{kinds:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_turn_that_ends_without_an_init_frame_fails_the_session() {
+        let (log, events) = run_fake_with_behaviour(FakeInitBehaviour::ResultBeforeInit).await;
+
+        assert!(log.contains("RESULT"), "{log:?}");
+        assert!(!log.contains("INIT_FRAME"), "{log:?}");
+        let kinds: Vec<Option<&str>> = events.iter().map(event_kind).collect();
+        assert!(
+            kinds.contains(&Some("Error")),
+            "a turn that ends unverified must fail, not look complete: {kinds:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_silent_cli_is_failed_by_the_verification_watchdog() {
+        // Nothing at all comes back after the prompt: no init frame, no output,
+        // no result. Only the timeout can resolve this.
+        let (log, events) = run_fake_with_behaviour(FakeInitBehaviour::SaysNothing).await;
+
+        assert!(log.contains("PROMPT"), "{log:?}");
+        assert!(!log.contains("INIT_FRAME"), "{log:?}");
+        let kinds: Vec<Option<&str>> = events.iter().map(event_kind).collect();
+        assert!(
+            kinds.contains(&Some("Error")),
+            "a silent CLI must not leave the session waiting forever: {kinds:?}"
         );
     }
 
