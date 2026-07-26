@@ -4202,7 +4202,7 @@ fn apply_agent_error(state: &AppState, host_id: &str, payload: AgentErrorPayload
         ChatMessageEntry {
             message: protocol::ChatMessage {
                 message_id: None,
-                timestamp: js_sys::Date::now() as u64,
+                timestamp: crate::state::now_ms(),
                 sender: protocol::MessageSender::Error,
                 content: payload.message,
                 reasoning: None,
