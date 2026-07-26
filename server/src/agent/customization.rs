@@ -286,7 +286,11 @@ pub(crate) fn resolve_spawn_config(
         if is_default_custom_agent(&custom_agent) {
             skill_selection = SkillSelection::AllInstalled;
             for skill in request.skill_store.list()? {
-                skills.push(resolve_skill(request.skill_store, &skill.id, skill_delivery)?);
+                skills.push(resolve_skill(
+                    request.skill_store,
+                    &skill.id,
+                    skill_delivery,
+                )?);
             }
             for mcp_server in request.mcp_server_store.list()? {
                 push_mcp_server(
@@ -298,7 +302,11 @@ pub(crate) fn resolve_spawn_config(
             }
         } else {
             for skill_id in &custom_agent.skill_ids {
-                skills.push(resolve_skill(request.skill_store, skill_id, skill_delivery)?);
+                skills.push(resolve_skill(
+                    request.skill_store,
+                    skill_id,
+                    skill_delivery,
+                )?);
             }
 
             for mcp_server_id in &custom_agent.mcp_server_ids {
@@ -502,8 +510,10 @@ mod tests {
 
     impl StoreFixture {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir()
-                .join(format!("tyde-customization-{name}-{}", uuid::Uuid::new_v4()));
+            let dir = std::env::temp_dir().join(format!(
+                "tyde-customization-{name}-{}",
+                uuid::Uuid::new_v4()
+            ));
             std::fs::create_dir_all(&dir)
                 .unwrap_or_else(|err| panic!("create fixture dir {}: {err}", dir.display()));
             let custom_agents = CustomAgentStore::load(dir.join("custom_agents.json"))
