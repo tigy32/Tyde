@@ -13019,12 +13019,27 @@ for raw_line in sys.stdin:
             "session_id": "init-after-prompt",
             "skills": {reported_skills},
         }})
+        # Two messages with different ids, because that is what makes the
+        # first one's phase close and be emitted. `start_turn` emits a turn's
+        # opening StreamStart before the process speaks, so the reducer only
+        # emits for *subsequent* phases; a lone assistant frame accumulates into
+        # the turn summary and is rendered from the outcome, never from an
+        # event. A real turn that says anything and then continues looks exactly
+        # like this.
         assistant = json.dumps({{
             "type": "assistant",
             "message": {{
-                "id": "msg_fake",
+                "id": "msg_fake_1",
                 "role": "assistant",
                 "content": [{{"type": "text", "text": "MODEL-OUTPUT-SENTINEL"}}],
+            }},
+        }})
+        assistant_next = json.dumps({{
+            "type": "assistant",
+            "message": {{
+                "id": "msg_fake_2",
+                "role": "assistant",
+                "content": [{{"type": "text", "text": "MODEL-OUTPUT-TAIL"}}],
             }},
         }})
         result = json.dumps({{"type": "result", "subtype": "success", "is_error": False}})
@@ -13035,7 +13050,8 @@ for raw_line in sys.stdin:
             print(assistant, flush=True); note("MODEL_OUTPUT")
             print(result, flush=True); note("RESULT")
         elif behaviour == "assistant_before_init":
-            print(assistant, flush=True); note("MODEL_OUTPUT")
+            print(assistant, flush=True)
+            print(assistant_next, flush=True); note("MODEL_OUTPUT")
             print(init_frame, flush=True); note("INIT_FRAME")
             print(result, flush=True); note("RESULT")
         elif behaviour == "omits_init":
@@ -13224,6 +13240,49 @@ for raw_line in sys.stdin:
         assert!(
             !kinds.contains(&Some("Error")),
             "a confirmed session must not report an error: {kinds:?}"
+        );
+    }
+
+    /// The existing replay test pins *presence*. This pins the two properties
+    /// presence cannot distinguish: the held output is replayed **exactly
+    /// once**, and it lands **before** anything derived from the frames that
+    /// followed it. A requeue that duplicated the buffer, or that let the
+    /// confirming frame overtake it, would satisfy `contains` and fail here.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn replayed_output_arrives_once_and_before_what_followed_it() {
+        let (_log, events, _state) = run_fake_with_behaviour(
+            FakeInitBehaviour::AssistantBeforeInit(r#"["tyde-skills:alpha"]"#),
+        )
+        .await;
+
+        let rendered: Vec<String> = events
+            .iter()
+            .map(|event| serde_json::to_string(event).expect("event"))
+            .collect();
+
+        let sentinel_positions: Vec<usize> = rendered
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.contains("MODEL-OUTPUT-SENTINEL"))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            sentinel_positions.len(),
+            1,
+            "held output must be replayed exactly once, got {sentinel_positions:?} in {rendered:?}"
+        );
+
+        // The init frame is the one that carries `session_id`, so the
+        // `SessionStarted` it produces marks where the confirming frame was
+        // handled. The replayed output must precede it.
+        let session_started = rendered
+            .iter()
+            .position(|event| event.contains("SessionStarted"))
+            .expect("the init frame is handled after the replay");
+        assert!(
+            sentinel_positions[0] < session_started,
+            "replayed output must arrive before the frame that confirmed it: {rendered:?}"
         );
     }
 
