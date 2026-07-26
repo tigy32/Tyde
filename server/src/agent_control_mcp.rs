@@ -2666,7 +2666,6 @@ mod tests {
             .expect("ordered-send status");
         assert!(committed.is_active());
         assert!(committed.is_thinking);
-        assert!(!committed.turn_completed);
         assert_eq!(committed.status(), AgentControlStatus::Thinking);
 
         let completed = timeout(

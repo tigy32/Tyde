@@ -494,6 +494,17 @@ mod tests {
         assert!(reused.is_active());
         assert_eq!(reused.status(), AgentControlStatus::Thinking);
 
+        let clean_close = AgentStatus {
+            started: true,
+            terminated: true,
+            is_thinking: false,
+            turn_completed: true,
+            last_error: None,
+            ..AgentStatus::default()
+        };
+        assert!(!clean_close.is_active());
+        assert_eq!(clean_close.status(), AgentControlStatus::Idle);
+
         let fatal = AgentStatus {
             started: true,
             terminated: true,
