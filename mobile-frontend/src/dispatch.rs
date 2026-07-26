@@ -1143,7 +1143,13 @@ fn apply_agent_error(state: &AppState, agent_ref: &AgentRef, payload: &AgentErro
     let entry = ChatMessageEntry {
         message: protocol::ChatMessage {
             message_id: None,
-            timestamp: js_sys::Date::now() as u64,
+            // `unix_time_ms`, not `js_sys::Date::now`: this reducer is now
+            // reached by native tests, and a wasm-bindgen import aborts the
+            // process off-wasm with "cannot call wasm-bindgen imported
+            // functions on non-wasm targets". The helper is the file's existing
+            // cfg-aware clock and returns the same wall-clock milliseconds on
+            // wasm, so production timestamps are unchanged.
+            timestamp: unix_time_ms(),
             sender: protocol::MessageSender::Error,
             content: payload.message.clone(),
             reasoning: None,
