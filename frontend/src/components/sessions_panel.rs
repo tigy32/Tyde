@@ -242,7 +242,9 @@ pub fn SessionsPanel() -> impl IntoView {
                 hosts
                     .into_iter()
                     .filter_map(|host_id| {
-                        streams.get(&host_id).map(|stream| (host_id, stream.clone()))
+                        streams
+                            .get(&host_id)
+                            .map(|stream| (host_id, stream.clone()))
                     })
                     .collect::<Vec<(String, StreamPath)>>()
             })
