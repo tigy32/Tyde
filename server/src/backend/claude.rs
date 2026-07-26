@@ -25,7 +25,7 @@ use protocol::{
     WorkflowRunStatus,
 };
 
-use crate::agent::customization::{ResolvedSkill, SkillSelection};
+use crate::agent::customization::SkillSelection;
 use crate::backend::claude_skills::{
     CLAUDE_PLUGIN_DIR_FLAG, ClaudeSkillPlugin, InitFrameVerdict, PreparedSkill,
     degraded_default_notice, help_text_supports_plugin_dir, native_skill_overlay,
@@ -11372,6 +11372,7 @@ async fn signal_ready(ready_tx: &ClaudeReadyTx, result: Result<(), String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::customization::ResolvedSkill;
     use crate::backend::Backend;
     use protocol::{ChatEvent, ToolExecutionNormalizationFailure, ToolRequestType};
     use tokio::sync::oneshot;
