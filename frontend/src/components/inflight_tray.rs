@@ -1678,9 +1678,15 @@ mod wasm_tests {
     }
 
     /// Spawn producers register and fan out the child before emitting this
-    /// receipt, so a receipt without an authoritative registry agent is
-    /// historical, including after bootstrap replay. Preserve that evidence
-    /// without claiming that absent work is active.
+    /// receipt: `spawn_progress_data_for_tool_result` in
+    /// `server/src/backend/agent_control_progress.rs` derives progress from
+    /// the completed result; `HostHandle::spawn_agent_with_origin_config_and_team`
+    /// in `server/src/host.rs` registers then synchronously fans out
+    /// `NewAgent`; and `register_codex_subagent_activity_if_needed` in
+    /// `server/src/backend/codex.rs` registers the native child stream before
+    /// synthetic Spawn progress. An absent authoritative registry agent is
+    /// therefore historical, including after bootstrap replay. Preserve the
+    /// receipt without claiming that absent work is active.
     #[wasm_bindgen_test]
     async fn spawn_receipt_without_registry_agent_is_not_active() {
         let (container, state) = mount_tray(|state| {
@@ -1764,25 +1770,35 @@ mod wasm_tests {
             "deregistration keeps the parent-owned spawn receipt intact"
         );
 
-        state.tool_progress.update(|map| map.clear());
-        seed_progress(&state, spawn_progress_for("agent-a", "Worker"));
+        // `frontend/src/dispatch.rs::apply_agent_bootstrap` clears the
+        // parent's progress before replay reducers rebuild it. Reconstruct
+        // that output in a fresh AppState and mount a fresh tray: the
+        // authoritative registry has no child while history restores the
+        // parent-owned Spawn receipt.
+        let (replayed_container, replayed_state) = mount_tray(|state| {
+            seed_progress(state, spawn_progress_for("agent-a", "Worker"));
+        });
         next_tick().await;
 
         assert_eq!(
-            count(&container, ".inflight-tray"),
+            count(&replayed_container, ".inflight-tray"),
             0,
-            "bootstrap-style receipt replay does not resurrect the absent child"
+            "a freshly mounted bootstrap reconstruction has no absent child row"
         );
         assert_eq!(
-            compute_snapshot(&state, &parent_ref()).counts.running,
+            compute_snapshot(&replayed_state, &parent_ref())
+                .counts
+                .running,
             0,
-            "replayed history remains a receipt rather than live work"
+            "replayed history remains a receipt rather than running work"
         );
         assert!(
-            state.tool_progress.with_untracked(|map| map.contains_key(&(
-                parent_ref().agent_id,
-                ToolCallId("toolu_agent_control".to_owned()),
-            ))),
+            replayed_state
+                .tool_progress
+                .with_untracked(|map| map.contains_key(&(
+                    parent_ref().agent_id,
+                    ToolCallId("toolu_agent_control".to_owned()),
+                ))),
             "the replayed receipt remains in AppState"
         );
     }
