@@ -13350,8 +13350,14 @@ static CODEX_FORK_STARTUP_CANCEL_OBSERVER: std::sync::Mutex<Option<oneshot::Send
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
+struct CodexSteeringTempfileObserver {
+    content: String,
+    sender: oneshot::Sender<PathBuf>,
+}
+
+#[cfg(test)]
 static CODEX_STEERING_TEMPFILE_CREATED_OBSERVER: std::sync::Mutex<
-    Option<oneshot::Sender<PathBuf>>,
+    Option<CodexSteeringTempfileObserver>,
 > = std::sync::Mutex::new(None);
 
 #[cfg(test)]
@@ -13372,7 +13378,7 @@ fn install_codex_request_observer(method: &str) -> oneshot::Receiver<()> {
 }
 
 #[cfg(test)]
-fn install_codex_steering_tempfile_observer() -> oneshot::Receiver<PathBuf> {
+fn install_codex_steering_tempfile_observer(content: &str) -> oneshot::Receiver<PathBuf> {
     let (sender, receiver) = oneshot::channel();
     let mut observer = CODEX_STEERING_TEMPFILE_CREATED_OBSERVER
         .lock()
@@ -13381,7 +13387,10 @@ fn install_codex_steering_tempfile_observer() -> oneshot::Receiver<PathBuf> {
         observer.is_none(),
         "a Codex steering tempfile observer is already installed"
     );
-    *observer = Some(sender);
+    *observer = Some(CodexSteeringTempfileObserver {
+        content: content.to_owned(),
+        sender,
+    });
     receiver
 }
 
@@ -13393,12 +13402,21 @@ fn write_codex_session_steering_tempfile(content: &str) -> Result<PathBuf, Strin
 #[cfg(test)]
 fn write_codex_session_steering_tempfile(content: &str) -> Result<PathBuf, String> {
     let path = crate::steering::write_codex_steering_tempfile(content)?;
-    if let Some(observer) = CODEX_STEERING_TEMPFILE_CREATED_OBSERVER
-        .lock()
-        .expect("Codex steering tempfile observer mutex poisoned")
-        .take()
-    {
-        let _ = observer.send(path.clone());
+    let observer = {
+        let mut observer = CODEX_STEERING_TEMPFILE_CREATED_OBSERVER
+            .lock()
+            .expect("Codex steering tempfile observer mutex poisoned");
+        if observer
+            .as_ref()
+            .is_some_and(|observer| observer.content == content)
+        {
+            observer.take()
+        } else {
+            None
+        }
+    };
+    if let Some(observer) = observer {
+        let _ = observer.sender.send(path.clone());
     }
     Ok(path)
 }
@@ -18345,17 +18363,18 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn codex_backend_fork_cleans_steering_tempfile_when_app_server_spawn_fails() {
+        const STEERING_CONTENT: &str = "Fork cleanup tempfile observer fixture.";
         let missing_binary_dir = tempfile::tempdir().expect("missing binary tempdir");
         let _guard = CodexTestAppServerBinaryGuard::set(
             missing_binary_dir.path().join("missing-codex-app-server"),
         );
-        let steering_tempfile_rx = install_codex_steering_tempfile_observer();
+        let steering_tempfile_rx = install_codex_steering_tempfile_observer(STEERING_CONTENT);
 
         let result = CodexSession::fork(
             &["/tmp".to_string()],
             None,
             &[],
-            Some("Temporary fork instructions."),
+            Some(STEERING_CONTENT),
             BackendAccessMode::ReadOnly,
             "parent-thread-id",
         )
@@ -18372,8 +18391,10 @@ for line in sys.stdin:
             err.contains("Failed to spawn Codex app-server"),
             "unexpected fork spawn error: {err}"
         );
-        let steering_tempfile = steering_tempfile_rx
+        let steering_tempfile =
+            tokio::time::timeout(CODEX_REQUEST_TIMEOUT, steering_tempfile_rx)
             .await
+            .expect("CodexSession::fork never created its keyed steering tempfile before the request timeout")
             .expect("fork should report the exact steering tempfile it created");
         assert!(
             !steering_tempfile.exists(),
