@@ -18,19 +18,61 @@ use crate::store::steering::SteeringStore;
 pub struct ResolvedSkill {
     pub id: SkillId,
     /// Directory name in the Tyde store, which is also the name the skill is
-    /// addressed by once a backend discovers it natively.
+    /// addressed by once a backend discovers it natively. It is whatever the
+    /// user's store contains: an adapter whose backend cannot address a given
+    /// name must normalize it or report it, not assume it is already safe.
     pub name: String,
+    /// Display title from the store's metadata, when it has one.
+    pub title: Option<String>,
+    /// One-line summary from the store's metadata, when it has one.
+    ///
+    /// `None` is normal and is not a defect to work around: Claude 2.1.220
+    /// loads a `SKILL.md` with no frontmatter at all, so nothing here requires
+    /// a description to exist. Adapters that want richer catalog text should
+    /// use it when present and fall back to the name.
+    pub description: Option<String>,
     /// Canonical skill directory, proven to sit inside the Tyde skill store.
     pub source_dir: PathBuf,
-    /// Canonical `<source_dir>/SKILL.md`.
+    /// Canonical `<source_dir>/SKILL.md`, proven to be a regular file inside
+    /// `source_dir`.
     pub skill_md_path: PathBuf,
-    /// Inline body. Empty under [`SkillDelivery::NativeDiscovery`] — the
-    /// backend reads `skill_md_path` itself when the model invokes the skill.
-    /// Use [`ResolvedSkill::load_body`] rather than assuming this is populated.
+    /// Inline body, non-empty only when the session's [`SkillDelivery`] loads
+    /// bodies. Prefer [`ResolvedSkill::inline_body`], which cannot be read as
+    /// "the body happens to be empty".
     pub body: String,
 }
 
 impl ResolvedSkill {
+    /// The only place a `ResolvedSkill` is built from the store, so `body`
+    /// cannot disagree with the delivery the session was resolved under.
+    fn new(
+        skill: protocol::Skill,
+        paths: crate::store::skills::SkillPaths,
+        delivery: SkillDelivery,
+    ) -> Result<Self, String> {
+        let mut resolved = Self {
+            id: skill.id,
+            name: skill.name,
+            title: skill.title,
+            description: skill.description,
+            source_dir: paths.source_dir,
+            skill_md_path: paths.skill_md,
+            body: String::new(),
+        };
+        if delivery.loads_bodies() {
+            resolved.body = resolved.load_body()?;
+        }
+        Ok(resolved)
+    }
+
+    /// The inline body, or `None` when this session's delivery never loaded
+    /// one. The store rejects empty bodies, so an empty `body` always means
+    /// "not delivered" rather than "delivered and blank".
+    pub fn inline_body(&self) -> Option<&str> {
+        let body = self.body.trim();
+        (!body.is_empty()).then_some(body)
+    }
+
     /// Read this skill's `SKILL.md` on demand.
     ///
     /// Native-discovery sessions never call this: the backend opens the file
@@ -58,6 +100,8 @@ impl ResolvedSkill {
         Self {
             id: SkillId(name.to_string()),
             name: name.to_string(),
+            title: None,
+            description: None,
             skill_md_path: source_dir.join("SKILL.md"),
             source_dir,
             body: body.to_string(),
@@ -78,11 +122,22 @@ pub enum SkillSelection {
 }
 
 /// How a backend receives the skills resolved for a session.
+///
+/// This is the transport fact. The two policies that follow from it —
+/// whether resolution reads bodies, and whether the shared renderer inlines
+/// them — are separate predicates, because they are not the same question: a
+/// backend can want no bodies in its prompt for reasons that have nothing to do
+/// with whether it can find the skill on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillDelivery {
     /// The adapter exposes `source_dir` through the backend's own on-demand
-    /// skill discovery. Resolution never reads a `SKILL.md`.
+    /// skill discovery.
     NativeDiscovery,
+    /// The adapter names the selected skills and the backend finds their text
+    /// through its own mechanism. Tyde hands over no path and no body — which
+    /// is a real gap when the backend's mechanism looks somewhere other than
+    /// Tyde's store, and the adapter owns closing it.
+    NamesOnly,
     /// The backend has no discovery seam, so bodies are rendered into its spawn
     /// instructions and are loaded during resolution — a read failure surfaces
     /// at spawn rather than halfway through building a prompt.
@@ -93,10 +148,28 @@ impl SkillDelivery {
     pub(crate) fn for_backend(backend_kind: BackendKind) -> Self {
         match backend_kind {
             BackendKind::Claude | BackendKind::Codex => Self::NativeDiscovery,
-            BackendKind::Tycode
-            | BackendKind::Kiro
-            | BackendKind::Antigravity
-            | BackendKind::Hermes => Self::InlineBodies,
+            // Hermes replaces the shared skill block with its own name-only
+            // catalog, so every body it was handed was read and thrown away.
+            BackendKind::Hermes => Self::NamesOnly,
+            BackendKind::Tycode | BackendKind::Kiro | BackendKind::Antigravity => {
+                Self::InlineBodies
+            }
+        }
+    }
+
+    /// Whether resolution must read each selected skill's `SKILL.md`.
+    pub fn loads_bodies(self) -> bool {
+        match self {
+            Self::NativeDiscovery | Self::NamesOnly => false,
+            Self::InlineBodies => true,
+        }
+    }
+
+    /// Whether the shared spawn-instruction renderer inlines skill bodies.
+    pub fn renders_inline_bodies(self) -> bool {
+        match self {
+            Self::NativeDiscovery | Self::NamesOnly => false,
+            Self::InlineBodies => true,
         }
     }
 }
@@ -253,7 +326,14 @@ pub(crate) fn resolve_spawn_config(
             skills = %resolved
                 .skills
                 .iter()
-                .map(|skill| format!("{}@{}", skill.id, skill.source_dir.display()))
+                .map(|skill| {
+                    let summary = skill
+                        .description
+                        .as_deref()
+                        .or(skill.title.as_deref())
+                        .unwrap_or("no store metadata");
+                    format!("{}@{} ({summary})", skill.id, skill.source_dir.display())
+                })
                 .collect::<Vec<_>>()
                 .join(", "),
             "resolved session skills"
@@ -350,17 +430,7 @@ fn resolve_skill(
         .get(skill_id)
         .ok_or_else(|| format!("cannot resolve missing skill {}", skill_id))?;
     let paths = skill_store.skill_paths(skill_id)?;
-    let mut resolved = ResolvedSkill {
-        id: skill.id,
-        name: skill.name,
-        source_dir: paths.source_dir,
-        skill_md_path: paths.skill_md,
-        body: String::new(),
-    };
-    if delivery == SkillDelivery::InlineBodies {
-        resolved.body = resolved.load_body()?;
-    }
-    Ok(resolved)
+    ResolvedSkill::new(skill, paths, delivery)
 }
 
 fn resolve_steering_body(
@@ -441,10 +511,13 @@ mod tests {
             id
         }
 
-        /// Delete a skill's `SKILL.md` while leaving it indexed, so any attempt
-        /// to read a body fails loudly instead of succeeding by accident.
+        fn body_path(&self, name: &str) -> PathBuf {
+            self.dir.join("skills").join(name).join("SKILL.md")
+        }
+
+        /// Delete a skill's `SKILL.md` while leaving it indexed.
         fn remove_skill_body(&self, name: &str) {
-            let path = self.dir.join("skills").join(name).join("SKILL.md");
+            let path = self.body_path(name);
             std::fs::remove_file(&path)
                 .unwrap_or_else(|err| panic!("remove {}: {err}", path.display()));
         }
@@ -474,14 +547,10 @@ mod tests {
     }
 
     #[test]
-    fn native_backends_resolve_skills_without_reading_any_body() {
+    fn native_backends_carry_no_body_text_anywhere_in_the_resolved_config() {
         let fixture = StoreFixture::new("native-no-body");
         fixture.install_skill("lint", &format!("{BODY_SENTINEL}\n{}", "x".repeat(20_000)));
         fixture.install_skill("qa", BODY_SENTINEL);
-        // Nothing may read these files during resolution, so remove them: a
-        // resolution that still succeeds cannot have read a body.
-        fixture.remove_skill_body("lint");
-        fixture.remove_skill_body("qa");
 
         for backend_kind in [BackendKind::Claude, BackendKind::Codex] {
             let resolved = fixture.resolve(backend_kind, None).unwrap_or_else(|err| {
@@ -489,16 +558,115 @@ mod tests {
             });
 
             assert_eq!(resolved.skill_delivery, SkillDelivery::NativeDiscovery);
+            assert!(!resolved.skill_delivery.loads_bodies());
             assert_eq!(resolved.skills.len(), 2, "{backend_kind:?}");
+            // The whole config, not just `body`: a sentinel anywhere in it
+            // would mean some field is smuggling the text through.
+            assert!(
+                !format!("{resolved:?}").contains(BODY_SENTINEL),
+                "{backend_kind:?} carried skill body text in its resolved config"
+            );
             for skill in &resolved.skills {
-                assert!(
-                    skill.body.is_empty(),
-                    "{backend_kind:?} carried an inline body for {}",
-                    skill.name
-                );
+                assert_eq!(skill.inline_body(), None);
                 assert!(skill.source_dir.is_dir(), "{}", skill.source_dir.display());
+                assert!(skill.skill_md_path.is_file());
                 assert_eq!(skill.skill_md_path, skill.source_dir.join("SKILL.md"));
                 assert_eq!(skill.id.0, skill.name);
+                // Store metadata travels with the skill so an adapter can build
+                // a catalog without reading anything.
+                assert_eq!(
+                    skill.description,
+                    Some(format!("{} description", skill.name))
+                );
+            }
+        }
+    }
+
+    /// The strongest available proof that native resolution never opens
+    /// `SKILL.md`: make the file unreadable and resolve anyway. Deleting it
+    /// would not prove this, because resolution legitimately stats the path.
+    #[cfg(unix)]
+    #[test]
+    fn native_resolution_does_not_open_an_unreadable_body() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = StoreFixture::new("native-unreadable-body");
+        fixture.install_skill("lint", BODY_SENTINEL);
+        let body_path = fixture.body_path("lint");
+        std::fs::set_permissions(&body_path, std::fs::Permissions::from_mode(0o000))
+            .expect("make the body unreadable");
+
+        if std::fs::read_to_string(&body_path).is_ok() {
+            // Privileges that ignore file modes (running as root) cannot prove
+            // this negative; the sentinel test above still covers the contract.
+            return;
+        }
+
+        let resolved = fixture
+            .resolve(BackendKind::Claude, None)
+            .expect("native resolution must not open SKILL.md");
+        assert_eq!(resolved.skills.len(), 1);
+        assert_eq!(resolved.skills[0].inline_body(), None);
+        assert!(resolved.skills[0].skill_md_path.is_file());
+
+        // The same store fails for a backend that must inline bodies, so the
+        // fixture really is unreadable rather than quietly readable.
+        let err = fixture
+            .resolve(BackendKind::Kiro, None)
+            .expect_err("inline delivery must fail on an unreadable body");
+        assert!(err.contains("Failed to read skill body"), "{err}");
+    }
+
+    #[test]
+    fn hermes_receives_names_without_reading_bodies() {
+        let fixture = StoreFixture::new("hermes-names-only");
+        fixture.install_skill("lint", BODY_SENTINEL);
+
+        let resolved = fixture
+            .resolve(BackendKind::Hermes, None)
+            .expect("Hermes must resolve without reading bodies");
+
+        assert_eq!(resolved.skill_delivery, SkillDelivery::NamesOnly);
+        assert!(!resolved.skill_delivery.loads_bodies());
+        assert!(!resolved.skill_delivery.renders_inline_bodies());
+        assert_eq!(resolved.skills.len(), 1);
+        assert_eq!(resolved.skills[0].name, "lint");
+        assert_eq!(resolved.skills[0].inline_body(), None);
+        assert!(!format!("{resolved:?}").contains(BODY_SENTINEL));
+
+        // Resolver through to the shared renderer: the name-only catalog Hermes
+        // builds itself still has a name to build from, and nothing the shared
+        // renderer emits contains a body.
+        let rendered = crate::backend::render_combined_spawn_instructions(&resolved);
+        if let Some(text) = rendered {
+            assert!(!text.contains(BODY_SENTINEL), "{text}");
+            assert!(!text.contains("Skill: "), "{text}");
+        }
+    }
+
+    #[test]
+    fn resolved_bodies_never_contradict_the_session_delivery() {
+        let fixture = StoreFixture::new("delivery-invariant");
+        fixture.install_skill("lint", BODY_SENTINEL);
+
+        for backend_kind in [
+            BackendKind::Claude,
+            BackendKind::Codex,
+            BackendKind::Hermes,
+            BackendKind::Kiro,
+            BackendKind::Tycode,
+            BackendKind::Antigravity,
+        ] {
+            let resolved = fixture
+                .resolve(backend_kind, None)
+                .unwrap_or_else(|err| panic!("{backend_kind:?} resolution: {err}"));
+            for skill in &resolved.skills {
+                assert_eq!(
+                    skill.inline_body().is_some(),
+                    resolved.skill_delivery.loads_bodies(),
+                    "{backend_kind:?} body presence disagrees with {:?}",
+                    resolved.skill_delivery
+                );
             }
         }
     }
@@ -534,16 +702,20 @@ mod tests {
             .resolve(BackendKind::Kiro, None)
             .expect("resolve for Kiro");
         assert_eq!(resolved.skill_delivery, SkillDelivery::InlineBodies);
+        assert!(resolved.skill_delivery.loads_bodies());
         assert_eq!(resolved.skills.len(), 1);
-        assert_eq!(resolved.skills[0].body, BODY_SENTINEL);
+        assert_eq!(resolved.skills[0].inline_body(), Some(BODY_SENTINEL));
 
-        // And the read is real: without the file, a legacy spawn fails rather
-        // than silently starting with an empty skill.
+        // A skill whose SKILL.md has gone missing fails the spawn rather than
+        // starting a session with a silently empty skill — for every backend,
+        // since a native one could not discover it either.
         fixture.remove_skill_body("lint");
-        let err = fixture
-            .resolve(BackendKind::Kiro, None)
-            .expect_err("legacy resolution must fail when a body is unreadable");
-        assert!(err.contains("Failed to read skill body"), "{err}");
+        for backend_kind in [BackendKind::Kiro, BackendKind::Claude] {
+            let err = fixture
+                .resolve(backend_kind, None)
+                .expect_err("resolution must fail when SKILL.md is gone");
+            assert!(err.contains("cannot resolve skill lint"), "{err}");
+        }
     }
 
     #[test]

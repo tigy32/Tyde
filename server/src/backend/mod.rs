@@ -26,7 +26,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
 use self::subprocess::ImageAttachment;
-use crate::agent::customization::{ResolvedSpawnConfig, SkillDelivery};
+use crate::agent::customization::ResolvedSpawnConfig;
 
 pub(crate) const READ_ONLY_ACCESS_MODE_INSTRUCTIONS: &str = concat!(
     "Backend access mode is read-only (best effort). Treat the workspace as ",
@@ -772,17 +772,21 @@ pub(crate) fn render_combined_spawn_instructions(config: &ResolvedSpawnConfig) -
     if !config.steering_body.trim().is_empty() {
         sections.push(format!("Steering:\n{}", config.steering_body.trim()));
     }
-    // Under native discovery the adapter points the backend at each skill's
-    // directory, so the bodies belong in the backend's own on-demand loader,
-    // not in the spawn instructions.
-    if config.skill_delivery == SkillDelivery::InlineBodies && !config.skills.is_empty() {
+    // Only backends with no discovery seam get bodies here; the rest are
+    // pointed at each skill's directory, or name it, from their own adapter.
+    if config.skill_delivery.renders_inline_bodies() {
         let skill_blocks = config
             .skills
             .iter()
-            .map(|skill| format!("Skill: {}\n{}", skill.name, skill.body.trim()))
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        sections.push(format!("Skills:\n{skill_blocks}"));
+            .filter_map(|skill| {
+                skill
+                    .inline_body()
+                    .map(|body| format!("Skill: {}\n{}", skill.name, body))
+            })
+            .collect::<Vec<_>>();
+        if !skill_blocks.is_empty() {
+            sections.push(format!("Skills:\n{}", skill_blocks.join("\n\n")));
+        }
     }
 
     if sections.is_empty() {
@@ -1014,21 +1018,23 @@ mod tests {
     }
 
     #[test]
-    fn native_discovery_keeps_skill_bodies_out_of_spawn_instructions() {
+    fn only_inline_delivery_puts_skill_bodies_in_spawn_instructions() {
         use crate::agent::customization::{ResolvedSkill, SkillDelivery};
 
         let sentinel = "SHARED_RENDERER_BODY_SENTINEL";
         let skills = vec![ResolvedSkill::test_fixture("lint", sentinel)];
 
-        let native = render_combined_spawn_instructions(&ResolvedSpawnConfig {
-            skills: skills.clone(),
-            skill_delivery: SkillDelivery::NativeDiscovery,
-            ..ResolvedSpawnConfig::default()
-        });
-        assert_eq!(
-            native, None,
-            "a native-discovery backend must receive no skill section here"
-        );
+        for delivery in [SkillDelivery::NativeDiscovery, SkillDelivery::NamesOnly] {
+            let rendered = render_combined_spawn_instructions(&ResolvedSpawnConfig {
+                skills: skills.clone(),
+                skill_delivery: delivery,
+                ..ResolvedSpawnConfig::default()
+            });
+            assert_eq!(
+                rendered, None,
+                "{delivery:?} must receive no skill section here"
+            );
+        }
 
         let inline = render_combined_spawn_instructions(&ResolvedSpawnConfig {
             skills,
@@ -1038,6 +1044,15 @@ mod tests {
         .expect("inline-body instructions");
         assert!(inline.contains("Skill: lint"));
         assert!(inline.contains(sentinel));
+
+        // A body-free skill under inline delivery must not render an empty
+        // block that reads as "this skill has no instructions".
+        let empty = render_combined_spawn_instructions(&ResolvedSpawnConfig {
+            skills: vec![ResolvedSkill::test_fixture("lint", "")],
+            skill_delivery: SkillDelivery::InlineBodies,
+            ..ResolvedSpawnConfig::default()
+        });
+        assert_eq!(empty, None);
     }
 
     #[test]

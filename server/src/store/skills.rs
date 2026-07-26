@@ -87,18 +87,34 @@ impl SkillStore {
 
     /// Resolve the canonical directory and `SKILL.md` path for `id`.
     ///
-    /// Fails when the skill is unknown or its directory is missing, and when
-    /// the directory resolves outside the store root. Containment is checked
-    /// after canonicalization, so neither a `..` segment in a stored name nor a
-    /// symlinked skill directory can point a backend at files outside the
-    /// store.
+    /// Each path is canonicalized and contained independently: the directory
+    /// must resolve inside the store root, and `SKILL.md` must resolve inside
+    /// that directory and be a regular file. Deriving the file path from the
+    /// checked directory is not enough — `<skill>/SKILL.md` can itself be a
+    /// symlink out of the store, or a directory or device node, and a backend
+    /// handed the path would follow it.
     pub fn skill_paths(&self, id: &SkillId) -> Result<SkillPaths, String> {
         let skill = self
             .get(id)
             .ok_or_else(|| format!("cannot resolve missing skill {}", id))?;
         let source_dir = canonical_within(&self.root_dir, &self.root_dir.join(&skill.name))
             .map_err(|err| format!("cannot resolve skill {} directory: {err}", skill.id))?;
-        let skill_md = source_dir.join(SKILL_BODY_FILENAME);
+        let skill_md = canonical_within(&source_dir, &source_dir.join(SKILL_BODY_FILENAME))
+            .map_err(|err| {
+                format!(
+                    "cannot resolve skill {} {SKILL_BODY_FILENAME}: {err}",
+                    skill.id
+                )
+            })?;
+        let metadata = std::fs::metadata(&skill_md)
+            .map_err(|err| format!("Failed to stat {}: {err}", skill_md.display()))?;
+        if !metadata.file_type().is_file() {
+            return Err(format!(
+                "skill {} {} is not a regular file",
+                skill.id,
+                skill_md.display()
+            ));
+        }
         Ok(SkillPaths {
             source_dir,
             skill_md,
@@ -367,12 +383,12 @@ fn canonical_within(
     candidate: &std::path::Path,
 ) -> Result<PathBuf, String> {
     let canonical_root = std::fs::canonicalize(root)
-        .map_err(|err| format!("Failed to resolve skills root {}: {err}", root.display()))?;
+        .map_err(|err| format!("Failed to resolve {}: {err}", root.display()))?;
     let canonical_candidate = std::fs::canonicalize(candidate)
         .map_err(|err| format!("Failed to resolve {}: {err}", candidate.display()))?;
     if !canonical_candidate.starts_with(&canonical_root) {
         return Err(format!(
-            "{} resolves to {}, which is outside the skills root {}",
+            "{} resolves to {}, which is outside {}",
             candidate.display(),
             canonical_candidate.display(),
             canonical_root.display()
@@ -476,30 +492,20 @@ fn validate_skill(skill: &Skill) -> Result<(), String> {
     if skill.name.trim().is_empty() {
         return Err(format!("skill {} name must not be empty", skill.id));
     }
-    // `name` is the directory joined onto the store root, and — once a backend
-    // discovers skills natively rather than receiving an inlined body — it is
-    // also the name the model addresses the skill by. Both roles make these
-    // characters load-bearing: separators and `..` escape the root, a leading
-    // `.` hides the directory from native skill loaders, and `:` is reserved
-    // for plugin namespacing.
+    // Only separators are rejected here. A name that a native skill loader
+    // dislikes — a leading `.`, or a `:` that collides with plugin namespacing
+    // — is still a skill the user installed and has been using: rejecting it
+    // would make an upgrade silently drop it from `list()` and from every
+    // session. Whether such a name can be exposed to a given backend is that
+    // adapter's call, per session, and must be normalized or reported there.
+    // Path safety does not depend on this check: `skill_paths` proves
+    // containment against the real filesystem.
     if skill.name.contains(std::path::MAIN_SEPARATOR)
         || skill.name.contains('/')
         || skill.name.contains('\\')
     {
         return Err(format!(
             "skill {} name '{}' must be a single directory name",
-            skill.id, skill.name
-        ));
-    }
-    if skill.name.starts_with('.') {
-        return Err(format!(
-            "skill {} name '{}' must not start with '.'",
-            skill.id, skill.name
-        ));
-    }
-    if skill.name.contains(':') {
-        return Err(format!(
-            "skill {} name '{}' must not contain ':'",
             skill.id, skill.name
         ));
     }
@@ -666,6 +672,114 @@ mod tests {
     }
 
     #[test]
+    fn skill_paths_reject_a_skill_md_symlink_that_escapes_the_skill_dir() {
+        let fixture = TestDir::new("skill-md-escape");
+        let index_path = fixture.path.join("skills.json");
+        let root_dir = fixture.path.join("skills");
+        write_skill_body(&root_dir, "lint", "# lint\n");
+        let outside_body = fixture.path.join("outside-SKILL.md");
+        std::fs::write(&outside_body, "# elsewhere\n").expect("write outside body");
+
+        // Index the skill while its body is a real file, then swap the body for
+        // a symlink pointing out of the store.
+        let store = SkillStore::load(index_path, root_dir.clone()).expect("load skill store");
+        let body_path = root_dir.join("lint").join(SKILL_BODY_FILENAME);
+        std::fs::remove_file(&body_path).expect("remove real body");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_body, &body_path).expect("symlink body");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&outside_body, &body_path).expect("symlink body");
+
+        let err = store
+            .skill_paths(&SkillId("lint".to_string()))
+            .expect_err("a body symlinked out of the skill dir must be refused");
+        assert!(err.contains("which is outside"), "unexpected error: {err}");
+        assert!(
+            store.load_body(&SkillId("lint".to_string())).is_err(),
+            "load_body must refuse the same path"
+        );
+    }
+
+    #[test]
+    fn skill_paths_accept_a_skill_md_symlink_inside_the_skill_dir() {
+        let fixture = TestDir::new("skill-md-inside");
+        let index_path = fixture.path.join("skills.json");
+        let root_dir = fixture.path.join("skills");
+        write_skill_body(&root_dir, "lint", "# lint\n");
+
+        let store = SkillStore::load(index_path, root_dir.clone()).expect("load skill store");
+        let body_path = root_dir.join("lint").join(SKILL_BODY_FILENAME);
+        let sibling = root_dir.join("lint").join("real-body.md");
+        std::fs::write(&sibling, "# lint via sibling\n").expect("write sibling body");
+        std::fs::remove_file(&body_path).expect("remove real body");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&sibling, &body_path).expect("symlink body");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&sibling, &body_path).expect("symlink body");
+
+        let paths = store
+            .skill_paths(&SkillId("lint".to_string()))
+            .expect("a body symlinked within its own skill dir stays contained");
+        assert!(paths.skill_md.starts_with(&paths.source_dir));
+        assert_eq!(
+            store
+                .load_body(&SkillId("lint".to_string()))
+                .expect("read through the symlink"),
+            "# lint via sibling\n"
+        );
+    }
+
+    #[test]
+    fn skill_paths_reject_a_skill_md_that_is_not_a_regular_file() {
+        let fixture = TestDir::new("skill-md-not-a-file");
+        let index_path = fixture.path.join("skills.json");
+        let root_dir = fixture.path.join("skills");
+        write_skill_body(&root_dir, "lint", "# lint\n");
+
+        let store = SkillStore::load(index_path, root_dir.clone()).expect("load skill store");
+        let body_path = root_dir.join("lint").join(SKILL_BODY_FILENAME);
+        std::fs::remove_file(&body_path).expect("remove real body");
+        std::fs::create_dir(&body_path).expect("replace body with a directory");
+
+        let err = store
+            .skill_paths(&SkillId("lint".to_string()))
+            .expect_err("a non-file body must be refused");
+        assert!(
+            err.contains("is not a regular file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_skill_keeps_accepting_names_existing_stores_already_use() {
+        // Rejecting a leading `.` or a `:` would make an upgrade silently drop
+        // a skill the user installed and has been using; adapters normalize or
+        // report those per session instead. `.` and `..` cannot come from a
+        // disk scan at all, and `skill_paths` containment is what makes them
+        // harmless if one reaches the index by other means.
+        for name in [".hidden", "build:games", "..", "."] {
+            let skill = Skill {
+                id: SkillId("candidate".to_string()),
+                name: name.to_string(),
+                title: None,
+                description: None,
+            };
+            assert!(
+                validate_skill(&skill).is_ok(),
+                "skill name '{name}' must stay valid in the store"
+            );
+        }
+
+        let nested = Skill {
+            id: SkillId("candidate".to_string()),
+            name: "nested/skill".to_string(),
+            title: None,
+            description: None,
+        };
+        assert!(validate_skill(&nested).is_err());
+    }
+
+    #[test]
     fn canonical_within_rejects_a_symlink_that_escapes_the_root() {
         let fixture = TestDir::new("containment");
         let root_dir = fixture.path.join("skills");
@@ -680,39 +794,12 @@ mod tests {
 
         let err = canonical_within(&root_dir, &root_dir.join("escapee"))
             .expect_err("a symlink out of the store must be refused");
-        assert!(
-            err.contains("outside the skills root"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("which is outside"), "unexpected error: {err}");
 
         // A sibling directory sharing the root's prefix is not "inside" it.
         let sibling = fixture.path.join("skills-elsewhere");
         std::fs::create_dir_all(&sibling).expect("create sibling");
         assert!(canonical_within(&root_dir, &sibling).is_err());
-    }
-
-    #[test]
-    fn validate_skill_rejects_traversal_and_namespace_names() {
-        for name in ["..", ".", ".hidden", "build:games", "nested/skill"] {
-            let skill = Skill {
-                id: SkillId("candidate".to_string()),
-                name: name.to_string(),
-                title: None,
-                description: None,
-            };
-            assert!(
-                validate_skill(&skill).is_err(),
-                "skill name '{name}' must be rejected"
-            );
-        }
-
-        let ok = Skill {
-            id: SkillId("build-games".to_string()),
-            name: "build-games".to_string(),
-            title: None,
-            description: None,
-        };
-        assert!(validate_skill(&ok).is_ok());
     }
 
     #[test]

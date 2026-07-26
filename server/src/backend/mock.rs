@@ -2046,10 +2046,9 @@ fn summarize_text(text: &str) -> String {
 /// under native discovery, and `name=body` when the resolver inlined a body.
 /// Tests read this to tell the two deliveries apart.
 fn summarize_skill(skill: &crate::agent::customization::ResolvedSkill) -> String {
-    if skill.body.trim().is_empty() {
-        skill.name.clone()
-    } else {
-        format!("{}={}", skill.name, summarize_text(&skill.body))
+    match skill.inline_body() {
+        Some(body) => format!("{}={}", skill.name, summarize_text(body)),
+        None => skill.name.clone(),
     }
 }
 
