@@ -80,9 +80,35 @@ fn host_heading(records: &[PendingSubmission]) -> String {
     }
 }
 
+/// True when a record's agent target died with `AgentError { fatal: true }`.
+///
+/// `SubmissionTarget::NewChat` is never terminated: it spawns a fresh agent on
+/// the host stream and has no dead actor to address.
+fn target_is_terminated(state: &AppState, record: &PendingSubmission) -> bool {
+    let SubmissionTarget::Agent(agent_ref) = &record.target else {
+        return false;
+    };
+    state.agents.with(|agents| {
+        agents.iter().any(|a| {
+            a.local_host_id == agent_ref.local_host_id
+                && a.agent_id == agent_ref.agent_id
+                && a.fatal_error.is_some()
+        })
+    })
+}
+
 /// A resend is only offered on a connection that is not the one that swallowed
-/// the original.
+/// the original — and only when the target can still receive it.
+///
+/// A new connection is what makes a resend meaningful, but it does not revive a
+/// dead agent: reconnecting to the host does not bring back an actor that
+/// crashed. Offering Send again there would take the user's text, address it to
+/// a stream nobody is reading, and mint a second stranded record. Copy, Edit,
+/// and Discard stay available, so the text is never trapped.
 fn can_resend(state: &AppState, record: &PendingSubmission) -> bool {
+    if target_is_terminated(state, record) {
+        return false;
+    }
     let current = state
         .active_connection_instance_ids
         .get()
@@ -110,6 +136,9 @@ async fn resend(state: &AppState, record: &PendingSubmission) {
             crate::actions::spawn_new_chat(state, record.text.clone(), record.images.clone()).await
         }
         SubmissionTarget::Agent(agent_ref) => {
+            // Transport guard, not just a disabled button: `can_resend` already
+            // hides this, but a tap in flight when the fatal frame lands must
+            // not reach a dead stream.
             let stream = state.agents.with_untracked(|agents| {
                 agents
                     .iter()
@@ -117,6 +146,7 @@ async fn resend(state: &AppState, record: &PendingSubmission) {
                         a.local_host_id == agent_ref.local_host_id
                             && a.agent_id == agent_ref.agent_id
                     })
+                    .filter(|a| a.fatal_error.is_none())
                     .map(|a| a.instance_stream.clone())
             });
             let Some(stream) = stream else {
@@ -880,6 +910,122 @@ mod wasm_tests {
         assert!(
             find(&container, "pending-submission-resend-warning").is_none(),
             "a message that provably never left must not warn about duplicates"
+        );
+    }
+
+    /// Mount an agent-targeted recovery card on a genuinely new connection —
+    /// the state in which "Send again" is normally offered — with the target
+    /// agent optionally dead.
+    ///
+    /// `live_agent_id` seeds a second, healthy agent whose id differs, so the
+    /// fatal check is proven to be about the *record's own target* rather than
+    /// "some agent on this host is dead".
+    async fn mount_agent_record(fatal: bool) -> (HtmlElement, AppState, AgentRef) {
+        let container = make_container();
+        let agent_ref = AgentRef {
+            local_host_id: LocalHostId(HOST.to_owned()),
+            agent_id: protocol::AgentId("agent-1".to_owned()),
+        };
+        let agent_for_mount = agent_ref.clone();
+        let handle: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let handle_for_mount = handle.clone();
+        let h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let host = LocalHostId(HOST.to_owned());
+            state.active_local_host_id.set(Some(host.clone()));
+            // A *new* connection instance: the one thing that normally makes a
+            // resend meaningful. It must not be enough on its own.
+            state.active_connection_instance_ids.update(|m| {
+                m.insert(host.clone(), 8);
+            });
+            state.host_streams.update(|m| {
+                m.insert(host.clone(), protocol::StreamPath("/host/h1".to_owned()));
+            });
+            state.agents.set(vec![crate::state::AgentInfo {
+                local_host_id: host.clone(),
+                agent_id: protocol::AgentId("agent-1".to_owned()),
+                name: "Agent".to_owned(),
+                origin: protocol::AgentOrigin::User,
+                backend_kind: protocol::BackendKind::Claude,
+                workspace_roots: Vec::new(),
+                project_id: None,
+                parent_agent_id: None,
+                session_id: None,
+                custom_agent_id: None,
+                created_at_ms: 0,
+                instance_stream: protocol::StreamPath("/agent/agent-1/inst".to_owned()),
+                started: true,
+                fatal_error: fatal.then(|| "backend crashed".to_owned()),
+            }]);
+            state.hold_submission(PendingSubmission {
+                local_submission_id: LocalSubmissionId(FIXTURE_ID),
+                origin: SubmissionOriginId(FIXTURE_ORIGIN + 2),
+                local_host_id: host,
+                connection_instance_id: 7,
+                target: SubmissionTarget::Agent(agent_for_mount.clone()),
+                text: "look at this".to_owned(),
+                images: Vec::new(),
+                tool_response: None,
+                state: PendingSubmissionState::DeliveryUnknown,
+            });
+            *handle_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! { <AgentPendingSubmissions agent_ref=agent_for_mount.clone() /> }
+        });
+        std::mem::forget(h);
+        next_tick().await;
+        let state = handle.borrow().as_ref().unwrap().clone();
+        (container, state, agent_ref)
+    }
+
+    /// **A new connection does not revive a dead agent.**
+    ///
+    /// Reconnecting to the host is what makes a resend meaningful, and it is the
+    /// only thing `can_resend` used to ask about. But reconnecting does not
+    /// bring back an actor that crashed: "Send again" on a fatal target would
+    /// take the user's text, address it to a stream nobody is reading, and mint
+    /// a second stranded record — the exact loss this whole recovery surface
+    /// exists to prevent.
+    ///
+    /// Copy, Edit, and Discard stay live, so the text is never trapped.
+    #[wasm_bindgen_test]
+    async fn resend_is_refused_when_the_target_agent_has_terminated() {
+        let _guard = crate::bridge::test_capture_sends();
+        let (container, state, _agent_ref) = mount_agent_record(true).await;
+
+        let resend = find(&container, "pending-submission-resend")
+            .expect("the resend control must still render, so its state is visible");
+        assert!(
+            resend.has_attribute("disabled"),
+            "a new connection must not offer a resend to an agent that has died"
+        );
+
+        let resend_el: HtmlElement = resend.dyn_into().unwrap();
+        resend_el.click();
+        next_tick().await;
+        next_tick().await;
+        assert!(
+            crate::bridge::test_sent_lines().is_empty(),
+            "and a stale click must not reach the dead agent's stream"
+        );
+        assert_eq!(
+            state.pending_submissions.get_untracked().len(),
+            1,
+            "the record — and the user's text — must survive the refusal"
+        );
+    }
+
+    /// The counterpart: the same record on the same new connection, with a live
+    /// target, still offers the resend. Without this the test above would pass
+    /// just as well if resend were broken outright.
+    #[wasm_bindgen_test]
+    async fn resend_is_still_offered_when_the_target_agent_is_alive() {
+        let (container, _state, _agent_ref) = mount_agent_record(false).await;
+        let resend = find(&container, "pending-submission-resend").expect("resend must render");
+        assert!(
+            !resend.has_attribute("disabled"),
+            "a live target on a new connection is exactly when resend is recovery"
         );
     }
 
