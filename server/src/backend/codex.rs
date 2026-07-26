@@ -14096,12 +14096,10 @@ mod tests {
             restrict_codex_file(&auth_path_in_home)?;
             drop(auth);
 
-            let previous_native_home = std::mem::replace(
-                &mut *codex_test_native_home_override()
-                    .lock()
-                    .expect("codex test native home mutex poisoned"),
-                Some(home.path().to_path_buf()),
-            );
+            let previous_native_home = codex_test_native_home_override()
+                .lock()
+                .expect("codex test native home mutex poisoned")
+                .replace(Some(home.path().to_path_buf()));
             Ok(Self {
                 _serial: serial,
                 previous_native_home,
