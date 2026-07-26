@@ -2205,13 +2205,20 @@ pub(crate) fn spawn_agent_actor(
         );
         let mut queue = VecDeque::new();
         let mut pending_inputs: VecDeque<AgentInput> = VecDeque::new();
-        // Acknowledged deliveries accepted while the backend was still starting.
-        // They sit in `pending_inputs` until startup completes, so the
-        // post-startup status update has to keep the agent active for them —
-        // otherwise a resumed agent publishes Idle between the acknowledgement
-        // and the dispatch, which is exactly the stale-idle read the
-        // acknowledgement exists to prevent.
-        let mut acknowledged_startup_deliveries: usize = 0;
+        // Checked deliveries this actor has already acknowledged as accepted
+        // and parked in `pending_inputs` behind a gate — either the startup
+        // loop or the resume-replay barrier. Two later transitions would
+        // otherwise normalize a resumed agent back to completed while that
+        // accepted work is still queued, publishing Idle for a message the
+        // caller was told was accepted: `record_agent_started(is_resume)` and
+        // `publish_resumed_agent_idle` at barrier completion. Both consult this
+        // count, and both run before the gate lifts and the queue drains, so it
+        // is never decremented.
+        //
+        // This is deliberately checked-delivery specific rather than
+        // `pending_inputs.is_empty()`: ordinary fire-and-forget `SendInput`
+        // queues the same way and its resume behavior must not change.
+        let mut acknowledged_gated_deliveries: usize = 0;
         let mut pending_name_commands = VecDeque::new();
         assert!(
             resume_session_id.is_none() || fork_from_session_id.is_none(),
@@ -2457,8 +2464,8 @@ pub(crate) fn spawn_agent_actor(
                             // (`started` is false), and the message is queued
                             // for dispatch once the backend is up. Rejecting it
                             // here would make spawn-then-send racy for no gain.
-                            acknowledged_startup_deliveries =
-                                acknowledged_startup_deliveries.saturating_add(1);
+                            acknowledged_gated_deliveries =
+                                acknowledged_gated_deliveries.saturating_add(1);
                             pending_inputs.push_back(AgentInput::SendMessage(payload));
                             let _ = reply.send(Ok(()));
                         }
@@ -2595,11 +2602,11 @@ pub(crate) fn spawn_agent_actor(
         };
         let _ = startup_tx.send(Ok(actor_session_id.clone()));
         accepting_input_task.store(!resume_replay_gate_pending, Ordering::SeqCst);
-        let has_acknowledged_startup_deliveries = acknowledged_startup_deliveries > 0;
+        let has_acknowledged_gated_deliveries = acknowledged_gated_deliveries > 0;
         status_handle
             .update(|s| {
                 record_agent_started(s, is_resume);
-                if has_acknowledged_startup_deliveries {
+                if has_acknowledged_gated_deliveries {
                     // A resume normalizes to completed here. That would publish
                     // Idle for a message this actor already acknowledged as
                     // accepted, so re-assert the active turn it is queued for.
@@ -3407,7 +3414,17 @@ pub(crate) fn spawn_agent_actor(
                             match result {
                                 Ok(()) => {
                                     accepting_input_task.store(true, Ordering::SeqCst);
-                                    if initial_follow_up.is_none() {
+                                    // Settling the resumed agent to Idle is only
+                                    // honest when nothing is waiting to run. An
+                                    // initial follow-up already suppressed it;
+                                    // a checked delivery accepted behind this
+                                    // gate is the same situation — the caller
+                                    // was told the message was accepted, so
+                                    // publishing Idle here would let its very
+                                    // next wait return before the turn starts.
+                                    if initial_follow_up.is_none()
+                                        && acknowledged_gated_deliveries == 0
+                                    {
                                         publish_resumed_agent_idle(
                                             &status_handle,
                                             &canonical_stream,
@@ -3526,9 +3543,13 @@ pub(crate) fn spawn_agent_actor(
                                 // Accepted, not rejected: the resume barrier is
                                 // transient and the message is dispatched once
                                 // it lifts. Mark the queued turn active before
-                                // acknowledging so the caller cannot read Idle.
+                                // acknowledging so the caller cannot read Idle,
+                                // and record the acceptance so completing the
+                                // barrier cannot publish Idle back over it.
                                 if delivery_ack.is_some() {
                                     mark_agent_turn_active(&status_handle).await;
+                                    acknowledged_gated_deliveries =
+                                        acknowledged_gated_deliveries.saturating_add(1);
                                 }
                                 pending_inputs.push_back(input);
                                 if let Some(reply) = delivery_ack.take() {
@@ -13663,5 +13684,106 @@ mod tests {
         );
         // No close here: the held turn never ends, so `close` would wait out a
         // turn the mock only releases on interrupt.
+    }
+
+    #[tokio::test]
+    async fn resume_barrier_keeps_an_acknowledged_gated_delivery_active() {
+        let _startup_test_guard = AGENT_STARTUP_ACTOR_TEST_LOCK.lock().await;
+
+        // Seed a resumable mock session.
+        let (_seed_dir, seed_start, seed_request, seed_runtime, _seed_status) =
+            startup_actor_fixture("agent-resume-delivery-seed", None);
+        let (seed_handle, seed_startup_rx) = spawn_agent_actor(
+            seed_start.agent_id.clone(),
+            seed_start,
+            seed_request,
+            seed_runtime,
+        );
+        let session_id = seed_startup_rx
+            .await
+            .expect("seed startup reply")
+            .expect("seed mock startup");
+        assert!(seed_handle.close().await);
+
+        let (_dir, start, mut request, runtime, status_handle) =
+            startup_actor_fixture("agent-resume-delivery", None);
+        // Resume with no initial follow-up: that is the only shape in which
+        // barrier completion publishes the resumed idle marker at all.
+        request.resume_session_id = Some(session_id);
+        request.initial_input = None;
+        let agent_id = start.agent_id.clone();
+        let (entered, release) = install_agent_startup_gate(agent_id.clone());
+        let (handle, startup_rx) = spawn_agent_actor(agent_id, start, request, runtime);
+        entered.await.expect("resumed actor reached the startup gate");
+
+        // Attach before releasing the gate so this subscriber is flushed by
+        // barrier completion itself. Its bootstrap is a snapshot taken at that
+        // exact point, which is what makes the assertion below durable rather
+        // than a race against the queue drain that follows.
+        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+        let attach_rx = handle
+            .begin_attach(replay_stream(output_tx))
+            .expect("queue a resume-gated attachment");
+
+        // The actor is parked in its startup command loop, so this delivery is
+        // provably accepted before the backend resumes and the barrier can fire.
+        assert_eq!(
+            handle.deliver_message(delivery_payload("gated follow-up")).await,
+            Ok(()),
+            "a delivery accepted behind the startup gate must be acknowledged"
+        );
+        assert!(
+            status_handle.snapshot().await.is_active(),
+            "status must already be active when the acknowledgement returns"
+        );
+
+        release.send(()).expect("release the resumed startup gate");
+        startup_rx
+            .await
+            .expect("resumed startup reply")
+            .expect("resumed mock startup");
+        assert!(attach_rx.await.expect("resume-gated attachment reply"));
+
+        let first = timeout(Duration::from_secs(5), output_rx.recv())
+            .await
+            .expect("barrier completion must flush the resume-gated attachment")
+            .expect("resume-gated subscriber stays open");
+        assert_eq!(first.kind, FrameKind::AgentBootstrap);
+        let bootstrap: AgentBootstrapPayload =
+            first.parse_payload().expect("resumed AgentBootstrap payload");
+        assert!(
+            bootstrap.turn_active,
+            "barrier completion must not publish Idle over an acknowledged queued delivery"
+        );
+        assert!(
+            !matches!(
+                bootstrap.events.last(),
+                Some(AgentBootstrapEvent::ChatEvent(ChatEvent::TypingStatusChanged(false)))
+            ),
+            "a resumed agent with queued acknowledged work must not settle to idle"
+        );
+
+        // And the acknowledged message really does run once the gate lifts, so
+        // the suppressed idle marker is not simply lost state.
+        let delivered = "gated follow-up";
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let history = handle
+                    .fetch_session_history(None, 200)
+                    .await
+                    .expect("resumed agent history");
+                let ran = history.events.iter().any(|event| match event {
+                    ChatEvent::StreamEnd(data) => data.message.content.contains(delivered),
+                    ChatEvent::MessageAdded(message) => message.content.contains(delivered),
+                    _ => false,
+                });
+                if ran {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the acknowledged delivery must run after the replay barrier");
     }
 }
