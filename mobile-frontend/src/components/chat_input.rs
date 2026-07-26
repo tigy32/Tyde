@@ -202,6 +202,15 @@ fn queued_message_preview(entry: &protocol::QueuedMessageEntry) -> String {
     }
 }
 
+/// The instance stream of the active agent, **only while it can still be
+/// addressed**.
+///
+/// After `AgentError { fatal: true }` the stream is dead and no frame sent to
+/// it will ever be answered. This is the single capability choke point for the
+/// composer's Send, Steer, and Interrupt: returning `None` here rejects a stale
+/// click or keyboard shortcut that a reactive `disabled` attribute had not yet
+/// caught up with. Rendering is guarded separately; a disabled control is not a
+/// transport guard.
 fn active_agent_stream(
     state: &AppState,
     active: &crate::state::ActiveAgentRef,
@@ -210,7 +219,49 @@ fn active_agent_stream(
         agents
             .iter()
             .find(|a| a.local_host_id == active.local_host_id && a.agent_id == active.agent_id)
+            .filter(|a| a.fatal_error.is_none())
             .map(|a| a.instance_stream.clone())
+    })
+}
+
+/// True when the exact `AgentRef` is terminated by a fatal error. Host-scoped,
+/// so a same-named agent on another host is never implicated.
+pub(crate) fn agent_ref_is_fatal(state: &AppState, agent_ref: &AgentRef) -> bool {
+    state.agents.with_untracked(|agents| {
+        agents.iter().any(|agent| {
+            agent.local_host_id == agent_ref.local_host_id
+                && agent.agent_id == agent_ref.agent_id
+                && agent.fatal_error.is_some()
+        })
+    })
+}
+
+/// True when the exact active agent is terminated by a fatal error.
+fn active_agent_is_terminated_tracked(state: &AppState) -> bool {
+    let Some(active) = state.active_agent.get() else {
+        return false;
+    };
+    state.agents.with(|agents| {
+        agents.iter().any(|agent| {
+            agent.local_host_id == active.local_host_id
+                && agent.agent_id == active.agent_id
+                && agent.fatal_error.is_some()
+        })
+    })
+}
+
+/// Untracked twin of [`active_agent_is_terminated_tracked`] for action guards,
+/// which must not subscribe the caller to the agent list.
+fn active_agent_is_terminated(state: &AppState) -> bool {
+    let Some(active) = state.active_agent.get_untracked() else {
+        return false;
+    };
+    state.agents.with_untracked(|agents| {
+        agents.iter().any(|agent| {
+            agent.local_host_id == active.local_host_id
+                && agent.agent_id == active.agent_id
+                && agent.fatal_error.is_some()
+        })
     })
 }
 
@@ -218,6 +269,12 @@ fn active_agent_is_running_tracked(state: &AppState) -> bool {
     let Some(active) = state.active_agent.get() else {
         return false;
     };
+    // Fatal wins before `agent_turn_active` is consulted. The reducer normally
+    // clears the turn, but a stale or late-arriving turn flag must never render
+    // Cancel/Queue on an agent that cannot receive either.
+    if active_agent_is_terminated_tracked(state) {
+        return false;
+    }
     let agent_ref = active.as_agent_ref();
     if state
         .agent_turn_active
@@ -274,6 +331,15 @@ fn QueuedMessageControlRow(row: QueuedRowRef) -> impl IntoView {
         let state = send_now_state.clone();
         let agent_ref = send_now_agent.clone();
         let id = send_now_id.clone();
+        // "Send Now" is a same-actor send. The row is already hidden for a dead
+        // owner, so this only catches a click that was already in flight when
+        // the fatal error landed — but a hidden control is not a guard.
+        //
+        // Delete is deliberately *not* gated: it is not a send, and it is the
+        // only way to clear a queue entry stranded behind a dead agent.
+        if agent_ref_is_fatal(&state, &agent_ref) {
+            return;
+        }
         spawn_local(async move {
             if let Err(error) =
                 crate::actions::send_queued_message_now(&state, &agent_ref, id).await
@@ -354,6 +420,14 @@ pub fn ChatInput() -> impl IntoView {
             // guard, it was a side effect, and a second `SpawnAgent` costs a
             // second agent and a second paid turn. Guard it explicitly.
             if composer.is_busy() || loading_photos.get_untracked() {
+                return;
+            }
+            // A terminated agent is a deliberate block, not a lookup failure.
+            // Falling through to the stream resolution below would surface
+            // "agent stream not found", which reads as a transport bug and says
+            // nothing about what to do instead. The draft survives either way —
+            // it is the payload for Fork + send.
+            if active_agent_is_terminated(&state) {
                 return;
             }
             let text = state.chat_input.get_untracked().trim().to_string();
@@ -454,6 +528,11 @@ pub fn ChatInput() -> impl IntoView {
             if composer.is_busy() || loading_photos.get_untracked() {
                 return;
             }
+            // Same deliberate-block rule as `do_send`: a dead agent has no turn
+            // to steer, and the stream-not-found copy would misdescribe it.
+            if active_agent_is_terminated(&state) {
+                return;
+            }
             let Some(active) = state.active_agent.get_untracked() else {
                 return;
             };
@@ -527,6 +606,12 @@ pub fn ChatInput() -> impl IntoView {
     let do_interrupt = {
         let state = state.clone();
         move || {
+            // Nothing to interrupt on a dead agent, and no honest error to
+            // report about it — the transcript's fatal Error row already says
+            // what happened.
+            if active_agent_is_terminated(&state) {
+                return;
+            }
             let Some(active) = state.active_agent.get_untracked() else {
                 return;
             };
@@ -615,6 +700,12 @@ pub fn ChatInput() -> impl IntoView {
     let s_input = state.clone();
     let running_state = state.clone();
     let is_running = Memo::new(move |_| active_agent_is_running_tracked(&running_state));
+    let terminated_state = state.clone();
+    // The composer target died. Same-actor Send/Steer/Interrupt are off, but the
+    // draft, the photo controls, and Fork + send all stay live: the draft is the
+    // payload the user forks with, and taking it away would remove the only
+    // in-context recovery route.
+    let is_terminated = Memo::new(move |_| active_agent_is_terminated_tracked(&terminated_state));
     let has_input_state = state.clone();
     let has_input = Memo::new(move |_| {
         has_input_state
@@ -717,6 +808,13 @@ pub fn ChatInput() -> impl IntoView {
         let Some(active) = queue_state.active_agent.get() else {
             return Vec::new();
         };
+        // A dead agent will never dequeue anything, so "Send Now" and the
+        // queued list are dead controls. The queue itself is server-owned and
+        // stays in state untouched — this hides the actions, it does not
+        // discard the messages.
+        if active_agent_is_terminated_tracked(&queue_state) {
+            return Vec::new();
+        }
         let agent_ref = active.as_agent_ref();
         queue_state.agent_message_queue.with(|queues| {
             queues
@@ -871,15 +969,26 @@ pub fn ChatInput() -> impl IntoView {
                         type="button"
                         class="send-button chat-send-split-primary"
                         aria-label={move || {
-                            if is_running.get() && !has_input.get() { "Cancel current turn" }
+                            if is_terminated.get() {
+                                "Agent stopped — use Fork + send, Resume in Sessions, or New chat"
+                            }
+                            else if is_running.get() && !has_input.get() { "Cancel current turn" }
                             else if is_steer.get() { "Queue message" }
                             else { "Send message" }
                         }}
+                        title=move || {
+                            if is_terminated.get() {
+                                "Agent stopped — use Fork + send, Resume in Sessions, or New chat"
+                            } else { "" }
+                        }
                         data-mobile-test="chat-send"
                         on:click={
                             let do_interrupt = interrupt_for_menu.clone();
                             let do_send = send_for_menu.clone();
                             move |_| {
+                                if is_terminated.get_untracked() {
+                                    return;
+                                }
                                 if is_running.get_untracked() && !has_input.get_untracked() {
                                     do_interrupt();
                                 } else {
@@ -888,9 +997,13 @@ pub fn ChatInput() -> impl IntoView {
                             }
                         }
                         disabled=move || {
+                            // A dead actor has no send, no steer, and no turn to
+                            // cancel. This outranks the Cancel branch below,
+                            // which is otherwise unconditionally enabled.
+                            if is_terminated.get() { true }
                             // Cancel (thinking+empty): always enabled — stopping a
                             // turn must never be blocked by an unsettled send.
-                            if is_running.get() && !has_input.get() { false }
+                            else if is_running.get() && !has_input.get() { false }
                             // The composer keeps its draft across the in-flight
                             // window, so having input no longer implies this is
                             // a fresh send. Say so explicitly.
@@ -898,7 +1011,8 @@ pub fn ChatInput() -> impl IntoView {
                         }
                     >
                         {move || {
-                            if is_running.get() && !has_input.get() { "Cancel" }
+                            if is_terminated.get() { "Terminated" }
+                            else if is_running.get() && !has_input.get() { "Cancel" }
                             else if is_steer.get() { "Queue" }
                             else { "Send" }
                         }}
@@ -1921,6 +2035,197 @@ mod wasm_tests {
         assert!(
             style.contains("height:") && style.contains("overflow-y:"),
             "composer should get an inline autosize style, got: {style}"
+        );
+    }
+
+    // ── Fatal agent lifecycle ───────────────────────────────────────────────
+
+    /// Mount a composer whose active agent died with `AgentError { fatal: true }`
+    /// while a turn was still marked active, and while a message sat queued.
+    ///
+    /// The stale `agent_turn_active` is deliberate: the reducer clears it, but
+    /// the composer must not *depend* on that having happened. A late frame, a
+    /// replay, or an ordering change would otherwise put Cancel back on a dead
+    /// agent.
+    fn mount_terminated_agent(container: &HtmlElement, with_session: bool) -> AppState {
+        let handle: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let handle_for_mount = handle.clone();
+        let h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let host = LocalHostId("host-1".to_owned());
+            let agent_id = AgentId("agent-1".to_owned());
+            let agent_ref = AgentRef {
+                local_host_id: host.clone(),
+                agent_id: agent_id.clone(),
+            };
+            state.active_local_host_id.set(Some(host.clone()));
+            state.host_streams.update(|m| {
+                m.insert(host.clone(), StreamPath("/host/h1".to_owned()));
+            });
+            state.agents.set(vec![AgentInfo {
+                local_host_id: host.clone(),
+                agent_id: agent_id.clone(),
+                name: "Agent".to_owned(),
+                origin: AgentOrigin::User,
+                backend_kind: BackendKind::Claude,
+                workspace_roots: Vec::new(),
+                project_id: None,
+                parent_agent_id: None,
+                session_id: with_session.then(|| SessionId("sess-1".to_owned())),
+                custom_agent_id: None,
+                created_at_ms: 0,
+                instance_stream: StreamPath("/agent/agent-1/inst".to_owned()),
+                started: true,
+                fatal_error: Some("backend crashed".to_owned()),
+            }]);
+            state.active_agent.set(Some(crate::state::ActiveAgentRef {
+                local_host_id: host.clone(),
+                agent_id: agent_id.clone(),
+            }));
+            state.agent_turn_active.update(|m| {
+                m.insert(agent_ref.clone(), true);
+            });
+            state.agent_message_queue.update(|m| {
+                m.insert(
+                    agent_ref,
+                    vec![QueuedMessageEntry {
+                        id: QueuedMessageId("q-1".to_owned()),
+                        message: "also fix the flaky test".to_owned(),
+                        images: Vec::new(),
+                        origin: None,
+                    }],
+                );
+            });
+            *handle_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! { <ChatInput /> }
+        });
+        std::mem::forget(h);
+        handle.borrow().as_ref().unwrap().clone()
+    }
+
+    /// **A dead agent must not present a working Send.**
+    ///
+    /// Everything on this composer used to stay live: the primary said Cancel
+    /// (stale turn) or Send (with a draft), both enabled, and either one
+    /// addressed a stream nobody was reading. The user's message would be
+    /// admitted, held as "Queued locally", and never delivered.
+    ///
+    /// The draft itself must survive — it is the payload for Fork + send, which
+    /// is the whole recovery route.
+    #[wasm_bindgen_test]
+    async fn terminated_agent_disables_send_but_keeps_the_draft_and_fork() {
+        let _guard = crate::bridge::test_defer_sends();
+        let container = make_container();
+        let state = mount_terminated_agent(&container, true);
+        next_tick().await;
+
+        let p = primary(&container);
+        assert_eq!(
+            p.text_content().unwrap_or_default().trim(),
+            "Terminated",
+            "a stale active turn must not render Cancel on a dead agent"
+        );
+        assert!(
+            p.has_attribute("disabled"),
+            "Terminated is a state, not an action — the control must be disabled"
+        );
+        assert!(
+            p.get_attribute("aria-label")
+                .unwrap_or_default()
+                .contains("Fork + send"),
+            "the accessible label must point at the recovery routes, got: {:?}",
+            p.get_attribute("aria-label")
+        );
+
+        // A draft arrives. Send stays shut; the draft is untouched.
+        type_text(&container, "please continue");
+        next_tick().await;
+        let p = primary(&container);
+        assert_eq!(
+            p.text_content().unwrap_or_default().trim(),
+            "Terminated",
+            "a draft must not turn a dead agent's primary back into Send"
+        );
+        assert!(p.has_attribute("disabled"));
+
+        let before = crate::bridge::test_send_attempts();
+        let p_el: HtmlElement = primary(&container).dyn_into().unwrap();
+        p_el.click();
+        next_tick().await;
+        assert_eq!(
+            crate::bridge::test_send_attempts(),
+            before,
+            "clicking a dead agent's primary must emit no frame at all"
+        );
+        assert_eq!(
+            state.chat_input.get_untracked(),
+            "please continue",
+            "the draft must survive — it is the payload for Fork + send"
+        );
+
+        // Fork + send is the escape hatch and stays reachable: it spawns a new
+        // agent from the retained session on the *host* stream, never on the
+        // dead instance stream.
+        let c = caret(&container);
+        assert!(
+            !c.has_attribute("disabled"),
+            "Fork + send must remain available on a dead agent with a session"
+        );
+        open_menu(&container).await;
+        assert_eq!(
+            menu_item_texts(&container),
+            vec!["Fork + send".to_owned()],
+            "a dead agent's menu offers recovery only — never Steer or Cancel"
+        );
+    }
+
+    /// The queue is server-owned and stays in state, but "Send Now" on a dead
+    /// agent is a send that can never land. The rows go, the queue does not.
+    #[wasm_bindgen_test]
+    async fn terminated_agent_hides_the_queued_rows_without_dropping_the_queue() {
+        let container = make_container();
+        let state = mount_terminated_agent(&container, true);
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-input-queued-list']")
+                .unwrap()
+                .is_none(),
+            "a dead agent must not offer queued-message actions"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-input-queued-send-now']")
+                .unwrap()
+                .is_none(),
+            "Send Now on a dead agent is a send that can never be delivered"
+        );
+        assert_eq!(
+            state.agent_message_queue.get_untracked().values().len(),
+            1,
+            "hiding the rows must not discard the server-owned queue"
+        );
+    }
+
+    /// Without a forkable session there is no in-context recovery, so the caret
+    /// closes too — but that must not quietly re-open same-actor Send.
+    #[wasm_bindgen_test]
+    async fn terminated_agent_without_a_session_offers_no_send_and_no_fork() {
+        let container = make_container();
+        let _state = mount_terminated_agent(&container, false);
+        next_tick().await;
+        type_text(&container, "please continue");
+        next_tick().await;
+
+        let p = primary(&container);
+        assert_eq!(p.text_content().unwrap_or_default().trim(), "Terminated");
+        assert!(p.has_attribute("disabled"));
+        assert!(
+            caret(&container).has_attribute("disabled"),
+            "no session means no Fork + send, so the menu has nothing to offer"
         );
     }
 }
