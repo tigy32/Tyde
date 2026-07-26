@@ -14039,6 +14039,122 @@ mod tests {
         previous_resource_link_failure: Option<OsString>,
     }
 
+    struct CodexLiveHomeGuard {
+        _serial: MutexGuard<'static, ()>,
+        previous_native_home: Option<std::path::PathBuf>,
+        home: tempfile::TempDir,
+    }
+
+    impl CodexLiveHomeGuard {
+        fn from_real_auth() -> Result<Self, String> {
+            let codex_home = inherited_codex_home()?;
+            Self::from_auth_path(&codex_home.join("auth.json"))
+        }
+
+        fn from_auth_path(auth_path: &Path) -> Result<Self, String> {
+            let serial = CODEX_FAKE_APP_SERVER_SERIAL
+                .get_or_init(|| std::sync::Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let home = tempfile::tempdir()
+                .map_err(|err| format!("failed to create isolated Codex home: {err}"))?;
+            restrict_codex_directory(home.path())?;
+
+            let auth = std::fs::read(auth_path).map_err(|err| {
+                format!(
+                    "failed to stage Codex auth from {}: {err}",
+                    auth_path.display()
+                )
+            })?;
+            let auth_path_in_home = home.path().join("auth.json");
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+
+                options.mode(0o600);
+            }
+            let mut auth_file = options.open(&auth_path_in_home).map_err(|err| {
+                format!(
+                    "failed to create isolated Codex auth {}: {err}",
+                    auth_path_in_home.display()
+                )
+            })?;
+            use std::io::Write;
+
+            auth_file.write_all(&auth).map_err(|err| {
+                format!(
+                    "failed to write isolated Codex auth {}: {err}",
+                    auth_path_in_home.display()
+                )
+            })?;
+            auth_file
+                .sync_all()
+                .map_err(|err| format!("failed to sync isolated Codex auth: {err}"))?;
+            drop(auth_file);
+            restrict_codex_file(&auth_path_in_home)?;
+            drop(auth);
+
+            let previous_native_home = std::mem::replace(
+                &mut *codex_test_native_home_override()
+                    .lock()
+                    .expect("codex test native home mutex poisoned"),
+                Some(home.path().to_path_buf()),
+            );
+            Ok(Self {
+                _serial: serial,
+                previous_native_home,
+                home,
+            })
+        }
+
+        fn path(&self) -> &Path {
+            self.home.path()
+        }
+    }
+
+    fn inherited_codex_home() -> Result<PathBuf, String> {
+        Ok(std::env::var_os("CODEX_HOME")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or(crate::paths::home_dir()?.join(".codex")))
+    }
+
+    impl Drop for CodexLiveHomeGuard {
+        fn drop(&mut self) {
+            *codex_test_native_home_override()
+                .lock()
+                .expect("codex test native home mutex poisoned") = self.previous_native_home.take();
+        }
+    }
+
+    fn codex_file_snapshot(path: &Path) -> Result<Option<[u8; 32]>, String> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(format!(
+                    "failed to snapshot Codex file {}: {err}",
+                    path.display()
+                ));
+            }
+        };
+        Ok(Some(Sha256::digest(bytes).into()))
+    }
+
+    fn assert_codex_file_snapshot_unchanged(
+        path: &Path,
+        before: Option<[u8; 32]>,
+    ) -> Result<(), String> {
+        let after = codex_file_snapshot(path)?;
+        if before == after {
+            Ok(())
+        } else {
+            Err(format!("Codex file changed during live test: {}", path.display()))
+        }
+    }
+
     impl CodexTestAppServerBinaryGuard {
         fn set(binary: std::path::PathBuf) -> Self {
             Self::set_with_native_home(binary, None)
@@ -14101,6 +14217,67 @@ mod tests {
                 .expect("Codex test resource-link failure mutex poisoned") =
                 self.previous_resource_link_failure.take();
         }
+    }
+
+    #[test]
+    fn codex_live_home_stages_auth_privately_and_cleans_up() {
+        let source_home = tempfile::tempdir().expect("Codex auth source home");
+        let source_auth = source_home.path().join("auth.json");
+        std::fs::write(&source_auth, br#"{"tokens":{"access":"fixture"}}"#)
+            .expect("write fixture auth");
+        let source_config = source_home.path().join("config.toml");
+        std::fs::write(&source_config, "[projects]\n").expect("write fixture config");
+        let source_config_before =
+            codex_file_snapshot(&source_config).expect("snapshot fixture config");
+        let isolated_home_path;
+        {
+            let guard = CodexLiveHomeGuard::from_auth_path(&source_auth)
+                .expect("stage fixture auth in isolated Codex home");
+            isolated_home_path = guard.path().to_path_buf();
+            let isolated_auth = guard.path().join("auth.json");
+            assert!(
+                std::fs::read(&isolated_auth)
+                    .expect("read isolated auth")
+                    == br#"{"tokens":{"access":"fixture"}}"#
+            );
+            assert!(!guard.path().join("config.toml").exists());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+
+                assert_eq!(
+                    std::fs::metadata(guard.path())
+                        .expect("isolated home metadata")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o700
+                );
+                assert_eq!(
+                    std::fs::metadata(&isolated_auth)
+                        .expect("isolated auth metadata")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+        }
+        assert!(!isolated_home_path.exists());
+        assert_codex_file_snapshot_unchanged(&source_config, source_config_before)
+            .expect("auth staging must not change source config");
+    }
+
+    #[test]
+    fn codex_live_home_rejects_missing_auth_without_fallback() {
+        let source_home = tempfile::tempdir().expect("Codex auth source home");
+        let result = CodexLiveHomeGuard::from_auth_path(&source_home.path().join("auth.json"));
+
+        assert!(result.is_err());
+        assert!(codex_test_native_home_override()
+            .lock()
+            .expect("codex test native home mutex poisoned")
+            .is_none());
     }
 
     #[test]
@@ -20180,6 +20357,15 @@ for line in sys.stdin:
             .build()
             .expect("tokio runtime");
         rt.block_on(async {
+            let real_codex_home = inherited_codex_home().expect("resolve inherited Codex home");
+            let real_config = real_codex_home.join("config.toml");
+            let real_auth = real_codex_home.join("auth.json");
+            let real_config_before =
+                codex_file_snapshot(&real_config).expect("snapshot real Codex config");
+            let real_auth_before = codex_file_snapshot(&real_auth).expect("snapshot real auth");
+            let live_home = CodexLiveHomeGuard::from_real_auth()
+                .expect("stage real Codex auth in isolated home");
+            let isolated_home_path = live_home.path().to_path_buf();
             let workspace = tempfile::tempdir().expect("live skill workspace");
             let store = tempfile::tempdir().expect("live skill store");
             let selected = write_codex_raw_skill(
@@ -20203,40 +20389,55 @@ for line in sys.stdin:
             )
             .await
             .expect("spawn live Codex session with native selected skill");
-            let model = live_test_select_model(&session)
-                .await
-                .expect("gpt-5.6-luna is required for the live native-skill smoke");
-            session
-                .command_handle()
-                .update_runtime_settings(json!({
-                    "model": model,
-                    "reasoning_effort": "low"
-                }))
-                .await
-                .expect("apply required Luna live-smoke settings");
-            session
-                .command_handle()
-                .execute(SessionCommand::SendMessage {
-                    message:
-                        "Invoke $live-wrapper-smoke now and follow its instructions exactly."
-                            .to_owned(),
-                    images: None,
-                })
-                .await
-                .expect("send live native-skill prompt");
+            let live_result: Result<String, String> = async {
+                let model = live_test_select_model(&session).await?;
+                session
+                    .command_handle()
+                    .update_runtime_settings(json!({
+                        "model": model,
+                        "reasoning_effort": "low"
+                    }))
+                    .await?;
+                session
+                    .command_handle()
+                    .execute(SessionCommand::SendMessage {
+                        message:
+                            "Invoke $live-wrapper-smoke now and follow its instructions exactly."
+                                .to_owned(),
+                        images: None,
+                    })
+                    .await?;
 
+                let expected =
+                    "IDENTITY=live-wrapper-smoke RESOURCE=LIVE_WRAPPER_RESOURCE_7F31";
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+                let mut observed = String::new();
+                while tokio::time::Instant::now() < deadline && !observed.contains(expected) {
+                    match tokio::time::timeout(Duration::from_secs(3), event_rx.recv()).await {
+                        Ok(Some(event)) => observed.push_str(&event.to_string()),
+                        Ok(None) => break,
+                        Err(_) => {}
+                    }
+                }
+                Ok(observed)
+            }
+            .await;
+            session.shutdown().await;
+            assert!(
+                isolated_home_path.join("config.toml").exists(),
+                "Codex trust/config writes must stay in the isolated home"
+            );
+            let real_config_result =
+                assert_codex_file_snapshot_unchanged(&real_config, real_config_before);
+            let real_auth_result =
+                assert_codex_file_snapshot_unchanged(&real_auth, real_auth_before);
+            drop(live_home);
+            assert!(!isolated_home_path.exists());
+            real_config_result.expect("real Codex config changed during live test");
+            real_auth_result.expect("real Codex auth changed during live test");
+            let observed = live_result.expect("live Codex smoke failed");
             let expected =
                 "IDENTITY=live-wrapper-smoke RESOURCE=LIVE_WRAPPER_RESOURCE_7F31";
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
-            let mut observed = String::new();
-            while tokio::time::Instant::now() < deadline && !observed.contains(expected) {
-                match tokio::time::timeout(Duration::from_secs(3), event_rx.recv()).await {
-                    Ok(Some(event)) => observed.push_str(&event.to_string()),
-                    Ok(None) => break,
-                    Err(_) => {}
-                }
-            }
-            session.shutdown().await;
             assert!(
                 observed.contains(expected),
                 "live Codex did not expose the normalized wrapper identity and linked resource; events={observed}"
