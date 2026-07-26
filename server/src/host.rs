@@ -19454,9 +19454,7 @@ mod tests {
     ) {
         let received = timeout(Duration::from_millis(50), async {
             loop {
-                let Some(envelope) = rx.recv().await else {
-                    return None;
-                };
+                let envelope = rx.recv().await?;
                 if envelope.kind == FrameKind::SessionSummaryCountUpdated {
                     return Some(envelope);
                 }
