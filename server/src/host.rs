@@ -973,7 +973,12 @@ pub(crate) struct HostState {
     removing_projects: HashSet<ProjectId>,
     #[cfg(feature = "test-support")]
     agent_name_test_gate: Option<Arc<AgentNameTestGateInner>>,
-    #[cfg(feature = "test-support")]
+    /// Gated on `any(test, ...)` rather than the `test-support` feature alone
+    /// because this crate's own `cfg(test)` build observes it. `cargo test -p
+    /// server` resolves `server` with default features, so a feature-only gate
+    /// compiles under the workspace-wide build (where the `tests` crate
+    /// unifies `test-support` on) but not under a package-scoped one.
+    #[cfg(any(test, feature = "test-support"))]
     session_schema_probe_count: u64,
 }
 
@@ -1798,67 +1803,6 @@ impl HostHandle {
         InstalledAgentNameGate { inner }
     }
 
-    pub async fn set_session_schema_ready_for_test(&self, backend_kind: BackendKind) {
-        let schema = session_settings_schema_for_backend(backend_kind);
-        let _refresh_guard = self.session_schema_refresh_lock.lock().await;
-        let mut state = self.state.lock().await;
-        match backend_kind {
-            BackendKind::Codex => {
-                state.codex_session_schema = CodexSessionSchemaState::Ready(schema)
-            }
-            BackendKind::Kiro => state.kiro_session_schema = KiroSessionSchemaState::Ready(schema),
-            BackendKind::Hermes => {
-                state.hermes_session_schema = HermesSessionSchemaState::Ready(schema)
-            }
-            _ => panic!("backend {backend_kind:?} does not have a dynamic session schema"),
-        }
-        if matches!(
-            &state.codex_session_schema,
-            CodexSessionSchemaState::Pending
-        ) {
-            state.codex_session_schema =
-                CodexSessionSchemaState::Unavailable("test schema not configured".to_owned());
-        }
-        if matches!(&state.kiro_session_schema, KiroSessionSchemaState::Pending) {
-            state.kiro_session_schema =
-                KiroSessionSchemaState::Unavailable("test schema not configured".to_owned());
-        }
-        if matches!(
-            &state.hermes_session_schema,
-            HermesSessionSchemaState::Pending
-        ) {
-            state.hermes_session_schema =
-                HermesSessionSchemaState::Unavailable("test schema not configured".to_owned());
-        }
-    }
-
-    pub async fn set_session_schema_unavailable_for_test(
-        &self,
-        backend_kind: BackendKind,
-        message: &str,
-    ) {
-        let _refresh_guard = self.session_schema_refresh_lock.lock().await;
-        let mut state = self.state.lock().await;
-        match backend_kind {
-            BackendKind::Codex => {
-                state.codex_session_schema =
-                    CodexSessionSchemaState::Unavailable(message.to_owned())
-            }
-            BackendKind::Kiro => {
-                state.kiro_session_schema = KiroSessionSchemaState::Unavailable(message.to_owned())
-            }
-            BackendKind::Hermes => {
-                state.hermes_session_schema =
-                    HermesSessionSchemaState::Unavailable(message.to_owned())
-            }
-            _ => panic!("backend {backend_kind:?} does not have a dynamic session schema"),
-        }
-    }
-
-    pub async fn session_schema_probe_count_for_test(&self) -> u64 {
-        self.state.lock().await.session_schema_probe_count
-    }
-
     pub fn install_spawn_operation_completion_test_gate(&self) -> InstalledSpawnOperationTestGate {
         let gate = new_spawn_operation_test_gate();
         let owner = self
@@ -1936,6 +1880,82 @@ impl HostHandle {
             MAX_CONCURRENT_SPAWN_OPERATIONS,
             SPAWN_OPERATION_QUEUE_CAPACITY,
         )
+    }
+}
+
+/// Session-schema probe helpers, kept separate from the `test-support`-only
+/// impl above because this crate's own `cfg(test)` unit tests drive them (see
+/// `host_reload_reprobes_ready_dynamic_session_schemas`). The workspace-wide
+/// build unifies `test-support` on via the `tests` crate, so a feature-only
+/// gate here still compiles under `./dev.sh check` while breaking the
+/// package-scoped `cargo test -p server` builds that AGENTS.md documents for
+/// the live backend tests.
+///
+/// These helpers depend on nothing from the `test-support`-only surface — only
+/// on `session_schema_refresh_lock`, the three `*SessionSchemaState` enums, and
+/// `session_settings_schema_for_backend`, all of which are unconditional — so
+/// widening them pulls in no further gates.
+#[cfg(any(test, feature = "test-support"))]
+impl HostHandle {
+    pub async fn set_session_schema_ready_for_test(&self, backend_kind: BackendKind) {
+        let schema = session_settings_schema_for_backend(backend_kind);
+        let _refresh_guard = self.session_schema_refresh_lock.lock().await;
+        let mut state = self.state.lock().await;
+        match backend_kind {
+            BackendKind::Codex => {
+                state.codex_session_schema = CodexSessionSchemaState::Ready(schema)
+            }
+            BackendKind::Kiro => state.kiro_session_schema = KiroSessionSchemaState::Ready(schema),
+            BackendKind::Hermes => {
+                state.hermes_session_schema = HermesSessionSchemaState::Ready(schema)
+            }
+            _ => panic!("backend {backend_kind:?} does not have a dynamic session schema"),
+        }
+        if matches!(
+            &state.codex_session_schema,
+            CodexSessionSchemaState::Pending
+        ) {
+            state.codex_session_schema =
+                CodexSessionSchemaState::Unavailable("test schema not configured".to_owned());
+        }
+        if matches!(&state.kiro_session_schema, KiroSessionSchemaState::Pending) {
+            state.kiro_session_schema =
+                KiroSessionSchemaState::Unavailable("test schema not configured".to_owned());
+        }
+        if matches!(
+            &state.hermes_session_schema,
+            HermesSessionSchemaState::Pending
+        ) {
+            state.hermes_session_schema =
+                HermesSessionSchemaState::Unavailable("test schema not configured".to_owned());
+        }
+    }
+
+    pub async fn set_session_schema_unavailable_for_test(
+        &self,
+        backend_kind: BackendKind,
+        message: &str,
+    ) {
+        let _refresh_guard = self.session_schema_refresh_lock.lock().await;
+        let mut state = self.state.lock().await;
+        match backend_kind {
+            BackendKind::Codex => {
+                state.codex_session_schema =
+                    CodexSessionSchemaState::Unavailable(message.to_owned())
+            }
+            BackendKind::Kiro => {
+                state.kiro_session_schema = KiroSessionSchemaState::Unavailable(message.to_owned())
+            }
+            BackendKind::Hermes => {
+                state.hermes_session_schema =
+                    HermesSessionSchemaState::Unavailable(message.to_owned())
+            }
+            _ => panic!("backend {backend_kind:?} does not have a dynamic session schema"),
+        }
+    }
+
+    pub async fn session_schema_probe_count_for_test(&self) -> u64 {
+        self.state.lock().await.session_schema_probe_count
     }
 }
 
@@ -8045,7 +8065,7 @@ impl HostHandle {
             prev_hermes_ready,
         ) = {
             let mut state = self.state.lock().await;
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             {
                 state.session_schema_probe_count =
                     state.session_schema_probe_count.saturating_add(1);
@@ -13139,7 +13159,7 @@ fn spawn_host_inner(
             removing_projects: HashSet::new(),
             #[cfg(feature = "test-support")]
             agent_name_test_gate: None,
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             session_schema_probe_count: 0,
         })),
         workflow_save_lock: Arc::new(Mutex::new(())),
@@ -24139,6 +24159,22 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .expect("forced session schema fanout");
         let forced = rx.recv().await.expect("forced session schema event");
         assert_eq!(forced.kind, FrameKind::SessionSchemas);
+    }
+
+    /// Compile-contract for the session-schema probe helpers: they must stay
+    /// reachable from this crate's own `cfg(test)` build, not just from the
+    /// `test-support` feature the `tests` crate turns on. Never called — it
+    /// exists so that re-narrowing any of the three gates back to
+    /// `#[cfg(feature = "test-support")]` fails `cargo test -p server`, which
+    /// is the configuration AGENTS.md documents for the live backend tests and
+    /// the only one the workspace-wide `./dev.sh check` build cannot observe.
+    /// `host_reload_reprobes_ready_dynamic_session_schemas` below covers two of
+    /// the three; this covers `set_session_schema_unavailable_for_test` too.
+    #[allow(dead_code)]
+    async fn session_schema_probe_helpers_compile_without_test_support(h: &HostHandle) {
+        HostHandle::set_session_schema_ready_for_test(h, BackendKind::Codex).await;
+        HostHandle::set_session_schema_unavailable_for_test(h, BackendKind::Codex, "").await;
+        let _: u64 = HostHandle::session_schema_probe_count_for_test(h).await;
     }
 
     #[tokio::test]
