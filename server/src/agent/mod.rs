@@ -172,6 +172,13 @@ impl AgentActorRuntimeResources {
 
 enum AgentCommand {
     SendInput(AgentInput),
+    /// Agent-control follow-up whose acceptance the actor acknowledges itself.
+    /// See [`AgentHandle::deliver_message`] for the contract; the mailbox
+    /// accepting this command is deliberately *not* the commit point.
+    DeliverMessage {
+        payload: SendMessagePayload,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     BeginSupervisorVerdictIfInactive {
         expected_activity_counter: u64,
         expected_verdict_settings: crate::host::VerdictSettingsFingerprint,
@@ -1005,6 +1012,44 @@ impl AgentHandle {
             return false;
         }
         self.tx.send(AgentCommand::SendInput(input)).is_ok()
+    }
+
+    /// Delivers an agent-control follow-up and waits for the actor's own
+    /// acceptance.
+    ///
+    /// [`AgentHandle::send_input`] is fire-and-forget: it reports only that the
+    /// mailbox took the command, which is why a parked terminal actor can
+    /// accept one and answer with a typed transcript rejection. That behavior
+    /// is load-bearing for client/router input and is unchanged.
+    ///
+    /// This method is the checked counterpart. It returns `Ok(())` only once
+    /// the actor has accepted or queued the message **and** published an active
+    /// turn through its own status handle, so a caller that immediately waits
+    /// on the agent cannot observe a stale idle snapshot. Every state in which
+    /// the actor drops the message instead — relay, active or blocked
+    /// compaction, closing, parked terminal, dead mailbox — returns `Err`
+    /// without touching the target's status and without appending a second
+    /// transcript error for a message that was never seen.
+    pub(crate) async fn deliver_message(&self, payload: SendMessagePayload) -> Result<(), String> {
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(DELIVERY_REJECTED_CLOSING.to_owned());
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(AgentCommand::DeliverMessage {
+                payload,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return Err(DELIVERY_REJECTED_MAILBOX_CLOSED.to_owned());
+        }
+        // A dropped acknowledgement means the actor ended without resolving the
+        // delivery. Fail closed: the caller must never read that as delivered.
+        reply_rx
+            .await
+            .unwrap_or_else(|_| Err(DELIVERY_NOT_ACKNOWLEDGED.to_owned()))
     }
 
     pub(crate) async fn begin_supervisor_verdict_if_inactive(
@@ -2160,6 +2205,13 @@ pub(crate) fn spawn_agent_actor(
         );
         let mut queue = VecDeque::new();
         let mut pending_inputs: VecDeque<AgentInput> = VecDeque::new();
+        // Acknowledged deliveries accepted while the backend was still starting.
+        // They sit in `pending_inputs` until startup completes, so the
+        // post-startup status update has to keep the agent active for them —
+        // otherwise a resumed agent publishes Idle between the acknowledgement
+        // and the dispatch, which is exactly the stale-idle read the
+        // acknowledgement exists to prevent.
+        let mut acknowledged_startup_deliveries: usize = 0;
         let mut pending_name_commands = VecDeque::new();
         assert!(
             resume_session_id.is_none() || fork_from_session_id.is_none(),
@@ -2400,6 +2452,16 @@ pub(crate) fn spawn_agent_actor(
                         AgentCommand::SendInput(input) => {
                             pending_inputs.push_back(input);
                         }
+                        AgentCommand::DeliverMessage { payload, reply } => {
+                            // Accepted: a starting agent is already active
+                            // (`started` is false), and the message is queued
+                            // for dispatch once the backend is up. Rejecting it
+                            // here would make spawn-then-send racy for no gain.
+                            acknowledged_startup_deliveries =
+                                acknowledged_startup_deliveries.saturating_add(1);
+                            pending_inputs.push_back(AgentInput::SendMessage(payload));
+                            let _ = reply.send(Ok(()));
+                        }
                         AgentCommand::ResumeReplayBarrier { .. } => {}
                     }
                 }
@@ -2533,9 +2595,17 @@ pub(crate) fn spawn_agent_actor(
         };
         let _ = startup_tx.send(Ok(actor_session_id.clone()));
         accepting_input_task.store(!resume_replay_gate_pending, Ordering::SeqCst);
+        let has_acknowledged_startup_deliveries = acknowledged_startup_deliveries > 0;
         status_handle
             .update(|s| {
                 record_agent_started(s, is_resume);
+                if has_acknowledged_startup_deliveries {
+                    // A resume normalizes to completed here. That would publish
+                    // Idle for a message this actor already acknowledged as
+                    // accepted, so re-assert the active turn it is queued for.
+                    s.is_thinking = true;
+                    s.turn_completed = false;
+                }
             })
             .await;
         append_event(
@@ -3256,6 +3326,20 @@ pub(crate) fn spawn_agent_actor(
                     let Some(command) = maybe_command else {
                         break;
                     };
+                    // The two input-bearing commands share one delivery path.
+                    // Normalizing here keeps that path single-sourced;
+                    // `delivery_ack` is the only difference between them, and
+                    // the `SendInput` arm below must resolve it on every exit.
+                    // An unresolved acknowledgement drops with this iteration,
+                    // which the caller reads as a failed delivery.
+                    let mut delivery_ack: Option<oneshot::Sender<Result<(), String>>> = None;
+                    let command = match command {
+                        AgentCommand::DeliverMessage { payload, reply } => {
+                            delivery_ack = Some(reply);
+                            AgentCommand::SendInput(AgentInput::SendMessage(payload))
+                        }
+                        command => command,
+                    };
                     match command {
                         AgentCommand::ResumeReplayBarrier { result } => {
                             if !resume_replay_gate_pending {
@@ -3430,15 +3514,42 @@ pub(crate) fn spawn_agent_actor(
                                 }
                             }
                         }
+                        AgentCommand::DeliverMessage { reply, .. } => {
+                            // Normalization above rewrites every delivery into
+                            // `SendInput`, so this is unreachable. Fail closed
+                            // rather than assert: a caller must never read an
+                            // unhandled command as a delivered message.
+                            let _ = reply.send(Err(DELIVERY_NOT_ACKNOWLEDGED.to_owned()));
+                        }
                         AgentCommand::SendInput(input) => {
                             if resume_replay_gate_pending {
+                                // Accepted, not rejected: the resume barrier is
+                                // transient and the message is dispatched once
+                                // it lifts. Mark the queued turn active before
+                                // acknowledging so the caller cannot read Idle.
+                                if delivery_ack.is_some() {
+                                    mark_agent_turn_active(&status_handle).await;
+                                }
                                 pending_inputs.push_back(input);
+                                if let Some(reply) = delivery_ack.take() {
+                                    let _ = reply.send(Ok(()));
+                                }
                                 continue;
                             }
                             if matches!(lifecycle, ActorLifecycle::Closing) {
+                                reject_agent_delivery(
+                                    delivery_ack.take(),
+                                    DELIVERY_REJECTED_CLOSING,
+                                );
                                 continue;
                             }
                             if active_compaction.is_some() || compaction_blocked {
+                                if reject_agent_delivery(
+                                    delivery_ack.take(),
+                                    DELIVERY_REJECTED_COMPACTING,
+                                ) {
+                                    continue;
+                                }
                                 let payload =
                                     compaction_input_rejected_payload(&current_start.agent_id);
                                 append_event(
@@ -3514,6 +3625,18 @@ pub(crate) fn spawn_agent_actor(
                                             &queue,
                                         )
                                         .await;
+                                        if let Some(reply) = delivery_ack.take() {
+                                            // Queued behind the open turn counts
+                                            // as accepted. Mark active first:
+                                            // between a cancellation and the
+                                            // backend's idle marker the status
+                                            // reads completed while `in_turn` is
+                                            // still true, so acknowledging
+                                            // without this would leave the agent
+                                            // Idle with a message it never ran.
+                                            mark_agent_turn_active(&status_handle).await;
+                                            let _ = reply.send(Ok(()));
+                                        }
                                     } else {
                                         if !is_tool_response {
                                             in_turn = true;
@@ -3558,6 +3681,17 @@ pub(crate) fn spawn_agent_actor(
                                                         &queue,
                                                     )
                                                     .await;
+                                                    if let Some(reply) = delivery_ack.take() {
+                                                        // A Busy hand-back is a
+                                                        // requeue, not a refusal:
+                                                        // the actor still owns
+                                                        // the message and will
+                                                        // send it when the
+                                                        // self-started turn ends.
+                                                        mark_agent_turn_active(&status_handle)
+                                                            .await;
+                                                        let _ = reply.send(Ok(()));
+                                                    }
                                                 }
                                                 _ => {
                                                     // Tool responses answer the
@@ -3567,6 +3701,10 @@ pub(crate) fn spawn_agent_actor(
                                                     tracing::error!(
                                                         agent_id = %current_start.agent_id,
                                                         "backend handed back a non-requeueable input as Busy"
+                                                    );
+                                                    reject_agent_delivery(
+                                                        delivery_ack.take(),
+                                                        DELIVERY_NOT_ACKNOWLEDGED,
                                                     );
                                                 }
                                             }
@@ -3587,6 +3725,15 @@ pub(crate) fn spawn_agent_actor(
                                                     "failed to send review-origin bundle to backend"
                                                 );
                                             }
+                                            // Report the refusal before the
+                                            // terminal transition so the caller
+                                            // learns its message was never
+                                            // delivered, not merely that the
+                                            // agent later died.
+                                            reject_agent_delivery(
+                                                delivery_ack.take(),
+                                                DELIVERY_REJECTED_BACKEND_CLOSED,
+                                            );
                                             let payload = AgentErrorPayload {
                                                 agent_id: current_start.agent_id.clone(),
                                                 code: AgentErrorCode::Internal,
@@ -3636,6 +3783,17 @@ pub(crate) fn spawn_agent_actor(
                                                         s.activity_counter.saturating_add(1);
                                                 })
                                                 .await;
+                                        }
+                                        if let Some(reply) = delivery_ack.take() {
+                                            if is_tool_response {
+                                                // Agent-control delivery carries
+                                                // a plain follow-up, never a tool
+                                                // response, but the active-before-
+                                                // acknowledge contract has to hold
+                                                // for whatever reaches here.
+                                                mark_agent_turn_active(&status_handle).await;
+                                            }
+                                            let _ = reply.send(Ok(()));
                                         }
                                         if let Some(review_id) = review_origin {
                                             tracing::debug!(
@@ -5134,6 +5292,13 @@ pub(crate) fn spawn_relay_agent_actor(
                             )
                             .await;
                         }
+                        AgentCommand::DeliverMessage { reply, .. } => {
+                            // A relay mirrors a backend-native child and never
+                            // accepts direct input. Answering the caller is the
+                            // whole fix: the old path left the target marked
+                            // active for a message it would never run.
+                            let _ = reply.send(Err(DELIVERY_REJECTED_RELAY.to_owned()));
+                        }
                         AgentCommand::Interrupt { reply } => {
                             let payload = relay_input_rejected_payload(&current_start.agent_id);
                             append_event(
@@ -5328,6 +5493,35 @@ async fn finish_actor_close(
         })
         .await;
     let _ = reply.send(());
+}
+
+/// Rejection reasons for an acknowledged [`AgentCommand::DeliverMessage`].
+///
+/// These reach the agent-control caller as the tool's error text, so they
+/// deliberately mirror the wording of the transcript rejections the
+/// fire-and-forget path appends for the same states. A rejected acknowledged
+/// delivery appends nothing: the caller is told directly, and inventing a
+/// transcript error for a message the actor never accepted would put a failure
+/// in the target's history that its user never caused.
+const DELIVERY_REJECTED_RELAY: &str = "backend-native relay agents do not accept direct input";
+const DELIVERY_REJECTED_COMPACTING: &str = "agent compaction is in progress";
+const DELIVERY_REJECTED_CLOSING: &str = "agent is closing";
+const DELIVERY_REJECTED_TERMINAL: &str = "agent not running";
+const DELIVERY_REJECTED_BACKEND_CLOSED: &str = "agent backend closed";
+const DELIVERY_REJECTED_MAILBOX_CLOSED: &str = "agent backend is closed";
+const DELIVERY_NOT_ACKNOWLEDGED: &str = "agent actor did not acknowledge the message";
+
+/// Resolves an acknowledged delivery as rejected.
+///
+/// Returns whether there was an acknowledgement to resolve, so a shared
+/// rejection site can skip the transcript error it would otherwise append for
+/// fire-and-forget input.
+fn reject_agent_delivery(ack: Option<oneshot::Sender<Result<(), String>>>, reason: &str) -> bool {
+    let Some(reply) = ack else {
+        return false;
+    };
+    let _ = reply.send(Err(reason.to_owned()));
+    true
 }
 
 fn relay_input_rejected_payload(agent_id: &AgentId) -> AgentErrorPayload {
@@ -5590,6 +5784,14 @@ async fn park_terminal_agent(
                 )
                 .await;
             }
+            AgentCommand::DeliverMessage { reply, .. } => {
+                // The fire-and-forget arm above answers a client with a typed
+                // transcript rejection because a human is watching this chat.
+                // An acknowledged delivery has a caller to answer instead, and
+                // appending here would overwrite the fatal error that explains
+                // why the agent is parked.
+                let _ = reply.send(Err(DELIVERY_REJECTED_TERMINAL.to_owned()));
+            }
             AgentCommand::Interrupt { reply } => {
                 let _ = reply.send(InterruptOutcome::NotRunning);
             }
@@ -5742,6 +5944,12 @@ async fn park_relay_terminal_agent(
                     &payload,
                 )
                 .await;
+            }
+            AgentCommand::DeliverMessage { reply, .. } => {
+                // Parked relay: terminal is the more actionable of the two
+                // reasons, since resume/fork applies and "does not accept
+                // direct input" would read as a routing mistake.
+                let _ = reply.send(Err(DELIVERY_REJECTED_TERMINAL.to_owned()));
             }
             AgentCommand::Interrupt { reply } => {
                 let payload = relay_input_rejected_payload(&current_start.agent_id);
@@ -9303,6 +9511,9 @@ mod tests {
                     }
                     AgentCommand::ReleaseCompaction { reply } => {
                         let _ = reply.send(());
+                    }
+                    AgentCommand::DeliverMessage { reply, .. } => {
+                        let _ = reply.send(Err(super::DELIVERY_REJECTED_TERMINAL.to_owned()));
                     }
                     AgentCommand::SendInput(_) => {
                         let rejection = terminal_input_rejected_payload(&start.agent_id);
@@ -13256,5 +13467,201 @@ mod tests {
             timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
             "one terminal input must append exactly one live rejection"
         );
+    }
+
+    fn delivery_payload(message: &str) -> protocol::SendMessagePayload {
+        protocol::SendMessagePayload {
+            message: message.to_owned(),
+            images: None,
+            origin: None,
+            tool_response: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn deliver_message_rejects_a_parked_terminal_actor_without_touching_it() {
+        let start = test_agent_start("agent-terminal-delivery");
+        let (status_handle, _status_rx) = AgentStatusHandle::new();
+        let handle = spawn_failed_agent_actor(
+            start.clone(),
+            "backend blew up".to_owned(),
+            status_handle.clone(),
+        );
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert!(handle.attach(replay_stream(tx)).await);
+        let _ = recv_agent_bootstrap_events(&mut rx, "terminal delivery bootstrap").await;
+        let before = status_handle.snapshot().await;
+        assert!(before.terminated);
+        assert_eq!(before.status(), AgentControlStatus::Failed);
+
+        assert_eq!(
+            handle.deliver_message(delivery_payload("follow-up")).await,
+            Err(super::DELIVERY_REJECTED_TERMINAL.to_owned()),
+            "a parked terminal actor must refuse an acknowledged delivery"
+        );
+
+        assert!(
+            timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
+            "a refused delivery must not append a transcript error for a message never taken"
+        );
+        let after = status_handle.snapshot().await;
+        assert_eq!(after.activity_counter, before.activity_counter);
+        assert_eq!(after.status(), AgentControlStatus::Failed);
+        assert!(!after.is_active());
+
+        // The fire-and-forget path is a separate contract and stays intact: a
+        // client sending here still gets the typed rejection in its transcript.
+        let client_input = AgentInput::SendMessage(delivery_payload("client input"));
+        assert!(handle.send_input(client_input).await);
+        let rejection = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("terminal client input must still append a live rejection")
+            .expect("terminal subscriber remained open");
+        assert_eq!(rejection.kind, FrameKind::AgentError);
+        let rejection: protocol::AgentErrorPayload = rejection
+            .parse_payload()
+            .expect("typed live terminal rejection");
+        assert_eq!(rejection.message, "agent not running");
+    }
+
+    #[tokio::test]
+    async fn deliver_message_reports_a_dead_mailbox_and_a_closing_handle() {
+        let start = test_agent_start("agent-mailbox-delivery");
+        let (_start_tx, start_rx) = watch::channel(start.clone());
+        let (tx, rx) = mpsc::unbounded_channel::<AgentCommand>();
+        // No actor: the receiver is gone, so the command cannot be enqueued.
+        drop(rx);
+        let dead = AgentHandle {
+            tx,
+            accepting_input: Arc::new(AtomicBool::new(true)),
+            closing: Arc::new(AtomicBool::new(false)),
+            start: start_rx.clone(),
+        };
+        assert_eq!(
+            dead.deliver_message(delivery_payload("into the void")).await,
+            Err(super::DELIVERY_REJECTED_MAILBOX_CLOSED.to_owned())
+        );
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<AgentCommand>();
+        let closing = AgentHandle {
+            tx,
+            accepting_input: Arc::new(AtomicBool::new(false)),
+            closing: Arc::new(AtomicBool::new(true)),
+            start: start_rx,
+        };
+        assert_eq!(
+            closing.deliver_message(delivery_payload("during close")).await,
+            Err(super::DELIVERY_REJECTED_CLOSING.to_owned())
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a closing handle must refuse before enqueuing anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_message_rejects_a_relay_actor_without_touching_it() {
+        let dir = tempfile::tempdir().expect("relay delivery tempdir");
+        let session_store = Arc::new(Mutex::new(
+            SessionStore::load(dir.path().join("sessions.json")).expect("relay session store"),
+        ));
+        let start = test_agent_start("agent-relay-delivery");
+        let (status_handle, _status_rx) = AgentStatusHandle::new();
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let (_model_usage_tx, model_usage_rx) = mpsc::unbounded_channel();
+        let (_total_usage_tx, total_usage_rx) = mpsc::unbounded_channel();
+        let handle = spawn_relay_agent_actor(
+            start.agent_id.clone(),
+            start,
+            RelayEventReceivers {
+                events: event_rx,
+                model_usage: model_usage_rx,
+                total_usage: total_usage_rx,
+            },
+            session_store,
+            SessionId("relay-delivery-session".to_owned()),
+            status_handle.clone(),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert!(handle.attach(replay_stream(tx)).await);
+        let _ = recv_agent_bootstrap_events(&mut rx, "relay delivery bootstrap").await;
+        let before = status_handle.snapshot().await;
+
+        assert_eq!(
+            handle.deliver_message(delivery_payload("relay follow-up")).await,
+            Err(super::DELIVERY_REJECTED_RELAY.to_owned()),
+            "a relay mirrors a backend-native child and cannot take direct input"
+        );
+
+        let after = status_handle.snapshot().await;
+        assert_eq!(
+            after.activity_counter,
+            before.activity_counter,
+            "a refused relay delivery must leave the target's status exactly as it was"
+        );
+        assert_eq!(after.is_active(), before.is_active());
+        assert!(
+            timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
+            "a refused relay delivery must not append a transcript error"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_message_queues_behind_an_open_turn_and_reports_active() {
+        let _startup_test_guard = AGENT_STARTUP_ACTOR_TEST_LOCK.lock().await;
+        let (_dir, start, mut request, runtime, status_handle) =
+            startup_actor_fixture("agent-queued-delivery", None);
+        // The held turn never ends, so every assertion below is about actor
+        // state the test controls rather than a race with a mock turn.
+        request.initial_input = Some(delivery_payload("__mock_hold_until_interrupt__ hold"));
+        let (handle, startup_rx) =
+            spawn_agent_actor(start.agent_id.clone(), start, request, runtime);
+        startup_rx
+            .await
+            .expect("actor startup reply")
+            .expect("mock actor startup");
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if status_handle.snapshot().await.is_thinking {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("held mock turn opens");
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert!(handle.attach(replay_stream(tx)).await);
+        let _ = recv_agent_bootstrap_events(&mut rx, "queued delivery bootstrap").await;
+
+        assert_eq!(
+            handle.deliver_message(delivery_payload("queued follow-up")).await,
+            Ok(()),
+            "a message queued behind an open turn is accepted, not refused"
+        );
+        let queued = timeout(Duration::from_secs(1), async {
+            loop {
+                let envelope = rx.recv().await.expect("queued delivery stream stays open");
+                if envelope.kind == FrameKind::QueuedMessages {
+                    return envelope
+                        .parse_payload::<QueuedMessagesPayload>()
+                        .expect("queued messages payload");
+                }
+            }
+        })
+        .await
+        .expect("accepted delivery becomes actor-owned queued work");
+        assert_eq!(queued.messages.len(), 1);
+        assert_eq!(queued.messages[0].message, "queued follow-up");
+
+        let status = status_handle.snapshot().await;
+        assert!(
+            status.is_active() && !status.turn_completed,
+            "an acknowledged delivery must leave the agent active, never idle with unrun work"
+        );
+        // No close here: the held turn never ends, so `close` would wait out a
+        // turn the mock only releases on interrupt.
     }
 }
