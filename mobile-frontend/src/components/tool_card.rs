@@ -1037,7 +1037,17 @@ fn AskUserQuestionCard(
 
     let submit_disabled = {
         let all_answered = all_answered.clone();
-        move || submitted.get().is_some() || sending.get() || !all_answered()
+        let agents = state.agents;
+        let owner = owner_agent_ref.clone();
+        move || {
+            submitted.get().is_some()
+                || sending.get()
+                || !all_answered()
+                // The asker died: Submit can never be delivered. Reactive, so
+                // the control closes the moment the fatal frame lands, even
+                // with the card already on screen and answers picked.
+                || owner_is_terminated(agents, &owner)
+        }
     };
 
     // The card's own view of what happened to its reply. A read of the record it
@@ -1199,17 +1209,39 @@ fn render_question(
 /// approval, or rejection to whichever conversation happened to be on screen when
 /// the user finally tapped, on whichever host that conversation lives on. The card
 /// knows who asked; that is who gets the answer.
+/// True when the exact asking agent died with `AgentError { fatal: true }`.
+///
+/// Owner-scoped, never `active_agent`: a question can sit unanswered while the
+/// user wanders to another chat, and only the *asker's* liveness decides
+/// whether a reply can still land.
+pub(crate) fn owner_is_terminated(
+    agents: RwSignal<Vec<crate::state::AgentInfo>>,
+    owner: &AgentRef,
+) -> bool {
+    agents.with(|agents| {
+        agents.iter().any(|agent| {
+            agent.local_host_id == owner.local_host_id
+                && agent.agent_id == owner.agent_id
+                && agent.fatal_error.is_some()
+        })
+    })
+}
+
 fn answer_target(
     state: &AppState,
     owner: &AgentRef,
 ) -> Result<(crate::state::LocalHostId, StreamPath), &'static str> {
-    let stream = state.agents.with_untracked(|agents| {
+    // Three outcomes, kept distinct because they call for different actions: no
+    // record at all (reopen), a record that died (fork / new chat), and a live
+    // stream. Collapsing the first two would tell a user to reopen a chat whose
+    // agent can never answer again.
+    let found = state.agents.with_untracked(|agents| {
         agents.iter().find_map(|agent| {
             (agent.local_host_id == owner.local_host_id && agent.agent_id == owner.agent_id)
-                .then(|| agent.instance_stream.clone())
+                .then(|| (agent.instance_stream.clone(), agent.fatal_error.is_some()))
         })
     });
-    let Some(stream) = stream else {
+    let Some((stream, fatal)) = found else {
         log::error!(
             "tool card reply: no agent record for the asking agent {:?} on {:?}",
             owner.agent_id,
@@ -1217,6 +1249,17 @@ fn answer_target(
         );
         return Err("No active agent is available. Reopen the chat and try again.");
     };
+    if fatal {
+        // A fatal error killed the asking stream. The reply has nowhere to
+        // land, and admitting it would leave the card claiming "Queued
+        // locally." for a message that can never be delivered.
+        log::warn!(
+            "tool card reply: the asking agent {:?} on {:?} has terminated",
+            owner.agent_id,
+            owner.local_host_id
+        );
+        return Err("This agent has stopped. Fork it or start a new chat to continue.");
+    }
     Ok((owner.local_host_id.clone(), stream))
 }
 
@@ -1487,7 +1530,18 @@ fn ExitPlanModeCard(
     });
     let on_reject = Callback::new(move |_: ()| submit(ExitPlanModeDecision::Reject));
 
-    let controls_disabled = move || decision_sent.get().is_some() || sending.get();
+    // A `Memo` rather than a plain closure: the three controls that read this
+    // then share one subscription and one answer, and the memo stays `Copy`
+    // now that the predicate captures a non-`Copy` owner ref.
+    let controls_disabled = {
+        let agents = state.agents;
+        let owner = owner_agent_ref.clone();
+        // Approve and Reject are both replies to the proposing agent. A dead
+        // asker can act on neither, so both close together.
+        Memo::new(move |_| {
+            decision_sent.get().is_some() || sending.get() || owner_is_terminated(agents, &owner)
+        })
+    };
 
     view! {
         <div class="exit-plan-body" data-mobile-test="exit-plan-body">
@@ -1507,7 +1561,7 @@ fn ExitPlanModeCard(
                 // cannot promise anything was sent — it can only say what the
                 // feedback will be attached to.
                 placeholder="Optional feedback (included if you reject)"
-                prop:disabled=controls_disabled
+                prop:disabled=move || controls_disabled.get()
                 on:input=move |ev: web_sys::Event| {
                     if decision_sent.get_untracked().is_some() || sending.get_untracked() {
                         return;
@@ -1521,7 +1575,7 @@ fn ExitPlanModeCard(
                     variant=ButtonVariant::Primary
                     size=ButtonSize::Compact
                     data_mobile_test="exit-plan-approve"
-                    disabled=Signal::derive(controls_disabled)
+                    disabled=Signal::derive(move || controls_disabled.get())
                     on_click=on_approve
                 />
                 <Button
@@ -1529,7 +1583,7 @@ fn ExitPlanModeCard(
                     variant=ButtonVariant::Secondary
                     size=ButtonSize::Compact
                     data_mobile_test="exit-plan-reject"
-                    disabled=Signal::derive(controls_disabled)
+                    disabled=Signal::derive(move || controls_disabled.get())
                     on_click=on_reject
                 />
                 <Show when=move || decision_sent.get().is_some()>
@@ -3217,6 +3271,96 @@ mod wasm_tests {
             local_host_id: LocalHostId("host-b".to_owned()),
             agent_id: AgentId("agent-1".to_owned()),
         }));
+    }
+
+    /// Seed the asking agent on host-A as terminated, leaving the user looking
+    /// at the healthy same-id agent on host-B.
+    ///
+    /// The cross-host shape is the point: the *asker's* liveness decides whether
+    /// a reply can land, never the active chat's. A card that consulted
+    /// `active_agent` would see a perfectly healthy agent-1 on host-B and
+    /// happily submit an answer that nobody on host-A can receive.
+    fn asker_on_a_is_terminated_active_on_b(state: &AppState) {
+        state.agents.update(|agents| {
+            let mut dead = child_agent_on("host-a", "agent-1", "Asker on A", true);
+            dead.fatal_error = Some("backend crashed".to_owned());
+            agents.push(dead);
+            agents.push(child_agent_on("host-b", "agent-1", "Asker on B", true));
+        });
+        state.active_agent.set(Some(ActiveAgentRef {
+            local_host_id: LocalHostId("host-b".to_owned()),
+            agent_id: AgentId("agent-1".to_owned()),
+        }));
+    }
+
+    /// **A reply to a dead asker must not be submittable.**
+    ///
+    /// The card can sit on screen for a long time, and the asking agent can die
+    /// under it. Submit used to stay live: the answer was admitted, held as
+    /// "Queued locally", and addressed to a stream nobody was reading — so the
+    /// user was told their answer was on its way to an agent that had crashed.
+    #[wasm_bindgen_test]
+    async fn a_terminated_asker_cannot_be_answered() {
+        let calls = configure_deferred_web_sends();
+        let container = mount_card_owned_by(
+            owner_on("host-a"),
+            ask_entry(false),
+            asker_on_a_is_terminated_active_on_b,
+        );
+        next_tick().await;
+
+        // Answer it fully, so nothing but the fatal state can be holding Submit
+        // shut.
+        option_buttons(&container)[0].click();
+        next_tick().await;
+
+        let submit = submit_button(&container);
+        assert!(
+            submit.disabled(),
+            "a fully-answered question whose asker has died must not offer Submit"
+        );
+
+        submit.click();
+        next_tick().await;
+        assert_eq!(
+            calls.length(),
+            0,
+            "and a stale click must not reach the dead asking stream"
+        );
+    }
+
+    /// Approve and Reject are both replies to the proposing agent, so a dead
+    /// proposer closes both. Approving a plan nobody can act on is worse than
+    /// inert: the user walks away believing work is underway.
+    #[wasm_bindgen_test]
+    async fn a_terminated_proposer_cannot_have_its_plan_approved_or_rejected() {
+        let calls = configure_deferred_web_sends();
+        let container = mount_card_owned_by(
+            owner_on("host-a"),
+            exit_plan_entry(false),
+            asker_on_a_is_terminated_active_on_b,
+        );
+        next_tick().await;
+
+        let approve = exit_approve_button(&container).expect("approve control present");
+        let reject = exit_reject_button(&container).expect("reject control present");
+        assert!(
+            approve.disabled(),
+            "a dead proposer cannot act on an approval"
+        );
+        assert!(
+            reject.disabled(),
+            "nor on a rejection — both are replies to the same dead stream"
+        );
+
+        approve.click();
+        reject.click();
+        next_tick().await;
+        assert_eq!(
+            calls.length(),
+            0,
+            "no decision may reach the dead proposing stream"
+        );
     }
 
     /// An answer goes back to the stream that asked — host-A's agent — even though
