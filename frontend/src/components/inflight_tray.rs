@@ -34,10 +34,10 @@ use wasm_bindgen_futures::spawn_local;
 
 use protocol::{
     AgentActivityStats, AgentActivitySummary, AgentActivitySummaryStaleReason,
-    AgentActivitySummaryState, AgentControlProgressKind, AgentId, BackendKind, BackgroundTaskState,
-    BackgroundTaskStatus, CancelQueuedMessagePayload, FrameKind, QueuedMessageId,
-    SendQueuedMessageNowPayload, SessionSettingValue, SubAgentProgress, ToolProgressUpdate,
-    ToolRequestType, WorkflowRunState, WorkflowRunStatus,
+    AgentActivitySummaryState, AgentId, BackendKind, BackgroundTaskState, BackgroundTaskStatus,
+    CancelQueuedMessagePayload, FrameKind, QueuedMessageId, SendQueuedMessageNowPayload,
+    SessionSettingValue, SubAgentProgress, ToolProgressUpdate, ToolRequestType, WorkflowRunState,
+    WorkflowRunStatus,
 };
 
 use crate::components::agents_panel::{DerivedAgentState, derive_agent_state};
@@ -167,11 +167,6 @@ struct TrayCounts {
 #[derive(Clone, PartialEq, Default)]
 struct TraySnapshot {
     children: Vec<AgentId>,
-    /// Agents referenced by a spawn's progress payload that have no registry
-    /// record yet — the gap between the spawn result and the `NewAgent`
-    /// frame. Rendered optimistically as "Starting", exactly as the spawn
-    /// card's live rows treated an unknown spawned agent.
-    pending_spawns: Vec<(AgentId, Option<String>)>,
     workflows: Vec<ToolCallId>,
     subagents: Vec<ToolCallId>,
     /// Backgrounded shell commands from server-reduced `BackgroundTask`
@@ -184,7 +179,6 @@ struct TraySnapshot {
 impl TraySnapshot {
     fn is_empty(&self) -> bool {
         self.children.is_empty()
-            && self.pending_spawns.is_empty()
             && self.workflows.is_empty()
             && self.subagents.is_empty()
             && self.commands.is_empty()
@@ -249,22 +243,6 @@ fn compute_snapshot(state: &AppState, parent: &ActiveAgentRef) -> TraySnapshot {
                     snapshot.counts.running += 1;
                     snapshot.subagents.push(call_id.clone());
                 }
-                ToolProgressUpdate::AgentControl(progress)
-                    if progress.progress_kind == AgentControlProgressKind::Spawn =>
-                {
-                    for agent in progress.agents {
-                        if child_ids.contains(&agent.agent_id)
-                            || snapshot
-                                .pending_spawns
-                                .iter()
-                                .any(|(id, _)| *id == agent.agent_id)
-                        {
-                            continue;
-                        }
-                        snapshot.counts.running += 1;
-                        snapshot.pending_spawns.push((agent.agent_id, agent.name));
-                    }
-                }
                 ToolProgressUpdate::BackgroundTask(task)
                     if task.status == BackgroundTaskStatus::Running =>
                 {
@@ -280,7 +258,6 @@ fn compute_snapshot(state: &AppState, parent: &ActiveAgentRef) -> TraySnapshot {
     snapshot.workflows.sort_by(|a, b| a.0.cmp(&b.0));
     snapshot.subagents.sort_by(|a, b| a.0.cmp(&b.0));
     snapshot.commands.sort_by(|a, b| a.0.cmp(&b.0));
-    snapshot.pending_spawns.sort_by(|a, b| a.0.0.cmp(&b.0.0));
 
     snapshot.queued = state.agent_message_queue.with(|queue| {
         queue
@@ -385,20 +362,6 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
                             let:agent_id
                         >
                             <ChildAgentRow parent_ref=agent_ref agent_id=agent_id />
-                        </For>
-                        <For
-                            each=move || snapshot.get().pending_spawns
-                            key=|(agent_id, _)| agent_id.0.clone()
-                            let:pending
-                        >
-                            <div class="tool-live-agent-row inflight-tray-row">
-                                <div class="tool-live-agent-main">
-                                    <span class="tool-live-agent-name">
-                                        {pending.1.unwrap_or_else(|| pending.0.0.clone())}
-                                    </span>
-                                    <span class="tool-live-agent-status running">"Starting"</span>
-                                </div>
-                            </div>
                         </For>
                         <For
                             each=move || snapshot.get().workflows
@@ -1087,7 +1050,8 @@ mod wasm_tests {
     use crate::state::{AgentInfo, ToolCallId};
     use leptos::mount::mount_to;
     use protocol::{
-        AgentId, AgentOrigin, BackendKind, QueuedMessageEntry, StreamPath, ToolProgressData,
+        AgentControlProgressKind, AgentId, AgentOrigin, BackendKind, QueuedMessageEntry, StreamPath,
+        ToolProgressData,
     };
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
@@ -1551,9 +1515,9 @@ mod wasm_tests {
     // The spawn/await cards' live rows moved here wholesale; these tests
     // moved with them. Each preserves the behavioral contract its
     // predecessor pinned on the card rows — server-owned summaries and
-    // stats rendered verbatim, host scoping, streaming previews, the
-    // optimistic Starting state — now asserted on the tray, the single
-    // surface that renders live per-agent detail.
+    // stats rendered verbatim, host scoping, and streaming previews — now
+    // asserted on the tray, the single surface that renders live
+    // per-agent detail.
 
     use crate::components::tool_card::ToolCardView;
     use crate::state::{StreamingState, ToolRequestEntry};
@@ -1713,27 +1677,113 @@ mod wasm_tests {
         );
     }
 
-    /// Ported from `agent_control_spawn_card_treats_unknown_agent_as_starting`:
-    /// an agent referenced by spawn progress with no registry record yet
-    /// renders optimistically as Starting and counts as running.
+    /// Spawn producers register and fan out the child before emitting this
+    /// receipt, so a receipt without an authoritative registry agent is
+    /// historical, including after bootstrap replay. Preserve that evidence
+    /// without claiming that absent work is active.
     #[wasm_bindgen_test]
-    async fn unknown_spawned_agent_renders_starting_row() {
-        let (container, _state) = mount_tray(|state| {
+    async fn spawn_receipt_without_registry_agent_is_not_active() {
+        let (container, state) = mount_tray(|state| {
             seed_progress(state, spawn_progress_for("agent-unknown", "Worker"));
         });
         next_tick().await;
 
         let body = text(&container);
-        assert!(
-            body.contains("1 running"),
-            "pending spawn counts as running: {body}"
+        assert_eq!(
+            count(&container, ".inflight-tray"),
+            0,
+            "an authoritative registry miss must not synthesize a tray"
         );
+        assert!(
+            !body.contains("Starting"),
+            "an absent registry agent must not render Starting: {body}"
+        );
+        assert_eq!(
+            compute_snapshot(&state, &parent_ref()).counts.running,
+            0,
+            "a historical spawn receipt is not running work"
+        );
+        assert!(
+            state.tool_progress.with_untracked(|map| map.contains_key(&(
+                parent_ref().agent_id,
+                ToolCallId("toolu_agent_control".to_owned()),
+            ))),
+            "the AppState spawn receipt remains available to transcript history"
+        );
+    }
 
-        expand(&container).await;
+    /// A registered child remains registry-derived live work, but removing
+    /// that authoritative row must not reinterpret its retained spawn receipt
+    /// as a new Starting lifecycle.
+    #[wasm_bindgen_test]
+    async fn removed_spawned_child_does_not_resurrect_as_starting() {
+        let (container, state) = mount_tray(|state| {
+            seed_progress(state, spawn_progress_for("agent-a", "Worker"));
+            state
+                .agents
+                .update(|agents| agents.push(child_agent("agent-a", "Worker")));
+            set_turn_active(state, "agent-a");
+        });
+        next_tick().await;
+
         let body = text(&container);
         assert!(
-            body.contains("Worker") && body.contains("Starting"),
-            "unknown spawned agent row starts optimistic: {body}"
+            body.contains("1 running") && body.contains("Worker") && body.contains("Running"),
+            "the registered running child remains visible exactly once: {body}"
+        );
+        assert!(
+            !body.contains("Starting"),
+            "the retained receipt does not duplicate the registered child: {body}"
+        );
+
+        state
+            .agents
+            .update(|agents| agents.retain(|agent| agent.agent_id.0 != "agent-a"));
+        next_tick().await;
+
+        let body = text(&container);
+        assert_eq!(
+            count(&container, ".inflight-tray"),
+            0,
+            "deregistering the child removes its only live row"
+        );
+        assert!(
+            !body.contains("Starting"),
+            "the retained receipt must not resurrect the removed child: {body}"
+        );
+        assert_eq!(
+            compute_snapshot(&state, &parent_ref()).counts.running,
+            0,
+            "the removed child no longer contributes to the running count"
+        );
+        assert!(
+            state.tool_progress.with_untracked(|map| map.contains_key(&(
+                parent_ref().agent_id,
+                ToolCallId("toolu_agent_control".to_owned()),
+            ))),
+            "deregistration keeps the parent-owned spawn receipt intact"
+        );
+
+        state.tool_progress.update(|map| map.clear());
+        seed_progress(&state, spawn_progress_for("agent-a", "Worker"));
+        next_tick().await;
+
+        assert_eq!(
+            count(&container, ".inflight-tray"),
+            0,
+            "bootstrap-style receipt replay does not resurrect the absent child"
+        );
+        assert_eq!(
+            compute_snapshot(&state, &parent_ref()).counts.running,
+            0,
+            "replayed history remains a receipt rather than live work"
+        );
+        assert!(
+            state.tool_progress.with_untracked(|map| map.contains_key(&(
+                parent_ref().agent_id,
+                ToolCallId("toolu_agent_control".to_owned()),
+            ))),
+            "the replayed receipt remains in AppState"
         );
     }
 
