@@ -13595,6 +13595,9 @@ mod tests {
         let (_event_tx, event_rx) = mpsc::unbounded_channel();
         let (_model_usage_tx, model_usage_rx) = mpsc::unbounded_channel();
         let (_total_usage_tx, total_usage_rx) = mpsc::unbounded_channel();
+        // Retain the receiver so summary-count publication behaves as it does in
+        // production; a dropped receiver would silently swallow every send.
+        let (session_summary_count_tx, _session_summary_count_rx) = mpsc::unbounded_channel();
         let handle = spawn_relay_agent_actor(
             start.agent_id.clone(),
             start,
@@ -13605,6 +13608,7 @@ mod tests {
             },
             session_store,
             SessionId("relay-delivery-session".to_owned()),
+            session_summary_count_tx,
             status_handle.clone(),
         );
         let (tx, mut rx) = mpsc::unbounded_channel();
