@@ -7065,10 +7065,9 @@ fn close_current_phase_with_turn_usage(
         for tool_call in &phase.tool_calls {
             emit_tool_request_with_tracking(summary, inner, tool_call);
         }
+        reset_phase_state(summary, segment);
+        segment.awaiting_stream_start = true;
     }
-
-    reset_phase_state(summary, segment);
-    segment.awaiting_stream_start = true;
 }
 
 fn emit_tool_request_with_tracking(
@@ -11600,7 +11599,13 @@ mod tests {
     use super::*;
     use crate::agent::customization::ResolvedSkill;
     use crate::backend::Backend;
-    use protocol::{ChatEvent, ToolExecutionNormalizationFailure, ToolRequestType};
+    use protocol::{
+        AgentBootstrapEvent, AgentBootstrapPayload, AgentId, AgentOrigin, AgentStartPayload,
+        BackendKind, BackendSetupPayload, ChatEvent, Envelope, FrameKind, HostBootstrapPayload,
+        HostSettings, MobileAccessStatePayload, MobileBrokerStatus, MobilePairingState,
+        NewAgentPayload, PROTOCOL_VERSION, ProtocolValidator, StreamPath, TeamPresetCatalog,
+        ToolExecutionNormalizationFailure, ToolRequestType, Version, WelcomePayload,
+    };
     use tokio::sync::oneshot;
     use tokio::time::{Duration, timeout};
 
@@ -11617,6 +11622,210 @@ mod tests {
 
     fn make_test_inner() -> (ClaudeInner, mpsc::UnboundedReceiver<Value>) {
         make_test_inner_with_workspace("/tmp/test-workspace".to_string())
+    }
+
+    fn assert_complete_stream_lifecycle(events: &[Value]) {
+        let mut active_message_id = None;
+        for (index, event) in events.iter().enumerate() {
+            match event_kind(event) {
+                Some("StreamStart") => {
+                    let message_id = event
+                        .pointer("/data/message_id")
+                        .and_then(Value::as_str)
+                        .expect("StreamStart message_id");
+                    assert!(
+                        active_message_id.replace(message_id.to_owned()).is_none(),
+                        "event {index} started {message_id} before ending the active stream"
+                    );
+                }
+                Some("StreamDelta" | "StreamReasoningDelta") => {
+                    let message_id = event
+                        .pointer("/data/message_id")
+                        .and_then(Value::as_str)
+                        .expect("stream delta message_id");
+                    assert_eq!(
+                        active_message_id.as_deref(),
+                        Some(message_id),
+                        "event {index} targeted a stream other than the active stream"
+                    );
+                }
+                Some("StreamEnd") => {
+                    let message_id = event
+                        .pointer("/data/message/message_id")
+                        .and_then(Value::as_str)
+                        .expect("StreamEnd message_id");
+                    assert_eq!(
+                        active_message_id.take().as_deref(),
+                        Some(message_id),
+                        "event {index} ended a stream other than the active stream"
+                    );
+                }
+                Some("Error") => panic!("event {index} emitted an Error: {event}"),
+                Some("OperationCancelled") => {
+                    panic!("event {index} cancelled a valid stream lifecycle: {event}")
+                }
+                Some("ToolExecutionCompleted")
+                    if event
+                        .pointer("/data/tool_result/short_message")
+                        .and_then(Value::as_str)
+                        == Some("Tool result missing") =>
+                {
+                    panic!("event {index} discarded a valid tool lifecycle: {event}")
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            active_message_id.is_none(),
+            "stream lifecycle ended with an unterminated message {active_message_id:?}"
+        );
+    }
+
+    fn assert_claude_protocol_valid(events: &[Value]) {
+        let mut validator = ProtocolValidator::new();
+        let host_stream = StreamPath("/host/local".to_string());
+        let agent_stream = StreamPath("/agent/agent-1/instance-1".to_string());
+        let agent_id = AgentId("agent-1".to_string());
+        let new_agent = NewAgentPayload {
+            agent_id: agent_id.clone(),
+            name: "Test Agent".to_string(),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Claude,
+            launch_profile_id: None,
+            workspace_roots: vec!["/tmp".to_string()],
+            custom_agent_id: None,
+            team_id: None,
+            team_member_id: None,
+            project_id: None,
+            parent_agent_id: None,
+            session_id: None,
+            workflow: None,
+            created_at_ms: 0,
+            instance_stream: agent_stream.clone(),
+            activity_summary: Default::default(),
+        };
+        let welcome = Envelope::from_payload(
+            host_stream.clone(),
+            FrameKind::Welcome,
+            0,
+            &WelcomePayload {
+                protocol_version: PROTOCOL_VERSION,
+                tyde_version: Version {
+                    major: 0,
+                    minor: 0,
+                    patch: 0,
+                },
+                release_version: None,
+            },
+        )
+        .expect("serialize Welcome");
+        validator
+            .validate_envelope(&welcome)
+            .expect("Welcome validates");
+        let bootstrap = Envelope::from_payload(
+            host_stream,
+            FrameKind::HostBootstrap,
+            1,
+            &HostBootstrapPayload {
+                settings: HostSettings {
+                    enabled_backends: vec![BackendKind::Claude],
+                    default_backend: Some(BackendKind::Claude),
+                    enable_mobile_connections: false,
+                    mobile_broker_url: None,
+                    tyde_debug_mcp_enabled: false,
+                    tyde_agent_control_mcp_enabled: true,
+                    complexity_tiers_enabled: false,
+                    backend_tier_configs: std::collections::HashMap::new(),
+                    background_agent_features: Default::default(),
+                    supervisor: Default::default(),
+                    code_intel: Default::default(),
+                    backend_config: std::collections::HashMap::new(),
+                    launch_profiles: Vec::new(),
+                },
+                mobile_access: MobileAccessStatePayload {
+                    broker_status: MobileBrokerStatus::Disabled,
+                    pairing: MobilePairingState::Idle,
+                    paired_devices: vec![],
+                },
+                backend_setup: BackendSetupPayload { backends: vec![] },
+                session_schemas: vec![],
+                backend_config_schemas: vec![],
+                backend_config_snapshots: vec![],
+                launch_profile_catalog: Default::default(),
+                sessions: vec![],
+                session_list: Default::default(),
+                projects: vec![],
+                mcp_servers: vec![],
+                skills: vec![],
+                steering: vec![],
+                custom_agents: vec![],
+                team_preset_catalog: TeamPresetCatalog {
+                    role_presets: vec![],
+                    personality_traits: vec![],
+                    personality_presets: vec![],
+                    team_templates: vec![],
+                },
+                team_drafts: vec![],
+                teams: vec![],
+                team_members: vec![],
+                team_member_bindings: vec![],
+                agents: vec![new_agent.clone()],
+                task_token_usages: Vec::new(),
+                workflow_summaries: vec![],
+                workflow_diagnostics: vec![],
+                workflow_runs: vec![],
+                workflow_locations: vec![],
+                agents_view_preferences: None,
+            },
+        )
+        .expect("serialize HostBootstrap");
+        validator
+            .validate_envelope(&bootstrap)
+            .expect("HostBootstrap validates");
+        let agent_bootstrap = Envelope::from_payload(
+            agent_stream.clone(),
+            FrameKind::AgentBootstrap,
+            0,
+            &AgentBootstrapPayload {
+                events: vec![AgentBootstrapEvent::AgentStart(AgentStartPayload {
+                    agent_id,
+                    name: new_agent.name,
+                    origin: new_agent.origin,
+                    backend_kind: new_agent.backend_kind,
+                    launch_profile_id: None,
+                    workspace_roots: new_agent.workspace_roots,
+                    custom_agent_id: new_agent.custom_agent_id,
+                    team_id: new_agent.team_id,
+                    team_member_id: new_agent.team_member_id,
+                    project_id: new_agent.project_id,
+                    parent_agent_id: new_agent.parent_agent_id,
+                    session_id: None,
+                    workflow: None,
+                    created_at_ms: new_agent.created_at_ms,
+                })],
+                latest_output: Default::default(),
+                turn_active: false,
+            },
+        )
+        .expect("serialize AgentBootstrap");
+        validator
+            .validate_envelope(&agent_bootstrap)
+            .expect("AgentBootstrap validates");
+
+        for (index, event) in events.iter().enumerate() {
+            let chat_event: ChatEvent =
+                serde_json::from_value(event.clone()).expect("emitter produced ChatEvent JSON");
+            let envelope = Envelope::from_payload(
+                agent_stream.clone(),
+                FrameKind::ChatEvent,
+                index as u64 + 1,
+                &chat_event,
+            )
+            .expect("serialize ChatEvent");
+            validator
+                .validate_envelope(&envelope)
+                .unwrap_or_else(|error| panic!("event {index} violates protocol: {error}"));
+        }
     }
 
     fn test_parent_emitter() -> (Arc<TurnEmitter>, mpsc::UnboundedReceiver<Value>) {
@@ -19018,6 +19227,219 @@ for raw_line in sys.stdin:
     }
 
     #[tokio::test]
+    async fn retained_pending_tool_phase_closes_before_next_stream() {
+        let (inner, mut rx) = make_test_inner();
+        let mut summary = ClaudeStdoutSummary::default();
+        let mut segment = SegmentState::default();
+        let base_id = "claude-msg".to_string();
+        let mut current_id = base_id.clone();
+        inner.emit_stream_start(&base_id, Some("claude-test".to_string()));
+
+        consume_stream_event(
+            &json!({
+                "type": "message_start",
+                "message": {
+                    "id": "provider-message-1",
+                    "model": "claude-test"
+                }
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+        consume_stream_event(
+            &json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "toolu_incomplete",
+                    "name": "TaskCreate",
+                    "input": {}
+                }
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+        consume_stream_event(
+            &json!({"type": "content_block_stop", "index": 0}),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+        assert!(segment.pending_tool_uses.contains_key(&0));
+
+        consume_stream_event(
+            &json!({
+                "type": "message_start",
+                "message": {
+                    "id": "provider-message-2",
+                    "model": "claude-test"
+                }
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+        consume_stream_event(
+            &json!({
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "toolu_complete",
+                    "name": "TaskCreate",
+                    "input": {"subject": "Complete task"}
+                }
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+        consume_stream_event(
+            &json!({"type": "message_stop"}),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+        consume_user_tool_result(
+            &json!({
+                "message": {
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_complete",
+                        "content": "Task created"
+                    }]
+                }
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            false,
+        );
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event_kind(event) == Some("ToolRequest")
+                        && event.pointer("/data/tool_call_id").and_then(Value::as_str)
+                            == Some("toolu_complete")
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event_kind(event) == Some("ToolExecutionCompleted")
+                        && event.pointer("/data/tool_call_id").and_then(Value::as_str)
+                            == Some("toolu_complete")
+                        && event.pointer("/data/success").and_then(Value::as_bool) == Some(true)
+                })
+                .count(),
+            1
+        );
+        assert_complete_stream_lifecycle(&events);
+        assert_claude_protocol_valid(&events);
+    }
+
+    #[tokio::test]
+    async fn whitespace_phase_closes_before_next_stream() {
+        let (inner, mut rx) = make_test_inner();
+        let mut summary = ClaudeStdoutSummary::default();
+        let mut segment = SegmentState::default();
+        let base_id = "claude-msg".to_string();
+        let mut current_id = base_id.clone();
+        inner.emit_stream_start(&base_id, Some("claude-test".to_string()));
+
+        consume_stream_event(
+            &json!({
+                "type": "message_start",
+                "message": {
+                    "id": "provider-message-1",
+                    "model": "claude-test"
+                }
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+        consume_stream_event(
+            &json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "text",
+                    "text": " \n "
+                }
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+        consume_stream_event(
+            &json!({
+                "type": "message_start",
+                "message": {
+                    "id": "provider-message-2",
+                    "model": "claude-test"
+                }
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+        consume_stream_event(
+            &json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "text",
+                    "text": "Complete response"
+                }
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+        close_current_phase(&mut summary, &mut segment, &inner);
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert_complete_stream_lifecycle(&events);
+        assert_claude_protocol_valid(&events);
+    }
+
+    #[tokio::test]
     async fn content_block_opens_phase_when_message_start_is_omitted() {
         let (inner, mut rx) = make_test_inner();
         let mut summary = ClaudeStdoutSummary {
@@ -22973,8 +23395,23 @@ for raw_line in sys.stdin:
                 .count(),
             3
         );
+        assert!(
+            events
+                .iter()
+                .all(|event| event_kind(event) != Some("Error")),
+            "repeated tool lifecycle emitted an Error: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event_kind(event) != Some("OperationCancelled")),
+            "repeated tool lifecycle was cancelled: {events:?}"
+        );
         assert!(events.iter().all(|event| {
-            event.pointer("/data/error").and_then(Value::as_str) != Some("Tool result missing")
+            event
+                .pointer("/data/tool_result/short_message")
+                .and_then(Value::as_str)
+                != Some("Tool result missing")
         }));
         let final_tasks = events
             .iter()
