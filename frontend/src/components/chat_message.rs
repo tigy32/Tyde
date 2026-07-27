@@ -665,6 +665,21 @@ mod wasm_tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
+    const PROD_STYLES: &str = include_str!("../../styles.css");
+
+    fn ensure_styles_loaded() {
+        let document = web_sys::window().unwrap().document().unwrap();
+        if document
+            .get_element_by_id("test-prod-styles-chat")
+            .is_none()
+        {
+            let style = document.create_element("style").unwrap();
+            style.set_id("test-prod-styles-chat");
+            style.set_text_content(Some(PROD_STYLES));
+            document.head().unwrap().append_child(&style).unwrap();
+        }
+    }
+
     fn tool_call(id: &str, offset: Option<u32>) -> protocol::ToolUseData {
         protocol::ToolUseData {
             id: id.to_owned(),
@@ -1079,6 +1094,24 @@ mod wasm_tests {
         }
     }
 
+    fn user_msg(text: &str) -> ChatMessageEntry {
+        ChatMessageEntry {
+            message: ChatMessage {
+                message_id: None,
+                timestamp: 0,
+                sender: MessageSender::User,
+                content: text.to_owned(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            },
+            tool_requests: Vec::new(),
+        }
+    }
+
     fn mount_message(entry: ChatMessageEntry) -> HtmlElement {
         let container = make_container();
         // Leak the mount handle so the component stays mounted after this
@@ -1093,6 +1126,87 @@ mod wasm_tests {
         })
         .forget();
         container
+    }
+
+    #[wasm_bindgen_test]
+    async fn user_bubbles_fit_short_text_and_wrap_long_text() {
+        ensure_styles_loaded();
+
+        let short_container = mount_message(user_msg("Why?"));
+        next_tick().await;
+        let short_card: HtmlElement = short_container
+            .query_selector(".chat-card-user")
+            .unwrap()
+            .expect("user card")
+            .dyn_into()
+            .unwrap();
+        let short_body: HtmlElement = short_container
+            .query_selector(".chat-card-body")
+            .unwrap()
+            .expect("user bubble")
+            .dyn_into()
+            .unwrap();
+        let short_style = web_sys::window()
+            .unwrap()
+            .get_computed_style(&short_body)
+            .unwrap()
+            .expect("computed bubble style");
+        let pixels = |property: &str| {
+            short_style
+                .get_property_value(property)
+                .unwrap()
+                .trim_end_matches("px")
+                .parse::<f64>()
+                .unwrap()
+        };
+        let one_line_height =
+            pixels("line-height") + pixels("padding-top") + pixels("padding-bottom");
+        let short_rect = short_body.get_bounding_client_rect();
+        let short_card_rect = short_card.get_bounding_client_rect();
+        assert!(
+            short_rect.height() <= one_line_height + 1.0,
+            "\"Why?\" must stay on one line at desktop width; bubble is {}px high \
+             for a {}px single-line box (bubble width {}px, card width {}px)",
+            short_rect.height(),
+            one_line_height,
+            short_rect.width(),
+            short_card_rect.width(),
+        );
+        assert!(
+            short_rect.width() < short_card_rect.width() / 2.0,
+            "a short user bubble must fit its content, not fill the row"
+        );
+
+        let long_container = mount_message(user_msg(
+            "This deliberately long user message must wrap onto multiple lines \
+             while remaining inside the normal user bubble width limit at desktop size.",
+        ));
+        next_tick().await;
+        let long_card: HtmlElement = long_container
+            .query_selector(".chat-card-user")
+            .unwrap()
+            .expect("long user card")
+            .dyn_into()
+            .unwrap();
+        let long_body: HtmlElement = long_container
+            .query_selector(".chat-card-body")
+            .unwrap()
+            .expect("long user bubble")
+            .dyn_into()
+            .unwrap();
+        let long_rect = long_body.get_bounding_client_rect();
+        let long_card_rect = long_card.get_bounding_client_rect();
+        assert!(
+            long_rect.height() > one_line_height + 1.0,
+            "long user text must wrap; bubble height was {}px",
+            long_rect.height(),
+        );
+        assert!(
+            long_rect.width() <= long_card_rect.width() * 0.85 + 1.0,
+            "long user bubble must respect the 85% width limit; bubble {}px, card {}px",
+            long_rect.width(),
+            long_card_rect.width(),
+        );
     }
 
     #[wasm_bindgen_test]
