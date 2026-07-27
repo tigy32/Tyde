@@ -605,6 +605,10 @@ struct AgentActivityStatsTracker {
     stats: AgentActivityStats,
     seen_tool_calls: HashSet<String>,
     token_usage_by_source: HashMap<TokenUsageSource, TaskTokenUsageScope>,
+    authoritative_token_usage_baseline: TokenUsage,
+    authoritative_token_usage_by_source: HashMap<TokenUsageSource, TokenUsage>,
+    authoritative_turn_sources: HashSet<TokenUsageSource>,
+    provisional_request_usage_by_source: HashMap<TokenUsageSource, TokenUsage>,
     active_reasoning: String,
     latest_model: Option<String>,
     token_usage_tracking_mode: TokenUsageTrackingMode,
@@ -749,8 +753,10 @@ impl AgentActivityStatsTracker {
                     self.stats.source_through_seq = Some(source_seq);
                 }
             }
-            ChatEvent::TypingStatusChanged(_)
-            | ChatEvent::ToolProgress(_)
+            ChatEvent::TypingStatusChanged(_) => {
+                self.commit_provisional_request_usage();
+            }
+            ChatEvent::ToolProgress(_)
             | ChatEvent::ToolExecutionCompleted(_)
             | ChatEvent::TaskUpdate(_)
             | ChatEvent::OperationCancelled(_)
@@ -863,28 +869,66 @@ impl AgentActivityStatsTracker {
             return token_usage;
         }
         let Some(turn_usage) = token_usage.turn.known_usage().cloned() else {
-            let reason = match token_usage.turn {
-                TokenUsageScope::Known { .. } => TaskTokenUsageUnavailableReason::AgentUnavailable,
-                TokenUsageScope::Unavailable { reason } => {
-                    task_token_usage_reason_from_message_reason(reason)
+            if let Some(request_usage) = token_usage.request.known_usage().cloned() {
+                if !self.authoritative_turn_sources.contains(&source) {
+                    if self
+                        .authoritative_token_usage_by_source
+                        .contains_key(&source)
+                    {
+                        self.authoritative_token_usage_by_source
+                            .insert(source.clone(), request_usage.clone());
+                    } else {
+                        self.provisional_request_usage_by_source
+                            .insert(source.clone(), request_usage.clone());
+                    }
                 }
-            };
-            self.token_usage_by_source
-                .insert(source, TaskTokenUsageScope::Unavailable { reason });
+                self.token_usage_by_source.insert(
+                    source,
+                    TaskTokenUsageScope::Known {
+                        usage: Box::new(TaskTokenUsageAmount::from_token_usage(&request_usage)),
+                    },
+                );
+                self.refresh_token_usage();
+                self.stats.source_through_seq = Some(source_seq);
+            } else {
+                let reason = match token_usage.turn {
+                    TokenUsageScope::Known { .. } => {
+                        TaskTokenUsageUnavailableReason::AgentUnavailable
+                    }
+                    TokenUsageScope::Unavailable { reason } => {
+                        task_token_usage_reason_from_message_reason(reason)
+                    }
+                };
+                self.token_usage_by_source
+                    .insert(source, TaskTokenUsageScope::Unavailable { reason });
+            }
             return token_usage;
         };
 
+        let existing_authoritative_turn = self.authoritative_turn_sources.contains(&source);
+        if !existing_authoritative_turn {
+            self.clear_provisional_request_usage();
+        }
         self.token_usage_by_source.insert(
-            source,
+            source.clone(),
             TaskTokenUsageScope::Known {
                 usage: Box::new(TaskTokenUsageAmount::from_token_usage(&turn_usage)),
             },
         );
         if let Some(cumulative) = token_usage.cumulative.known_usage().cloned() {
-            self.stats.token_usage = cumulative;
+            self.authoritative_token_usage_baseline = cumulative;
+            self.authoritative_token_usage_by_source.clear();
             self.token_usage_by_source
                 .retain(|_, usage| matches!(usage, TaskTokenUsageScope::Known { .. }));
         } else {
+            if !existing_authoritative_turn
+                || self
+                    .authoritative_token_usage_by_source
+                    .contains_key(&source)
+            {
+                self.authoritative_token_usage_by_source
+                    .insert(source.clone(), turn_usage);
+            }
             self.refresh_token_usage();
             if !matches!(
                 token_usage.cumulative,
@@ -902,17 +946,49 @@ impl AgentActivityStatsTracker {
                 };
             }
         }
+        self.authoritative_turn_sources.insert(source);
+        self.refresh_token_usage();
         self.stats.source_through_seq = Some(source_seq);
         token_usage
     }
 
+    fn commit_provisional_request_usage(&mut self) {
+        for (source, usage) in self.provisional_request_usage_by_source.drain() {
+            self.authoritative_token_usage_by_source
+                .insert(source, usage);
+        }
+        self.refresh_token_usage();
+    }
+
+    fn clear_provisional_request_usage(&mut self) {
+        for (source, _) in self.provisional_request_usage_by_source.drain() {
+            self.token_usage_by_source.remove(&source);
+        }
+    }
+
     fn refresh_token_usage(&mut self) {
-        self.stats.token_usage = total_task_token_usage(
-            self.token_usage_by_source
-                .values()
-                .filter_map(|usage| usage.reported_usage()),
+        self.stats.token_usage = total_token_usage(
+            std::iter::once(&self.authoritative_token_usage_baseline)
+                .chain(self.authoritative_token_usage_by_source.values())
+                .chain(self.provisional_request_usage_by_source.values()),
         );
     }
+}
+
+fn total_token_usage<'a>(entries: impl Iterator<Item = &'a TokenUsage>) -> TokenUsage {
+    let mut total = TokenUsage::default();
+    for usage in entries {
+        total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
+        total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
+        total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
+        add_optional_tokens(&mut total.cached_prompt_tokens, usage.cached_prompt_tokens);
+        add_optional_tokens(
+            &mut total.cache_creation_input_tokens,
+            usage.cache_creation_input_tokens,
+        );
+        add_optional_tokens(&mut total.reasoning_tokens, usage.reasoning_tokens);
+    }
+    total
 }
 
 fn extend_task_token_usage_reasons(
@@ -1003,28 +1079,6 @@ fn last_non_empty_logical_line(text: &str) -> Option<String> {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .map(str::to_owned)
-}
-
-fn total_task_token_usage<'a>(
-    entries: impl Iterator<Item = &'a TaskTokenUsageAmount>,
-) -> TokenUsage {
-    let mut total = TokenUsage::default();
-    for usage in entries {
-        total.input_tokens = total
-            .input_tokens
-            .saturating_add(usage.input_tokens.unwrap_or(0));
-        total.output_tokens = total
-            .output_tokens
-            .saturating_add(usage.output_tokens.unwrap_or(0));
-        total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
-        add_optional_tokens(&mut total.cached_prompt_tokens, usage.cached_prompt_tokens);
-        add_optional_tokens(
-            &mut total.cache_creation_input_tokens,
-            usage.cache_creation_input_tokens,
-        );
-        add_optional_tokens(&mut total.reasoning_tokens, usage.reasoning_tokens);
-    }
-    total
 }
 
 fn known_turn_usage(token_usage: &Option<MessageTokenUsage>) -> Option<&TokenUsage> {
@@ -10572,7 +10626,7 @@ mod tests {
 
     #[test]
     fn activity_stats_preserves_request_only_usage_without_inventing_turn() {
-        let mut stats = AgentActivityStatsTracker::default();
+        let mut stats = AgentActivityStatsTracker::for_backend(BackendKind::Claude);
         let mut message = assistant_message("intermediate");
         message.message_id = Some(ChatMessageId("message-1".to_owned()));
         message.token_usage = Some(MessageTokenUsage::request_known(token_usage(7)));
@@ -10589,7 +10643,180 @@ mod tests {
         );
         assert!(usage.turn.known_usage().is_none());
         assert!(usage.cumulative.known_usage().is_none());
-        assert_eq!(stats.snapshot().token_usage, TokenUsage::default());
+        assert_eq!(stats.snapshot().token_usage, token_usage(7));
+
+        let (usage, _) = stats.usage_snapshot();
+        assert!(matches!(
+            usage,
+            TaskTokenUsageScope::Known { ref usage } if usage.total_tokens == 7
+        ));
+    }
+
+    #[test]
+    fn claude_activity_stats_replace_provisional_requests_with_terminal_usage() {
+        let mut stats = AgentActivityStatsTracker::for_backend(BackendKind::Claude);
+
+        for (message_id, total, seq) in [("request-1", 7, 1), ("request-2", 8, 2)] {
+            let mut message = assistant_message("intermediate");
+            message.message_id = Some(ChatMessageId(message_id.to_owned()));
+            message.token_usage = Some(MessageTokenUsage::request_known(token_usage(total)));
+            assert!(observe_stats(
+                &mut stats,
+                ChatEvent::MessageAdded(message),
+                seq,
+                ""
+            ));
+        }
+        assert_eq!(stats.snapshot().token_usage.total_tokens, 15);
+
+        let mut replacement = assistant_message("corrected request");
+        replacement.message_id = Some(ChatMessageId("request-1".to_owned()));
+        replacement.token_usage = Some(MessageTokenUsage::request_known(token_usage(9)));
+        assert!(observe_stats(
+            &mut stats,
+            ChatEvent::MessageAdded(replacement),
+            3,
+            ""
+        ));
+        assert_eq!(
+            stats.snapshot().token_usage.total_tokens,
+            17,
+            "a duplicate source replaces its provisional request usage"
+        );
+
+        let mut terminal = assistant_message("done");
+        terminal.message_id = Some(ChatMessageId("terminal".to_owned()));
+        terminal.token_usage = Some(MessageTokenUsage::request_and_turn_known(
+            token_usage(4),
+            token_usage(20),
+        ));
+        assert!(observe_stats(
+            &mut stats,
+            ChatEvent::MessageAdded(terminal),
+            4,
+            ""
+        ));
+        assert_eq!(
+            stats.snapshot().token_usage.total_tokens,
+            20,
+            "the terminal turn replaces every overlapping provisional request"
+        );
+
+        let cumulative = MessageTokenUsage::request_and_turn_known(token_usage(4), token_usage(20))
+            .with_cumulative(token_usage(120));
+        let mut metadata = ChatEvent::MessageMetadataUpdated(MessageMetadataUpdateData {
+            message_id: ChatMessageId("terminal".to_owned()),
+            model_info: None,
+            token_usage: Some(cumulative),
+            context_breakdown: None,
+        });
+        assert!(stats.observe_chat_event(&mut metadata, 5, ""));
+        assert_eq!(
+            stats.snapshot().token_usage.total_tokens,
+            120,
+            "authoritative cumulative usage replaces the terminal turn"
+        );
+    }
+
+    #[test]
+    fn claude_activity_stats_carry_unreconciled_requests_across_turn_reset_once() {
+        let mut stats = AgentActivityStatsTracker::for_backend(BackendKind::Claude);
+        let mut first = assistant_message("first request");
+        first.message_id = Some(ChatMessageId("turn-1-request".to_owned()));
+        first.token_usage = Some(MessageTokenUsage::request_known(token_usage(7)));
+
+        observe_stats(&mut stats, ChatEvent::TypingStatusChanged(true), 0, "");
+        assert!(observe_stats(
+            &mut stats,
+            ChatEvent::MessageAdded(first),
+            1,
+            ""
+        ));
+        assert_eq!(stats.snapshot().token_usage.total_tokens, 7);
+        observe_stats(&mut stats, ChatEvent::TypingStatusChanged(false), 2, "");
+        observe_stats(&mut stats, ChatEvent::TypingStatusChanged(true), 3, "");
+
+        let mut second = assistant_message("second request");
+        second.message_id = Some(ChatMessageId("turn-2-request".to_owned()));
+        second.token_usage = Some(MessageTokenUsage::request_known(token_usage(5)));
+        assert!(observe_stats(
+            &mut stats,
+            ChatEvent::MessageAdded(second),
+            4,
+            ""
+        ));
+        assert_eq!(
+            stats.snapshot().token_usage.total_tokens,
+            12,
+            "a new turn carries the prior unreconciled request exactly once"
+        );
+
+        let mut terminal = assistant_message("second turn done");
+        terminal.message_id = Some(ChatMessageId("turn-2-terminal".to_owned()));
+        terminal.token_usage = Some(
+            MessageTokenUsage::request_and_turn_known(token_usage(2), token_usage(6))
+                .with_cumulative(token_usage(13)),
+        );
+        assert!(observe_stats(
+            &mut stats,
+            ChatEvent::MessageAdded(terminal),
+            5,
+            ""
+        ));
+        assert_eq!(stats.snapshot().token_usage.total_tokens, 13);
+    }
+
+    #[test]
+    fn claude_terminal_turn_replaces_provisional_usage_but_keeps_real_partial_scope() {
+        let mut stats = AgentActivityStatsTracker::for_backend(BackendKind::Claude);
+        let mut missing = assistant_message("prior missing usage");
+        missing.message_id = Some(ChatMessageId("prior-missing".to_owned()));
+        observe_stats(&mut stats, ChatEvent::MessageAdded(missing), 0, "");
+        observe_stats(&mut stats, ChatEvent::TypingStatusChanged(false), 1, "");
+        observe_stats(&mut stats, ChatEvent::TypingStatusChanged(true), 2, "");
+
+        for (message_id, total, seq) in [("live-1", 7, 3), ("live-2", 8, 4)] {
+            let mut message = assistant_message("live request");
+            message.message_id = Some(ChatMessageId(message_id.to_owned()));
+            message.token_usage = Some(MessageTokenUsage::request_known(token_usage(total)));
+            observe_stats(&mut stats, ChatEvent::MessageAdded(message), seq, "");
+        }
+        assert_eq!(stats.snapshot().token_usage.total_tokens, 15);
+
+        let mut terminal_usage =
+            MessageTokenUsage::request_and_turn_known(token_usage(3), token_usage(20));
+        terminal_usage.cumulative = TokenUsageScope::Unavailable {
+            reason: TokenUsageUnavailableReason::ProviderScopeAmbiguous,
+        };
+        let mut terminal = assistant_message("done");
+        terminal.message_id = Some(ChatMessageId("live-terminal".to_owned()));
+        terminal.token_usage = Some(terminal_usage);
+        let mut event = ChatEvent::MessageAdded(terminal);
+        assert!(stats.observe_chat_event(&mut event, 5, ""));
+
+        let ChatEvent::MessageAdded(message) = event else {
+            panic!("expected MessageAdded")
+        };
+        assert!(matches!(
+            message.token_usage.expect("terminal usage").cumulative,
+            TokenUsageScope::Unavailable {
+                reason: TokenUsageUnavailableReason::ProviderScopeAmbiguous
+            }
+        ));
+        assert_eq!(
+            stats.snapshot().token_usage.total_tokens,
+            20,
+            "the terminal turn replaces request phases even without a cumulative total"
+        );
+        assert!(matches!(
+            stats.usage_snapshot().0,
+            TaskTokenUsageScope::Partial {
+                ref usage,
+                unavailable_count: 1,
+                ref reasons,
+            } if usage.total_tokens == 20
+                && reasons == &vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
+        ));
     }
 
     #[test]
@@ -10947,7 +11174,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_activity_stats_accumulate_subagent_turn_usage() {
+    async fn relay_activity_stats_replace_native_total_only_usage() {
         let dir = tempfile::tempdir().expect("tempdir");
         let session_store_path = dir.path().join("sessions.json");
         let session_store = Arc::new(Mutex::new(
@@ -11001,10 +11228,10 @@ mod tests {
             })
             .expect("relay model usage channel should be open");
         total_usage_tx
-            .send(31)
+            .send(47)
             .expect("relay total-only usage channel should be open");
 
-        let stats = timeout(Duration::from_secs(1), async {
+        let first_stats = timeout(Duration::from_secs(1), async {
             loop {
                 let event = output_rx
                     .recv()
@@ -11013,7 +11240,7 @@ mod tests {
                 if event.kind == FrameKind::AgentActivityStats
                     && let Ok(payload) = event.parse_payload::<AgentActivityStatsPayload>()
                     && payload.stats.token_usage.total_tokens == 17
-                    && payload.stats.token_usage_total_only == Some(31)
+                    && payload.stats.token_usage_total_only == Some(47)
                     && payload.stats.last_output_line.as_deref() == Some("second")
                 {
                     return payload.stats;
@@ -11022,11 +11249,36 @@ mod tests {
         })
         .await
         .expect("relay token stats should be emitted");
+        assert_eq!(first_stats.token_usage_total_only, Some(47));
+
+        total_usage_tx
+            .send(53)
+            .expect("relay total-only usage channel should stay open");
+        let stats = timeout(Duration::from_secs(1), async {
+            loop {
+                let event = output_rx
+                    .recv()
+                    .await
+                    .expect("relay output stream should stay open");
+                if event.kind == FrameKind::AgentActivityStats
+                    && let Ok(payload) = event.parse_payload::<AgentActivityStatsPayload>()
+                    && payload.stats.token_usage_total_only == Some(53)
+                {
+                    return payload.stats;
+                }
+            }
+        })
+        .await
+        .expect("replacement relay token stats should be emitted");
 
         assert_eq!(stats.token_usage.total_tokens, 17);
         assert_eq!(stats.token_usage.input_tokens, 8);
         assert_eq!(stats.token_usage.output_tokens, 9);
-        assert_eq!(stats.token_usage_total_only, Some(31));
+        assert_eq!(
+            stats.token_usage_total_only,
+            Some(53),
+            "native total-only frames are cumulative replacements, not deltas"
+        );
         assert_eq!(stats.last_output_line.as_deref(), Some("second"));
         drop(event_tx);
         drop(model_usage_tx);

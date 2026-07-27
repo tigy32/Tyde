@@ -23085,6 +23085,112 @@ Rules: Record only what remains true and useful for future work; drop transient 
         ));
     }
 
+    #[test]
+    fn task_token_usage_rollup_mixes_registered_and_native_children_once() {
+        let root_id = AgentId("mixed-root".to_owned());
+        let native_id = AgentId("mixed-native".to_owned());
+        let registered_id = AgentId("mixed-registered".to_owned());
+        let mut root_start = task_usage_start(root_id.clone(), None, 1);
+        root_start.origin = AgentOrigin::User;
+        let mut native_start = task_usage_start(native_id.clone(), Some(root_id.clone()), 2);
+        native_start.origin = AgentOrigin::BackendNative;
+        let mut registered_start =
+            task_usage_start(registered_id.clone(), Some(root_id.clone()), 3);
+        registered_start.origin = AgentOrigin::AgentControl;
+        let snapshots = vec![
+            AgentUsageSnapshot {
+                start: root_start,
+                usage: TaskTokenUsageScope::Known {
+                    usage: Box::new(task_usage_amount(70, 30)),
+                },
+                model: Some("claude-root".to_owned()),
+            },
+            AgentUsageSnapshot {
+                start: native_start,
+                usage: TaskTokenUsageScope::Known {
+                    usage: Box::new(TaskTokenUsageAmount::total_only(47)),
+                },
+                model: Some("claude-native".to_owned()),
+            },
+            AgentUsageSnapshot {
+                start: registered_start,
+                usage: TaskTokenUsageScope::Known {
+                    usage: Box::new(task_usage_amount(20, 10)),
+                },
+                model: Some("claude-managed".to_owned()),
+            },
+        ];
+        let live_agent_ids = HashSet::from([root_id.clone()]);
+        let agent_sessions = HashMap::new();
+
+        let payloads = task_token_usage_rollups_from_snapshots(
+            snapshots.clone(),
+            &live_agent_ids,
+            &agent_sessions,
+        );
+
+        assert_eq!(payloads.len(), 1);
+        let payload = &payloads[0];
+        assert_eq!(payload.total.usage.total_tokens, 177);
+        assert_eq!(payload.descendant_usage.usage.total_tokens, 77);
+        assert_eq!(payload.descendant_count, 2);
+        assert_eq!(payload.total.status, TaskTokenUsageStatus::Known);
+        assert_eq!(
+            payload.descendant_usage.status,
+            TaskTokenUsageStatus::Known,
+            "a truthful total-only native child does not make the rollup partial"
+        );
+        assert_eq!(
+            payload
+                .breakdown
+                .iter()
+                .filter(|entry| entry.agent_id == native_id)
+                .count(),
+            1
+        );
+        assert_eq!(
+            payload
+                .breakdown
+                .iter()
+                .filter(|entry| entry.agent_id == registered_id)
+                .count(),
+            1
+        );
+
+        let unavailable_id = AgentId("mixed-unavailable".to_owned());
+        let mut unavailable_start = task_usage_start(unavailable_id, Some(root_id.clone()), 4);
+        unavailable_start.origin = AgentOrigin::AgentControl;
+        let mut incomplete = snapshots;
+        incomplete.push(AgentUsageSnapshot {
+            start: unavailable_start,
+            usage: TaskTokenUsageScope::Unavailable {
+                reason: TaskTokenUsageUnavailableReason::BackendDidNotReport,
+            },
+            model: None,
+        });
+
+        let payloads =
+            task_token_usage_rollups_from_snapshots(incomplete, &live_agent_ids, &agent_sessions);
+        let payload = &payloads[0];
+        assert_eq!(payload.total.usage.total_tokens, 177);
+        assert_eq!(payload.descendant_usage.usage.total_tokens, 77);
+        assert_eq!(payload.descendant_count, 3);
+        assert!(matches!(
+            payload.total.status,
+            TaskTokenUsageStatus::Partial {
+                unavailable_count: 1,
+                ref reasons,
+            } if reasons == &vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
+        ));
+        assert!(matches!(
+            payload.descendant_usage.status,
+            TaskTokenUsageStatus::Partial {
+                unavailable_count: 1,
+                ref reasons,
+            } if reasons == &vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
+        ));
+    }
+
     async fn spawn_idle_user_agent(host: &HostHandle, prompt: &str) -> (AgentId, SessionId) {
         let agent_id = host
             .spawn_agent(SpawnAgentPayload {

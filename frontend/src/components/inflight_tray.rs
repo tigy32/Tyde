@@ -41,7 +41,7 @@ use protocol::{
 };
 
 use crate::components::agents_panel::{DerivedAgentState, derive_agent_state};
-use crate::components::chat_message::token_badge_data;
+use crate::components::chat_message::{format_compact, token_badge_data};
 use crate::components::tool_card::{agent_display_name, open_child_agent};
 use crate::components::workflow_view::run_status_label;
 use crate::send::send_frame;
@@ -896,32 +896,67 @@ fn token_usage_has_content(tokens: &protocol::TokenUsage) -> bool {
         || tokens.reasoning_tokens.unwrap_or(0) > 0
 }
 
+enum AgentTokenUsageDisplay<'a> {
+    Split(&'a protocol::TokenUsage),
+    TotalOnly(u64),
+}
+
+fn agent_token_usage_display(stats: &AgentActivityStats) -> Option<AgentTokenUsageDisplay<'_>> {
+    if let Some(total) = stats
+        .token_usage_total_only
+        .filter(|total| *total > 0 && *total >= stats.token_usage.total_tokens)
+    {
+        Some(AgentTokenUsageDisplay::TotalOnly(total))
+    } else if token_usage_has_content(&stats.token_usage) {
+        Some(AgentTokenUsageDisplay::Split(&stats.token_usage))
+    } else {
+        None
+    }
+}
+
 fn stats_has_content(stats: &AgentActivityStats) -> bool {
-    stats.tool_calls > 0 || token_usage_has_content(&stats.token_usage)
+    stats.tool_calls > 0 || agent_token_usage_display(stats).is_some()
 }
 
 /// Render an agent row's server-owned stats line: the running tool-call count
-/// and token usage, formatted with the shared token badge helper so it reads
-/// identically to the chat token UI (`↑input (cached) · ↓output (reasoning)`).
+/// and either split token usage or the provider's authoritative total-only
+/// cumulative.
 ///
-/// The token spans (and their reasoning/cache tooltip) are only rendered when
-/// the agent has actually reported non-zero usage — a tool-call-only agent
-/// shows just its tool-call count, never a fake `↑0 · ↓0` badge.
+/// A tool-call-only agent shows just its tool-call count, never a fake
+/// `↑0 · ↓0` badge.
 fn agent_control_stats_line(stats: AgentActivityStats) -> AnyView {
     let tool_label = if stats.tool_calls == 1 {
         "1 tool call".to_owned()
     } else {
         format!("{} tool calls", stats.tool_calls)
     };
-    let token_spans = token_usage_has_content(&stats.token_usage).then(|| {
-        let (input_text, output_text, tooltip) = token_badge_data(&stats.token_usage);
-        view! {
-            <span class="token-sep">"\u{00b7}"</span>
-            <span class="token-stat token-stat-input" title=tooltip>{input_text}</span>
-            <span class="token-sep">"\u{00b7}"</span>
-            <span class="token-stat token-stat-output">{output_text}</span>
+    let token_spans = match agent_token_usage_display(&stats) {
+        Some(AgentTokenUsageDisplay::Split(tokens)) => {
+            let (input_text, output_text, tooltip) = token_badge_data(tokens);
+            Some(
+                view! {
+                    <span class="token-sep">"\u{00b7}"</span>
+                    <span class="token-stat token-stat-input" title=tooltip>{input_text}</span>
+                    <span class="token-sep">"\u{00b7}"</span>
+                    <span class="token-stat token-stat-output">{output_text}</span>
+                }
+                .into_any(),
+            )
         }
-    });
+        Some(AgentTokenUsageDisplay::TotalOnly(total)) => Some(
+            view! {
+                <span class="token-sep">"\u{00b7}"</span>
+                <span
+                    class="token-stat token-stat-total"
+                    title="Provider-reported cumulative total; input/output split unavailable"
+                >
+                    {format!("\u{03a3}{}", format_compact(total))}
+                </span>
+            }
+            .into_any(),
+        ),
+        None => None,
+    };
     view! {
         <div class="tool-live-agent-stats">
             <span class="tool-live-agent-stats-tools">{tool_label}</span>
@@ -1050,8 +1085,8 @@ mod wasm_tests {
     use crate::state::{AgentInfo, ToolCallId};
     use leptos::mount::mount_to;
     use protocol::{
-        AgentControlProgressKind, AgentId, AgentOrigin, BackendKind, QueuedMessageEntry,
-        StreamPath, ToolProgressData,
+        AgentActivityStatsPayload, AgentControlProgressKind, AgentId, AgentOrigin, BackendKind,
+        Envelope, QueuedMessageEntry, StreamPath, ToolProgressData,
     };
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
@@ -1551,6 +1586,17 @@ mod wasm_tests {
         }
     }
 
+    fn activity_stats_with_total_only(
+        tool_calls: u64,
+        token_usage: protocol::TokenUsage,
+        total_only: u64,
+    ) -> protocol::AgentActivityStats {
+        protocol::AgentActivityStats {
+            token_usage_total_only: Some(total_only),
+            ..activity_stats(None, tool_calls, token_usage)
+        }
+    }
+
     fn token_usage(input: u64, cached: u64, output: u64, reasoning: u64) -> protocol::TokenUsage {
         protocol::TokenUsage {
             input_tokens: input,
@@ -1582,6 +1628,25 @@ mod wasm_tests {
     fn seed_stats(state: &AppState, agent_id: &str, stats: protocol::AgentActivityStats) {
         // Child agents in these fixtures live on the parent chat's host.
         seed_stats_on_host(state, "host-1", agent_id, stats);
+    }
+
+    fn dispatch_stats(
+        state: &AppState,
+        agent_id: &str,
+        seq: u64,
+        stats: protocol::AgentActivityStats,
+    ) {
+        let envelope = Envelope::from_payload(
+            StreamPath(format!("/agent/{agent_id}/activity-regression")),
+            FrameKind::AgentActivityStats,
+            seq,
+            &AgentActivityStatsPayload {
+                agent_id: AgentId(agent_id.to_owned()),
+                stats,
+            },
+        )
+        .expect("serialize activity stats envelope");
+        crate::dispatch::dispatch_envelope(state, "host-1", envelope);
     }
 
     fn stats_line_text(container: &HtmlElement) -> String {
@@ -2120,6 +2185,99 @@ mod wasm_tests {
         assert!(
             !stats_line.contains('\u{2191}') && !stats_line.contains('\u{2193}'),
             "total-only usage must render no token arrows: {stats_line}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn stats_envelope_renders_total_only_replacement_and_split_precedence() {
+        let (container, state) = mount_tray(|state| {
+            let mut info = child_agent("agent-total-only", "Claude Worker");
+            info.backend_kind = BackendKind::Claude;
+            info.activity_summary = AgentActivitySummaryState::Disabled;
+            state.agents.update(|agents| agents.push(info));
+            set_turn_active(state, "agent-total-only");
+        });
+        next_tick().await;
+        expand(&container).await;
+
+        dispatch_stats(
+            &state,
+            "agent-total-only",
+            0,
+            activity_stats_with_total_only(3, token_usage(0, 0, 0, 0), 47),
+        );
+        next_tick().await;
+        let stats_line = stats_line_text(&container);
+        assert!(
+            stats_line.contains("\u{03a3}47"),
+            "the dispatched total-only cumulative renders with the compact total convention: {stats_line}"
+        );
+        assert!(
+            !stats_line.contains('\u{2191}') && !stats_line.contains('\u{2193}'),
+            "a total-only value never invents split arrows: {stats_line}"
+        );
+
+        dispatch_stats(
+            &state,
+            "agent-total-only",
+            1,
+            activity_stats_with_total_only(3, token_usage(0, 0, 0, 0), 53),
+        );
+        next_tick().await;
+        let stats_line = stats_line_text(&container);
+        assert!(
+            stats_line.contains("\u{03a3}53") && !stats_line.contains("\u{03a3}47"),
+            "a later cumulative frame replaces rather than adds to the first: {stats_line}"
+        );
+        assert!(
+            !stats_line.contains('\u{2191}') && !stats_line.contains('\u{2193}'),
+            "replacement remains total-only: {stats_line}"
+        );
+
+        let split = token_usage(30, 0, 17, 0);
+        dispatch_stats(
+            &state,
+            "agent-total-only",
+            2,
+            activity_stats_with_total_only(3, split.clone(), 46),
+        );
+        next_tick().await;
+        let stats_line = stats_line_text(&container);
+        assert!(
+            stats_line.contains('\u{2191}')
+                && stats_line.contains('\u{2193}')
+                && !stats_line.contains('\u{03a3}'),
+            "split usage wins when its total is larger: {stats_line}"
+        );
+
+        dispatch_stats(
+            &state,
+            "agent-total-only",
+            3,
+            activity_stats_with_total_only(3, split.clone(), 47),
+        );
+        next_tick().await;
+        let stats_line = stats_line_text(&container);
+        assert!(
+            stats_line.contains("\u{03a3}47")
+                && !stats_line.contains('\u{2191}')
+                && !stats_line.contains('\u{2193}'),
+            "total-only wins the authoritative equality tie: {stats_line}"
+        );
+
+        dispatch_stats(
+            &state,
+            "agent-total-only",
+            4,
+            activity_stats_with_total_only(3, split, 53),
+        );
+        next_tick().await;
+        let stats_line = stats_line_text(&container);
+        assert!(
+            stats_line.contains("\u{03a3}53")
+                && !stats_line.contains('\u{2191}')
+                && !stats_line.contains('\u{2193}'),
+            "total-only wins when it is larger: {stats_line}"
         );
     }
 
