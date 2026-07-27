@@ -6381,6 +6381,14 @@ fn finalize_subagent_stream(mut stream: SubAgentStream, outcome: SubAgentFinalOu
             None,
         );
     }
+    if stream.inner.emitter.is_stream_open() {
+        stream.inner.emit_placeholder_stream_end(
+            stream.summary.model.clone(),
+            subagent_terminal_usage(&stream.summary),
+            None,
+        );
+    }
+    close_terminal_tool_requests(&mut stream.summary, &stream.inner, false);
     // Child liveness is owned by the child stream, not by the parent Task
     // card's completed progress snapshot. Without an explicit idle marker the
     // relay agent can remain Active after its final StreamEnd (or forever when
@@ -15144,6 +15152,84 @@ for raw_line in sys.stdin:
     }
 
     #[test]
+    fn subagent_teardown_closes_whitespace_only_stream() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (mut stream, mut child_rx) =
+                usage_only_subagent_stream("toolu-whitespace-child", false);
+            stream.summary = ClaudeStdoutSummary::default();
+            let child_emitter = stream.inner.emitter.clone();
+
+            consume_subagent_event(
+                &mut stream,
+                &json!({
+                    "type": "stream_event",
+                    "event": {
+                        "type": "message_start",
+                        "message": {
+                            "id": "provider-child-message",
+                            "model": "claude-test"
+                        }
+                    }
+                }),
+            );
+            consume_subagent_event(
+                &mut stream,
+                &json!({
+                    "type": "stream_event",
+                    "event": {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {
+                            "type": "text",
+                            "text": " \n "
+                        }
+                    }
+                }),
+            );
+            assert!(child_emitter.is_stream_open());
+
+            finalize_subagent_stream(stream, SubAgentFinalOutcome::default());
+
+            let events = std::iter::from_fn(|| child_rx.try_recv().ok()).collect::<Vec<_>>();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event_kind(event) == Some("StreamStart"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event_kind(event) == Some("StreamEnd"))
+                    .count(),
+                1
+            );
+            let stream_end = events
+                .iter()
+                .find(|event| event_kind(event) == Some("StreamEnd"))
+                .expect("subagent teardown StreamEnd");
+            assert_eq!(
+                stream_end_message(stream_end)
+                    .get("content")
+                    .and_then(Value::as_str),
+                Some("")
+            );
+            assert_paired_stream_lifecycle(&events);
+            assert_claude_protocol_valid(&events);
+            assert!(
+                !child_emitter.is_stream_open(),
+                "subagent teardown must close a whitespace-only child stream"
+            );
+        });
+    }
+
+    #[test]
     fn subagent_teardown_closes_retained_pending_tool_stream() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -15200,11 +15286,43 @@ for raw_line in sys.stdin:
             finalize_subagent_stream(stream, SubAgentFinalOutcome::default());
 
             let events = std::iter::from_fn(|| child_rx.try_recv().ok()).collect::<Vec<_>>();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| {
+                        event_kind(event) == Some("ToolRequest")
+                            && event.pointer("/data/tool_call_id").and_then(Value::as_str)
+                                == Some("toolu_child_incomplete")
+                    })
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| {
+                        event_kind(event) == Some("ToolExecutionCompleted")
+                            && event.pointer("/data/tool_call_id").and_then(Value::as_str)
+                                == Some("toolu_child_incomplete")
+                            && event.pointer("/data/success").and_then(Value::as_bool)
+                                == Some(false)
+                            && event
+                                .pointer("/data/tool_result/short_message")
+                                .and_then(Value::as_str)
+                                == Some("Tool result missing")
+                    })
+                    .count(),
+                1
+            );
             assert_paired_stream_lifecycle(&events);
             assert_claude_protocol_valid(&events);
             assert!(
                 !child_emitter.is_stream_open(),
                 "subagent teardown must not leave its retained-pending stream open"
+            );
+            assert!(
+                !child_emitter.has_pending_tool_request("toolu_child_incomplete"),
+                "subagent teardown must complete its fallback-emitted tool request"
             );
         });
     }
