@@ -1200,6 +1200,16 @@ struct ClaudeTurnUsage {
     cumulative: Option<Value>,
 }
 
+#[derive(Default)]
+struct ClaudeTerminalPhaseOptions {
+    turn_id: u64,
+    conversation_history_bytes: u64,
+    known_context_window: Option<u64>,
+    model_hint: Option<String>,
+    turn_usage: Option<ClaudeTurnUsage>,
+    cancelled: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ClaudeMessageUsage {
     request: Option<Value>,
@@ -1731,11 +1741,14 @@ impl ClaudeInner {
                 if !self
                     .emit_terminal_phase_or_placeholder(
                         &mut summary,
-                        conversation_history_bytes,
-                        known_context_window,
-                        result_model_hint.or(model_hint),
-                        turn_usage,
-                        false,
+                        ClaudeTerminalPhaseOptions {
+                            turn_id,
+                            conversation_history_bytes,
+                            known_context_window,
+                            model_hint: result_model_hint.or(model_hint),
+                            turn_usage,
+                            cancelled: false,
+                        },
                     )
                     .await
                     && summary.emitted_phase_count == 0
@@ -1751,11 +1764,14 @@ impl ClaudeInner {
                 let known_context_window = summary.result_context_window;
                 self.emit_terminal_phase_or_placeholder(
                     &mut summary,
-                    conversation_history_bytes,
-                    known_context_window,
-                    None,
-                    turn_usage,
-                    true,
+                    ClaudeTerminalPhaseOptions {
+                        turn_id,
+                        conversation_history_bytes,
+                        known_context_window,
+                        model_hint: None,
+                        turn_usage,
+                        cancelled: true,
+                    },
                 )
                 .await;
                 let quiesced_waiters = self.clear_active_turn(turn_id).await;
@@ -1775,11 +1791,14 @@ impl ClaudeInner {
                 let _ = self
                     .emit_terminal_phase_or_placeholder(
                         &mut summary,
-                        conversation_history_bytes,
-                        known_context_window,
-                        None,
-                        turn_usage,
-                        false,
+                        ClaudeTerminalPhaseOptions {
+                            turn_id,
+                            conversation_history_bytes,
+                            known_context_window,
+                            model_hint: None,
+                            turn_usage,
+                            cancelled: false,
+                        },
                     )
                     .await;
                 let detail = summary.error_message().unwrap_or(error);
@@ -3406,12 +3425,16 @@ impl ClaudeInner {
     async fn emit_terminal_phase_or_placeholder(
         &self,
         summary: &mut ClaudeStdoutSummary,
-        conversation_history_bytes: u64,
-        known_context_window: Option<u64>,
-        model_hint: Option<String>,
-        turn_usage: Option<ClaudeTurnUsage>,
-        cancelled: bool,
+        options: ClaudeTerminalPhaseOptions,
     ) -> bool {
+        let ClaudeTerminalPhaseOptions {
+            turn_id,
+            conversation_history_bytes,
+            known_context_window,
+            model_hint,
+            turn_usage,
+            cancelled,
+        } = options;
         // The Context Usage breakdown must reflect the context-window fill — the
         // last API call's prompt footprint — which lives on `summary.usage`
         // (per-API-call usage from assistant stream events, bounded by the
@@ -3445,6 +3468,12 @@ impl ClaudeInner {
             );
             if !text.is_empty() {
                 self.add_conversation_bytes(text.len() as u64).await;
+            }
+            if !self.emitter.is_stream_open() {
+                self.emit_stream_start(
+                    &format!("claude-msg-{turn_id}-terminal"),
+                    selected_model.clone(),
+                );
             }
             self.emit_stream_end(
                 text,
@@ -3483,6 +3512,12 @@ impl ClaudeInner {
                         self.emit_system_message(CLAUDE_CONVERSATION_COMPACTED_NOTICE);
                     }
                 }
+                if !self.emitter.is_stream_open() {
+                    self.emit_stream_start(
+                        &format!("claude-msg-{turn_id}-terminal"),
+                        selected_model.clone(),
+                    );
+                }
                 self.emit_placeholder_stream_end(
                     selected_model,
                     turn_usage.clone(),
@@ -3508,6 +3543,12 @@ impl ClaudeInner {
                 known_context_window,
                 selected_model.as_deref(),
             );
+            if !self.emitter.is_stream_open() {
+                self.emit_stream_start(
+                    &format!("claude-msg-{turn_id}-terminal"),
+                    selected_model.clone(),
+                );
+            }
             self.emit_placeholder_stream_end(selected_model, turn_usage, Some(context_breakdown));
         }
 
@@ -7067,6 +7108,19 @@ fn close_current_phase_with_turn_usage(
         }
         reset_phase_state(summary, segment);
         segment.awaiting_stream_start = true;
+    } else {
+        tracing::warn!(
+            stream_open = inner.emitter.is_stream_open(),
+            awaiting_stream_start = segment.awaiting_stream_start,
+            has_content = segment.has_content,
+            pending_tool_uses = segment.pending_tool_uses.len(),
+            has_streamed_text = !summary.streamed_text.is_empty(),
+            has_streamed_reasoning = !summary.streamed_reasoning.is_empty(),
+            has_assistant_text = summary.assistant_text.is_some(),
+            has_result_text = summary.result_text.is_some(),
+            has_result_reasoning = summary.result_reasoning.is_some(),
+            "Claude phase close found pending state without an emittable payload; retaining the current stream"
+        );
     }
 }
 
@@ -11624,7 +11678,7 @@ mod tests {
         make_test_inner_with_workspace("/tmp/test-workspace".to_string())
     }
 
-    fn assert_complete_stream_lifecycle(events: &[Value]) {
+    fn assert_paired_stream_lifecycle(events: &[Value]) {
         let mut active_message_id = None;
         for (index, event) in events.iter().enumerate() {
             match event_kind(event) {
@@ -11664,20 +11718,25 @@ mod tests {
                 Some("OperationCancelled") => {
                     panic!("event {index} cancelled a valid stream lifecycle: {event}")
                 }
-                Some("ToolExecutionCompleted")
-                    if event
-                        .pointer("/data/tool_result/short_message")
-                        .and_then(Value::as_str)
-                        == Some("Tool result missing") =>
-                {
-                    panic!("event {index} discarded a valid tool lifecycle: {event}")
-                }
                 _ => {}
             }
         }
         assert!(
             active_message_id.is_none(),
             "stream lifecycle ended with an unterminated message {active_message_id:?}"
+        );
+    }
+
+    fn assert_complete_stream_lifecycle(events: &[Value]) {
+        assert_paired_stream_lifecycle(events);
+        assert!(
+            events.iter().all(|event| {
+                event
+                    .pointer("/data/tool_result/short_message")
+                    .and_then(Value::as_str)
+                    != Some("Tool result missing")
+            }),
+            "valid tool lifecycle was discarded: {events:?}"
         );
     }
 
@@ -11813,8 +11872,20 @@ mod tests {
             .expect("AgentBootstrap validates");
 
         for (index, event) in events.iter().enumerate() {
+            match event_kind(event) {
+                Some("Error") => panic!("event {index} emitted a backend Error: {event}"),
+                Some("OperationCancelled") => {
+                    panic!("event {index} cancelled the Claude lifecycle: {event}")
+                }
+                _ => {}
+            }
             let chat_event: ChatEvent =
-                serde_json::from_value(event.clone()).expect("emitter produced ChatEvent JSON");
+                serde_json::from_value(event.clone()).unwrap_or_else(|error| {
+                    panic!(
+                        "event {index} with kind {:?} is not valid ChatEvent JSON: {error}",
+                        event_kind(event)
+                    )
+                });
             let envelope = Envelope::from_payload(
                 agent_stream.clone(),
                 FrameKind::ChatEvent,
@@ -12096,7 +12167,14 @@ mod tests {
 
         // Cancel fires the terminal path.
         inner
-            .emit_terminal_phase_or_placeholder(&mut summary, 0, None, None, None, true)
+            .emit_terminal_phase_or_placeholder(
+                &mut summary,
+                ClaudeTerminalPhaseOptions {
+                    turn_id: 1,
+                    cancelled: true,
+                    ..ClaudeTerminalPhaseOptions::default()
+                },
+            )
             .await;
         inner.emit_operation_cancelled("Claude turn cancelled.");
 
@@ -12175,7 +12253,14 @@ mod tests {
             "the cancellation tail must retain ownership of the pending tool"
         );
         inner
-            .emit_terminal_phase_or_placeholder(&mut summary, 0, None, None, None, true)
+            .emit_terminal_phase_or_placeholder(
+                &mut summary,
+                ClaudeTerminalPhaseOptions {
+                    turn_id: 1,
+                    cancelled: true,
+                    ..ClaudeTerminalPhaseOptions::default()
+                },
+            )
             .await;
 
         let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
@@ -15056,6 +15141,72 @@ for raw_line in sys.stdin:
             },
             child_rx,
         )
+    }
+
+    #[test]
+    fn subagent_teardown_closes_retained_pending_tool_stream() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (mut stream, mut child_rx) =
+                usage_only_subagent_stream("toolu-incomplete-child", false);
+            stream.summary = ClaudeStdoutSummary::default();
+            let child_emitter = stream.inner.emitter.clone();
+
+            consume_subagent_event(
+                &mut stream,
+                &json!({
+                    "type": "stream_event",
+                    "event": {
+                        "type": "message_start",
+                        "message": {
+                            "id": "provider-child-message",
+                            "model": "claude-test"
+                        }
+                    }
+                }),
+            );
+            consume_subagent_event(
+                &mut stream,
+                &json!({
+                    "type": "stream_event",
+                    "event": {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": "toolu_child_incomplete",
+                            "name": "EmptyTool",
+                            "input": {}
+                        }
+                    }
+                }),
+            );
+            consume_subagent_event(
+                &mut stream,
+                &json!({
+                    "type": "stream_event",
+                    "event": {
+                        "type": "content_block_stop",
+                        "index": 0
+                    }
+                }),
+            );
+            assert!(stream.segment.pending_tool_uses.contains_key(&0));
+
+            finalize_subagent_stream(stream, SubAgentFinalOutcome::default());
+
+            let events = std::iter::from_fn(|| child_rx.try_recv().ok()).collect::<Vec<_>>();
+            assert_paired_stream_lifecycle(&events);
+            assert_claude_protocol_valid(&events);
+            assert!(
+                !child_emitter.is_stream_open(),
+                "subagent teardown must not leave its retained-pending stream open"
+            );
+        });
     }
 
     #[test]
@@ -18929,11 +19080,12 @@ for raw_line in sys.stdin:
         inner
             .emit_terminal_phase_or_placeholder(
                 &mut summary,
-                0,
-                Some(1_000_000),
-                None,
-                Some(turn_usage),
-                false,
+                ClaudeTerminalPhaseOptions {
+                    turn_id: 1,
+                    known_context_window: Some(1_000_000),
+                    turn_usage: Some(turn_usage),
+                    ..ClaudeTerminalPhaseOptions::default()
+                },
             )
             .await;
 
@@ -19293,7 +19445,7 @@ for raw_line in sys.stdin:
         consume_stream_event(
             &json!({
                 "type": "content_block_start",
-                "index": 1,
+                "index": 0,
                 "content_block": {
                     "type": "tool_use",
                     "id": "toolu_complete",
@@ -19306,6 +19458,10 @@ for raw_line in sys.stdin:
             &inner,
             &base_id,
             &mut current_id,
+        );
+        assert!(
+            segment.pending_tool_uses.contains_key(&0),
+            "provider block indexes restart per message and must not erase a different retained tool"
         );
         consume_stream_event(
             &json!({"type": "message_stop"}),
@@ -19359,6 +19515,124 @@ for raw_line in sys.stdin:
             1
         );
         assert_complete_stream_lifecycle(&events);
+        assert_claude_protocol_valid(&events);
+    }
+
+    #[tokio::test]
+    async fn terminal_retained_tool_phase_has_a_matching_stream_lifecycle() {
+        let (inner, mut rx) = make_test_inner();
+        let mut summary = ClaudeStdoutSummary::default();
+        let mut segment = SegmentState::default();
+        let base_id = "claude-msg-terminal".to_string();
+        inner.emit_stream_start(&base_id, Some("claude-test".to_string()));
+        segment.pending_tool_uses.insert(
+            0,
+            PendingClaudeToolUse {
+                id: "toolu_incomplete".to_string(),
+                name: "EmptyTool".to_string(),
+                arguments: json!({}),
+                partial_json: String::new(),
+                request_emitted: false,
+            },
+        );
+        register_tool_call_for_phase(
+            &mut summary,
+            &mut segment,
+            ClaudeToolCall {
+                id: "toolu_complete".to_string(),
+                name: "CompleteTool".to_string(),
+                arguments: json!({"value": "ok"}),
+            },
+        );
+        close_current_phase(&mut summary, &mut segment, &inner);
+        consume_user_tool_result(
+            &json!({
+                "message": {
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_complete",
+                        "content": "done"
+                    }]
+                }
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            false,
+        );
+        assert!(segment.pending_tool_uses.contains_key(&0));
+
+        flush_pending_tool_uses_with_fallback(&mut summary, &mut segment);
+        assert!(segment.pending_tool_uses.is_empty());
+        assert_eq!(
+            summary
+                .tool_calls
+                .iter()
+                .find(|tool| tool.id == "toolu_incomplete")
+                .map(|tool| &tool.arguments),
+            Some(&json!({}))
+        );
+        inner
+            .emit_terminal_phase_or_placeholder(
+                &mut summary,
+                ClaudeTerminalPhaseOptions {
+                    turn_id: 1,
+                    ..ClaudeTerminalPhaseOptions::default()
+                },
+            )
+            .await;
+
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event_kind(event) == Some("StreamStart"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event_kind(event) == Some("StreamEnd"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .rev()
+                .find(|event| event_kind(event) == Some("StreamStart"))
+                .and_then(|event| event.pointer("/data/message_id"))
+                .and_then(Value::as_str),
+            Some("claude-msg-1-terminal")
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event_kind(event) == Some("ToolRequest")
+                        && event.pointer("/data/tool_call_id").and_then(Value::as_str)
+                            == Some("toolu_incomplete")
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event_kind(event) == Some("ToolExecutionCompleted")
+                        && event.pointer("/data/tool_call_id").and_then(Value::as_str)
+                            == Some("toolu_incomplete")
+                        && event
+                            .pointer("/data/tool_result/short_message")
+                            .and_then(Value::as_str)
+                            == Some("Tool result missing")
+                })
+                .count(),
+            1
+        );
+        assert_paired_stream_lifecycle(&events);
         assert_claude_protocol_valid(&events);
     }
 
@@ -21409,7 +21683,13 @@ for raw_line in sys.stdin:
         };
 
         let emitted = inner
-            .emit_terminal_phase_or_placeholder(&mut summary, 0, None, None, None, false)
+            .emit_terminal_phase_or_placeholder(
+                &mut summary,
+                ClaudeTerminalPhaseOptions {
+                    turn_id: 1,
+                    ..ClaudeTerminalPhaseOptions::default()
+                },
+            )
             .await;
         assert!(
             emitted,
