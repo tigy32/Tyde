@@ -904,7 +904,7 @@ enum AgentTokenUsageDisplay<'a> {
 fn agent_token_usage_display(stats: &AgentActivityStats) -> Option<AgentTokenUsageDisplay<'_>> {
     if let Some(total) = stats
         .token_usage_total_only
-        .filter(|total| *total > 0 && *total >= stats.token_usage.total_tokens)
+        .filter(|total| *total >= stats.token_usage.total_tokens)
     {
         Some(AgentTokenUsageDisplay::TotalOnly(total))
     } else if token_usage_has_content(&stats.token_usage) {
@@ -947,8 +947,11 @@ fn agent_control_stats_line(stats: AgentActivityStats) -> AnyView {
             view! {
                 <span class="token-sep">"\u{00b7}"</span>
                 <span
-                    class="token-stat token-stat-total"
+                    class="token-stat token-stat-input token-stat-total"
                     title="Provider-reported cumulative total; input/output split unavailable"
+                    aria-label=format!(
+                        "{total} total tokens; input/output split unavailable"
+                    )
                 >
                     {format!("\u{03a3}{}", format_compact(total))}
                 </span>
@@ -2216,6 +2219,20 @@ mod wasm_tests {
             !stats_line.contains('\u{2191}') && !stats_line.contains('\u{2193}'),
             "a total-only value never invents split arrows: {stats_line}"
         );
+        let total_badge = container
+            .query_selector(".token-stat-total")
+            .expect("query total-only badge")
+            .expect("total-only badge");
+        assert!(
+            total_badge
+                .get_attribute("class")
+                .is_some_and(|classes| classes.contains("token-stat-input")),
+            "the total-only badge reuses the established token emphasis"
+        );
+        assert_eq!(
+            total_badge.get_attribute("aria-label").as_deref(),
+            Some("47 total tokens; input/output split unavailable")
+        );
 
         dispatch_stats(
             &state,
@@ -2278,6 +2295,21 @@ mod wasm_tests {
                 && !stats_line.contains('\u{2191}')
                 && !stats_line.contains('\u{2193}'),
             "total-only wins when it is larger: {stats_line}"
+        );
+
+        dispatch_stats(
+            &state,
+            "agent-total-only",
+            5,
+            activity_stats_with_total_only(3, token_usage(0, 0, 0, 0), 0),
+        );
+        next_tick().await;
+        let stats_line = stats_line_text(&container);
+        assert!(
+            stats_line.contains("\u{03a3}0")
+                && !stats_line.contains('\u{2191}')
+                && !stats_line.contains('\u{2193}'),
+            "a reported zero follows the server's authoritative equality rule: {stats_line}"
         );
     }
 

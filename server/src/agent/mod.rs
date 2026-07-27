@@ -591,6 +591,7 @@ enum TokenUsageSource {
     Message(ChatMessageId),
     EventSeq(u64),
     ModelRequest(ModelRequestId),
+    PromotedRequests,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -753,10 +754,13 @@ impl AgentActivityStatsTracker {
                     self.stats.source_through_seq = Some(source_seq);
                 }
             }
-            ChatEvent::TypingStatusChanged(_) => {
+            ChatEvent::TypingStatusChanged(_)
+                if self.token_usage_tracking_mode == TokenUsageTrackingMode::Messages =>
+            {
                 self.commit_provisional_request_usage();
             }
-            ChatEvent::ToolProgress(_)
+            ChatEvent::TypingStatusChanged(_)
+            | ChatEvent::ToolProgress(_)
             | ChatEvent::ToolExecutionCompleted(_)
             | ChatEvent::TaskUpdate(_)
             | ChatEvent::OperationCancelled(_)
@@ -953,10 +957,26 @@ impl AgentActivityStatsTracker {
     }
 
     fn commit_provisional_request_usage(&mut self) {
-        for (source, usage) in self.provisional_request_usage_by_source.drain() {
-            self.authoritative_token_usage_by_source
-                .insert(source, usage);
+        if self.token_usage_tracking_mode != TokenUsageTrackingMode::Messages
+            || self.provisional_request_usage_by_source.is_empty()
+        {
+            return;
         }
+        // A typing boundary ends the Messages-mode generation. If no turn
+        // reconciled it, fold its request sources into the baseline and keep
+        // one classification marker rather than retaining every request key.
+        let promoted = total_token_usage(self.provisional_request_usage_by_source.values());
+        self.authoritative_token_usage_baseline =
+            total_token_usage([&self.authoritative_token_usage_baseline, &promoted].into_iter());
+        for (source, _) in self.provisional_request_usage_by_source.drain() {
+            self.token_usage_by_source.remove(&source);
+        }
+        self.token_usage_by_source.insert(
+            TokenUsageSource::PromotedRequests,
+            TaskTokenUsageScope::Known {
+                usage: Box::new(TaskTokenUsageAmount::from_token_usage(&promoted)),
+            },
+        );
         self.refresh_token_usage();
     }
 
@@ -8689,7 +8709,7 @@ mod tests {
         AppendSupervisorWarningOutcome, CLOSE_TURN_GRACE, DELIVERY_REJECTED_CLOSING,
         GenerateAgentActivitySummaryRequest, InterruptOutcome, RelayEventReceivers,
         ResolvedSpawnRequest, SupervisorStallInterruptOutcome, SupervisorVerdictStart,
-        SupervisorVerdictStartRejection, activity_history_snapshot,
+        SupervisorVerdictStartRejection, TokenUsageSource, activity_history_snapshot,
         agent_name_generation_spawn_config, agent_usage_snapshot_from_log, append_chat_event,
         append_event, apply_generated_agent_name, apply_runtime_session_updates, attach_subscriber,
         attach_subscriber_with_latest_output, collect_agent_activity_summary_events,
@@ -10535,12 +10555,57 @@ mod tests {
         };
         assert!(stats.observe_model_request_token_usage(second, 181));
 
+        for (seq, typing) in [(182, true), (183, false)] {
+            let mut event = ChatEvent::TypingStatusChanged(typing);
+            assert!(
+                !stats.observe_chat_event(&mut event, seq, ""),
+                "typing transitions must not rewrite ModelRequests cumulative usage"
+            );
+            assert_eq!(stats.snapshot().token_usage.total_tokens, 1_025);
+        }
+
         let (usage, _) = stats.usage_snapshot();
         let TaskTokenUsageScope::Known { usage } = usage else {
             panic!("Codex request usage should be fully known");
         };
         assert_eq!(usage.total_tokens, 1_025);
         assert_eq!(stats.token_usage_by_source.len(), 2);
+
+        let mut start = test_agent_start("resumed-codex-usage");
+        start.backend_kind = BackendKind::Codex;
+        let stream = StreamPath("/agent/resumed-codex-usage".to_owned());
+        let payload = AgentActivityStatsPayload {
+            agent_id: start.agent_id.clone(),
+            stats: stats.snapshot(),
+        };
+        let event_log = vec![
+            protocol::Envelope::from_payload(
+                stream.clone(),
+                FrameKind::AgentActivityStats,
+                0,
+                &payload,
+            )
+            .expect("serialize cumulative stats"),
+            protocol::Envelope::from_payload(
+                stream.clone(),
+                FrameKind::ChatEvent,
+                1,
+                &ChatEvent::TypingStatusChanged(true),
+            )
+            .expect("serialize typing start"),
+            protocol::Envelope::from_payload(
+                stream,
+                FrameKind::ChatEvent,
+                2,
+                &ChatEvent::TypingStatusChanged(false),
+            )
+            .expect("serialize typing stop"),
+        ];
+        let resumed = agent_usage_snapshot_from_log(&start, &event_log);
+        assert!(matches!(
+            resumed.usage,
+            TaskTokenUsageScope::Known { ref usage } if usage.total_tokens == 1_025
+        ));
     }
 
     #[test]
@@ -10643,6 +10708,10 @@ mod tests {
         );
         assert!(usage.turn.known_usage().is_none());
         assert!(usage.cumulative.known_usage().is_none());
+        // Claude's intermediate StreamEnd reports a known request while the
+        // turn and cumulative scopes above remain unavailable. The old zero
+        // assertion rejected that provider-reported work; this assertion
+        // exposes it provisionally without weakening the wire-scope contract.
         assert_eq!(stats.snapshot().token_usage, token_usage(7));
 
         let (usage, _) = stats.usage_snapshot();
@@ -10716,6 +10785,14 @@ mod tests {
             120,
             "authoritative cumulative usage replaces the terminal turn"
         );
+        let terminal_snapshot = stats.snapshot();
+        let mut typing_stop = ChatEvent::TypingStatusChanged(false);
+        assert!(!stats.observe_chat_event(&mut typing_stop, 6, ""));
+        assert_eq!(
+            stats.snapshot(),
+            terminal_snapshot,
+            "an empty provisional drain is a complete no-op"
+        );
     }
 
     #[test]
@@ -10734,6 +10811,13 @@ mod tests {
         ));
         assert_eq!(stats.snapshot().token_usage.total_tokens, 7);
         observe_stats(&mut stats, ChatEvent::TypingStatusChanged(false), 2, "");
+        assert!(stats.provisional_request_usage_by_source.is_empty());
+        assert!(stats.authoritative_token_usage_by_source.is_empty());
+        assert_eq!(
+            stats.token_usage_by_source.keys().collect::<Vec<_>>(),
+            vec![&TokenUsageSource::PromotedRequests],
+            "completed request-only generations collapse to one classification entry"
+        );
         observe_stats(&mut stats, ChatEvent::TypingStatusChanged(true), 3, "");
 
         let mut second = assistant_message("second request");
@@ -11287,7 +11371,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_preserves_codex_model_request_usage_in_live_and_replay_stats() {
+    async fn relay_preserves_codex_usage_across_typing_live_and_replay() {
         let dir = tempfile::tempdir().expect("tempdir");
         let session_store = Arc::new(Mutex::new(
             SessionStore::load(dir.path().join("sessions.json")).expect("load session store"),
@@ -11342,6 +11426,45 @@ mod tests {
         .await
         .expect("live model usage stats");
         assert_eq!(live_stats.token_usage.total_tokens, 11);
+
+        event_tx
+            .send(ChatEvent::TypingStatusChanged(true))
+            .expect("relay event channel should be open");
+        event_tx
+            .send(ChatEvent::TypingStatusChanged(false))
+            .expect("relay event channel should stay open");
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let event = live_rx.recv().await.expect("live relay stream");
+                if event.kind == FrameKind::AgentActivityStats {
+                    let payload = event
+                        .parse_payload::<AgentActivityStatsPayload>()
+                        .expect("valid activity stats");
+                    assert_eq!(
+                        payload.stats.token_usage.total_tokens, 11,
+                        "typing must never replace Codex cumulative usage"
+                    );
+                }
+                if event.kind == FrameKind::ChatEvent
+                    && event
+                        .parse_payload::<ChatEvent>()
+                        .is_ok_and(|event| matches!(event, ChatEvent::TypingStatusChanged(false)))
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("typing transitions should be relayed");
+
+        let task_snapshot = handle
+            .read_usage_snapshot()
+            .await
+            .expect("Codex task usage snapshot");
+        assert!(matches!(
+            task_snapshot.usage,
+            TaskTokenUsageScope::Known { ref usage } if usage.total_tokens == 11
+        ));
 
         let (replay_tx, mut replay_rx) = mpsc::unbounded_channel();
         assert!(handle.attach(replay_stream(replay_tx)).await);
