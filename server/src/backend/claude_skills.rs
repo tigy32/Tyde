@@ -13,13 +13,12 @@
 //! ```
 //!
 //! `SKILL.md` is **not** symlinked. Tyde reads the store's `SKILL.md` exactly
-//! once, validates those bytes, and writes a sanitized snapshot built from the
+//! once, validates those bytes, and writes a semantic snapshot built from the
 //! same bytes. What Claude loads is therefore what Tyde inspected: there is no
-//! window in which the file can change between validation and load, and a skill
-//! cannot smuggle an activation key past the check by being rewritten
-//! afterwards. The snapshot carries a synthesized `name`/`description`
-//! frontmatter and the instructional body verbatim; every other frontmatter key
-//! is dropped by construction.
+//! window in which the file can change between validation and load. The
+//! snapshot carries the complete parsed frontmatter mapping with only `name`
+//! replaced by the synthesized wrapper name, plus the instructional body
+//! verbatim.
 //!
 //! Other top-level entries are symlinked so a skill's relative assets and
 //! scripts still resolve — that is what keeps this O(number of skills) instead
@@ -78,45 +77,6 @@ pub(crate) const CLAUDE_PLUGIN_DIR_FLAG: &str = "--plugin-dir";
 /// 64 is comfortably under every path-component limit Tyde needs to survive and
 /// short enough to stay readable in the model's skill listing.
 const EXPOSED_NAME_MAX_LEN: usize = 64;
-
-/// The **only** frontmatter keys a Tyde wrapper will carry over.
-///
-/// This is an allowlist, not a denylist, and that is the whole point: a denylist
-/// silently changes a skill's semantics whenever Claude grows a field nobody
-/// added to the list. `name` and `description` are the two fields Claude
-/// documents for a skill and the two that are inert — they say what the skill is
-/// called and what it is for, and nothing else. Everything else, whether it is a
-/// known behaviour-changing field (`allowed-tools`, `model`,
-/// `disable-model-invocation`), a known activation field (`hooks`,
-/// `mcpServers`, `lsp`), or a field this version of Tyde has never heard of, is
-/// a **refusal**. Refusing is visible; quietly dropping a field that changed the
-/// skill's behaviour is not.
-const ALLOWED_FRONTMATTER_KEYS: &[&str] = &["name", "description"];
-
-/// Known activation keys, named separately only so the refusal message can say
-/// *why* rather than "unrecognized". Not a gate — the allowlist is the gate.
-const KNOWN_ACTIVATION_KEYS: &[&str] = &[
-    "hooks",
-    "mcp",
-    "mcpservers",
-    "mcp_servers",
-    "lsp",
-    "lspservers",
-    "lsp_servers",
-    "monitors",
-    "agents",
-    "commands",
-    "workflows",
-    "outputstyles",
-    "output_styles",
-    "statusline",
-    "permissions",
-    "allowed-tools",
-    "allowed_tools",
-    "disable-model-invocation",
-    "disable_model_invocation",
-    "model",
-];
 
 /// Top-level resource names never linked into a wrapper, because they name
 /// plugin-level activation surfaces. A skill directory has no business shipping
@@ -364,10 +324,13 @@ fn inspect_skill(
     // a later rewrite of the store file cannot change what Claude loads.
     let raw = std::fs::read_to_string(&skill.skill_md_path)
         .map_err(|err| format!("could not read {}: {err}", skill.skill_md_path.display()))?;
-    let parsed = parse_skill_md(&raw)?;
+    let ParsedSkillMd {
+        frontmatter,
+        description: frontmatter_description,
+        body,
+    } = parse_skill_md(&raw)?;
     let resources = inspect_resources(skill)?;
-    let description = parsed
-        .description
+    let description = frontmatter_description
         .or_else(|| skill.description.clone())
         .map(|text| collapse_to_one_line(&text))
         .filter(|text| !text.is_empty());
@@ -375,7 +338,7 @@ fn inspect_skill(
     // exposed, so a refused skill never consumes an ordinal and the numbering
     // stays a function of what actually materializes.
     let exposed = synthesize_exposed_name(&skill.name, claimed);
-    let contents = render_skill_md(&exposed, description.as_deref(), parsed.body);
+    let contents = render_skill_md(&exposed, frontmatter, body)?;
     Ok(InspectedSkill {
         prepared: PreparedSkill {
             name: exposed.clone(),
@@ -463,6 +426,7 @@ fn fail_injection_point(_index: usize) -> Result<(), String> {
 }
 
 struct ParsedSkillMd<'a> {
+    frontmatter: serde_yaml::Mapping,
     description: Option<String>,
     /// Instructional body, preserved exactly as read.
     body: &'a str,
@@ -477,6 +441,7 @@ struct ParsedSkillMd<'a> {
 fn parse_skill_md(raw: &str) -> Result<ParsedSkillMd<'_>, String> {
     let Some(rest) = strip_frontmatter_open(raw) else {
         return Ok(ParsedSkillMd {
+            frontmatter: serde_yaml::Mapping::new(),
             description: None,
             body: raw,
         });
@@ -490,55 +455,29 @@ fn parse_skill_md(raw: &str) -> Result<ParsedSkillMd<'_>, String> {
         .map_err(|err| format!("its SKILL.md frontmatter is not valid YAML: {err}"))?;
     let mapping = match value {
         serde_yaml::Value::Mapping(mapping) => mapping,
-        serde_yaml::Value::Null => serde_yaml::Mapping::new(),
         _ => return Err("its SKILL.md frontmatter is not a YAML mapping".to_string()),
     };
 
-    let mut activation = Vec::new();
-    let mut unknown = Vec::new();
-    let mut description = None;
-    for (key, value) in &mapping {
-        let Some(key) = key.as_str() else {
-            return Err("its SKILL.md frontmatter has a non-string key".to_string());
-        };
-        let normalized = key.trim().to_ascii_lowercase();
-        if ALLOWED_FRONTMATTER_KEYS.contains(&normalized.as_str()) {
-            if normalized == "description"
-                && let Some(text) = value.as_str()
-            {
-                description = Some(text.to_string());
-            }
-            continue;
-        }
-        if KNOWN_ACTIVATION_KEYS.contains(&normalized.as_str()) {
-            activation.push(key.trim().to_string());
-        } else {
-            unknown.push(key.trim().to_string());
-        }
-    }
-    if !activation.is_empty() || !unknown.is_empty() {
-        activation.sort();
-        unknown.sort();
-        let mut reasons = Vec::new();
-        if !activation.is_empty() {
-            reasons.push(format!(
-                "declares {}, which changes what the skill may do",
-                activation.join(", ")
-            ));
-        }
-        if !unknown.is_empty() {
-            reasons.push(format!(
-                "declares {}, which Tyde cannot prove is inert",
-                unknown.join(", ")
-            ));
-        }
-        return Err(format!(
-            "its SKILL.md frontmatter {}. Only 'name' and 'description' are carried into a \
-             Tyde wrapper; dropping anything else would silently change the skill's behaviour",
-            reasons.join(", and ")
-        ));
-    }
-    Ok(ParsedSkillMd { description, body })
+    validate_optional_string_field(&mapping, "name")?;
+    let description = validate_optional_string_field(&mapping, "description")?;
+    Ok(ParsedSkillMd {
+        frontmatter: mapping,
+        description,
+        body,
+    })
+}
+
+fn validate_optional_string_field(
+    mapping: &serde_yaml::Mapping,
+    field: &str,
+) -> Result<Option<String>, String> {
+    let Some(value) = mapping.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .map(|text| Some(text.to_string()))
+        .ok_or_else(|| format!("its SKILL.md frontmatter field '{field}' must be a YAML string"))
 }
 
 fn strip_frontmatter_open(raw: &str) -> Option<&str> {
@@ -561,25 +500,62 @@ fn split_frontmatter_close(rest: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// Build the sanitized snapshot: synthesized frontmatter plus the body as read.
+/// Build the semantic snapshot: complete frontmatter plus the body as read.
 ///
 /// `name` must equal the wrapper directory name so Claude addresses the skill as
-/// `tyde-skills:<name>` whichever of the two the loader keys on. Both scalars are
-/// emitted as YAML double-quoted strings via JSON escaping, which YAML accepts,
-/// so no name or description can break out of the block.
+/// `tyde-skills:<name>` whichever of the two the loader keys on. Inserting it
+/// into the parsed mapping before serialization guarantees source YAML cannot
+/// supersede the synthesized name.
 ///
 /// The body is appended **byte for byte**. Nothing is trimmed: leading blank
 /// lines, indentation, and trailing whitespace are all part of a Markdown
 /// document's meaning, and a wrapper that quietly reflowed a skill would be
 /// changing instructions the user wrote.
-fn render_skill_md(name: &str, description: Option<&str>, body: &str) -> String {
-    let description = description.unwrap_or("A skill installed in Tyde.");
-    format!(
-        "---\nname: {}\ndescription: {}\n---\n{}",
-        yaml_quote(name),
-        yaml_quote(description),
-        body
-    )
+fn render_skill_md(
+    name: &str,
+    mut frontmatter: serde_yaml::Mapping,
+    body: &str,
+) -> Result<String, String> {
+    frontmatter.insert(
+        serde_yaml::Value::String("name".to_string()),
+        serde_yaml::Value::String(name.to_string()),
+    );
+    let canonical = canonicalize_yaml(serde_yaml::Value::Mapping(frontmatter))?;
+    let rendered = serde_yaml::to_string(&canonical)
+        .map_err(|err| format!("its SKILL.md frontmatter could not be serialized: {err}"))?;
+    Ok(format!("---\n{rendered}---\n{body}"))
+}
+
+fn canonicalize_yaml(value: serde_yaml::Value) -> Result<serde_yaml::Value, String> {
+    match value {
+        serde_yaml::Value::Sequence(values) => values
+            .into_iter()
+            .map(canonicalize_yaml)
+            .collect::<Result<Vec<_>, _>>()
+            .map(serde_yaml::Value::Sequence),
+        serde_yaml::Value::Mapping(mapping) => {
+            let mut entries = Vec::with_capacity(mapping.len());
+            for (key, value) in mapping {
+                let key = canonicalize_yaml(key)?;
+                let value = canonicalize_yaml(value)?;
+                let sort_key = serde_yaml::to_string(&key).map_err(|err| {
+                    format!("its SKILL.md frontmatter key could not be serialized: {err}")
+                })?;
+                entries.push((sort_key, key, value));
+            }
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            let mut canonical = serde_yaml::Mapping::with_capacity(entries.len());
+            for (_, key, value) in entries {
+                canonical.insert(key, value);
+            }
+            Ok(serde_yaml::Value::Mapping(canonical))
+        }
+        serde_yaml::Value::Tagged(mut tagged) => {
+            tagged.value = canonicalize_yaml(tagged.value)?;
+            Ok(serde_yaml::Value::Tagged(tagged))
+        }
+        scalar => Ok(scalar),
+    }
 }
 
 /// Derive a wrapper name that is safe to use as both a directory name and a
@@ -635,10 +611,6 @@ fn synthesize_exposed_name(source: &str, claimed: &mut BTreeSet<String>) -> Stri
         }
     }
     unreachable!("an ordinal suffix always terminates")
-}
-
-fn yaml_quote(value: &str) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
 }
 
 fn collapse_to_one_line(text: &str) -> String {
@@ -1034,15 +1006,30 @@ mod tests {
         outcome.plugin.expect("a plugin")
     }
 
+    fn assert_semantic_snapshot(source: &str, written: &str, wrapper_name: &str) {
+        let source = parse_skill_md(source).expect("source frontmatter");
+        let written = parse_skill_md(written).expect("written frontmatter");
+        let mut expected = source.frontmatter;
+        expected.insert(
+            serde_yaml::Value::String("name".to_string()),
+            serde_yaml::Value::String(wrapper_name.to_string()),
+        );
+        assert_eq!(
+            written.frontmatter, expected,
+            "every frontmatter value except name must survive semantically"
+        );
+        assert_eq!(
+            written.body, source.body,
+            "the instructional body must survive byte for byte"
+        );
+    }
+
     #[test]
-    fn skill_md_is_a_sanitized_snapshot_not_a_link_to_the_store() {
+    fn skill_md_is_a_semantic_snapshot_not_a_link_to_the_store() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = tmp.path().join("store");
-        let skills = vec![store_skill(
-            &store,
-            "alpha",
-            "---\nname: something-else\ndescription: Original text.\n---\n\nBODY-11aa22\n",
-        )];
+        let source = "---\nname: something-else\ndescription: Original text.\n---\n\nBODY-11aa22\n";
+        let skills = vec![store_skill(&store, "alpha", source)];
 
         let plugin = prepare_ok(tmp.path(), &skills);
         let wrapper_md = plugin.root().join("skills").join("alpha").join("SKILL.md");
@@ -1055,21 +1042,12 @@ mod tests {
             "SKILL.md must be a real file Tyde wrote, never a link into the store"
         );
         let written = std::fs::read_to_string(&wrapper_md).expect("read snapshot");
-        assert!(
-            written.starts_with("---\nname: \"alpha\"\n"),
-            "the snapshot's name must match the wrapper directory: {written}"
-        );
-        assert!(
-            written.contains("description: \"Original text.\""),
-            "{written}"
-        );
-        assert!(
-            !written.contains("something-else"),
-            "the snapshot's name is the wrapper name, not whatever the store claimed: {written}"
-        );
-        assert!(
-            written.contains("BODY-11aa22"),
-            "the body is preserved: {written}"
+        assert_semantic_snapshot(source, &written, "alpha");
+        let parsed = parse_skill_md(&written).expect("written mapping");
+        assert_eq!(
+            parsed.frontmatter.get("name"),
+            Some(&serde_yaml::Value::String("alpha".to_string())),
+            "the source name must not override the wrapper directory name"
         );
     }
 
@@ -1084,7 +1062,7 @@ mod tests {
         )];
         let plugin = prepare_ok(tmp.path(), &skills);
 
-        // The store file is swapped for one that would have been refused.
+        // The store file is swapped after Tyde has created the snapshot.
         std::fs::write(
             &skills[0].skill_md_path,
             "---\nname: alpha\nhooks:\n  - evil\n---\n\nEVIL-BODY\n",
@@ -1159,6 +1137,17 @@ mod tests {
                 "---\njust a string\n---\nbody\n",
                 "not a YAML mapping",
             ),
+            ("null", "---\n~\n---\nbody\n", "not a YAML mapping"),
+            (
+                "badname",
+                "---\nname: [not, a, string]\n---\nbody\n",
+                "field 'name' must be a YAML string",
+            ),
+            (
+                "baddescription",
+                "---\nname: ok\ndescription: {not: a string}\n---\nbody\n",
+                "field 'description' must be a YAML string",
+            ),
         ] {
             let skills = vec![store_skill(&store, name, body)];
             let outcome = ClaudeSkillPlugin::prepare(Some(tmp.path()), &skills).expect("prepare");
@@ -1173,45 +1162,86 @@ mod tests {
     }
 
     #[test]
-    fn activation_frontmatter_is_refused_and_named() {
+    fn full_valid_frontmatter_is_preserved_semantically() {
+        // The replaced oracle treated `allowed-tools: [Bash]` as invalid even
+        // though it is valid YAML and documented Claude skill metadata. It
+        // therefore proved only Tyde's two-key allowlist, not a safety property.
+        // This regression is stronger: every scalar, sequence, mapping,
+        // permission/activation field, and unknown future field must emerge
+        // semantically unchanged, while only the wrapper name may differ.
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = tmp.path().join("store");
+        let rich = concat!(
+            "---\n",
+            "name: source-name\n",
+            "description: |\n",
+            "  Multi-line description\n",
+            "  remains one YAML string.\n",
+            "allowed-tools:\n",
+            "  - Read\n",
+            "  - Bash(git *)\n",
+            "user-invocable: false\n",
+            "disable-model-invocation: true\n",
+            "argument-hint: \"[issue]\"\n",
+            "model: sonnet\n",
+            "context: fork\n",
+            "agent: Explore\n",
+            "hooks:\n",
+            "  PreToolUse:\n",
+            "    - matcher: Bash\n",
+            "      hooks:\n",
+            "        - type: command\n",
+            "          command: echo checked\n",
+            "mcpServers:\n",
+            "  local:\n",
+            "    command: node\n",
+            "    args: [server.js, --stdio]\n",
+            "permissions:\n",
+            "  allow: [Read]\n",
+            "metadata:\n",
+            "  owner: platform\n",
+            "some-future-field:\n",
+            "  enabled: false\n",
+            "  modes:\n",
+            "    - name: deep\n",
+            "      config: {threshold: 2, labels: [a, b]}\n",
+            "7: non-string-key\n",
+            "---\n",
+            "\n# Body\n\n  preserved indentation  \n"
+        );
+        let scalar = concat!(
+            "---\n",
+            "name: scalar\n",
+            "description: Scalar allowed-tools form.\n",
+            "allowed-tools: Read\n",
+            "unknown-scalar: future\n",
+            "---\n",
+            "scalar body\n"
+        );
         let skills = vec![
-            store_skill(
-                &store,
-                "inert",
-                "---\nname: inert\ndescription: d\n---\nbody\n",
-            ),
-            store_skill(
-                &store,
-                "hooky",
-                "---\nname: hooky\nHooks:\n  - x\n---\nbody\n",
-            ),
-            store_skill(
-                &store,
-                "serverish",
-                "---\nname: s\nmcpServers:\n  x: {}\n---\nbody\n",
-            ),
+            store_skill(&store, "incident-rich", rich),
+            store_skill(&store, "incident-scalar", scalar),
         ];
 
         let outcome = ClaudeSkillPlugin::prepare(Some(tmp.path()), &skills).expect("prepare");
 
-        let plugin = outcome.plugin.expect("the inert skill materializes");
-        assert_eq!(plugin.exposed(), ["tyde-skills:inert"]);
-        assert_eq!(outcome.refusals.len(), 2, "{:?}", outcome.refusals);
-        assert!(
-            outcome
-                .refusals
-                .iter()
-                .any(|r| r.name == "hooky" && r.reason.contains("Hooks"))
+        assert!(outcome.refusals.is_empty(), "{:?}", outcome.refusals);
+        let plugin = outcome.plugin.expect("both valid skills materialize");
+        assert_eq!(
+            plugin.exposed(),
+            ["tyde-skills:incident-rich", "tyde-skills:incident-scalar"]
         );
-        assert!(
-            outcome
-                .refusals
-                .iter()
-                .any(|r| r.name == "serverish" && r.reason.contains("mcpServers"))
-        );
-        assert!(!plugin.root().join("skills").join("hooky").exists());
+        for (source, wrapper_name) in [(rich, "incident-rich"), (scalar, "incident-scalar")] {
+            let written = std::fs::read_to_string(
+                plugin
+                    .root()
+                    .join("skills")
+                    .join(wrapper_name)
+                    .join("SKILL.md"),
+            )
+            .expect("semantic snapshot");
+            assert_semantic_snapshot(source, &written, wrapper_name);
+        }
     }
 
     #[test]
@@ -1225,23 +1255,32 @@ mod tests {
         let written =
             std::fs::read_to_string(plugin.root().join("skills").join("bare").join("SKILL.md"))
                 .expect("snapshot");
-        assert!(written.starts_with("---\nname: \"bare\"\n"), "{written}");
-        assert!(
-            written.contains("description: \"bare description\""),
-            "{written}"
+        let parsed = parse_skill_md(&written).expect("frontmatter");
+        assert_eq!(
+            parsed.frontmatter.len(),
+            1,
+            "only the required wrapper name is synthesized: {written}"
         );
-        assert!(written.contains("Just instructions."), "{written}");
+        assert_eq!(
+            parsed.frontmatter.get("name").and_then(|v| v.as_str()),
+            Some("bare")
+        );
+        assert_eq!(parsed.body, "Just instructions.\n");
     }
 
     #[test]
-    fn a_name_that_could_break_out_of_yaml_is_quoted_or_refused() {
-        assert_eq!(yaml_quote("a\"b"), "\"a\\\"b\"");
-        assert_eq!(yaml_quote("line\nbreak"), "\"line\\nbreak\"");
-        let rendered = render_skill_md("ok", Some("has: colon and \"quotes\""), "body\n");
-        assert!(
-            rendered.contains("description: \"has: colon and \\\"quotes\\\"\""),
-            "{rendered}"
+    fn source_name_cannot_override_or_break_out_of_the_wrapper_mapping() {
+        let source = "---\nname: \"source\\n---\\nhooks: surprise\"\ndescription: 'has: colon and \"quotes\"'\n---\nbody\n";
+        let parsed = parse_skill_md(source).expect("valid source");
+        let rendered =
+            render_skill_md("safe-wrapper", parsed.frontmatter, parsed.body).expect("render");
+        assert_semantic_snapshot(source, &rendered, "safe-wrapper");
+        let parsed = parse_skill_md(&rendered).expect("rendered mapping");
+        assert_eq!(
+            parsed.frontmatter.get("name").and_then(|v| v.as_str()),
+            Some("safe-wrapper")
         );
+        assert!(!parsed.frontmatter.contains_key("hooks"));
     }
 
     #[test]
@@ -1509,49 +1548,41 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_frontmatter_field_is_refused_rather_than_silently_dropped() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let store = tmp.path().join("store");
-        let skills = vec![
-            store_skill(
-                &store,
-                "plain",
-                "---\nname: plain\ndescription: d\n---\nbody\n",
-            ),
-            store_skill(
-                &store,
-                "gated",
-                "---\nname: gated\nallowed-tools: [Bash]\n---\nbody\n",
-            ),
-            store_skill(
-                &store,
-                "novel",
-                "---\nname: novel\nsome-future-field: true\n---\nbody\n",
-            ),
-        ];
+    fn semantic_serialization_is_deterministic_across_mapping_order() {
+        let first = parse_skill_md(concat!(
+            "---\n",
+            "name: source\n",
+            "zeta: 1\n",
+            "nested: {z: false, a: [3, {y: 2, x: 1}]}\n",
+            "alpha: true\n",
+            "---\n",
+            "body\n"
+        ))
+        .expect("first mapping");
+        let second = parse_skill_md(concat!(
+            "---\n",
+            "alpha: true\n",
+            "nested:\n",
+            "  a:\n",
+            "    - 3\n",
+            "    - x: 1\n",
+            "      y: 2\n",
+            "  z: false\n",
+            "zeta: 1\n",
+            "name: another-source\n",
+            "---\n",
+            "body\n"
+        ))
+        .expect("second mapping");
 
-        let outcome = ClaudeSkillPlugin::prepare(Some(tmp.path()), &skills).expect("prepare");
+        let first =
+            render_skill_md("wrapper", first.frontmatter, first.body).expect("first render");
+        let second =
+            render_skill_md("wrapper", second.frontmatter, second.body).expect("second render");
 
-        let plugin = outcome.plugin.expect("the plain skill materializes");
-        assert_eq!(plugin.exposed(), ["tyde-skills:plain"]);
-        assert_eq!(outcome.refusals.len(), 2, "{:?}", outcome.refusals);
-        let gated = outcome
-            .refusals
-            .iter()
-            .find(|r| r.name == "gated")
-            .expect("gated");
-        assert!(
-            gated.reason.contains("allowed-tools") && gated.reason.contains("changes what"),
-            "{gated:?}"
-        );
-        let novel = outcome
-            .refusals
-            .iter()
-            .find(|r| r.name == "novel")
-            .expect("novel");
-        assert!(
-            novel.reason.contains("some-future-field") && novel.reason.contains("cannot prove"),
-            "a field Tyde has never heard of must be refused, not dropped: {novel:?}"
+        assert_eq!(
+            first, second,
+            "semantically identical mappings must produce identical wrapper bytes"
         );
     }
 
@@ -1561,8 +1592,8 @@ mod tests {
         let store = tmp.path().join("store");
         let skills = vec![store_skill(
             &store,
-            "hooky",
-            "---\nname: x\nhooks:\n  - y\n---\nb\n",
+            "malformed",
+            "---\nname: [not, a, string]\n---\nb\n",
         )];
 
         let outcome = ClaudeSkillPlugin::prepare(Some(tmp.path()), &skills).expect("prepare");
@@ -1958,7 +1989,8 @@ mod tests {
         // Leading blank lines, indentation, and trailing whitespace are all part
         // of a Markdown document's meaning; a wrapper must not reflow them.
         let body = "\n\n# Heading\n\n    indented block\n\nSee [art](art.md).\n\n- item\n   \n";
-        let rendered = render_skill_md("x", Some("d"), body);
+        let frontmatter = serde_yaml::from_str("description: d\n").expect("mapping");
+        let rendered = render_skill_md("x", frontmatter, body).expect("render");
 
         assert!(
             rendered.ends_with(body),

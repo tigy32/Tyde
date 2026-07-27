@@ -12753,37 +12753,55 @@ sys.exit(1)
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn an_explicit_selection_fails_closed_when_a_skill_cannot_be_exposed() {
+    async fn an_explicit_selection_with_full_frontmatter_prepares_successfully() {
         let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
         let cli = FakeClaudeCli::install(true, None);
         let tmp = tempfile::tempdir().expect("tempdir");
-        let good = skill_fixture(tmp.path(), "good", "---\nname: good\n---\nbody\n");
-        let broken = skill_fixture(
+        let incident = skill_fixture(
             tmp.path(),
-            "broken",
-            "---\nname: broken\nhooks:\n  - x\n---\nbody\n",
+            "axdb-ops",
+            concat!(
+                "---\n",
+                "name: source-name\n",
+                "description: Database operations.\n",
+                "allowed-tools: [Read, Grep, \"Bash(git *)\"]\n",
+                "user-invocable: true\n",
+                "hooks:\n",
+                "  PreToolUse:\n",
+                "    - matcher: Bash\n",
+                "      hooks: [{type: command, command: echo checked}]\n",
+                "some-future-field: {enabled: false}\n",
+                "---\n",
+                "body\n"
+            ),
         );
-        let config = spawn_config_with_skills(vec![good, broken], SkillSelection::Explicit);
+        let config = spawn_config_with_skills(vec![incident], SkillSelection::Explicit);
 
-        let err = claude_prepare_skills(&config, None, cli.workspace())
+        let (exposure, steering) = claude_prepare_skills(&config, None, cli.workspace())
             .await
-            .expect_err("an explicit selection must not start partially");
+            .expect("valid full frontmatter must reach plugin preflight");
 
-        assert!(err.contains("explicitly selected"), "{err}");
-        assert!(err.contains("broken"), "{err}");
-        assert!(err.contains("hooks"), "{err}");
+        assert_eq!(exposure.expected, ["tyde-skills:axdb-ops"]);
+        assert!(exposure.degraded_notice.is_none());
+        match steering {
+            ClaudeSkillSteering::Native(SkillSelection::Explicit, prepared) => {
+                assert_eq!(prepared.len(), 1);
+                assert_eq!(prepared[0].name, "axdb-ops");
+            }
+            other => panic!("expected explicit native steering, got {other:?}"),
+        }
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn an_explicit_selection_fails_closed_when_every_skill_is_refused() {
+    async fn an_explicit_selection_fails_closed_on_malformed_frontmatter() {
         let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
         let cli = FakeClaudeCli::install(true, None);
         let tmp = tempfile::tempdir().expect("tempdir");
         let broken = skill_fixture(
             tmp.path(),
             "broken",
-            "---\nname: b\nmcpServers:\n  x: {}\n---\nb\n",
+            "---\nname: [not, a, string]\n---\nb\n",
         );
         let config = spawn_config_with_skills(vec![broken], SkillSelection::Explicit);
 
@@ -12792,7 +12810,7 @@ sys.exit(1)
             .expect_err("an explicit selection must fail closed");
 
         assert!(err.contains("explicitly selected"), "{err}");
-        assert!(err.contains("mcpServers"), "{err}");
+        assert!(err.contains("field 'name' must be a YAML string"), "{err}");
     }
 
     #[cfg(unix)]
@@ -12805,7 +12823,7 @@ sys.exit(1)
         let broken = skill_fixture(
             tmp.path(),
             "broken",
-            "---\nname: broken\nhooks:\n  - x\n---\nbody\n",
+            "---\nname: broken\ndescription: [not, a, string]\n---\nbody\n",
         );
         let config = spawn_config_with_skills(vec![good, broken], SkillSelection::AllInstalled);
 
@@ -12819,7 +12837,10 @@ sys.exit(1)
             .as_deref()
             .expect("degradation must be user-visible");
         assert!(notice.contains("broken"), "{notice}");
-        assert!(notice.contains("hooks"), "{notice}");
+        assert!(
+            notice.contains("field 'description' must be a YAML string"),
+            "{notice}"
+        );
         assert!(
             !notice.contains("'good'"),
             "a skill that worked must not be reported as omitted: {notice}"
@@ -12839,11 +12860,7 @@ sys.exit(1)
         let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
         let cli = FakeClaudeCli::install(true, None);
         let tmp = tempfile::tempdir().expect("tempdir");
-        let broken = skill_fixture(
-            tmp.path(),
-            "broken",
-            "---\nname: b\nhooks:\n  - x\n---\nb\n",
-        );
+        let broken = skill_fixture(tmp.path(), "broken", "---\nname: {not: a string}\n---\nb\n");
         let config = spawn_config_with_skills(vec![broken], SkillSelection::AllInstalled);
 
         let (exposure, steering) = claude_prepare_skills(&config, None, cli.workspace())
