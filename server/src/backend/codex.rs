@@ -416,19 +416,10 @@ fn materialize_codex_skill(
     restrict_codex_directory(&wrapper_dir)?;
 
     let original = skill.load_body()?;
-    let instructional_body = parse_codex_skill_instructional_body(&original)
+    let parsed = parse_codex_skill_md(&original)
         .map_err(|err| format!("Selected Codex skill '{}': {err}", skill.name))?;
-    let description = skill.description.as_deref().unwrap_or(&skill.name);
-    let name = serde_json::to_string(&skill.name)
-        .map_err(|err| format!("Failed to quote Codex skill name '{}': {err}", skill.name))?;
-    let description = serde_json::to_string(description).map_err(|err| {
-        format!(
-            "Failed to quote Codex skill description '{}': {err}",
-            skill.name
-        )
-    })?;
-    let wrapper_body =
-        format!("---\nname: {name}\ndescription: {description}\n---\n{instructional_body}");
+    let wrapper_body = render_codex_skill_md(skill, parsed)
+        .map_err(|err| format!("Selected Codex skill '{}': {err}", skill.name))?;
     let wrapper_skill_md = wrapper_dir.join("SKILL.md");
     std::fs::write(&wrapper_skill_md, wrapper_body).map_err(|err| {
         format!(
@@ -489,23 +480,47 @@ fn discard_codex_skill_wrapper(projection_root: &Path, ordinal: usize) -> Result
     }
 }
 
-fn parse_codex_skill_instructional_body(body: &str) -> Result<&str, String> {
-    let body = body.strip_prefix('\u{feff}').unwrap_or(body);
-    let Some(rest) = body
-        .strip_prefix("---\n")
-        .or_else(|| body.strip_prefix("---\r\n"))
-    else {
-        return Ok(body);
+#[derive(Debug)]
+struct ParsedCodexSkillMd<'a> {
+    frontmatter: serde_yaml::Mapping,
+    description: Option<String>,
+    body: &'a str,
+}
+
+fn parse_codex_skill_md(raw: &str) -> Result<ParsedCodexSkillMd<'_>, String> {
+    let detected = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+    let mut lines = detected.split_inclusive('\n');
+    let Some(opening) = lines.next() else {
+        return Ok(ParsedCodexSkillMd {
+            frontmatter: serde_yaml::Mapping::new(),
+            description: None,
+            body: raw,
+        });
     };
-    let (frontmatter, instructional_body) = if let Some(index) = rest.find("\n---\n") {
-        (&rest[..index], &rest[index + 5..])
-    } else if let Some(index) = rest.find("\n---\r\n") {
-        (&rest[..index], &rest[index + 6..])
-    } else if let Some(frontmatter) = rest.strip_suffix("\n---") {
-        (frontmatter, "")
-    } else {
+    if codex_skill_line_contents(opening).trim() != "---" {
+        return Ok(ParsedCodexSkillMd {
+            frontmatter: serde_yaml::Mapping::new(),
+            description: None,
+            body: raw,
+        });
+    }
+
+    let frontmatter_start = opening.len();
+    let mut closing_start = frontmatter_start;
+    let mut closing_end = None;
+    for line in lines {
+        let end = closing_start + line.len();
+        if codex_skill_line_contents(line).trim() == "---" {
+            closing_end = Some(end);
+            break;
+        }
+        closing_start = end;
+    }
+    let Some(closing_end) = closing_end else {
         return Err("its SKILL.md opens a '---' frontmatter block that is never closed".to_owned());
     };
+
+    let frontmatter = &detected[frontmatter_start..closing_start];
     let value: serde_yaml::Value = serde_yaml::from_str(frontmatter)
         .map_err(|err| format!("its SKILL.md frontmatter is not valid YAML: {err}"))?;
     let mapping = match value {
@@ -513,26 +528,137 @@ fn parse_codex_skill_instructional_body(body: &str) -> Result<&str, String> {
         serde_yaml::Value::Null => serde_yaml::Mapping::new(),
         _ => return Err("its SKILL.md frontmatter is not a YAML mapping".to_owned()),
     };
-    let mut unsupported = Vec::new();
-    for key in mapping.keys() {
-        let Some(key) = key.as_str() else {
-            return Err("its SKILL.md frontmatter has a non-string key".to_owned());
+    validate_codex_skill_frontmatter(&mapping)?;
+    let description = mapping
+        .get("description")
+        .map(|value| {
+            value.as_str().map(str::to_owned).ok_or_else(|| {
+                "its SKILL.md frontmatter field 'description' must be a YAML string".to_owned()
+            })
+        })
+        .transpose()?;
+    if description
+        .as_deref()
+        .is_some_and(|description| codex_single_line(description).is_empty())
+    {
+        return Err("its SKILL.md frontmatter field 'description' must not be empty".to_owned());
+    }
+
+    Ok(ParsedCodexSkillMd {
+        frontmatter: mapping,
+        description,
+        body: &detected[closing_end..],
+    })
+}
+
+fn codex_skill_line_contents(line: &str) -> &str {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    line.strip_suffix('\r').unwrap_or(line)
+}
+
+fn validate_codex_skill_frontmatter(mapping: &serde_yaml::Mapping) -> Result<(), String> {
+    if mapping.keys().any(|key| {
+        matches!(
+            key,
+            serde_yaml::Value::Sequence(_) | serde_yaml::Value::Mapping(_)
+        )
+    }) {
+        return Err(
+            "its SKILL.md frontmatter has a collection-valued key that Codex cannot load"
+                .to_owned(),
+        );
+    }
+    if let Some(metadata) = mapping.get("metadata") {
+        let serde_yaml::Value::Mapping(metadata) = metadata else {
+            return Err(
+                "its SKILL.md frontmatter field 'metadata' must be a YAML mapping".to_owned(),
+            );
         };
-        if !matches!(
-            key.trim().to_ascii_lowercase().as_str(),
-            "name" | "description"
-        ) {
-            unsupported.push(key.trim().to_owned());
+        if let Some(short_description) = metadata.get("short-description")
+            && !matches!(
+                short_description,
+                serde_yaml::Value::String(_) | serde_yaml::Value::Null
+            )
+        {
+            return Err(
+                "its SKILL.md frontmatter field 'metadata.short-description' must be a YAML string"
+                    .to_owned(),
+            );
         }
     }
-    if !unsupported.is_empty() {
-        unsupported.sort();
-        return Err(format!(
-            "its SKILL.md frontmatter declares {}, which Tyde cannot prove is inert. Only 'name' and 'description' are carried into a Tyde wrapper",
-            unsupported.join(", ")
-        ));
+    Ok(())
+}
+
+fn render_codex_skill_md(
+    skill: &ResolvedSkill,
+    mut parsed: ParsedCodexSkillMd<'_>,
+) -> Result<String, String> {
+    parsed.frontmatter.remove("name");
+    parsed.frontmatter.insert(
+        serde_yaml::Value::String("name".to_owned()),
+        serde_yaml::Value::String(skill.name.clone()),
+    );
+    if parsed.description.is_none() {
+        let description = skill
+            .description
+            .as_deref()
+            .filter(|description| !codex_single_line(description).is_empty())
+            .unwrap_or(&skill.name);
+        parsed.frontmatter.insert(
+            serde_yaml::Value::String("description".to_owned()),
+            serde_yaml::Value::String(description.to_owned()),
+        );
     }
-    Ok(instructional_body)
+
+    let frontmatter =
+        canonicalize_codex_skill_yaml(serde_yaml::Value::Mapping(parsed.frontmatter))?;
+    let mut rendered = serde_yaml::to_string(&frontmatter)
+        .map_err(|err| format!("its SKILL.md frontmatter could not be serialized: {err}"))?;
+    if rendered.lines().any(|line| line.trim() == "---") {
+        return Err(
+            "its SKILL.md frontmatter serialized an ambiguous Codex '---' delimiter".to_owned(),
+        );
+    }
+    if !rendered.ends_with('\n') {
+        rendered.push('\n');
+    }
+    Ok(format!("---\n{rendered}---\n{}", parsed.body))
+}
+
+fn canonicalize_codex_skill_yaml(value: serde_yaml::Value) -> Result<serde_yaml::Value, String> {
+    match value {
+        serde_yaml::Value::Sequence(values) => values
+            .into_iter()
+            .map(canonicalize_codex_skill_yaml)
+            .collect::<Result<Vec<_>, _>>()
+            .map(serde_yaml::Value::Sequence),
+        serde_yaml::Value::Mapping(mapping) => {
+            let mut entries = Vec::with_capacity(mapping.len());
+            for (key, value) in mapping {
+                let key = canonicalize_codex_skill_yaml(key)?;
+                let value = canonicalize_codex_skill_yaml(value)?;
+                let sort_key = serde_yaml::to_string(&key).map_err(|err| {
+                    format!("its SKILL.md frontmatter key could not be serialized: {err}")
+                })?;
+                entries.push((sort_key, key, value));
+            }
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            let mut canonical = serde_yaml::Mapping::with_capacity(entries.len());
+            for (_, key, value) in entries {
+                canonical.insert(key, value);
+            }
+            Ok(serde_yaml::Value::Mapping(canonical))
+        }
+        serde_yaml::Value::Tagged(mut tagged) => {
+            tagged.value = canonicalize_codex_skill_yaml(tagged.value)?;
+            Ok(serde_yaml::Value::Tagged(tagged))
+        }
+        scalar => Ok(scalar),
+    }
+}
+
+fn codex_single_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(unix)]
@@ -14428,6 +14554,19 @@ def send(value):
     sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
     sys.stdout.flush()
 
+def yaml_scalar(value):
+    value = value.strip()
+    if value.startswith('"'):
+        try:
+            return json.loads(value)
+        except Exception:
+            return None
+    if value.startswith("'") and value.endswith("'"):
+        return value[1:-1].replace("''", "'")
+    if value in ("", "~", "null", "Null", "NULL"):
+        return None
+    return value
+
 def skill_metadata(skill_dir, enabled=True):
     skill_md = os.path.join(skill_dir, "SKILL.md")
     if not os.path.isfile(skill_md):
@@ -14445,12 +14584,28 @@ def skill_metadata(skill_dir, enabled=True):
         stripped = line.strip()
         if stripped == "---":
             break
-        if stripped.startswith("name:"):
-            name = stripped.split(":", 1)[1].strip().strip("\"'")
-        elif stripped.startswith("description:"):
-            description = stripped.split(":", 1)[1].strip().strip("\"'")
+        if not line or line[0].isspace() or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        if key == "name" and name is None:
+            name = yaml_scalar(value)
+        elif key == "description" and description is None:
+            description = yaml_scalar(value)
     if not name or not description:
         return None
+    for manifest in (".codex-plugin/plugin.json", ".claude-plugin/plugin.json"):
+        manifest_path = os.path.join(skill_dir, manifest)
+        if not os.path.isfile(manifest_path):
+            continue
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as body:
+                namespace = (json.load(body).get("name") or "").strip()
+        except Exception:
+            continue
+        if not namespace:
+            namespace = os.path.basename(skill_dir)
+        name = namespace + ":" + name
+        break
     return {
         "name": name,
         "description": description,
@@ -15204,6 +15359,414 @@ for line in sys.stdin:
             .map(PathBuf::from)
     }
 
+    fn codex_wrapper_parts(body: &str) -> (&str, &str) {
+        let rest = body
+            .strip_prefix("---\n")
+            .expect("wrapper frontmatter opener");
+        rest.split_once("\n---\n")
+            .expect("wrapper frontmatter closer")
+    }
+
+    fn codex_wrapper_mapping(body: &str) -> serde_yaml::Mapping {
+        let (frontmatter, _) = codex_wrapper_parts(body);
+        serde_yaml::from_str::<serde_yaml::Value>(frontmatter)
+            .expect("wrapper frontmatter YAML")
+            .as_mapping()
+            .expect("wrapper frontmatter mapping")
+            .clone()
+    }
+
+    fn yaml_string(mapping: &serde_yaml::Mapping, key: &str) -> String {
+        mapping
+            .get(key)
+            .and_then(serde_yaml::Value::as_str)
+            .unwrap_or_else(|| panic!("string frontmatter field {key}"))
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn codex_projection_preserves_full_frontmatter_semantics() {
+        let fake = CodexFakeAppServer::new("ok", "unused");
+        let native_home = tempfile::tempdir().expect("native Codex home");
+        let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
+            fake.binary.clone(),
+            Some(native_home.path().to_path_buf()),
+        );
+        let workspace = tempfile::tempdir().expect("workspace");
+        let store = tempfile::tempdir().expect("Tyde skill store");
+        let selected = vec![write_codex_raw_skill(
+            store.path(),
+            "rich-helper",
+            Some("Store description must not replace source"),
+            concat!(
+                "---\n",
+                "name: source-name-must-not-survive\n",
+                "Name: preserved-case-sensitive-unknown\n",
+                "description: Source description controls implicit matching\n",
+                "metadata:\n",
+                "  short-description: Source short description\n",
+                "allowed-tools: [Read, Bash]\n",
+                "future-field:\n",
+                "  enabled: true\n",
+                "  options: [one, two]\n",
+                "1: scalar-key-retained\n",
+                "delimiter-value: \"alpha\\n  ---  \\nomega\"\n",
+                "z-nested:\n",
+                "  name: nested-name-must-not-override-identity\n",
+                "  description: nested-description-must-not-override-source\n",
+                "---\n",
+                "RICH_BODY_SENTINEL\n",
+                "Read reference.md.\n",
+            ),
+        )];
+
+        let (session, mut raw_events) = CodexSession::spawn_with_mode(
+            &[workspace.path().to_string_lossy().to_string()],
+            None,
+            &[],
+            None,
+            codex_native_skill_spawn_options(&selected),
+        )
+        .await
+        .expect("valid rich frontmatter must remain discoverable");
+        assert!(
+            raw_events.try_recv().is_err(),
+            "valid rich frontmatter must not degrade"
+        );
+
+        let requests = fake.requests();
+        let methods = requests
+            .iter()
+            .filter_map(|request| request.get("method").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            vec![
+                "initialize",
+                "skills/list",
+                "skills/extraRoots/set",
+                "skills/list",
+                "thread/start",
+            ]
+        );
+        let projection = codex_extra_root(&requests).expect("projection root");
+        let wrapper = std::fs::read_to_string(projection.join("skill-00000").join("SKILL.md"))
+            .expect("rich wrapper");
+        let (rendered_frontmatter, rendered_body) = codex_wrapper_parts(&wrapper);
+        assert_eq!(rendered_body, "RICH_BODY_SENTINEL\nRead reference.md.\n");
+        assert!(
+            !rendered_frontmatter
+                .lines()
+                .any(|line| line.trim() == "---"),
+            "serialized frontmatter must not contain a Codex closing delimiter"
+        );
+
+        let mapping = codex_wrapper_mapping(&wrapper);
+        assert_eq!(yaml_string(&mapping, "name"), "rich-helper");
+        assert_eq!(
+            yaml_string(&mapping, "Name"),
+            "preserved-case-sensitive-unknown"
+        );
+        assert_eq!(
+            yaml_string(&mapping, "description"),
+            "Source description controls implicit matching"
+        );
+        assert_eq!(
+            mapping
+                .get("metadata")
+                .and_then(serde_yaml::Value::as_mapping)
+                .and_then(|metadata| metadata.get("short-description"))
+                .and_then(serde_yaml::Value::as_str),
+            Some("Source short description")
+        );
+        assert_eq!(
+            mapping.get("allowed-tools"),
+            Some(&serde_yaml::from_str("[Read, Bash]").expect("allowed-tools YAML"))
+        );
+        assert_eq!(
+            mapping
+                .get("future-field")
+                .and_then(serde_yaml::Value::as_mapping)
+                .and_then(|future| future.get("options")),
+            Some(&serde_yaml::from_str("[one, two]").expect("future options YAML"))
+        );
+        assert_eq!(
+            mapping
+                .get("z-nested")
+                .and_then(serde_yaml::Value::as_mapping)
+                .and_then(|nested| nested.get("name"))
+                .and_then(serde_yaml::Value::as_str),
+            Some("nested-name-must-not-override-identity")
+        );
+        assert_eq!(
+            mapping
+                .get("delimiter-value")
+                .and_then(serde_yaml::Value::as_str),
+            Some("alpha\n  ---  \nomega")
+        );
+        assert_eq!(
+            mapping
+                .get(serde_yaml::Value::Number(1.into()))
+                .and_then(serde_yaml::Value::as_str),
+            Some("scalar-key-retained")
+        );
+
+        session.shutdown().await;
+        assert!(!projection.exists());
+    }
+
+    #[test]
+    fn codex_projection_accepts_empty_comment_and_null_frontmatter() {
+        let projection = tempfile::tempdir().expect("projection");
+        let store = tempfile::tempdir().expect("Tyde skill store");
+        let fixtures = [
+            (
+                "empty",
+                Some("Empty fallback"),
+                "---\n---\nEMPTY_BODY\n",
+                "Empty fallback",
+                "EMPTY_BODY\n",
+            ),
+            (
+                "comment",
+                Some("Comment fallback"),
+                "---\n# comment only\n---\nCOMMENT_BODY\n",
+                "Comment fallback",
+                "COMMENT_BODY\n",
+            ),
+            (
+                "null",
+                None,
+                "---\n~\n---\nNULL_BODY\n",
+                "null",
+                "NULL_BODY\n",
+            ),
+            (
+                "bom-body",
+                Some("BOM fallback"),
+                "\u{feff}BOM_BODY\n",
+                "BOM fallback",
+                "\u{feff}BOM_BODY\n",
+            ),
+        ];
+
+        for (ordinal, (name, store_description, source, expected_description, expected_body)) in
+            fixtures.into_iter().enumerate()
+        {
+            let skill = write_codex_raw_skill(store.path(), name, store_description, source);
+            let wrapper = materialize_codex_skill(projection.path(), &skill, ordinal)
+                .unwrap_or_else(|err| panic!("{name} frontmatter must be accepted: {err}"));
+            let wrapper = std::fs::read_to_string(wrapper).expect("normalized wrapper");
+            let mapping = codex_wrapper_mapping(&wrapper);
+            assert_eq!(yaml_string(&mapping, "name"), name);
+            assert_eq!(yaml_string(&mapping, "description"), expected_description);
+            assert_eq!(codex_wrapper_parts(&wrapper).1, expected_body);
+        }
+    }
+
+    #[test]
+    fn codex_projection_uses_source_then_store_then_name_description() {
+        let projection = tempfile::tempdir().expect("projection");
+        let store = tempfile::tempdir().expect("Tyde skill store");
+        let fixtures = [
+            (
+                "source-wins",
+                Some("Store description"),
+                "---\nname: source\ndescription: Source description\n---\nSOURCE_BODY\n",
+                "Source description",
+            ),
+            (
+                "store-fallback",
+                Some("Store description"),
+                "---\nname: source\nfuture: true\n---\nSTORE_BODY\n",
+                "Store description",
+            ),
+            (
+                "name-fallback",
+                None,
+                "---\nname: source\nfuture: true\n---\nNAME_BODY\n",
+                "name-fallback",
+            ),
+        ];
+
+        for (ordinal, (name, store_description, source, expected_description)) in
+            fixtures.into_iter().enumerate()
+        {
+            let skill = write_codex_raw_skill(store.path(), name, store_description, source);
+            let wrapper = materialize_codex_skill(projection.path(), &skill, ordinal)
+                .unwrap_or_else(|err| panic!("{name} wrapper: {err}"));
+            let wrapper = std::fs::read_to_string(wrapper).expect("description wrapper");
+            let mapping = codex_wrapper_mapping(&wrapper);
+            assert_eq!(yaml_string(&mapping, "name"), name);
+            assert_eq!(yaml_string(&mapping, "description"), expected_description);
+            if name != "source-wins" {
+                assert_eq!(
+                    mapping.get("future").and_then(serde_yaml::Value::as_bool),
+                    Some(true)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_projection_rejects_only_frontmatter_codex_cannot_load() {
+        let fixtures = [
+            (
+                "---\n[one, two]\n---\nBODY\n",
+                "frontmatter is not a YAML mapping",
+            ),
+            (
+                "---\ndescription: true\n---\nBODY\n",
+                "field 'description' must be a YAML string",
+            ),
+            (
+                "---\ndescription: \"  \\t \"\n---\nBODY\n",
+                "field 'description' must not be empty",
+            ),
+            (
+                "---\nmetadata: text\n---\nBODY\n",
+                "field 'metadata' must be a YAML mapping",
+            ),
+            (
+                "---\nmetadata:\n  short-description: [one]\n---\nBODY\n",
+                "field 'metadata.short-description' must be a YAML string",
+            ),
+            (
+                "---\n? [one, two]\n: value\n---\nBODY\n",
+                "collection-valued key that Codex cannot load",
+            ),
+            (
+                "---\ndescription: [\n---\nBODY\n",
+                "frontmatter is not valid YAML",
+            ),
+            (
+                "---\ndescription: never closed\nBODY\n",
+                "frontmatter block that is never closed",
+            ),
+        ];
+
+        for (source, expected) in fixtures {
+            let err = parse_codex_skill_md(source).expect_err("invalid frontmatter must fail");
+            assert!(
+                err.contains(expected),
+                "expected {expected:?} in error for {source:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_projection_matches_trimmed_delimiters_and_preserves_body() {
+        let projection = tempfile::tempdir().expect("projection");
+        let store = tempfile::tempdir().expect("Tyde skill store");
+        let skill = write_codex_raw_skill(
+            store.path(),
+            "trimmed-delimiters",
+            Some("Store fallback"),
+            "  ---  \r\ndescription: Source delimiter description\nfuture: retained\r\n  ---  \r\nTRIMMED_BODY\r\n",
+        );
+
+        let wrapper = materialize_codex_skill(projection.path(), &skill, 0)
+            .expect("Codex-compatible trimmed delimiters");
+        let wrapper = std::fs::read_to_string(wrapper).expect("trimmed-delimiter wrapper");
+        let mapping = codex_wrapper_mapping(&wrapper);
+        assert_eq!(
+            yaml_string(&mapping, "description"),
+            "Source delimiter description"
+        );
+        assert_eq!(
+            mapping.get("future").and_then(serde_yaml::Value::as_str),
+            Some("retained")
+        );
+        assert_eq!(codex_wrapper_parts(&wrapper).1, "TRIMMED_BODY\r\n");
+    }
+
+    #[test]
+    fn codex_projection_rendering_is_deterministic() {
+        let first_projection = tempfile::tempdir().expect("first projection");
+        let second_projection = tempfile::tempdir().expect("second projection");
+        let store = tempfile::tempdir().expect("Tyde skill store");
+        let skill = write_codex_raw_skill(
+            store.path(),
+            "deterministic",
+            Some("Unused store fallback"),
+            "---\nz-last: true\ndescription: Source description\na-first:\n  z: 2\n  a: 1\nname: source\n---\nDETERMINISTIC_BODY\n",
+        );
+
+        let first = materialize_codex_skill(first_projection.path(), &skill, 0)
+            .expect("first deterministic wrapper");
+        let second = materialize_codex_skill(second_projection.path(), &skill, 0)
+            .expect("second deterministic wrapper");
+        assert_eq!(
+            std::fs::read(first).expect("first wrapper"),
+            std::fs::read(second).expect("second wrapper")
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_projection_exposes_claude_plugin_namespace_collision() {
+        let fake = CodexFakeAppServer::new("ok", "unused");
+        let native_home = tempfile::tempdir().expect("native Codex home");
+        let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
+            fake.binary.clone(),
+            Some(native_home.path().to_path_buf()),
+        );
+        let workspace = tempfile::tempdir().expect("workspace");
+        let store = tempfile::tempdir().expect("Tyde skill store");
+        let selected = write_codex_skill(store.path(), "plugin-bearing", "PLUGIN_BODY");
+        std::fs::create_dir(selected.source_dir.join(".claude-plugin"))
+            .expect("create Claude plugin manifest directory");
+        std::fs::write(
+            selected
+                .source_dir
+                .join(".claude-plugin")
+                .join("plugin.json"),
+            r#"{"name":"source-plugin"}"#,
+        )
+        .expect("write Claude plugin manifest");
+        let selected = vec![selected];
+
+        let result = CodexSession::spawn_with_mode(
+            &[workspace.path().to_string_lossy().to_string()],
+            None,
+            &[],
+            None,
+            codex_native_skill_spawn_options(&selected),
+        )
+        .await;
+        let err = match result {
+            Ok((session, _)) => {
+                session.shutdown().await;
+                panic!("plugin namespace collision must remain visible")
+            }
+            Err(err) => err,
+        };
+        assert!(
+            err.contains(
+                "Selected Codex skill 'plugin-bearing' must resolve to exactly one enabled entry"
+            ),
+            "unexpected collision error: {err}"
+        );
+        let methods = fake
+            .requests()
+            .into_iter()
+            .filter_map(|request| {
+                request
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            vec![
+                "initialize",
+                "skills/list",
+                "skills/extraRoots/set",
+                "skills/list",
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn codex_native_skills_are_selected_before_the_first_turn_and_cleaned() {
         let fake = CodexFakeAppServer::new("ok", "unused");
@@ -15307,7 +15870,8 @@ for line in sys.stdin:
             let wrapper = projection.join(format!("skill-{ordinal:05}"));
             let wrapper_body =
                 std::fs::read_to_string(wrapper.join("SKILL.md")).expect("wrapper SKILL.md");
-            assert!(wrapper_body.contains(&format!("name: \"{}\"", skill.name)));
+            let wrapper_mapping = codex_wrapper_mapping(&wrapper_body);
+            assert_eq!(yaml_string(&wrapper_mapping, "name"), skill.name);
             assert!(wrapper_body.contains(&format!("BODY_SENTINEL_{}", ['A', 'B'][ordinal])));
             assert_eq!(
                 std::fs::canonicalize(wrapper.join("reference.md"))
@@ -15376,7 +15940,7 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn codex_projection_normalizes_missing_and_mismatched_frontmatter() {
+    async fn codex_projection_preserves_source_description_and_normalizes_identity() {
         let fake = CodexFakeAppServer::new("ok", "unused");
         let native_home = tempfile::tempdir().expect("native Codex home");
         let _guard = CodexTestAppServerBinaryGuard::set_with_native_home(
@@ -15413,18 +15977,39 @@ for line in sys.stdin:
         let hidden_wrapper =
             std::fs::read_to_string(projection.join("skill-00000").join("SKILL.md"))
                 .expect("frontmatter-less wrapper");
-        assert!(hidden_wrapper.starts_with(
-            "---\nname: \".hidden-helper\"\ndescription: \"Hidden helper description\"\n---\n"
-        ));
-        assert!(hidden_wrapper.contains("FRONTMATTERLESS_INSTRUCTIONS"));
+        let hidden_mapping = codex_wrapper_mapping(&hidden_wrapper);
+        assert_eq!(yaml_string(&hidden_mapping, "name"), ".hidden-helper");
+        assert_eq!(
+            yaml_string(&hidden_mapping, "description"),
+            "Hidden helper description"
+        );
+        assert_eq!(
+            codex_wrapper_parts(&hidden_wrapper).1,
+            "FRONTMATTERLESS_INSTRUCTIONS\nRead reference.md.\n"
+        );
         let mismatch_wrapper =
             std::fs::read_to_string(projection.join("skill-00001").join("SKILL.md"))
                 .expect("mismatched wrapper");
-        assert!(mismatch_wrapper.starts_with(
-            "---\nname: \"store-helper\"\ndescription: \"Store helper description\"\n---\n"
-        ));
-        assert!(mismatch_wrapper.contains("MISMATCHED_INSTRUCTIONS"));
-        assert!(!mismatch_wrapper.contains("name: other-helper"));
+        let mismatch_mapping = codex_wrapper_mapping(&mismatch_wrapper);
+        assert_eq!(yaml_string(&mismatch_mapping, "name"), "store-helper");
+        // The rendered source value is "Wrong metadata". The old store-value
+        // assertion rejected correct behavior because Codex uses this field for
+        // implicit matching; only the wrapper's top-level name is authoritative.
+        assert_eq!(
+            yaml_string(&mismatch_mapping, "description"),
+            "Wrong metadata"
+        );
+        assert_eq!(
+            mismatch_mapping
+                .keys()
+                .filter(|key| key.as_str() == Some("name"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            codex_wrapper_parts(&mismatch_wrapper).1,
+            "MISMATCHED_INSTRUCTIONS\nRead reference.md.\n"
+        );
         for (ordinal, skill) in selected.iter().enumerate() {
             assert_eq!(
                 std::fs::canonicalize(
@@ -15984,8 +16569,10 @@ for line in sys.stdin:
         assert_eq!(wrappers.len(), 1);
         let wrapper = std::fs::read_to_string(wrappers[0].join("SKILL.md"))
             .expect("remaining wrapper SKILL.md");
-        assert!(wrapper.contains("name: \"available\""));
-        assert!(!wrapper.contains("name: \"collision\""));
+        assert_eq!(
+            yaml_string(&codex_wrapper_mapping(&wrapper), "name"),
+            "available"
+        );
         assert!(fake.requests().iter().any(|request| {
             request.get("method").and_then(Value::as_str) == Some("thread/start")
         }));
@@ -16043,10 +16630,11 @@ for line in sys.stdin:
                 .map(|entry| entry.expect("remaining wrapper").path())
                 .collect::<Vec<_>>();
             assert_eq!(wrappers.len(), 1);
-            assert!(
-                std::fs::read_to_string(wrappers[0].join("SKILL.md"))
-                    .expect("remaining SKILL.md")
-                    .contains("name: \"available\"")
+            let wrapper =
+                std::fs::read_to_string(wrappers[0].join("SKILL.md")).expect("remaining SKILL.md");
+            assert_eq!(
+                yaml_string(&codex_wrapper_mapping(&wrapper), "name"),
+                "available"
             );
             session.shutdown().await;
         }
@@ -16144,10 +16732,11 @@ for line in sys.stdin:
                 .map(|entry| entry.expect("remaining wrapper").path())
                 .collect::<Vec<_>>();
             assert_eq!(wrappers.len(), 1);
-            assert!(
-                std::fs::read_to_string(wrappers[0].join("SKILL.md"))
-                    .expect("remaining SKILL.md")
-                    .contains("name: \"available\"")
+            let wrapper =
+                std::fs::read_to_string(wrappers[0].join("SKILL.md")).expect("remaining SKILL.md");
+            assert_eq!(
+                yaml_string(&codex_wrapper_mapping(&wrapper), "name"),
+                "available"
             );
             assert!(
                 !projection.join("skill-00000").exists(),
@@ -16567,15 +17156,16 @@ for line in sys.stdin:
             .iter()
             .find(|projection| {
                 std::fs::read_to_string(projection.join("skill-00000").join("SKILL.md"))
-                    .is_ok_and(|body| body.contains("name: \"first\""))
+                    .is_ok_and(|body| yaml_string(&codex_wrapper_mapping(&body), "name") == "first")
             })
             .expect("first projection")
             .clone();
         let second_projection = projections
             .iter()
             .find(|projection| {
-                std::fs::read_to_string(projection.join("skill-00000").join("SKILL.md"))
-                    .is_ok_and(|body| body.contains("name: \"second\""))
+                std::fs::read_to_string(projection.join("skill-00000").join("SKILL.md")).is_ok_and(
+                    |body| yaml_string(&codex_wrapper_mapping(&body), "name") == "second",
+                )
             })
             .expect("second projection")
             .clone();
@@ -20418,8 +21008,8 @@ for line in sys.stdin:
             let selected = write_codex_raw_skill(
                 store.path(),
                 "live-wrapper-smoke",
-                Some("Required wrapper identity and linked-resource smoke"),
-                "---\nname: deliberately-wrong-source-name\ndescription: stale source metadata\n---\nWhen invoked, read reference.md and reply with exactly one line in this format: IDENTITY=live-wrapper-smoke RESOURCE=<the complete contents of reference.md>\n",
+                Some("Fallback description for the wrapper smoke"),
+                "---\nname: deliberately-wrong-source-name\ndescription: Live wrapper identity and linked-resource smoke\n---\nWhen invoked, read reference.md and reply with exactly one line in this format: IDENTITY=live-wrapper-smoke RESOURCE=<the complete contents of reference.md>\n",
             );
             std::fs::write(
                 selected.source_dir.join("reference.md"),
