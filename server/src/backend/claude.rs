@@ -12482,6 +12482,27 @@ mod tests {
         )
     }
 
+    fn prepared_wrapper_frontmatter(
+        exposure: &ClaudeSkillExposure,
+        wrapper_name: &str,
+    ) -> serde_yaml::Mapping {
+        let plugin = exposure.plugin.as_ref().expect("prepared plugin");
+        let raw = std::fs::read_to_string(
+            plugin
+                .root()
+                .join("skills")
+                .join(wrapper_name)
+                .join("SKILL.md"),
+        )
+        .expect("prepared wrapper");
+        let rest = raw.strip_prefix("---\n").expect("frontmatter opener");
+        let (frontmatter, _) = rest.split_once("\n---\n").expect("frontmatter closer");
+        match serde_yaml::from_str(frontmatter).expect("valid wrapper YAML") {
+            serde_yaml::Value::Mapping(mapping) => mapping,
+            other => panic!("wrapper frontmatter is not a mapping: {other:?}"),
+        }
+    }
+
     fn spawn_config_with_skills(
         skills: Vec<ResolvedSkill>,
         skill_selection: SkillSelection,
@@ -12763,7 +12784,6 @@ sys.exit(1)
             concat!(
                 "---\n",
                 "name: source-name\n",
-                "description: Database operations.\n",
                 "allowed-tools: [Read, Grep, \"Bash(git *)\"]\n",
                 "user-invocable: true\n",
                 "hooks:\n",
@@ -12783,6 +12803,13 @@ sys.exit(1)
 
         assert_eq!(exposure.expected, ["tyde-skills:axdb-ops"]);
         assert!(exposure.degraded_notice.is_none());
+        assert_eq!(
+            prepared_wrapper_frontmatter(&exposure, "axdb-ops")
+                .get("description")
+                .and_then(|value| value.as_str()),
+            Some("axdb-ops summary"),
+            "Explicit preparation must inject the real store description fallback"
+        );
         match steering {
             ClaudeSkillSteering::Native(SkillSelection::Explicit, prepared) => {
                 assert_eq!(prepared.len(), 1);
@@ -12801,7 +12828,7 @@ sys.exit(1)
         let broken = skill_fixture(
             tmp.path(),
             "broken",
-            "---\nname: [not, a, string]\n---\nb\n",
+            "---\nname: broken\nsequence: [never closed\n---\nb\n",
         );
         let config = spawn_config_with_skills(vec![broken], SkillSelection::Explicit);
 
@@ -12810,7 +12837,7 @@ sys.exit(1)
             .expect_err("an explicit selection must fail closed");
 
         assert!(err.contains("explicitly selected"), "{err}");
-        assert!(err.contains("field 'name' must be a YAML string"), "{err}");
+        assert!(err.contains("not valid YAML"), "{err}");
     }
 
     #[cfg(unix)]
@@ -12820,11 +12847,7 @@ sys.exit(1)
         let cli = FakeClaudeCli::install(true, None);
         let tmp = tempfile::tempdir().expect("tempdir");
         let good = skill_fixture(tmp.path(), "good", "---\nname: good\n---\nbody\n");
-        let broken = skill_fixture(
-            tmp.path(),
-            "broken",
-            "---\nname: broken\ndescription: [not, a, string]\n---\nbody\n",
-        );
+        let broken = skill_fixture(tmp.path(), "broken", "---\njust a scalar\n---\nbody\n");
         let config = spawn_config_with_skills(vec![good, broken], SkillSelection::AllInstalled);
 
         let (exposure, steering) = claude_prepare_skills(&config, None, cli.workspace())
@@ -12837,10 +12860,7 @@ sys.exit(1)
             .as_deref()
             .expect("degradation must be user-visible");
         assert!(notice.contains("broken"), "{notice}");
-        assert!(
-            notice.contains("field 'description' must be a YAML string"),
-            "{notice}"
-        );
+        assert!(notice.contains("not a YAML mapping"), "{notice}");
         assert!(
             !notice.contains("'good'"),
             "a skill that worked must not be reported as omitted: {notice}"
@@ -12852,6 +12872,13 @@ sys.exit(1)
             }
             other => panic!("expected native steering, got {other:?}"),
         }
+        assert_eq!(
+            prepared_wrapper_frontmatter(&exposure, "good")
+                .get("description")
+                .and_then(|value| value.as_str()),
+            Some("good summary"),
+            "Default preparation must inject the real store description fallback"
+        );
     }
 
     #[cfg(unix)]
@@ -12860,7 +12887,11 @@ sys.exit(1)
         let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
         let cli = FakeClaudeCli::install(true, None);
         let tmp = tempfile::tempdir().expect("tempdir");
-        let broken = skill_fixture(tmp.path(), "broken", "---\nname: {not: a string}\n---\nb\n");
+        let broken = skill_fixture(
+            tmp.path(),
+            "broken",
+            "---\nname: broken\nbody without a closing delimiter\n",
+        );
         let config = spawn_config_with_skills(vec![broken], SkillSelection::AllInstalled);
 
         let (exposure, steering) = claude_prepare_skills(&config, None, cli.workspace())
@@ -12876,6 +12907,13 @@ sys.exit(1)
                 .expect("a notice")
                 .contains("broken"),
             "starting with no skills must never be silent"
+        );
+        assert!(
+            exposure
+                .degraded_notice
+                .as_deref()
+                .expect("a notice")
+                .contains("never closed")
         );
         assert!(matches!(steering, ClaudeSkillSteering::None));
     }
