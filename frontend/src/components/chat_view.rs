@@ -1623,6 +1623,7 @@ mod wasm_tests {
 
         let agent_id = AgentId("agent-virt".to_owned());
         let host_id = "host-virt".to_owned();
+        let tab_id = TabId(10_002);
         // 200 rows is well above the viewport / overscan budget at any
         // row height — this confirms windowing engaged, not just that
         // the test container happened to be too small.
@@ -1643,42 +1644,28 @@ mod wasm_tests {
             state.chat_rows.update(|m| {
                 m.insert(agent_id_for_mount.clone(), rows);
             });
+            // This test owns a top-anchored viewport, so seed that user intent
+            // before mounting. Waiting for sticky-bottom and then scrolling
+            // raced its deferred mount callback under full-suite load.
+            state.save_tab_scroll_state(
+                tab_id,
+                TabScrollState {
+                    scroll_top: 0,
+                    scroll_height: 40_000,
+                    client_height: 600,
+                    user_scrolled_up: true,
+                },
+            );
             provide_context(state);
             let agent_ref_signal = Signal::derive(move || Some(bound.clone()));
             let is_active_signal: Signal<bool> = Signal::derive(|| true);
-            view! { <ChatView tab_id=TabId(10_002) agent_ref=agent_ref_signal is_active=is_active_signal /> }
+            view! { <ChatView tab_id=tab_id agent_ref=agent_ref_signal is_active=is_active_signal /> }
         });
 
         next_tick().await;
         // Second tick lets the viewport ResizeObserver and per-row
         // ResizeObservers fire so the visible-window Memo recomputes
         // against measured heights rather than the 200px estimate.
-        next_tick().await;
-        let scroller: HtmlElement = container
-            .query_selector(".chat-messages")
-            .unwrap()
-            .expect("chat scroller present")
-            .dyn_into()
-            .unwrap();
-        // Production chat views sticky-scroll to the bottom on mount when
-        // the user has not explicitly scrolled up. This test is about the
-        // top-window geometry, so force that scroll position before
-        // asserting that the unmounted suffix is represented by the
-        // bottom spacer.
-        scroller.set_scroll_top(0);
-        // `set_scroll_top` moves the DOM, but the windowing Memo only
-        // re-anchors to the top once the production `scroll` listener
-        // observes the new position (updating `scroll_top_sig`) and marks
-        // `user_scrolled_up`, which stops sticky-bottom auto-scroll from
-        // re-pinning to the end. The browser dispatches `scroll`
-        // asynchronously; under full-suite event-loop load that dispatch
-        // can land after the assertion, leaving the list bottom-anchored
-        // (bottom spacer 0px). Dispatch it synchronously so the
-        // scrolled-to-top precondition is deterministic — this drives the
-        // exact same listener the browser would.
-        scroller
-            .dispatch_event(&web_sys::Event::new("scroll").unwrap())
-            .unwrap();
         next_tick().await;
 
         let mounted = message_rows(&container);

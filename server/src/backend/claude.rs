@@ -18316,6 +18316,7 @@ for raw_line in sys.stdin:
             },
         })
         os.close(0)
+        log("STDIN_CLOSED " + str(process_number))
         time.sleep(60)
         sys.exit(0)
     emit({
@@ -18408,6 +18409,26 @@ for raw_line in sys.stdin:
         })
         .await
         .expect("AskUserQuestion ToolRequest should arrive");
+
+        // Receiving the ToolRequest proves only that stdout was flushed; the
+        // fake closes stdin afterward. Wait for its retained marker so this
+        // test exercises an actual broken pipe instead of racing that close.
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if std::fs::read_to_string(&log)
+                    .unwrap_or_default()
+                    .contains("STDIN_CLOSED 1")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            let log_contents = std::fs::read_to_string(&log).unwrap_or_default();
+            panic!("fake Claude must close stdin before the answer: {log_contents}");
+        });
 
         assert!(
             backend
