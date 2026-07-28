@@ -234,12 +234,11 @@ impl WebContentRecoveryPolicy {
         }
         if self.reload_pending {
             self.terminated_while_pending = true;
-            if self.readiness_notice_presented {
-                self.failure_presented = true;
-                self.readiness_deadline_epoch = self.readiness_deadline_epoch.wrapping_add(1);
+            self.frontend_visible = None;
+            if let Some(failure) = self.escalate_repeated_termination_if_observable() {
                 return RecoveryDecision::Escalate {
                     generation: self.generation,
-                    failure: RecoveryFailure::RepeatedTermination,
+                    failure,
                 };
             }
             return RecoveryDecision::Suppress {
@@ -266,6 +265,7 @@ impl WebContentRecoveryPolicy {
         self.frontend_ready = false;
         self.readiness_notice_presented = false;
         self.terminated_while_pending = false;
+        self.frontend_visible = None;
         self.readiness_deadline_epoch = self.readiness_deadline_epoch.wrapping_add(1);
         RecoveryDecision::Reload {
             generation: self.generation,
@@ -274,6 +274,13 @@ impl WebContentRecoveryPolicy {
 
     fn page_load_started(&mut self) {
         if self.reload_pending {
+            self.frontend_visible = None;
+            if self.terminated_while_pending {
+                self.terminated_while_pending = false;
+                self.failure_presented = false;
+                self.readiness_notice_presented = false;
+                self.readiness_deadline_epoch = self.readiness_deadline_epoch.wrapping_add(1);
+            }
             self.page_load_finished = false;
             self.frontend_ready = false;
         }
@@ -293,7 +300,6 @@ impl WebContentRecoveryPolicy {
         if self.page_load_finished && self.frontend_ready && !self.terminated_while_pending {
             self.reload_pending = false;
             self.readiness_notice_presented = false;
-            self.terminated_while_pending = false;
             self.readiness_deadline_epoch = self.readiness_deadline_epoch.wrapping_add(1);
         }
     }
@@ -348,6 +354,19 @@ impl WebContentRecoveryPolicy {
         self.frontend_visible == Some(false) || self.native_window_focused == Some(false)
     }
 
+    fn escalate_repeated_termination_if_observable(&mut self) -> Option<RecoveryFailure> {
+        if !self.reload_pending
+            || !self.terminated_while_pending
+            || self.failure_presented
+            || self.readiness_is_deferred()
+        {
+            return None;
+        }
+        self.failure_presented = true;
+        self.readiness_deadline_epoch = self.readiness_deadline_epoch.wrapping_add(1);
+        Some(RecoveryFailure::RepeatedTermination)
+    }
+
     fn readiness_deadline_elapsed(
         &mut self,
         ticket: RecoveryDeadlineTicket,
@@ -362,9 +381,7 @@ impl WebContentRecoveryPolicy {
             return None;
         }
         if self.terminated_while_pending {
-            self.failure_presented = true;
-            self.readiness_deadline_epoch = self.readiness_deadline_epoch.wrapping_add(1);
-            Some(RecoveryFailure::RepeatedTermination)
+            self.escalate_repeated_termination_if_observable()
         } else {
             self.readiness_notice_presented = true;
             Some(RecoveryFailure::ReadinessDeadline)
@@ -988,15 +1005,18 @@ fn report_frontend_lifecycle(
     event: FrontendLifecycleEvent,
 ) {
     let label = webview.label().to_owned();
-    let ticket = event.visible().and_then(|visible| {
+    let (ticket, failure, generation) = event.visible().map_or((None, None, 0), |visible| {
         with_recovery_policies(&state.web_content_recovery, |policies| {
-            policies
-                .for_label(&label)
-                .frontend_visibility_changed(visible)
+            let policy = policies.for_label(&label);
+            let ticket = policy.frontend_visibility_changed(visible);
+            let failure = policy.escalate_repeated_termination_if_observable();
+            (ticket, failure, policy.generation)
         })
     });
     tracing::info!("webview.lifecycle event={} label={label}", event.as_str());
-    if let Some(ticket) = ticket {
+    if let Some(failure) = failure {
+        show_web_content_recovery_notice(webview.app_handle().clone(), label, generation, failure);
+    } else if let Some(ticket) = ticket {
         schedule_recovery_readiness_deadline(
             webview.app_handle().clone(),
             label,
@@ -1056,15 +1076,22 @@ pub fn run() {
         .plugin(external_link_guard())
         .plugin(tauri_plugin_dialog::init())
         .on_page_load(move |webview, payload| {
-            let label = webview.label();
-            let generation = with_recovery_policies(&recovery_for_page_load, |policies| {
-                let policy = policies.for_label(label);
-                match payload.event() {
-                    PageLoadEvent::Started => policy.page_load_started(),
-                    PageLoadEvent::Finished => policy.page_load_finished(),
-                }
-                policy.generation
-            });
+            let label = webview.label().to_owned();
+            let (generation, ticket) =
+                with_recovery_policies(&recovery_for_page_load, |policies| {
+                    let policy = policies.for_label(&label);
+                    let ticket = match payload.event() {
+                        PageLoadEvent::Started => {
+                            policy.page_load_started();
+                            policy.start_readiness_deadline(policy.generation)
+                        }
+                        PageLoadEvent::Finished => {
+                            policy.page_load_finished();
+                            None
+                        }
+                    };
+                    (policy.generation, ticket)
+                });
             let event = match payload.event() {
                 PageLoadEvent::Started => "page_load_started",
                 PageLoadEvent::Finished => "page_load_finished",
@@ -1073,6 +1100,14 @@ pub fn run() {
                 "webview.lifecycle event={event} label={} generation={generation}",
                 webview.label()
             );
+            if let Some(ticket) = ticket {
+                schedule_recovery_readiness_deadline(
+                    webview.app_handle().clone(),
+                    label,
+                    ticket,
+                    recovery_for_page_load.clone(),
+                );
+            }
         })
         .on_window_event(move |window, event| match event {
             WindowEvent::Focused(focused) => {
@@ -1081,12 +1116,21 @@ pub fn run() {
                     window.label()
                 );
                 let label = window.label().to_owned();
-                let ticket = with_recovery_policies(&recovery_for_window, |policies| {
-                    policies
-                        .for_label(&label)
-                        .native_window_focus_changed(*focused)
-                });
-                if let Some(ticket) = ticket {
+                let (ticket, failure, generation) =
+                    with_recovery_policies(&recovery_for_window, |policies| {
+                        let policy = policies.for_label(&label);
+                        let ticket = policy.native_window_focus_changed(*focused);
+                        let failure = policy.escalate_repeated_termination_if_observable();
+                        (ticket, failure, policy.generation)
+                    });
+                if let Some(failure) = failure {
+                    show_web_content_recovery_notice(
+                        window.app_handle().clone(),
+                        label,
+                        generation,
+                        failure,
+                    );
+                } else if let Some(ticket) = ticket {
                     schedule_recovery_readiness_deadline(
                         window.app_handle().clone(),
                         label,
@@ -1119,9 +1163,7 @@ pub fn run() {
                 || window.is_focused().is_ok_and(|focused| !focused);
             let decision = with_recovery_policies(&recovery_for_termination, |policies| {
                 let policy = policies.for_label(&label);
-                if native_window_obscured {
-                    policy.native_window_focus_changed(false);
-                }
+                policy.native_window_focus_changed(!native_window_obscured);
                 policy.web_content_process_terminated(Instant::now())
             });
             match decision {
@@ -1321,6 +1363,10 @@ mod web_content_recovery_tests {
 
         policy.page_load_started();
         policy.page_load_finished();
+        // A second termination now records observed failure state, so invoking it
+        // here would mutate the recovery this test is proving. This direct state
+        // assertion more precisely preserves the original not-ready contract;
+        // repeated-termination suppression and escalation are pinned below.
         assert!(policy.reload_pending);
         policy.frontend_ready();
         assert_eq!(
@@ -1340,6 +1386,9 @@ mod web_content_recovery_tests {
         ));
 
         policy.frontend_ready();
+        // As above, probing with another termination would poison the ordering
+        // test by recording a real second death. Pending state is the stronger
+        // assertion for this phase; the dedicated sequence test owns Suppress.
         assert!(policy.reload_pending);
 
         policy.page_load_finished();
@@ -1435,7 +1484,7 @@ mod web_content_recovery_tests {
     }
 
     #[test]
-    fn second_termination_becomes_an_observed_failure_at_the_deadline() {
+    fn second_termination_escalates_now_or_on_the_next_observable_edge() {
         let now = Instant::now();
         let mut policy = WebContentRecoveryPolicy::default();
         assert_eq!(
@@ -1447,20 +1496,26 @@ mod web_content_recovery_tests {
             .expect("the first observed death starts recovery");
         assert_eq!(
             policy.web_content_process_terminated(now + Duration::from_secs(2)),
-            RecoveryDecision::Suppress {
+            RecoveryDecision::Escalate {
                 generation: 1,
-                terminated_while_pending: true,
+                failure: RecoveryFailure::RepeatedTermination,
             }
         );
+        assert_eq!(policy.readiness_deadline_elapsed(ticket), None);
         policy.page_load_finished();
         policy.frontend_ready();
         assert!(
             policy.reload_pending,
             "stale readiness acknowledgements cannot erase an observed second death"
         );
+        policy.page_load_started();
+        policy.page_load_finished();
+        policy.frontend_ready();
+        assert!(!policy.reload_pending);
         assert_eq!(
-            policy.readiness_deadline_elapsed(ticket),
-            Some(RecoveryFailure::RepeatedTermination)
+            policy.web_content_process_terminated(now + Duration::from_secs(3)),
+            RecoveryDecision::Reload { generation: 2 },
+            "a confirmed new load sequence clears stale second-death evidence"
         );
         match recovery_dialog_buttons(RecoveryFailure::RepeatedTermination) {
             MessageDialogButtons::OkCancelCustom(restart, keep_waiting) => {
@@ -1484,24 +1539,29 @@ mod web_content_recovery_tests {
             buttons => panic!("unexpected repeated-termination buttons: {buttons:?}"),
         }
 
-        let mut after_advisory = WebContentRecoveryPolicy::default();
+        let mut hidden = WebContentRecoveryPolicy::default();
+        hidden.native_window_focus_changed(false);
         assert!(matches!(
-            after_advisory.web_content_process_terminated(now),
+            hidden.web_content_process_terminated(now),
             RecoveryDecision::Reload { generation: 1 }
         ));
-        let advisory_ticket = after_advisory.start_readiness_deadline(1).unwrap();
         assert_eq!(
-            after_advisory.readiness_deadline_elapsed(advisory_ticket),
-            Some(RecoveryFailure::ReadinessDeadline)
-        );
-        assert_eq!(
-            after_advisory.web_content_process_terminated(now + Duration::from_secs(16)),
-            RecoveryDecision::Escalate {
+            hidden.web_content_process_terminated(now + Duration::from_secs(2)),
+            RecoveryDecision::Suppress {
                 generation: 1,
-                failure: RecoveryFailure::RepeatedTermination,
+                terminated_while_pending: true,
             },
-            "a second death after the advisory must surface immediately"
+            "an observed failure remains deferred while the window is not observable"
         );
+        let stale_ticket = hidden
+            .native_window_focus_changed(true)
+            .expect("the observable edge initially creates a deadline ticket");
+        assert_eq!(
+            hidden.escalate_repeated_termination_if_observable(),
+            Some(RecoveryFailure::RepeatedTermination),
+            "the observed failure surfaces on the first observable edge"
+        );
+        assert_eq!(hidden.readiness_deadline_elapsed(stale_ticket), None);
     }
 
     #[test]
@@ -1613,6 +1673,9 @@ mod web_content_recovery_tests {
     fn recovery_state_is_scoped_by_webview_label() {
         let now = Instant::now();
         let mut policies = WebContentRecoveryPolicies::default();
+        policies
+            .for_label("main")
+            .native_window_focus_changed(false);
         assert!(matches!(
             policies
                 .for_label("main")
