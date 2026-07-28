@@ -393,9 +393,9 @@ impl PersistedComposerDraftStore {
         DraftStoreUpdate::Stored { evicted }
     }
 
-    fn encoded_len(&self) -> usize {
+    fn encoded_len(&self) -> Result<usize, serde_json::Error> {
         record_composer_draft_serialization();
-        serde_json::to_vec(self).map_or(usize::MAX, |encoded| encoded.len())
+        serde_json::to_vec(self).map(|encoded| encoded.len())
     }
 
     fn pop_lru(&mut self) {
@@ -424,23 +424,47 @@ impl PersistedComposerDraftStore {
         evicted
     }
 
-    fn finalize_bounds(&mut self) -> usize {
-        let mut evicted = self.enforce_tracked_bounds();
-        let before_retain = self.entries.len();
+    fn finalize_bounds(&mut self) -> DraftBoundsOutcome {
+        let mut outcome = DraftBoundsOutcome {
+            evicted: self.enforce_tracked_bounds(),
+            ..DraftBoundsOutcome::default()
+        };
+        let mut index = 0;
         self.entries.retain(|draft| {
-            serialized_composer_draft_len(draft)
-                .is_some_and(|bytes| bytes <= MAX_PERSISTED_COMPOSER_DRAFT_ENTRY_BYTES)
+            let keep = match serialized_composer_draft_len(draft) {
+                Some(bytes) => bytes <= MAX_PERSISTED_COMPOSER_DRAFT_ENTRY_BYTES,
+                None => {
+                    outcome.failure = Some(DraftPersistenceFailure::Encoding);
+                    false
+                }
+            };
+            if !keep {
+                outcome.evicted += 1;
+                outcome.active_entry_too_large |= index == 0;
+            }
+            index += 1;
+            keep
         });
-        evicted += before_retain - self.entries.len();
         self.total_text_bytes = self.entries.iter().map(|draft| draft.text.len()).sum();
 
-        while !self.entries.is_empty()
-            && self.encoded_len() > MAX_PERSISTED_COMPOSER_DRAFT_TOTAL_BYTES
-        {
-            self.pop_lru();
-            evicted += 1;
+        loop {
+            match self.encoded_len() {
+                Ok(bytes) if bytes <= MAX_PERSISTED_COMPOSER_DRAFT_TOTAL_BYTES => break,
+                Ok(_) if !self.entries.is_empty() => {
+                    self.pop_lru();
+                    outcome.evicted += 1;
+                }
+                Ok(_) => {
+                    outcome.failure = Some(DraftPersistenceFailure::ExactSizeBackstop);
+                    break;
+                }
+                Err(_) => {
+                    outcome.failure = Some(DraftPersistenceFailure::Encoding);
+                    break;
+                }
+            }
         }
-        evicted
+        outcome
     }
 }
 
@@ -449,6 +473,29 @@ impl PersistedComposerDraftStore {
 enum DraftStoreUpdate {
     Stored { evicted: usize },
     EntryTooLarge,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DraftBoundsOutcome {
+    evicted: usize,
+    active_entry_too_large: bool,
+    failure: Option<DraftPersistenceFailure>,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DraftPersistenceFailure {
+    Encoding,
+    ExactSizeBackstop,
+    StorageWrite,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DraftPersistenceOutcome {
+    bounds: DraftBoundsOutcome,
+    failure: Option<DraftPersistenceFailure>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -546,48 +593,120 @@ fn load_composer_drafts() -> PersistedComposerDraftStore {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn persist_composer_drafts(drafts: &mut PersistedComposerDraftStore) -> usize {
-    let evicted = drafts.finalize_bounds();
+fn persist_composer_drafts(drafts: &mut PersistedComposerDraftStore) -> DraftPersistenceOutcome {
+    let bounds = drafts.finalize_bounds();
+    let mut outcome = DraftPersistenceOutcome {
+        failure: bounds.failure,
+        bounds,
+    };
     let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
     else {
-        return evicted;
+        log::warn!("composer draft storage is unavailable");
+        outcome.failure = Some(DraftPersistenceFailure::StorageWrite);
+        return outcome;
     };
     if drafts.entries.is_empty() {
-        let _ = storage.remove_item(COMPOSER_DRAFT_STORAGE_KEY);
-        return evicted;
+        if let Err(error) = storage.remove_item(COMPOSER_DRAFT_STORAGE_KEY) {
+            log::warn!("failed to clear composer draft store: {error:?}");
+            outcome.failure = Some(DraftPersistenceFailure::StorageWrite);
+        }
+        return outcome;
     }
     match serialize_composer_draft_store(drafts) {
         Ok(encoded) => {
             if encoded.len() > MAX_PERSISTED_COMPOSER_DRAFT_TOTAL_BYTES {
                 log::error!("bounded composer draft store exceeded its total limit");
-                return evicted;
+                let _ = storage.remove_item(COMPOSER_DRAFT_STORAGE_KEY);
+                outcome.failure = Some(DraftPersistenceFailure::ExactSizeBackstop);
+                return outcome;
             }
             if let Err(error) = storage.set_item(COMPOSER_DRAFT_STORAGE_KEY, &encoded) {
                 log::warn!("failed to persist composer draft store: {error:?}");
+                outcome.failure = Some(DraftPersistenceFailure::StorageWrite);
             }
         }
-        Err(error) => log::warn!("failed to encode composer draft store: {error}"),
+        Err(error) => {
+            log::warn!("failed to encode composer draft store: {error}");
+            let _ = storage.remove_item(COMPOSER_DRAFT_STORAGE_KEY);
+            outcome.failure = Some(DraftPersistenceFailure::Encoding);
+        }
     }
-    evicted
+    outcome
 }
 
 #[cfg(target_arch = "wasm32")]
-fn notify_composer_draft_eviction(notified: RwSignal<bool>, evicted: usize) {
-    if evicted == 0 {
-        return;
-    }
-    log::warn!("composer draft bounds evicted {evicted} entries");
+fn notify_composer_draft_limit(notified: RwSignal<bool>) {
     if notified.get_untracked() {
         return;
     }
     notified.set(true);
     wasm_bindgen_futures::spawn_local(async {
         crate::bridge::message_dialog(
-            "Draft recovery limit reached",
-            "Tyde reached its bounded crash-recovery storage limit. Older or oversized drafts were removed from recovery storage.",
+            "Draft is too large to protect",
+            "This draft exceeds Tyde's crash-recovery storage limit after safe encoding. Shorten it before relying on automatic draft recovery.",
         )
         .await;
     });
+}
+
+#[cfg(target_arch = "wasm32")]
+fn notify_composer_draft_eviction(notified: RwSignal<bool>, evicted: usize) {
+    if evicted == 0 || notified.get_untracked() {
+        return;
+    }
+    notified.set(true);
+    wasm_bindgen_futures::spawn_local(async {
+        crate::bridge::message_dialog(
+            "Draft recovery limit reached",
+            "Tyde reached its bounded crash-recovery storage limit. Older drafts were removed from recovery storage.",
+        )
+        .await;
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+fn notify_composer_draft_persistence_failure(
+    notified: RwSignal<bool>,
+    failure: DraftPersistenceFailure,
+) {
+    log::error!("composer draft persistence failed: {failure:?}");
+    if notified.get_untracked() {
+        return;
+    }
+    notified.set(true);
+    wasm_bindgen_futures::spawn_local(async {
+        crate::bridge::message_dialog(
+            "Draft recovery could not be updated",
+            "Tyde could not safely update its bounded crash-recovery storage. Your current draft remains visible, but it may not be available after a reload.",
+        )
+        .await;
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+fn surface_composer_draft_persistence_outcome(
+    pending_evictions: RwSignal<usize>,
+    eviction_notified: RwSignal<bool>,
+    limit_notified: RwSignal<bool>,
+    failure_notified: RwSignal<bool>,
+    outcome: DraftPersistenceOutcome,
+) {
+    let pending = pending_evictions
+        .try_update(std::mem::take)
+        .unwrap_or_default();
+    let evicted = pending.saturating_add(outcome.bounds.evicted);
+    if evicted > 0 {
+        log::warn!("composer draft bounds evicted {evicted} entries");
+    }
+    if let Some(failure) = outcome.failure {
+        notify_composer_draft_persistence_failure(failure_notified, failure);
+    } else if outcome.bounds.active_entry_too_large {
+        notify_composer_draft_limit(limit_notified);
+    } else {
+        limit_notified.set(false);
+        failure_notified.set(false);
+        notify_composer_draft_eviction(eviction_notified, evicted);
+    }
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
@@ -659,7 +778,11 @@ mod composer_draft_tests {
                 "keystroke-time upserts must not serialize entries or the store"
             );
         });
-        assert!(byte_bounded.encoded_len() <= MAX_PERSISTED_COMPOSER_DRAFT_TOTAL_BYTES);
+        assert!(
+            byte_bounded
+                .encoded_len()
+                .is_ok_and(|bytes| bytes <= MAX_PERSISTED_COMPOSER_DRAFT_TOTAL_BYTES)
+        );
         assert_eq!(
             byte_bounded.upsert(
                 owner("too-large"),
@@ -668,6 +791,72 @@ mod composer_draft_tests {
             DraftStoreUpdate::EntryTooLarge
         );
         assert!(byte_bounded.find_index(&owner("too-large")).is_none());
+    }
+
+    #[wasm_bindgen_test]
+    fn exact_persisted_bounds_include_json_escaping_overhead() {
+        clear_storage();
+        let storage = web_sys::window().unwrap().local_storage().unwrap().unwrap();
+        storage
+            .set_item(COMPOSER_DRAFT_STORAGE_KEY, "stale")
+            .unwrap();
+        let escaped_text = "\u{0001}".repeat(50 * 1024);
+        let mut entry_bounded = PersistedComposerDraftStore::default();
+        assert_eq!(
+            entry_bounded.upsert(owner("escaped-active"), escaped_text),
+            DraftStoreUpdate::Stored { evicted: 0 },
+            "the typing path applies only its cheap raw-byte preflight"
+        );
+        let entry_outcome = persist_composer_drafts(&mut entry_bounded);
+        assert_eq!(entry_outcome.bounds.evicted, 1);
+        assert!(entry_outcome.bounds.active_entry_too_large);
+        assert_eq!(entry_outcome.failure, None);
+        assert!(entry_bounded.entries.is_empty());
+        assert!(
+            storage
+                .get_item(COMPOSER_DRAFT_STORAGE_KEY)
+                .unwrap()
+                .is_none(),
+            "an exact-size rejection must clear the stale persisted draft"
+        );
+
+        let mut total_bounded = PersistedComposerDraftStore::default();
+        for index in 0..3 {
+            assert_eq!(
+                total_bounded.upsert(
+                    owner(&format!("escaped-{index}")),
+                    "\u{0001}".repeat(40 * 1024)
+                ),
+                DraftStoreUpdate::Stored { evicted: 0 }
+            );
+        }
+        let total_outcome = total_bounded.finalize_bounds();
+        assert_eq!(total_outcome.evicted, 1);
+        assert!(!total_outcome.active_entry_too_large);
+        assert!(total_bounded.find_index(&owner("escaped-0")).is_none());
+        assert!(
+            total_bounded
+                .encoded_len()
+                .is_ok_and(|bytes| bytes <= MAX_PERSISTED_COMPOSER_DRAFT_TOTAL_BYTES)
+        );
+        clear_storage();
+    }
+
+    #[wasm_bindgen_test]
+    fn typing_path_queues_eviction_notice_until_persistence() {
+        let state = AppState::new();
+        for index in 0..=MAX_PERSISTED_COMPOSER_DRAFT_ENTRIES {
+            state
+                .composer_draft_owner
+                .set(Some(owner(&format!("typing-{index}"))));
+            state.chat_input.set(format!("draft-{index}"));
+            assert!(state.checkpoint_current_composer_draft());
+        }
+        assert_eq!(state.composer_draft_pending_evictions.get_untracked(), 1);
+        assert!(
+            !state.composer_draft_eviction_notified.get_untracked(),
+            "typing may queue an eviction notice but must not open its modal"
+        );
     }
 
     #[wasm_bindgen_test]
@@ -3149,7 +3338,11 @@ pub struct AppState {
     #[cfg(target_arch = "wasm32")]
     composer_draft_limit_notified: RwSignal<bool>,
     #[cfg(target_arch = "wasm32")]
+    composer_draft_pending_evictions: RwSignal<usize>,
+    #[cfg(target_arch = "wasm32")]
     composer_draft_eviction_notified: RwSignal<bool>,
+    #[cfg(target_arch = "wasm32")]
+    composer_draft_persistence_failure_notified: RwSignal<bool>,
     pub task_lists: RwSignal<HashMap<AgentId, TaskList>>,
     /// Per-agent Tycode orchestration event log (sub-agent/workflow progress),
     /// chronological. Appended to as `ChatEvent::Orchestration` events arrive
@@ -3638,7 +3831,11 @@ impl AppState {
             #[cfg(target_arch = "wasm32")]
             composer_draft_limit_notified: RwSignal::new(false),
             #[cfg(target_arch = "wasm32")]
+            composer_draft_pending_evictions: RwSignal::new(0),
+            #[cfg(target_arch = "wasm32")]
             composer_draft_eviction_notified: RwSignal::new(false),
+            #[cfg(target_arch = "wasm32")]
+            composer_draft_persistence_failure_notified: RwSignal::new(false),
             task_lists: RwSignal::new(HashMap::new()),
             orchestration: RwSignal::new(HashMap::new()),
             center_zone,
@@ -4852,22 +5049,16 @@ impl AppState {
             .unwrap_or(DraftStoreUpdate::EntryTooLarge);
         match update {
             DraftStoreUpdate::Stored { evicted } => {
-                self.composer_draft_limit_notified.set(false);
-                notify_composer_draft_eviction(self.composer_draft_eviction_notified, evicted);
+                if evicted > 0 {
+                    log::warn!("composer draft bounds queued {evicted} evictions");
+                    self.composer_draft_pending_evictions
+                        .update(|pending| *pending = pending.saturating_add(evicted));
+                }
                 true
             }
             DraftStoreUpdate::EntryTooLarge => {
                 log::warn!("composer draft exceeds the per-entry persistence limit");
-                if !self.composer_draft_limit_notified.get_untracked() {
-                    self.composer_draft_limit_notified.set(true);
-                    wasm_bindgen_futures::spawn_local(async {
-                        crate::bridge::message_dialog(
-                            "Draft is too large to protect",
-                            "This draft exceeds Tyde's crash-recovery storage limit. Shorten it before relying on automatic draft recovery.",
-                        )
-                        .await;
-                    });
-                }
+                notify_composer_draft_limit(self.composer_draft_limit_notified);
                 true
             }
         }
@@ -4893,13 +5084,22 @@ impl AppState {
 
         self.cancel_composer_draft_persist();
         let drafts = self.composer_drafts;
+        let pending_evictions = self.composer_draft_pending_evictions;
         let eviction_notified = self.composer_draft_eviction_notified;
+        let limit_notified = self.composer_draft_limit_notified;
+        let failure_notified = self.composer_draft_persistence_failure_notified;
         let scheduler_id = self.composer_draft_persistence.id;
         let callback = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
-            let evicted = drafts
+            let outcome = drafts
                 .try_update(persist_composer_drafts)
                 .unwrap_or_default();
-            notify_composer_draft_eviction(eviction_notified, evicted);
+            surface_composer_draft_persistence_outcome(
+                pending_evictions,
+                eviction_notified,
+                limit_notified,
+                failure_notified,
+                outcome,
+            );
             COMPOSER_DRAFT_TIMEOUTS.with(|timeouts| {
                 timeouts.borrow_mut().remove(&scheduler_id);
             });
@@ -4936,11 +5136,17 @@ impl AppState {
     pub fn flush_composer_drafts(&self) {
         self.checkpoint_current_composer_draft();
         self.cancel_composer_draft_persist();
-        let evicted = self
+        let outcome = self
             .composer_drafts
             .try_update(persist_composer_drafts)
             .unwrap_or_default();
-        notify_composer_draft_eviction(self.composer_draft_eviction_notified, evicted);
+        surface_composer_draft_persistence_outcome(
+            self.composer_draft_pending_evictions,
+            self.composer_draft_eviction_notified,
+            self.composer_draft_limit_notified,
+            self.composer_draft_persistence_failure_notified,
+            outcome,
+        );
     }
 
     #[cfg(not(target_arch = "wasm32"))]

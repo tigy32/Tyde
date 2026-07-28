@@ -175,6 +175,7 @@ enum RecoveryDecision {
     },
     Suppress {
         generation: u64,
+        terminated_while_pending: bool,
     },
     Escalate {
         generation: u64,
@@ -185,6 +186,7 @@ enum RecoveryDecision {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecoveryFailure {
     ReloadFailed,
+    RepeatedTermination,
     ReadinessDeadline,
     AttemptLimit,
 }
@@ -215,6 +217,7 @@ struct WebContentRecoveryPolicy {
     frontend_ready: bool,
     failure_presented: bool,
     readiness_notice_presented: bool,
+    terminated_while_pending: bool,
     frontend_visible: Option<bool>,
     native_window_focused: Option<bool>,
     readiness_deadline_epoch: u64,
@@ -223,9 +226,25 @@ struct WebContentRecoveryPolicy {
 
 impl WebContentRecoveryPolicy {
     fn web_content_process_terminated(&mut self, now: Instant) -> RecoveryDecision {
-        if self.reload_pending || self.failure_presented {
+        if self.failure_presented {
             return RecoveryDecision::Suppress {
                 generation: self.generation,
+                terminated_while_pending: false,
+            };
+        }
+        if self.reload_pending {
+            self.terminated_while_pending = true;
+            if self.readiness_notice_presented {
+                self.failure_presented = true;
+                self.readiness_deadline_epoch = self.readiness_deadline_epoch.wrapping_add(1);
+                return RecoveryDecision::Escalate {
+                    generation: self.generation,
+                    failure: RecoveryFailure::RepeatedTermination,
+                };
+            }
+            return RecoveryDecision::Suppress {
+                generation: self.generation,
+                terminated_while_pending: true,
             };
         }
         self.attempts.retain(|attempt| {
@@ -246,6 +265,7 @@ impl WebContentRecoveryPolicy {
         self.page_load_finished = false;
         self.frontend_ready = false;
         self.readiness_notice_presented = false;
+        self.terminated_while_pending = false;
         self.readiness_deadline_epoch = self.readiness_deadline_epoch.wrapping_add(1);
         RecoveryDecision::Reload {
             generation: self.generation,
@@ -270,9 +290,10 @@ impl WebContentRecoveryPolicy {
     }
 
     fn rearm_if_ready(&mut self) {
-        if self.page_load_finished && self.frontend_ready {
+        if self.page_load_finished && self.frontend_ready && !self.terminated_while_pending {
             self.reload_pending = false;
             self.readiness_notice_presented = false;
+            self.terminated_while_pending = false;
             self.readiness_deadline_epoch = self.readiness_deadline_epoch.wrapping_add(1);
         }
     }
@@ -340,8 +361,14 @@ impl WebContentRecoveryPolicy {
         {
             return None;
         }
-        self.readiness_notice_presented = true;
-        Some(RecoveryFailure::ReadinessDeadline)
+        if self.terminated_while_pending {
+            self.failure_presented = true;
+            self.readiness_deadline_epoch = self.readiness_deadline_epoch.wrapping_add(1);
+            Some(RecoveryFailure::RepeatedTermination)
+        } else {
+            self.readiness_notice_presented = true;
+            Some(RecoveryFailure::ReadinessDeadline)
+        }
     }
 
     fn fail_if_pending(
@@ -446,12 +473,12 @@ fn recovery_dialog_buttons(failure: RecoveryFailure) -> MessageDialogButtons {
         RecoveryFailure::ReadinessDeadline => {
             MessageDialogButtons::OkCustom(RECOVERY_KEEP_WAITING_LABEL.to_owned())
         }
-        RecoveryFailure::ReloadFailed | RecoveryFailure::AttemptLimit => {
-            MessageDialogButtons::OkCancelCustom(
-                RECOVERY_RESTART_LABEL.to_owned(),
-                RECOVERY_KEEP_WAITING_LABEL.to_owned(),
-            )
-        }
+        RecoveryFailure::ReloadFailed
+        | RecoveryFailure::RepeatedTermination
+        | RecoveryFailure::AttemptLimit => MessageDialogButtons::OkCancelCustom(
+            RECOVERY_RESTART_LABEL.to_owned(),
+            RECOVERY_KEEP_WAITING_LABEL.to_owned(),
+        ),
     }
 }
 
@@ -485,6 +512,11 @@ fn show_web_content_recovery_notice(
             "Tyde recovery failed",
             "Tyde could not reload its interface after the web content process stopped. You can restart Tyde, or keep waiting without exiting.",
         ),
+        RecoveryFailure::RepeatedTermination => (
+            "recovery_failed",
+            "Tyde recovery stopped",
+            "Tyde's interface stopped again before recovery completed. You can restart Tyde, or keep waiting without exiting.",
+        ),
         RecoveryFailure::AttemptLimit => (
             "recovery_failed",
             "Tyde recovery stopped",
@@ -495,7 +527,9 @@ fn show_web_content_recovery_notice(
         RecoveryFailure::ReadinessDeadline => tracing::warn!(
             "webview.recovery event={event} label={label} generation={generation} failure={failure:?} action=prompt"
         ),
-        RecoveryFailure::ReloadFailed | RecoveryFailure::AttemptLimit => tracing::error!(
+        RecoveryFailure::ReloadFailed
+        | RecoveryFailure::RepeatedTermination
+        | RecoveryFailure::AttemptLimit => tracing::error!(
             "webview.recovery event={event} label={label} generation={generation} failure={failure:?} action=prompt"
         ),
     }
@@ -505,9 +539,9 @@ fn show_web_content_recovery_notice(
         .title(title)
         .kind(match failure {
             RecoveryFailure::ReadinessDeadline => MessageDialogKind::Warning,
-            RecoveryFailure::ReloadFailed | RecoveryFailure::AttemptLimit => {
-                MessageDialogKind::Error
-            }
+            RecoveryFailure::ReloadFailed
+            | RecoveryFailure::RepeatedTermination
+            | RecoveryFailure::AttemptLimit => MessageDialogKind::Error,
         })
         .buttons(recovery_dialog_buttons(failure));
     if let Some(window) = app.get_webview_window(&label) {
@@ -1133,11 +1167,21 @@ pub fn run() {
                         }
                     }
                 }
-                RecoveryDecision::Suppress { generation } => {
-                    tracing::error!(
-                        "webview.recovery event=web_content_process_terminated label={} generation={generation} action=suppress_pending",
-                        webview.label()
-                    );
+                RecoveryDecision::Suppress {
+                    generation,
+                    terminated_while_pending,
+                } => {
+                    if terminated_while_pending {
+                        tracing::error!(
+                            "webview.recovery event=web_content_process_terminated label={} generation={generation} action=record_pending_failure",
+                            webview.label()
+                        );
+                    } else {
+                        tracing::error!(
+                            "webview.recovery event=web_content_process_terminated label={} generation={generation} action=suppress_failed",
+                            webview.label()
+                        );
+                    }
                 }
                 RecoveryDecision::Escalate {
                     generation,
@@ -1274,20 +1318,10 @@ mod web_content_recovery_tests {
             policy.web_content_process_terminated(now),
             RecoveryDecision::Reload { generation: 1 }
         );
-        assert_eq!(
-            policy.web_content_process_terminated(now),
-            RecoveryDecision::Suppress { generation: 1 },
-            "a repeated termination before recovery completes must not reload-loop"
-        );
 
         policy.page_load_started();
         policy.page_load_finished();
-        assert_eq!(
-            policy.web_content_process_terminated(now),
-            RecoveryDecision::Suppress { generation: 1 },
-            "load completion without the frontend-ready acknowledgement is not recovery"
-        );
-
+        assert!(policy.reload_pending);
         policy.frontend_ready();
         assert_eq!(
             policy.web_content_process_terminated(now),
@@ -1306,10 +1340,7 @@ mod web_content_recovery_tests {
         ));
 
         policy.frontend_ready();
-        assert!(matches!(
-            policy.web_content_process_terminated(now),
-            RecoveryDecision::Suppress { generation: 1 }
-        ));
+        assert!(policy.reload_pending);
 
         policy.page_load_finished();
         assert!(matches!(
@@ -1404,6 +1435,76 @@ mod web_content_recovery_tests {
     }
 
     #[test]
+    fn second_termination_becomes_an_observed_failure_at_the_deadline() {
+        let now = Instant::now();
+        let mut policy = WebContentRecoveryPolicy::default();
+        assert_eq!(
+            policy.web_content_process_terminated(now),
+            RecoveryDecision::Reload { generation: 1 }
+        );
+        let ticket = policy
+            .start_readiness_deadline(1)
+            .expect("the first observed death starts recovery");
+        assert_eq!(
+            policy.web_content_process_terminated(now + Duration::from_secs(2)),
+            RecoveryDecision::Suppress {
+                generation: 1,
+                terminated_while_pending: true,
+            }
+        );
+        policy.page_load_finished();
+        policy.frontend_ready();
+        assert!(
+            policy.reload_pending,
+            "stale readiness acknowledgements cannot erase an observed second death"
+        );
+        assert_eq!(
+            policy.readiness_deadline_elapsed(ticket),
+            Some(RecoveryFailure::RepeatedTermination)
+        );
+        match recovery_dialog_buttons(RecoveryFailure::RepeatedTermination) {
+            MessageDialogButtons::OkCancelCustom(restart, keep_waiting) => {
+                assert_eq!(restart, RECOVERY_RESTART_LABEL);
+                assert_eq!(keep_waiting, RECOVERY_KEEP_WAITING_LABEL);
+                assert_eq!(
+                    recovery_dialog_action(
+                        RecoveryFailure::RepeatedTermination,
+                        MessageDialogResult::Cancel
+                    ),
+                    RecoveryDialogAction::KeepWaiting
+                );
+                assert_eq!(
+                    recovery_dialog_action(
+                        RecoveryFailure::RepeatedTermination,
+                        MessageDialogResult::Custom(keep_waiting)
+                    ),
+                    RecoveryDialogAction::KeepWaiting
+                );
+            }
+            buttons => panic!("unexpected repeated-termination buttons: {buttons:?}"),
+        }
+
+        let mut after_advisory = WebContentRecoveryPolicy::default();
+        assert!(matches!(
+            after_advisory.web_content_process_terminated(now),
+            RecoveryDecision::Reload { generation: 1 }
+        ));
+        let advisory_ticket = after_advisory.start_readiness_deadline(1).unwrap();
+        assert_eq!(
+            after_advisory.readiness_deadline_elapsed(advisory_ticket),
+            Some(RecoveryFailure::ReadinessDeadline)
+        );
+        assert_eq!(
+            after_advisory.web_content_process_terminated(now + Duration::from_secs(16)),
+            RecoveryDecision::Escalate {
+                generation: 1,
+                failure: RecoveryFailure::RepeatedTermination,
+            },
+            "a second death after the advisory must surface immediately"
+        );
+    }
+
+    #[test]
     fn recovery_dialog_escape_and_cancel_always_keep_waiting() {
         match recovery_dialog_buttons(RecoveryFailure::ReadinessDeadline) {
             MessageDialogButtons::OkCustom(label) => {
@@ -1425,7 +1526,11 @@ mod web_content_recovery_tests {
             ),
             RecoveryDialogAction::KeepWaiting
         );
-        for failure in [RecoveryFailure::ReloadFailed, RecoveryFailure::AttemptLimit] {
+        for failure in [
+            RecoveryFailure::ReloadFailed,
+            RecoveryFailure::RepeatedTermination,
+            RecoveryFailure::AttemptLimit,
+        ] {
             match recovery_dialog_buttons(failure) {
                 MessageDialogButtons::OkCancelCustom(restart, cancel) => {
                     assert_eq!(restart, RECOVERY_RESTART_LABEL);
@@ -1520,7 +1625,10 @@ mod web_content_recovery_tests {
             policies
                 .for_label("main")
                 .web_content_process_terminated(now),
-            RecoveryDecision::Suppress { generation: 1 }
+            RecoveryDecision::Suppress {
+                generation: 1,
+                terminated_while_pending: true,
+            }
         ));
         assert_eq!(policies.for_label("auth").generation, 0);
     }
