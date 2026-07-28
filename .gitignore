@@ -1,4 +1,9 @@
 /target
+# Scratch Cargo target dirs. Comparing a build against the normal one means
+# pointing CARGO_TARGET_DIR somewhere else, and `/target` alone does not cover
+# that: a `target-nodebug/` used to measure the wasm module once reached a
+# commit as 2683 files and a gigabyte.
+/target-*
 /old
 /build
 /node_modules
