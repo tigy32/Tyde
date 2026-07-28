@@ -10085,6 +10085,105 @@ mod wasm_tests {
         clear_workspace_storage();
     }
 
+    /// A reload may restore an unsent composer only into the exact conversation
+    /// that owned it. The same text appearing in a different agent's composer is
+    /// both a data leak and a send-to-the-wrong-agent hazard.
+    #[wasm_bindgen_test]
+    async fn composer_draft_round_trips_only_to_its_owner() {
+        clear_workspace_storage();
+        clear_composer_draft_storage();
+        reset_inbound_state_for_host("host-a");
+
+        let document = web_sys::window().unwrap().document().unwrap();
+        let first_container = document
+            .create_element("div")
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        document
+            .body()
+            .unwrap()
+            .append_child(&first_container)
+            .unwrap();
+
+        let first = AppState::new();
+        let first_for_mount = first.clone();
+        let _first_handle = mount_to(first_container.clone(), move || {
+            first_for_mount.install_browser_effects();
+            view! { <span></span> }
+        });
+        let agent_a = ActiveAgentRef {
+            host_id: "host-a".to_owned(),
+            agent_id: AgentId("agent-a".to_owned()),
+        };
+        first.agents.set(vec![agent_info_from_payload(
+            "host-a",
+            restore_agent_payload_with_session("agent-a", None, Some("session-a")),
+        )]);
+        first.open_tab(
+            TabContent::chat_with_agent(agent_a),
+            "Agent A".to_owned(),
+            true,
+        );
+        first.chat_input.set("unsent for agent A".to_owned());
+        next_tick().await;
+
+        let second_container = document
+            .create_element("div")
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        document
+            .body()
+            .unwrap()
+            .append_child(&second_container)
+            .unwrap();
+        let second = AppState::new();
+        let second_for_mount = second.clone();
+        let _second_handle = mount_to(second_container.clone(), move || {
+            second_for_mount.install_browser_effects();
+            view! { <span></span> }
+        });
+        apply_host_bootstrap(
+            &second,
+            "host-a",
+            restore_bootstrap(
+                vec![BackendKind::Hermes],
+                Default::default(),
+                Vec::new(),
+                vec![
+                    restore_agent_payload_with_session("agent-a", None, Some("session-a")),
+                    restore_agent_payload_with_session("agent-b", None, Some("session-b")),
+                ],
+            ),
+        );
+        next_tick().await;
+
+        assert_eq!(
+            second.chat_input.get_untracked(),
+            "unsent for agent A",
+            "the exact restored conversation must recover its unsent composer"
+        );
+
+        second.open_tab(
+            TabContent::chat_with_agent(ActiveAgentRef {
+                host_id: "host-a".to_owned(),
+                agent_id: AgentId("agent-b".to_owned()),
+            }),
+            "Agent B".to_owned(),
+            true,
+        );
+        next_tick().await;
+        assert_eq!(
+            second.chat_input.get_untracked(),
+            "",
+            "agent A's draft must never appear in agent B's composer"
+        );
+
+        clear_composer_draft_storage();
+        clear_workspace_storage();
+    }
+
     /// RF-02's missing case: a chat opened before its session exists must have
     /// its stored identity upgraded when the session arrives, even though
     /// `active_agent` never changes.
@@ -10159,6 +10258,16 @@ mod wasm_tests {
             &crate::state::PersistedWorkspaceSelection::default(),
         );
         crate::state::persist_active_project_for_tests(None);
+    }
+
+    fn clear_composer_draft_storage() {
+        web_sys::window()
+            .unwrap()
+            .local_storage()
+            .unwrap()
+            .unwrap()
+            .remove_item("tyde-composer-draft")
+            .unwrap();
     }
 
     /// FE-08: the visible badge must actually rerender. Inspecting `state`

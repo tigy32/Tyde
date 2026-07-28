@@ -123,6 +123,10 @@ pub const TAB_LRU_CAPACITY: usize = 2;
 pub const CENTER_SPLIT_RATIO_STORAGE_KEY: &str = "tyde-center-split-ratio";
 #[cfg(target_arch = "wasm32")]
 const ACTIVE_PROJECT_STORAGE_KEY: &str = "tyde-active-project";
+#[cfg(target_arch = "wasm32")]
+const COMPOSER_DRAFT_STORAGE_KEY: &str = "tyde-composer-draft";
+#[cfg(target_arch = "wasm32")]
+const MAX_PERSISTED_COMPOSER_DRAFT_BYTES: usize = 256 * 1024;
 /// Deliberately a second key rather than an extension of the project record:
 /// the project format already ships and is covered by tests, and a separate
 /// key means an old or corrupt selection degrades to today's behaviour instead
@@ -238,6 +242,112 @@ pub struct PersistedChatRef {
     /// `None` while the agent has not been assigned a session yet.
     #[serde(default)]
     pub session_id: Option<SessionId>,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PersistedComposerDraftOwner {
+    ActiveChat {
+        host_id: String,
+        agent_id: AgentId,
+        #[serde(default)]
+        project_id: Option<ProjectId>,
+        #[serde(default)]
+        session_id: Option<SessionId>,
+    },
+    NewChat {
+        host_id: String,
+        #[serde(default)]
+        project_id: Option<ProjectId>,
+    },
+    TeamMember {
+        host_id: String,
+        #[serde(default)]
+        project_id: Option<ProjectId>,
+        member_id: TeamMemberId,
+    },
+}
+
+#[cfg(target_arch = "wasm32")]
+impl PersistedComposerDraftOwner {
+    fn same_conversation(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::ActiveChat {
+                    host_id,
+                    agent_id,
+                    project_id,
+                    session_id,
+                },
+                Self::ActiveChat {
+                    host_id: other_host,
+                    agent_id: other_agent,
+                    project_id: other_project,
+                    session_id: other_session,
+                },
+            ) => {
+                host_id == other_host
+                    && agent_id == other_agent
+                    && project_id == other_project
+                    && (session_id == other_session
+                        || session_id.is_none()
+                        || other_session.is_none())
+            }
+            _ => self == other,
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PersistedComposerDraft {
+    owner: PersistedComposerDraftOwner,
+    text: String,
+}
+
+#[cfg(target_arch = "wasm32")]
+fn load_composer_draft() -> Option<PersistedComposerDraft> {
+    let storage = web_sys::window()?.local_storage().ok().flatten()?;
+    let encoded = storage
+        .get_item(COMPOSER_DRAFT_STORAGE_KEY)
+        .ok()
+        .flatten()?;
+    let draft = match serde_json::from_str::<PersistedComposerDraft>(&encoded) {
+        Ok(draft) => draft,
+        Err(error) => {
+            log::warn!("invalid persisted composer draft: {error}");
+            let _ = storage.remove_item(COMPOSER_DRAFT_STORAGE_KEY);
+            return None;
+        }
+    };
+    if draft.text.is_empty() || draft.text.len() > MAX_PERSISTED_COMPOSER_DRAFT_BYTES {
+        let _ = storage.remove_item(COMPOSER_DRAFT_STORAGE_KEY);
+        return None;
+    }
+    Some(draft)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn persist_composer_draft(draft: Option<&PersistedComposerDraft>) {
+    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    else {
+        return;
+    };
+    let Some(draft) = draft.filter(|draft| {
+        !draft.text.is_empty() && draft.text.len() <= MAX_PERSISTED_COMPOSER_DRAFT_BYTES
+    }) else {
+        let _ = storage.remove_item(COMPOSER_DRAFT_STORAGE_KEY);
+        return;
+    };
+    match serde_json::to_string(draft) {
+        Ok(encoded) => {
+            if let Err(error) = storage.set_item(COMPOSER_DRAFT_STORAGE_KEY, &encoded) {
+                log::warn!("failed to persist composer draft: {error:?}");
+            }
+        }
+        Err(error) => log::warn!("failed to encode composer draft: {error}"),
+    }
 }
 
 /// A draft backend/launch-profile choice, scoped to the host it was made
@@ -2628,6 +2738,10 @@ pub struct AppState {
     /// `chat_tool_rows` is cleared.
     pub tool_progress: RwSignal<HashMap<(AgentId, ToolCallId), ArcRwSignal<ToolProgressData>>>,
     pub chat_input: RwSignal<String>,
+    #[cfg(target_arch = "wasm32")]
+    composer_draft_owner: RwSignal<Option<PersistedComposerDraftOwner>>,
+    #[cfg(target_arch = "wasm32")]
+    pending_composer_draft: RwSignal<Option<PersistedComposerDraft>>,
     pub task_lists: RwSignal<HashMap<AgentId, TaskList>>,
     /// Per-agent Tycode orchestration event log (sub-agent/workflow progress),
     /// chronological. Appended to as `ChatEvent::Orchestration` events arrive
@@ -3107,6 +3221,10 @@ impl AppState {
             task_token_usage: RwSignal::new(HashMap::new()),
             tool_progress: RwSignal::new(HashMap::new()),
             chat_input: RwSignal::new(String::new()),
+            #[cfg(target_arch = "wasm32")]
+            composer_draft_owner: RwSignal::new(None),
+            #[cfg(target_arch = "wasm32")]
+            pending_composer_draft: RwSignal::new(None),
             task_lists: RwSignal::new(HashMap::new()),
             orchestration: RwSignal::new(HashMap::new()),
             center_zone,
@@ -4151,6 +4269,24 @@ impl AppState {
     /// the paths that matter off the browser.
     #[cfg(target_arch = "wasm32")]
     pub fn install_browser_effects(&self) {
+        self.pending_composer_draft.set(load_composer_draft());
+
+        let composer_owner_state = self.clone();
+        Effect::new(move |_| {
+            composer_owner_state.center_zone.with(|_| ());
+            composer_owner_state.active_project.with(|_| ());
+            composer_owner_state.selected_host_id.with(|_| ());
+            composer_owner_state.agents.with(|_| ());
+            composer_owner_state.reconcile_composer_draft_owner();
+        });
+
+        let composer_text_state = self.clone();
+        Effect::new(move |_| {
+            composer_text_state.chat_input.with(|_| ());
+            composer_text_state.composer_draft_owner.with(|_| ());
+            composer_text_state.persist_bound_composer_draft();
+        });
+
         let selection_state = self.clone();
         Effect::new(move |_| {
             // Tracked reads: the stored identity must follow a session
@@ -4171,6 +4307,150 @@ impl AppState {
             let _ = draft_host_state.chat_context_host_id();
             draft_host_state.drop_draft_bound_to_another_host();
         });
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn current_composer_draft_owner_untracked(&self) -> Option<PersistedComposerDraftOwner> {
+        let content = self.center_zone.with_untracked(|center_zone| {
+            let (_, tab_id) = center_zone.composer_owner()?;
+            center_zone.tab(tab_id).map(|tab| tab.content.clone())
+        })?;
+        match content {
+            TabContent::Chat {
+                agent_ref: Some(agent_ref),
+                ..
+            } => {
+                let agent = self.agents.with_untracked(|agents| {
+                    agents
+                        .iter()
+                        .find(|agent| {
+                            agent.host_id == agent_ref.host_id
+                                && agent.agent_id == agent_ref.agent_id
+                        })
+                        .cloned()
+                })?;
+                Some(PersistedComposerDraftOwner::ActiveChat {
+                    host_id: agent_ref.host_id,
+                    agent_id: agent_ref.agent_id,
+                    project_id: agent.project_id,
+                    session_id: agent.session_id,
+                })
+            }
+            TabContent::Chat {
+                pending_team_member: Some(pending),
+                ..
+            } => Some(PersistedComposerDraftOwner::TeamMember {
+                project_id: self
+                    .active_project
+                    .get_untracked()
+                    .filter(|project| project.host_id == pending.host_id)
+                    .map(|project| project.project_id),
+                host_id: pending.host_id,
+                member_id: pending.member_id,
+            }),
+            TabContent::Chat { .. } => {
+                let host_id = self.chat_context_host_id_untracked()?;
+                let project_id = self
+                    .active_project
+                    .get_untracked()
+                    .filter(|project| project.host_id == host_id)
+                    .map(|project| project.project_id);
+                Some(PersistedComposerDraftOwner::NewChat {
+                    host_id,
+                    project_id,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn reconcile_composer_draft_owner(&self) {
+        let next = self.current_composer_draft_owner_untracked();
+        let current = self.composer_draft_owner.get_untracked();
+        if current == next {
+            self.restore_pending_composer_draft(next.as_ref());
+            return;
+        }
+
+        if let (Some(current), Some(next)) = (&current, &next)
+            && current.same_conversation(next)
+        {
+            self.composer_draft_owner.set(Some(next.clone()));
+            if let Some(mut pending) = self.pending_composer_draft.get_untracked()
+                && pending.owner.same_conversation(next)
+            {
+                pending.owner = next.clone();
+                persist_composer_draft(Some(&pending));
+                self.pending_composer_draft.set(Some(pending));
+            }
+            self.restore_pending_composer_draft(Some(next));
+            return;
+        }
+
+        let text = self.chat_input.get_untracked();
+        if current.is_none() && next.is_some() && !text.is_empty() {
+            self.composer_draft_owner.set(next.clone());
+            self.persist_bound_composer_draft();
+            return;
+        }
+        if let Some(owner) = current
+            && !text.is_empty()
+        {
+            let draft = PersistedComposerDraft { owner, text };
+            persist_composer_draft(Some(&draft));
+            self.pending_composer_draft.set(Some(draft));
+        }
+
+        self.chat_input.set(String::new());
+        self.composer_draft_owner.set(next.clone());
+        self.restore_pending_composer_draft(next.as_ref());
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn restore_pending_composer_draft(&self, owner: Option<&PersistedComposerDraftOwner>) {
+        if !self.chat_input.get_untracked().is_empty() {
+            return;
+        }
+        let Some(owner) = owner else {
+            return;
+        };
+        let Some(pending) = self.pending_composer_draft.get_untracked() else {
+            return;
+        };
+        if pending.owner.same_conversation(owner) {
+            self.chat_input.set(pending.text);
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn persist_bound_composer_draft(&self) {
+        let Some(owner) = self.composer_draft_owner.get_untracked() else {
+            return;
+        };
+        let text = self.chat_input.get_untracked();
+        if text.len() > MAX_PERSISTED_COMPOSER_DRAFT_BYTES {
+            persist_composer_draft(None);
+            self.pending_composer_draft.set(None);
+            log::warn!("composer draft exceeds the bounded persistence limit");
+            return;
+        }
+        if text.is_empty() {
+            let clears_pending = self.pending_composer_draft.with_untracked(|pending| {
+                pending
+                    .as_ref()
+                    .is_some_and(|draft| draft.owner.same_conversation(&owner))
+            });
+            if clears_pending {
+                persist_composer_draft(None);
+                self.pending_composer_draft.set(None);
+            }
+            return;
+        }
+
+        let draft = PersistedComposerDraft { owner, text };
+        persist_composer_draft(Some(&draft));
+        self.pending_composer_draft.set(Some(draft));
     }
 
     /// Persist the current selection, unless a restore has not yet resolved.

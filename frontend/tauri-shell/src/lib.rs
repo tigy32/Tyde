@@ -163,6 +163,64 @@ struct ShellState {
     ui_debug: Arc<devtools::UiDebugBridgeState>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryDecision {
+    Reload { generation: u64 },
+    Suppress { generation: u64 },
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct WebContentRecoveryPolicy {
+    generation: u64,
+    reload_pending: bool,
+    page_load_finished: bool,
+    frontend_ready: bool,
+}
+
+#[cfg(test)]
+impl WebContentRecoveryPolicy {
+    fn web_content_process_terminated(&mut self) -> RecoveryDecision {
+        if self.reload_pending {
+            return RecoveryDecision::Suppress {
+                generation: self.generation,
+            };
+        }
+
+        self.generation = self.generation.wrapping_add(1);
+        self.reload_pending = true;
+        self.page_load_finished = false;
+        self.frontend_ready = false;
+        RecoveryDecision::Reload {
+            generation: self.generation,
+        }
+    }
+
+    fn page_load_started(&mut self) {
+        if self.reload_pending {
+            self.page_load_finished = false;
+            self.frontend_ready = false;
+        }
+    }
+
+    fn page_load_finished(&mut self) {
+        self.page_load_finished = true;
+        self.rearm_if_ready();
+    }
+
+    fn frontend_ready(&mut self) {
+        self.frontend_ready = true;
+        self.rearm_if_ready();
+    }
+
+    fn rearm_if_ready(&mut self) {
+        if self.page_load_finished && self.frontend_ready {
+            self.reload_pending = false;
+        }
+    }
+}
+
 fn shutdown_managed_host(app: &AppHandle) {
     let host = app.state::<ShellState>().host.clone();
     tauri::async_runtime::block_on(host.shutdown_spawn_operations());
@@ -714,4 +772,60 @@ pub fn run_host_launch_uds() -> Result<(), String> {
 
 pub fn run_host_bridge_uds() -> Result<(), String> {
     host_bridge_uds::run()
+}
+
+#[cfg(test)]
+mod web_content_recovery_tests {
+    use super::{RecoveryDecision, WebContentRecoveryPolicy};
+
+    #[test]
+    fn termination_reloads_once_until_the_new_page_is_ready() {
+        let mut policy = WebContentRecoveryPolicy::default();
+
+        assert_eq!(
+            policy.web_content_process_terminated(),
+            RecoveryDecision::Reload { generation: 1 }
+        );
+        assert_eq!(
+            policy.web_content_process_terminated(),
+            RecoveryDecision::Suppress { generation: 1 },
+            "a repeated termination before recovery completes must not reload-loop"
+        );
+
+        policy.page_load_started();
+        policy.page_load_finished();
+        assert_eq!(
+            policy.web_content_process_terminated(),
+            RecoveryDecision::Suppress { generation: 1 },
+            "load completion without the frontend-ready acknowledgement is not recovery"
+        );
+
+        policy.frontend_ready();
+        assert_eq!(
+            policy.web_content_process_terminated(),
+            RecoveryDecision::Reload { generation: 2 },
+            "a later independent process death is recoverable after the page is healthy"
+        );
+    }
+
+    #[test]
+    fn ready_and_load_finished_rearm_in_either_order() {
+        let mut policy = WebContentRecoveryPolicy::default();
+        assert!(matches!(
+            policy.web_content_process_terminated(),
+            RecoveryDecision::Reload { generation: 1 }
+        ));
+
+        policy.frontend_ready();
+        assert!(matches!(
+            policy.web_content_process_terminated(),
+            RecoveryDecision::Suppress { generation: 1 }
+        ));
+
+        policy.page_load_finished();
+        assert!(matches!(
+            policy.web_content_process_terminated(),
+            RecoveryDecision::Reload { generation: 2 }
+        ));
+    }
 }
