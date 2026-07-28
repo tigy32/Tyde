@@ -464,6 +464,16 @@ fn install_cmd_stuck_clear_listeners(state: AppState) {
             callback: visibility_callback,
         });
     });
+    report_lifecycle(
+        if web_sys::window()
+            .and_then(|window| window.document())
+            .is_some_and(|document| document.hidden())
+        {
+            "hidden"
+        } else {
+            "visible"
+        },
+    );
 }
 
 fn report_lifecycle(event: &'static str) {

@@ -1,5 +1,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(target_arch = "wasm32")]
+use std::sync::Arc;
 
 use crate::bridge::{ConfiguredHost, RemoteHostLifecycleStatus};
 use leptos::prelude::*;
@@ -317,6 +319,33 @@ struct PersistedComposerDraft {
 struct PersistedComposerDraftStore {
     #[serde(default)]
     entries: Vec<PersistedComposerDraft>,
+    #[serde(skip)]
+    total_text_bytes: usize,
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+thread_local! {
+    static COMPOSER_DRAFT_SERIALIZATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(target_arch = "wasm32")]
+fn record_composer_draft_serialization() {
+    #[cfg(test)]
+    COMPOSER_DRAFT_SERIALIZATIONS.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(target_arch = "wasm32")]
+fn serialized_composer_draft_len(draft: &PersistedComposerDraft) -> Option<usize> {
+    record_composer_draft_serialization();
+    serde_json::to_vec(draft).ok().map(|encoded| encoded.len())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn serialize_composer_draft_store(
+    drafts: &PersistedComposerDraftStore,
+) -> Result<String, serde_json::Error> {
+    record_composer_draft_serialization();
+    serde_json::to_string(drafts)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -340,43 +369,78 @@ impl PersistedComposerDraftStore {
         let Some(index) = self.find_index(owner) else {
             return false;
         };
-        self.entries.remove(index);
+        let removed = self.entries.remove(index);
+        self.total_text_bytes = self.total_text_bytes.saturating_sub(removed.text.len());
         true
     }
 
     fn upsert(&mut self, owner: PersistedComposerDraftOwner, text: String) -> DraftStoreUpdate {
         self.remove(&owner);
-        let draft = PersistedComposerDraft { owner, text };
-        let entry_bytes = serde_json::to_vec(&draft).map_or(usize::MAX, |encoded| encoded.len());
-        if entry_bytes > MAX_PERSISTED_COMPOSER_DRAFT_ENTRY_BYTES {
+        if text.len() >= MAX_PERSISTED_COMPOSER_DRAFT_ENTRY_BYTES {
             return DraftStoreUpdate::EntryTooLarge;
         }
 
-        self.entries.insert(0, draft);
+        self.total_text_bytes += text.len();
+        self.entries
+            .insert(0, PersistedComposerDraft { owner, text });
         let mut evicted = 0;
         while self.entries.len() > MAX_PERSISTED_COMPOSER_DRAFT_ENTRIES
-            || self.encoded_len() > MAX_PERSISTED_COMPOSER_DRAFT_TOTAL_BYTES
+            || self.total_text_bytes > MAX_PERSISTED_COMPOSER_DRAFT_TOTAL_BYTES
         {
-            self.entries.pop();
+            self.pop_lru();
             evicted += 1;
         }
         DraftStoreUpdate::Stored { evicted }
     }
 
     fn encoded_len(&self) -> usize {
+        record_composer_draft_serialization();
         serde_json::to_vec(self).map_or(usize::MAX, |encoded| encoded.len())
     }
 
-    fn enforce_bounds(&mut self) {
-        self.entries.retain(|draft| {
-            !draft.text.is_empty()
-                && serde_json::to_vec(draft)
-                    .is_ok_and(|encoded| encoded.len() <= MAX_PERSISTED_COMPOSER_DRAFT_ENTRY_BYTES)
-        });
-        self.entries.truncate(MAX_PERSISTED_COMPOSER_DRAFT_ENTRIES);
-        while self.encoded_len() > MAX_PERSISTED_COMPOSER_DRAFT_TOTAL_BYTES {
-            self.entries.pop();
+    fn pop_lru(&mut self) {
+        if let Some(removed) = self.entries.pop() {
+            self.total_text_bytes = self.total_text_bytes.saturating_sub(removed.text.len());
         }
+    }
+
+    fn enforce_tracked_bounds(&mut self) -> usize {
+        let before_retain = self.entries.len();
+        self.entries.retain(|draft| {
+            !draft.text.is_empty() && draft.text.len() < MAX_PERSISTED_COMPOSER_DRAFT_ENTRY_BYTES
+        });
+        let mut evicted = before_retain - self.entries.len();
+        self.total_text_bytes = self.entries.iter().map(|draft| draft.text.len()).sum();
+
+        let before_truncate = self.entries.len();
+        self.entries.truncate(MAX_PERSISTED_COMPOSER_DRAFT_ENTRIES);
+        evicted += before_truncate - self.entries.len();
+        self.total_text_bytes = self.entries.iter().map(|draft| draft.text.len()).sum();
+
+        while self.total_text_bytes > MAX_PERSISTED_COMPOSER_DRAFT_TOTAL_BYTES {
+            self.pop_lru();
+            evicted += 1;
+        }
+        evicted
+    }
+
+    fn finalize_bounds(&mut self) -> usize {
+        let mut evicted = self.enforce_tracked_bounds();
+        let before_retain = self.entries.len();
+        self.entries.retain(|draft| {
+            serialized_composer_draft_len(draft)
+                .is_some_and(|bytes| bytes <= MAX_PERSISTED_COMPOSER_DRAFT_ENTRY_BYTES)
+        });
+        evicted += before_retain - self.entries.len();
+        self.total_text_bytes = self.entries.iter().map(|draft| draft.text.len()).sum();
+
+        while !self.entries.is_empty()
+            && self.encoded_len() > MAX_PERSISTED_COMPOSER_DRAFT_TOTAL_BYTES
+        {
+            self.pop_lru();
+            evicted += 1;
+        }
+        evicted
     }
 }
 
@@ -428,7 +492,25 @@ thread_local! {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn register_composer_draft_scheduler() -> u64 {
+struct ComposerDraftPersistenceRegistration {
+    id: u64,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Drop for ComposerDraftPersistenceRegistration {
+    fn drop(&mut self) {
+        let timeout =
+            COMPOSER_DRAFT_TIMEOUTS.with(|timeouts| timeouts.borrow_mut().remove(&self.id));
+        let scheduler =
+            COMPOSER_DRAFT_SCHEDULERS.with(|schedulers| schedulers.borrow_mut().remove(&self.id));
+        if let (Some(timeout), Some(scheduler)) = (timeout, scheduler) {
+            (scheduler.cancel)(timeout.handle);
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn register_composer_draft_scheduler() -> Arc<ComposerDraftPersistenceRegistration> {
     let id = NEXT_COMPOSER_DRAFT_SCHEDULER_ID.with(|next| {
         let id = next.get().wrapping_add(1);
         next.set(id);
@@ -439,7 +521,7 @@ fn register_composer_draft_scheduler() -> u64 {
             .borrow_mut()
             .insert(id, ComposerDraftScheduler::default());
     });
-    id
+    Arc::new(ComposerDraftPersistenceRegistration { id })
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -459,25 +541,26 @@ fn load_composer_drafts() -> PersistedComposerDraftStore {
             return PersistedComposerDraftStore::default();
         }
     };
-    drafts.enforce_bounds();
+    drafts.enforce_tracked_bounds();
     drafts
 }
 
 #[cfg(target_arch = "wasm32")]
-fn persist_composer_drafts(drafts: &PersistedComposerDraftStore) {
+fn persist_composer_drafts(drafts: &mut PersistedComposerDraftStore) -> usize {
+    let evicted = drafts.finalize_bounds();
     let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
     else {
-        return;
+        return evicted;
     };
     if drafts.entries.is_empty() {
         let _ = storage.remove_item(COMPOSER_DRAFT_STORAGE_KEY);
-        return;
+        return evicted;
     }
-    match serde_json::to_string(drafts) {
+    match serialize_composer_draft_store(drafts) {
         Ok(encoded) => {
             if encoded.len() > MAX_PERSISTED_COMPOSER_DRAFT_TOTAL_BYTES {
                 log::error!("bounded composer draft store exceeded its total limit");
-                return;
+                return evicted;
             }
             if let Err(error) = storage.set_item(COMPOSER_DRAFT_STORAGE_KEY, &encoded) {
                 log::warn!("failed to persist composer draft store: {error:?}");
@@ -485,6 +568,26 @@ fn persist_composer_drafts(drafts: &PersistedComposerDraftStore) {
         }
         Err(error) => log::warn!("failed to encode composer draft store: {error}"),
     }
+    evicted
+}
+
+#[cfg(target_arch = "wasm32")]
+fn notify_composer_draft_eviction(notified: RwSignal<bool>, evicted: usize) {
+    if evicted == 0 {
+        return;
+    }
+    log::warn!("composer draft bounds evicted {evicted} entries");
+    if notified.get_untracked() {
+        return;
+    }
+    notified.set(true);
+    wasm_bindgen_futures::spawn_local(async {
+        crate::bridge::message_dialog(
+            "Draft recovery limit reached",
+            "Tyde reached its bounded crash-recovery storage limit. Older or oversized drafts were removed from recovery storage.",
+        )
+        .await;
+    });
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
@@ -516,6 +619,7 @@ mod composer_draft_tests {
 
     #[wasm_bindgen_test]
     fn draft_store_evicts_the_least_recently_used_entry_by_count_and_total_bytes() {
+        COMPOSER_DRAFT_SERIALIZATIONS.with(|count| count.set(0));
         let mut drafts = PersistedComposerDraftStore::default();
         for index in 0..=MAX_PERSISTED_COMPOSER_DRAFT_ENTRIES {
             assert!(matches!(
@@ -546,7 +650,15 @@ mod composer_draft_tests {
             2,
             "the total-byte ceiling evicts the least-recent entry"
         );
+        assert_eq!(byte_bounded.total_text_bytes, 440 * 1024);
         assert!(byte_bounded.find_index(&owner("large-0")).is_none());
+        COMPOSER_DRAFT_SERIALIZATIONS.with(|count| {
+            assert_eq!(
+                count.get(),
+                0,
+                "keystroke-time upserts must not serialize entries or the store"
+            );
+        });
         assert!(byte_bounded.encoded_len() <= MAX_PERSISTED_COMPOSER_DRAFT_TOTAL_BYTES);
         assert_eq!(
             byte_bounded.upsert(
@@ -569,9 +681,10 @@ mod composer_draft_tests {
         let cancelled_for_callback = cancelled.clone();
 
         let state = AppState::new();
+        let scheduler_id = state.composer_draft_persistence.id;
         COMPOSER_DRAFT_SCHEDULERS.with(|schedulers| {
             schedulers.borrow_mut().insert(
-                state.composer_draft_scheduler_id,
+                scheduler_id,
                 ComposerDraftScheduler {
                     schedule: Rc::new(move |callback, delay_ms| {
                         assert_eq!(delay_ms, COMPOSER_DRAFT_DEBOUNCE_MS);
@@ -629,6 +742,13 @@ mod composer_draft_tests {
             "lifecycle flush bypasses the debounce deadline"
         );
         clear_storage();
+        drop(state);
+        COMPOSER_DRAFT_SCHEDULERS.with(|schedulers| {
+            assert!(!schedulers.borrow().contains_key(&scheduler_id));
+        });
+        COMPOSER_DRAFT_TIMEOUTS.with(|timeouts| {
+            assert!(!timeouts.borrow().contains_key(&scheduler_id));
+        });
     }
 }
 
@@ -3025,9 +3145,11 @@ pub struct AppState {
     #[cfg(target_arch = "wasm32")]
     composer_drafts: RwSignal<PersistedComposerDraftStore>,
     #[cfg(target_arch = "wasm32")]
-    composer_draft_scheduler_id: u64,
+    composer_draft_persistence: Arc<ComposerDraftPersistenceRegistration>,
     #[cfg(target_arch = "wasm32")]
     composer_draft_limit_notified: RwSignal<bool>,
+    #[cfg(target_arch = "wasm32")]
+    composer_draft_eviction_notified: RwSignal<bool>,
     pub task_lists: RwSignal<HashMap<AgentId, TaskList>>,
     /// Per-agent Tycode orchestration event log (sub-agent/workflow progress),
     /// chronological. Appended to as `ChatEvent::Orchestration` events arrive
@@ -3512,9 +3634,11 @@ impl AppState {
             #[cfg(target_arch = "wasm32")]
             composer_drafts: RwSignal::new(PersistedComposerDraftStore::default()),
             #[cfg(target_arch = "wasm32")]
-            composer_draft_scheduler_id: register_composer_draft_scheduler(),
+            composer_draft_persistence: register_composer_draft_scheduler(),
             #[cfg(target_arch = "wasm32")]
             composer_draft_limit_notified: RwSignal::new(false),
+            #[cfg(target_arch = "wasm32")]
+            composer_draft_eviction_notified: RwSignal::new(false),
             task_lists: RwSignal::new(HashMap::new()),
             orchestration: RwSignal::new(HashMap::new()),
             center_zone,
@@ -4729,9 +4853,7 @@ impl AppState {
         match update {
             DraftStoreUpdate::Stored { evicted } => {
                 self.composer_draft_limit_notified.set(false);
-                if evicted > 0 {
-                    log::info!("composer draft LRU evicted {evicted} bounded entries");
-                }
+                notify_composer_draft_eviction(self.composer_draft_eviction_notified, evicted);
                 true
             }
             DraftStoreUpdate::EntryTooLarge => {
@@ -4753,15 +4875,12 @@ impl AppState {
 
     #[cfg(target_arch = "wasm32")]
     fn cancel_composer_draft_persist(&self) {
-        let timeout = COMPOSER_DRAFT_TIMEOUTS.with(|timeouts| {
-            timeouts
-                .borrow_mut()
-                .remove(&self.composer_draft_scheduler_id)
-        });
+        let scheduler_id = self.composer_draft_persistence.id;
+        let timeout =
+            COMPOSER_DRAFT_TIMEOUTS.with(|timeouts| timeouts.borrow_mut().remove(&scheduler_id));
         if let Some(timeout) = timeout {
             COMPOSER_DRAFT_SCHEDULERS.with(|schedulers| {
-                if let Some(scheduler) = schedulers.borrow().get(&self.composer_draft_scheduler_id)
-                {
+                if let Some(scheduler) = schedulers.borrow().get(&scheduler_id) {
                     (scheduler.cancel)(timeout.handle);
                 }
             });
@@ -4774,13 +4893,21 @@ impl AppState {
 
         self.cancel_composer_draft_persist();
         let drafts = self.composer_drafts;
+        let eviction_notified = self.composer_draft_eviction_notified;
+        let scheduler_id = self.composer_draft_persistence.id;
         let callback = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
-            persist_composer_drafts(&drafts.get_untracked());
+            let evicted = drafts
+                .try_update(persist_composer_drafts)
+                .unwrap_or_default();
+            notify_composer_draft_eviction(eviction_notified, evicted);
+            COMPOSER_DRAFT_TIMEOUTS.with(|timeouts| {
+                timeouts.borrow_mut().remove(&scheduler_id);
+            });
         });
         let scheduler = COMPOSER_DRAFT_SCHEDULERS.with(|schedulers| {
             schedulers
                 .borrow()
-                .get(&self.composer_draft_scheduler_id)
+                .get(&scheduler_id)
                 .cloned()
                 .unwrap_or_default()
         });
@@ -4791,7 +4918,7 @@ impl AppState {
             Ok(handle) => {
                 COMPOSER_DRAFT_TIMEOUTS.with(|timeouts| {
                     timeouts.borrow_mut().insert(
-                        self.composer_draft_scheduler_id,
+                        scheduler_id,
                         ComposerDraftTimeout {
                             handle,
                             _callback: callback,
@@ -4809,7 +4936,11 @@ impl AppState {
     pub fn flush_composer_drafts(&self) {
         self.checkpoint_current_composer_draft();
         self.cancel_composer_draft_persist();
-        persist_composer_drafts(&self.composer_drafts.get_untracked());
+        let evicted = self
+            .composer_drafts
+            .try_update(persist_composer_drafts)
+            .unwrap_or_default();
+        notify_composer_draft_eviction(self.composer_draft_eviction_notified, evicted);
     }
 
     #[cfg(not(target_arch = "wasm32"))]

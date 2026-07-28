@@ -24,7 +24,9 @@ use host_config::RemoteHostLifecycleSnapshot;
 use host_store::{ConfiguredHostStore, HostStore, UpsertConfiguredHostRequest};
 use router::ProxyRouterHandle;
 use tauri::{AppHandle, Manager, RunEvent, Url, WindowEvent, webview::PageLoadEvent};
-use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use tauri_plugin_dialog::{
+    DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult,
+};
 
 #[cfg(target_os = "macos")]
 mod macos_webview_defaults {
@@ -187,6 +189,20 @@ enum RecoveryFailure {
     AttemptLimit,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RecoveryDeadlineTicket {
+    generation: u64,
+    epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryDialogAction {
+    KeepWaiting,
+    Restart,
+}
+
+const RECOVERY_RESTART_LABEL: &str = "Restart";
+const RECOVERY_KEEP_WAITING_LABEL: &str = "Keep Waiting";
 const RECOVERY_ATTEMPT_LIMIT: usize = 3;
 const RECOVERY_ATTEMPT_WINDOW: Duration = Duration::from_secs(5 * 60);
 const RECOVERY_READINESS_DEADLINE: Duration = Duration::from_secs(15);
@@ -198,6 +214,10 @@ struct WebContentRecoveryPolicy {
     page_load_finished: bool,
     frontend_ready: bool,
     failure_presented: bool,
+    readiness_notice_presented: bool,
+    frontend_visible: Option<bool>,
+    native_window_focused: Option<bool>,
+    readiness_deadline_epoch: u64,
     attempts: VecDeque<Instant>,
 }
 
@@ -225,6 +245,8 @@ impl WebContentRecoveryPolicy {
         self.reload_pending = true;
         self.page_load_finished = false;
         self.frontend_ready = false;
+        self.readiness_notice_presented = false;
+        self.readiness_deadline_epoch = self.readiness_deadline_epoch.wrapping_add(1);
         RecoveryDecision::Reload {
             generation: self.generation,
         }
@@ -250,6 +272,8 @@ impl WebContentRecoveryPolicy {
     fn rearm_if_ready(&mut self) {
         if self.page_load_finished && self.frontend_ready {
             self.reload_pending = false;
+            self.readiness_notice_presented = false;
+            self.readiness_deadline_epoch = self.readiness_deadline_epoch.wrapping_add(1);
         }
     }
 
@@ -257,8 +281,67 @@ impl WebContentRecoveryPolicy {
         self.fail_if_pending(generation, RecoveryFailure::ReloadFailed)
     }
 
-    fn readiness_deadline_elapsed(&mut self, generation: u64) -> Option<RecoveryFailure> {
-        self.fail_if_pending(generation, RecoveryFailure::ReadinessDeadline)
+    fn start_readiness_deadline(&mut self, generation: u64) -> Option<RecoveryDeadlineTicket> {
+        if self.generation != generation
+            || !self.reload_pending
+            || self.failure_presented
+            || self.readiness_notice_presented
+            || self.readiness_is_deferred()
+        {
+            return None;
+        }
+        self.readiness_deadline_epoch = self.readiness_deadline_epoch.wrapping_add(1);
+        Some(RecoveryDeadlineTicket {
+            generation,
+            epoch: self.readiness_deadline_epoch,
+        })
+    }
+
+    fn frontend_visibility_changed(&mut self, visible: bool) -> Option<RecoveryDeadlineTicket> {
+        if self.frontend_visible == Some(visible) {
+            return None;
+        }
+        self.frontend_visible = Some(visible);
+        self.readiness_deadline_epoch = self.readiness_deadline_epoch.wrapping_add(1);
+        if visible {
+            self.start_readiness_deadline(self.generation)
+        } else {
+            None
+        }
+    }
+
+    fn native_window_focus_changed(&mut self, focused: bool) -> Option<RecoveryDeadlineTicket> {
+        if self.native_window_focused == Some(focused) {
+            return None;
+        }
+        self.native_window_focused = Some(focused);
+        self.readiness_deadline_epoch = self.readiness_deadline_epoch.wrapping_add(1);
+        if focused {
+            self.start_readiness_deadline(self.generation)
+        } else {
+            None
+        }
+    }
+
+    fn readiness_is_deferred(&self) -> bool {
+        self.frontend_visible == Some(false) || self.native_window_focused == Some(false)
+    }
+
+    fn readiness_deadline_elapsed(
+        &mut self,
+        ticket: RecoveryDeadlineTicket,
+    ) -> Option<RecoveryFailure> {
+        if self.generation != ticket.generation
+            || self.readiness_deadline_epoch != ticket.epoch
+            || !self.reload_pending
+            || self.failure_presented
+            || self.readiness_notice_presented
+            || self.readiness_is_deferred()
+        {
+            return None;
+        }
+        self.readiness_notice_presented = true;
+        Some(RecoveryFailure::ReadinessDeadline)
     }
 
     fn fail_if_pending(
@@ -270,6 +353,7 @@ impl WebContentRecoveryPolicy {
             return None;
         }
         self.failure_presented = true;
+        self.readiness_deadline_epoch = self.readiness_deadline_epoch.wrapping_add(1);
         Some(failure)
     }
 }
@@ -357,47 +441,84 @@ fn request_quit_confirmation(app: tauri::AppHandle, confirmation: Arc<QuitConfir
     });
 }
 
-fn show_web_content_recovery_failure(
+fn recovery_dialog_buttons(failure: RecoveryFailure) -> MessageDialogButtons {
+    match failure {
+        RecoveryFailure::ReadinessDeadline => {
+            MessageDialogButtons::OkCustom(RECOVERY_KEEP_WAITING_LABEL.to_owned())
+        }
+        RecoveryFailure::ReloadFailed | RecoveryFailure::AttemptLimit => {
+            MessageDialogButtons::OkCancelCustom(
+                RECOVERY_RESTART_LABEL.to_owned(),
+                RECOVERY_KEEP_WAITING_LABEL.to_owned(),
+            )
+        }
+    }
+}
+
+fn recovery_dialog_action(
+    failure: RecoveryFailure,
+    result: MessageDialogResult,
+) -> RecoveryDialogAction {
+    if !matches!(failure, RecoveryFailure::ReadinessDeadline)
+        && result == MessageDialogResult::Custom(RECOVERY_RESTART_LABEL.to_owned())
+    {
+        RecoveryDialogAction::Restart
+    } else {
+        RecoveryDialogAction::KeepWaiting
+    }
+}
+
+fn show_web_content_recovery_notice(
     app: tauri::AppHandle,
     label: String,
-    confirmation: Arc<QuitConfirmation>,
     generation: u64,
     failure: RecoveryFailure,
 ) {
-    tracing::error!(
-        "webview.recovery event=recovery_failed label={label} generation={generation} failure={failure:?} action=prompt_restart_or_quit"
-    );
-    let message = match failure {
-        RecoveryFailure::ReloadFailed => {
-            "Tyde could not reload its interface after the web content process stopped."
-        }
-        RecoveryFailure::ReadinessDeadline => {
-            "Tyde reloaded its interface, but it did not become ready in time."
-        }
-        RecoveryFailure::AttemptLimit => {
-            "Tyde's interface stopped repeatedly. Automatic recovery has been disabled."
-        }
+    let (event, title, message) = match failure {
+        RecoveryFailure::ReadinessDeadline => (
+            "recovery_still_waiting",
+            "Tyde recovery is still waiting",
+            "Tyde reloaded its interface, but background or system scheduling may have delayed readiness. Tyde will keep waiting without restarting or quitting.",
+        ),
+        RecoveryFailure::ReloadFailed => (
+            "recovery_failed",
+            "Tyde recovery failed",
+            "Tyde could not reload its interface after the web content process stopped. You can restart Tyde, or keep waiting without exiting.",
+        ),
+        RecoveryFailure::AttemptLimit => (
+            "recovery_failed",
+            "Tyde recovery stopped",
+            "Tyde's interface stopped repeatedly. Automatic recovery has been disabled. You can restart Tyde, or keep waiting without exiting.",
+        ),
     };
+    match failure {
+        RecoveryFailure::ReadinessDeadline => tracing::warn!(
+            "webview.recovery event={event} label={label} generation={generation} failure={failure:?} action=prompt"
+        ),
+        RecoveryFailure::ReloadFailed | RecoveryFailure::AttemptLimit => tracing::error!(
+            "webview.recovery event={event} label={label} generation={generation} failure={failure:?} action=prompt"
+        ),
+    }
     let mut dialog = app
         .dialog()
-        .message(format!(
-            "{message}\n\nRestart Tyde to reconnect safely, or quit without restarting."
-        ))
-        .title("Tyde recovery failed")
-        .kind(MessageDialogKind::Error)
-        .buttons(MessageDialogButtons::OkCancelCustom(
-            "Restart".to_owned(),
-            "Quit".to_owned(),
-        ));
+        .message(message)
+        .title(title)
+        .kind(match failure {
+            RecoveryFailure::ReadinessDeadline => MessageDialogKind::Warning,
+            RecoveryFailure::ReloadFailed | RecoveryFailure::AttemptLimit => {
+                MessageDialogKind::Error
+            }
+        })
+        .buttons(recovery_dialog_buttons(failure));
     if let Some(window) = app.get_webview_window(&label) {
         dialog = dialog.parent(&window);
     }
-    dialog.show(move |restart| {
-        if restart {
-            app.request_restart();
-        } else {
-            confirmation.mark_confirmed_exit();
-            app.exit(1);
+    dialog.show_with_result(move |result| {
+        match recovery_dialog_action(failure, result) {
+            RecoveryDialogAction::Restart => app.request_restart(),
+            RecoveryDialogAction::KeepWaiting => tracing::info!(
+                "webview.recovery event=recovery_prompt_dismissed label={label} generation={generation} failure={failure:?} action=keep_waiting"
+            ),
         }
     });
 }
@@ -405,32 +526,40 @@ fn show_web_content_recovery_failure(
 fn schedule_recovery_readiness_deadline(
     app: tauri::AppHandle,
     label: String,
-    generation: u64,
+    ticket: RecoveryDeadlineTicket,
     recovery: Arc<Mutex<WebContentRecoveryPolicies>>,
-    confirmation: Arc<QuitConfirmation>,
 ) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(RECOVERY_READINESS_DEADLINE).await;
-        let failure = with_recovery_policies(&recovery, |policies| {
-            policies
-                .for_label(&label)
-                .readiness_deadline_elapsed(generation)
-        });
-        if let Some(failure) = failure {
-            let app_for_dialog = app.clone();
-            if let Err(error) = app.run_on_main_thread(move || {
-                show_web_content_recovery_failure(
+        let app_for_dialog = app.clone();
+        let label_for_dialog = label.clone();
+        if let Err(error) = app.run_on_main_thread(move || {
+            let native_window_obscured = app_for_dialog
+                .get_webview_window(&label_for_dialog)
+                .is_some_and(|window| {
+                    window.is_visible().is_ok_and(|visible| !visible)
+                        || window.is_focused().is_ok_and(|focused| !focused)
+                });
+            let failure = with_recovery_policies(&recovery, |policies| {
+                let policy = policies.for_label(&label_for_dialog);
+                if native_window_obscured {
+                    policy.native_window_focus_changed(false);
+                }
+                policy.readiness_deadline_elapsed(ticket)
+            });
+            if let Some(failure) = failure {
+                show_web_content_recovery_notice(
                     app_for_dialog,
-                    label,
-                    confirmation,
-                    generation,
+                    label_for_dialog,
+                    ticket.generation,
                     failure,
                 );
-            }) {
-                tracing::error!(
-                    "webview.recovery event=failure_dialog_dispatch_failed generation={generation} error={error}"
-                );
             }
+        }) {
+            tracing::error!(
+                "webview.recovery event=failure_dialog_dispatch_failed label={label} generation={} error={error}",
+                ticket.generation
+            );
         }
     });
 }
@@ -808,11 +937,39 @@ impl FrontendLifecycleEvent {
             Self::PageHide => "page_hide",
         }
     }
+
+    fn visible(&self) -> Option<bool> {
+        match self {
+            Self::Visible | Self::PageShow => Some(true),
+            Self::Hidden | Self::PageHide => Some(false),
+            Self::Focus | Self::Blur => None,
+        }
+    }
 }
 
 #[tauri::command]
-fn report_frontend_lifecycle(event: FrontendLifecycleEvent) {
-    tracing::info!("webview.lifecycle event={}", event.as_str());
+fn report_frontend_lifecycle(
+    webview: tauri::Webview,
+    state: tauri::State<'_, ShellState>,
+    event: FrontendLifecycleEvent,
+) {
+    let label = webview.label().to_owned();
+    let ticket = event.visible().and_then(|visible| {
+        with_recovery_policies(&state.web_content_recovery, |policies| {
+            policies
+                .for_label(&label)
+                .frontend_visibility_changed(visible)
+        })
+    });
+    tracing::info!("webview.lifecycle event={} label={label}", event.as_str());
+    if let Some(ticket) = ticket {
+        schedule_recovery_readiness_deadline(
+            webview.app_handle().clone(),
+            label,
+            ticket,
+            state.web_content_recovery.clone(),
+        );
+    }
 }
 
 #[tauri::command]
@@ -858,6 +1015,7 @@ pub fn run() {
     let quit_confirmation_for_run = quit_confirmation.clone();
     let web_content_recovery = Arc::new(Mutex::new(WebContentRecoveryPolicies::default()));
     let recovery_for_page_load = web_content_recovery.clone();
+    let recovery_for_window = web_content_recovery.clone();
     let recovery_for_setup = web_content_recovery.clone();
 
     let builder = tauri::Builder::default()
@@ -888,6 +1046,20 @@ pub fn run() {
                     "webview.lifecycle event=window_focus label={} focused={focused}",
                     window.label()
                 );
+                let label = window.label().to_owned();
+                let ticket = with_recovery_policies(&recovery_for_window, |policies| {
+                    policies
+                        .for_label(&label)
+                        .native_window_focus_changed(*focused)
+                });
+                if let Some(ticket) = ticket {
+                    schedule_recovery_readiness_deadline(
+                        window.app_handle().clone(),
+                        label,
+                        ticket,
+                        recovery_for_window.clone(),
+                    );
+                }
             }
             WindowEvent::CloseRequested { api, .. } => {
                 if quit_confirmation_for_window.is_confirmed_exit() {
@@ -906,13 +1078,17 @@ pub fn run() {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     let builder = {
         let recovery_for_termination = web_content_recovery.clone();
-        let confirmation_for_recovery = quit_confirmation.clone();
         builder.on_web_content_process_terminate(move |webview| {
             let label = webview.label().to_owned();
+            let window = webview.window();
+            let native_window_obscured = window.is_visible().is_ok_and(|visible| !visible)
+                || window.is_focused().is_ok_and(|focused| !focused);
             let decision = with_recovery_policies(&recovery_for_termination, |policies| {
-                policies
-                    .for_label(&label)
-                    .web_content_process_terminated(Instant::now())
+                let policy = policies.for_label(&label);
+                if native_window_obscured {
+                    policy.native_window_focus_changed(false);
+                }
+                policy.web_content_process_terminated(Instant::now())
             });
             match decision {
                 RecoveryDecision::Reload { generation } => {
@@ -921,13 +1097,22 @@ pub fn run() {
                         webview.label()
                     );
                     match webview.reload() {
-                        Ok(()) => schedule_recovery_readiness_deadline(
-                            webview.app_handle().clone(),
-                            label,
-                            generation,
-                            recovery_for_termination.clone(),
-                            confirmation_for_recovery.clone(),
-                        ),
+                        Ok(()) => {
+                            let ticket =
+                                with_recovery_policies(&recovery_for_termination, |policies| {
+                                    policies
+                                        .for_label(&label)
+                                        .start_readiness_deadline(generation)
+                                });
+                            if let Some(ticket) = ticket {
+                                schedule_recovery_readiness_deadline(
+                                    webview.app_handle().clone(),
+                                    label,
+                                    ticket,
+                                    recovery_for_termination.clone(),
+                                );
+                            }
+                        }
                         Err(error) => {
                             tracing::error!(
                                 "webview.recovery event=reload_failed label={} generation={generation} error={error}",
@@ -938,10 +1123,9 @@ pub fn run() {
                                     policies.for_label(&label).reload_failed(generation)
                                 });
                             if let Some(failure) = failure {
-                                show_web_content_recovery_failure(
+                                show_web_content_recovery_notice(
                                     webview.app_handle().clone(),
                                     label,
-                                    confirmation_for_recovery.clone(),
                                     generation,
                                     failure,
                                 );
@@ -959,10 +1143,9 @@ pub fn run() {
                     generation,
                     failure,
                 } => {
-                    show_web_content_recovery_failure(
+                    show_web_content_recovery_notice(
                         webview.app_handle().clone(),
                         label,
-                        confirmation_for_recovery.clone(),
                         generation,
                         failure,
                     );
@@ -1073,9 +1256,13 @@ pub fn run_host_bridge_uds() -> Result<(), String> {
 mod web_content_recovery_tests {
     use std::time::{Duration, Instant};
 
+    use tauri_plugin_dialog::{MessageDialogButtons, MessageDialogResult};
+
     use super::{
-        RECOVERY_ATTEMPT_LIMIT, RECOVERY_ATTEMPT_WINDOW, RecoveryDecision, RecoveryFailure,
-        WebContentRecoveryPolicies, WebContentRecoveryPolicy,
+        RECOVERY_ATTEMPT_LIMIT, RECOVERY_ATTEMPT_WINDOW, RECOVERY_KEEP_WAITING_LABEL,
+        RECOVERY_RESTART_LABEL, RecoveryDeadlineTicket, RecoveryDecision, RecoveryDialogAction,
+        RecoveryFailure, WebContentRecoveryPolicies, WebContentRecoveryPolicy,
+        recovery_dialog_action, recovery_dialog_buttons,
     };
 
     #[test]
@@ -1132,18 +1319,28 @@ mod web_content_recovery_tests {
     }
 
     #[test]
-    fn deadline_and_reload_error_escalate_only_a_termination_recovery() {
+    fn deadline_notice_is_non_terminal_and_reload_error_is_observed_failure() {
         let now = Instant::now();
         let mut deadline = WebContentRecoveryPolicy::default();
         assert_eq!(
             deadline.web_content_process_terminated(now),
             RecoveryDecision::Reload { generation: 1 }
         );
+        let ticket = deadline
+            .start_readiness_deadline(1)
+            .expect("visible recovery starts a readiness deadline");
         assert_eq!(
-            deadline.readiness_deadline_elapsed(1),
+            deadline.readiness_deadline_elapsed(ticket),
             Some(RecoveryFailure::ReadinessDeadline)
         );
-        assert_eq!(deadline.readiness_deadline_elapsed(1), None);
+        assert_eq!(deadline.readiness_deadline_elapsed(ticket), None);
+        deadline.page_load_finished();
+        deadline.frontend_ready();
+        assert_eq!(
+            deadline.web_content_process_terminated(now),
+            RecoveryDecision::Reload { generation: 2 },
+            "an inferred readiness notice must not disable later recovery"
+        );
 
         let mut reload_error = WebContentRecoveryPolicy::default();
         assert_eq!(
@@ -1157,14 +1354,119 @@ mod web_content_recovery_tests {
 
         let mut normal_page = WebContentRecoveryPolicy::default();
         assert_eq!(
-            normal_page.readiness_deadline_elapsed(0),
+            normal_page.readiness_deadline_elapsed(RecoveryDeadlineTicket {
+                generation: 0,
+                epoch: 0,
+            }),
             None,
             "normal startup and unrelated frontend panics have no recovery deadline"
         );
     }
 
     #[test]
-    fn rolling_attempt_limit_escalates_then_expires() {
+    fn readiness_deadline_restarts_after_hidden_recovery_becomes_visible() {
+        let now = Instant::now();
+        let mut policy = WebContentRecoveryPolicy::default();
+        policy.native_window_focus_changed(false);
+        policy.frontend_visibility_changed(true);
+        policy.frontend_visibility_changed(false);
+        assert_eq!(
+            policy.web_content_process_terminated(now),
+            RecoveryDecision::Reload { generation: 1 }
+        );
+        assert_eq!(
+            policy.start_readiness_deadline(1),
+            None,
+            "hidden recovery must not run a wall-clock readiness deadline"
+        );
+
+        assert!(
+            policy.frontend_visibility_changed(true).is_none(),
+            "a visible document must not override an unfocused native window"
+        );
+        let first_visible = policy
+            .native_window_focus_changed(true)
+            .expect("focusing a visible recovery starts a fresh deadline");
+        policy.frontend_visibility_changed(false);
+        assert_eq!(
+            policy.readiness_deadline_elapsed(first_visible),
+            None,
+            "hiding again invalidates the visible deadline"
+        );
+        let second_visible = policy
+            .frontend_visibility_changed(true)
+            .expect("the next visible edge restarts the full deadline");
+        assert_ne!(first_visible, second_visible);
+        assert_eq!(
+            policy.readiness_deadline_elapsed(second_visible),
+            Some(RecoveryFailure::ReadinessDeadline)
+        );
+    }
+
+    #[test]
+    fn recovery_dialog_escape_and_cancel_always_keep_waiting() {
+        match recovery_dialog_buttons(RecoveryFailure::ReadinessDeadline) {
+            MessageDialogButtons::OkCustom(label) => {
+                assert_eq!(label, RECOVERY_KEEP_WAITING_LABEL);
+                assert_eq!(
+                    recovery_dialog_action(
+                        RecoveryFailure::ReadinessDeadline,
+                        MessageDialogResult::Custom(label)
+                    ),
+                    RecoveryDialogAction::KeepWaiting
+                );
+            }
+            buttons => panic!("unexpected readiness buttons: {buttons:?}"),
+        }
+        assert_eq!(
+            recovery_dialog_action(
+                RecoveryFailure::ReadinessDeadline,
+                MessageDialogResult::Cancel
+            ),
+            RecoveryDialogAction::KeepWaiting
+        );
+        for failure in [RecoveryFailure::ReloadFailed, RecoveryFailure::AttemptLimit] {
+            match recovery_dialog_buttons(failure) {
+                MessageDialogButtons::OkCancelCustom(restart, cancel) => {
+                    assert_eq!(restart, RECOVERY_RESTART_LABEL);
+                    assert_eq!(cancel, RECOVERY_KEEP_WAITING_LABEL);
+                    assert_eq!(
+                        recovery_dialog_action(failure, MessageDialogResult::Custom(restart)),
+                        RecoveryDialogAction::Restart
+                    );
+                    assert_eq!(
+                        recovery_dialog_action(failure, MessageDialogResult::Custom(cancel)),
+                        RecoveryDialogAction::KeepWaiting,
+                        "the plugin maps Escape/cancel to the custom cancel label"
+                    );
+                }
+                buttons => panic!("unexpected observed-failure buttons: {buttons:?}"),
+            }
+        }
+
+        for result in [
+            MessageDialogResult::Cancel,
+            MessageDialogResult::Custom(RECOVERY_KEEP_WAITING_LABEL.to_owned()),
+            MessageDialogResult::Ok,
+            MessageDialogResult::No,
+        ] {
+            assert_eq!(
+                recovery_dialog_action(RecoveryFailure::ReloadFailed, result),
+                RecoveryDialogAction::KeepWaiting
+            );
+        }
+        assert_eq!(
+            recovery_dialog_action(
+                RecoveryFailure::ReadinessDeadline,
+                MessageDialogResult::Custom(RECOVERY_RESTART_LABEL.to_owned())
+            ),
+            RecoveryDialogAction::KeepWaiting,
+            "the inferred deadline may never authorize restart"
+        );
+    }
+
+    #[test]
+    fn rolling_attempt_limit_escalates_while_old_attempts_age_out() {
         let now = Instant::now();
         let mut policy = WebContentRecoveryPolicy::default();
         for generation in 1..=RECOVERY_ATTEMPT_LIMIT {
