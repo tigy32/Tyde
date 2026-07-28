@@ -946,26 +946,52 @@ mod wasm_tests {
         .expect("install reject-once send stub");
     }
 
-    fn install_deferred_send_stub() {
-        js_sys::eval(
+    /// Install the deferred-send bridge stub, scoped to `stream` — the caller's
+    /// own stream path.
+    ///
+    /// Every frontend wasm test shares one browser, so this stub is global and
+    /// so is its resolver queue. A send started by an *earlier* test can still
+    /// be in flight when this one installs its stub, and it then lands in this
+    /// test's queue: `reject_next_send` shifts the front of that queue, so it
+    /// would reject the stranger and leave this test's own send pending
+    /// forever. That made the send tests fragile to adding a test anywhere in
+    /// the suite — the failure appeared here while the cause was six unrelated
+    /// tests changing the interleaving.
+    ///
+    /// Scoping by stream path fixes it at the source: only this test's frames
+    /// are recorded and queued, and a foreign send resolves immediately so it
+    /// completes harmlessly instead of poisoning the queue.
+    fn install_deferred_send_stub(stream: &StreamPath) {
+        js_sys::eval(&format!(
             r#"
-            (function() {
+            (function() {{
                 window.__test_send_lines = [];
                 window.__test_send_resolvers = [];
-                window.__TAURI__ = window.__TAURI__ || {};
-                window.__TAURI__.core = window.__TAURI__.core || {};
-                window.__TAURI__.core.invoke = function(cmd, args) {
-                    if (cmd !== "send_host_line") {
+                window.__test_send_stream = {stream};
+                window.__TAURI__ = window.__TAURI__ || {{}};
+                window.__TAURI__.core = window.__TAURI__.core || {{}};
+                window.__TAURI__.core.invoke = function(cmd, args) {{
+                    if (cmd !== "send_host_line") {{
                         return Promise.resolve();
-                    }
+                    }}
+                    var mine = false;
+                    try {{
+                        mine = JSON.parse(args.line).stream === window.__test_send_stream;
+                    }} catch (e) {{
+                        mine = false;
+                    }}
+                    if (!mine) {{
+                        return Promise.resolve();
+                    }}
                     window.__test_send_lines.push(args.line);
-                    return new Promise(function(resolve, reject) {
-                        window.__test_send_resolvers.push({ resolve, reject });
-                    });
-                };
-            })();
+                    return new Promise(function(resolve, reject) {{
+                        window.__test_send_resolvers.push({{ resolve, reject }});
+                    }});
+                }};
+            }})();
             "#,
-        )
+            stream = serde_json::to_string(&stream.0).expect("encode stream path"),
+        ))
         .expect("install deferred send stub");
     }
 
@@ -1052,7 +1078,7 @@ mod wasm_tests {
         let host_id = "host-concurrent";
         let stream = StreamPath("/host/concurrent".to_owned());
         clear_host_seqs(host_id);
-        install_deferred_send_stub();
+        install_deferred_send_stub(&stream);
 
         let outcomes = Rc::new(RefCell::new(Vec::new()));
         for attempt in 1..=2 {
@@ -1096,7 +1122,7 @@ mod wasm_tests {
         let host_id = "host-clear";
         let stream = StreamPath("/host/clear".to_owned());
         clear_host_seqs(host_id);
-        install_deferred_send_stub();
+        install_deferred_send_stub(&stream);
 
         let outcome = Rc::new(RefCell::new(None));
         let captured_outcome = Rc::clone(&outcome);
@@ -1131,7 +1157,7 @@ mod wasm_tests {
         let host_id = "host-clear-failure";
         let stream = StreamPath("/host/clear-failure".to_owned());
         clear_host_seqs(host_id);
-        install_deferred_send_stub();
+        install_deferred_send_stub(&stream);
 
         let outcome = Rc::new(RefCell::new(None));
         let captured_outcome = Rc::clone(&outcome);
@@ -1167,7 +1193,7 @@ mod wasm_tests {
         let host_id = "host-new-epoch";
         let stream = StreamPath("/host/new-epoch".to_owned());
         clear_host_seqs(host_id);
-        install_deferred_send_stub();
+        install_deferred_send_stub(&stream);
 
         let outcome = Rc::new(RefCell::new(None));
         let captured_outcome = Rc::clone(&outcome);
