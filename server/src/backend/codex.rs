@@ -2035,6 +2035,8 @@ impl CodexSession {
                 next_generated_identity_ordinal: 1,
                 pending_tool_call_ids: HashSet::new(),
                 tool_call_identities: CodexToolCallIdentities::default(),
+                background_commands: HashMap::new(),
+                background_command_owner_active: true,
                 tool_container_images: Vec::new(),
                 cancelled_tool_call_ids: HashSet::new(),
                 close_active_stream_when_tools_idle: false,
@@ -2149,6 +2151,8 @@ impl CodexSession {
     }
 
     pub async fn shutdown(self) {
+        self.inner.rpc.abort_readers();
+        self.inner.drain_background_commands().await;
         self.inner.rpc.shutdown().await;
         remove_codex_skill_projection_guard(&self.inner.skill_projection);
         remove_codex_steering_tempfile(&self.inner.steering_tempfile);
@@ -3048,6 +3052,39 @@ struct CodexSubAgentActivity {
     kind: String,
 }
 
+struct CodexBackgroundCommand {
+    tool_call_id: String,
+    task_id: String,
+    description: Option<String>,
+}
+
+impl CodexBackgroundCommand {
+    fn progress(&self, status: BackgroundTaskStatus, exit_code: Option<i64>) -> ToolProgressData {
+        let summary = match status {
+            BackgroundTaskStatus::Completed => {
+                Some(format!("Exited with code {}", exit_code.unwrap_or(0)))
+            }
+            BackgroundTaskStatus::Failed => {
+                Some(format!("Exited with code {}", exit_code.unwrap_or(-1)))
+            }
+            BackgroundTaskStatus::Running
+            | BackgroundTaskStatus::Stopped
+            | BackgroundTaskStatus::Unknown => None,
+        };
+        ToolProgressData {
+            tool_call_id: self.tool_call_id.clone(),
+            tool_name: "run_command".to_owned(),
+            update: ToolProgressUpdate::BackgroundTask(BackgroundTaskState {
+                task_id: self.task_id.clone(),
+                description: self.description.clone(),
+                status,
+                summary,
+                output_unavailable: None,
+            }),
+        }
+    }
+}
+
 enum CodexNotificationOwner {
     Parent { thread_id: String },
     LiveChild { thread_id: String },
@@ -3079,6 +3116,8 @@ struct CodexState {
     next_generated_identity_ordinal: u64,
     pending_tool_call_ids: HashSet<String>,
     tool_call_identities: CodexToolCallIdentities,
+    background_commands: HashMap<(String, String), CodexBackgroundCommand>,
+    background_command_owner_active: bool,
     tool_container_images: Vec<protocol::ImageData>,
     cancelled_tool_call_ids: HashSet<String>,
     close_active_stream_when_tools_idle: bool,
@@ -3233,6 +3272,73 @@ struct CodexInner {
 }
 
 impl CodexInner {
+    async fn register_background_command(
+        &self,
+        params: &Value,
+        provider_item_id: &str,
+        tool_call_id: &str,
+        item: &Value,
+    ) -> Option<ToolProgressData> {
+        let command = codex_background_command(tool_call_id, item)?;
+        let mut state = self.state.lock().await;
+        if !state.background_command_owner_active {
+            return None;
+        }
+        let thread_id =
+            extract_notification_thread_id(params).unwrap_or_else(|| state.thread_id.clone());
+        let key = (thread_id, provider_item_id.to_owned());
+        if state.background_commands.contains_key(&key) {
+            return None;
+        }
+        let progress = command.progress(BackgroundTaskStatus::Running, None);
+        state.background_commands.insert(key, command);
+        Some(progress)
+    }
+
+    async fn take_background_command(
+        &self,
+        params: &Value,
+        provider_item_id: &str,
+    ) -> Option<CodexBackgroundCommand> {
+        let mut state = self.state.lock().await;
+        let thread_id =
+            extract_notification_thread_id(params).unwrap_or_else(|| state.thread_id.clone());
+        state
+            .background_commands
+            .remove(&(thread_id, provider_item_id.to_owned()))
+    }
+
+    async fn drain_background_commands(&self) {
+        let commands = {
+            let mut state = self.state.lock().await;
+            state.background_command_owner_active = false;
+            let commands = std::mem::take(&mut state.background_commands)
+                .into_values()
+                .collect::<Vec<_>>();
+            for command in &commands {
+                state.pending_tool_call_ids.remove(&command.tool_call_id);
+                state.cancelled_tool_call_ids.remove(&command.tool_call_id);
+            }
+            commands
+        };
+        for command in commands {
+            self.emitter
+                .tool_progress(&command.progress(BackgroundTaskStatus::Stopped, None));
+            if self.emitter.has_pending_tool_request(&command.tool_call_id) {
+                self.emitter.tool_completed(ToolCompletedPayload {
+                    tool_call_id: &command.tool_call_id,
+                    tool_name: "run_command",
+                    tool_result: json!({
+                        "kind": "Cancelled",
+                        "message": "Background command owner exited",
+                    }),
+                    success: false,
+                    error: None,
+                });
+            }
+        }
+    }
+
     async fn tool_call_started_id(
         &self,
         params: &Value,
@@ -4977,6 +5083,7 @@ impl CodexInner {
             .cloned()
             .ok_or_else(|| "Codex resume response missing 'turns' array".to_string())?;
 
+        self.drain_background_commands().await;
         self.complete_all_codex_subagents().await;
 
         {
@@ -4997,6 +5104,7 @@ impl CodexInner {
             state.model_token_usage_by_turn.clear();
             state.turn_context_by_turn.clear();
             state.file_change_call_ids.clear();
+            state.background_command_owner_active = true;
             state.pending_request = None;
             state.pending_user_input_bytes = 0;
             state.conversation_bytes_total = 0;
@@ -5303,6 +5411,7 @@ impl CodexInner {
                 self.emitter.subprocess_stderr(&line);
             }
             CodexInbound::Closed { exit_code } => {
+                self.drain_background_commands().await;
                 self.complete_all_codex_subagents().await;
                 self.emitter.subprocess_exit(exit_code);
                 // The app-server exited on its own; reap it now rather than
@@ -5398,6 +5507,31 @@ impl CodexInner {
             false
         };
         if suppress_root_response_before_routing {
+            if method == "item/completed"
+                && let Some(item) = params.get("item")
+                && item.get("type").and_then(Value::as_str) == Some("commandExecution")
+                && let Some(provider_item_id) = item.get("id").and_then(Value::as_str)
+                && let Some(command) = self.take_background_command(params, provider_item_id).await
+            {
+                self.state
+                    .lock()
+                    .await
+                    .cancelled_tool_call_ids
+                    .remove(&command.tool_call_id);
+                let exit_code = item
+                    .get("exitCode")
+                    .or_else(|| item.get("exit_code"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(-1);
+                self.emitter.tool_progress(&command.progress(
+                    if exit_code == 0 {
+                        BackgroundTaskStatus::Completed
+                    } else {
+                        BackgroundTaskStatus::Failed
+                    },
+                    Some(exit_code),
+                ));
+            }
             tracing::debug!(
                 codex_method = method,
                 "Ignoring late Codex response notification for terminated root turn"
@@ -8708,8 +8842,9 @@ impl CodexInner {
                 .await;
             }
             "commandExecution" => {
+                let provider_item_id = item_id.unwrap_or("tool-call");
                 let item_id = self
-                    .tool_call_started_id(params, item_id.unwrap_or("tool-call"), "run_command")
+                    .tool_call_started_id(params, provider_item_id, "run_command")
                     .await;
                 let command = item
                     .get("command")
@@ -8733,8 +8868,9 @@ impl CodexInner {
                     }),
                 )
                 .await;
-                if let Some(progress) =
-                    codex_background_command_progress(&item_id, item, BackgroundTaskStatus::Running)
+                if let Some(progress) = self
+                    .register_background_command(params, provider_item_id, &item_id, item)
+                    .await
                 {
                     self.emitter.tool_progress(&progress);
                 }
@@ -9132,9 +9268,12 @@ impl CodexInner {
                 self.complete_native_tool(&item_id, item_type).await;
             }
             "commandExecution" => {
+                let provider_item_id = item_id.unwrap_or("item");
                 let item_id = self
-                    .tool_call_completed_id(params, item_id.unwrap_or("item"), "run_command")
+                    .tool_call_completed_id(params, provider_item_id, "run_command")
                     .await;
+                let background_command =
+                    self.take_background_command(params, provider_item_id).await;
                 self.add_active_turn_tool_bytes(estimate_command_execution_tool_bytes(item))
                     .await;
                 let exit_code = item.get("exitCode").and_then(Value::as_i64).unwrap_or(-1) as i32;
@@ -9161,16 +9300,15 @@ impl CodexInner {
                     },
                 )
                 .await;
-                if let Some(progress) = codex_background_command_progress(
-                    &item_id,
-                    item,
-                    if success {
-                        BackgroundTaskStatus::Completed
-                    } else {
-                        BackgroundTaskStatus::Failed
-                    },
-                ) {
-                    self.emitter.tool_progress(&progress);
+                if let Some(command) = background_command {
+                    self.emitter.tool_progress(&command.progress(
+                        if success {
+                            BackgroundTaskStatus::Completed
+                        } else {
+                            BackgroundTaskStatus::Failed
+                        },
+                        Some(exit_code as i64),
+                    ));
                 }
             }
             "fileChange" => {
@@ -11661,11 +11799,7 @@ fn estimate_command_execution_tool_bytes(item: &Value) -> u64 {
         .saturating_add(value_str_len(item, "aggregatedOutput"))
 }
 
-fn codex_background_command_progress(
-    tool_call_id: &str,
-    item: &Value,
-    status: BackgroundTaskStatus,
-) -> Option<ToolProgressData> {
+fn codex_background_command(tool_call_id: &str, item: &Value) -> Option<CodexBackgroundCommand> {
     let process_id = item
         .get("processId")
         .or_else(|| item.get("process_id"))
@@ -11681,35 +11815,10 @@ fn codex_background_command_progress(
         .and_then(Value::as_str)
         .filter(|command| !command.trim().is_empty())
         .map(str::to_owned);
-    let summary = match status {
-        BackgroundTaskStatus::Completed => Some(format!(
-            "Exited with code {}",
-            item.get("exitCode")
-                .or_else(|| item.get("exit_code"))
-                .and_then(Value::as_i64)
-                .unwrap_or(0)
-        )),
-        BackgroundTaskStatus::Failed => Some(format!(
-            "Exited with code {}",
-            item.get("exitCode")
-                .or_else(|| item.get("exit_code"))
-                .and_then(Value::as_i64)
-                .unwrap_or(-1)
-        )),
-        BackgroundTaskStatus::Running
-        | BackgroundTaskStatus::Stopped
-        | BackgroundTaskStatus::Unknown => None,
-    };
-    Some(ToolProgressData {
+    Some(CodexBackgroundCommand {
         tool_call_id: tool_call_id.to_owned(),
-        tool_name: "run_command".to_owned(),
-        update: ToolProgressUpdate::BackgroundTask(BackgroundTaskState {
-            task_id: process_id,
-            description: command,
-            status,
-            summary,
-            output_unavailable: None,
-        }),
+        task_id: process_id,
+        description: command,
     })
 }
 
@@ -12220,6 +12329,11 @@ struct CodexRpc {
 }
 
 impl CodexRpc {
+    fn abort_readers(&self) {
+        self.stdout_task.abort();
+        self.stderr_task.abort();
+    }
+
     async fn spawn(
         ssh_host: Option<&str>,
         startup_mcp_servers: &[StartupMcpServer],
@@ -12505,8 +12619,7 @@ impl CodexRpc {
         }
         // child is taken (None) — Drop will be a no-op. Drop the readers so the
         // parent-side stdio pipe fds are released even if EOF hasn't propagated.
-        self.stdout_task.abort();
-        self.stderr_task.abort();
+        self.abort_readers();
     }
 
     async fn terminate(&self) -> Result<(), String> {
@@ -19214,6 +19327,8 @@ for line in sys.stdin:
             next_generated_identity_ordinal: 1,
             pending_tool_call_ids: HashSet::new(),
             tool_call_identities: CodexToolCallIdentities::default(),
+            background_commands: HashMap::new(),
+            background_command_owner_active: true,
             tool_container_images: Vec::new(),
             cancelled_tool_call_ids: HashSet::new(),
             close_active_stream_when_tools_idle: false,
@@ -24683,16 +24798,28 @@ Do not describe the tool, and do not skip the tool call."#;
                     "item/started",
                     &json!({
                         "threadId": "thread-test",
+                        "turnId": "cancelled-turn",
                         "item": {
                             "type": "commandExecution",
                             "id": "cancelled-command",
                             "command": "sleep 30",
-                            "cwd": "/tmp"
+                            "cwd": "/tmp",
+                            "processId": "4242",
+                            "status": "inProgress"
                         }
                     }),
                 )
                 .await;
-            drain_events(&mut rx);
+            let started = drain_events(&mut rx);
+            let running = started
+                .iter()
+                .filter(|event| {
+                    event.get("kind").and_then(Value::as_str) == Some("ToolProgress")
+                        && event.pointer("/data/update/status").and_then(Value::as_str)
+                            == Some("running")
+                })
+                .count();
+            assert_eq!(running, 1, "unified exec must publish one Running row");
             inner
                 .handle_notification(
                     "turn/completed",
@@ -24702,7 +24829,23 @@ Do not describe the tool, and do not skip the tool call."#;
                     }),
                 )
                 .await;
-            drain_events(&mut rx);
+            let interrupted = drain_events(&mut rx);
+            assert_eq!(
+                interrupted
+                    .iter()
+                    .filter(|event| {
+                        event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
+                    })
+                    .count(),
+                1,
+                "interrupt owns the cancelled tool-card completion"
+            );
+            assert!(
+                interrupted
+                    .iter()
+                    .all(|event| event.get("kind").and_then(Value::as_str) != Some("ToolProgress")),
+                "interrupt alone must leave the still-live unified exec Running"
+            );
 
             inner
                 .handle_notification(
@@ -24730,20 +24873,38 @@ Do not describe the tool, and do not skip the tool call."#;
                     "item/completed",
                     &json!({
                         "threadId": "thread-test",
+                        "turnId": "cancelled-turn",
                         "item": {
                             "type": "commandExecution",
                             "id": "cancelled-command",
                             "command": "sleep 30",
                             "cwd": "/tmp",
-                            "exitCode": -1,
+                            "processId": "4242",
+                            "status": "completed",
+                            "exitCode": 0,
                             "aggregatedOutput": ""
                         }
                     }),
                 )
                 .await;
+            let terminal = drain_events(&mut rx);
+            assert_eq!(
+                terminal
+                    .iter()
+                    .filter(|event| {
+                        event.get("kind").and_then(Value::as_str) == Some("ToolProgress")
+                            && event.pointer("/data/update/status").and_then(Value::as_str)
+                                == Some("completed")
+                    })
+                    .count(),
+                1,
+                "the real old-turn process exit must terminalize activity"
+            );
             assert!(
-                drain_events(&mut rx).is_empty(),
-                "a late completion from the interrupted turn must not open a synthetic tool container in the next turn"
+                terminal.iter().all(|event| {
+                    event.get("kind").and_then(Value::as_str) != Some("ToolExecutionCompleted")
+                }),
+                "the suppressed exit must not complete the already-cancelled card again"
             );
             assert!(
                 !inner
@@ -24752,6 +24913,39 @@ Do not describe the tool, and do not skip the tool call."#;
                     .await
                     .cancelled_tool_call_ids
                     .contains("cancelled-command")
+            );
+            {
+                let state = inner.state.lock().await;
+                assert!(
+                    !state
+                        .cancelled_tool_call_ids
+                        .contains("codex:thread-test:cancelled-turn:cancelled-command")
+                );
+                assert!(state.background_commands.is_empty());
+            }
+
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turnId": "cancelled-turn",
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "cancelled-command",
+                            "command": "sleep 30",
+                            "cwd": "/tmp",
+                            "processId": "4242",
+                            "status": "completed",
+                            "exitCode": 0,
+                            "aggregatedOutput": ""
+                        }
+                    }),
+                )
+                .await;
+            assert!(
+                drain_events(&mut rx).is_empty(),
+                "a duplicate real exit must be an exact no-op"
             );
             inner.rpc.shutdown().await;
         });
@@ -24935,7 +25129,120 @@ Do not describe the tool, and do not skip the tool call."#;
                     .and_then(Value::as_str),
                 Some("1234")
             );
+
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turnId": "background-turn",
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "background-command",
+                            "command": "sleep 12",
+                            "cwd": "/tmp",
+                            "processId": "1234",
+                            "status": "completed",
+                            "exitCode": 0,
+                            "aggregatedOutput": "done"
+                        }
+                    }),
+                )
+                .await;
+            assert!(
+                drain_events(&mut rx).is_empty(),
+                "normal command completion must emit progress and card completion exactly once"
+            );
             inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn codex_owner_loss_stops_running_unified_exec_once() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut rx) = test_codex_inner();
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({ "threadId": "thread-test", "turn": { "id": "owner-turn" } }),
+                )
+                .await;
+            drain_events(&mut rx);
+            inner
+                .handle_notification(
+                    "item/started",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turnId": "owner-turn",
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "owner-command",
+                            "command": "sleep 30",
+                            "cwd": "/tmp",
+                            "processId": "5252",
+                            "status": "inProgress"
+                        }
+                    }),
+                )
+                .await;
+            let started = drain_events(&mut rx);
+            assert_eq!(
+                started
+                    .iter()
+                    .filter(|event| {
+                        event.get("kind").and_then(Value::as_str) == Some("ToolProgress")
+                            && event.pointer("/data/update/status").and_then(Value::as_str)
+                                == Some("running")
+                    })
+                    .count(),
+                1
+            );
+
+            inner
+                .rpc
+                .terminate()
+                .await
+                .expect("terminate fake app-server");
+            inner
+                .handle_inbound(CodexInbound::Closed { exit_code: Some(9) })
+                .await;
+            let exited = drain_events(&mut rx);
+            assert_eq!(
+                exited
+                    .iter()
+                    .filter(|event| {
+                        event.get("kind").and_then(Value::as_str) == Some("ToolProgress")
+                            && event.pointer("/data/update/status").and_then(Value::as_str)
+                                == Some("stopped")
+                    })
+                    .count(),
+                1,
+                "owner loss must retire the Running tray row"
+            );
+            assert_eq!(
+                exited
+                    .iter()
+                    .filter(|event| {
+                        event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
+                    })
+                    .count(),
+                1,
+                "owner loss must complete a still-pending tool card"
+            );
+
+            inner
+                .handle_inbound(CodexInbound::Closed { exit_code: Some(9) })
+                .await;
+            let duplicate = drain_events(&mut rx);
+            assert!(duplicate.iter().all(|event| {
+                event.get("kind").and_then(Value::as_str) != Some("ToolProgress")
+                    && event.get("kind").and_then(Value::as_str) != Some("ToolExecutionCompleted")
+            }));
         });
     }
 

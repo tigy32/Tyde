@@ -370,7 +370,6 @@ impl TurnEmitter {
         true
     }
 
-    #[cfg(test)]
     pub(crate) fn has_pending_tool_request(&self, tool_call_id: &str) -> bool {
         self.lock().is_tool_pending(tool_call_id)
     }

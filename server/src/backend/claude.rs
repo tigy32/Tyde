@@ -514,6 +514,7 @@ impl ClaudeSession {
             runtime: Mutex::new(None),
             turn_event_gate: Mutex::new(()),
             task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
+            background_tasks: StdMutex::new(HashMap::new()),
             skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
             skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
         });
@@ -734,6 +735,7 @@ struct ClaudeInner {
     runtime: Mutex<Option<ClaudeProcessRuntime>>,
     turn_event_gate: Mutex<()>,
     task_tracker: StdMutex<ClaudeTaskTracker>,
+    background_tasks: StdMutex<HashMap<String, BackgroundTaskEntry>>,
     /// Gates the first prompt on the CLI confirming this session's skills.
     /// A `watch` rather than a one-shot because a respawn re-arms it.
     skill_readiness: watch::Sender<ClaudeSkillReadiness>,
@@ -772,9 +774,13 @@ struct ClaudeProcessRuntime {
 type ClaudeControlWaiters = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>>;
 
 impl ClaudeProcessRuntime {
-    async fn kill(self) {
+    fn abort_readers(&self) {
         self.stdout_task.abort();
         self.stderr_task.abort();
+    }
+
+    async fn kill(self) {
+        self.abort_readers();
         let mut child = self.child.lock().await;
         if let Some(child) = child.as_mut() {
             let _ = child.kill().await;
@@ -2894,11 +2900,16 @@ impl ClaudeInner {
     async fn shutdown_process(&self) {
         let runtime = self.runtime.lock().await.take();
         if let Some(runtime) = runtime {
+            runtime.abort_readers();
+            self.drain_background_tasks();
             runtime.kill().await;
+        } else {
+            self.drain_background_tasks();
         }
     }
 
     async fn mark_process_exited(&self) {
+        self.drain_background_tasks();
         let runtime = self.runtime.lock().await.take();
         if let Some(runtime) = runtime {
             let mut child = runtime.child.lock().await;
@@ -2906,6 +2917,14 @@ impl ClaudeInner {
                 let _ = child.try_wait();
             }
         }
+    }
+
+    fn drain_background_tasks(&self) {
+        let mut tasks = self
+            .background_tasks
+            .lock()
+            .expect("Claude background task mutex poisoned");
+        drain_background_task_entries(&mut tasks);
     }
 
     async fn cancel_active_turn(&self) {
@@ -4033,9 +4052,6 @@ async fn read_claude_stdout_persistent(
     // Keyed by task_id; lives at loop scope (not per-turn) because a
     // workflow's task frames keep arriving after its turn completes.
     let mut workflow_runs: HashMap<String, WorkflowRunEntry> = HashMap::new();
-    // Keyed by task_id; loop scope for the same reason — a backgrounded
-    // command's terminal frames arrive after the launching turn ends.
-    let mut background_tasks: HashMap<String, BackgroundTaskEntry> = HashMap::new();
     // Frames held back while skill verification is still Pending. The `init`
     // frame arrives at the head of the CLI's response to the first user
     // message, so anything the model says can reach this reader *before* Tyde
@@ -4220,12 +4236,19 @@ async fn read_claude_stdout_persistent(
         if handle_workflow_task_frame(&value, &mut workflow_runs, &inner.emitter) {
             continue;
         }
-        if handle_background_bash_task_frame_with_owners(
-            &value,
-            &mut background_tasks,
-            &inner.emitter,
-            &subagent_streams,
-        ) {
+        let handled_background_task = {
+            let mut background_tasks = inner
+                .background_tasks
+                .lock()
+                .expect("Claude background task mutex poisoned");
+            handle_background_bash_task_frame_with_owners(
+                &value,
+                &mut background_tasks,
+                &inner.emitter,
+                &subagent_streams,
+            )
+        };
+        if handled_background_task {
             continue;
         }
 
@@ -4263,12 +4286,18 @@ async fn read_claude_stdout_persistent(
                 parent_id,
                 &value,
             );
-            refresh_unresolved_background_tasks(
-                &value,
-                &mut background_tasks,
-                &inner.emitter,
-                &subagent_streams,
-            );
+            {
+                let mut background_tasks = inner
+                    .background_tasks
+                    .lock()
+                    .expect("Claude background task mutex poisoned");
+                refresh_unresolved_background_tasks(
+                    &value,
+                    &mut background_tasks,
+                    &inner.emitter,
+                    &subagent_streams,
+                );
+            }
             continue;
         }
 
@@ -4306,12 +4335,18 @@ async fn read_claude_stdout_persistent(
             &mut turn_state.current_message_id,
             interrupt_requested,
         );
-        refresh_unresolved_background_tasks(
-            &value,
-            &mut background_tasks,
-            &inner.emitter,
-            &subagent_streams,
-        );
+        {
+            let mut background_tasks = inner
+                .background_tasks
+                .lock()
+                .expect("Claude background task mutex poisoned");
+            refresh_unresolved_background_tasks(
+                &value,
+                &mut background_tasks,
+                &inner.emitter,
+                &subagent_streams,
+            );
+        }
 
         if subagent_emitter.is_some() {
             detect_subagent_completions(&value, &mut subagent_streams).await;
@@ -5213,6 +5248,7 @@ async fn ensure_subagent_stream(
         runtime: Mutex::new(None),
         turn_event_gate: Mutex::new(()),
         task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
+        background_tasks: StdMutex::new(HashMap::new()),
         skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
         skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
     });
@@ -5498,6 +5534,8 @@ struct BackgroundTaskEntry {
     state: BackgroundTaskState,
     output: Option<ClaudeRunCommandResult>,
     output_path: Option<String>,
+    terminal_progress_emitted: bool,
+    completion_emitted: bool,
 }
 
 fn background_task_parent_tool_use_id(value: &Value) -> Option<&str> {
@@ -5759,6 +5797,26 @@ fn emit_background_task_completion(emitter: &TurnEmitter, entry: &BackgroundTask
     });
 }
 
+fn drain_background_task_entries(background_tasks: &mut HashMap<String, BackgroundTaskEntry>) {
+    for (_, mut entry) in background_tasks.drain() {
+        let Some(owner) = entry.owner.as_deref() else {
+            continue;
+        };
+        if entry.tool_name.is_none() {
+            continue;
+        }
+        if !entry.terminal_progress_emitted {
+            entry.state.status = BackgroundTaskStatus::Stopped;
+            entry.terminal_progress_emitted = true;
+            emit_background_task_snapshot(owner, &entry);
+        }
+        if !entry.completion_emitted {
+            entry.completion_emitted = true;
+            emit_background_task_completion(owner, &entry);
+        }
+    }
+}
+
 fn map_background_task_patch_status(raw: &str) -> BackgroundTaskStatus {
     match raw {
         "running" => BackgroundTaskStatus::Running,
@@ -5842,6 +5900,8 @@ fn handle_background_bash_task_frame_with_owners(
                 },
                 output: None,
                 output_path: None,
+                terminal_progress_emitted: false,
+                completion_emitted: false,
             };
             tracing::debug!(
                 task_id,
@@ -5877,7 +5937,12 @@ fn handle_background_bash_task_frame_with_owners(
                 return true;
             };
             entry.state.status = map_background_task_patch_status(status);
-            if let Some(owner) = entry.owner.as_ref().map(Arc::clone) {
+            let should_emit = entry.state.status == BackgroundTaskStatus::Running
+                || !entry.terminal_progress_emitted;
+            if entry.state.status != BackgroundTaskStatus::Running {
+                entry.terminal_progress_emitted = true;
+            }
+            if should_emit && let Some(owner) = entry.owner.as_ref().map(Arc::clone) {
                 emit_background_task_snapshot(&owner, entry);
             }
             true
@@ -5909,8 +5974,14 @@ fn handle_background_bash_task_frame_with_owners(
             if let Some(owner) = entry.owner.as_deref()
                 && entry.tool_name.is_some()
             {
-                emit_background_task_snapshot(owner, &entry);
-                emit_background_task_completion(owner, &entry);
+                if !entry.terminal_progress_emitted {
+                    entry.terminal_progress_emitted = true;
+                    emit_background_task_snapshot(owner, &entry);
+                }
+                if !entry.completion_emitted {
+                    entry.completion_emitted = true;
+                    emit_background_task_completion(owner, &entry);
+                }
             } else {
                 tracing::error!(
                     task_id,
@@ -11957,6 +12028,7 @@ mod tests {
             runtime: Mutex::new(None),
             turn_event_gate: Mutex::new(()),
             task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
+            background_tasks: StdMutex::new(HashMap::new()),
             skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
             skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
         };
@@ -20572,8 +20644,25 @@ for raw_line in sys.stdin:
         ));
         assert!(tasks.is_empty(), "task is dropped after its notification");
 
-        let snapshots = recv_background_snapshots(&mut rx);
-        assert_eq!(snapshots.len(), 3);
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        let snapshots = events
+            .iter()
+            .filter(|event| event_kind(event) == Some("ToolProgress"))
+            .map(|event| {
+                let data: ToolProgressData =
+                    serde_json::from_value(event.get("data").cloned().unwrap_or(Value::Null))
+                        .expect("ToolProgress payload parses");
+                let ToolProgressUpdate::BackgroundTask(state) = data.update else {
+                    panic!("expected BackgroundTask update");
+                };
+                state
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            snapshots.len(),
+            2,
+            "task_updated owns the terminal progress transition; notification must not repeat it"
+        );
         assert_eq!(snapshots[0].status, BackgroundTaskStatus::Running);
         assert_eq!(
             snapshots[0].description.as_deref(),
@@ -20583,11 +20672,89 @@ for raw_line in sys.stdin:
         let last = snapshots.last().unwrap();
         assert_eq!(last.status, BackgroundTaskStatus::Completed);
         assert_eq!(
-            last.summary.as_deref(),
-            Some(
-                "Background command \"Sleep 10 seconds then echo marker\" completed (exit code 0)"
-            )
+            events
+                .iter()
+                .filter(|event| event_kind(event) == Some("ToolExecutionCompleted"))
+                .count(),
+            1,
+            "task_notification must complete the detached launch exactly once"
         );
+    }
+
+    #[tokio::test]
+    async fn background_bash_owner_loss_requires_stopped_and_completion_once() {
+        for cause in ["stdout EOF", "reader abort", "explicit shutdown"] {
+            let (inner, mut rx) = make_test_inner();
+            {
+                let mut tasks = inner
+                    .background_tasks
+                    .lock()
+                    .expect("Claude background task mutex poisoned");
+                handle_background_bash_task_frame(
+                    &bash_task_started_frame(),
+                    &mut tasks,
+                    &inner.emitter,
+                );
+            }
+            assert!(
+                inner.emitter.detach_tool("toolu_01Ay3XKHPknVQCy2L7zkvvH6"),
+                "fixture must model a pending detached launch"
+            );
+            let _ = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+
+            match cause {
+                "stdout EOF" => inner.mark_process_exited().await,
+                "reader abort" | "explicit shutdown" => inner.shutdown_process().await,
+                _ => unreachable!(),
+            }
+
+            let terminal = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+            assert_eq!(
+                terminal
+                    .iter()
+                    .filter(|event| {
+                        event_kind(event) == Some("ToolProgress")
+                            && event.pointer("/data/update/status").and_then(Value::as_str)
+                                == Some("stopped")
+                    })
+                    .count(),
+                1,
+                "{cause} must retire Running exactly once"
+            );
+            assert_eq!(
+                terminal
+                    .iter()
+                    .filter(|event| event_kind(event) == Some("ToolExecutionCompleted"))
+                    .count(),
+                1,
+                "{cause} must complete the detached launch exactly once"
+            );
+
+            inner.shutdown_process().await;
+            let duplicate = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+            assert!(duplicate.iter().all(|event| {
+                event_kind(event) != Some("ToolProgress")
+                    && event_kind(event) != Some("ToolExecutionCompleted")
+            }));
+        }
+    }
+
+    #[test]
+    fn background_bash_turn_end_and_interrupt_preserve_running() {
+        let (inner, mut rx) = make_test_inner();
+        let mut tasks: HashMap<String, BackgroundTaskEntry> = HashMap::new();
+        handle_background_bash_task_frame(&bash_task_started_frame(), &mut tasks, &inner.emitter);
+        assert!(inner.emitter.detach_tool("toolu_01Ay3XKHPknVQCy2L7zkvvH6"));
+        let _ = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+
+        inner.emitter.typing_status_changed(false);
+        inner.emitter.operation_cancelled("Operation cancelled");
+        let boundary = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(tasks.contains_key("b4r45rw5t"));
+        assert!(boundary.iter().all(|event| {
+            event_kind(event) != Some("ToolProgress")
+                && event_kind(event) != Some("ToolExecutionCompleted")
+        }));
     }
 
     #[test]
@@ -21160,9 +21327,8 @@ for raw_line in sys.stdin:
         ));
 
         let snapshots = recv_background_snapshots(&mut rx);
-        assert_eq!(snapshots.len(), 3);
+        assert_eq!(snapshots.len(), 2);
         assert_eq!(snapshots[1].status, BackgroundTaskStatus::Stopped);
-        assert_eq!(snapshots[2].status, BackgroundTaskStatus::Stopped);
     }
 
     #[test]
@@ -21964,6 +22130,7 @@ for raw_line in sys.stdin:
                 runtime: Mutex::new(None),
                 turn_event_gate: Mutex::new(()),
                 task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
+                background_tasks: StdMutex::new(HashMap::new()),
                 skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
                 skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
             }),
@@ -23942,6 +24109,7 @@ for raw_line in sys.stdin:
                     runtime: Mutex::new(None),
                     turn_event_gate: Mutex::new(()),
                     task_tracker: StdMutex::new(ClaudeTaskTracker::default()),
+                    background_tasks: StdMutex::new(HashMap::new()),
                     skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
                     skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
                 }),

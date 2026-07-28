@@ -381,6 +381,7 @@ struct AgentReplayState {
     /// background tasks don't bloat the replay log. Safe because the
     /// event_log is append-only.
     progress_log_index: HashMap<String, usize>,
+    active_background_progress: HashMap<String, protocol::ToolProgressData>,
 }
 
 impl AgentReplayState {
@@ -7227,6 +7228,17 @@ fn record_chat_event_for_replay(
             }
         }
         ChatEvent::ToolProgress(data) => {
+            if let protocol::ToolProgressUpdate::BackgroundTask(task) = &data.update {
+                if task.status == protocol::BackgroundTaskStatus::Running {
+                    replay_state
+                        .active_background_progress
+                        .insert(data.tool_call_id.clone(), data.clone());
+                } else {
+                    replay_state
+                        .active_background_progress
+                        .remove(&data.tool_call_id);
+                }
+            }
             if let Some(active) = replay_state.active_stream.as_mut() {
                 let existing = active.tool_events.iter_mut().find(|buffered| {
                     matches!(
@@ -8076,6 +8088,27 @@ fn attach_subscriber_with_latest_output(
                 .into_iter()
                 .map(AgentBootstrapEvent::ChatEvent),
         );
+        let mut active_background_progress = replay_state
+            .active_background_progress
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        active_background_progress
+            .sort_by(|left, right| left.tool_call_id.cmp(&right.tool_call_id));
+        for progress in active_background_progress {
+            let already_included = events.iter().any(|event| {
+                matches!(
+                    event,
+                    AgentBootstrapEvent::ChatEvent(ChatEvent::ToolProgress(included))
+                        if included.tool_call_id == progress.tool_call_id
+                )
+            });
+            if !already_included {
+                events.push(AgentBootstrapEvent::ChatEvent(ChatEvent::ToolProgress(
+                    progress,
+                )));
+            }
+        }
         if replay_state.resume_history_settled_idle {
             events.push(AgentBootstrapEvent::ChatEvent(
                 ChatEvent::TypingStatusChanged(false),
@@ -13077,6 +13110,149 @@ mod tests {
         // Replaced in place: progress keeps its original position before
         // the later TypingStatusChanged.
         assert!(progress_envelopes[0].seq < event_log.last().unwrap().seq);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_replays_active_background_progress_outside_history_tail_once() {
+        let canonical_stream = "/agent/replay-agent";
+        let mut event_log = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+        let mut subscribers = Vec::new();
+        let background_progress = |tool_call_id: &str, status: protocol::BackgroundTaskStatus| {
+            ChatEvent::ToolProgress(protocol::ToolProgressData {
+                tool_call_id: tool_call_id.to_owned(),
+                tool_name: "run_command".to_owned(),
+                update: protocol::ToolProgressUpdate::BackgroundTask(
+                    protocol::BackgroundTaskState {
+                        task_id: format!("task-{tool_call_id}"),
+                        description: Some(format!("command {tool_call_id}")),
+                        status,
+                        summary: None,
+                        output_unavailable: None,
+                    },
+                ),
+            })
+        };
+
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &background_progress("old-running", protocol::BackgroundTaskStatus::Running),
+        )
+        .await;
+        for index in 0..=15 {
+            let mut message = assistant_message(&format!("history {index}"));
+            message.message_id = Some(ChatMessageId(format!("message-{index}")));
+            append_chat_event(
+                canonical_stream,
+                &mut event_log,
+                &mut subscribers,
+                &mut replay_state,
+                &ChatEvent::MessageAdded(message),
+            )
+            .await;
+        }
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &background_progress("tail-running", protocol::BackgroundTaskStatus::Running),
+        )
+        .await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        attach_subscriber(
+            &event_log,
+            Some(&replay_state),
+            &mut subscribers,
+            replay_stream(tx),
+        );
+        let events = recv_agent_bootstrap_events(&mut rx, "running progress bootstrap").await;
+        for tool_call_id in ["old-running", "tail-running"] {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event,
+                            AgentBootstrapEvent::ChatEvent(ChatEvent::ToolProgress(progress))
+                                if progress.tool_call_id == tool_call_id
+                                    && matches!(
+                                        progress.update,
+                                        protocol::ToolProgressUpdate::BackgroundTask(
+                                            protocol::BackgroundTaskState {
+                                                status: protocol::BackgroundTaskStatus::Running,
+                                                ..
+                                            }
+                                        )
+                                    )
+                        )
+                    })
+                    .count(),
+                1,
+                "{tool_call_id} must be present exactly once whether inside or outside the tail"
+            );
+        }
+
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &background_progress("old-running", protocol::BackgroundTaskStatus::Completed),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &background_progress("tail-running", protocol::BackgroundTaskStatus::Failed),
+        )
+        .await;
+        assert!(replay_state.active_background_progress.is_empty());
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        attach_subscriber(
+            &event_log,
+            Some(&replay_state),
+            &mut subscribers,
+            replay_stream(tx),
+        );
+        let events = recv_agent_bootstrap_events(&mut rx, "terminal progress bootstrap").await;
+        assert!(events.iter().all(|event| {
+            !matches!(
+                event,
+                AgentBootstrapEvent::ChatEvent(ChatEvent::ToolProgress(progress))
+                    if progress.tool_call_id == "old-running"
+            )
+        }));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        AgentBootstrapEvent::ChatEvent(ChatEvent::ToolProgress(progress))
+                            if progress.tool_call_id == "tail-running"
+                                && matches!(
+                                    progress.update,
+                                    protocol::ToolProgressUpdate::BackgroundTask(
+                                        protocol::BackgroundTaskState {
+                                            status: protocol::BackgroundTaskStatus::Failed,
+                                            ..
+                                        }
+                                    )
+                                )
+                    )
+                })
+                .count(),
+            1,
+            "terminal progress in the tail must replace Running without roster duplication"
+        );
     }
 
     #[tokio::test]
