@@ -124,30 +124,37 @@ pub fn ChatView(
     /// agent_ref upgrades from `None` to the spawned agent (see
     /// `dispatch.rs` agent-creation handling).
     agent_ref: Signal<Option<ActiveAgentRef>>,
-    /// True only when this chat owns the singleton composer. In a single pane
-    /// this is the active chat; in a split it is derived from
-    /// `CenterZoneState::composer_owner()` and may remain true while a file in
-    /// the other pane has focus.
+    /// True only when this chat owns the *visible* composer — the focused
+    /// pane's chat, else the other pane's. Every chat now mounts its own
+    /// composer, so this no longer gates the composer; it gates the controls
+    /// that are client-global and must render exactly once (see
+    /// `ToolOutputModeToggle`, dev-docs/32 §7).
     #[prop(optional)]
     owns_composer: Option<Signal<bool>>,
     /// Compatibility input for the pre-split center zone. Remove once every
     /// caller supplies `owns_composer` from the layout foundation.
     #[prop(optional)]
     is_active: Option<Signal<bool>>,
+    /// Whether this chat is the visible tab in its pane, and so mounts a
+    /// composer. Hidden tabs stay mounted to preserve scroll and find state,
+    /// but a composer the user cannot see is not one they can type into.
+    /// Defaults to the composer-owner signal so single-pane callers that pass
+    /// only `is_active`/`owns_composer` keep their existing behaviour.
+    #[prop(optional)]
+    has_composer: Option<Signal<bool>>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
     let owns_composer = owns_composer
         .or(is_active)
         .unwrap_or_else(|| Signal::derive(|| false));
+    let has_composer = has_composer.unwrap_or(owns_composer);
+    // This pane's own composer and its own pending team member. Both are keyed
+    // to `tab_id` rather than to the composer owner, which is what keeps one
+    // pane's draft and spawn choices out of the other's.
+    let composer = state.composer_for(tab_id);
     let pending_state = state.clone();
-    let composer_pending_team_member = Signal::derive(move || {
-        pending_state.center_zone.with(|_| ());
-        pending_state.composer_pending_team_member_untracked()
-    });
-    let reply_state = state.clone();
-    let reply_in_this_pane = move |_| {
-        reply_state.activate_tab(tab_id);
-    };
+    let composer_pending_team_member =
+        Signal::derive(move || pending_state.tab_pending_team_member(tab_id));
     let initial_scroll_state = state.tab_scroll_state_untracked(tab_id);
 
     let has_agent = move || agent_ref.get().is_some();
@@ -1028,21 +1035,15 @@ pub fn ChatView(
             // flight, and is deliberately independent of the tool-output
             // mode — live operational state is not transcript history.
             <InflightTray agent_ref=agent_ref />
-            <Show
-                when=move || owns_composer.get()
-                fallback=move || view! {
-                    <button
-                        class="chat-reply-in-pane"
-                        type="button"
-                        on:click=reply_in_this_pane.clone()
-                    >
-                        "Reply in this pane"
-                    </button>
-                }
-            >
+            // Every visible chat mounts its own composer. A chat beside another
+            // chat is directly repliable; neither pane has to be focused first,
+            // and neither pane's draft, backend choice, or session settings can
+            // reach the other (dev-docs/32 §7).
+            <Show when=move || has_composer.get()>
                 <ChatInput
                     agent_ref=agent_ref
                     pending_team_member=composer_pending_team_member
+                    composer=composer.clone()
                 />
             </Show>
             </div>
@@ -1994,15 +1995,32 @@ mod wasm_tests {
         }
     }
 
+    /// dev-docs/32 §7: every chat pane mounts its own composer, and the two are
+    /// independent. The client-global tool-output preference still renders
+    /// exactly once, with the composer owner.
+    ///
+    /// This replaces an earlier assertion that two rendered chats mount exactly
+    /// *one* composer plus a "Reply in this pane" button. That singleton rule
+    /// was the product decision at the time; it has been deliberately reversed,
+    /// so the assertion is re-pointed at the new contract rather than deleted.
+    /// The guarantee it was reaching for — a chat you are not focused on is
+    /// still repliable, and controls that are client-global render once — is
+    /// preserved and strengthened: repliable now means *directly* repliable,
+    /// and the independence of the two composers (the thing a shared composer
+    /// could never give) is asserted here for the first time.
     #[wasm_bindgen_test]
-    async fn split_chats_mount_one_composer_and_one_global_tool_toggle() {
+    async fn split_chats_mount_independent_composers_and_one_global_tool_toggle() {
         let container = make_container();
+        let state_handle: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let state_for_mount = state_handle.clone();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
             state.agents.set(vec![
                 make_target_agent("host-a", "agent-a", None),
                 make_target_agent("host-b", "agent-b", None),
             ]);
+            *state_for_mount.borrow_mut() = Some(state.clone());
             provide_context(state);
             let agent_a = Signal::derive(|| {
                 Some(ActiveAgentRef {
@@ -2018,13 +2036,21 @@ mod wasm_tests {
             });
             let owns = Signal::derive(|| true);
             let does_not_own = Signal::derive(|| false);
+            // Both panes are visible; only one owns the client-global controls.
+            let visible = Signal::derive(|| true);
             view! {
                 <div>
-                    <ChatView tab_id=TabId(30_001) agent_ref=agent_a owns_composer=owns />
+                    <ChatView
+                        tab_id=TabId(30_001)
+                        agent_ref=agent_a
+                        owns_composer=owns
+                        has_composer=visible
+                    />
                     <ChatView
                         tab_id=TabId(30_002)
                         agent_ref=agent_b
                         owns_composer=does_not_own
+                        has_composer=visible
                     />
                 </div>
             }
@@ -2036,8 +2062,8 @@ mod wasm_tests {
                 .query_selector_all(".chat-input-area")
                 .unwrap()
                 .length(),
-            1,
-            "two rendered chats must mount exactly one composer"
+            2,
+            "each rendered chat must mount its own composer"
         );
         assert_eq!(
             container
@@ -2052,8 +2078,33 @@ mod wasm_tests {
                 .query_selector_all(".chat-reply-in-pane")
                 .unwrap()
                 .length(),
-            1,
-            "the non-owning rendered chat must offer one keyboard-accessible reply action"
+            0,
+            "a directly repliable pane needs no reply-in-pane affordance"
+        );
+
+        // The point of a composer per chat: text typed in one is not visible
+        // in, and cannot be sent from, the other.
+        let state = state_handle.borrow().as_ref().cloned().unwrap();
+        state
+            .composer_for(TabId(30_001))
+            .text
+            .set("for agent A".to_owned());
+        next_tick().await;
+
+        let textareas = container.query_selector_all("textarea").unwrap();
+        assert_eq!(textareas.length(), 2, "one textarea per mounted composer");
+        let first: web_sys::HtmlTextAreaElement = textareas.item(0).unwrap().dyn_into().unwrap();
+        let second: web_sys::HtmlTextAreaElement = textareas.item(1).unwrap().dyn_into().unwrap();
+        assert_eq!(first.value(), "for agent A");
+        assert_eq!(
+            second.value(),
+            "",
+            "one chat's draft must never appear in the other chat's composer"
+        );
+        assert_eq!(
+            state.composer_for(TabId(30_002)).text.get_untracked(),
+            "",
+            "the second chat's composer state must be untouched"
         );
     }
 

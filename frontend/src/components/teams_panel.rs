@@ -3509,7 +3509,7 @@ mod wasm_tests {
         let pending = state
             .composer_pending_team_member_untracked()
             .expect("composer owner should be draft team-member");
-        state.chat_input.set("hello".to_owned());
+        state.composer_untracked().text.set("hello".to_owned());
         let container = make_container();
         let state_for_mount = state.clone();
         let pending_for_mount = pending.clone();

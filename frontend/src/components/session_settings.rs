@@ -10,7 +10,7 @@ use protocol::{
 use crate::components::agents_panel::backend_label;
 use crate::components::backend_capacity::CapacityCompactRow;
 use crate::components::chat_message::{format_compact, token_badge_data};
-use crate::state::AppState;
+use crate::state::{ActiveAgentRef, AppState, ComposerHandle};
 
 pub(crate) fn clear_invalid_dependent_select_values(
     fields: &[protocol::SessionSettingField],
@@ -487,7 +487,16 @@ pub fn SessionSettingsControls(
 }
 
 #[component]
-pub fn SessionSettingsBar() -> impl IntoView {
+pub fn SessionSettingsBar(
+    /// Live-agent identity of the chat this bar belongs to; `None` for a draft.
+    /// Explicit rather than derived from `active_agent` because every chat pane
+    /// renders its own bar, and the unfocused pane must show — and edit — its
+    /// own chat's settings.
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+    /// The same chat's composer, holding the draft session settings shown
+    /// before an agent exists.
+    composer: ComposerHandle,
+) -> impl IntoView {
     let state = expect_context::<AppState>();
     let expanded = RwSignal::new(false);
 
@@ -499,8 +508,9 @@ pub fn SessionSettingsBar() -> impl IntoView {
     // the active agent's binding is unchanged.
     let current_binding = {
         let state = state.clone();
+        let composer = composer.clone();
         Memo::new(move |_| -> Option<(String, BackendKind)> {
-            if let Some(agent_ref) = state.active_agent.get() {
+            if let Some(agent_ref) = agent_ref.get() {
                 // `with` reads the agents Vec in place — the previous
                 // `state.agents.get().into_iter().find` cloned the
                 // whole Vec just to find one agent's backend_kind.
@@ -516,7 +526,7 @@ pub fn SessionSettingsBar() -> impl IntoView {
             } else {
                 let host_id = state.chat_context_host_id()?;
                 let settings = state.host_settings(&host_id)?;
-                let backend_kind = state.draft_backend_override.get().or_else(|| {
+                let backend_kind = composer.backend_override.get().or_else(|| {
                     settings
                         .default_backend
                         .or_else(|| settings.enabled_backends.first().copied())
@@ -591,8 +601,9 @@ pub fn SessionSettingsBar() -> impl IntoView {
 
     let current_values = {
         let state = state.clone();
+        let composer = composer.clone();
         Signal::derive(move || {
-            if let Some(agent_ref) = state.active_agent.get() {
+            if let Some(agent_ref) = agent_ref.get() {
                 state
                     .agent_session_settings
                     .get()
@@ -600,7 +611,7 @@ pub fn SessionSettingsBar() -> impl IntoView {
                     .cloned()
                     .unwrap_or_default()
             } else {
-                state.draft_session_settings.get()
+                composer.session_settings.get()
             }
         })
     };
@@ -617,7 +628,7 @@ pub fn SessionSettingsBar() -> impl IntoView {
     let task_rollup = {
         let state = state.clone();
         Memo::new(move |_| -> Option<TaskTokenUsagePayload> {
-            let agent_ref = state.active_agent.get()?;
+            let agent_ref = agent_ref.get()?;
             state.task_token_usage.with(|map| {
                 if let Some(payload) = map.get(&agent_ref) {
                     return Some(payload.clone());
@@ -637,14 +648,15 @@ pub fn SessionSettingsBar() -> impl IntoView {
     let has_task_rollup = Memo::new(move |_| task_rollup.with(|payload| payload.is_some()));
 
     let on_change_state = state.clone();
+    let on_change_composer = composer.clone();
     let on_change = Callback::new(move |new_values: SessionSettingsValues| {
-        if on_change_state.active_agent.get_untracked().is_some() {
-            crate::actions::send_set_session_settings(&on_change_state, new_values);
+        if let Some(target) = agent_ref.get_untracked() {
+            crate::actions::send_set_session_settings(&on_change_state, target, new_values);
         } else {
             // A user edit to the draft: mark dirty so spawn sends these as
             // explicit overrides even when a launch profile is selected.
-            on_change_state.draft_session_settings_dirty.set(true);
-            on_change_state.draft_session_settings.set(new_values);
+            on_change_composer.session_settings_dirty.set(true);
+            on_change_composer.session_settings.set(new_values);
         }
     });
 
@@ -1765,11 +1777,17 @@ mod wasm_tests {
         state
     }
 
+    /// Mounts the bar the way a chat pane does: bound to that pane's own agent
+    /// and composer rather than to a global active agent.
     fn mount_bar(container: &HtmlElement, state: AppState) -> impl Sized {
         let state_for_mount = state;
         mount_to(container.clone(), move || {
-            provide_context(state_for_mount.clone());
-            view! { <SessionSettingsBar /> }
+            let state = state_for_mount.clone();
+            let agent_state = state.clone();
+            let agent_ref = Signal::derive(move || agent_state.active_agent.get());
+            let composer = state.composer_untracked();
+            provide_context(state);
+            view! { <SessionSettingsBar agent_ref=agent_ref composer=composer /> }
         })
     }
 

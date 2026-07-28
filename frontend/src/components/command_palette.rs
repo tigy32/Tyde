@@ -533,9 +533,11 @@ pub fn execute_command(state: &AppState, id: CommandId, workspace_width: Option<
             state.right_tab.set(RightTab::Workflows);
         }
         CommandId::OpenAgentMonitor => {
-            state.open_tab(TabContent::AgentMonitor, "Agent Monitor".to_owned(), true)
+            state.open_tab(TabContent::AgentMonitor, "Agent Monitor".to_owned(), true);
         }
-        CommandId::GoToHome => state.open_tab(TabContent::Home, "Home".to_string(), false),
+        CommandId::GoToHome => {
+            state.open_tab(TabContent::Home, "Home".to_string(), false);
+        }
         // "Go to Chat" means: take me to the chat I would be typing into.
         // In priority order — the chat that owns the composer (which may be in
         // either pane), then a chat hidden behind another tab in the focused

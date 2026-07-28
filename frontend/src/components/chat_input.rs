@@ -9,7 +9,7 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 use crate::actions::spawn_new_chat;
 use crate::components::session_settings::SessionSettingsBar;
 use crate::send::send_frame;
-use crate::state::{ActiveAgentRef, AppState, ConnectionStatus, PendingTeamMember};
+use crate::state::{ActiveAgentRef, AppState, ComposerHandle, ConnectionStatus, PendingTeamMember};
 
 use protocol::{
     AgentOrigin, BackendKind, BackendSetupStatus, FrameKind, ImageData, InterruptPayload,
@@ -66,6 +66,7 @@ fn chat_target_ready_tracked(state: &AppState, agent_ref: Signal<Option<ActiveAg
 
 fn selected_backend_kind(
     state: &AppState,
+    composer: &ComposerHandle,
     agent_ref: Signal<Option<ActiveAgentRef>>,
 ) -> Option<BackendKind> {
     if let Some(active_agent) = agent_ref.get_untracked() {
@@ -78,7 +79,7 @@ fn selected_backend_kind(
         }
     }
 
-    let draft = state.draft_backend_override.get_untracked();
+    let draft = composer.backend_override.get_untracked();
     draft.or_else(|| {
         state
             .chat_context_host_settings_untracked()
@@ -92,6 +93,7 @@ fn selected_backend_kind(
 
 fn selected_backend_kind_tracked(
     state: &AppState,
+    composer: &ComposerHandle,
     agent_ref: Signal<Option<ActiveAgentRef>>,
 ) -> Option<BackendKind> {
     if let Some(active_agent) = agent_ref.get() {
@@ -106,7 +108,7 @@ fn selected_backend_kind_tracked(
         }
     }
 
-    let draft = state.draft_backend_override.get();
+    let draft = composer.backend_override.get();
     draft.or_else(|| {
         state.chat_context_host_settings().and_then(|settings| {
             settings
@@ -268,6 +270,7 @@ impl DraftBackendNotice {
 /// is intentionally not covered here.
 fn draft_backend_notice(
     state: &AppState,
+    composer: &ComposerHandle,
     agent_ref: Signal<Option<ActiveAgentRef>>,
     pending_team_member: Signal<Option<PendingTeamMember>>,
 ) -> Option<DraftBackendNotice> {
@@ -285,8 +288,8 @@ fn draft_backend_notice(
     }
     let host_id = state.chat_context_host_id()?;
     let settings = state.chat_context_host_settings()?;
-    let backend = state
-        .draft_backend_override
+    let backend = composer
+        .backend_override
         .get()
         .or(settings.default_backend)
         .or_else(|| settings.enabled_backends.first().copied());
@@ -303,24 +306,25 @@ fn draft_backend_notice(
 }
 
 fn restore_submitted_input(
-    state: &AppState,
+    composer: &ComposerHandle,
     pending_images: RwSignal<Vec<PendingImage>>,
     draft: String,
     images: Vec<PendingImage>,
 ) {
-    if state.chat_input.get_untracked().is_empty() && pending_images.get_untracked().is_empty() {
-        state.chat_input.set(draft);
+    if composer.text.get_untracked().is_empty() && pending_images.get_untracked().is_empty() {
+        composer.text.set(draft);
         pending_images.set(images);
     }
 }
 
 fn submit_chat_input(
     state: &AppState,
+    composer: &ComposerHandle,
     agent_ref: Signal<Option<ActiveAgentRef>>,
     pending_team_member: Signal<Option<PendingTeamMember>>,
     pending_images: RwSignal<Vec<PendingImage>>,
 ) {
-    let draft = state.chat_input.get_untracked();
+    let draft = composer.text.get_untracked();
     let text = draft.trim().to_owned();
     let images = pending_images.get_untracked();
     let payload_images = pending_images_to_payload(&images);
@@ -331,7 +335,7 @@ fn submit_chat_input(
     // A draft with no usable backend: keep the text and let the inline notice
     // above the composer guide the user to setup, instead of clearing the input
     // and silently failing to spawn.
-    if draft_backend_notice(state, agent_ref, pending_team_member).is_some() {
+    if draft_backend_notice(state, composer, agent_ref, pending_team_member).is_some() {
         return;
     }
 
@@ -351,9 +355,9 @@ fn submit_chat_input(
                 );
                 return;
             };
-            state.chat_input.set(String::new());
+            composer.text.set(String::new());
             pending_images.set(Vec::new());
-            let restore_state = state.clone();
+            let restore_composer = composer.clone();
             let restore_draft = draft.clone();
             let restore_images = images.clone();
             spawn_local(async move {
@@ -368,7 +372,7 @@ fn submit_chat_input(
                 {
                     log::error!("team_member_activate (with prompt) failed: {error}");
                     restore_submitted_input(
-                        &restore_state,
+                        &restore_composer,
                         pending_images,
                         restore_draft,
                         restore_images,
@@ -377,18 +381,18 @@ fn submit_chat_input(
             });
             return;
         }
-        let restore_state = state.clone();
+        let restore_composer = composer.clone();
         let restore_draft = draft.clone();
         let restore_images = images.clone();
-        if spawn_new_chat(state, text, payload_images, move |_| {
+        if spawn_new_chat(state, composer, text, payload_images, move |_| {
             restore_submitted_input(
-                &restore_state,
+                &restore_composer,
                 pending_images,
                 restore_draft,
                 restore_images,
             );
         }) {
-            state.chat_input.set(String::new());
+            composer.text.set(String::new());
             pending_images.set(Vec::new());
         }
         return;
@@ -411,9 +415,9 @@ fn submit_chat_input(
         }
     };
 
-    state.chat_input.set(String::new());
+    composer.text.set(String::new());
     pending_images.set(Vec::new());
-    let restore_state = state.clone();
+    let restore_composer = composer.clone();
     let restore_draft = draft.clone();
     let restore_images = images.clone();
     spawn_local(async move {
@@ -428,7 +432,7 @@ fn submit_chat_input(
         {
             log::error!("failed to send message: {e}");
             restore_submitted_input(
-                &restore_state,
+                &restore_composer,
                 pending_images,
                 restore_draft,
                 restore_images,
@@ -443,10 +447,11 @@ fn submit_chat_input(
 /// has a session id, so the guard here just protects against an empty draft.
 fn submit_side_question(
     state: &AppState,
+    composer: &ComposerHandle,
     agent_ref: Signal<Option<ActiveAgentRef>>,
     pending_images: RwSignal<Vec<PendingImage>>,
 ) {
-    let text = state.chat_input.get_untracked();
+    let text = composer.text.get_untracked();
     let text = text.trim().to_owned();
     let images = pending_images.get_untracked();
     let payload_images = pending_images_to_payload(&images);
@@ -457,15 +462,11 @@ fn submit_side_question(
     let Some(target) = agent_ref.get_untracked() else {
         return;
     };
-    if state.active_agent.get_untracked().as_ref() != Some(&target) {
-        log::error!("submit_side_question: composer owner does not match active_agent");
-        return;
-    }
 
-    state.chat_input.set(String::new());
+    composer.text.set(String::new());
     pending_images.set(Vec::new());
 
-    crate::actions::spawn_side_question(state, text, payload_images);
+    crate::actions::spawn_side_question(state, target, text, payload_images);
 }
 
 fn interrupt_target_turn(state: &AppState, agent_ref: Signal<Option<ActiveAgentRef>>) {
@@ -530,10 +531,11 @@ fn claim_interrupt_slot(state: &AppState, agent_id: &protocol::AgentId) -> bool 
 
 fn steer_chat_input(
     state: &AppState,
+    composer: &ComposerHandle,
     agent_ref: Signal<Option<ActiveAgentRef>>,
     pending_images: RwSignal<Vec<PendingImage>>,
 ) {
-    let draft = state.chat_input.get_untracked();
+    let draft = composer.text.get_untracked();
     let text = draft.trim().to_owned();
     let images = pending_images.get_untracked();
     let payload_images = pending_images_to_payload(&images);
@@ -555,9 +557,9 @@ fn steer_chat_input(
         }
     };
 
-    state.chat_input.set(String::new());
+    composer.text.set(String::new());
     pending_images.set(Vec::new());
-    let restore_state = state.clone();
+    let restore_composer = composer.clone();
     let restore_draft = draft.clone();
     let restore_images = images.clone();
 
@@ -572,7 +574,7 @@ fn steer_chat_input(
         {
             log::error!("failed to interrupt conversation for steer: {e}");
             restore_submitted_input(
-                &restore_state,
+                &restore_composer,
                 pending_images,
                 restore_draft,
                 restore_images,
@@ -591,7 +593,7 @@ fn steer_chat_input(
         {
             log::error!("failed to send steer message: {e}");
             restore_submitted_input(
-                &restore_state,
+                &restore_composer,
                 pending_images,
                 restore_draft,
                 restore_images,
@@ -738,14 +740,20 @@ async fn read_image_file(file: web_sys::File) -> Result<PendingImage, String> {
 pub fn ChatInput(
     /// Exact live-agent identity of the chat that owns this composer. Draft
     /// chats supply `None`. The compatibility fallback is single-pane only;
-    /// split callers must always pass the composer owner's signal.
+    /// split callers must always pass their own chat's signal.
     #[prop(optional)]
     agent_ref: Option<Signal<Option<ActiveAgentRef>>>,
-    /// Exact pending team-member identity for a draft composer owner. The
-    /// fallback delegates to the canonical composer-owner state accessor
-    /// rather than reconstructing a target from the focused active tab.
+    /// Exact pending team-member identity for a draft composer. The fallback
+    /// delegates to the canonical composer-owner state accessor rather than
+    /// reconstructing a target from the focused active tab.
     #[prop(optional)]
     pending_team_member: Option<Signal<Option<PendingTeamMember>>>,
+    /// The rendering chat's own composer. Every chat pane mounts a composer, so
+    /// this is what keeps one pane's draft, backend choice, and session
+    /// settings out of the other's. The fallback is the visible composer, for
+    /// single-pane callers that have no tab identity of their own.
+    #[prop(optional)]
+    composer: Option<ComposerHandle>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
     let agent_ref = agent_ref.unwrap_or_else(|| {
@@ -759,11 +767,13 @@ pub fn ChatInput(
             state.composer_pending_team_member_untracked()
         })
     });
+    let composer = composer.unwrap_or_else(|| state.composer_untracked());
     let pending_images = RwSignal::new(Vec::<PendingImage>::new());
     let attachment_error = RwSignal::new(None::<String>);
     let drag_depth = RwSignal::new(0u32);
 
     let ui_state = state.clone();
+    let ui_composer = composer.clone();
     let ui_images = pending_images;
     let ui_mode = Memo::new(move |_| {
         let is_connected = matches!(
@@ -771,10 +781,10 @@ pub fn ChatInput(
             ConnectionStatus::Connected
         );
         // `with` reads through the signal to compute `has_text` without
-        // cloning the input string per keystroke — `chat_input.get()`
-        // would clone the entire String into a temporary just to check
+        // cloning the input string per keystroke — a `get()` here would
+        // clone the entire String into a temporary just to check
         // `trim().is_empty()` and drop it.
-        let has_text = ui_state.chat_input.with(|s| !s.trim().is_empty());
+        let has_text = ui_composer.text.with(|s| !s.trim().is_empty());
         let has_images = ui_images.with(|images| !images.is_empty());
         let has_input = has_text || has_images;
         let target_ready = chat_target_ready_tracked(&ui_state, agent_ref);
@@ -810,12 +820,13 @@ pub fn ChatInput(
     let active_has_session =
         Memo::new(move |_| target_agent_has_session_id_tracked(&btw_state, agent_ref));
     let fork_state = state.clone();
+    let fork_composer = composer.clone();
     let fork_images = pending_images;
     let can_btw = Memo::new(move |_| {
         matches!(
             fork_state.chat_context_connection_status(),
             ConnectionStatus::Connected
-        ) && (fork_state.chat_input.with(|s| !s.trim().is_empty())
+        ) && (fork_composer.text.with(|s| !s.trim().is_empty())
             || fork_images.with(|images| !images.is_empty()))
             && active_has_session.get()
     });
@@ -872,19 +883,19 @@ pub fn ChatInput(
     };
 
     let submit_on_enter_state = state.clone();
+    let submit_on_enter_composer = composer.clone();
     let submit_on_enter_images = pending_images;
     let submit_on_enter_mode = move || {
         matches!(
             submit_on_enter_state.chat_context_connection_status(),
             ConnectionStatus::Connected
         ) && chat_target_ready_tracked(&submit_on_enter_state, agent_ref)
-            && (submit_on_enter_state
-                .chat_input
-                .with(|s| !s.trim().is_empty())
+            && (submit_on_enter_composer.text.with(|s| !s.trim().is_empty())
                 || submit_on_enter_images.with(|images| !images.is_empty()))
     };
 
     let on_keydown_state = state.clone();
+    let on_keydown_composer = composer.clone();
     let on_keydown_images = pending_images;
     let on_keydown = move |ev: leptos::ev::KeyboardEvent| {
         if ev.key() != "Enter" {
@@ -899,7 +910,12 @@ pub fn ChatInput(
             if ev.shift_key() {
                 // Cmd/Ctrl+Shift+Enter → Fork + send, when available.
                 if can_btw.get_untracked() {
-                    submit_side_question(&on_keydown_state, agent_ref, on_keydown_images);
+                    submit_side_question(
+                        &on_keydown_state,
+                        &on_keydown_composer,
+                        agent_ref,
+                        on_keydown_images,
+                    );
                 }
             } else if is_steer.get_untracked() {
                 // Cmd/Ctrl+Enter while thinking with input → steer, mirroring
@@ -908,12 +924,18 @@ pub fn ChatInput(
                 // If steer isn't actionable, no-op — do NOT fall through to
                 // send (the dropdown offers nothing actionable here either).
                 if ui_mode.get_untracked().1 && !is_readonly.get_untracked() {
-                    steer_chat_input(&on_keydown_state, agent_ref, on_keydown_images);
+                    steer_chat_input(
+                        &on_keydown_state,
+                        &on_keydown_composer,
+                        agent_ref,
+                        on_keydown_images,
+                    );
                 }
             } else if ui_mode.get_untracked().0 {
                 // Cmd/Ctrl+Enter otherwise → normal send.
                 submit_chat_input(
                     &on_keydown_state,
+                    &on_keydown_composer,
                     agent_ref,
                     pending_team_member,
                     on_keydown_images,
@@ -928,6 +950,7 @@ pub fn ChatInput(
             if submit_on_enter_mode() {
                 submit_chat_input(
                     &on_keydown_state,
+                    &on_keydown_composer,
                     agent_ref,
                     pending_team_member,
                     on_keydown_images,
@@ -939,7 +962,7 @@ pub fn ChatInput(
     // Primary button handler: Cancel (interrupt) when thinking+empty, else submit.
     // Menu handlers park non-`Copy` AppState in a StoredValue so they're `Copy`.
     let primary_interrupt_stored = StoredValue::new_local(state.clone());
-    let primary_submit_stored = StoredValue::new_local(state.clone());
+    let primary_submit_stored = StoredValue::new_local((state.clone(), composer.clone()));
     let primary_submit_images = pending_images;
     let on_click_primary = move |_| {
         let mode = ui_mode.get_untracked();
@@ -951,25 +974,35 @@ pub fn ChatInput(
         if mode.1 && !is_steer_now && !readonly {
             primary_interrupt_stored.with_value(|state| interrupt_target_turn(state, agent_ref));
         } else {
-            primary_submit_stored.with_value(|state| {
-                submit_chat_input(state, agent_ref, pending_team_member, primary_submit_images)
+            primary_submit_stored.with_value(|(state, composer)| {
+                submit_chat_input(
+                    state,
+                    composer,
+                    agent_ref,
+                    pending_team_member,
+                    primary_submit_images,
+                )
             });
         }
     };
 
-    let menu_state = StoredValue::new_local(state.clone());
+    let menu_state = StoredValue::new_local((state.clone(), composer.clone()));
     let menu_images = pending_images;
     let on_menu_btw = move |_| {
         menu_open.set(false);
-        menu_state.with_value(|state| submit_side_question(state, agent_ref, menu_images));
+        menu_state.with_value(|(state, composer)| {
+            submit_side_question(state, composer, agent_ref, menu_images)
+        });
     };
     let on_menu_steer = move |_| {
         menu_open.set(false);
-        menu_state.with_value(|state| steer_chat_input(state, agent_ref, menu_images));
+        menu_state.with_value(|(state, composer)| {
+            steer_chat_input(state, composer, agent_ref, menu_images)
+        });
     };
     let on_menu_cancel = move |_| {
         menu_open.set(false);
-        menu_state.with_value(|state| interrupt_target_turn(state, agent_ref));
+        menu_state.with_value(|(state, _)| interrupt_target_turn(state, agent_ref));
     };
 
     let on_split_keydown = move |ev: leptos::ev::KeyboardEvent| {
@@ -979,7 +1012,7 @@ pub fn ChatInput(
         }
     };
 
-    let on_input_state = state.clone();
+    let on_input_composer = composer.clone();
     // Throttle textarea autosize to one update per animation frame.
     // The previous code ran height="auto" → read scrollHeight →
     // write height inline on every keypress, which forces a synchronous
@@ -988,7 +1021,7 @@ pub fn ChatInput(
     let autosize_pending = std::rc::Rc::new(std::cell::Cell::new(false));
     let on_input = move |ev: leptos::ev::Event| {
         let target = event_target_value(&ev);
-        on_input_state.chat_input.set(target);
+        on_input_composer.text.set(target);
         if autosize_pending.get() {
             return;
         }
@@ -1050,6 +1083,7 @@ pub fn ChatInput(
     };
 
     let on_drop_state = state.clone();
+    let on_drop_composer = composer.clone();
     let on_drop_images = pending_images;
     let on_drop_error = attachment_error;
     let on_drop_depth = drag_depth;
@@ -1062,11 +1096,11 @@ pub fn ChatInput(
             return;
         }
 
-        if !selected_backend_kind(&on_drop_state, agent_ref)
+        if !selected_backend_kind(&on_drop_state, &on_drop_composer, agent_ref)
             .map(BackendKind::supports_image_input)
             .unwrap_or(false)
         {
-            let backend_name = selected_backend_kind(&on_drop_state, agent_ref)
+            let backend_name = selected_backend_kind(&on_drop_state, &on_drop_composer, agent_ref)
                 .map(|backend| format!("{backend:?}"))
                 .unwrap_or_else(|| "selected backend".to_string());
             on_drop_error.set(Some(format!("{backend_name} does not support image input")));
@@ -1109,22 +1143,22 @@ pub fn ChatInput(
     // This replaces the previous `prop:value=move || …` reactive
     // binding on the textarea, which subscribed unconditionally and
     // ran a property write per keystroke.
-    let reset_state = state.clone();
+    let reset_composer = composer.clone();
     Effect::new(move |_| {
         let Some(el) = textarea_ref.get() else {
             return;
         };
         let textarea: web_sys::HtmlTextAreaElement = (*el).clone().unchecked_into();
         // `with` reads the signal in place to skip cloning the input
-        // string per keystroke; the previous `chat_input.get()`
-        // allocated a fresh `String` just to compare against the DOM
-        // value and (in the no-op case) drop it.
-        let needs_set = reset_state.chat_input.with(|val| textarea.value() != *val);
+        // string per keystroke; a `get()` here would allocate a fresh
+        // `String` just to compare against the DOM value and (in the
+        // no-op case) drop it.
+        let needs_set = reset_composer.text.with(|val| textarea.value() != *val);
         if needs_set {
-            let val = reset_state.chat_input.get_untracked();
+            let val = reset_composer.text.get_untracked();
             textarea.set_value(&val);
         }
-        let is_empty = reset_state.chat_input.with(|val| val.is_empty());
+        let is_empty = reset_composer.text.with(|val| val.is_empty());
         if is_empty {
             let html_el: web_sys::HtmlElement = el.into();
             let style = html_el.style();
@@ -1134,16 +1168,22 @@ pub fn ChatInput(
     });
 
     let overlay_support_state = state.clone();
+    let overlay_support_composer = composer.clone();
     let overlay_is_unsupported = Memo::new(move |_| {
-        !selected_backend_kind_tracked(&overlay_support_state, agent_ref)
+        !selected_backend_kind_tracked(&overlay_support_state, &overlay_support_composer, agent_ref)
             .map(BackendKind::supports_image_input)
             .unwrap_or(false)
     });
     let overlay_support_copy_state = state.clone();
+    let overlay_support_copy_composer = composer.clone();
     let overlay_drop_copy = Memo::new(move |_| {
-        if selected_backend_kind_tracked(&overlay_support_copy_state, agent_ref)
-            .map(BackendKind::supports_image_input)
-            .unwrap_or(false)
+        if selected_backend_kind_tracked(
+            &overlay_support_copy_state,
+            &overlay_support_copy_composer,
+            agent_ref,
+        )
+        .map(BackendKind::supports_image_input)
+        .unwrap_or(false)
         {
             "Drop images to attach".to_string()
         } else {
@@ -1153,8 +1193,14 @@ pub fn ChatInput(
 
     // Draft "New Chat" with no usable backend → inline guidance toward setup.
     let notice_compute_state = state.clone();
+    let notice_compute_composer = composer.clone();
     let backend_notice = Memo::new(move |_| {
-        draft_backend_notice(&notice_compute_state, agent_ref, pending_team_member)
+        draft_backend_notice(
+            &notice_compute_state,
+            &notice_compute_composer,
+            agent_ref,
+            pending_team_member,
+        )
     });
     let notice_state = state.clone();
 
@@ -1430,7 +1476,7 @@ pub fn ChatInput(
                     </Show>
                 </div>
             </div>
-            <SessionSettingsBar />
+            <SessionSettingsBar agent_ref=agent_ref composer=composer.clone() />
         </div>
     }
 }
@@ -1534,9 +1580,6 @@ mod wasm_tests {
                 m.insert(agent_id.clone(), true);
             });
         }
-        if !input.is_empty() {
-            state.chat_input.set(input.to_owned());
-        }
         state.open_tab(
             TabContent::chat_with_agent(ActiveAgentRef {
                 host_id: HOST.to_owned(),
@@ -1545,6 +1588,13 @@ mod wasm_tests {
             "Chat".to_owned(),
             true,
         );
+        // Seeded after the tab exists: a draft belongs to a chat, so there has
+        // to be a chat for it to belong to. Writing first would land the text
+        // on the detached composer the workspace uses when no chat is open,
+        // and the mounted composer would come up empty.
+        if !input.is_empty() {
+            state.composer_untracked().text.set(input.to_owned());
+        }
     }
 
     /// Like [`stub_send_host_line`] but records every `send_host_line` call into
@@ -1854,7 +1904,7 @@ mod wasm_tests {
         next_tick().await;
 
         assert_eq!(
-            state.chat_input.get_untracked(),
+            state.composer_untracked().text.get_untracked(),
             "hello",
             "keyboard submit must not clear a draft that has no live agent stream"
         );
@@ -1911,7 +1961,7 @@ mod wasm_tests {
         dispatch_keydown(&textarea(&container), "Enter", true, false);
         next_tick().await;
         assert_eq!(
-            state.chat_input.get_untracked(),
+            state.composer_untracked().text.get_untracked(),
             "continue from a fork",
             "same-actor keyboard send must preserve the draft"
         );
@@ -1920,7 +1970,7 @@ mod wasm_tests {
         dispatch_keydown(&textarea(&container), "Enter", true, true);
         next_tick().await;
         assert_eq!(
-            state.chat_input.get_untracked(),
+            state.composer_untracked().text.get_untracked(),
             "",
             "Fork + send owns and clears the retained draft"
         );
@@ -1930,7 +1980,7 @@ mod wasm_tests {
             "the only emitted frame is the host-level fork"
         );
 
-        state.chat_input.set("new draft".to_owned());
+        state.composer_untracked().text.set("new draft".to_owned());
         state.agents.update(|agents| {
             agents[0].session_id = None;
         });
@@ -2243,12 +2293,12 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        assert_eq!(state.chat_input.get_untracked(), "hello");
+        assert_eq!(state.composer_untracked().text.get_untracked(), "hello");
         dispatch_keydown(&textarea(&container), "Enter", true, false);
         next_tick().await;
 
         assert_eq!(
-            state.chat_input.get_untracked(),
+            state.composer_untracked().text.get_untracked(),
             "",
             "Cmd+Enter must submit and clear the draft"
         );
@@ -2271,12 +2321,12 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        assert_eq!(state.chat_input.get_untracked(), "fork this");
+        assert_eq!(state.composer_untracked().text.get_untracked(), "fork this");
         dispatch_keydown(&textarea(&container), "Enter", true, true);
         next_tick().await;
 
         assert_eq!(
-            state.chat_input.get_untracked(),
+            state.composer_untracked().text.get_untracked(),
             "",
             "Cmd+Shift+Enter must initiate Fork + send and clear the draft"
         );
@@ -2301,7 +2351,7 @@ mod wasm_tests {
         next_tick().await;
 
         assert_eq!(
-            state.chat_input.get_untracked(),
+            state.composer_untracked().text.get_untracked(),
             "keep this",
             "Cmd+Shift+Enter with no fork available must not submit or alter the draft"
         );
@@ -2332,7 +2382,7 @@ mod wasm_tests {
         next_tick().await;
 
         assert_eq!(
-            state.chat_input.get_untracked(),
+            state.composer_untracked().text.get_untracked(),
             "redirect this",
             "Cmd+Enter must not steer a read-only backend-native agent"
         );

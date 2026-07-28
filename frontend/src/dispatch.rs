@@ -5734,11 +5734,14 @@ fn restore_draft_selection_after_host_bootstrap(state: &AppState, host_id: &str)
     }
 
     state.pending_draft_restore.set(None);
-    state.draft_backend_override.set(pending.backend);
-    state.draft_launch_profile_id.set(pending.launch_profile);
+    // The restored selection is single-valued and belongs to the chat the user
+    // is looking at, matching what `persist_selection_snapshot` wrote.
+    let composer = state.composer_untracked();
+    composer.backend_override.set(pending.backend);
+    composer.launch_profile_id.set(pending.launch_profile);
     // Keep the binding alive past the restore: a later switch to another host
     // must drop this selection rather than carry it across.
-    state.draft_selection_host.set(Some(host_id.to_owned()));
+    composer.selection_host.set(Some(host_id.to_owned()));
     // The applied selection is now the live one; write it through so storage
     // reflects reality even though the effect may not observe a change.
     state.persist_selection_snapshot();
@@ -6536,12 +6539,12 @@ mod tests {
                 "and the chat restores rather than being consumed by the project step"
             );
             assert_eq!(
-                state.draft_launch_profile_id.get_untracked(),
+                state.composer_untracked().launch_profile_id.get_untracked(),
                 Some(LaunchProfileId("hermes:profile:qa".to_owned())),
                 "and so does the draft profile"
             );
             assert_eq!(
-                state.draft_backend_override.get_untracked(),
+                state.composer_untracked().backend_override.get_untracked(),
                 Some(BackendKind::Hermes)
             );
             assert_eq!(
@@ -6617,48 +6620,69 @@ mod tests {
 
             // A whole draft bound to host-a: backend, profile, custom agent and
             // the profile-derived settings.
-            state.draft_backend_override.set(Some(BackendKind::Hermes));
             state
-                .draft_launch_profile_id
+                .composer_untracked()
+                .backend_override
+                .set(Some(BackendKind::Hermes));
+            state
+                .composer_untracked()
+                .launch_profile_id
                 .set(Some(LaunchProfileId("hermes:profile:qa".to_owned())));
             state
-                .draft_custom_agent_id
+                .composer_untracked()
+                .custom_agent_id
                 .set(Some(protocol::CustomAgentId("agent-a-custom".to_owned())));
             let mut settings = protocol::SessionSettingsValues::default();
             settings.0.insert(
                 "profile".to_owned(),
                 protocol::SessionSettingValue::String("hermes-qa".to_owned()),
             );
-            state.draft_session_settings.set(settings);
-            state.draft_session_settings_dirty.set(true);
-            state.draft_selection_host.set(Some("host-a".to_owned()));
+            state.composer_untracked().session_settings.set(settings);
+            state.composer_untracked().session_settings_dirty.set(true);
+            state
+                .composer_untracked()
+                .selection_host
+                .set(Some("host-a".to_owned()));
 
             // Spawning against host-b, in the same turn, with no yield.
-            let discarded = crate::actions::discard_foreign_draft_for_spawn(&state, "host-b");
+            let discarded = crate::actions::discard_foreign_draft_for_spawn(
+                &state.composer_untracked(),
+                "host-b",
+            );
 
             assert!(discarded, "a draft bound to another host must be discarded");
             assert_eq!(
-                state.draft_launch_profile_id.get_untracked(),
+                state.composer_untracked().launch_profile_id.get_untracked(),
                 None,
                 "host-a's profile must not reach a spawn against host-b"
             );
             assert_eq!(
-                state.draft_backend_override.get_untracked(),
+                state.composer_untracked().backend_override.get_untracked(),
                 None,
                 "nor its backend override, which host-b may have disabled"
             );
             assert_eq!(
-                state.draft_custom_agent_id.get_untracked(),
+                state.composer_untracked().custom_agent_id.get_untracked(),
                 None,
                 "nor its custom agent, which is host-scoped in exactly the same way"
             );
             assert!(
-                state.draft_session_settings.get_untracked().0.is_empty(),
+                state
+                    .composer_untracked()
+                    .session_settings
+                    .get_untracked()
+                    .0
+                    .is_empty(),
                 "nor its profile-derived session settings"
             );
-            assert!(!state.draft_session_settings_dirty.get_untracked());
+            assert!(
+                !state
+                    .composer_untracked()
+                    .session_settings_dirty
+                    .get_untracked()
+            );
             assert_eq!(
-                state.draft_selection_host.get_untracked(),
+                state.composer_untracked().selection_host.get_untracked(),
                 None,
                 "and the binding itself must not survive"
             );
@@ -6672,22 +6696,32 @@ mod tests {
         let owner = leptos::reactive::owner::Owner::new();
         owner.with(|| {
             let state = AppState::new();
-            state.draft_backend_override.set(Some(BackendKind::Hermes));
             state
-                .draft_launch_profile_id
+                .composer_untracked()
+                .backend_override
+                .set(Some(BackendKind::Hermes));
+            state
+                .composer_untracked()
+                .launch_profile_id
                 .set(Some(LaunchProfileId("hermes:profile:qa".to_owned())));
-            state.draft_selection_host.set(Some("host-a".to_owned()));
+            state
+                .composer_untracked()
+                .selection_host
+                .set(Some("host-a".to_owned()));
 
-            let discarded = crate::actions::discard_foreign_draft_for_spawn(&state, "host-a");
+            let discarded = crate::actions::discard_foreign_draft_for_spawn(
+                &state.composer_untracked(),
+                "host-a",
+            );
 
             assert!(!discarded, "a matching binding is not a mismatch");
             assert_eq!(
-                state.draft_launch_profile_id.get_untracked(),
+                state.composer_untracked().launch_profile_id.get_untracked(),
                 Some(LaunchProfileId("hermes:profile:qa".to_owned())),
                 "the user's own selection for this host must survive"
             );
             assert_eq!(
-                state.draft_backend_override.get_untracked(),
+                state.composer_untracked().backend_override.get_untracked(),
                 Some(BackendKind::Hermes)
             );
         });
@@ -6747,7 +6781,7 @@ mod tests {
                 ),
             );
             assert_eq!(
-                state.draft_launch_profile_id.get_untracked(),
+                state.composer_untracked().launch_profile_id.get_untracked(),
                 Some(LaunchProfileId("hermes:profile:qa".to_owned())),
                 "precondition: the draft restored on its own host"
             );
@@ -6759,13 +6793,13 @@ mod tests {
             }));
 
             assert_eq!(
-                state.draft_launch_profile_id.get_untracked(),
+                state.composer_untracked().launch_profile_id.get_untracked(),
                 None,
                 "host-a's profile is meaningless in host-b's catalog and must \
                  not be carried into a spawn against host-b"
             );
             assert_eq!(
-                state.draft_backend_override.get_untracked(),
+                state.composer_untracked().backend_override.get_untracked(),
                 None,
                 "and its backend must not bypass host-b's enabled set"
             );
@@ -6799,12 +6833,12 @@ mod tests {
             );
 
             assert_eq!(
-                state.draft_backend_override.get_untracked(),
+                state.composer_untracked().backend_override.get_untracked(),
                 None,
                 "host-b must not inherit host-a's backend choice"
             );
             assert_eq!(
-                state.draft_launch_profile_id.get_untracked(),
+                state.composer_untracked().launch_profile_id.get_untracked(),
                 None,
                 "nor its profile id, which host-b's catalog does not define"
             );
@@ -6842,7 +6876,7 @@ mod tests {
                 ),
             );
             assert_eq!(
-                state.draft_backend_override.get_untracked(),
+                state.composer_untracked().backend_override.get_untracked(),
                 None,
                 "a backend the host has disabled must not stay armed"
             );
@@ -6872,12 +6906,12 @@ mod tests {
                 restore_bootstrap(vec![BackendKind::Hermes], catalog, Vec::new(), Vec::new()),
             );
             assert_eq!(
-                state.draft_launch_profile_id.get_untracked(),
+                state.composer_untracked().launch_profile_id.get_untracked(),
                 None,
                 "an Unavailable catalog entry must not be re-armed"
             );
             assert_eq!(
-                state.draft_backend_override.get_untracked(),
+                state.composer_untracked().backend_override.get_untracked(),
                 None,
                 "and its backend goes with it rather than half-applying"
             );
@@ -9817,7 +9851,7 @@ mod wasm_tests {
             "a dead pointer must be forgotten, not retried on every reload"
         );
         assert_eq!(
-            state.draft_backend_override.get_untracked(),
+            state.composer_untracked().backend_override.get_untracked(),
             Some(BackendKind::Hermes),
             "the draft is independent intent and must still be applied"
         );
@@ -10054,7 +10088,7 @@ mod wasm_tests {
             "the chat restores on the real bootstrap path"
         );
         assert_eq!(
-            state.draft_backend_override.get_untracked(),
+            state.composer_untracked().backend_override.get_untracked(),
             Some(BackendKind::Hermes),
             "and so does the draft"
         );
@@ -10113,7 +10147,10 @@ mod wasm_tests {
             "Agent A".to_owned(),
             true,
         );
-        first.chat_input.set("unsent for agent A".to_owned());
+        first
+            .composer_untracked()
+            .text
+            .set("unsent for agent A".to_owned());
         next_tick().await;
         first.flush_composer_drafts();
 
@@ -10149,7 +10186,7 @@ mod wasm_tests {
         next_tick().await;
 
         assert_eq!(
-            second.chat_input.get_untracked(),
+            second.composer_untracked().text.get_untracked(),
             "unsent for agent A",
             "the exact restored conversation must recover its unsent composer"
         );
@@ -10164,11 +10201,14 @@ mod wasm_tests {
         );
         next_tick().await;
         assert_eq!(
-            second.chat_input.get_untracked(),
+            second.composer_untracked().text.get_untracked(),
             "",
             "agent A's draft must never appear in agent B's composer"
         );
-        second.chat_input.set("unsent for agent B".to_owned());
+        second
+            .composer_untracked()
+            .text
+            .set("unsent for agent B".to_owned());
         next_tick().await;
 
         second.open_tab(
@@ -10181,7 +10221,7 @@ mod wasm_tests {
         );
         next_tick().await;
         assert_eq!(
-            second.chat_input.get_untracked(),
+            second.composer_untracked().text.get_untracked(),
             "unsent for agent A",
             "switching A to B to A must restore A independently"
         );
@@ -10213,7 +10253,7 @@ mod wasm_tests {
         );
         next_tick().await;
         assert_eq!(
-            second.chat_input.get_untracked(),
+            second.composer_untracked().text.get_untracked(),
             "unsent for agent B",
             "restoring A must not overwrite B's independently owned draft"
         );
@@ -10857,21 +10897,29 @@ mod wasm_tests {
         apply_host_bootstrap(&state, "host-b", bootstrap);
 
         // A whole draft bound to host-a, still live at submit time.
-        state.draft_backend_override.set(Some(BackendKind::Hermes));
         state
-            .draft_launch_profile_id
+            .composer_untracked()
+            .backend_override
+            .set(Some(BackendKind::Hermes));
+        state
+            .composer_untracked()
+            .launch_profile_id
             .set(Some(LaunchProfileId("hermes:profile:qa".to_owned())));
         state
-            .draft_custom_agent_id
+            .composer_untracked()
+            .custom_agent_id
             .set(Some(protocol::CustomAgentId("agent-a-custom".to_owned())));
         let mut settings = protocol::SessionSettingsValues::default();
         settings.0.insert(
             "profile".to_owned(),
             protocol::SessionSettingValue::String("hermes-qa".to_owned()),
         );
-        state.draft_session_settings.set(settings);
-        state.draft_session_settings_dirty.set(true);
-        state.draft_selection_host.set(Some("host-a".to_owned()));
+        state.composer_untracked().session_settings.set(settings);
+        state.composer_untracked().session_settings_dirty.set(true);
+        state
+            .composer_untracked()
+            .selection_host
+            .set(Some("host-a".to_owned()));
         // Target host-b directly, without letting the reactive guard run.
         state.active_project.set(Some(ActiveProjectRef {
             host_id: "host-b".to_owned(),
@@ -10879,7 +10927,13 @@ mod wasm_tests {
         }));
 
         install_send_stub();
-        crate::actions::spawn_new_chat(&state, "hello".to_owned(), None, |_| {});
+        crate::actions::spawn_new_chat(
+            &state,
+            &state.composer_untracked(),
+            "hello".to_owned(),
+            None,
+            |_| {},
+        );
         for _ in 0..4 {
             next_tick().await;
         }

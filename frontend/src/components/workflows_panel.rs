@@ -1608,7 +1608,7 @@ mod wasm_tests {
         next_tick().await;
 
         let state = captured.borrow().clone().expect("state captured");
-        let prefill = state.chat_input.get_untracked();
+        let prefill = state.composer_untracked().text.get_untracked();
         assert!(
             prefill.contains("Create a Tyde workflow"),
             "composer must be pre-filled with the authoring prompt; was {prefill:?}"

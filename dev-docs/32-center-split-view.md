@@ -97,8 +97,9 @@ Chats are never duplicated, whether live, draft, or pending-team-member:
 - draft-to-agent upgrade currently identifies the one draft by content;
   duplication would bind the spawned agent arbitrarily;
 - pending-team-member upgrade likewise requires one matching tab; and
-- a live chat must have one unambiguous composer owner and exactly one mounted
-  `ChatInput`.
+- a chat's composer state is keyed by tab, so two tabs for one conversation
+  would be two drafts claiming the same identity, with no rule for which one
+  wins.
 
 Diffs, comments, workflows, Agent Monitor, and Home are also never duplicated.
 No gesture offers duplication for those resources.
@@ -244,44 +245,56 @@ looking at. Pane focus changes when the user clicks or tabs into a pane, selects
 one of its tabs, uses a pane-focus command, or completes an action targeted at
 that pane. Focus is visible in pane chrome and never encoded as server state.
 
-The chat composer remains a singleton. `composer_owner()` is derived from the
-layout using this precedence:
+**Every visible chat has its own composer.** A chat you can see is a chat you
+can type into: no pane has to be focused first, and there is no "reply here"
+step between reading a chat and answering it. A chat tab that is mounted but
+hidden (its pane is showing another tab) has no composer — there is nothing
+there for the user to type into.
+
+Composer state is keyed by **chat tab**, not by agent and not globally. One
+`ComposerHandle` per tab holds the unsent text, the identity that text is
+checkpointed under, and every draft spawn choice: backend override, custom
+agent, launch profile, session settings, and the session-settings dirty flag.
+Nothing in that set may live in a signal shared between chats. Two chats side
+by side must be able to hold two different drafts, aimed at two different
+backends, with two different session settings, and neither may observe or
+overwrite the other.
+
+Because state is per tab, a chat keeps its draft when its agent identity is
+replaced underneath it — the "New Chat" to live-agent upgrade, a team-member
+activation, a compaction retarget. A tab recycled for unrelated content
+(`replace_active`) drops its composer instead, so the previous occupant's
+unsent text cannot reappear in a different conversation.
+
+`composer_owner()` still exists, derived from the layout using this precedence:
 
 1. The focused pane's active tab, if it is a chat.
 2. The other pane's active tab, if it is a chat.
 3. No owner.
 
-The entire compose and send target is derived from `composer_owner()`, never
-directly from `active_tab()`. This includes `active_agent`, live-agent send and
-steer, draft spawn and fork/send, the pending-team-member target, and every
-draft choice: backend override, custom agent, launch profile, session settings,
-and the session-settings dirty flag. Loading, displaying, editing, resetting,
-and submitting those choices must all use the same composer owner. A focus
-change to a file pane must not retarget or clear the chat pane's draft.
+It no longer decides where a composer is *mounted*. It answers a narrower
+question — "which chat is the user working in?" — for the paths that have no
+pane of their own: keyboard commands, the dispatcher, launch menus, `GoToChat`,
+and the single-valued persisted draft selection. `active_agent` is still
+derived from it. A focus change to a file pane must not retarget or clear any
+chat's draft.
 
-The pending-team-member accessor used by `chat_input` and `teams_panel` is
-therefore composer-owner-based. Teams-panel selection, enablement, and actions
-must observe that accessor rather than the focused active tab, so a pending
-member beside a focused file remains the one the visible composer will spawn.
-No compose-path consumer may independently reconstruct its target from pane
-focus or tab activity.
-
-Thus a file beside a chat keeps the chat composer available even while the file
-pane is focused. With two different chats, the focused pane owns the composer.
-With two files, no composer appears. Duplicate chat occurrences are forbidden,
-so composer ownership is never ambiguous.
-
-Exactly one composer is mounted. A non-owning chat remains live and interactive
-for reading, streaming, scrolling, and tool output, but shows a keyboard-
-accessible “Reply in this pane” affordance instead of a second composer.
 Controls that mutate an agent or session receive that pane's explicit agent
-identity; they must not read a global active agent and infer their target.
+identity; they must not read a global active agent and infer their target. This
+binds `SessionSettingsBar`, session-settings writes, and fork/send: an edit made
+in the pane the user is not focused on must reach that pane's agent.
+
+Thus a file beside a chat keeps the chat's composer while the file pane is
+focused. Two chats each keep their own. With two files, no composer appears.
+Duplicate chat occurrences are forbidden, so composer *ownership* — the
+narrower question above — is never ambiguous.
 
 `ToolOutputModeToggle` is different: it controls one client-global local
 storage preference, not an agent, chat, or pane property. It renders only once,
 with the composer-owning chat, to avoid redundant controls in a two-chat split.
 It must not accept an agent identity, imply per-agent state, or change value
-when composer ownership moves between panes.
+when composer ownership moves between panes. It is now the main thing
+`composer_owner()` gates in the view layer.
 
 ---
 
@@ -567,9 +580,13 @@ The following invariants are required throughout v1:
 - A lazy open destination and navigation target are fixed at invocation time.
 - User-open intent has precedence over refresh intent.
 - Every pane's active tab remains mounted, including in narrow-window mode.
-- Exactly one chat composer exists. Its entire target, including pending team
-  member and all draft settings, derives from `composer_owner()` rather than
-  directly from `active_tab()`.
+- Every visible chat mounts its own composer; a hidden chat tab mounts none.
+  Composer state — unsent text, pending team member, and all draft spawn
+  settings — is keyed by chat tab, and no chat can observe or overwrite
+  another's.
+- `composer_owner()` no longer decides where a composer mounts. It names the
+  chat the user is working in, for paths with no pane of their own, and still
+  derives `active_agent`.
 - `ToolOutputModeToggle` is one client-global preference rendered only with the
   composer owner; it is not per agent.
 - `GoToChat` preserves a visible composer owner before considering hidden chats
@@ -594,7 +611,7 @@ Explicitly deferred from v1:
 - vertical, nested, or more-than-two-pane layouts;
 - cross-project splits;
 - empty persistent drop-target panes;
-- per-tab chat drafts or multiple composers;
+- persisting more than one chat's draft selection across reload;
 - eager loading tabs and typed `ProjectReadFile` error correlation;
 - restoring tabs, split topology, focus, or resource placement after reload;
   and

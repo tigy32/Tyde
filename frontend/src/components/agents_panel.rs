@@ -1549,7 +1549,8 @@ fn agent_card(
             .with_untracked(|a| a.as_ref().is_some_and(|a| a.agent_id == close_agent_id));
         let has_draft = is_active
             && !close_state
-                .chat_input
+                .composer_untracked()
+                .text
                 .with_untracked(|s| s.trim().is_empty());
         let message = if has_draft {
             format!(

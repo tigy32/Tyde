@@ -1,7 +1,6 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
-#[cfg(target_arch = "wasm32")]
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::bridge::{ConfiguredHost, RemoteHostLifecycleStatus};
 use leptos::prelude::*;
@@ -863,12 +862,13 @@ mod composer_draft_tests {
     #[wasm_bindgen_test]
     fn typing_path_queues_eviction_notice_until_persistence() {
         let state = AppState::new();
+        let composer = state.composer_untracked();
         for index in 0..=MAX_PERSISTED_COMPOSER_DRAFT_ENTRIES {
-            state
-                .composer_draft_owner
+            composer
+                .draft_owner
                 .set(Some(owner(&format!("typing-{index}"))));
-            state.chat_input.set(format!("draft-{index}"));
-            assert!(state.checkpoint_current_composer_draft());
+            composer.text.set(format!("draft-{index}"));
+            assert!(state.checkpoint_composer_draft(&composer));
         }
         assert_eq!(state.composer_draft_pending_evictions.get_untracked(), 1);
         assert!(
@@ -882,14 +882,15 @@ mod composer_draft_tests {
         clear_storage();
         COMPOSER_DRAFT_LIMIT_NOTICES.with(|count| count.set(0));
         let state = AppState::new();
+        let composer = state.composer_untracked();
         let active_owner = owner("sustained-oversize");
-        state.composer_draft_owner.set(Some(active_owner.clone()));
+        composer.draft_owner.set(Some(active_owner.clone()));
 
         for extra in 0..3 {
-            state
-                .chat_input
+            composer
+                .text
                 .set("x".repeat(MAX_PERSISTED_COMPOSER_DRAFT_ENTRY_BYTES + extra));
-            assert!(state.checkpoint_current_composer_draft());
+            assert!(state.checkpoint_composer_draft(&composer));
             state.flush_composer_drafts();
         }
         COMPOSER_DRAFT_LIMIT_NOTICES.with(|count| {
@@ -901,8 +902,8 @@ mod composer_draft_tests {
         });
         assert!(state.composer_draft_limit_notified.get_untracked());
 
-        state.chat_input.set("persistable".to_owned());
-        assert!(state.checkpoint_current_composer_draft());
+        composer.text.set("persistable".to_owned());
+        assert!(state.checkpoint_composer_draft(&composer));
         state.flush_composer_drafts();
         assert!(!state.composer_draft_limit_notified.get_untracked());
         assert!(
@@ -912,12 +913,12 @@ mod composer_draft_tests {
         );
 
         let mut escape_expanded = "\u{0001}".repeat(50 * 1024);
-        state.chat_input.set(escape_expanded.clone());
-        assert!(state.checkpoint_current_composer_draft());
+        composer.text.set(escape_expanded.clone());
+        assert!(state.checkpoint_composer_draft(&composer));
         state.flush_composer_drafts();
         escape_expanded.push('\u{0001}');
-        state.chat_input.set(escape_expanded);
-        assert!(state.checkpoint_current_composer_draft());
+        composer.text.set(escape_expanded);
+        assert!(state.checkpoint_composer_draft(&composer));
         state.flush_composer_drafts();
         COMPOSER_DRAFT_LIMIT_NOTICES.with(|count| {
             assert_eq!(
@@ -928,14 +929,14 @@ mod composer_draft_tests {
         });
         assert!(state.composer_draft_limit_notified.get_untracked());
 
-        state.chat_input.set("persistable again".to_owned());
-        assert!(state.checkpoint_current_composer_draft());
+        composer.text.set("persistable again".to_owned());
+        assert!(state.checkpoint_composer_draft(&composer));
         state.flush_composer_drafts();
         assert!(!state.composer_draft_limit_notified.get_untracked());
-        state
-            .chat_input
+        composer
+            .text
             .set("x".repeat(MAX_PERSISTED_COMPOSER_DRAFT_ENTRY_BYTES));
-        assert!(state.checkpoint_current_composer_draft());
+        assert!(state.checkpoint_composer_draft(&composer));
         COMPOSER_DRAFT_LIMIT_NOTICES.with(|count| {
             assert_eq!(
                 count.get(),
@@ -975,15 +976,14 @@ mod composer_draft_tests {
                 },
             );
         });
-        state
-            .composer_draft_owner
-            .set(Some(owner("scheduled-host")));
+        let composer = state.composer_untracked();
+        composer.draft_owner.set(Some(owner("scheduled-host")));
 
-        state.chat_input.set("f".to_owned());
-        assert!(state.checkpoint_current_composer_draft());
+        composer.text.set("f".to_owned());
+        assert!(state.checkpoint_composer_draft(&composer));
         state.schedule_composer_draft_persist();
-        state.chat_input.set("final".to_owned());
-        assert!(state.checkpoint_current_composer_draft());
+        composer.text.set("final".to_owned());
+        assert!(state.checkpoint_composer_draft(&composer));
         state.schedule_composer_draft_persist();
 
         assert_eq!(&*cancelled.borrow(), &[1]);
@@ -1009,7 +1009,7 @@ mod composer_draft_tests {
             Some("final")
         );
 
-        state.chat_input.set("flushed".to_owned());
+        composer.text.set("flushed".to_owned());
         state.flush_composer_drafts();
         let mut restored = load_composer_drafts();
         assert_eq!(
@@ -3354,6 +3354,69 @@ pub struct WorkflowPanelError {
     pub message: String,
 }
 
+/// Everything one chat's composer owns: the unsent text, the identity that text
+/// is checkpointed under, and the spawn choices a draft chat would be created
+/// with.
+///
+/// One handle per chat *tab*, not per agent — a "New Chat" tab has no agent yet
+/// but still holds a draft, and a tab keeps its handle when its agent identity
+/// is swapped underneath it (team-member upgrade, compaction retarget), so the
+/// user's unsent text survives those.
+///
+/// `ArcRwSignal` rather than `RwSignal`: handles are created and dropped with
+/// tabs at runtime, and the arena-allocated `RwSignal` would leak a slot per
+/// closed tab.
+#[derive(Clone)]
+pub struct ComposerHandle {
+    pub text: ArcRwSignal<String>,
+    pub backend_override: ArcRwSignal<Option<BackendKind>>,
+    pub custom_agent_id: ArcRwSignal<Option<CustomAgentId>>,
+    pub launch_profile_id: ArcRwSignal<Option<LaunchProfileId>>,
+    pub session_settings: ArcRwSignal<SessionSettingsValues>,
+    pub session_settings_dirty: ArcRwSignal<bool>,
+    /// Host the spawn choices above were made against. A profile id means
+    /// nothing in another host's catalog, so switching hosts drops them.
+    pub selection_host: ArcRwSignal<Option<String>>,
+    /// Conversation identity `text` is currently checkpointed under. Tracked
+    /// per tab so a pane whose chat is retargeted re-files its draft without
+    /// disturbing the other pane's.
+    #[cfg(target_arch = "wasm32")]
+    draft_owner: ArcRwSignal<Option<PersistedComposerDraftOwner>>,
+}
+
+impl Default for ComposerHandle {
+    fn default() -> Self {
+        Self {
+            text: ArcRwSignal::new(String::new()),
+            backend_override: ArcRwSignal::new(None),
+            custom_agent_id: ArcRwSignal::new(None),
+            launch_profile_id: ArcRwSignal::new(None),
+            session_settings: ArcRwSignal::new(SessionSettingsValues::default()),
+            session_settings_dirty: ArcRwSignal::new(false),
+            selection_host: ArcRwSignal::new(None),
+            #[cfg(target_arch = "wasm32")]
+            draft_owner: ArcRwSignal::new(None),
+        }
+    }
+}
+
+impl ComposerHandle {
+    /// Reset the spawn choices while leaving the typed text alone.
+    ///
+    /// The selection is **one** host-bound value, not a bag of independent
+    /// ones: backend, launch profile, custom agent, and profile-derived session
+    /// settings are all chosen against a single host and are all meaningless
+    /// against another, so they are always cleared as a unit.
+    pub fn clear_selection(&self) {
+        self.backend_override.set(None);
+        self.launch_profile_id.set(None);
+        self.custom_agent_id.set(None);
+        self.session_settings.set(SessionSettingsValues::default());
+        self.session_settings_dirty.set(false);
+        self.selection_host.set(None);
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub configured_hosts: RwSignal<Vec<ConfiguredHost>>,
@@ -3379,14 +3442,6 @@ pub struct AppState {
     /// only valid against that host's enabled backends and launch catalog, and
     /// neither exists until the bootstrap lands.
     pub pending_draft_restore: RwSignal<Option<PersistedDraftSelection>>,
-    /// Host the *live* draft selection belongs to.
-    ///
-    /// Host scoping cannot stop at the serialized pending form: once a draft is
-    /// applied it lives in the same global `draft_backend_override` /
-    /// `draft_launch_profile_id` signals, and switching to another host would
-    /// otherwise carry host A's profile — meaningless in B's catalog — into a
-    /// spawn against B.
-    pub draft_selection_host: RwSignal<Option<String>>,
     /// Latest paging state per `(host, scope)`, so a continuation can be both
     /// requested and *verified*. Scope is part of the key because cursors are
     /// scope-local: a page from another scope describes a different result set
@@ -3425,9 +3480,17 @@ pub struct AppState {
     /// update without re-rendering the whole map. Cleared anywhere
     /// `chat_tool_rows` is cleared.
     pub tool_progress: RwSignal<HashMap<(AgentId, ToolCallId), ArcRwSignal<ToolProgressData>>>,
-    pub chat_input: RwSignal<String>,
-    #[cfg(target_arch = "wasm32")]
-    composer_draft_owner: RwSignal<Option<PersistedComposerDraftOwner>>,
+    /// Per-chat composer state, keyed by the owning chat tab. Deliberately a
+    /// plain map and not a signal: the *lookup* never needs to be reactive
+    /// because each `ChatView` binds to one fixed `TabId`, and the reactivity
+    /// that matters already lives inside each handle. Making the map itself a
+    /// signal would mean lazily creating a handle during a render that same
+    /// render tracks.
+    composers: Arc<Mutex<HashMap<TabId, ComposerHandle>>>,
+    /// Composer used when no chat tab exists to own one (two files split, Home,
+    /// cold start). Keeps every accessor total so callers never branch on
+    /// "there is no composer".
+    detached_composer: ComposerHandle,
     #[cfg(target_arch = "wasm32")]
     composer_drafts: RwSignal<PersistedComposerDraftStore>,
     #[cfg(target_arch = "wasm32")]
@@ -3576,17 +3639,11 @@ pub struct AppState {
     pub backend_setup_by_host: RwSignal<HashMap<String, Vec<BackendSetupInfo>>>,
     pub agent_message_queue: RwSignal<HashMap<AgentId, Vec<QueuedMessageEntry>>>,
     pub agent_turn_active: RwSignal<HashMap<AgentId, bool>>,
-    pub draft_backend_override: RwSignal<Option<BackendKind>>,
-    pub draft_custom_agent_id: RwSignal<Option<CustomAgentId>>,
     /// Server-owned launch profile catalog keyed by host id. Seeded by
     /// `HostBootstrap` and replaced wholesale by `LaunchProfileCatalogNotify`.
     /// The new-chat menus render these entries directly instead of deriving
     /// launch options from raw backend lists.
     pub launch_profile_catalog: RwSignal<HashMap<String, LaunchProfileCatalog>>,
-    /// Launch profile selected for the pending new chat. Set from a ready
-    /// catalog profile (never parsed from the id) and sent with
-    /// `SpawnAgentParams::New`.
-    pub draft_launch_profile_id: RwSignal<Option<LaunchProfileId>>,
     pub session_schemas: RwSignal<HashMap<String, HashMap<BackendKind, SessionSchemaEntry>>>,
     pub schemas_loaded_for_host: RwSignal<HashMap<String, bool>>,
     /// Host-level deep-config schemas, keyed by host id then backend kind.
@@ -3638,14 +3695,6 @@ pub struct AppState {
     /// submitted values prevents that expected gap from masquerading as Auto.
     pub pending_agent_session_settings: RwSignal<PendingAgentSessionSettingsByProject>,
     next_pending_agent_session_settings_id: RwSignal<u64>,
-    pub draft_session_settings: RwSignal<SessionSettingsValues>,
-    /// Whether the user has actually edited `draft_session_settings` in the
-    /// session-settings bar. Reset when a new-chat draft starts. When a launch
-    /// profile is selected and this is `false`, `spawn_new_chat` omits explicit
-    /// `session_settings` so the server-owned profile resolution is authoritative
-    /// (a stale copy of the profile's settings must not override a changed
-    /// server profile).
-    pub draft_session_settings_dirty: RwSignal<bool>,
     pub font_size: RwSignal<u32>,
     pub theme: RwSignal<String>,
     pub font_family: RwSignal<String>,
@@ -3913,7 +3962,6 @@ impl AppState {
             pending_active_project_restore: RwSignal::new(load_active_project()),
             pending_active_chat_restore: RwSignal::new(restored_selection.active_chat.clone()),
             pending_draft_restore: RwSignal::new(restored_selection.draft.clone()),
-            draft_selection_host: RwSignal::new(None),
             session_list_pages: RwSignal::new(HashMap::new()),
             session_list_refresh_in_flight: RwSignal::new(HashSet::new()),
             active_agent,
@@ -3925,9 +3973,8 @@ impl AppState {
             agent_activity_stats: RwSignal::new(HashMap::new()),
             task_token_usage: RwSignal::new(HashMap::new()),
             tool_progress: RwSignal::new(HashMap::new()),
-            chat_input: RwSignal::new(String::new()),
-            #[cfg(target_arch = "wasm32")]
-            composer_draft_owner: RwSignal::new(None),
+            composers: Arc::new(Mutex::new(HashMap::new())),
+            detached_composer: ComposerHandle::default(),
             #[cfg(target_arch = "wasm32")]
             composer_drafts: RwSignal::new(PersistedComposerDraftStore::default()),
             #[cfg(target_arch = "wasm32")]
@@ -3988,10 +4035,7 @@ impl AppState {
             backend_setup_by_host: RwSignal::new(HashMap::new()),
             agent_message_queue: RwSignal::new(HashMap::new()),
             agent_turn_active: RwSignal::new(HashMap::new()),
-            draft_backend_override: RwSignal::new(None),
-            draft_custom_agent_id: RwSignal::new(None),
             launch_profile_catalog: RwSignal::new(HashMap::new()),
-            draft_launch_profile_id: RwSignal::new(None),
             session_schemas: RwSignal::new(HashMap::new()),
             schemas_loaded_for_host: RwSignal::new(HashMap::new()),
             backend_config_schemas: RwSignal::new(HashMap::new()),
@@ -4003,8 +4047,6 @@ impl AppState {
             agent_session_settings: RwSignal::new(HashMap::new()),
             pending_agent_session_settings: RwSignal::new(HashMap::new()),
             next_pending_agent_session_settings_id: RwSignal::new(0),
-            draft_session_settings: RwSignal::new(SessionSettingsValues::default()),
-            draft_session_settings_dirty: RwSignal::new(false),
             font_size: RwSignal::new(13),
             theme: RwSignal::new("dark".to_owned()),
             font_family: RwSignal::new("system".to_owned()),
@@ -4912,25 +4954,118 @@ impl AppState {
             .collect()
     }
 
-    /// Reset every field of the new-chat draft.
+    /// The composer belonging to one specific chat tab, created on first use.
     ///
-    /// The draft is **one** host-bound value, not a bag of independent ones:
-    /// the backend, launch profile, custom agent, and profile-derived session
-    /// settings are all chosen against a single host and are all meaningless
-    /// against another. Clearing only the obvious three left a custom-agent id
-    /// and provider-specific settings armed, which the spawn path then read and
-    /// sent to whichever host it was targeting.
+    /// Keyed by tab rather than by agent so a "New Chat" tab (no agent yet) has
+    /// somewhere to keep its draft, and so a tab whose agent is swapped
+    /// underneath it keeps the text the user already typed.
+    pub fn composer_for(&self, tab: TabId) -> ComposerHandle {
+        let mut composers = self
+            .composers
+            .lock()
+            .expect("composer registry is only held long enough to clone a handle");
+        composers.entry(tab).or_default().clone()
+    }
+
+    /// The composer of the chat the user is currently working in — the focused
+    /// pane's chat, else the other pane's. Tracks `center_zone`, so a caller
+    /// inside an effect re-runs when the owner changes.
+    ///
+    /// Every chat renders its own composer; this accessor exists for paths with
+    /// no pane of their own (keyboard commands, the dispatcher, launch menus)
+    /// that must act on the one the user is actually looking at.
+    ///
+    /// Browser-only: the tracked form is consumed by the persistence effects,
+    /// which only exist in the browser. Off-wasm callers use the untracked
+    /// accessor below.
+    #[cfg(target_arch = "wasm32")]
+    pub fn composer(&self) -> ComposerHandle {
+        match self.center_zone.with(CenterZoneState::composer_owner) {
+            Some((_, tab)) => self.composer_for(tab),
+            None => self.detached_composer.clone(),
+        }
+    }
+
+    pub fn composer_untracked(&self) -> ComposerHandle {
+        match self
+            .center_zone
+            .with_untracked(CenterZoneState::composer_owner)
+        {
+            Some((_, tab)) => self.composer_for(tab),
+            None => self.detached_composer.clone(),
+        }
+    }
+
+    /// Every chat tab currently visible — at most one per pane. These are the
+    /// tabs that have a mounted composer, so they are the ones whose drafts are
+    /// reconciled and checkpointed.
+    #[cfg(target_arch = "wasm32")]
+    fn visible_chat_tabs(&self) -> Vec<TabId> {
+        self.center_zone.with_untracked(|center_zone| {
+            center_zone
+                .panes()
+                .filter_map(|(_, pane)| {
+                    let tab_id = pane.active_tab_id?;
+                    let tab = pane.tabs.iter().find(|tab| tab.id == tab_id)?;
+                    matches!(&tab.content, TabContent::Chat { .. }).then_some(tab_id)
+                })
+                .collect()
+        })
+    }
+
+    /// Every composer that could be holding unsent text, visible or not,
+    /// ordered so the visible one is **last**.
+    ///
+    /// Order is load-bearing on the flush path. Two "New Chat" tabs in the same
+    /// project derive the same `PersistedComposerDraftOwner::NewChat` identity,
+    /// so they share one store entry; checkpointing the visible composer last
+    /// makes the chat the user was actually typing in the one that survives.
+    #[cfg(target_arch = "wasm32")]
+    fn composers_for_flush(&self) -> Vec<ComposerHandle> {
+        let visible = self
+            .center_zone
+            .with_untracked(CenterZoneState::composer_owner)
+            .map(|(_, tab)| tab);
+        let mut handles: Vec<ComposerHandle> = {
+            let composers = self
+                .composers
+                .lock()
+                .expect("composer registry is only held long enough to clone a handle");
+            composers
+                .iter()
+                .filter(|(tab, _)| Some(**tab) != visible)
+                .map(|(_, composer)| composer.clone())
+                .collect()
+        };
+        handles.push(match visible {
+            Some(tab) => self.composer_for(tab),
+            None => self.detached_composer.clone(),
+        });
+        handles
+    }
+
+    /// Drop composers whose tabs are gone.
+    fn forget_composers(&self, doomed: &HashSet<TabId>) {
+        let mut composers = self
+            .composers
+            .lock()
+            .expect("composer registry is only held long enough to clone a handle");
+        composers.retain(|id, _| !doomed.contains(id));
+    }
+
+    /// Reset every spawn choice on the visible composer.
+    ///
+    /// The selection is **one** host-bound value, not a bag of independent
+    /// ones: the backend, launch profile, custom agent, and profile-derived
+    /// session settings are all chosen against a single host and are all
+    /// meaningless against another. Clearing only the obvious three left a
+    /// custom-agent id and provider-specific settings armed, which the spawn
+    /// path then read and sent to whichever host it was targeting.
     ///
     /// Every mismatch path routes through here so the set can never drift
     /// apart again.
     pub(crate) fn clear_draft_selection(&self) {
-        self.draft_backend_override.set(None);
-        self.draft_launch_profile_id.set(None);
-        self.draft_custom_agent_id.set(None);
-        self.draft_session_settings
-            .set(SessionSettingsValues::default());
-        self.draft_session_settings_dirty.set(false);
-        self.draft_selection_host.set(None);
+        self.composer_untracked().clear_selection();
     }
 
     /// The selection as it should currently be stored.
@@ -4955,13 +5090,18 @@ impl AppState {
                     })
             })
         });
-        let live_draft = self
-            .draft_selection_host
+        // Only the visible composer's selection is persisted. Restoring is
+        // single-valued (one `PersistedDraftSelection`), so persisting every
+        // open draft would make the last writer win at an arbitrary moment;
+        // the chat the user is actually working in is the honest choice.
+        let composer = self.composer_untracked();
+        let live_draft = composer
+            .selection_host
             .get_untracked()
             .map(|host_id| PersistedDraftSelection {
                 host_id,
-                backend: self.draft_backend_override.get_untracked(),
-                launch_profile: self.draft_launch_profile_id.get_untracked(),
+                backend: composer.backend_override.get_untracked(),
+                launch_profile: composer.launch_profile_id.get_untracked(),
             })
             .filter(|draft| !draft.is_empty());
         PersistedWorkspaceSelection {
@@ -4987,21 +5127,41 @@ impl AppState {
     pub fn install_browser_effects(&self) {
         self.composer_drafts.set(load_composer_drafts());
 
+        // Both composer effects re-read the visible tab set on every run, so
+        // the dynamic set of per-pane signals they depend on is re-collected
+        // each time rather than fixed at install.
         let composer_owner_state = self.clone();
-        Effect::new(move |_| {
+        Effect::new(move |previous: Option<Vec<TabId>>| {
             composer_owner_state.center_zone.with(|_| ());
             composer_owner_state.active_project.with(|_| ());
             composer_owner_state.selected_host_id.with(|_| ());
             composer_owner_state.active_agent.with(|_| ());
             composer_owner_state.agents.with(|_| ());
-            composer_owner_state.reconcile_composer_draft_owner();
+            let visible = composer_owner_state.visible_chat_tabs();
+            // A chat leaving view is the moment its draft must reach storage.
+            // Per-tab composers keep their own text, so the reconcile below no
+            // longer sees an owner change on the way out and would otherwise
+            // leave the outgoing draft sitting in the debounce queue.
+            if previous.is_some_and(|previous| previous != visible) {
+                composer_owner_state.flush_composer_drafts();
+            }
+            for tab in &visible {
+                composer_owner_state.reconcile_composer_draft_owner_for_tab(*tab);
+            }
+            visible
         });
 
         let composer_text_state = self.clone();
         Effect::new(move |_| {
-            composer_text_state.chat_input.with(|_| ());
-            composer_text_state.composer_draft_owner.with(|_| ());
-            if composer_text_state.checkpoint_current_composer_draft() {
+            composer_text_state.center_zone.with(|_| ());
+            let mut dirty = false;
+            for tab in composer_text_state.visible_chat_tabs() {
+                let composer = composer_text_state.composer_for(tab);
+                composer.text.with(|_| ());
+                composer.draft_owner.with(|_| ());
+                dirty |= composer_text_state.checkpoint_composer_draft(&composer);
+            }
+            if dirty {
                 composer_text_state.schedule_composer_draft_persist();
             }
         });
@@ -5011,9 +5171,12 @@ impl AppState {
             // Tracked reads: the stored identity must follow a session
             // assignment that arrives after the tab is already open.
             let _ = selection_state.active_agent.get();
-            let _ = selection_state.draft_backend_override.get();
-            let _ = selection_state.draft_launch_profile_id.get();
-            let _ = selection_state.draft_selection_host.get();
+            // `composer()` tracks `center_zone`, so switching chats re-runs
+            // this and persists the newly visible composer's selection.
+            let composer = selection_state.composer();
+            let _ = composer.backend_override.get();
+            let _ = composer.launch_profile_id.get();
+            let _ = composer.selection_host.get();
             let _ = selection_state.agents.get();
             selection_state.persist_selection_snapshot_if_settled();
         });
@@ -5028,12 +5191,15 @@ impl AppState {
         });
     }
 
+    /// The conversation identity a given chat tab's draft belongs to.
+    ///
+    /// Derived from the tab rather than from `composer_owner()` so each pane's
+    /// composer files its draft under its own chat.
     #[cfg(target_arch = "wasm32")]
-    fn current_composer_draft_owner_untracked(&self) -> Option<PersistedComposerDraftOwner> {
-        let content = self.center_zone.with_untracked(|center_zone| {
-            let (_, tab_id) = center_zone.composer_owner()?;
-            center_zone.tab(tab_id).map(|tab| tab.content.clone())
-        })?;
+    fn composer_draft_owner_for_tab(&self, tab_id: TabId) -> Option<PersistedComposerDraftOwner> {
+        let content = self
+            .center_zone
+            .with_untracked(|center_zone| center_zone.tab(tab_id).map(|tab| tab.content.clone()))?;
         match content {
             TabContent::Chat {
                 agent_ref: Some(agent_ref),
@@ -5083,10 +5249,16 @@ impl AppState {
         }
     }
 
+    /// Re-file one chat's draft when the conversation under it changes.
+    ///
+    /// Scoped to a single tab: a pane whose New Chat upgrades to a live agent,
+    /// or whose agent is retargeted by compaction, re-files its own draft
+    /// without touching the other pane's composer.
     #[cfg(target_arch = "wasm32")]
-    fn reconcile_composer_draft_owner(&self) {
-        let next = self.current_composer_draft_owner_untracked();
-        let current = self.composer_draft_owner.get_untracked();
+    fn reconcile_composer_draft_owner_for_tab(&self, tab_id: TabId) {
+        let composer = self.composer_for(tab_id);
+        let next = self.composer_draft_owner_for_tab(tab_id);
+        let current = composer.draft_owner.get_untracked();
         if current == next {
             return;
         }
@@ -5094,33 +5266,37 @@ impl AppState {
         if let (Some(current), Some(next)) = (&current, &next)
             && current.same_conversation(next)
         {
-            self.composer_draft_owner.set(Some(next.clone()));
+            composer.draft_owner.set(Some(next.clone()));
             self.composer_drafts.update(|drafts| {
                 drafts.restore(next);
             });
             self.flush_composer_drafts();
-            self.restore_composer_draft(Some(next));
+            self.restore_composer_draft(&composer, Some(next));
             return;
         }
 
-        let text = self.chat_input.get_untracked();
+        let text = composer.text.get_untracked();
         if current.is_none() && next.is_some() && !text.is_empty() {
-            self.composer_draft_owner.set(next.clone());
-            if self.checkpoint_current_composer_draft() {
+            composer.draft_owner.set(next.clone());
+            if self.checkpoint_composer_draft(&composer) {
                 self.schedule_composer_draft_persist();
             }
             return;
         }
 
         self.flush_composer_drafts();
-        self.chat_input.set(String::new());
-        self.composer_draft_owner.set(next.clone());
-        self.restore_composer_draft(next.as_ref());
+        composer.text.set(String::new());
+        composer.draft_owner.set(next.clone());
+        self.restore_composer_draft(&composer, next.as_ref());
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn restore_composer_draft(&self, owner: Option<&PersistedComposerDraftOwner>) {
-        if !self.chat_input.get_untracked().is_empty() {
+    fn restore_composer_draft(
+        &self,
+        composer: &ComposerHandle,
+        owner: Option<&PersistedComposerDraftOwner>,
+    ) {
+        if !composer.text.get_untracked().is_empty() {
             return;
         }
         let Some(owner) = owner else {
@@ -5131,16 +5307,16 @@ impl AppState {
             .try_update(|drafts| drafts.restore(owner))
             .flatten();
         if let Some(text) = restored {
-            self.chat_input.set(text);
+            composer.text.set(text);
         }
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn checkpoint_current_composer_draft(&self) -> bool {
-        let Some(owner) = self.composer_draft_owner.get_untracked() else {
+    fn checkpoint_composer_draft(&self, composer: &ComposerHandle) -> bool {
+        let Some(owner) = composer.draft_owner.get_untracked() else {
             return false;
         };
-        let text = self.chat_input.get_untracked();
+        let text = composer.text.get_untracked();
         if text.is_empty() {
             return self
                 .composer_drafts
@@ -5189,14 +5365,16 @@ impl AppState {
 
         self.cancel_composer_draft_persist();
         let drafts = self.composer_drafts;
-        let composer_owner = self.composer_draft_owner;
+        // Resolved when the debounce fires, not now: the protected-from-
+        // eviction entry is whichever chat the user is in at write time.
+        let owner_state = self.clone();
         let pending_evictions = self.composer_draft_pending_evictions;
         let eviction_notified = self.composer_draft_eviction_notified;
         let limit_notified = self.composer_draft_limit_notified;
         let failure_notified = self.composer_draft_persistence_failure_notified;
         let scheduler_id = self.composer_draft_persistence.id;
         let callback = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
-            let active_owner = composer_owner.get_untracked();
+            let active_owner = owner_state.composer_untracked().draft_owner.get_untracked();
             let outcome = drafts
                 .try_update(|drafts| persist_composer_drafts(drafts, active_owner.as_ref()))
                 .unwrap_or_default();
@@ -5241,9 +5419,14 @@ impl AppState {
 
     #[cfg(target_arch = "wasm32")]
     pub fn flush_composer_drafts(&self) {
-        self.checkpoint_current_composer_draft();
+        // Every composer is checkpointed, not just the visible one: a flush
+        // runs on page hide, and unsent text in the other pane is exactly what
+        // this exists to rescue.
+        for composer in self.composers_for_flush() {
+            self.checkpoint_composer_draft(&composer);
+        }
         self.cancel_composer_draft_persist();
-        let active_owner = self.composer_draft_owner.get_untracked();
+        let active_owner = self.composer_untracked().draft_owner.get_untracked();
         let outcome = self
             .composer_drafts
             .try_update(|drafts| persist_composer_drafts(drafts, active_owner.as_ref()))
@@ -5298,8 +5481,13 @@ impl AppState {
     /// enabled on one host may be disabled on the next. This is what keeps the
     /// binding holding *after* a successful restore, not only while it is
     /// pending.
+    ///
+    /// Scoped to the visible composer. A background chat's selection is bound
+    /// to *its own* host and stays valid there; it is re-checked when the user
+    /// switches back to it, because that switch re-runs the effect this hangs
+    /// off.
     pub(crate) fn drop_draft_bound_to_another_host(&self) {
-        let Some(bound_host) = self.draft_selection_host.get_untracked() else {
+        let Some(bound_host) = self.composer_untracked().selection_host.get_untracked() else {
             return;
         };
         // No chat context at all is not a *different* host. On a cold start
@@ -5943,11 +6131,11 @@ impl AppState {
 
     // ── Tab convenience methods ─────────────────────────────────────────
 
-    pub fn open_tab(&self, content: TabContent, label: String, closeable: bool) {
+    pub fn open_tab(&self, content: TabContent, label: String, closeable: bool) -> Option<TabId> {
         let target = self
             .center_zone
             .with_untracked(|center_zone| center_zone.resolve(OpenTarget::Focused));
-        self.open_tab_in(target, content, label, closeable);
+        self.open_tab_in(target, content, label, closeable)
     }
 
     #[cfg(all(test, target_arch = "wasm32"))]
@@ -5996,6 +6184,11 @@ impl AppState {
         });
         if let Some(id) = replaced_id {
             self.forget_tab_scroll_state(id);
+            // `replace_active` recycles the tab id for unrelated content, so
+            // the previous occupant's draft must not survive into it. The
+            // New Chat -> live agent upgrade goes through `update_tab`
+            // instead and deliberately keeps its composer.
+            self.forget_composers(&HashSet::from([id]));
         }
         result
     }
@@ -6517,6 +6710,7 @@ impl AppState {
         self.tab_scroll_state.update(|scroll| {
             scroll.retain(|id, _| !doomed.contains(id));
         });
+        self.forget_composers(doomed);
         self.code_intel_hover.update(|hover| {
             if hover
                 .as_ref()
@@ -6797,6 +6991,20 @@ impl AppState {
     pub fn rename_tab_label(&self, id: TabId, new_label: String) {
         self.center_zone
             .update(|center_zone| center_zone.rename_tab_label(id, new_label));
+    }
+
+    /// The team member a specific chat tab would spawn, if it is a draft
+    /// awaiting one. Each pane's composer targets its own tab.
+    pub fn tab_pending_team_member(&self, tab_id: TabId) -> Option<PendingTeamMember> {
+        self.center_zone.with(|center_zone| {
+            center_zone.tab(tab_id).and_then(|tab| match &tab.content {
+                TabContent::Chat {
+                    agent_ref: None,
+                    pending_team_member: Some(pending),
+                } => Some(pending.clone()),
+                _ => None,
+            })
+        })
     }
 
     pub fn composer_pending_team_member_untracked(&self) -> Option<PendingTeamMember> {

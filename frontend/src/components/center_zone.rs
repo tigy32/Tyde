@@ -935,9 +935,13 @@ fn TabMount(tab_id: TabId, pane: PaneId) -> impl IntoView {
                                     }
                                 })
                             });
-                        // The singleton composer belongs to the composer owner,
-                        // not to "the active tab": a chat beside a focused file
-                        // keeps its composer (dev-docs/32 §7).
+                        // Every *visible* chat mounts its own composer. Hidden
+                        // tabs stay mounted for their scroll and find state but
+                        // grow no composer — there is nothing to type into.
+                        let visible_composer: Signal<bool> = Signal::derive(is_active);
+                        // `owns_composer` now only gates controls that are
+                        // client-global and must render exactly once across the
+                        // split, not the composer itself (dev-docs/32 §7).
                         let composer_state = state.clone();
                         let owns_composer: Signal<bool> = Signal::derive(move || {
                             composer_state.center_zone.with(|center_zone| {
@@ -949,6 +953,7 @@ fn TabMount(tab_id: TabId, pane: PaneId) -> impl IntoView {
                                 tab_id=tab_id
                                 agent_ref=agent_ref_signal
                                 owns_composer=owns_composer
+                                has_composer=visible_composer
                             />
                         }.into_any()
                     }
@@ -2588,11 +2593,10 @@ mod wasm_tests {
         );
     }
 
-    /// Exactly one chat composer exists, and it belongs to the active chat.
-    /// dev-docs/32 §7 keeps the singleton composer but re-derives its owner
-    /// from `composer_owner()` instead of the active tab; in an unsplit
-    /// workspace the two must agree, including "no chat active → no
-    /// composer".
+    /// A composer belongs to the *visible* chat. In an unsplit workspace that
+    /// means exactly one, in the active tab — and none at all when a file is
+    /// active, because a hidden chat tab stays mounted for its scroll and find
+    /// state but grows no composer the user could type into (dev-docs/32 §7).
     #[wasm_bindgen_test]
     async fn exactly_one_composer_and_it_belongs_to_the_active_chat() {
         let container = make_container();
@@ -3896,10 +3900,19 @@ mod wasm_tests {
         );
     }
 
-    /// dev-docs/32 §7: the composer belongs to the composer owner, not to the
-    /// focused pane. A chat beside a focused file keeps exactly one composer.
+    /// dev-docs/32 §7: a chat keeps its composer regardless of which pane has
+    /// focus, and every visible chat has one. The client-global tool-output
+    /// toggle still renders exactly once, with the composer owner.
+    ///
+    /// The two-chat case previously asserted "exactly one composer" — the
+    /// singleton rule. That rule was deliberately reversed: a chat you can see
+    /// is now a chat you can type into. The assertion is re-pointed rather than
+    /// dropped, and the guarantees it was protecting are all still checked:
+    /// focus never moves a composer off its own chat, the composer lives in the
+    /// chat's pane and not the focused one, and the client-global control never
+    /// duplicates across the split.
     #[wasm_bindgen_test]
-    async fn composer_stays_with_the_chat_while_the_file_pane_is_focused() {
+    async fn every_visible_chat_keeps_its_own_composer_regardless_of_focus() {
         let container = make_container();
         let state = AppState::new();
 
@@ -3965,7 +3978,8 @@ mod wasm_tests {
              rendered with the composer owner"
         );
 
-        // A second chat in the focused pane takes ownership; still one composer.
+        // A second chat in the focused pane takes composer *ownership* — but
+        // both chats are visible, so both are directly repliable.
         state.open_tab_in(
             PaneId::Primary,
             TabContent::chat_with_agent(ActiveAgentRef {
@@ -3979,12 +3993,20 @@ mod wasm_tests {
         let composers = query_all(&container, ".chat-input-area");
         assert_eq!(
             composers.len(),
-            1,
-            "two chats in a split still mount exactly one composer"
+            2,
+            "a chat in each pane means a composer in each pane"
         );
         assert!(
-            pane_element(&container, PaneId::Primary).contains(Some(&composers[0])),
-            "with a chat in each pane the focused pane owns the composer"
+            composers
+                .iter()
+                .any(|composer| pane_element(&container, PaneId::Primary).contains(Some(composer))),
+            "the focused pane's chat has its own composer"
+        );
+        assert!(
+            composers.iter().any(
+                |composer| pane_element(&container, PaneId::Secondary).contains(Some(composer))
+            ),
+            "the unfocused pane's chat keeps its own composer"
         );
         assert_eq!(
             query_all(&container, ".tool-output-mode-toggle").len(),

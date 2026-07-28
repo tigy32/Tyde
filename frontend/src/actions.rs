@@ -3,8 +3,8 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::send::send_frame;
 use crate::state::{
-    ActiveAgentRef, ActiveProjectRef, AppState, DockVisibility, FileResourceKey, LeftTab,
-    OpenTarget, PaneId, PendingFileNavigation, PendingFileOpen, PendingOpenDestination,
+    ActiveAgentRef, ActiveProjectRef, AppState, ComposerHandle, DockVisibility, FileResourceKey,
+    LeftTab, OpenTarget, PaneId, PendingFileNavigation, PendingFileOpen, PendingOpenDestination,
     PendingWorkbenchCreate, PendingWorkbenchRemove, TabContent, TabId, sort_project_infos,
 };
 
@@ -150,22 +150,27 @@ pub fn begin_new_chat_with(
     backend_override: Option<BackendKind>,
     custom_agent_id: Option<CustomAgentId>,
 ) {
-    state.draft_backend_override.set(backend_override);
-    state.draft_custom_agent_id.set(custom_agent_id);
-    state.draft_launch_profile_id.set(None);
-    // Bind the choice to the host it is being made against.
-    state
-        .draft_selection_host
-        .set(state.chat_context_host_id_untracked());
-    state
-        .draft_session_settings
-        .set(SessionSettingsValues::default());
-    state.draft_session_settings_dirty.set(false);
+    // Bind the choice to the host it is being made against, captured before the
+    // new tab opens and moves the chat context.
+    let selection_host = state.chat_context_host_id_untracked();
     // Opening (and activating) the new chat tab drives `active_agent` to None
     // via the Memo derived from `center_zone`.
     // An explicit New Chat outranks a restore still waiting on its host.
     state.retire_pending_restores();
-    state.open_tab(TabContent::empty_chat(), "New Chat".to_string(), true);
+    let Some(tab) = state.open_tab(TabContent::empty_chat(), "New Chat".to_string(), true) else {
+        return;
+    };
+    // The selection belongs to the tab just opened, so it is written after the
+    // open rather than before it.
+    let composer = state.composer_for(tab);
+    composer.backend_override.set(backend_override);
+    composer.custom_agent_id.set(custom_agent_id);
+    composer.launch_profile_id.set(None);
+    composer.selection_host.set(selection_host);
+    composer
+        .session_settings
+        .set(SessionSettingsValues::default());
+    composer.session_settings_dirty.set(false);
 }
 
 /// Begin a new chat from a server-provided ready launch profile. The profile
@@ -177,28 +182,30 @@ pub fn begin_new_chat_with_profile(
     profile: LaunchProfile,
     custom_agent_id: Option<CustomAgentId>,
 ) {
-    state.draft_backend_override.set(Some(profile.backend_kind));
-    state.draft_custom_agent_id.set(custom_agent_id);
-    state.draft_launch_profile_id.set(Some(profile.id));
     // A profile id is only meaningful in this host's catalog.
-    state
-        .draft_selection_host
-        .set(state.chat_context_host_id_untracked());
+    let selection_host = state.chat_context_host_id_untracked();
+    // An explicit New Chat outranks a restore still waiting on its host.
+    state.retire_pending_restores();
+    let Some(tab) = state.open_tab(TabContent::empty_chat(), "New Chat".to_string(), true) else {
+        return;
+    };
+    let composer = state.composer_for(tab);
+    composer.backend_override.set(Some(profile.backend_kind));
+    composer.custom_agent_id.set(custom_agent_id);
+    composer.launch_profile_id.set(Some(profile.id));
+    composer.selection_host.set(selection_host);
     // Show the profile's settings as the effective draft values, but mark them
     // clean so spawn defers to server-owned profile resolution unless the user
     // edits them.
-    state.draft_session_settings.set(profile.session_settings);
-    state.draft_session_settings_dirty.set(false);
-    // An explicit New Chat outranks a restore still waiting on its host.
-    state.retire_pending_restores();
-    state.open_tab(TabContent::empty_chat(), "New Chat".to_string(), true);
+    composer.session_settings.set(profile.session_settings);
+    composer.session_settings_dirty.set(false);
 }
 
 /// Open a fresh new-chat tab in the given host/project context and pre-fill the
 /// composer with an editable `prompt`, in one state transition.
 ///
 /// Used by the Workflows authoring CTA: the active draft (project context +
-/// default backend) and the prefilled `chat_input` must be set together so they
+/// default backend) and the prefilled composer text must be set together so they
 /// can never drift apart. This deliberately reuses the ordinary new-chat draft
 /// path — no backend is chosen here and no agent is spawned until the user
 /// edits and sends. The prompt remains fully editable in the composer.
@@ -221,17 +228,23 @@ pub fn open_new_chat_with_prefill(
     // session settings. Backend selection stays on the host/project default.
     state.clear_draft_selection();
 
-    // Open (and activate) the new chat tab, then seed the composer. The composer
-    // mirrors `chat_input` into the textarea reactively, so the prefill appears
-    // immediately and the user can edit before sending.
+    // Open (and activate) the new chat tab, then seed that tab's composer. The
+    // composer mirrors its text signal into the textarea reactively, so the
+    // prefill appears immediately and the user can edit before sending.
     // An explicit New Chat outranks a restore still waiting on its host.
     state.retire_pending_restores();
-    state.open_tab(TabContent::empty_chat(), "New Chat".to_string(), true);
-    state.chat_input.set(prompt);
+    let Some(tab) = state.open_tab(TabContent::empty_chat(), "New Chat".to_string(), true) else {
+        return;
+    };
+    state.composer_for(tab).text.set(prompt);
 }
 
-pub fn resolve_backend(state: &AppState, host_id: &str) -> Option<BackendKind> {
-    let draft = state.draft_backend_override.get_untracked();
+pub fn resolve_backend(
+    state: &AppState,
+    composer: &ComposerHandle,
+    host_id: &str,
+) -> Option<BackendKind> {
+    let draft = composer.backend_override.get_untracked();
     draft.or_else(|| {
         state
             .host_settings_by_host
@@ -260,8 +273,8 @@ pub fn resolve_backend(state: &AppState, host_id: &str) -> Option<BackendKind> {
 /// The *whole* draft goes, not just the backend and profile: the custom agent
 /// and the profile-derived session settings were chosen against the same host
 /// and would otherwise be read further down and sent to this one.
-pub(crate) fn discard_foreign_draft_for_spawn(state: &AppState, host_id: &str) -> bool {
-    let draft_host = state.draft_selection_host.get_untracked();
+pub(crate) fn discard_foreign_draft_for_spawn(composer: &ComposerHandle, host_id: &str) -> bool {
+    let draft_host = composer.selection_host.get_untracked();
     if draft_host.as_deref().is_none_or(|bound| bound == host_id) {
         return false;
     }
@@ -269,12 +282,18 @@ pub(crate) fn discard_foreign_draft_for_spawn(state: &AppState, host_id: &str) -
         "spawn_new_chat: discarding a draft selection bound to {draft_host:?} \
          for a spawn against {host_id}"
     );
-    state.clear_draft_selection();
+    composer.clear_selection();
     true
 }
 
+/// Spawn the agent a draft chat describes.
+///
+/// `composer` is the submitting chat's own composer, not the globally visible
+/// one: with a composer per pane, the pane that was submitted must be the pane
+/// whose backend, profile, and session settings are sent.
 pub fn spawn_new_chat(
     state: &AppState,
+    composer: &ComposerHandle,
     initial_message: String,
     initial_images: Option<Vec<ImageData>>,
     on_send_error: impl FnOnce(String) + 'static,
@@ -328,9 +347,9 @@ pub fn spawn_new_chat(
     // backend override or profile id into a spawn against B. A profile id is
     // meaningless in another host's catalog, and an override can name a backend
     // B has disabled.
-    discard_foreign_draft_for_spawn(state, &host_id);
+    discard_foreign_draft_for_spawn(composer, &host_id);
 
-    let backend_kind = match resolve_backend(state, &host_id) {
+    let backend_kind = match resolve_backend(state, composer, &host_id) {
         Some(kind) => kind,
         None => {
             log::error!("spawn_new_chat: no backend available — enable one in settings");
@@ -338,11 +357,11 @@ pub fn spawn_new_chat(
         }
     };
 
-    let custom_agent_id = state.draft_custom_agent_id.get_untracked();
-    let launch_profile_id = state.draft_launch_profile_id.get_untracked();
+    let custom_agent_id = composer.custom_agent_id.get_untracked();
+    let launch_profile_id = composer.launch_profile_id.get_untracked();
 
-    let draft_settings = state.draft_session_settings.get_untracked();
-    let settings_dirty = state.draft_session_settings_dirty.get_untracked();
+    let draft_settings = composer.session_settings.get_untracked();
+    let settings_dirty = composer.session_settings_dirty.get_untracked();
     // With a launch profile selected and no user edits, defer to server-owned
     // profile resolution rather than echoing a stale copy of the profile's
     // settings back as explicit overrides.
@@ -359,7 +378,7 @@ pub fn spawn_new_chat(
         draft_settings,
     );
 
-    state.clear_draft_selection();
+    composer.clear_selection();
 
     let pending_state = state.clone();
     spawn_local(async move {
@@ -426,17 +445,24 @@ pub fn fork_payload(
 /// whose backend session forks the parent's, so the parent transcript is
 /// left untouched. No-ops (with a logged reason) when there is no active
 /// agent or when its backend session id hasn't been reported yet.
-pub fn spawn_side_question(state: &AppState, prompt: String, images: Option<Vec<ImageData>>) {
+/// Fork `target`'s session and send `prompt` to the fork.
+///
+/// `target` is passed in rather than read from `active_agent`: every chat pane
+/// has its own composer, so a fork issued from the pane the user is not focused
+/// on must still fork *that* pane's agent (dev-docs/32 §7).
+pub fn spawn_side_question(
+    state: &AppState,
+    target: ActiveAgentRef,
+    prompt: String,
+    images: Option<Vec<ImageData>>,
+) {
     let prompt = prompt.trim().to_owned();
     if prompt.is_empty() && images.as_ref().is_none_or(|images| images.is_empty()) {
         log::error!("spawn_side_question: prompt or images required");
         return;
     }
 
-    let Some(active_agent) = state.active_agent.get_untracked() else {
-        log::error!("spawn_side_question: no active agent to fork from");
-        return;
-    };
+    let active_agent = target;
 
     let agent_info = state.agents.with_untracked(|agents| {
         agents
@@ -1491,14 +1517,17 @@ pub fn remove_workbench(
     });
 }
 
-pub fn send_set_session_settings(state: &AppState, values: SessionSettingsValues) {
-    let active_agent = match state.active_agent.get_untracked() {
-        Some(agent) => agent,
-        None => {
-            log::error!("send_set_session_settings: no active agent");
-            return;
-        }
-    };
+/// Push edited session settings to `target`.
+///
+/// `target` is explicit rather than read from `active_agent`: each chat pane
+/// renders its own settings bar, so an edit made in the pane the user is not
+/// focused on must reach that pane's agent (dev-docs/32 §7).
+pub fn send_set_session_settings(
+    state: &AppState,
+    target: ActiveAgentRef,
+    values: SessionSettingsValues,
+) {
+    let active_agent = target;
 
     let instance_stream = state.agents.with_untracked(|agents| {
         agents
@@ -1953,7 +1982,13 @@ mod wasm_tests {
             let state = AppState::new();
             install_profile_host(&state);
             begin_new_chat_with_profile(&state, profile_with_model("opus"), None);
-            assert!(spawn_new_chat(&state, "hello".to_owned(), None, |_| {}));
+            assert!(spawn_new_chat(
+                &state,
+                &state.composer_untracked(),
+                "hello".to_owned(),
+                None,
+                |_| {},
+            ));
         });
         for _ in 0..4 {
             tick().await;
@@ -1992,10 +2027,17 @@ mod wasm_tests {
                 protocol::SessionSettingValue::String("sonnet".to_owned()),
             );
             state
-                .draft_session_settings
+                .composer_untracked()
+                .session_settings
                 .set(SessionSettingsValues(edited));
-            state.draft_session_settings_dirty.set(true);
-            assert!(spawn_new_chat(&state, "hello".to_owned(), None, |_| {}));
+            state.composer_untracked().session_settings_dirty.set(true);
+            assert!(spawn_new_chat(
+                &state,
+                &state.composer_untracked(),
+                "hello".to_owned(),
+                None,
+                |_| {},
+            ));
         });
         for _ in 0..4 {
             tick().await;

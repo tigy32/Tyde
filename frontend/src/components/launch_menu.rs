@@ -524,17 +524,17 @@ mod wasm_tests {
         next_tick().await;
 
         assert_eq!(
-            state.draft_launch_profile_id.get_untracked(),
+            state.composer_untracked().launch_profile_id.get_untracked(),
             Some(LaunchProfileId("claude:default".to_owned())),
             "draft launch profile id must be set from the selected profile"
         );
         assert_eq!(
-            state.draft_backend_override.get_untracked(),
+            state.composer_untracked().backend_override.get_untracked(),
             Some(BackendKind::Claude),
             "draft backend must come from the profile"
         );
         assert_eq!(
-            state.draft_session_settings.get_untracked(),
+            state.composer_untracked().session_settings.get_untracked(),
             SessionSettingsValues(settings),
             "draft session settings must come from the profile"
         );
@@ -591,17 +591,17 @@ mod wasm_tests {
         next_tick().await;
 
         assert_eq!(
-            state.draft_custom_agent_id.get_untracked(),
+            state.composer_untracked().custom_agent_id.get_untracked(),
             Some(CustomAgentId("reviewer".to_owned())),
             "selecting a custom agent must set the draft custom agent id"
         );
         assert_eq!(
-            state.draft_launch_profile_id.get_untracked(),
+            state.composer_untracked().launch_profile_id.get_untracked(),
             Some(LaunchProfileId("claude:default".to_owned())),
             "custom agent selection must keep the composed launch profile"
         );
         assert_eq!(
-            state.draft_backend_override.get_untracked(),
+            state.composer_untracked().backend_override.get_untracked(),
             Some(BackendKind::Claude),
             "custom agent selection must keep the profile backend"
         );
@@ -789,12 +789,12 @@ mod wasm_tests {
         crate::actions::begin_new_chat_default(&state);
 
         assert_eq!(
-            state.draft_launch_profile_id.get_untracked(),
+            state.composer_untracked().launch_profile_id.get_untracked(),
             Some(LaunchProfileId("claude:default".to_owned())),
             "primary button must preselect the server default profile"
         );
         assert_eq!(
-            state.draft_backend_override.get_untracked(),
+            state.composer_untracked().backend_override.get_untracked(),
             Some(BackendKind::Claude),
             "primary button must use the default profile's backend"
         );
@@ -815,12 +815,12 @@ mod wasm_tests {
         crate::actions::begin_new_chat_default(&state);
 
         assert_eq!(
-            state.draft_launch_profile_id.get_untracked(),
+            state.composer_untracked().launch_profile_id.get_untracked(),
             None,
             "no server default → no profile preselected"
         );
         assert_eq!(
-            state.draft_backend_override.get_untracked(),
+            state.composer_untracked().backend_override.get_untracked(),
             None,
             "no server default → no backend override; server resolves its default"
         );
