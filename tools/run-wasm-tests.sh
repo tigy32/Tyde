@@ -596,6 +596,25 @@ fi
 export CHROMEDRIVER="$driver_bin"
 export PATH="$(dirname "$runner_bin"):$PATH"
 
+# Build the wasm test modules without DWARF.
+#
+# Every frontend test runs in ONE browser instance, so the whole module has to
+# be loaded and compiled before any test runs. Debug info dominated it: 1156 MiB
+# with, 141 MiB without — an 8x difference. At the larger size Chrome's peak
+# went from 6.1 GiB to 12.9 GiB and the driver was SIGKILLed mid-load, which
+# surfaced as "Failed to detect test as having been run" with no assertion text
+# and left the repo roughly one UI feature away from being unable to add any.
+#
+# Costs nothing that matters for diagnosis: panic locations come from
+# `#[track_caller]`, not DWARF, so failures still report
+# `panicked at frontend/src/…rs:LINE:COL` plus the assertion message. Only the
+# JS-side stack frames lose Rust source mapping, and those already printed as
+# wasm function offsets.
+#
+# Scoped to this script so native builds keep full debug info. An explicit
+# RUSTFLAGS from the environment wins, so a debugging session can opt back in.
+export RUSTFLAGS="${RUSTFLAGS:--C debuginfo=0}"
+
 cd "$repo_root/frontend"
 log "running: cargo test --target wasm32-unknown-unknown $* (frontend)"
 cargo test --target wasm32-unknown-unknown "$@"

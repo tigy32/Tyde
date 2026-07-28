@@ -9049,9 +9049,13 @@ kbd {
 .settings-hermes-provider-actions {
     display: grid;
     /* Note the root font size is 13px, so 1rem is 13px, not 16px. The action
-       column grows past its floor rather than clipping a label, and the row
-       grid right-aligns this block either way, so badges stay in one column. */
-    grid-template-columns: 8rem minmax(16rem, max-content);
+       column is a FIXED width, not `max-content`: each row is its own grid, so
+       a content-sized column makes a row with more buttons wider, and since the
+       row grid right-aligns this block that shoves the badge left and breaks the
+       status column. 26rem fits the widest pairing (disable + replace key +
+       disconnect, which measures ~321px) with room to spare, so no label
+       clips either. */
+    grid-template-columns: 8rem 26rem;
     align-items: center;
     gap: var(--space-2);
     justify-items: end;
