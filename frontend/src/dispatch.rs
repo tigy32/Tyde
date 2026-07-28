@@ -37,10 +37,10 @@ use crate::line_source::FileLines;
 use crate::state::{
     ActiveAgentRef, ActiveProjectRef, ActiveTerminalRef, AgentInfo, AppState, CenterZoneState,
     ChatMessageEntry, CodeIntelKey, ConnectionStatus, FileResourceKey, NativeSettingsSaveState,
-    OpenFile, OrchestrationRecord, PaneId, PendingFileNavigation, PendingFileOpen, ProjectInfo,
-    ProjectReferencesMode, ProjectReferencesUiState, ReviewActionTarget, SessionHistoryState,
-    SessionInfo, StreamingState, StreamingToolRequest, TabContent, TabId, TerminalInfo, ToolCallId,
-    ToolRequestEntry, TransientEvent, WorkflowPanelError, reduce_diff_response, root_display_name,
+    OpenFile, OrchestrationRecord, PaneId, PendingFileOpen, ProjectInfo, ProjectReferencesMode,
+    ProjectReferencesUiState, ReviewActionTarget, SessionHistoryState, SessionInfo, StreamingState,
+    StreamingToolRequest, TabContent, TabId, TerminalInfo, ToolCallId, ToolRequestEntry,
+    TransientEvent, WorkflowPanelError, reduce_diff_response, root_display_name,
     sort_project_infos,
 };
 
@@ -2971,21 +2971,7 @@ pub(crate) fn apply_code_intel_navigate_result(
     }
     if targets.len() == 1 {
         let target = targets.remove(0);
-        if target.path == ctx.key.path {
-            state.activate_tab(ctx.tab);
-            state
-                .target_file_navigation(ctx.tab, PendingFileNavigation::Offset(target.range.start));
-        } else if let Some(destination) = state
-            .center_zone
-            .with_untracked(|center_zone| center_zone.locate_tab(ctx.tab))
-        {
-            crate::actions::open_project_path_in(
-                state,
-                target.path,
-                destination,
-                Some(PendingFileNavigation::Offset(target.range.start)),
-            );
-        }
+        crate::actions::jump_to_definition_target(state, ctx.tab, &ctx.key.path, target);
         return;
     }
 

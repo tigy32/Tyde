@@ -5,18 +5,24 @@ use leptos::prelude::*;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::spawn_local;
 
+use crate::code_intel_dom::{
+    TimeoutClosureSlot, caret_at_point, clear_timeout_timer, is_identifier_byte,
+    line_byte_for_utf16_col, node_to_element, utf16_col_in_code,
+};
 use crate::components::find_bar::{FindBar, FindState, render_text_with_highlights};
 use crate::components::review_layer::{build_review_decorations, install_drag_listeners};
+use crate::line_source::FileLines;
 use crate::send::send_frame;
-use crate::state::{AppState, DiffViewMode, DiffViewState, TabId, TabScrollState};
+use crate::state::{AppState, DiffViewMode, DiffViewState, FileResourceKey, TabId, TabScrollState};
 use crate::syntax_highlight::{
     LineHighlighter, LineTokens, color_to_css, compute_hunk_tokens, syntax_for_path,
 };
 
 use protocol::{
-    DiffContextMode, FrameKind, ProjectDiffScope, ProjectGitDiffFile, ProjectGitDiffHunk,
-    ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectPath,
-    ProjectReadDiffPayload, ProjectRootPath, ProjectStageHunkPayload, ReviewDiffSide, StreamPath,
+    DiffContextMode, FrameKind, ProjectDiffScope, ProjectFileVersion, ProjectGitDiffFile,
+    ProjectGitDiffHunk, ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectGitDiffPayload,
+    ProjectId, ProjectPath, ProjectReadDiffPayload, ProjectRootPath, ProjectStageHunkPayload,
+    ReviewDiffSide, StreamPath,
 };
 
 /// Map a path's extension to a syntect language token (`"rs"`, `"ts"`,
@@ -376,6 +382,8 @@ pub fn DiffView(
         });
     });
 
+    let content_host_id = host_id.clone();
+    let content_project_id = project_id.clone();
     view! {
         <div class="diff-view">
             {(!review_mode).then(|| view! { <DiffToolbar /> })}
@@ -392,6 +400,8 @@ pub fn DiffView(
                             tab_id=tab_id
                             diff=dv
                             decorations=decorations
+                            host_id=content_host_id.clone()
+                            project_id=content_project_id.clone()
                             review_mode=review_mode
                         />
                     }.into_any(),
@@ -706,11 +716,310 @@ fn stage_hunk(root: ProjectRootPath, relative_path: String, hunk_id: String) {
     });
 }
 
+// ── Code intelligence over the diff's new side ──────────────────────────────
+//
+// Code intel answers questions about the file **on disk**. A diff row is only a
+// legitimate place to ask one when the text in that row is the text on disk, so
+// every request passes two independent gates:
+//
+// 1. `new_side_matches_worktree` — a per-scope precondition, checked before we
+//    subscribe at all. Exact, not a guess (see the doc comment).
+// 2. The row-text equality check in `diff_target_at_point` — a per-row check at
+//    the moment of use, because the diff payload is a snapshot and the file may
+//    have been rewritten (by an agent, a rebase, an editor) since it was
+//    fetched. A row whose rendered text no longer matches the file at that line
+//    number is declined outright rather than answered against shifted offsets.
+//
+// The old side is never eligible: removed text does not exist on disk, so there
+// is no honest answer. Those rows stay inert.
+
+/// Whether the **new side** of `scope`'s diff for `relative_path` is
+/// byte-identical to the file in the working tree.
+///
+/// - `Unstaged` / `Uncommitted` compare against the working tree, so their new
+///   side *is* the file on disk by construction. (Untracked files are read
+///   straight off disk and appended — `read_diff_with_runner` in
+///   `server/src/project_stream.rs` — so they hold too.)
+/// - `Staged` compares HEAD to the *index*, which is a different object than
+///   the working tree. It coincides exactly when the file has nothing unstaged:
+///   git guarantees index == worktree then. That makes this an exact
+///   precondition rather than a content heuristic — a sampled text comparison
+///   could not distinguish "identical" from "shifted but coincidentally equal
+///   on the lines the diff happens to show".
+fn new_side_matches_worktree(
+    state: &AppState,
+    project_id: &ProjectId,
+    root: &ProjectRootPath,
+    relative_path: &str,
+    scope: ProjectDiffScope,
+) -> bool {
+    match scope {
+        ProjectDiffScope::Unstaged | ProjectDiffScope::Uncommitted => true,
+        ProjectDiffScope::Staged => state.git_status.with_untracked(|status| {
+            status.get(project_id).is_some_and(|roots| {
+                roots
+                    .iter()
+                    .find(|candidate| &candidate.root == root)
+                    .is_some_and(|candidate| {
+                        candidate
+                            .files
+                            .iter()
+                            .find(|file| file.relative_path == relative_path)
+                            // No status entry means we cannot prove the index
+                            // matches the worktree, so we decline. Failing
+                            // closed keeps a wrong answer off the screen.
+                            .is_some_and(|file| file.unstaged.is_none() && !file.untracked)
+                    })
+            })
+        }),
+    }
+}
+
+/// A diff row resolved to a position in the underlying file.
+struct DiffCodeIntelTarget {
+    key: FileResourceKey,
+    version: ProjectFileVersion,
+    /// Absolute byte offset into the file on disk.
+    offset: u32,
+    /// The file's line containing `offset`, for the identifier-char gate.
+    line_text: String,
+    line_byte: u32,
+    anchor_left: f64,
+    anchor_top: f64,
+    anchor_bottom: f64,
+}
+
+/// Owning identity for a diff tab's code-intel requests. Absent for review
+/// snapshots, which carry no project identity and are frozen against a diff we
+/// cannot prove still matches the worktree — both reasons to stay inert.
+#[derive(Clone)]
+struct DiffCodeIntelContext {
+    tab: TabId,
+    host_id: String,
+    project_id: ProjectId,
+    root: ProjectRootPath,
+    scope: ProjectDiffScope,
+}
+
+/// Per-file `FileLines` cache for one mounted diff, so a mousemove burst does
+/// not rebuild the line-offset table on every event. Keyed by file and
+/// invalidated on version change.
+type DiffLinesCache =
+    RefCell<std::collections::HashMap<FileResourceKey, (ProjectFileVersion, FileLines)>>;
+
+/// Resolve a viewport point over a diff to a position in the file on disk.
+///
+/// Returns `None` — meaning "no code intel here", never a guess — when the point
+/// is not over new-side code, the file's contents are not held yet, or the row's
+/// text no longer matches the file.
+fn diff_target_at_point(
+    state: &AppState,
+    context: &DiffCodeIntelContext,
+    cache: &DiffLinesCache,
+    client_x: f64,
+    client_y: f64,
+) -> Option<DiffCodeIntelTarget> {
+    let caret = caret_at_point(client_x, client_y)?;
+    let element = node_to_element(&caret.node)?;
+    let row = element.closest(".diff-line").ok().flatten()?;
+
+    // New side only. In unified mode `data-anchor-side` is "new" for Added and
+    // Context rows; in side-by-side it is "new" for the right pane. Reading
+    // `data-anchor-new-line` (rather than `data-anchor-line`) matters in
+    // side-by-side, where the *pair's* new line number is stamped on both
+    // panes' rows — the left pane of a Removed/Added pair would otherwise
+    // resolve a removed line against the added line's number.
+    if row.get_attribute("data-anchor-side")? != "new" {
+        return None;
+    }
+    let line_number: u32 = row.get_attribute("data-anchor-new-line")?.parse().ok()?;
+    let line_idx = (line_number.checked_sub(1)?) as usize;
+
+    let relative_path = row
+        .closest(".diff-file")
+        .ok()
+        .flatten()?
+        .get_attribute("data-diff-path")?;
+    let key = FileResourceKey {
+        host_id: context.host_id.clone(),
+        project_id: context.project_id.clone(),
+        path: ProjectPath {
+            root: context.root.clone(),
+            relative_path,
+        },
+    };
+
+    // This diff tab must own the file's code intel. Without the hold the
+    // contents in `open_files` belong to someone else (a file tab), the
+    // subscription may not exist, and any result we asked for would be dropped
+    // by the occurrence guard on arrival — so decline rather than round-trip.
+    if !state.diff_tab_holds_code_intel(context.tab, &key) {
+        return None;
+    }
+
+    let (version, lines) = held_file_lines(state, cache, &key)?;
+    if line_idx >= lines.len() {
+        return None;
+    }
+    let file_line = lines.line(line_idx).to_owned();
+
+    // The row's rendered text must still be the file's text at that line. The
+    // diff payload is a snapshot; if the file moved underneath it, answering
+    // here would resolve a different symbol than the one on screen.
+    let code = row.query_selector(".diff-text").ok().flatten()?;
+    if code.text_content().unwrap_or_default() != file_line {
+        return None;
+    }
+
+    let code_node: &web_sys::Node = code.unchecked_ref();
+    let utf16_col = utf16_col_in_code(code_node, &caret.node, caret.offset)?;
+    let line_byte = line_byte_for_utf16_col(&file_line, utf16_col);
+    let (anchor_left, anchor_top, anchor_bottom) = match caret.rect {
+        Some(rect) => (rect.left(), rect.top(), rect.bottom()),
+        None => (client_x, client_y, client_y + 16.0),
+    };
+    Some(DiffCodeIntelTarget {
+        key,
+        version,
+        offset: lines.line_start(line_idx) + line_byte,
+        line_text: file_line,
+        line_byte,
+        anchor_left,
+        anchor_top,
+        anchor_bottom,
+    })
+}
+
+/// The held contents of `key` as a `FileLines`, or `None` if the diff view has
+/// not pulled them yet (or the read came back missing/binary).
+fn held_file_lines(
+    state: &AppState,
+    cache: &DiffLinesCache,
+    key: &FileResourceKey,
+) -> Option<(ProjectFileVersion, FileLines)> {
+    // Resolve the version without copying the text: mousemove fires constantly,
+    // and cloning a large file's contents on every event would be the most
+    // expensive thing in the handler.
+    let version = state.open_files.with_untracked(|files| {
+        let file = files.get(key)?;
+        if file.missing || file.is_binary || file.contents.is_none() {
+            return None;
+        }
+        Some(file.version)
+    })?;
+    if let Some((cached_version, lines)) = cache.borrow().get(key)
+        && *cached_version == version
+    {
+        return Some((version, lines.clone()));
+    }
+    // Cold, or the file changed on disk — rebuild the line-offset table.
+    let contents = state
+        .open_files
+        .with_untracked(|files| files.get(key).and_then(|file| file.contents.clone()))?;
+    let lines = FileLines::new(&contents);
+    cache
+        .borrow_mut()
+        .insert(key.clone(), (version, lines.clone()));
+    Some((version, lines))
+}
+
+/// Ensure the file under a pointer is held (contents + subscription), so the
+/// *next* interaction over it can resolve. Called on hover before any request:
+/// subscribing lazily, per file the user actually points at, is what keeps a
+/// whole-root diff from `didOpen`-ing hundreds of documents in the language
+/// server.
+fn ensure_diff_file_held(
+    state: &AppState,
+    context: &DiffCodeIntelContext,
+    client_x: f64,
+    client_y: f64,
+) {
+    let Some(row) = caret_at_point(client_x, client_y)
+        .and_then(|caret| node_to_element(&caret.node))
+        .and_then(|element| element.closest(".diff-line").ok().flatten())
+    else {
+        return;
+    };
+    if row.get_attribute("data-anchor-side").as_deref() != Some("new") {
+        return;
+    }
+    let Some(relative_path) = row
+        .closest(".diff-file")
+        .ok()
+        .flatten()
+        .and_then(|file| file.get_attribute("data-diff-path"))
+    else {
+        return;
+    };
+    if !new_side_matches_worktree(
+        state,
+        &context.project_id,
+        &context.root,
+        &relative_path,
+        context.scope,
+    ) {
+        return;
+    }
+    let key = FileResourceKey {
+        host_id: context.host_id.clone(),
+        project_id: context.project_id.clone(),
+        path: ProjectPath {
+            root: context.root.clone(),
+            relative_path,
+        },
+    };
+    crate::actions::hold_file_for_diff_code_intel(state, context.tab, &key);
+}
+
+/// Debounce before firing a hover request, matching `file_view`'s delay so the
+/// two surfaces feel the same.
+const DIFF_HOVER_DEBOUNCE_MS: i32 = 250;
+
+/// A settled pointer over a new-side identifier fires one `code_intel_hover`.
+fn maybe_request_diff_hover(
+    state: &AppState,
+    context: &DiffCodeIntelContext,
+    cache: &DiffLinesCache,
+    client_x: f64,
+    client_y: f64,
+) {
+    let Some(target) = diff_target_at_point(state, context, cache, client_x, client_y) else {
+        crate::actions::dismiss_hover(state);
+        return;
+    };
+    if !is_identifier_byte(&target.line_text, target.line_byte) {
+        crate::actions::dismiss_hover(state);
+        return;
+    }
+    // Already showing/awaiting a hover for this exact identifier: leave it.
+    if state.code_intel_hover.with_untracked(|hover| {
+        hover.as_ref().is_some_and(|popover| {
+            popover.tab == context.tab
+                && popover.key == target.key
+                && popover.offset == target.offset
+        })
+    }) {
+        return;
+    }
+    crate::actions::request_hover(
+        state,
+        context.tab,
+        target.key,
+        target.version,
+        target.offset,
+        target.anchor_left,
+        target.anchor_top,
+        target.anchor_bottom,
+    );
+}
+
 #[component]
 fn DiffContent(
     tab_id: Option<TabId>,
     diff: DiffViewState,
     decorations: DiffDecorations,
+    #[prop(optional_no_strip)] host_id: Option<String>,
+    #[prop(optional_no_strip)] project_id: Option<ProjectId>,
     #[prop(optional)] review_mode: bool,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -868,6 +1177,29 @@ fn DiffContent(
     // paint, so the `<For>` diffs once per frame and the main thread
     // doesn't fight itself trying to keep up. Smooths out the
     // "lines flash blank during fast scroll" pattern users report.
+    //
+    // ── Code intelligence (hover + go-to-definition) over the new side ──────
+    // Only a live diff tab with a project identity qualifies: review snapshots
+    // are frozen against a diff we cannot prove still matches the worktree.
+    let code_intel_context = match (tab_id, host_id, project_id) {
+        (Some(tab), Some(host_id), Some(project_id)) if !review_mode => {
+            Some(DiffCodeIntelContext {
+                tab,
+                host_id,
+                project_id,
+                root: diff.root.clone(),
+                scope: diff.scope,
+            })
+        }
+        _ => None,
+    };
+    // `Rc`, not `Arc`: the cache never leaves this component's (single-threaded)
+    // event handlers.
+    let lines_cache: std::rc::Rc<DiffLinesCache> =
+        std::rc::Rc::new(RefCell::new(std::collections::HashMap::new()));
+    let hover_timer: TimeoutClosureSlot = StoredValue::new_local(None);
+    on_cleanup(move || clear_timeout_timer(hover_timer));
+
     // Scroll handler: write the native scrollTop straight into the
     // signal. Leptos batches reactive updates within the same task, so
     // a burst of native scroll events still only re-renders the visible
@@ -878,6 +1210,8 @@ fn DiffContent(
     // lines down were unreachable because no scroll ever propagated
     // into the virtualization math.
     let state_for_scroll = state.clone();
+    let scroll_hover_state = state.clone();
+    let scroll_has_code_intel = code_intel_context.is_some();
     let on_scroll = move |_: web_sys::Event| {
         if let Some(el) = scroll_ref.get_untracked() {
             scroll_top.set(el.scroll_top() as f64);
@@ -887,10 +1221,97 @@ fn DiffContent(
                     .save_tab_scroll_state(tab_id, tab_scroll_state_from_element(&element));
             }
         }
+        // A scroll moves the hovered span out from under the popover: cancel a
+        // pending request and supersede any in flight.
+        if scroll_has_code_intel {
+            clear_timeout_timer(hover_timer);
+            crate::actions::dismiss_hover(&scroll_hover_state);
+        }
+    };
+
+    let mousemove_context = code_intel_context.clone();
+    let mousemove_state = state.clone();
+    let mousemove_cache = lines_cache.clone();
+    let on_mousemove = move |ev: web_sys::MouseEvent| {
+        let Some(context) = mousemove_context.as_ref() else {
+            return;
+        };
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        clear_timeout_timer(hover_timer);
+        let client_x = ev.client_x() as f64;
+        let client_y = ev.client_y() as f64;
+        // Pull contents + subscription for whatever file the pointer is over,
+        // before the debounce, so the request that follows has something to
+        // resolve against.
+        ensure_diff_file_held(&mousemove_state, context, client_x, client_y);
+
+        let state = mousemove_state.clone();
+        let context = context.clone();
+        let cache = mousemove_cache.clone();
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            maybe_request_diff_hover(&state, &context, &cache, client_x, client_y);
+        });
+        if let Ok(id) = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+            cb.as_ref().unchecked_ref(),
+            DIFF_HOVER_DEBOUNCE_MS,
+        ) {
+            hover_timer.update_value(|slot| *slot = Some((id, cb)));
+        }
+    };
+
+    let leave_state = state.clone();
+    let leave_has_code_intel = code_intel_context.is_some();
+    let on_mouseleave = move |_: web_sys::MouseEvent| {
+        if !leave_has_code_intel {
+            return;
+        }
+        clear_timeout_timer(hover_timer);
+        crate::actions::dismiss_hover(&leave_state);
+    };
+
+    // Cmd/Ctrl+click go-to-definition. Falls through to the on-demand
+    // `code_intel_navigate` when no target has been pushed yet, exactly like the
+    // file viewer.
+    let click_context = code_intel_context.clone();
+    let click_state = state.clone();
+    let click_cache = lines_cache.clone();
+    let on_click = move |ev: web_sys::MouseEvent| {
+        let Some(context) = click_context.as_ref() else {
+            return;
+        };
+        if !(ev.ctrl_key() || ev.meta_key()) {
+            return;
+        }
+        let Some(target) = diff_target_at_point(
+            &click_state,
+            context,
+            &click_cache,
+            ev.client_x() as f64,
+            ev.client_y() as f64,
+        ) else {
+            return;
+        };
+        ev.prevent_default();
+        crate::actions::navigate_to_definition(
+            &click_state,
+            context.tab,
+            target.key,
+            target.version,
+            target.offset,
+        );
     };
 
     view! {
-        <div class="diff-content" node_ref=scroll_ref on:scroll=on_scroll>
+        <div
+            class="diff-content"
+            node_ref=scroll_ref
+            on:scroll=on_scroll
+            on:mousemove=on_mousemove
+            on:mouseleave=on_mouseleave
+            on:click=on_click
+        >
             {move || {
                 if state.find_bar_open.get() {
                     Some(view! { <FindBar /> })
@@ -996,8 +1417,12 @@ fn DiffFileView(
         "No textual changes"
     };
 
+    // `data-diff-path` lets a pointer hit-test resolve which file a row belongs
+    // to in an all-files diff, where many `.diff-file` blocks share one
+    // scrollport. Code intel needs the path to address the project stream.
+    let data_path = relative_path.clone();
     view! {
-        <div class="diff-file">
+        <div class="diff-file" data-diff-path=data_path>
             <div class="diff-file-header">
                 <span class="diff-file-path">{file.relative_path}</span>
                 {(!review_mode).then(|| view! { <span class="diff-scope-badge">{scope_label}</span> })}
@@ -3353,6 +3778,139 @@ mod tests {
         }
     }
 
+    // ── Code-intel eligibility ─────────────────────────────────────────────
+
+    fn code_intel_state(
+        files: Vec<protocol::ProjectGitFileStatus>,
+    ) -> (AppState, ProjectId, ProjectRootPath) {
+        let state = AppState::new();
+        let project_id = ProjectId("p1".to_owned());
+        let root = ProjectRootPath("/repo".to_owned());
+        state.git_status.update(|status| {
+            status.insert(
+                project_id.clone(),
+                vec![protocol::ProjectRootGitStatus {
+                    root: root.clone(),
+                    branch: Some("main".to_owned()),
+                    ahead: 0,
+                    behind: 0,
+                    clean: false,
+                    files,
+                }],
+            );
+        });
+        (state, project_id, root)
+    }
+
+    fn file_status(
+        relative_path: &str,
+        staged: Option<protocol::ProjectGitChangeKind>,
+        unstaged: Option<protocol::ProjectGitChangeKind>,
+        untracked: bool,
+    ) -> protocol::ProjectGitFileStatus {
+        protocol::ProjectGitFileStatus {
+            relative_path: relative_path.to_owned(),
+            staged,
+            unstaged,
+            untracked,
+        }
+    }
+
+    /// The new side of an unstaged / uncommitted diff *is* the working tree, so
+    /// eligibility holds without consulting git status at all — including for a
+    /// file git status has no entry for.
+    #[test]
+    fn worktree_scopes_are_eligible_without_a_status_entry() {
+        let (state, project_id, root) = code_intel_state(vec![]);
+        for scope in [ProjectDiffScope::Unstaged, ProjectDiffScope::Uncommitted] {
+            assert!(
+                new_side_matches_worktree(&state, &project_id, &root, "src/main.rs", scope),
+                "{scope:?} compares against the working tree by construction"
+            );
+        }
+    }
+
+    /// `git diff --cached` shows the index. With nothing unstaged, git
+    /// guarantees index == worktree, so the diff's new side is the file on disk
+    /// and byte offsets line up.
+    #[test]
+    fn staged_is_eligible_when_the_file_has_nothing_unstaged() {
+        let (state, project_id, root) = code_intel_state(vec![file_status(
+            "src/main.rs",
+            Some(protocol::ProjectGitChangeKind::Modified),
+            None,
+            false,
+        )]);
+        assert!(new_side_matches_worktree(
+            &state,
+            &project_id,
+            &root,
+            "src/main.rs",
+            ProjectDiffScope::Staged,
+        ));
+    }
+
+    /// Staged *and* further edited: the index no longer matches the worktree, so
+    /// the diff's line numbers can address different text than the file has.
+    /// Declining is the whole point — answering would be silently wrong.
+    #[test]
+    fn staged_is_ineligible_once_the_file_has_unstaged_changes() {
+        let (state, project_id, root) = code_intel_state(vec![file_status(
+            "src/main.rs",
+            Some(protocol::ProjectGitChangeKind::Modified),
+            Some(protocol::ProjectGitChangeKind::Modified),
+            false,
+        )]);
+        assert!(!new_side_matches_worktree(
+            &state,
+            &project_id,
+            &root,
+            "src/main.rs",
+            ProjectDiffScope::Staged,
+        ));
+    }
+
+    /// No status entry means we cannot prove index == worktree. Fail closed.
+    #[test]
+    fn staged_is_ineligible_without_a_status_entry() {
+        let (state, project_id, root) = code_intel_state(vec![file_status(
+            "other.rs",
+            Some(protocol::ProjectGitChangeKind::Modified),
+            None,
+            false,
+        )]);
+        assert!(!new_side_matches_worktree(
+            &state,
+            &project_id,
+            &root,
+            "src/main.rs",
+            ProjectDiffScope::Staged,
+        ));
+        // Nor for a root the status snapshot doesn't cover.
+        assert!(!new_side_matches_worktree(
+            &state,
+            &project_id,
+            &ProjectRootPath("/elsewhere".to_owned()),
+            "other.rs",
+            ProjectDiffScope::Staged,
+        ));
+    }
+
+    /// An untracked file is not in the index at all, so a staged diff cannot be
+    /// showing worktree content for it.
+    #[test]
+    fn staged_is_ineligible_for_an_untracked_file() {
+        let (state, project_id, root) =
+            code_intel_state(vec![file_status("new.rs", None, None, true)]);
+        assert!(!new_side_matches_worktree(
+            &state,
+            &project_id,
+            &root,
+            "new.rs",
+            ProjectDiffScope::Staged,
+        ));
+    }
+
     #[test]
     fn pair_only_removed() {
         let rows = pair_lines_side_by_side(vec![
@@ -3746,6 +4304,545 @@ mod wasm_tests {
         // original line — rendering must not corrupt or duplicate source.
         let rendered_text = container.text_content().unwrap_or_default();
         assert_eq!(rendered_text, "fn main() {}");
+    }
+
+    // ── Code intelligence over the diff ────────────────────────────────────
+
+    const CODE_INTEL_HOST: &str = "h";
+    const CODE_INTEL_PROJECT: &str = "p";
+
+    fn code_intel_root() -> ProjectRootPath {
+        ProjectRootPath("test-root".to_owned())
+    }
+
+    fn code_intel_key(relative_path: &str) -> FileResourceKey {
+        FileResourceKey {
+            host_id: CODE_INTEL_HOST.to_owned(),
+            project_id: ProjectId(CODE_INTEL_PROJECT.to_owned()),
+            path: ProjectPath {
+                root: code_intel_root(),
+                relative_path: relative_path.to_owned(),
+            },
+        }
+    }
+
+    /// Install a JS stub capturing outbound `send_host_line` invokes so a test
+    /// can inspect the frames actually put on the wire.
+    fn install_send_stub() {
+        js_sys::eval(
+            r#"
+            (function() {
+                window.__test_send_calls = [];
+                window.__TAURI__ = window.__TAURI__ || {};
+                window.__TAURI__.core = window.__TAURI__.core || {};
+                window.__TAURI__.core.invoke = function(cmd, args) {
+                    window.__test_send_calls.push([cmd, JSON.stringify(args || {})]);
+                    return Promise.resolve();
+                };
+                window.__TAURI__.event = window.__TAURI__.event || {};
+                window.__TAURI__.event.listen = function() { return Promise.resolve(null); };
+            })();
+            "#,
+        )
+        .expect("install send stub");
+    }
+
+    /// Every captured frame of `kind`, as JSON strings of its payload.
+    fn captured_frames(kind: &str) -> Vec<String> {
+        let script = format!(
+            r#"
+            (function() {{
+                const out = [];
+                for (const [cmd, args] of (window.__test_send_calls || [])) {{
+                    if (cmd !== "send_host_line") continue;
+                    const env = JSON.parse(JSON.parse(args).line);
+                    if (env.kind === "{kind}") out.push(JSON.stringify(env.payload));
+                }}
+                return out.join("\n");
+            }})()
+            "#
+        );
+        let joined = js_sys::eval(&script)
+            .expect("probe send calls")
+            .as_string()
+            .unwrap_or_default();
+        if joined.is_empty() {
+            Vec::new()
+        } else {
+            joined.lines().map(|line| line.to_owned()).collect()
+        }
+    }
+
+    /// A one-file unstaged diff: one Context row then one Added row, plus a
+    /// Removed row so the old side is represented too.
+    fn code_intel_diff(relative_path: &str) -> DiffViewState {
+        let hunk = ProjectGitDiffHunk {
+            old_start: 1,
+            old_count: 2,
+            new_start: 1,
+            new_count: 2,
+            hunk_id: "h1".to_owned(),
+            lines: vec![
+                ProjectGitDiffLine {
+                    kind: ProjectGitDiffLineKind::Context,
+                    text: "fn main() {".to_owned(),
+                    old_line_number: Some(1),
+                    new_line_number: Some(1),
+                },
+                ProjectGitDiffLine {
+                    kind: ProjectGitDiffLineKind::Removed,
+                    text: "    let removed = 1;".to_owned(),
+                    old_line_number: Some(2),
+                    new_line_number: None,
+                },
+                ProjectGitDiffLine {
+                    kind: ProjectGitDiffLineKind::Added,
+                    text: "    let 名前 = 2;".to_owned(),
+                    old_line_number: None,
+                    new_line_number: Some(2),
+                },
+            ],
+        };
+        DiffViewState {
+            root: code_intel_root(),
+            scope: ProjectDiffScope::Unstaged,
+            path: Some(relative_path.to_owned()),
+            context_mode: DiffContextMode::Hunks,
+            pending: false,
+            files: vec![ProjectGitDiffFile {
+                relative_path: relative_path.to_owned(),
+                is_binary: false,
+                hunks: vec![hunk],
+            }],
+        }
+    }
+
+    /// Mount a live unstaged diff tab with `on_disk` cached as the file's
+    /// contents and the diff tab already holding its code intel.
+    ///
+    /// `on_disk` is passed separately from the diff on purpose: a test can make
+    /// them disagree to exercise the staleness guard.
+    fn mount_code_intel_diff(
+        container: HtmlElement,
+        relative_path: &'static str,
+        on_disk: &'static str,
+        tab: TabId,
+        held: bool,
+    ) -> impl Sized {
+        let diff = code_intel_diff(relative_path);
+        mount_to(container, move || {
+            let state = AppState::new();
+            let key = code_intel_key(relative_path);
+            state.diff_contents.update(|diffs| {
+                diffs.insert(
+                    crate::state::DiffKey::new(
+                        CODE_INTEL_HOST,
+                        ProjectId(CODE_INTEL_PROJECT.to_owned()),
+                        code_intel_root(),
+                        ProjectDiffScope::Unstaged,
+                        relative_path.to_owned(),
+                    ),
+                    diff.clone(),
+                );
+            });
+            state.open_files.update(|files| {
+                files.insert(
+                    key.clone(),
+                    crate::state::OpenFile {
+                        path: key.path.clone(),
+                        version: ProjectFileVersion(1),
+                        contents: Some(on_disk.to_owned()),
+                        is_binary: false,
+                        missing: false,
+                    },
+                );
+            });
+            if held {
+                state.hold_diff_code_intel(tab, &key);
+            }
+            state
+                .active_project
+                .set(Some(crate::state::ActiveProjectRef {
+                    host_id: CODE_INTEL_HOST.to_owned(),
+                    project_id: ProjectId(CODE_INTEL_PROJECT.to_owned()),
+                }));
+            provide_context(state);
+            view! {
+                <DiffView
+                    tab_id=tab
+                    host_id=CODE_INTEL_HOST.to_owned()
+                    project_id=ProjectId(CODE_INTEL_PROJECT.to_owned())
+                    root=code_intel_root()
+                    scope=ProjectDiffScope::Unstaged
+                    path=relative_path.to_owned()
+                />
+            }
+        })
+    }
+
+    /// The `.diff-text` element of the row whose `data-anchor-side` is `side`
+    /// and whose own line number is `line_number`.
+    fn row_code_element(
+        container: &HtmlElement,
+        side: &str,
+        line_number: u32,
+    ) -> Option<web_sys::Element> {
+        let selector = format!(
+            ".diff-line[data-anchor-side=\"{side}\"][data-anchor-{side}-line=\"{line_number}\"] \
+             .diff-text"
+        );
+        container.query_selector(&selector).unwrap()
+    }
+
+    /// A container for the pointer-driven code-intel tests.
+    ///
+    /// These tests resolve a position with `caretPositionFromPoint`, which
+    /// answers by *viewport coordinate*, so unlike the render-only tests they
+    /// are sensitive to where the container actually sits and to what else is
+    /// painted over it. Two things had to be dealt with:
+    ///
+    /// - `make_container`'s divs are never removed, so they pile up on the page
+    ///   and one of them wins hit-testing at our coordinates — the caret then
+    ///   resolves inside *that* div, the handler correctly finds no diff row,
+    ///   and every "did we send a request?" assertion fails as though the
+    ///   feature were broken. They are cleared here (tests run sequentially, so
+    ///   by now they are all finished).
+    /// - Absolutely-positioned containers move with page scroll; a mounted row
+    ///   was landing at `top: -93px`, off-screen, where the caret API returns
+    ///   `None`. `position: fixed` pins this one to the viewport instead.
+    fn make_code_intel_container() -> HtmlElement {
+        let document = web_sys::window().unwrap().document().unwrap();
+        if let Some(previous) = document.get_element_by_id("code-intel-test-container") {
+            previous.remove();
+        }
+        // Leftover mount containers from earlier tests. Every component's
+        // `make_container` pins one at the top-left corner — some absolute,
+        // some fixed — which is exactly where ours goes, and a `position:
+        // fixed` leftover sits in the same stacking layer, so `z-index` alone
+        // does not reliably keep ours on top. Matching on the shared
+        // "top: 0; left: 0" inline style catches them whichever they use.
+        let stale = document
+            .query_selector_all("div[style*=\"top: 0\"][style*=\"left: 0\"]")
+            .unwrap();
+        for i in 0..stale.length() {
+            if let Some(node) = stale.item(i)
+                && let Ok(element) = node.dyn_into::<web_sys::Element>()
+                && element.id() != "code-intel-test-container"
+            {
+                element.remove();
+            }
+        }
+        let container = document.create_element("div").unwrap();
+        container.set_id("code-intel-test-container");
+        container
+            .set_attribute(
+                "style",
+                "position: fixed; top: 0; left: 0; width: 800px; height: 600px; \
+                 z-index: 99999; background: #fff; display: flex; flex-direction: column;",
+            )
+            .unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        container.dyn_into::<HtmlElement>().unwrap()
+    }
+
+    /// Viewport coordinates just inside `element`'s left edge.
+    ///
+    /// Asserts the point is on-screen first. An off-screen point makes
+    /// `caretPositionFromPoint` return `None`, which would turn every "did this
+    /// send a request?" assertion into a false negative that passes for the
+    /// wrong reason.
+    fn point_in(element: &web_sys::Element) -> (f64, f64) {
+        let rect = element.get_bounding_client_rect();
+        assert!(
+            rect.width() > 0.0 && rect.height() > 0.0,
+            "row has no layout box ({}x{}); it cannot be pointed at",
+            rect.width(),
+            rect.height()
+        );
+        let x = rect.left() + 1.0;
+        let y = rect.top() + rect.height() / 2.0;
+        assert!(
+            x >= 0.0 && y >= 0.0,
+            "row is off-screen at ({x}, {y}); caretPositionFromPoint would answer None \
+             and the test would pass for the wrong reason"
+        );
+        // The point must actually hit-test into this row. Containers from
+        // earlier tests share the page, and if one covers these coordinates the
+        // caret API resolves inside *it* instead — the handler then correctly
+        // declines, and the assertion downstream fails as "no frames sent",
+        // which reads like a product bug rather than a test-environment one.
+        // Checking here turns that into a failure that names the real cause.
+        let document = web_sys::window().unwrap().document().unwrap();
+        let hit = document.element_from_point(x as f32, y as f32);
+        let landed_in_row = hit.as_ref().is_some_and(|hit| {
+            element.contains(Some(hit.unchecked_ref()))
+                || hit.contains(Some(element.unchecked_ref()))
+        });
+        assert!(
+            landed_in_row,
+            "point ({x}, {y}) hit-tests to {} which is outside the intended row; \
+             something is covering the diff",
+            hit.map(|hit| {
+                let rect = hit.get_bounding_client_rect();
+                format!(
+                    "<{} id={:?} class={:?} at ({:.0},{:.0}) {:.0}x{:.0}>",
+                    hit.tag_name(),
+                    hit.id(),
+                    hit.class_name(),
+                    rect.left(),
+                    rect.top(),
+                    rect.width(),
+                    rect.height(),
+                )
+            })
+            .unwrap_or_else(|| "nothing".into())
+        );
+        (x, y)
+    }
+
+    /// Dispatch a synthesized mouse event positioned over `element`.
+    ///
+    /// The event is dispatched on the **scroll container**, not on `element`
+    /// itself. Syntax tokens arrive asynchronously from the highlight worker and
+    /// re-render each row's `.diff-text`, so a row's code node can be replaced
+    /// between being looked up and being clicked — and an event dispatched on a
+    /// detached node never reaches the handler, which listens on the container.
+    /// The handler resolves the position by viewport coordinate, so dispatching
+    /// on the (stable) container is equivalent and not timing-dependent.
+    fn dispatch_over(container: &HtmlElement, element: &web_sys::Element, kind: &str, cmd: bool) {
+        let (x, y) = point_in(element);
+        let init = web_sys::MouseEventInit::new();
+        init.set_bubbles(true);
+        init.set_client_x(x as i32);
+        init.set_client_y(y as i32);
+        if cmd {
+            init.set_ctrl_key(true);
+            init.set_meta_key(true);
+        }
+        let event = web_sys::MouseEvent::new_with_mouse_event_init_dict(kind, &init).unwrap();
+        container
+            .query_selector(".diff-content")
+            .unwrap()
+            .expect("diff scroll container present")
+            .dispatch_event(&event)
+            .unwrap();
+    }
+
+    fn cmd_click(container: &HtmlElement, element: &web_sys::Element) {
+        dispatch_over(container, element, "click", true);
+    }
+
+    fn mouse_move(container: &HtmlElement, element: &web_sys::Element) {
+        dispatch_over(container, element, "mousemove", false);
+    }
+
+    /// Cmd/Ctrl+click on an **added** row resolves the position to an absolute
+    /// byte offset **into the file on disk** — not into the diff — and asks the
+    /// server about it.
+    ///
+    /// The file's first line is 12 bytes (`fn main() {` + `\n`), so the added
+    /// row's line 2 starts at byte 12; four spaces of indent put `let` at byte
+    /// 16. Getting this wrong by even one line is the whole risk of hanging code
+    /// intel off a diff, so the test pins the exact number.
+    #[wasm_bindgen_test]
+    async fn cmd_click_on_added_row_navigates_at_the_file_byte_offset() {
+        ensure_styles_loaded();
+        install_send_stub();
+
+        let on_disk = "fn main() {\n    let 名前 = 2;\n}\n";
+        let container = make_code_intel_container();
+        let _handle =
+            mount_code_intel_diff(container.clone(), "main.rs", on_disk, TabId(30_001), true);
+        next_tick().await;
+        next_tick().await;
+
+        let code = row_code_element(&container, "new", 2).expect("added row rendered");
+        // 4 px in from the left edge of the code lands inside the leading
+        // indent; +1 char widths are unreliable, so click the row start and
+        // assert the offset is the line start.
+        cmd_click(&container, &code);
+        for _ in 0..10 {
+            next_tick().await;
+        }
+
+        let frames = captured_frames("code_intel_navigate");
+        assert_eq!(
+            frames.len(),
+            1,
+            "expected exactly one code_intel_navigate, got {frames:?}"
+        );
+        let payload: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
+        assert_eq!(
+            payload["path"]["relative_path"], "main.rs",
+            "navigate must address the file the row belongs to"
+        );
+        assert_eq!(
+            payload["offset"], 12,
+            "line 2 of the file starts at byte 12 (line 1 is `fn main() {{` + newline); \
+             got {payload:?}"
+        );
+    }
+
+    /// A **removed** row has no counterpart on disk, so there is no honest
+    /// position to resolve. Cmd/Ctrl+click over it must stay inert rather than
+    /// answer against the line number of some other row.
+    #[wasm_bindgen_test]
+    async fn cmd_click_on_removed_row_sends_nothing() {
+        ensure_styles_loaded();
+        install_send_stub();
+
+        let on_disk = "fn main() {\n    let 名前 = 2;\n}\n";
+        let container = make_code_intel_container();
+        let _handle =
+            mount_code_intel_diff(container.clone(), "main.rs", on_disk, TabId(30_002), true);
+        next_tick().await;
+        next_tick().await;
+
+        let code = row_code_element(&container, "old", 2).expect("removed row rendered");
+        cmd_click(&container, &code);
+        for _ in 0..10 {
+            next_tick().await;
+        }
+
+        assert!(
+            captured_frames("code_intel_navigate").is_empty(),
+            "the old side of a diff does not exist on disk; it must not be queried"
+        );
+    }
+
+    /// The diff payload is a snapshot. If the file was rewritten since it was
+    /// fetched, the row's line number now addresses different text — answering
+    /// would silently resolve a symbol other than the one under the cursor. The
+    /// row-text equality check must decline instead.
+    #[wasm_bindgen_test]
+    async fn cmd_click_declines_when_the_file_no_longer_matches_the_row() {
+        ensure_styles_loaded();
+        install_send_stub();
+
+        // Same line 1, but line 2 has been rewritten out from under the diff.
+        let on_disk = "fn main() {\n    let something_else = 9;\n}\n";
+        let container = make_code_intel_container();
+        let _handle =
+            mount_code_intel_diff(container.clone(), "main.rs", on_disk, TabId(30_003), true);
+        next_tick().await;
+        next_tick().await;
+
+        let code = row_code_element(&container, "new", 2).expect("added row rendered");
+        cmd_click(&container, &code);
+        for _ in 0..10 {
+            next_tick().await;
+        }
+
+        assert!(
+            captured_frames("code_intel_navigate").is_empty(),
+            "a row whose text no longer matches the file must not be resolved against it"
+        );
+
+        // The unchanged context row still matches the file, so it stays usable —
+        // staleness is judged per row, not by disabling the whole file.
+        let context_row = row_code_element(&container, "new", 1).expect("context row rendered");
+        cmd_click(&container, &context_row);
+        for _ in 0..10 {
+            next_tick().await;
+        }
+        let frames = captured_frames("code_intel_navigate");
+        assert_eq!(
+            frames.len(),
+            1,
+            "the still-matching context row should resolve, got {frames:?}"
+        );
+        let payload: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
+        assert_eq!(payload["offset"], 0, "line 1 of the file starts at byte 0");
+    }
+
+    /// Without the diff tab's hold, the file's contents in `open_files` belong
+    /// to someone else and there may be no subscription — a request would be
+    /// dropped on arrival. Declining keeps a pointless round trip off the wire.
+    #[wasm_bindgen_test]
+    async fn cmd_click_sends_nothing_before_the_file_is_held() {
+        ensure_styles_loaded();
+        install_send_stub();
+
+        let on_disk = "fn main() {\n    let 名前 = 2;\n}\n";
+        let container = make_code_intel_container();
+        let _handle =
+            mount_code_intel_diff(container.clone(), "main.rs", on_disk, TabId(30_004), false);
+        next_tick().await;
+        next_tick().await;
+
+        let code = row_code_element(&container, "new", 2).expect("added row rendered");
+        cmd_click(&container, &code);
+        for _ in 0..10 {
+            next_tick().await;
+        }
+
+        assert!(captured_frames("code_intel_navigate").is_empty());
+    }
+
+    /// Hovering the new side pulls the file's contents + subscription exactly
+    /// once, however many events the pointer generates. Lazy, per-file
+    /// subscription is what keeps a whole-root diff from `didOpen`-ing every
+    /// file it lists in the language server.
+    #[wasm_bindgen_test]
+    async fn hovering_subscribes_the_file_once() {
+        ensure_styles_loaded();
+        install_send_stub();
+
+        let on_disk = "fn main() {\n    let 名前 = 2;\n}\n";
+        let container = make_code_intel_container();
+        // Not pre-held: the hover itself is what must acquire the hold.
+        let _handle =
+            mount_code_intel_diff(container.clone(), "main.rs", on_disk, TabId(30_005), false);
+        next_tick().await;
+        next_tick().await;
+
+        // Re-query each pass: the row's code node is replaced when syntax
+        // tokens land, and a stale handle would be measuring a detached node.
+        for _ in 0..3 {
+            let code = row_code_element(&container, "new", 2).expect("added row rendered");
+            mouse_move(&container, &code);
+            next_tick().await;
+        }
+        for _ in 0..10 {
+            next_tick().await;
+        }
+
+        let subscribes = captured_frames("code_intel_subscribe_file");
+        assert_eq!(
+            subscribes.len(),
+            1,
+            "three mousemoves over one file must produce one subscription, got {subscribes:?}"
+        );
+        let payload: serde_json::Value = serde_json::from_str(&subscribes[0]).unwrap();
+        assert_eq!(payload["path"]["relative_path"], "main.rs");
+        assert_eq!(
+            captured_frames("project_read_file").len(),
+            1,
+            "the contents read is paired with the subscription"
+        );
+    }
+
+    /// Hovering the **old** side subscribes nothing: there is no on-disk file
+    /// position behind a removed line to ask about.
+    #[wasm_bindgen_test]
+    async fn hovering_the_old_side_subscribes_nothing() {
+        ensure_styles_loaded();
+        install_send_stub();
+
+        let on_disk = "fn main() {\n    let 名前 = 2;\n}\n";
+        let container = make_code_intel_container();
+        let _handle =
+            mount_code_intel_diff(container.clone(), "main.rs", on_disk, TabId(30_006), false);
+        next_tick().await;
+        next_tick().await;
+
+        let code = row_code_element(&container, "old", 2).expect("removed row rendered");
+        mouse_move(&container, &code);
+        for _ in 0..10 {
+            next_tick().await;
+        }
+
+        assert!(captured_frames("code_intel_subscribe_file").is_empty());
     }
 
     /// A diff with 1000 Added lines must NOT put all 1000 rows in the DOM.

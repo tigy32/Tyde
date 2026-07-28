@@ -645,6 +645,28 @@ pub fn refresh_open_file(
     send_read_and_subscribe(host_id, project_id.0, path);
 }
 
+/// Pull a file's contents and code-intel subscription for a **diff** tab.
+///
+/// The diff viewer needs the same two things a file tab needs — the exact text
+/// (to turn a caret into an absolute byte offset) and a subscription (the LSP
+/// provider declines hover/navigate for a path it has not `didOpen`'d; see
+/// `query_context` in `server/src/code_intel/lsp_provider.rs`). It deliberately
+/// records no `PendingFileOpen`, so the arriving `ProjectFileContents` lands in
+/// `open_files` and sets the rendered version without opening a tab.
+///
+/// Idempotent per `(tab, path)`: the hold is what makes it a no-op on repeat, so
+/// a mousemove burst over one file sends exactly one read + subscribe.
+pub fn hold_file_for_diff_code_intel(state: &AppState, tab: TabId, key: &FileResourceKey) {
+    if !state.hold_diff_code_intel(tab, key) {
+        return;
+    }
+    send_read_and_subscribe(
+        key.host_id.clone(),
+        key.project_id.0.clone(),
+        key.path.clone(),
+    );
+}
+
 /// Send `ProjectReadFile` then `CodeIntelSubscribeFile` for `path` on the
 /// project stream. Order matters: the server processes them in arrival order,
 /// so the read resolves the file version the subscribe then peeks — the pushed
@@ -746,30 +768,55 @@ fn try_local_definition_jump(
             // Clearing the context makes `apply_code_intel_navigate_result` drop
             // any such result on arrival.
             state.code_intel_navigate_ctx.set(None);
-            let destination = state
-                .center_zone
-                .with_untracked(|center_zone| center_zone.locate_tab(source_tab));
-            let Some(destination) = destination else {
-                return false;
-            };
-            if location.path == source.path {
-                state.activate_tab(source_tab);
-                state.target_file_navigation(
-                    source_tab,
-                    PendingFileNavigation::Offset(location.range.start),
-                );
-            } else {
-                open_project_path_in(
-                    state,
-                    location.path,
-                    destination,
-                    Some(PendingFileNavigation::Offset(location.range.start)),
-                );
-            }
-            true
+            jump_to_definition_target(state, source_tab, &source.path, location)
         }
         None => false,
     }
+}
+
+/// Reveal a resolved definition target from the occurrence in `source_tab`.
+///
+/// Jumping *within* the source tab is only correct when that tab actually
+/// renders the target file — a file tab showing the same path. A **diff** tab
+/// renders a diff of the file, and its scroll position is in diff-row space,
+/// not file-line space: `PendingFileNavigation` there would set a signal only
+/// `FileView` consumes, so the jump would silently do nothing. Navigating from
+/// a diff always opens the file itself.
+///
+/// Returns whether the target could be revealed.
+pub(crate) fn jump_to_definition_target(
+    state: &AppState,
+    source_tab: TabId,
+    source_path: &ProjectPath,
+    location: protocol::CodeIntelLocation,
+) -> bool {
+    let source_tab_renders_target = location.path == *source_path
+        && state.center_zone.with_untracked(|center_zone| {
+            center_zone
+                .tab(source_tab)
+                .is_some_and(|tab| matches!(tab.content, crate::state::TabContent::File { .. }))
+        });
+    if source_tab_renders_target {
+        state.activate_tab(source_tab);
+        state.target_file_navigation(
+            source_tab,
+            PendingFileNavigation::Offset(location.range.start),
+        );
+        return true;
+    }
+    let Some(destination) = state
+        .center_zone
+        .with_untracked(|center_zone| center_zone.locate_tab(source_tab))
+    else {
+        return false;
+    };
+    open_project_path_in(
+        state,
+        location.path,
+        destination,
+        Some(PendingFileNavigation::Offset(location.range.start)),
+    );
+    true
 }
 
 /// Send a `code_intel_set_visible_range` hint so the server prioritizes

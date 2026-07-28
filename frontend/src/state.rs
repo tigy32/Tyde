@@ -2569,6 +2569,16 @@ pub struct CodeIntelKey {
     pub path: ProjectPath,
 }
 
+impl From<&FileResourceKey> for CodeIntelKey {
+    fn from(key: &FileResourceKey) -> Self {
+        Self {
+            host_id: key.host_id.clone(),
+            project_id: key.project_id.clone(),
+            path: key.path.clone(),
+        }
+    }
+}
+
 /// The semantic data the server pushed for one file version.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CodeIntelData {
@@ -3489,6 +3499,13 @@ pub struct AppState {
     /// per-row token path has a wasm test guarding against text mangling, and
     /// semantic decorations must never ride that path.
     pub code_intel: RwSignal<HashMap<CodeIntelKey, CodeIntelFileState>>,
+    /// Which diff tabs have pulled a file's contents + code-intel subscription
+    /// for their own rows, keyed by the file. A diff tab is not a file tab, so
+    /// without this the two lifetimes collide: closing a *file* tab would strip
+    /// `open_files` and unsubscribe a file a diff tab is still hovering, and
+    /// closing the *diff* tab would leave an orphan `didOpen` in the language
+    /// server. Both directions consult this set before tearing anything down.
+    pub diff_code_intel_holds: RwSignal<HashMap<CodeIntelKey, HashSet<TabId>>>,
     pub diff_contents: RwSignal<HashMap<DiffKey, DiffViewState>>,
     pub terminals: RwSignal<Vec<TerminalInfo>>,
     pub active_terminal: RwSignal<Option<ActiveTerminalRef>>,
@@ -3940,6 +3957,7 @@ impl AppState {
             open_files: RwSignal::new(HashMap::new()),
             pending_file_opens: RwSignal::new(HashMap::new()),
             code_intel: RwSignal::new(HashMap::new()),
+            diff_code_intel_holds: RwSignal::new(HashMap::new()),
             diff_contents: RwSignal::new(HashMap::new()),
             terminals: RwSignal::new(Vec::new()),
             active_terminal: RwSignal::new(None),
@@ -6322,6 +6340,15 @@ impl AppState {
         })
     }
 
+    /// Whether `tab` is still showing `key`'s contents at exactly `version`.
+    ///
+    /// Two tab kinds can host a code-intel occurrence. A **file** tab renders
+    /// the file itself. A **diff** tab renders the new side of a diff whose
+    /// text is byte-identical to that file on disk (see
+    /// `diff_view::new_side_matches_worktree`), and holds the file's contents +
+    /// subscription for the duration. Either way the contract is the same: the
+    /// request/result only applies while the exact text it was computed against
+    /// is what the user is looking at.
     pub fn file_occurrence_is_current(
         &self,
         tab: TabId,
@@ -6329,14 +6356,73 @@ impl AppState {
         version: ProjectFileVersion,
     ) -> bool {
         let occurrence_matches = self.center_zone.with_untracked(|center_zone| {
-            center_zone.tab(tab).is_some_and(|candidate| {
-                matches!(&candidate.content, TabContent::File { key: candidate_key } if candidate_key == key)
-            })
+            center_zone
+                .tab(tab)
+                .is_some_and(|candidate| match &candidate.content {
+                    TabContent::File { key: candidate_key } => candidate_key == key,
+                    TabContent::Diff { .. } => self.diff_tab_holds_code_intel(tab, key),
+                    _ => false,
+                })
         });
         occurrence_matches
             && self
                 .open_files
                 .with_untracked(|files| files.get(key).is_some_and(|file| file.version == version))
+    }
+
+    /// Whether diff tab `tab` has pulled contents + a code-intel subscription
+    /// for `key`.
+    pub fn diff_tab_holds_code_intel(&self, tab: TabId, key: &FileResourceKey) -> bool {
+        let code_intel_key = CodeIntelKey::from(key);
+        self.diff_code_intel_holds.with_untracked(|holds| {
+            holds
+                .get(&code_intel_key)
+                .is_some_and(|tabs| tabs.contains(&tab))
+        })
+    }
+
+    /// Record that diff tab `tab` depends on `key`'s contents and code-intel
+    /// subscription. Returns `true` when this is the first hold for that file
+    /// from this tab, i.e. the caller still needs to issue the read + subscribe.
+    pub fn hold_diff_code_intel(&self, tab: TabId, key: &FileResourceKey) -> bool {
+        let code_intel_key = CodeIntelKey::from(key);
+        let mut newly_held = false;
+        self.diff_code_intel_holds.update(|holds| {
+            newly_held = holds.entry(code_intel_key).or_default().insert(tab);
+        });
+        newly_held
+    }
+
+    /// Whether any diff tab still depends on `key`.
+    fn diff_code_intel_is_held(&self, key: &FileResourceKey) -> bool {
+        let code_intel_key = CodeIntelKey::from(key);
+        self.diff_code_intel_holds.with_untracked(|holds| {
+            holds
+                .get(&code_intel_key)
+                .is_some_and(|tabs| !tabs.is_empty())
+        })
+    }
+
+    /// Drop `doomed`'s diff code-intel holds, returning the files that no diff
+    /// tab holds any more. Bookkeeping only — the caller decides which of those
+    /// files are now fully unreferenced and must be unsubscribed.
+    fn release_diff_code_intel_holds(&self, doomed: &HashSet<TabId>) -> Vec<FileResourceKey> {
+        let mut released = Vec::new();
+        self.diff_code_intel_holds.update(|holds| {
+            holds.retain(|key, tabs| {
+                tabs.retain(|tab| !doomed.contains(tab));
+                if tabs.is_empty() {
+                    released.push(FileResourceKey {
+                        host_id: key.host_id.clone(),
+                        project_id: key.project_id.clone(),
+                        path: key.path.clone(),
+                    });
+                    return false;
+                }
+                true
+            });
+        });
+        released
     }
 
     pub fn target_file_navigation(&self, tab: TabId, navigation: PendingFileNavigation) {
@@ -6447,6 +6533,11 @@ impl AppState {
                 *context = None;
             }
         });
+        // Bookkeeping only. `close_tabs` releases holds explicitly (before the
+        // backing teardown) so it can unsubscribe what falls out; the paths that
+        // reach here without it — project switch, restore — are dropping the
+        // whole project stream anyway, so there is nothing to unsubscribe from.
+        let _ = self.release_diff_code_intel_holds(doomed);
     }
 
     #[cfg(test)]
@@ -6482,11 +6573,19 @@ impl AppState {
     fn tear_down_backing_resource(&self, resource: &BackingResource) {
         match resource {
             BackingResource::File(key) => {
-                self.open_files.update(|files| {
-                    files.remove(key);
-                });
                 self.pending_file_opens.update(|pending| {
                     pending.remove(key);
+                });
+                // A diff tab may have pulled this file's contents and code-intel
+                // subscription for its own rows. Closing the *file* tab must not
+                // strip them out from under it — the diff view would silently
+                // lose hover/go-to-definition with nothing to re-trigger a
+                // resubscribe.
+                if self.diff_code_intel_is_held(key) {
+                    return;
+                }
+                self.open_files.update(|files| {
+                    files.remove(key);
                 });
                 self.drop_code_intel(key);
             }
@@ -6552,9 +6651,28 @@ impl AppState {
         if doomed.is_empty() {
             return;
         }
-        let (_, released) = self.backing_release_projection(&doomed);
+        // Release the doomed diff tabs' code-intel holds *first*, so the file
+        // teardown below sees an accurate holder set. Closing a file tab and the
+        // diff tab holding the same file together must still tear the file down.
+        let released_holds = self.release_diff_code_intel_holds(&doomed);
+        let (survivors, released) = self.backing_release_projection(&doomed);
         for resource in &released {
             self.tear_down_backing_resource(resource);
+        }
+        // Files the diff viewer subscribed on its own. Now that no diff tab
+        // holds them, they are unreferenced unless a file tab still backs one —
+        // in which case that tab's own teardown owns it. Otherwise unsubscribe,
+        // or the language server keeps the document open forever.
+        for key in released_holds {
+            let backing = BackingResource::File(key.clone());
+            // Still open in a file tab, or already torn down by the loop above.
+            if survivors.contains(&backing) || released.contains(&backing) {
+                continue;
+            }
+            self.open_files.update(|files| {
+                files.remove(&key);
+            });
+            self.drop_code_intel(&key);
         }
         self.forget_removed_tab_occurrence_state(&doomed);
         self.center_zone
@@ -9332,6 +9450,141 @@ mod tests {
                 state
                     .open_files
                     .with_untracked(|files| files.contains_key(&key_a))
+            );
+        });
+    }
+
+    /// Open a diff tab and give it a code-intel hold on `key`, the way the diff
+    /// viewer does the first time a pointer settles over one of that file's
+    /// new-side rows.
+    fn install_diff_tab_holding(state: &AppState, key: &FileResourceKey) -> TabId {
+        let tab = state
+            .open_tab_in(
+                PaneId::Primary,
+                TabContent::Diff {
+                    host_id: key.host_id.clone(),
+                    project_id: key.project_id.clone(),
+                    root: key.path.root.clone(),
+                    scope: ProjectDiffScope::Unstaged,
+                    path: String::new(),
+                },
+                "diff".to_string(),
+                true,
+            )
+            .expect("diff tab opens");
+        assert!(
+            state.hold_diff_code_intel(tab, key),
+            "the first hold from a tab is the one that triggers read + subscribe"
+        );
+        tab
+    }
+
+    /// A diff tab hovering a file keeps that file's contents and code-intel
+    /// subscription alive even when the user closes the *file* tab showing it.
+    /// Otherwise the diff view silently loses hover/go-to-definition with
+    /// nothing left to trigger a resubscribe.
+    #[test]
+    fn closing_a_file_tab_keeps_code_intel_a_diff_tab_still_holds() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let key = resource_key("h", "p", test_path("held"));
+            let intel = CodeIntelKey::from(&key);
+            let file_tab = install_loaded_file(&state, PaneId::Primary, key.clone());
+            state.code_intel.update(|map| {
+                map.insert(intel.clone(), CodeIntelFileState::default());
+            });
+            let _diff_tab = install_diff_tab_holding(&state, &key);
+
+            state.close_tab(file_tab);
+
+            assert!(
+                state
+                    .open_files
+                    .with_untracked(|files| files.contains_key(&key)),
+                "the diff tab still needs the contents to resolve byte offsets"
+            );
+            assert!(
+                state
+                    .code_intel
+                    .with_untracked(|map| map.contains_key(&intel)),
+                "the diff tab still needs the subscription"
+            );
+        });
+    }
+
+    /// Closing the diff tab releases its hold. With nothing else referencing the
+    /// file, the subscription must be dropped — an orphan hold would leave the
+    /// document open in the language server for the rest of the session.
+    #[test]
+    fn closing_the_last_holding_diff_tab_drops_the_subscription() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let key = resource_key("h", "p", test_path("orphan"));
+            let intel = CodeIntelKey::from(&key);
+            state.open_files.update(|files| {
+                files.insert(
+                    key.clone(),
+                    OpenFile {
+                        path: key.path.clone(),
+                        version: ProjectFileVersion(1),
+                        contents: Some("one\ntwo".to_string()),
+                        is_binary: false,
+                        missing: false,
+                    },
+                );
+            });
+            state.code_intel.update(|map| {
+                map.insert(intel.clone(), CodeIntelFileState::default());
+            });
+            let diff_tab = install_diff_tab_holding(&state, &key);
+
+            state.close_tab(diff_tab);
+
+            assert!(
+                !state
+                    .code_intel
+                    .with_untracked(|map| map.contains_key(&intel)),
+                "no tab references the file any more; it must be unsubscribed"
+            );
+            assert!(
+                !state
+                    .open_files
+                    .with_untracked(|files| files.contains_key(&key))
+            );
+        });
+    }
+
+    /// Closing a file tab and the diff tab holding the same file together must
+    /// still tear the file down. This is the ordering trap: if the holds were
+    /// released *after* the backing teardown, the file teardown would see a
+    /// live hold, skip, and nothing would come back to clean up.
+    #[test]
+    fn closing_file_and_diff_tabs_together_still_tears_the_file_down() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let key = resource_key("h", "p", test_path("both"));
+            let intel = CodeIntelKey::from(&key);
+            let file_tab = install_loaded_file(&state, PaneId::Primary, key.clone());
+            state.code_intel.update(|map| {
+                map.insert(intel.clone(), CodeIntelFileState::default());
+            });
+            let diff_tab = install_diff_tab_holding(&state, &key);
+
+            state.close_tabs(HashSet::from([file_tab, diff_tab]));
+
+            assert!(
+                !state
+                    .code_intel
+                    .with_untracked(|map| map.contains_key(&intel)),
+                "both referencing tabs are gone; the file must not stay subscribed"
+            );
+            assert!(
+                !state
+                    .open_files
+                    .with_untracked(|files| files.contains_key(&key))
             );
         });
     }

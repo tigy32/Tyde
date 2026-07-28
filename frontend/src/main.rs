@@ -1,6 +1,7 @@
 mod actions;
 mod app;
 mod bridge;
+mod code_intel_dom;
 mod components;
 mod devtools;
 mod dispatch;
