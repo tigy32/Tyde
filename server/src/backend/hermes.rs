@@ -1269,6 +1269,7 @@ impl HermesSessionActor {
 
         for event in startup_gateway_events {
             if !self.handle_gateway_event(event).await {
+                self.drain_background_tasks();
                 self.gateway.shutdown().await;
                 return;
             }
@@ -1306,6 +1307,7 @@ impl HermesSessionActor {
                             let _ = reply.send(ok);
                         }
                         HermesBackendCommand::Shutdown(reply) => {
+                            self.drain_background_tasks();
                             self.gateway.shutdown().await;
                             let _ = reply.send(());
                             return;
@@ -1315,7 +1317,14 @@ impl HermesSessionActor {
             }
         }
 
+        self.drain_background_tasks();
         self.gateway.shutdown().await;
+    }
+
+    fn drain_background_tasks(&mut self) {
+        for event in self.mapper.drain_background_tasks() {
+            self.emit(event);
+        }
     }
 
     async fn handle_input(&mut self, input: AgentInput) {
@@ -2816,6 +2825,26 @@ async fn spawn_gateway_child(target: &HermesSpawnTarget) -> Result<AsyncGroupChi
 }
 
 impl HermesEventMapper {
+    fn drain_background_tasks(&mut self) -> Vec<ChatEvent> {
+        let mut tasks = self.background_tasks.drain().collect::<Vec<_>>();
+        tasks.sort_by(|(left, _), (right, _)| left.cmp(right));
+        tasks
+            .into_iter()
+            .map(|(task_id, background)| {
+                hermes_background_progress(
+                    &background.tool_call_id,
+                    &task_id,
+                    background.command,
+                    BackgroundTaskStatus::Stopped,
+                    Some(
+                        "Hermes gateway owner exited before the background command reported completion"
+                            .to_string(),
+                    ),
+                )
+            })
+            .collect()
+    }
+
     fn map_event(&mut self, event_type: &str, payload: Option<Value>) -> Vec<ChatEvent> {
         let result = match event_type {
             "gateway.ready" => Ok(Vec::new()),
@@ -7085,6 +7114,116 @@ with open({exited:?}, "w") as output:
     }
 
     #[tokio::test]
+    async fn hermes_owner_loss_retires_background_command_once() {
+        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
+        let dir = TempDir::new().expect("tempdir");
+        let fake = write_fake_gateway(
+            &dir,
+            r#"
+import json, sys
+print(json.dumps({"jsonrpc":"2.0","method":"event","params":{"type":"gateway.ready","payload":{}}}), flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    method = req["method"]
+    if method == "session.create":
+        result = {"session_id":"live","stored_session_id":"stored"}
+    elif method == "prompt.submit":
+        result = {"status":"streaming"}
+    elif method == "session.usage":
+        result = {"input":1,"output":1,"total":2}
+    elif method == "session.context_breakdown":
+        result = {"context_used":2,"context_max":200000}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc":"2.0","id":req["id"],"result":result}), flush=True)
+    if method == "prompt.submit":
+        def emit(event_type, payload=None):
+            params = {"type":event_type,"session_id":"live"}
+            if payload is not None:
+                params["payload"] = payload
+            print(json.dumps({"jsonrpc":"2.0","method":"event","params":params}), flush=True)
+        emit("message.start")
+        emit("tool.start", {
+            "tool_id":"terminal-1",
+            "name":"terminal",
+            "args":{"command":"sleep 30","background":True}
+        })
+        emit("tool.complete", {
+            "tool_id":"terminal-1",
+            "name":"terminal",
+            "result":{"session_id":"proc-1","exit_code":0}
+        })
+        emit("message.complete", {
+            "text":"launched",
+            "status":"complete",
+            "usage":{"input":1,"output":1,"total":2}
+        })
+"#,
+        );
+        let _guard = TestHermesPythonGuard::set(&fake);
+        let (backend, mut events) =
+            HermesBackend::spawn(Vec::new(), BackendSpawnConfig::default(), payload("launch"))
+                .await
+                .expect("spawn fake Hermes");
+        let mut observed = Vec::new();
+        timeout(Duration::from_secs(2), async {
+            while let Some(event) = events.recv().await {
+                let turn_done = matches!(event, ChatEvent::StreamEnd(_));
+                observed.push(event);
+                if turn_done {
+                    return;
+                }
+            }
+            panic!("event stream closed before launch completed");
+        })
+        .await
+        .expect("background launch");
+
+        backend.shutdown().await;
+        timeout(Duration::from_secs(2), async {
+            while let Some(event) = events.recv().await {
+                observed.push(event);
+            }
+        })
+        .await
+        .expect("Hermes teardown");
+
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ChatEvent::ToolProgress(ToolProgressData {
+                        tool_call_id,
+                        update: ToolProgressUpdate::BackgroundTask(BackgroundTaskState {
+                            task_id,
+                            status: BackgroundTaskStatus::Stopped,
+                            ..
+                        }),
+                        ..
+                    }) if tool_call_id == "terminal-1" && task_id == "proc-1"
+                ))
+                .count(),
+            1,
+            "irreversible Hermes owner loss must retire Running exactly once"
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
+                        tool_call_id,
+                        ..
+                    }) if tool_call_id == "terminal-1"
+                ))
+                .count(),
+            1,
+            "the launch completion remains authoritative; teardown must not duplicate it"
+        );
+    }
+
+    #[tokio::test]
     async fn hermes_shutdown_forces_a_child_that_ignores_eof() {
         let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
         let dir = TempDir::new().expect("tempdir");
@@ -7913,6 +8052,52 @@ for line in sys.stdin:
                 ..
             }) if tool_call_id == "terminal-1" && task_id == "proc-1"
         )));
+    }
+
+    #[test]
+    fn hermes_turn_interrupt_preserves_background_command() {
+        let mut mapper = HermesEventMapper::default();
+        let _ = mapper.map_event(
+            "tool.start",
+            Some(json!({
+                "tool_id": "terminal-1",
+                "name": "terminal",
+                "args": {
+                    "command": "sleep 8",
+                    "background": true
+                }
+            })),
+        );
+        let _ = mapper.map_event(
+            "tool.complete",
+            Some(json!({
+                "tool_id": "terminal-1",
+                "name": "terminal",
+                "result": {
+                    "session_id": "proc-1",
+                    "exit_code": 0
+                }
+            })),
+        );
+
+        let cancelled = mapper.cancel_events("Operation cancelled");
+
+        assert!(
+            mapper.background_tasks.contains_key("proc-1"),
+            "ordinary turn interruption must preserve detached Hermes work"
+        );
+        assert!(cancelled.iter().all(|event| {
+            !matches!(
+                event,
+                ChatEvent::ToolProgress(ToolProgressData {
+                    update: ToolProgressUpdate::BackgroundTask(BackgroundTaskState {
+                        status: BackgroundTaskStatus::Stopped,
+                        ..
+                    }),
+                    ..
+                })
+            )
+        }));
     }
 
     #[test]

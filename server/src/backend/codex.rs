@@ -2151,7 +2151,6 @@ impl CodexSession {
     }
 
     pub async fn shutdown(self) {
-        self.inner.rpc.abort_readers();
         self.inner.drain_background_commands().await;
         self.inner.rpc.shutdown().await;
         remove_codex_skill_projection_guard(&self.inner.skill_projection);

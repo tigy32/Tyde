@@ -13121,7 +13121,12 @@ mod tests {
         let background_progress = |tool_call_id: &str, status: protocol::BackgroundTaskStatus| {
             ChatEvent::ToolProgress(protocol::ToolProgressData {
                 tool_call_id: tool_call_id.to_owned(),
-                tool_name: "run_command".to_owned(),
+                tool_name: if tool_call_id == "hermes-running" {
+                    "terminal"
+                } else {
+                    "run_command"
+                }
+                .to_owned(),
                 update: protocol::ToolProgressUpdate::BackgroundTask(
                     protocol::BackgroundTaskState {
                         task_id: format!("task-{tool_call_id}"),
@@ -13139,7 +13144,7 @@ mod tests {
             &mut event_log,
             &mut subscribers,
             &mut replay_state,
-            &background_progress("old-running", protocol::BackgroundTaskStatus::Running),
+            &background_progress("hermes-running", protocol::BackgroundTaskStatus::Running),
         )
         .await;
         for index in 0..=15 {
@@ -13171,7 +13176,7 @@ mod tests {
             replay_stream(tx),
         );
         let events = recv_agent_bootstrap_events(&mut rx, "running progress bootstrap").await;
-        for tool_call_id in ["old-running", "tail-running"] {
+        for tool_call_id in ["hermes-running", "tail-running"] {
             assert_eq!(
                 events
                     .iter()
@@ -13202,7 +13207,7 @@ mod tests {
             &mut event_log,
             &mut subscribers,
             &mut replay_state,
-            &background_progress("old-running", protocol::BackgroundTaskStatus::Completed),
+            &background_progress("hermes-running", protocol::BackgroundTaskStatus::Stopped),
         )
         .await;
         append_chat_event(
@@ -13223,13 +13228,16 @@ mod tests {
             replay_stream(tx),
         );
         let events = recv_agent_bootstrap_events(&mut rx, "terminal progress bootstrap").await;
-        assert!(events.iter().all(|event| {
-            !matches!(
-                event,
-                AgentBootstrapEvent::ChatEvent(ChatEvent::ToolProgress(progress))
-                    if progress.tool_call_id == "old-running"
-            )
-        }));
+        assert!(
+            events.iter().all(|event| {
+                !matches!(
+                    event,
+                    AgentBootstrapEvent::ChatEvent(ChatEvent::ToolProgress(progress))
+                        if progress.tool_call_id == "hermes-running"
+                )
+            }),
+            "Hermes owner-loss Stopped must remove an aged Running roster entry"
+        );
         assert_eq!(
             events
                 .iter()

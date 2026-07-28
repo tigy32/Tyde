@@ -1510,6 +1510,40 @@ mod wasm_tests {
         );
     }
 
+    /// Owner loss is terminal too: Stopped must remove the row rather than
+    /// leaving the backend's teardown correction visible as active work.
+    #[wasm_bindgen_test]
+    async fn stopped_background_command_leaves_the_tray() {
+        let (container, state) = mount_tray(|state| {
+            seed_progress(
+                state,
+                background_command_progress(BackgroundTaskStatus::Running, None),
+            );
+        });
+        next_tick().await;
+        assert_eq!(count(&container, ".inflight-tray-row"), 1);
+
+        let key = (
+            parent_ref().agent_id,
+            ToolCallId("toolu_bg_bash".to_owned()),
+        );
+        let progress = state
+            .tool_progress
+            .with_untracked(|map| map.get(&key).cloned())
+            .expect("seeded progress entry exists");
+        progress.set(background_command_progress(
+            BackgroundTaskStatus::Stopped,
+            Some("Background command owner exited"),
+        ));
+        next_tick().await;
+
+        assert_eq!(
+            count(&container, ".inflight-tray"),
+            0,
+            "Stopped exits the active-only tray"
+        );
+    }
+
     /// Product decision (2026-07): failed commands are not shown either —
     /// the failure's record is the tool card, not the activity hub.
     #[wasm_bindgen_test]
