@@ -12,7 +12,7 @@ mod router;
 use std::{
     process::Command,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -21,7 +21,7 @@ use devtools_protocol::UiDebugResponseSubmission;
 use host_config::RemoteHostLifecycleSnapshot;
 use host_store::{ConfiguredHostStore, HostStore, UpsertConfiguredHostRequest};
 use router::ProxyRouterHandle;
-use tauri::{AppHandle, Manager, RunEvent, Url, WindowEvent};
+use tauri::{AppHandle, Manager, RunEvent, Url, WindowEvent, webview::PageLoadEvent};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 #[cfg(target_os = "macos")]
@@ -161,16 +161,15 @@ struct ShellState {
     host: server::HostHandle,
     host_store: HostStore,
     ui_debug: Arc<devtools::UiDebugBridgeState>,
+    web_content_recovery: Arc<Mutex<WebContentRecoveryPolicy>>,
 }
 
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecoveryDecision {
     Reload { generation: u64 },
     Suppress { generation: u64 },
 }
 
-#[cfg(test)]
 #[derive(Default)]
 struct WebContentRecoveryPolicy {
     generation: u64,
@@ -179,7 +178,6 @@ struct WebContentRecoveryPolicy {
     frontend_ready: bool,
 }
 
-#[cfg(test)]
 impl WebContentRecoveryPolicy {
     fn web_content_process_terminated(&mut self) -> RecoveryDecision {
         if self.reload_pending {
@@ -219,6 +217,17 @@ impl WebContentRecoveryPolicy {
             self.reload_pending = false;
         }
     }
+}
+
+fn with_recovery_policy<T>(
+    recovery: &Mutex<WebContentRecoveryPolicy>,
+    f: impl FnOnce(&mut WebContentRecoveryPolicy) -> T,
+) -> T {
+    let mut policy = recovery.lock().unwrap_or_else(|poisoned| {
+        tracing::error!("webview.recovery event=policy_lock_poisoned");
+        poisoned.into_inner()
+    });
+    f(&mut policy)
 }
 
 fn shutdown_managed_host(app: &AppHandle) {
@@ -623,6 +632,44 @@ fn mark_ui_debug_ready(state: tauri::State<'_, ShellState>) {
 }
 
 #[tauri::command]
+fn mark_frontend_ready(state: tauri::State<'_, ShellState>) {
+    let generation = with_recovery_policy(&state.web_content_recovery, |policy| {
+        policy.frontend_ready();
+        policy.generation
+    });
+    tracing::info!("webview.lifecycle event=frontend_ready generation={generation}");
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FrontendLifecycleEvent {
+    Visible,
+    Hidden,
+    Focus,
+    Blur,
+    PageShow,
+    PageHide,
+}
+
+impl FrontendLifecycleEvent {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Visible => "visible",
+            Self::Hidden => "hidden",
+            Self::Focus => "focus",
+            Self::Blur => "blur",
+            Self::PageShow => "page_show",
+            Self::PageHide => "page_hide",
+        }
+    }
+}
+
+#[tauri::command]
+fn report_frontend_lifecycle(event: FrontendLifecycleEvent) {
+    tracing::info!("webview.lifecycle event={}", event.as_str());
+}
+
+#[tauri::command]
 async fn submit_ui_debug_response(
     state: tauri::State<'_, ShellState>,
     request_id: String,
@@ -663,12 +710,38 @@ pub fn run() {
     let quit_confirmation = Arc::new(QuitConfirmation::default());
     let quit_confirmation_for_window = quit_confirmation.clone();
     let quit_confirmation_for_run = quit_confirmation.clone();
+    let web_content_recovery = Arc::new(Mutex::new(WebContentRecoveryPolicy::default()));
+    let recovery_for_page_load = web_content_recovery.clone();
+    let recovery_for_setup = web_content_recovery.clone();
 
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(external_link_guard())
         .plugin(tauri_plugin_dialog::init())
-        .on_window_event(move |window, event| {
-            if let WindowEvent::CloseRequested { api, .. } = event {
+        .on_page_load(move |webview, payload| {
+            let generation = with_recovery_policy(&recovery_for_page_load, |policy| {
+                match payload.event() {
+                    PageLoadEvent::Started => policy.page_load_started(),
+                    PageLoadEvent::Finished => policy.page_load_finished(),
+                }
+                policy.generation
+            });
+            let event = match payload.event() {
+                PageLoadEvent::Started => "page_load_started",
+                PageLoadEvent::Finished => "page_load_finished",
+            };
+            tracing::info!(
+                "webview.lifecycle event={event} label={} generation={generation}",
+                webview.label()
+            );
+        })
+        .on_window_event(move |window, event| match event {
+            WindowEvent::Focused(focused) => {
+                tracing::info!(
+                    "webview.lifecycle event=window_focus label={} focused={focused}",
+                    window.label()
+                );
+            }
+            WindowEvent::CloseRequested { api, .. } => {
                 if quit_confirmation_for_window.is_confirmed_exit() {
                     return;
                 }
@@ -679,8 +752,41 @@ pub fn run() {
                     quit_confirmation_for_window.clone(),
                 );
             }
+            _ => {}
+        });
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let builder = {
+        let recovery_for_termination = web_content_recovery.clone();
+        builder.on_web_content_process_terminate(move |webview| {
+            let decision = with_recovery_policy(&recovery_for_termination, |policy| {
+                policy.web_content_process_terminated()
+            });
+            match decision {
+                RecoveryDecision::Reload { generation } => {
+                    tracing::warn!(
+                        "webview.recovery event=web_content_process_terminated label={} generation={generation} action=reload",
+                        webview.label()
+                    );
+                    if let Err(error) = webview.reload() {
+                        tracing::error!(
+                            "webview.recovery event=reload_failed label={} generation={generation} error={error}",
+                            webview.label()
+                        );
+                    }
+                }
+                RecoveryDecision::Suppress { generation } => {
+                    tracing::error!(
+                        "webview.recovery event=web_content_process_terminated label={} generation={generation} action=suppress_pending",
+                        webview.label()
+                    );
+                }
+            }
         })
-        .setup(|app| {
+    };
+
+    let app = builder
+        .setup(move |app| {
             tracing::info!("setup: spawning host and router");
             let host_store_path =
                 host_store::HostStore::default_path().map_err(std::io::Error::other)?;
@@ -717,6 +823,7 @@ pub fn run() {
                 host,
                 host_store,
                 ui_debug,
+                web_content_recovery: recovery_for_setup,
             });
             Ok(())
         })
@@ -732,6 +839,8 @@ pub fn run() {
             remove_configured_host,
             set_selected_host,
             mark_ui_debug_ready,
+            mark_frontend_ready,
+            report_frontend_lifecycle,
             submit_ui_debug_response,
             submit_feedback,
             open_external_url

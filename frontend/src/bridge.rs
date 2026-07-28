@@ -226,6 +226,26 @@ pub async fn mark_ui_debug_ready() -> Result<(), String> {
     Ok(())
 }
 
+pub async fn mark_frontend_ready() -> Result<(), String> {
+    tauri_invoke("mark_frontend_ready", JsValue::NULL)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    Ok(())
+}
+
+pub async fn report_frontend_lifecycle(event: &'static str) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct Args {
+        event: &'static str,
+    }
+
+    let args = serde_wasm_bindgen::to_value(&Args { event }).map_err(|e| e.to_string())?;
+    tauri_invoke("report_frontend_lifecycle", args)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    Ok(())
+}
+
 pub async fn submit_ui_debug_response(request: SubmitUiDebugResponseRequest) -> Result<(), String> {
     let args = serde_wasm_bindgen::to_value(&request).map_err(|e| e.to_string())?;
     tauri_invoke("submit_ui_debug_response", args)

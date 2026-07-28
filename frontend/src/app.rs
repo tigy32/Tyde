@@ -100,6 +100,9 @@ thread_local! {
     static KEYDOWN_LISTENER_HANDLE: RefCell<Option<EventListenerHandle>> = const { RefCell::new(None) };
     static KEYUP_LISTENER_HANDLE: RefCell<Option<EventListenerHandle>> = const { RefCell::new(None) };
     static BLUR_LISTENER_HANDLE: RefCell<Option<EventListenerHandle>> = const { RefCell::new(None) };
+    static FOCUS_LISTENER_HANDLE: RefCell<Option<EventListenerHandle>> = const { RefCell::new(None) };
+    static PAGE_SHOW_LISTENER_HANDLE: RefCell<Option<EventListenerHandle>> = const { RefCell::new(None) };
+    static PAGE_HIDE_LISTENER_HANDLE: RefCell<Option<EventListenerHandle>> = const { RefCell::new(None) };
     static VISIBILITY_LISTENER_HANDLE: RefCell<Option<DocumentEventListenerHandle>> = const { RefCell::new(None) };
     static CLICK_LISTENER_HANDLE: RefCell<Option<EventListenerHandle>> = const { RefCell::new(None) };
     static FILE_DROP_LISTENER_HANDLES: RefCell<Vec<EventListenerHandle>> = const { RefCell::new(Vec::new()) };
@@ -153,6 +156,21 @@ pub(crate) fn clear_app_listeners() {
         }
     });
     BLUR_LISTENER_HANDLE.with(|handle| {
+        if let Some(handle) = handle.borrow_mut().take() {
+            handle.remove();
+        }
+    });
+    FOCUS_LISTENER_HANDLE.with(|handle| {
+        if let Some(handle) = handle.borrow_mut().take() {
+            handle.remove();
+        }
+    });
+    PAGE_SHOW_LISTENER_HANDLE.with(|handle| {
+        if let Some(handle) = handle.borrow_mut().take() {
+            handle.remove();
+        }
+    });
+    PAGE_HIDE_LISTENER_HANDLE.with(|handle| {
         if let Some(handle) = handle.borrow_mut().take() {
             handle.remove();
         }
@@ -345,6 +363,21 @@ fn install_cmd_stuck_clear_listeners(state: AppState) {
             existing.remove();
         }
     });
+    FOCUS_LISTENER_HANDLE.with(|slot| {
+        if let Some(existing) = slot.borrow_mut().take() {
+            existing.remove();
+        }
+    });
+    PAGE_SHOW_LISTENER_HANDLE.with(|slot| {
+        if let Some(existing) = slot.borrow_mut().take() {
+            existing.remove();
+        }
+    });
+    PAGE_HIDE_LISTENER_HANDLE.with(|slot| {
+        if let Some(existing) = slot.borrow_mut().take() {
+            existing.remove();
+        }
+    });
     VISIBILITY_LISTENER_HANDLE.with(|slot| {
         if let Some(existing) = slot.borrow_mut().take() {
             existing.remove();
@@ -354,14 +387,54 @@ fn install_cmd_stuck_clear_listeners(state: AppState) {
     let blur_state = state.clone();
     let blur_callback = Closure::<dyn Fn(web_sys::Event)>::new(move |_| {
         blur_state.cmd_held.set(false);
+        report_lifecycle("blur");
     });
     let window = web_sys::window().unwrap();
     let _ = window.add_event_listener_with_callback("blur", blur_callback.as_ref().unchecked_ref());
     BLUR_LISTENER_HANDLE.with(|slot| {
         slot.borrow_mut().replace(EventListenerHandle {
-            window,
+            window: window.clone(),
             event: "blur",
             callback: blur_callback,
+        });
+    });
+
+    let focus_callback = Closure::<dyn Fn(web_sys::Event)>::new(move |_| {
+        report_lifecycle("focus");
+    });
+    let _ =
+        window.add_event_listener_with_callback("focus", focus_callback.as_ref().unchecked_ref());
+    FOCUS_LISTENER_HANDLE.with(|slot| {
+        slot.borrow_mut().replace(EventListenerHandle {
+            window: window.clone(),
+            event: "focus",
+            callback: focus_callback,
+        });
+    });
+
+    let page_show_callback = Closure::<dyn Fn(web_sys::Event)>::new(move |_| {
+        report_lifecycle("page_show");
+    });
+    let _ = window
+        .add_event_listener_with_callback("pageshow", page_show_callback.as_ref().unchecked_ref());
+    PAGE_SHOW_LISTENER_HANDLE.with(|slot| {
+        slot.borrow_mut().replace(EventListenerHandle {
+            window: window.clone(),
+            event: "pageshow",
+            callback: page_show_callback,
+        });
+    });
+
+    let page_hide_callback = Closure::<dyn Fn(web_sys::Event)>::new(move |_| {
+        report_lifecycle("page_hide");
+    });
+    let _ = window
+        .add_event_listener_with_callback("pagehide", page_hide_callback.as_ref().unchecked_ref());
+    PAGE_HIDE_LISTENER_HANDLE.with(|slot| {
+        slot.borrow_mut().replace(EventListenerHandle {
+            window,
+            event: "pagehide",
+            callback: page_hide_callback,
         });
     });
 
@@ -371,6 +444,9 @@ fn install_cmd_stuck_clear_listeners(state: AppState) {
     let visibility_callback = Closure::<dyn Fn(web_sys::Event)>::new(move |_| {
         if document_for_callback.hidden() {
             visibility_state.cmd_held.set(false);
+            report_lifecycle("hidden");
+        } else {
+            report_lifecycle("visible");
         }
     });
     let _ = document.add_event_listener_with_callback(
@@ -383,6 +459,14 @@ fn install_cmd_stuck_clear_listeners(state: AppState) {
             event: "visibilitychange",
             callback: visibility_callback,
         });
+    });
+}
+
+fn report_lifecycle(event: &'static str) {
+    spawn_local(async move {
+        if let Err(error) = bridge::report_frontend_lifecycle(event).await {
+            log::warn!("failed to report frontend lifecycle event: {error}");
+        }
     });
 }
 
@@ -798,6 +882,12 @@ pub fn App() -> impl IntoView {
         yield_to_browser().await;
         crate::syntax_highlight::warm_up();
         let _ = crate::highlight_worker::shared();
+    });
+    spawn_local(async {
+        yield_to_browser().await;
+        if let Err(error) = bridge::mark_frontend_ready().await {
+            log::error!("failed to acknowledge frontend readiness: {error}");
+        }
     });
 
     let state_for_startup = state.clone();
