@@ -10,11 +10,13 @@ mod remote_bootstrap;
 mod router;
 
 use std::{
+    collections::{HashMap, VecDeque},
     process::Command,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use devtools_protocol::UiDebugResponseSubmission;
@@ -161,14 +163,33 @@ struct ShellState {
     host: server::HostHandle,
     host_store: HostStore,
     ui_debug: Arc<devtools::UiDebugBridgeState>,
-    web_content_recovery: Arc<Mutex<WebContentRecoveryPolicy>>,
+    web_content_recovery: Arc<Mutex<WebContentRecoveryPolicies>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecoveryDecision {
-    Reload { generation: u64 },
-    Suppress { generation: u64 },
+    Reload {
+        generation: u64,
+    },
+    Suppress {
+        generation: u64,
+    },
+    Escalate {
+        generation: u64,
+        failure: RecoveryFailure,
+    },
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryFailure {
+    ReloadFailed,
+    ReadinessDeadline,
+    AttemptLimit,
+}
+
+const RECOVERY_ATTEMPT_LIMIT: usize = 3;
+const RECOVERY_ATTEMPT_WINDOW: Duration = Duration::from_secs(5 * 60);
+const RECOVERY_READINESS_DEADLINE: Duration = Duration::from_secs(15);
 
 #[derive(Default)]
 struct WebContentRecoveryPolicy {
@@ -176,17 +197,31 @@ struct WebContentRecoveryPolicy {
     reload_pending: bool,
     page_load_finished: bool,
     frontend_ready: bool,
+    failure_presented: bool,
+    attempts: VecDeque<Instant>,
 }
 
 impl WebContentRecoveryPolicy {
-    fn web_content_process_terminated(&mut self) -> RecoveryDecision {
-        if self.reload_pending {
+    fn web_content_process_terminated(&mut self, now: Instant) -> RecoveryDecision {
+        if self.reload_pending || self.failure_presented {
             return RecoveryDecision::Suppress {
                 generation: self.generation,
             };
         }
+        self.attempts.retain(|attempt| {
+            now.checked_duration_since(*attempt)
+                .is_some_and(|age| age <= RECOVERY_ATTEMPT_WINDOW)
+        });
+        if self.attempts.len() >= RECOVERY_ATTEMPT_LIMIT {
+            self.failure_presented = true;
+            return RecoveryDecision::Escalate {
+                generation: self.generation,
+                failure: RecoveryFailure::AttemptLimit,
+            };
+        }
 
         self.generation = self.generation.wrapping_add(1);
+        self.attempts.push_back(now);
         self.reload_pending = true;
         self.page_load_finished = false;
         self.frontend_ready = false;
@@ -217,17 +252,48 @@ impl WebContentRecoveryPolicy {
             self.reload_pending = false;
         }
     }
+
+    fn reload_failed(&mut self, generation: u64) -> Option<RecoveryFailure> {
+        self.fail_if_pending(generation, RecoveryFailure::ReloadFailed)
+    }
+
+    fn readiness_deadline_elapsed(&mut self, generation: u64) -> Option<RecoveryFailure> {
+        self.fail_if_pending(generation, RecoveryFailure::ReadinessDeadline)
+    }
+
+    fn fail_if_pending(
+        &mut self,
+        generation: u64,
+        failure: RecoveryFailure,
+    ) -> Option<RecoveryFailure> {
+        if self.generation != generation || !self.reload_pending || self.failure_presented {
+            return None;
+        }
+        self.failure_presented = true;
+        Some(failure)
+    }
 }
 
-fn with_recovery_policy<T>(
-    recovery: &Mutex<WebContentRecoveryPolicy>,
-    f: impl FnOnce(&mut WebContentRecoveryPolicy) -> T,
+#[derive(Default)]
+struct WebContentRecoveryPolicies {
+    by_label: HashMap<String, WebContentRecoveryPolicy>,
+}
+
+impl WebContentRecoveryPolicies {
+    fn for_label(&mut self, label: &str) -> &mut WebContentRecoveryPolicy {
+        self.by_label.entry(label.to_owned()).or_default()
+    }
+}
+
+fn with_recovery_policies<T>(
+    recovery: &Mutex<WebContentRecoveryPolicies>,
+    f: impl FnOnce(&mut WebContentRecoveryPolicies) -> T,
 ) -> T {
-    let mut policy = recovery.lock().unwrap_or_else(|poisoned| {
+    let mut policies = recovery.lock().unwrap_or_else(|poisoned| {
         tracing::error!("webview.recovery event=policy_lock_poisoned");
         poisoned.into_inner()
     });
-    f(&mut policy)
+    f(&mut policies)
 }
 
 fn shutdown_managed_host(app: &AppHandle) {
@@ -287,6 +353,84 @@ fn request_quit_confirmation(app: tauri::AppHandle, confirmation: Arc<QuitConfir
         if should_quit {
             confirmation.mark_confirmed_exit();
             app.exit(0);
+        }
+    });
+}
+
+fn show_web_content_recovery_failure(
+    app: tauri::AppHandle,
+    label: String,
+    confirmation: Arc<QuitConfirmation>,
+    generation: u64,
+    failure: RecoveryFailure,
+) {
+    tracing::error!(
+        "webview.recovery event=recovery_failed label={label} generation={generation} failure={failure:?} action=prompt_restart_or_quit"
+    );
+    let message = match failure {
+        RecoveryFailure::ReloadFailed => {
+            "Tyde could not reload its interface after the web content process stopped."
+        }
+        RecoveryFailure::ReadinessDeadline => {
+            "Tyde reloaded its interface, but it did not become ready in time."
+        }
+        RecoveryFailure::AttemptLimit => {
+            "Tyde's interface stopped repeatedly. Automatic recovery has been disabled."
+        }
+    };
+    let mut dialog = app
+        .dialog()
+        .message(format!(
+            "{message}\n\nRestart Tyde to reconnect safely, or quit without restarting."
+        ))
+        .title("Tyde recovery failed")
+        .kind(MessageDialogKind::Error)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Restart".to_owned(),
+            "Quit".to_owned(),
+        ));
+    if let Some(window) = app.get_webview_window(&label) {
+        dialog = dialog.parent(&window);
+    }
+    dialog.show(move |restart| {
+        if restart {
+            app.request_restart();
+        } else {
+            confirmation.mark_confirmed_exit();
+            app.exit(1);
+        }
+    });
+}
+
+fn schedule_recovery_readiness_deadline(
+    app: tauri::AppHandle,
+    label: String,
+    generation: u64,
+    recovery: Arc<Mutex<WebContentRecoveryPolicies>>,
+    confirmation: Arc<QuitConfirmation>,
+) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(RECOVERY_READINESS_DEADLINE).await;
+        let failure = with_recovery_policies(&recovery, |policies| {
+            policies
+                .for_label(&label)
+                .readiness_deadline_elapsed(generation)
+        });
+        if let Some(failure) = failure {
+            let app_for_dialog = app.clone();
+            if let Err(error) = app.run_on_main_thread(move || {
+                show_web_content_recovery_failure(
+                    app_for_dialog,
+                    label,
+                    confirmation,
+                    generation,
+                    failure,
+                );
+            }) {
+                tracing::error!(
+                    "webview.recovery event=failure_dialog_dispatch_failed generation={generation} error={error}"
+                );
+            }
         }
     });
 }
@@ -632,12 +776,14 @@ fn mark_ui_debug_ready(state: tauri::State<'_, ShellState>) {
 }
 
 #[tauri::command]
-fn mark_frontend_ready(state: tauri::State<'_, ShellState>) {
-    let generation = with_recovery_policy(&state.web_content_recovery, |policy| {
+fn mark_frontend_ready(webview: tauri::Webview, state: tauri::State<'_, ShellState>) {
+    let label = webview.label();
+    let generation = with_recovery_policies(&state.web_content_recovery, |policies| {
+        let policy = policies.for_label(label);
         policy.frontend_ready();
         policy.generation
     });
-    tracing::info!("webview.lifecycle event=frontend_ready generation={generation}");
+    tracing::info!("webview.lifecycle event=frontend_ready label={label} generation={generation}");
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -710,7 +856,7 @@ pub fn run() {
     let quit_confirmation = Arc::new(QuitConfirmation::default());
     let quit_confirmation_for_window = quit_confirmation.clone();
     let quit_confirmation_for_run = quit_confirmation.clone();
-    let web_content_recovery = Arc::new(Mutex::new(WebContentRecoveryPolicy::default()));
+    let web_content_recovery = Arc::new(Mutex::new(WebContentRecoveryPolicies::default()));
     let recovery_for_page_load = web_content_recovery.clone();
     let recovery_for_setup = web_content_recovery.clone();
 
@@ -718,7 +864,9 @@ pub fn run() {
         .plugin(external_link_guard())
         .plugin(tauri_plugin_dialog::init())
         .on_page_load(move |webview, payload| {
-            let generation = with_recovery_policy(&recovery_for_page_load, |policy| {
+            let label = webview.label();
+            let generation = with_recovery_policies(&recovery_for_page_load, |policies| {
+                let policy = policies.for_label(label);
                 match payload.event() {
                     PageLoadEvent::Started => policy.page_load_started(),
                     PageLoadEvent::Finished => policy.page_load_finished(),
@@ -758,9 +906,13 @@ pub fn run() {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     let builder = {
         let recovery_for_termination = web_content_recovery.clone();
+        let confirmation_for_recovery = quit_confirmation.clone();
         builder.on_web_content_process_terminate(move |webview| {
-            let decision = with_recovery_policy(&recovery_for_termination, |policy| {
-                policy.web_content_process_terminated()
+            let label = webview.label().to_owned();
+            let decision = with_recovery_policies(&recovery_for_termination, |policies| {
+                policies
+                    .for_label(&label)
+                    .web_content_process_terminated(Instant::now())
             });
             match decision {
                 RecoveryDecision::Reload { generation } => {
@@ -768,17 +920,51 @@ pub fn run() {
                         "webview.recovery event=web_content_process_terminated label={} generation={generation} action=reload",
                         webview.label()
                     );
-                    if let Err(error) = webview.reload() {
-                        tracing::error!(
-                            "webview.recovery event=reload_failed label={} generation={generation} error={error}",
-                            webview.label()
-                        );
+                    match webview.reload() {
+                        Ok(()) => schedule_recovery_readiness_deadline(
+                            webview.app_handle().clone(),
+                            label,
+                            generation,
+                            recovery_for_termination.clone(),
+                            confirmation_for_recovery.clone(),
+                        ),
+                        Err(error) => {
+                            tracing::error!(
+                                "webview.recovery event=reload_failed label={} generation={generation} error={error}",
+                                webview.label()
+                            );
+                            let failure =
+                                with_recovery_policies(&recovery_for_termination, |policies| {
+                                    policies.for_label(&label).reload_failed(generation)
+                                });
+                            if let Some(failure) = failure {
+                                show_web_content_recovery_failure(
+                                    webview.app_handle().clone(),
+                                    label,
+                                    confirmation_for_recovery.clone(),
+                                    generation,
+                                    failure,
+                                );
+                            }
+                        }
                     }
                 }
                 RecoveryDecision::Suppress { generation } => {
                     tracing::error!(
                         "webview.recovery event=web_content_process_terminated label={} generation={generation} action=suppress_pending",
                         webview.label()
+                    );
+                }
+                RecoveryDecision::Escalate {
+                    generation,
+                    failure,
+                } => {
+                    show_web_content_recovery_failure(
+                        webview.app_handle().clone(),
+                        label,
+                        confirmation_for_recovery.clone(),
+                        generation,
+                        failure,
                     );
                 }
             }
@@ -885,18 +1071,24 @@ pub fn run_host_bridge_uds() -> Result<(), String> {
 
 #[cfg(test)]
 mod web_content_recovery_tests {
-    use super::{RecoveryDecision, WebContentRecoveryPolicy};
+    use std::time::{Duration, Instant};
+
+    use super::{
+        RECOVERY_ATTEMPT_LIMIT, RECOVERY_ATTEMPT_WINDOW, RecoveryDecision, RecoveryFailure,
+        WebContentRecoveryPolicies, WebContentRecoveryPolicy,
+    };
 
     #[test]
     fn termination_reloads_once_until_the_new_page_is_ready() {
         let mut policy = WebContentRecoveryPolicy::default();
+        let now = Instant::now();
 
         assert_eq!(
-            policy.web_content_process_terminated(),
+            policy.web_content_process_terminated(now),
             RecoveryDecision::Reload { generation: 1 }
         );
         assert_eq!(
-            policy.web_content_process_terminated(),
+            policy.web_content_process_terminated(now),
             RecoveryDecision::Suppress { generation: 1 },
             "a repeated termination before recovery completes must not reload-loop"
         );
@@ -904,14 +1096,14 @@ mod web_content_recovery_tests {
         policy.page_load_started();
         policy.page_load_finished();
         assert_eq!(
-            policy.web_content_process_terminated(),
+            policy.web_content_process_terminated(now),
             RecoveryDecision::Suppress { generation: 1 },
             "load completion without the frontend-ready acknowledgement is not recovery"
         );
 
         policy.frontend_ready();
         assert_eq!(
-            policy.web_content_process_terminated(),
+            policy.web_content_process_terminated(now),
             RecoveryDecision::Reload { generation: 2 },
             "a later independent process death is recoverable after the page is healthy"
         );
@@ -920,21 +1112,114 @@ mod web_content_recovery_tests {
     #[test]
     fn ready_and_load_finished_rearm_in_either_order() {
         let mut policy = WebContentRecoveryPolicy::default();
+        let now = Instant::now();
         assert!(matches!(
-            policy.web_content_process_terminated(),
+            policy.web_content_process_terminated(now),
             RecoveryDecision::Reload { generation: 1 }
         ));
 
         policy.frontend_ready();
         assert!(matches!(
-            policy.web_content_process_terminated(),
+            policy.web_content_process_terminated(now),
             RecoveryDecision::Suppress { generation: 1 }
         ));
 
         policy.page_load_finished();
         assert!(matches!(
-            policy.web_content_process_terminated(),
+            policy.web_content_process_terminated(now),
             RecoveryDecision::Reload { generation: 2 }
         ));
+    }
+
+    #[test]
+    fn deadline_and_reload_error_escalate_only_a_termination_recovery() {
+        let now = Instant::now();
+        let mut deadline = WebContentRecoveryPolicy::default();
+        assert_eq!(
+            deadline.web_content_process_terminated(now),
+            RecoveryDecision::Reload { generation: 1 }
+        );
+        assert_eq!(
+            deadline.readiness_deadline_elapsed(1),
+            Some(RecoveryFailure::ReadinessDeadline)
+        );
+        assert_eq!(deadline.readiness_deadline_elapsed(1), None);
+
+        let mut reload_error = WebContentRecoveryPolicy::default();
+        assert_eq!(
+            reload_error.web_content_process_terminated(now),
+            RecoveryDecision::Reload { generation: 1 }
+        );
+        assert_eq!(
+            reload_error.reload_failed(1),
+            Some(RecoveryFailure::ReloadFailed)
+        );
+
+        let mut normal_page = WebContentRecoveryPolicy::default();
+        assert_eq!(
+            normal_page.readiness_deadline_elapsed(0),
+            None,
+            "normal startup and unrelated frontend panics have no recovery deadline"
+        );
+    }
+
+    #[test]
+    fn rolling_attempt_limit_escalates_then_expires() {
+        let now = Instant::now();
+        let mut policy = WebContentRecoveryPolicy::default();
+        for generation in 1..=RECOVERY_ATTEMPT_LIMIT {
+            assert_eq!(
+                policy.web_content_process_terminated(now),
+                RecoveryDecision::Reload {
+                    generation: generation as u64
+                }
+            );
+            policy.page_load_finished();
+            policy.frontend_ready();
+        }
+        assert_eq!(
+            policy.web_content_process_terminated(now),
+            RecoveryDecision::Escalate {
+                generation: RECOVERY_ATTEMPT_LIMIT as u64,
+                failure: RecoveryFailure::AttemptLimit,
+            }
+        );
+
+        let mut expired = WebContentRecoveryPolicy::default();
+        for _ in 0..RECOVERY_ATTEMPT_LIMIT {
+            assert!(matches!(
+                expired.web_content_process_terminated(now),
+                RecoveryDecision::Reload { .. }
+            ));
+            expired.page_load_finished();
+            expired.frontend_ready();
+        }
+        assert!(matches!(
+            expired.web_content_process_terminated(
+                now + RECOVERY_ATTEMPT_WINDOW + Duration::from_secs(1)
+            ),
+            RecoveryDecision::Reload { .. }
+        ));
+    }
+
+    #[test]
+    fn recovery_state_is_scoped_by_webview_label() {
+        let now = Instant::now();
+        let mut policies = WebContentRecoveryPolicies::default();
+        assert!(matches!(
+            policies
+                .for_label("main")
+                .web_content_process_terminated(now),
+            RecoveryDecision::Reload { generation: 1 }
+        ));
+        policies.for_label("auth").page_load_finished();
+        policies.for_label("auth").frontend_ready();
+        assert!(matches!(
+            policies
+                .for_label("main")
+                .web_content_process_terminated(now),
+            RecoveryDecision::Suppress { generation: 1 }
+        ));
+        assert_eq!(policies.for_label("auth").generation, 0);
     }
 }

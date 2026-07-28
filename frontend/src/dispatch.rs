@@ -10089,7 +10089,7 @@ mod wasm_tests {
     /// that owned it. The same text appearing in a different agent's composer is
     /// both a data leak and a send-to-the-wrong-agent hazard.
     #[wasm_bindgen_test]
-    async fn composer_draft_round_trips_only_to_its_owner() {
+    async fn composer_drafts_round_trip_independently_across_a_b_a_switches() {
         clear_workspace_storage();
         clear_composer_draft_storage();
         reset_inbound_state_for_host("host-a");
@@ -10127,6 +10127,7 @@ mod wasm_tests {
         );
         first.chat_input.set("unsent for agent A".to_owned());
         next_tick().await;
+        first.flush_composer_drafts();
 
         let second_container = document
             .create_element("div")
@@ -10178,6 +10179,55 @@ mod wasm_tests {
             second.chat_input.get_untracked(),
             "",
             "agent A's draft must never appear in agent B's composer"
+        );
+        second.chat_input.set("unsent for agent B".to_owned());
+        next_tick().await;
+
+        second.open_tab(
+            TabContent::chat_with_agent(ActiveAgentRef {
+                host_id: "host-a".to_owned(),
+                agent_id: AgentId("agent-a".to_owned()),
+            }),
+            "Agent A".to_owned(),
+            true,
+        );
+        next_tick().await;
+        assert_eq!(
+            second.chat_input.get_untracked(),
+            "unsent for agent A",
+            "switching A to B to A must restore A independently"
+        );
+        let persisted = web_sys::window()
+            .unwrap()
+            .local_storage()
+            .unwrap()
+            .unwrap()
+            .get_item("tyde-composer-draft")
+            .unwrap()
+            .expect("switching owners must synchronously flush both drafts");
+        let persisted: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+        let persisted_texts = persisted["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["text"].as_str())
+            .collect::<Vec<_>>();
+        assert!(persisted_texts.contains(&"unsent for agent A"));
+        assert!(persisted_texts.contains(&"unsent for agent B"));
+
+        second.open_tab(
+            TabContent::chat_with_agent(ActiveAgentRef {
+                host_id: "host-a".to_owned(),
+                agent_id: AgentId("agent-b".to_owned()),
+            }),
+            "Agent B".to_owned(),
+            true,
+        );
+        next_tick().await;
+        assert_eq!(
+            second.chat_input.get_untracked(),
+            "unsent for agent B",
+            "restoring A must not overwrite B's independently owned draft"
         );
 
         clear_composer_draft_storage();

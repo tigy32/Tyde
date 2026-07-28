@@ -657,6 +657,23 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
             check_workflow.index("run: ./dev.sh check"),
         )
 
+    def test_linux_gui_workflows_install_tauri_dbus_build_dependencies(
+        self,
+    ) -> None:
+        for workflow_name in ("check.yml", "release.yml"):
+            workflow = (
+                REPO_ROOT / ".github" / "workflows" / workflow_name
+            ).read_text(encoding="utf-8")
+            linux_install = workflow[
+                workflow.index("- name: Install Linux dependencies") :
+            ]
+            self.assertIn("libdbus-1-dev", linux_install)
+            self.assertIn("pkg-config", linux_install)
+            self.assertLess(
+                linux_install.index("libdbus-1-dev"),
+                linux_install.index("- name: Install repository Rust toolchain"),
+            )
+
     def test_contract_stage_is_reachable_without_recursive_checks(self) -> None:
         env = self.env.copy()
         env["DEV_CHECK_CONTRACT_CHILD"] = "1"

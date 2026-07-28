@@ -126,7 +126,13 @@ const ACTIVE_PROJECT_STORAGE_KEY: &str = "tyde-active-project";
 #[cfg(target_arch = "wasm32")]
 const COMPOSER_DRAFT_STORAGE_KEY: &str = "tyde-composer-draft";
 #[cfg(target_arch = "wasm32")]
-const MAX_PERSISTED_COMPOSER_DRAFT_BYTES: usize = 256 * 1024;
+const MAX_PERSISTED_COMPOSER_DRAFT_ENTRIES: usize = 8;
+#[cfg(target_arch = "wasm32")]
+const MAX_PERSISTED_COMPOSER_DRAFT_ENTRY_BYTES: usize = 256 * 1024;
+#[cfg(target_arch = "wasm32")]
+const MAX_PERSISTED_COMPOSER_DRAFT_TOTAL_BYTES: usize = 512 * 1024;
+#[cfg(target_arch = "wasm32")]
+const COMPOSER_DRAFT_DEBOUNCE_MS: i32 = 400;
 /// Deliberately a second key rather than an extension of the project record:
 /// the project format already ships and is covered by tests, and a separate
 /// key means an old or corrupt selection degrades to today's behaviour instead
@@ -307,46 +313,322 @@ struct PersistedComposerDraft {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn load_composer_draft() -> Option<PersistedComposerDraft> {
-    let storage = web_sys::window()?.local_storage().ok().flatten()?;
-    let encoded = storage
-        .get_item(COMPOSER_DRAFT_STORAGE_KEY)
-        .ok()
-        .flatten()?;
-    let draft = match serde_json::from_str::<PersistedComposerDraft>(&encoded) {
-        Ok(draft) => draft,
-        Err(error) => {
-            log::warn!("invalid persisted composer draft: {error}");
-            let _ = storage.remove_item(COMPOSER_DRAFT_STORAGE_KEY);
-            return None;
-        }
-    };
-    if draft.text.is_empty() || draft.text.len() > MAX_PERSISTED_COMPOSER_DRAFT_BYTES {
-        let _ = storage.remove_item(COMPOSER_DRAFT_STORAGE_KEY);
-        return None;
-    }
-    Some(draft)
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PersistedComposerDraftStore {
+    #[serde(default)]
+    entries: Vec<PersistedComposerDraft>,
 }
 
 #[cfg(target_arch = "wasm32")]
-fn persist_composer_draft(draft: Option<&PersistedComposerDraft>) {
+impl PersistedComposerDraftStore {
+    fn find_index(&self, owner: &PersistedComposerDraftOwner) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|draft| draft.owner.same_conversation(owner))
+    }
+
+    fn restore(&mut self, owner: &PersistedComposerDraftOwner) -> Option<String> {
+        let index = self.find_index(owner)?;
+        let mut draft = self.entries.remove(index);
+        draft.owner = owner.clone();
+        let text = draft.text.clone();
+        self.entries.insert(0, draft);
+        Some(text)
+    }
+
+    fn remove(&mut self, owner: &PersistedComposerDraftOwner) -> bool {
+        let Some(index) = self.find_index(owner) else {
+            return false;
+        };
+        self.entries.remove(index);
+        true
+    }
+
+    fn upsert(&mut self, owner: PersistedComposerDraftOwner, text: String) -> DraftStoreUpdate {
+        self.remove(&owner);
+        let draft = PersistedComposerDraft { owner, text };
+        let entry_bytes = serde_json::to_vec(&draft).map_or(usize::MAX, |encoded| encoded.len());
+        if entry_bytes > MAX_PERSISTED_COMPOSER_DRAFT_ENTRY_BYTES {
+            return DraftStoreUpdate::EntryTooLarge;
+        }
+
+        self.entries.insert(0, draft);
+        let mut evicted = 0;
+        while self.entries.len() > MAX_PERSISTED_COMPOSER_DRAFT_ENTRIES
+            || self.encoded_len() > MAX_PERSISTED_COMPOSER_DRAFT_TOTAL_BYTES
+        {
+            self.entries.pop();
+            evicted += 1;
+        }
+        DraftStoreUpdate::Stored { evicted }
+    }
+
+    fn encoded_len(&self) -> usize {
+        serde_json::to_vec(self).map_or(usize::MAX, |encoded| encoded.len())
+    }
+
+    fn enforce_bounds(&mut self) {
+        self.entries.retain(|draft| {
+            !draft.text.is_empty()
+                && serde_json::to_vec(draft)
+                    .is_ok_and(|encoded| encoded.len() <= MAX_PERSISTED_COMPOSER_DRAFT_ENTRY_BYTES)
+        });
+        self.entries.truncate(MAX_PERSISTED_COMPOSER_DRAFT_ENTRIES);
+        while self.encoded_len() > MAX_PERSISTED_COMPOSER_DRAFT_TOTAL_BYTES {
+            self.entries.pop();
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DraftStoreUpdate {
+    Stored { evicted: usize },
+    EntryTooLarge,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone)]
+struct ComposerDraftScheduler {
+    schedule: std::rc::Rc<dyn Fn(&js_sys::Function, i32) -> Result<i32, wasm_bindgen::JsValue>>,
+    cancel: std::rc::Rc<dyn Fn(i32)>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Default for ComposerDraftScheduler {
+    fn default() -> Self {
+        Self {
+            schedule: std::rc::Rc::new(|callback, delay_ms| {
+                web_sys::window()
+                    .ok_or_else(|| wasm_bindgen::JsValue::from_str("window is unavailable"))?
+                    .set_timeout_with_callback_and_timeout_and_arguments_0(callback, delay_ms)
+            }),
+            cancel: std::rc::Rc::new(|handle| {
+                if let Some(window) = web_sys::window() {
+                    window.clear_timeout_with_handle(handle);
+                }
+            }),
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+struct ComposerDraftTimeout {
+    handle: i32,
+    _callback: wasm_bindgen::closure::Closure<dyn FnMut()>,
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static NEXT_COMPOSER_DRAFT_SCHEDULER_ID: Cell<u64> = const { Cell::new(0) };
+    static COMPOSER_DRAFT_SCHEDULERS: std::cell::RefCell<HashMap<u64, ComposerDraftScheduler>> =
+        std::cell::RefCell::new(HashMap::new());
+    static COMPOSER_DRAFT_TIMEOUTS: std::cell::RefCell<HashMap<u64, ComposerDraftTimeout>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+#[cfg(target_arch = "wasm32")]
+fn register_composer_draft_scheduler() -> u64 {
+    let id = NEXT_COMPOSER_DRAFT_SCHEDULER_ID.with(|next| {
+        let id = next.get().wrapping_add(1);
+        next.set(id);
+        id
+    });
+    COMPOSER_DRAFT_SCHEDULERS.with(|schedulers| {
+        schedulers
+            .borrow_mut()
+            .insert(id, ComposerDraftScheduler::default());
+    });
+    id
+}
+
+#[cfg(target_arch = "wasm32")]
+fn load_composer_drafts() -> PersistedComposerDraftStore {
+    let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    else {
+        return PersistedComposerDraftStore::default();
+    };
+    let Some(encoded) = storage.get_item(COMPOSER_DRAFT_STORAGE_KEY).ok().flatten() else {
+        return PersistedComposerDraftStore::default();
+    };
+    let mut drafts = match serde_json::from_str::<PersistedComposerDraftStore>(&encoded) {
+        Ok(drafts) => drafts,
+        Err(error) => {
+            log::warn!("invalid persisted composer draft store: {error}");
+            let _ = storage.remove_item(COMPOSER_DRAFT_STORAGE_KEY);
+            return PersistedComposerDraftStore::default();
+        }
+    };
+    drafts.enforce_bounds();
+    drafts
+}
+
+#[cfg(target_arch = "wasm32")]
+fn persist_composer_drafts(drafts: &PersistedComposerDraftStore) {
     let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
     else {
         return;
     };
-    let Some(draft) = draft.filter(|draft| {
-        !draft.text.is_empty() && draft.text.len() <= MAX_PERSISTED_COMPOSER_DRAFT_BYTES
-    }) else {
+    if drafts.entries.is_empty() {
         let _ = storage.remove_item(COMPOSER_DRAFT_STORAGE_KEY);
         return;
-    };
-    match serde_json::to_string(draft) {
+    }
+    match serde_json::to_string(drafts) {
         Ok(encoded) => {
+            if encoded.len() > MAX_PERSISTED_COMPOSER_DRAFT_TOTAL_BYTES {
+                log::error!("bounded composer draft store exceeded its total limit");
+                return;
+            }
             if let Err(error) = storage.set_item(COMPOSER_DRAFT_STORAGE_KEY, &encoded) {
-                log::warn!("failed to persist composer draft: {error:?}");
+                log::warn!("failed to persist composer draft store: {error:?}");
             }
         }
-        Err(error) => log::warn!("failed to encode composer draft: {error}"),
+        Err(error) => log::warn!("failed to encode composer draft store: {error}"),
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod composer_draft_tests {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use wasm_bindgen::JsValue;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::*;
+
+    fn owner(host_id: &str) -> PersistedComposerDraftOwner {
+        PersistedComposerDraftOwner::NewChat {
+            host_id: host_id.to_owned(),
+            project_id: None,
+        }
+    }
+
+    fn clear_storage() {
+        web_sys::window()
+            .unwrap()
+            .local_storage()
+            .unwrap()
+            .unwrap()
+            .remove_item(COMPOSER_DRAFT_STORAGE_KEY)
+            .unwrap();
+    }
+
+    #[wasm_bindgen_test]
+    fn draft_store_evicts_the_least_recently_used_entry_by_count_and_total_bytes() {
+        let mut drafts = PersistedComposerDraftStore::default();
+        for index in 0..=MAX_PERSISTED_COMPOSER_DRAFT_ENTRIES {
+            assert!(matches!(
+                drafts.upsert(owner(&format!("host-{index}")), format!("draft-{index}")),
+                DraftStoreUpdate::Stored { .. }
+            ));
+        }
+
+        assert_eq!(drafts.entries.len(), MAX_PERSISTED_COMPOSER_DRAFT_ENTRIES);
+        assert!(drafts.find_index(&owner("host-0")).is_none());
+        let newest = format!("host-{MAX_PERSISTED_COMPOSER_DRAFT_ENTRIES}");
+        let newest_text = format!("draft-{MAX_PERSISTED_COMPOSER_DRAFT_ENTRIES}");
+        assert_eq!(
+            drafts.restore(&owner(&newest)).as_deref(),
+            Some(newest_text.as_str()),
+            "the newest entry survives count-based eviction"
+        );
+
+        let mut byte_bounded = PersistedComposerDraftStore::default();
+        for index in 0..3 {
+            assert!(matches!(
+                byte_bounded.upsert(owner(&format!("large-{index}")), "x".repeat(220 * 1024)),
+                DraftStoreUpdate::Stored { .. }
+            ));
+        }
+        assert_eq!(
+            byte_bounded.entries.len(),
+            2,
+            "the total-byte ceiling evicts the least-recent entry"
+        );
+        assert!(byte_bounded.find_index(&owner("large-0")).is_none());
+        assert!(byte_bounded.encoded_len() <= MAX_PERSISTED_COMPOSER_DRAFT_TOTAL_BYTES);
+        assert_eq!(
+            byte_bounded.upsert(
+                owner("too-large"),
+                "x".repeat(MAX_PERSISTED_COMPOSER_DRAFT_ENTRY_BYTES)
+            ),
+            DraftStoreUpdate::EntryTooLarge
+        );
+        assert!(byte_bounded.find_index(&owner("too-large")).is_none());
+    }
+
+    #[wasm_bindgen_test]
+    fn injected_scheduler_debounces_writes_until_timer_or_flush() {
+        clear_storage();
+        let next_handle = Rc::new(Cell::new(0));
+        let scheduled = Rc::new(RefCell::new(Vec::<js_sys::Function>::new()));
+        let cancelled = Rc::new(RefCell::new(Vec::<i32>::new()));
+        let scheduled_for_callback = scheduled.clone();
+        let next_for_callback = next_handle.clone();
+        let cancelled_for_callback = cancelled.clone();
+
+        let state = AppState::new();
+        COMPOSER_DRAFT_SCHEDULERS.with(|schedulers| {
+            schedulers.borrow_mut().insert(
+                state.composer_draft_scheduler_id,
+                ComposerDraftScheduler {
+                    schedule: Rc::new(move |callback, delay_ms| {
+                        assert_eq!(delay_ms, COMPOSER_DRAFT_DEBOUNCE_MS);
+                        let handle = next_for_callback.get() + 1;
+                        next_for_callback.set(handle);
+                        scheduled_for_callback.borrow_mut().push(callback.clone());
+                        Ok(handle)
+                    }),
+                    cancel: Rc::new(move |handle| {
+                        cancelled_for_callback.borrow_mut().push(handle);
+                    }),
+                },
+            );
+        });
+        state
+            .composer_draft_owner
+            .set(Some(owner("scheduled-host")));
+
+        state.chat_input.set("f".to_owned());
+        assert!(state.checkpoint_current_composer_draft());
+        state.schedule_composer_draft_persist();
+        state.chat_input.set("final".to_owned());
+        assert!(state.checkpoint_current_composer_draft());
+        state.schedule_composer_draft_persist();
+
+        assert_eq!(&*cancelled.borrow(), &[1]);
+        assert_eq!(scheduled.borrow().len(), 2);
+        assert!(
+            web_sys::window()
+                .unwrap()
+                .local_storage()
+                .unwrap()
+                .unwrap()
+                .get_item(COMPOSER_DRAFT_STORAGE_KEY)
+                .unwrap()
+                .is_none(),
+            "edits update memory but do not synchronously write localStorage"
+        );
+
+        scheduled.borrow()[1]
+            .call0(&JsValue::UNDEFINED)
+            .expect("the injected timer should invoke");
+        let mut restored = load_composer_drafts();
+        assert_eq!(
+            restored.restore(&owner("scheduled-host")).as_deref(),
+            Some("final")
+        );
+
+        state.chat_input.set("flushed".to_owned());
+        state.flush_composer_drafts();
+        let mut restored = load_composer_drafts();
+        assert_eq!(
+            restored.restore(&owner("scheduled-host")).as_deref(),
+            Some("flushed"),
+            "lifecycle flush bypasses the debounce deadline"
+        );
+        clear_storage();
     }
 }
 
@@ -2741,7 +3023,11 @@ pub struct AppState {
     #[cfg(target_arch = "wasm32")]
     composer_draft_owner: RwSignal<Option<PersistedComposerDraftOwner>>,
     #[cfg(target_arch = "wasm32")]
-    pending_composer_draft: RwSignal<Option<PersistedComposerDraft>>,
+    composer_drafts: RwSignal<PersistedComposerDraftStore>,
+    #[cfg(target_arch = "wasm32")]
+    composer_draft_scheduler_id: u64,
+    #[cfg(target_arch = "wasm32")]
+    composer_draft_limit_notified: RwSignal<bool>,
     pub task_lists: RwSignal<HashMap<AgentId, TaskList>>,
     /// Per-agent Tycode orchestration event log (sub-agent/workflow progress),
     /// chronological. Appended to as `ChatEvent::Orchestration` events arrive
@@ -3224,7 +3510,11 @@ impl AppState {
             #[cfg(target_arch = "wasm32")]
             composer_draft_owner: RwSignal::new(None),
             #[cfg(target_arch = "wasm32")]
-            pending_composer_draft: RwSignal::new(None),
+            composer_drafts: RwSignal::new(PersistedComposerDraftStore::default()),
+            #[cfg(target_arch = "wasm32")]
+            composer_draft_scheduler_id: register_composer_draft_scheduler(),
+            #[cfg(target_arch = "wasm32")]
+            composer_draft_limit_notified: RwSignal::new(false),
             task_lists: RwSignal::new(HashMap::new()),
             orchestration: RwSignal::new(HashMap::new()),
             center_zone,
@@ -4269,13 +4559,14 @@ impl AppState {
     /// the paths that matter off the browser.
     #[cfg(target_arch = "wasm32")]
     pub fn install_browser_effects(&self) {
-        self.pending_composer_draft.set(load_composer_draft());
+        self.composer_drafts.set(load_composer_drafts());
 
         let composer_owner_state = self.clone();
         Effect::new(move |_| {
             composer_owner_state.center_zone.with(|_| ());
             composer_owner_state.active_project.with(|_| ());
             composer_owner_state.selected_host_id.with(|_| ());
+            composer_owner_state.active_agent.with(|_| ());
             composer_owner_state.agents.with(|_| ());
             composer_owner_state.reconcile_composer_draft_owner();
         });
@@ -4284,7 +4575,9 @@ impl AppState {
         Effect::new(move |_| {
             composer_text_state.chat_input.with(|_| ());
             composer_text_state.composer_draft_owner.with(|_| ());
-            composer_text_state.persist_bound_composer_draft();
+            if composer_text_state.checkpoint_current_composer_draft() {
+                composer_text_state.schedule_composer_draft_persist();
+            }
         });
 
         let selection_state = self.clone();
@@ -4369,7 +4662,6 @@ impl AppState {
         let next = self.current_composer_draft_owner_untracked();
         let current = self.composer_draft_owner.get_untracked();
         if current == next {
-            self.restore_pending_composer_draft(next.as_ref());
             return;
         }
 
@@ -4377,81 +4669,151 @@ impl AppState {
             && current.same_conversation(next)
         {
             self.composer_draft_owner.set(Some(next.clone()));
-            if let Some(mut pending) = self.pending_composer_draft.get_untracked()
-                && pending.owner.same_conversation(next)
-            {
-                pending.owner = next.clone();
-                persist_composer_draft(Some(&pending));
-                self.pending_composer_draft.set(Some(pending));
-            }
-            self.restore_pending_composer_draft(Some(next));
+            self.composer_drafts.update(|drafts| {
+                drafts.restore(next);
+            });
+            self.flush_composer_drafts();
+            self.restore_composer_draft(Some(next));
             return;
         }
 
         let text = self.chat_input.get_untracked();
         if current.is_none() && next.is_some() && !text.is_empty() {
             self.composer_draft_owner.set(next.clone());
-            self.persist_bound_composer_draft();
+            if self.checkpoint_current_composer_draft() {
+                self.schedule_composer_draft_persist();
+            }
             return;
         }
-        if let Some(owner) = current
-            && !text.is_empty()
-        {
-            let draft = PersistedComposerDraft { owner, text };
-            persist_composer_draft(Some(&draft));
-            self.pending_composer_draft.set(Some(draft));
-        }
 
+        self.flush_composer_drafts();
         self.chat_input.set(String::new());
         self.composer_draft_owner.set(next.clone());
-        self.restore_pending_composer_draft(next.as_ref());
+        self.restore_composer_draft(next.as_ref());
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn restore_pending_composer_draft(&self, owner: Option<&PersistedComposerDraftOwner>) {
+    fn restore_composer_draft(&self, owner: Option<&PersistedComposerDraftOwner>) {
         if !self.chat_input.get_untracked().is_empty() {
             return;
         }
         let Some(owner) = owner else {
             return;
         };
-        let Some(pending) = self.pending_composer_draft.get_untracked() else {
-            return;
-        };
-        if pending.owner.same_conversation(owner) {
-            self.chat_input.set(pending.text);
+        let restored = self
+            .composer_drafts
+            .try_update(|drafts| drafts.restore(owner))
+            .flatten();
+        if let Some(text) = restored {
+            self.chat_input.set(text);
         }
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn persist_bound_composer_draft(&self) {
+    fn checkpoint_current_composer_draft(&self) -> bool {
         let Some(owner) = self.composer_draft_owner.get_untracked() else {
-            return;
+            return false;
         };
         let text = self.chat_input.get_untracked();
-        if text.len() > MAX_PERSISTED_COMPOSER_DRAFT_BYTES {
-            persist_composer_draft(None);
-            self.pending_composer_draft.set(None);
-            log::warn!("composer draft exceeds the bounded persistence limit");
-            return;
-        }
         if text.is_empty() {
-            let clears_pending = self.pending_composer_draft.with_untracked(|pending| {
-                pending
-                    .as_ref()
-                    .is_some_and(|draft| draft.owner.same_conversation(&owner))
-            });
-            if clears_pending {
-                persist_composer_draft(None);
-                self.pending_composer_draft.set(None);
-            }
-            return;
+            return self
+                .composer_drafts
+                .try_update(|drafts| drafts.remove(&owner))
+                .unwrap_or(false);
         }
 
-        let draft = PersistedComposerDraft { owner, text };
-        persist_composer_draft(Some(&draft));
-        self.pending_composer_draft.set(Some(draft));
+        let update = self
+            .composer_drafts
+            .try_update(|drafts| drafts.upsert(owner, text))
+            .unwrap_or(DraftStoreUpdate::EntryTooLarge);
+        match update {
+            DraftStoreUpdate::Stored { evicted } => {
+                self.composer_draft_limit_notified.set(false);
+                if evicted > 0 {
+                    log::info!("composer draft LRU evicted {evicted} bounded entries");
+                }
+                true
+            }
+            DraftStoreUpdate::EntryTooLarge => {
+                log::warn!("composer draft exceeds the per-entry persistence limit");
+                if !self.composer_draft_limit_notified.get_untracked() {
+                    self.composer_draft_limit_notified.set(true);
+                    wasm_bindgen_futures::spawn_local(async {
+                        crate::bridge::message_dialog(
+                            "Draft is too large to protect",
+                            "This draft exceeds Tyde's crash-recovery storage limit. Shorten it before relying on automatic draft recovery.",
+                        )
+                        .await;
+                    });
+                }
+                true
+            }
+        }
     }
+
+    #[cfg(target_arch = "wasm32")]
+    fn cancel_composer_draft_persist(&self) {
+        let timeout = COMPOSER_DRAFT_TIMEOUTS.with(|timeouts| {
+            timeouts
+                .borrow_mut()
+                .remove(&self.composer_draft_scheduler_id)
+        });
+        if let Some(timeout) = timeout {
+            COMPOSER_DRAFT_SCHEDULERS.with(|schedulers| {
+                if let Some(scheduler) = schedulers.borrow().get(&self.composer_draft_scheduler_id)
+                {
+                    (scheduler.cancel)(timeout.handle);
+                }
+            });
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn schedule_composer_draft_persist(&self) {
+        use wasm_bindgen::JsCast;
+
+        self.cancel_composer_draft_persist();
+        let drafts = self.composer_drafts;
+        let callback = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
+            persist_composer_drafts(&drafts.get_untracked());
+        });
+        let scheduler = COMPOSER_DRAFT_SCHEDULERS.with(|schedulers| {
+            schedulers
+                .borrow()
+                .get(&self.composer_draft_scheduler_id)
+                .cloned()
+                .unwrap_or_default()
+        });
+        match (scheduler.schedule)(
+            callback.as_ref().unchecked_ref(),
+            COMPOSER_DRAFT_DEBOUNCE_MS,
+        ) {
+            Ok(handle) => {
+                COMPOSER_DRAFT_TIMEOUTS.with(|timeouts| {
+                    timeouts.borrow_mut().insert(
+                        self.composer_draft_scheduler_id,
+                        ComposerDraftTimeout {
+                            handle,
+                            _callback: callback,
+                        },
+                    );
+                });
+            }
+            Err(error) => {
+                log::warn!("failed to schedule composer draft persistence: {error:?}");
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn flush_composer_drafts(&self) {
+        self.checkpoint_current_composer_draft();
+        self.cancel_composer_draft_persist();
+        persist_composer_drafts(&self.composer_drafts.get_untracked());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn flush_composer_drafts(&self) {}
 
     /// Persist the current selection, unless a restore has not yet resolved.
     ///

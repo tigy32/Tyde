@@ -386,6 +386,7 @@ fn install_cmd_stuck_clear_listeners(state: AppState) {
 
     let blur_state = state.clone();
     let blur_callback = Closure::<dyn Fn(web_sys::Event)>::new(move |_| {
+        blur_state.flush_composer_drafts();
         blur_state.cmd_held.set(false);
         report_lifecycle("blur");
     });
@@ -425,7 +426,9 @@ fn install_cmd_stuck_clear_listeners(state: AppState) {
         });
     });
 
+    let page_hide_state = state.clone();
     let page_hide_callback = Closure::<dyn Fn(web_sys::Event)>::new(move |_| {
+        page_hide_state.flush_composer_drafts();
         report_lifecycle("page_hide");
     });
     let _ = window
@@ -443,6 +446,7 @@ fn install_cmd_stuck_clear_listeners(state: AppState) {
     let document_for_callback = document.clone();
     let visibility_callback = Closure::<dyn Fn(web_sys::Event)>::new(move |_| {
         if document_for_callback.hidden() {
+            visibility_state.flush_composer_drafts();
             visibility_state.cmd_held.set(false);
             report_lifecycle("hidden");
         } else {
@@ -845,6 +849,8 @@ mod tests {
 #[component]
 pub fn App() -> impl IntoView {
     let state = AppState::new();
+    let app_shell_ref = NodeRef::<leptos::html::Div>::new();
+    let frontend_ready_sent = StoredValue::new(false);
     restore_appearance(&state);
     // Reactive wiring is installed here, at the one place that mounts and
     // therefore has an executor, rather than inside the constructor.
@@ -883,11 +889,17 @@ pub fn App() -> impl IntoView {
         crate::syntax_highlight::warm_up();
         let _ = crate::highlight_worker::shared();
     });
-    spawn_local(async {
-        yield_to_browser().await;
-        if let Err(error) = bridge::mark_frontend_ready().await {
-            log::error!("failed to acknowledge frontend readiness: {error}");
+    Effect::new(move |_| {
+        if app_shell_ref.get().is_none() || frontend_ready_sent.get_value() {
+            return;
         }
+        frontend_ready_sent.set_value(true);
+        spawn_local(async {
+            yield_to_browser().await;
+            if let Err(error) = bridge::mark_frontend_ready().await {
+                log::error!("failed to acknowledge frontend readiness: {error}");
+            }
+        });
     });
 
     let state_for_startup = state.clone();
@@ -977,7 +989,7 @@ pub fn App() -> impl IntoView {
     };
 
     view! {
-        <div class="app-shell">
+        <div class="app-shell" node_ref=app_shell_ref>
             <Header />
             <div class="app-body">
                 <ProjectRail />
