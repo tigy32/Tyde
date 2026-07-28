@@ -3383,47 +3383,76 @@ impl CodexInner {
 
     /// One reconcile pass. Returns whether the loop should keep polling.
     async fn poll_background_terminals_once(&self) -> bool {
-        let thread_id = {
+        // Native children are separate threads on the same app-server, and
+        // each keeps its own background terminals, so every thread with an
+        // outstanding command needs its own snapshot.
+        let thread_ids = {
             let state = self.state.lock().await;
-            if state.outstanding_command_executions.is_empty() {
-                return false;
-            }
-            state.thread_id.clone()
+            state
+                .outstanding_command_executions
+                .keys()
+                .map(|(thread_id, _)| thread_id.clone())
+                .collect::<HashSet<_>>()
         };
-        let result = match self
-            .rpc
-            .request(
-                "thread/backgroundTerminals/list",
-                json!({ "threadId": thread_id }),
-            )
-            .await
-        {
-            Ok(result) => result,
-            Err(err) => {
-                // The app-server is gone or wedged. Nothing authoritative is
-                // left to report, so stop rather than guess at liveness.
-                tracing::debug!("Codex background terminal poll failed: {err}");
-                return false;
-            }
-        };
-        if result
-            .get("nextCursor")
-            .is_some_and(|cursor| !cursor.is_null())
-        {
-            tracing::warn!(
-                "Codex reported more background terminals than one page; \
-                 only the first page is tracked"
-            );
+        if thread_ids.is_empty() {
+            return false;
         }
-        let listed = parse_codex_background_terminals(&result);
-        let progress = {
-            let mut state = self.state.lock().await;
-            reconcile_codex_background_terminals(&mut state, &thread_id, &listed)
-        };
-        for update in &progress {
-            self.emitter.tool_progress(update);
+        for thread_id in thread_ids {
+            let result = match self
+                .rpc
+                .request(
+                    "thread/backgroundTerminals/list",
+                    json!({ "threadId": thread_id }),
+                )
+                .await
+            {
+                Ok(result) => result,
+                Err(err) => {
+                    // The app-server is gone or wedged. Nothing authoritative
+                    // is left to report, so stop rather than guess at liveness.
+                    tracing::debug!("Codex background terminal poll failed: {err}");
+                    return false;
+                }
+            };
+            if result
+                .get("nextCursor")
+                .is_some_and(|cursor| !cursor.is_null())
+            {
+                tracing::warn!(
+                    "Codex reported more background terminals than one page; \
+                     only the first page is tracked"
+                );
+            }
+            let listed = parse_codex_background_terminals(&result);
+            let progress = {
+                let mut state = self.state.lock().await;
+                reconcile_codex_background_terminals(&mut state, &thread_id, &listed)
+            };
+            if progress.is_empty() {
+                continue;
+            }
+            let Some(emitter) = self.background_progress_emitter(&thread_id).await else {
+                // The child's stream is gone; its rows went with it.
+                continue;
+            };
+            for update in &progress {
+                emitter.tool_progress(update);
+            }
         }
         true
+    }
+
+    /// Background rows belong to the thread that owns the command: the root
+    /// session, or a native child's own stream.
+    async fn background_progress_emitter(&self, thread_id: &str) -> Option<Arc<TurnEmitter>> {
+        let state = self.state.lock().await;
+        if state.thread_id == thread_id {
+            return Some(Arc::clone(&self.emitter));
+        }
+        state
+            .subagent_streams
+            .get(thread_id)
+            .map(|stream| Arc::clone(&stream.emitter))
     }
 
     async fn take_background_command(
@@ -6144,7 +6173,11 @@ impl CodexInner {
         }
     }
 
-    async fn handle_subagent_notification_if_needed(&self, method: &str, params: &Value) -> bool {
+    async fn handle_subagent_notification_if_needed(
+        self: &Arc<Self>,
+        method: &str,
+        params: &Value,
+    ) -> bool {
         let explicitly_thread_scoped_control = matches!(method, "model/rerouted" | "error")
             && extract_notification_thread_id(params).is_some();
         if !is_thread_scoped_codex_notification(method) && !explicitly_thread_scoped_control {
@@ -6223,7 +6256,7 @@ impl CodexInner {
     }
 
     async fn handle_subagent_notification(
-        &self,
+        self: &Arc<Self>,
         method: &str,
         params: &Value,
         stream_key: &str,
@@ -7201,7 +7234,7 @@ impl CodexInner {
     }
 
     async fn handle_subagent_item_started(
-        &self,
+        self: &Arc<Self>,
         params: &Value,
         emitter: &TurnEmitter,
     ) -> (Option<ChatMessageId>, Vec<String>) {
@@ -7305,6 +7338,18 @@ impl CodexInner {
                         "working_directory": cwd
                     }),
                 );
+                // Children background processes exactly like the root thread,
+                // and the poll is keyed by thread id, so the same tracking
+                // gives the child's own tray its rows.
+                self.track_command_execution(
+                    params,
+                    item.get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool-call"),
+                    &item_id,
+                    item,
+                )
+                .await;
                 (container, vec![item_id])
             }
             "fileChange" => {
@@ -7510,6 +7555,10 @@ impl CodexInner {
                 let item_id = self
                     .tool_call_completed_id(params, provider_item_id, "run_command")
                     .await;
+                let background_command =
+                    self.take_background_command(params, provider_item_id).await;
+                self.forget_command_execution(params, provider_item_id)
+                    .await;
                 let Some(emitter) = self.codex_subagent_emitter(stream_key).await else {
                     return;
                 };
@@ -7541,6 +7590,16 @@ impl CodexInner {
                     .await;
                 self.complete_subagent_tool_calls(stream_key, std::slice::from_ref(&item_id))
                     .await;
+                if let Some(command) = background_command {
+                    emitter.tool_progress(&command.progress(
+                        if success {
+                            BackgroundTaskStatus::Completed
+                        } else {
+                            BackgroundTaskStatus::Failed
+                        },
+                        Some(exit_code as i64),
+                    ));
+                }
             }
             "fileChange" => {
                 let item_id = self
@@ -25705,6 +25764,151 @@ Do not describe the tool, and do not skip the tool call."#;
                     state.background_commands.is_empty()
                         && state.outstanding_command_executions.is_empty(),
                     "a finished background terminal stayed tracked"
+                );
+            }
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    /// A native child backgrounds a process exactly like the root thread does.
+    /// Its rows belong to the child's own stream, not the parent's.
+    #[test]
+    fn subagent_background_terminal_reports_on_the_child_stream() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut parent_rx) = test_codex_inner();
+            let (child_tx, mut child_rx) = mpsc::unbounded_channel();
+            attach_test_codex_subagent(&inner, child_tx, "thread-child").await;
+
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({ "threadId": "thread-child", "turn": { "id": "child-turn" } }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/started",
+                    &json!({
+                        "threadId": "thread-child",
+                        "turnId": "child-turn",
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "child-command",
+                            "command": "/bin/zsh -lc 'sleep 18'",
+                            "cwd": "/tmp",
+                            "processId": "3312",
+                            "source": "unifiedExecStartup",
+                            "status": "inProgress"
+                        }
+                    }),
+                )
+                .await;
+            drain_events(&mut parent_rx);
+            drain_events(&mut child_rx);
+
+            // The child's thread is polled on its own key, and its snapshot
+            // publishes to the child's emitter.
+            let progress = {
+                let mut state = inner.state.lock().await;
+                reconcile_codex_background_terminals(
+                    &mut state,
+                    "thread-child",
+                    &[background_terminal_row("child-command", "3312", "sleep 18")],
+                )
+            };
+            assert_eq!(
+                progress.len(),
+                1,
+                "child background terminal was not tracked"
+            );
+            let emitter = inner
+                .background_progress_emitter("thread-child")
+                .await
+                .expect("child stream owns its background rows");
+            for update in &progress {
+                emitter.tool_progress(update);
+            }
+
+            let running = drain_events(&mut child_rx);
+            let running = running
+                .iter()
+                .filter(|event| event.get("kind").and_then(Value::as_str) == Some("ToolProgress"))
+                .collect::<Vec<_>>();
+            assert_eq!(running.len(), 1, "expected one running row: {running:?}");
+            assert_eq!(
+                running[0]
+                    .pointer("/data/update/status")
+                    .and_then(Value::as_str),
+                Some("running")
+            );
+            assert_eq!(
+                running[0]
+                    .pointer("/data/update/task_id")
+                    .and_then(Value::as_str),
+                Some("3312")
+            );
+            assert!(
+                drain_events(&mut parent_rx).iter().all(|event| {
+                    event.get("kind").and_then(Value::as_str) != Some("ToolProgress")
+                }),
+                "a child's background row must not leak into the parent transcript"
+            );
+
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-child",
+                        "turnId": "child-turn",
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "child-command",
+                            "command": "/bin/zsh -lc 'sleep 18'",
+                            "cwd": "/tmp",
+                            "processId": "3312",
+                            "source": "unifiedExecStartup",
+                            "status": "completed",
+                            "exitCode": 0,
+                            "durationMs": 17973,
+                            "aggregatedOutput": ""
+                        }
+                    }),
+                )
+                .await;
+
+            let terminal = drain_events(&mut child_rx);
+            let terminal = terminal
+                .iter()
+                .filter(|event| event.get("kind").and_then(Value::as_str) == Some("ToolProgress"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                terminal.len(),
+                1,
+                "expected exactly one terminal progress: {terminal:?}"
+            );
+            assert_eq!(
+                terminal[0]
+                    .pointer("/data/update/status")
+                    .and_then(Value::as_str),
+                Some("completed")
+            );
+            assert_eq!(
+                terminal[0]
+                    .pointer("/data/update/summary")
+                    .and_then(Value::as_str),
+                Some("Exited with code 0")
+            );
+            {
+                let state = inner.state.lock().await;
+                assert!(
+                    state.background_commands.is_empty()
+                        && state.outstanding_command_executions.is_empty(),
+                    "a finished child background terminal stayed tracked"
                 );
             }
             inner.rpc.shutdown().await;

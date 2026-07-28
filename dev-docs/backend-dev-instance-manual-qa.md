@@ -553,7 +553,9 @@ unique name, prompt marker, command marker, and final-answer marker.
    and final answer renders in the child's chat, not the parent's.
 3. Confirm the foreground card includes command, output, exit status, and one
    terminal state.
-4. Confirm the background card retains identity from running to terminal.
+4. Confirm the background card retains identity from running to terminal, and
+   that its running row appears in the *child's* in-flight tray and not the
+   parent's. The child's foreground command must leave both trays empty.
 5. Confirm the final message appears once, is not empty, and shows the child's
    backend and model. The parent shows only typed spawn/await progress, not a
    duplicate of the child's answer.
