@@ -3285,6 +3285,59 @@ impl ClaudeInner {
             &tool_call.name,
             claude_tool_request_type(&tool_call.name, &tool_call.arguments),
         );
+        self.adopt_background_task_awaiting_tool_request(&tool_call.id);
+    }
+
+    /// Claim a background task whose `task_started` frame arrived before Tyde
+    /// had a tool request to identify it with.
+    ///
+    /// Ownership is normally resolved at `task_started` by asking the emitter
+    /// for the launching tool request. Tyde only registers that request when
+    /// the response phase closes (`message_stop`, or the close at the top of
+    /// `consume_user_tool_result`), and the CLI does not guarantee the task
+    /// frame arrives after it: once another background task is running, a
+    /// captured 2.1.220 stream puts `task_started` — and the `tool_result` —
+    /// ahead of `message_delta`/`message_stop`. An entry that misses its owner
+    /// stays unresolved, which costs the tray its row *and* drops the task's
+    /// terminal frame. Resolving here removes the ordering dependency
+    /// entirely: whenever the request finally lands, the task adopts it.
+    fn adopt_background_task_awaiting_tool_request(&self, tool_call_id: &str) {
+        let mut registry = self
+            .background_tasks
+            .lock()
+            .expect("Claude background task mutex poisoned");
+        let Some(entry) = registry
+            .entries
+            .values_mut()
+            .find(|entry| entry.tool_use_id == tool_call_id)
+        else {
+            return;
+        };
+        if entry.owner.is_some() && entry.tool_name.is_some() {
+            return;
+        }
+        // Only the root stream reaches this path; a task owned by a sub-agent
+        // resolves through that sub-agent's own stream and must not be
+        // adopted here.
+        if entry.parent_tool_use_id.is_some() {
+            return;
+        }
+        let owner = Arc::clone(&self.emitter);
+        entry.owner.get_or_insert_with(|| Arc::clone(&owner));
+        if entry.tool_name.is_none() {
+            entry.tool_name = owner.tool_request_name(tool_call_id);
+        }
+        if entry.state.description.is_none() {
+            entry.state.description = owner.tool_request_command(tool_call_id);
+        }
+        if entry.tool_name.is_some() {
+            tracing::debug!(
+                task_id = entry.state.task_id,
+                tool_use_id = tool_call_id,
+                "adopted background task on its late tool request"
+            );
+            emit_background_task_snapshot(&owner, entry);
+        }
     }
 
     fn emit_tool_execution_completed(
@@ -16414,6 +16467,521 @@ for raw_line in sys.stdin:
         assert_eq!(log_contents.matches("\"type\":\"user\"").count(), 2);
     }
 
+    /// End-to-end guard for the tray row of a background command launched
+    /// while another background task is already running. A concurrent task
+    /// makes the CLI emit `task_started` (and the `tool_result`) *before*
+    /// `message_delta`/`message_stop`, so ownership cannot be resolved from
+    /// the tool request at `task_started` time. The client must still receive
+    /// a `Running` snapshot — that snapshot is the only thing the in-flight
+    /// tray renders a background command from.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fake_concurrent_background_launch_publishes_running_snapshot() {
+        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let fake = workspace.path().join("fake-claude-concurrent-bg.py");
+        let log = workspace.path().join("fake-claude-concurrent-bg.log");
+        std::fs::write(
+            &fake,
+            r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+session_id = "fake-concurrent-bg"
+if "--session-id" in args:
+    session_id = args[args.index("--session-id") + 1]
+elif "--resume" in args:
+    session_id = args[args.index("--resume") + 1]
+log_path = os.environ["TYDE_FAKE_CLAUDE_LOG"]
+
+TOOL = "toolu_concurrent_bg_probe"
+WATCH = "toolu_concurrent_bg_watch"
+LATE = "toolu_concurrent_bg_late"
+INPUT = {
+    "command": "sleep 30; echo done",
+    "description": "probe",
+    "run_in_background": True,
+}
+LATE_INPUT = {
+    "command": "sleep 60; echo late",
+    "description": "late probe",
+    "run_in_background": True,
+}
+
+def log(message):
+    with open(log_path, "a", encoding="utf-8") as handle:
+        handle.write(message + "\n")
+
+def emit(value):
+    print(json.dumps(value), flush=True)
+
+def arm_watcher():
+    # Turn 1 arms a long-lived watcher. Its tool call is NOT run_in_background
+    # (so Tyde completes rather than detaches it), but the CLI still registers
+    # the watcher as a `local_bash` background task that outlives the turn.
+    emit({"type": "system", "subtype": "init", "session_id": session_id, "model": "fake-model"})
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {
+            "type": "message_start",
+            "message": {"id": "watch-msg", "model": "fake-model", "usage": {"input_tokens": 1}},
+        },
+    })
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": WATCH,
+                "name": "Monitor",
+                "input": {},
+                "caller": {"type": "direct"},
+            },
+        },
+    })
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": json.dumps({"command": "tail -f /dev/null", "description": "watch"}),
+            },
+        },
+    })
+    emit({
+        "type": "assistant",
+        "session_id": session_id,
+        "message": {
+            "id": "watch-msg",
+            "type": "message",
+            "role": "assistant",
+            "model": "fake-model",
+            "content": [{
+                "type": "tool_use",
+                "id": WATCH,
+                "name": "Monitor",
+                "input": {"command": "tail -f /dev/null", "description": "watch"},
+                "caller": {"type": "direct"},
+            }],
+        },
+    })
+    emit({"type": "stream_event", "session_id": session_id, "event": {"type": "content_block_stop", "index": 0}})
+    emit({
+        "type": "system",
+        "subtype": "background_tasks_changed",
+        "session_id": session_id,
+        "tasks": [{"task_id": "watchtask", "task_type": "local_bash", "description": "watch"}],
+    })
+    emit({
+        "type": "system",
+        "subtype": "task_started",
+        "session_id": session_id,
+        "task_id": "watchtask",
+        "tool_use_id": WATCH,
+        "description": "watch",
+        "task_type": "local_bash",
+    })
+    emit({
+        "type": "user",
+        "session_id": session_id,
+        "message": {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": WATCH,
+                "content": "Monitor started (task watchtask).",
+            }],
+        },
+    })
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
+    })
+    emit({"type": "stream_event", "session_id": session_id, "event": {"type": "message_stop"}})
+    emit({
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "watcher armed",
+        "session_id": session_id,
+        "usage": {"input_tokens": 2, "output_tokens": 2, "total_tokens": 4},
+    })
+
+def launch_at_finalization():
+    # Turn 3 models the window the per-frame ownership retry cannot cover: the
+    # tool_use block never closes before the turn's `result`, so Tyde first
+    # materializes the tool request from `flush_pending_tool_uses_with_fallback`
+    # during turn finalization -- after the last per-frame retry, with no
+    # further frame left to retry on. Synthetic ordering rather than a captured
+    # stream; what it pins is that ownership must not depend on *when* the
+    # launching tool request lands.
+    emit({"type": "system", "subtype": "init", "session_id": session_id, "model": "fake-model"})
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {
+            "type": "message_start",
+            "message": {"id": "late-msg", "model": "fake-model", "usage": {"input_tokens": 1}},
+        },
+    })
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": LATE,
+                "name": "Bash",
+                "input": {},
+                "caller": {"type": "direct"},
+            },
+        },
+    })
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": json.dumps(LATE_INPUT)},
+        },
+    })
+    emit({
+        "type": "system",
+        "subtype": "background_tasks_changed",
+        "session_id": session_id,
+        "tasks": [
+            {"task_id": "watchtask", "task_type": "local_bash", "description": "watch"},
+            {"task_id": "latetask", "task_type": "local_bash", "description": "late probe"},
+        ],
+    })
+    emit({
+        "type": "system",
+        "subtype": "task_started",
+        "session_id": session_id,
+        "task_id": "latetask",
+        "tool_use_id": LATE,
+        "description": "late probe",
+        "task_type": "local_bash",
+    })
+    emit({
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "late launch",
+        "session_id": session_id,
+        "usage": {"input_tokens": 2, "output_tokens": 2, "total_tokens": 4},
+    })
+
+log("START " + " ".join(args))
+turn = 0
+for raw_line in sys.stdin:
+    line = raw_line.strip()
+    if not line:
+        continue
+    value = json.loads(line)
+    if value.get("type") == "control_request":
+        request = value.get("request", {})
+        request_id = value.get("request_id") or request.get("request_id")
+        if request.get("subtype") == "initialize":
+            emit({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": request_id,
+                    "response": {},
+                },
+            })
+        continue
+    if value.get("type") != "user":
+        continue
+    turn += 1
+    if turn == 1:
+        arm_watcher()
+        continue
+    if turn == 3:
+        launch_at_finalization()
+        continue
+    emit({"type": "system", "subtype": "init", "session_id": session_id, "model": "fake-model"})
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {
+            "type": "message_start",
+            "message": {"id": "bg-msg", "model": "fake-model", "usage": {"input_tokens": 1}},
+        },
+    })
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": TOOL,
+                "name": "Bash",
+                "input": {},
+                "caller": {"type": "direct"},
+            },
+        },
+    })
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": json.dumps(INPUT)},
+        },
+    })
+    emit({
+        "type": "assistant",
+        "session_id": session_id,
+        "message": {
+            "id": "bg-msg",
+            "type": "message",
+            "role": "assistant",
+            "model": "fake-model",
+            "content": [{
+                "type": "tool_use",
+                "id": TOOL,
+                "name": "Bash",
+                "input": INPUT,
+                "caller": {"type": "direct"},
+            }],
+        },
+    })
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {"type": "content_block_stop", "index": 0},
+    })
+    # A second task is already running; that is what pulls the task frames and
+    # the tool_result ahead of message_delta/message_stop.
+    emit({
+        "type": "system",
+        "subtype": "background_tasks_changed",
+        "session_id": session_id,
+        "tasks": [
+            {"task_id": "watchtask", "task_type": "local_bash", "description": "watch"},
+            {"task_id": "bgtask", "task_type": "local_bash", "description": "probe"},
+        ],
+    })
+    emit({
+        "type": "system",
+        "subtype": "task_started",
+        "session_id": session_id,
+        "task_id": "bgtask",
+        "tool_use_id": TOOL,
+        "description": "probe",
+        "task_type": "local_bash",
+    })
+    emit({
+        "type": "user",
+        "session_id": session_id,
+        "message": {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": TOOL,
+                "content": "Command running in background with ID: bgtask.",
+            }],
+        },
+    })
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
+    })
+    emit({"type": "stream_event", "session_id": session_id, "event": {"type": "message_stop"}})
+    emit({
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "launched",
+        "session_id": session_id,
+        "usage": {"input_tokens": 2, "output_tokens": 2, "total_tokens": 4},
+    })
+"#,
+        )
+        .expect("write fake concurrent background Claude script");
+        make_executable(&fake);
+
+        let previous_claude_bin = std::env::var_os(TYDE_CLAUDE_BIN_ENV);
+        let previous_fake_log = std::env::var_os("TYDE_FAKE_CLAUDE_LOG");
+        // SAFETY: guarded by FAKE_CLAUDE_ENV_LOCK for the whole window where
+        // the process-global environment points at the fake binary.
+        unsafe {
+            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
+            std::env::set_var("TYDE_FAKE_CLAUDE_LOG", &log);
+        }
+
+        let (session, mut rx) = ClaudeSession::spawn(
+            &[workspace.path().to_string_lossy().to_string()],
+            None,
+            &[],
+            None,
+            None,
+            ToolPolicy::Unrestricted,
+            BackendAccessMode::Unrestricted,
+        )
+        .await
+        .expect("spawn fake Claude session");
+        session
+            .inner
+            .ensure_process_ready()
+            .await
+            .expect("initialize persistent fake Claude process");
+        let handle = session.command_handle();
+        handle
+            .execute(SessionCommand::SendMessage {
+                message: "arm the watcher".to_string(),
+                images: None,
+            })
+            .await
+            .expect("send watcher turn");
+        // Let the watcher turn go fully idle so its task is live in the
+        // registry before the background command is launched — production
+        // only fails when a task from an earlier turn is still running.
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let event = rx
+                    .recv()
+                    .await
+                    .expect("Claude event channel should stay open");
+                if event_kind(&event) == Some("TypingStatusChanged")
+                    && event.get("data").and_then(Value::as_bool) == Some(false)
+                {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("watcher turn should go idle");
+        handle
+            .execute(SessionCommand::SendMessage {
+                message: "launch a background command".to_string(),
+                images: None,
+            })
+            .await
+            .expect("send background launch turn");
+
+        let mut seen = Vec::new();
+        let running = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = rx
+                    .recv()
+                    .await
+                    .expect("Claude event channel should stay open");
+                if event_kind(&event) != Some("ToolProgress") {
+                    seen.push(event_kind(&event).unwrap_or("?").to_owned());
+                    continue;
+                }
+                let data: ToolProgressData =
+                    serde_json::from_value(event.get("data").cloned().unwrap_or(Value::Null))
+                        .expect("ToolProgress payload parses");
+                if let ToolProgressUpdate::BackgroundTask(state) = data.update
+                    && state.status == BackgroundTaskStatus::Running
+                {
+                    return (data.tool_call_id, state);
+                }
+            }
+        })
+        .await;
+
+        // Turn 3: the launching tool request only materializes during turn
+        // finalization, which is past the last per-frame ownership retry.
+        let late = if running.is_ok() {
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let event = rx
+                        .recv()
+                        .await
+                        .expect("Claude event channel should stay open");
+                    if event_kind(&event) == Some("TypingStatusChanged")
+                        && event.get("data").and_then(Value::as_bool) == Some(false)
+                    {
+                        return;
+                    }
+                }
+            })
+            .await
+            .expect("background launch turn should go idle");
+            handle
+                .execute(SessionCommand::SendMessage {
+                    message: "launch one more background command".to_string(),
+                    images: None,
+                })
+                .await
+                .expect("send late background launch turn");
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let event = rx
+                        .recv()
+                        .await
+                        .expect("Claude event channel should stay open");
+                    if event_kind(&event) != Some("ToolProgress") {
+                        continue;
+                    }
+                    let data: ToolProgressData =
+                        serde_json::from_value(event.get("data").cloned().unwrap_or(Value::Null))
+                            .expect("ToolProgress payload parses");
+                    if let ToolProgressUpdate::BackgroundTask(state) = data.update
+                        && state.status == BackgroundTaskStatus::Running
+                        && data.tool_call_id == "toolu_concurrent_bg_late"
+                    {
+                        return state;
+                    }
+                }
+            })
+            .await
+            .ok()
+        } else {
+            None
+        };
+
+        session.shutdown().await;
+        // SAFETY: guarded by FAKE_CLAUDE_ENV_LOCK; restore the process-global
+        // environment before other tests run through this section.
+        unsafe {
+            match previous_claude_bin {
+                Some(value) => std::env::set_var(TYDE_CLAUDE_BIN_ENV, value),
+                None => std::env::remove_var(TYDE_CLAUDE_BIN_ENV),
+            }
+            match previous_fake_log {
+                Some(value) => std::env::set_var("TYDE_FAKE_CLAUDE_LOG", value),
+                None => std::env::remove_var("TYDE_FAKE_CLAUDE_LOG"),
+            }
+        }
+
+        let (tool_call_id, state) = running.unwrap_or_else(|_| {
+            panic!(
+                "a background command launched alongside a running task published no Running \
+                 snapshot, so the in-flight tray has no row to render; saw {seen:?}"
+            )
+        });
+        assert_eq!(tool_call_id, "toolu_concurrent_bg_probe");
+        assert_eq!(state.status, BackgroundTaskStatus::Running);
+
+        let late = late.expect(
+            "a background command whose tool request only lands during turn finalization \
+             published no Running snapshot, so the in-flight tray has no row to render",
+        );
+        assert_eq!(late.status, BackgroundTaskStatus::Running);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn fake_resume_missing_history_starts_fresh_and_accepts_follow_up() {
         let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
@@ -20751,6 +21319,196 @@ for raw_line in sys.stdin:
                 "message": { "parent_tool_use_id": "toolu_child" }
             })),
             Some("toolu_child")
+        );
+    }
+
+    /// Frames captured from a live CLI 2.1.220 probe
+    /// (`/tmp/bg-frame-probe/two_turns.jsonl`) for one turn that launches a
+    /// background Bash *while another background task is already running*.
+    /// The concurrent task reorders the stream: `task_started` and the
+    /// `tool_result` both arrive **before** `message_delta`/`message_stop`,
+    /// whereas the single-task ordering puts `message_stop` first.
+    fn concurrent_background_launch_frames(tool_use_id: &str) -> Vec<Value> {
+        let message_id = "msg_011CdV5gZSj3zWvJFWn48x9t";
+        vec![
+            json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "message_start",
+                    "message": {
+                        "id": message_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-haiku-4-5-20251001",
+                        "content": [],
+                    },
+                },
+                "parent_tool_use_id": Value::Null,
+            }),
+            json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": tool_use_id,
+                        "name": "Bash",
+                        "input": {},
+                        "caller": {"type": "direct"},
+                    },
+                },
+                "parent_tool_use_id": Value::Null,
+            }),
+            json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": "{\"command\": \"sleep 30; echo done\", \
+                                          \"run_in_background\": true, \
+                                          \"description\": \"Sleep for 30 seconds then echo done\"}",
+                    },
+                },
+                "parent_tool_use_id": Value::Null,
+            }),
+            json!({
+                "type": "assistant",
+                "message": {
+                    "id": message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-haiku-4-5-20251001",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": tool_use_id,
+                        "name": "Bash",
+                        "input": {
+                            "command": "sleep 30; echo done",
+                            "description": "Sleep for 30 seconds then echo done",
+                            "run_in_background": true,
+                        },
+                        "caller": {"type": "direct"},
+                    }],
+                },
+                "parent_tool_use_id": Value::Null,
+            }),
+            json!({
+                "type": "stream_event",
+                "event": {"type": "content_block_stop", "index": 1},
+                "parent_tool_use_id": Value::Null,
+            }),
+            // A second task ("probe") is already running — this is what
+            // reorders everything below ahead of message_stop.
+            json!({
+                "type": "system",
+                "subtype": "background_tasks_changed",
+                "tasks": [
+                    {"task_id": "br9licaun", "task_type": "local_bash", "description": "probe"},
+                    {
+                        "task_id": "br8yx57k1",
+                        "task_type": "local_bash",
+                        "description": "Sleep for 30 seconds then echo done",
+                    },
+                ],
+            }),
+            json!({
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": "br8yx57k1",
+                "tool_use_id": tool_use_id,
+                "description": "Sleep for 30 seconds then echo done",
+                "task_type": "local_bash",
+            }),
+            json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": "Command running in background with ID: br8yx57k1. \
+                                    Output is being written to: /tmp/tasks/br8yx57k1.output.",
+                    }],
+                },
+                "parent_tool_use_id": Value::Null,
+            }),
+            json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "tool_use"},
+                },
+                "parent_tool_use_id": Value::Null,
+            }),
+            json!({
+                "type": "stream_event",
+                "event": {"type": "message_stop"},
+                "parent_tool_use_id": Value::Null,
+            }),
+        ]
+    }
+
+    /// The tray row for a background command must survive the reordered
+    /// stream a *concurrent* background task produces. This replays the
+    /// reader loop's pre-gate → consume → refresh sequence over captured
+    /// frames; the contract is that a `Running` snapshot reaches the client,
+    /// which is exactly what `InflightTray::compute_snapshot` renders from.
+    #[test]
+    fn concurrent_background_launch_still_emits_running_snapshot() {
+        let (inner, mut rx) = make_test_inner();
+        inner.activate_background_task_owner();
+        let tool_use_id = "toolu_015a12ViCe4M3D4j3pDzUFca";
+
+        let mut summary = ClaudeStdoutSummary::default();
+        let mut segment = SegmentState::default();
+        let base_message_id = "claude-msg-1".to_string();
+        let mut current_message_id = base_message_id.clone();
+
+        for value in concurrent_background_launch_frames(tool_use_id) {
+            if inner.handle_background_task_frame(&value, &HashMap::new()) {
+                continue;
+            }
+            consume_claude_stream_value(
+                &value,
+                &mut summary,
+                &mut segment,
+                &inner,
+                &base_message_id,
+                &mut current_message_id,
+            );
+            let mut registry = inner
+                .background_tasks
+                .lock()
+                .expect("Claude background task mutex poisoned");
+            refresh_unresolved_background_tasks(
+                &value,
+                &mut registry.entries,
+                &inner.emitter,
+                &HashMap::new(),
+            );
+        }
+
+        let running = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|event| event_kind(event) == Some("ToolProgress"))
+            .filter_map(|event| {
+                let data: ToolProgressData =
+                    serde_json::from_value(event.get("data").cloned().unwrap_or(Value::Null))
+                        .expect("ToolProgress payload parses");
+                match data.update {
+                    ToolProgressUpdate::BackgroundTask(state) => Some((data.tool_call_id, state)),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            running.iter().any(|(call_id, state)| call_id == tool_use_id
+                && state.status == BackgroundTaskStatus::Running),
+            "a background command launched alongside another running task must still \
+             publish a Running snapshot for the tray; got {running:?}"
         );
     }
 
