@@ -6942,6 +6942,41 @@ kbd {
        on Mac. `none` removes the bounce on this scroll container only;
        elastic scroll on the rest of the app is unaffected. */
     overscroll-behavior-y: none;
+    /* Positioning context for `.diff-cmd-link`, which is measured in
+       scrollport-relative coordinates. */
+    position: relative;
+}
+
+/* Cmd/Ctrl-hover go-to-definition affordance over a diff row.
+ *
+ * Drawn as an overlay rather than by splitting the row's spans the way the file
+ * viewer does: the diff needs exactly one transient range, and the per-row text
+ * path is guarded by a wasm test against any mangling of rendered characters.
+ * `pointer-events: none` keeps it from stealing the click it is advertising. */
+.diff-cmd-link {
+    position: absolute;
+    pointer-events: none;
+    z-index: 2;
+    border-bottom: 1px solid var(--accent-primary);
+}
+
+/* The pointer is over the underlined symbol whenever the overlay exists, so
+   scoping the cursor to the scrollport reads correctly and needs no per-span
+   styling. */
+.diff-content-cmd-link {
+    cursor: pointer;
+}
+
+/* Explains a code-intel request the diff could not answer (a removed line, a
+   staged diff that no longer matches the working tree). Transient — see
+   `install_notice_auto_clear`. */
+.diff-code-intel-notice {
+    padding: 6px 12px;
+    background: color-mix(in srgb, var(--accent-primary, #007acc) 12%, transparent);
+    color: var(--text-secondary);
+    border-bottom: 1px solid var(--border);
+    font-size: 0.846rem;
+    flex-shrink: 0;
 }
 
 .diff-file {

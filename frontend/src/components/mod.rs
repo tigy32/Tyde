@@ -6,6 +6,7 @@ pub mod chat_input;
 pub mod chat_message;
 pub mod chat_streaming;
 pub mod chat_view;
+pub mod code_intel_ui;
 pub mod command_palette;
 pub mod diff_view;
 pub mod dock_zone;

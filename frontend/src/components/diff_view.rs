@@ -9,6 +9,9 @@ use crate::code_intel_dom::{
     TimeoutClosureSlot, caret_at_point, clear_timeout_timer, is_identifier_byte,
     line_byte_for_utf16_col, node_to_element, utf16_col_in_code,
 };
+use crate::components::code_intel_ui::{
+    CodeIntelContextMenu, CodeIntelMenuState, CodeIntelMenuTarget,
+};
 use crate::components::find_bar::{FindBar, FindState, render_text_with_highlights};
 use crate::components::review_layer::{build_review_decorations, install_drag_listeners};
 use crate::line_source::FileLines;
@@ -779,11 +782,16 @@ fn new_side_matches_worktree(
 struct DiffCodeIntelTarget {
     key: FileResourceKey,
     version: ProjectFileVersion,
+    /// 0-based index of the file line this row shows.
+    line_idx: usize,
     /// Absolute byte offset into the file on disk.
     offset: u32,
     /// The file's line containing `offset`, for the identifier-char gate.
     line_text: String,
     line_byte: u32,
+    /// The row's `.diff-text` element, so the Cmd-link overlay can measure a
+    /// sub-range of the rendered line without re-querying the DOM.
+    code: web_sys::Element,
     anchor_left: f64,
     anchor_top: f64,
     anchor_bottom: f64,
@@ -807,21 +815,67 @@ struct DiffCodeIntelContext {
 type DiffLinesCache =
     RefCell<std::collections::HashMap<FileResourceKey, (ProjectFileVersion, FileLines)>>;
 
-/// Resolve a viewport point over a diff to a position in the file on disk.
+/// Why a point over the diff has no code-intel position behind it.
 ///
-/// Returns `None` — meaning "no code intel here", never a guess — when the point
-/// is not over new-side code, the file's contents are not held yet, or the row's
-/// text no longer matches the file.
+/// Every variant is a case the diff viewer must not answer, and all but
+/// `NotOverCode` are worth *saying out loud* — a Cmd+click that resolves
+/// nothing is otherwise indistinguishable from a broken feature.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DiffTargetMiss {
+    /// The pointer is not over diff code (gutter, spacer, blank pane cell).
+    /// The only silent case: there was no plausible symbol to ask about.
+    NotOverCode,
+    /// The old side. Removed text does not exist on disk, so there is no
+    /// position to resolve.
+    RemovedLine,
+    /// A staged diff for a file that also has unstaged changes: the index and
+    /// the working tree differ, so the row's line number does not address the
+    /// file the language server has open.
+    IndexDiffersFromWorktree,
+    /// Contents and subscription have not arrived yet.
+    NotReady,
+    /// The file changed under the diff snapshot: this row's text is no longer
+    /// what the file has at that line.
+    RowStale,
+}
+
+impl DiffTargetMiss {
+    /// User-facing explanation, or `None` when there is nothing worth saying.
+    fn reason(&self) -> Option<&'static str> {
+        match self {
+            Self::NotOverCode => None,
+            Self::RemovedLine => {
+                Some("Removed lines do not exist on disk, so they have no code intelligence")
+            }
+            Self::IndexDiffersFromWorktree => Some(
+                "This file has unstaged changes, so the staged diff does not match the file \
+                 on disk",
+            ),
+            Self::NotReady => Some("Code intelligence is still loading for this file"),
+            Self::RowStale => Some(
+                "This file changed since the diff was loaded — reload it to use code \
+                      intelligence here",
+            ),
+        }
+    }
+}
+
+/// Resolve a viewport point over a diff to a position in the file on disk, or
+/// the reason there is none. Never guesses.
 fn diff_target_at_point(
     state: &AppState,
     context: &DiffCodeIntelContext,
     cache: &DiffLinesCache,
     client_x: f64,
     client_y: f64,
-) -> Option<DiffCodeIntelTarget> {
-    let caret = caret_at_point(client_x, client_y)?;
-    let element = node_to_element(&caret.node)?;
-    let row = element.closest(".diff-line").ok().flatten()?;
+) -> Result<DiffCodeIntelTarget, DiffTargetMiss> {
+    let caret = caret_at_point(client_x, client_y).ok_or(DiffTargetMiss::NotOverCode)?;
+    let element = node_to_element(&caret.node).ok_or(DiffTargetMiss::NotOverCode)?;
+    let row = element
+        .closest(".diff-line")
+        .ok()
+        .flatten()
+        .ok_or(DiffTargetMiss::NotOverCode)?;
 
     // New side only. In unified mode `data-anchor-side` is "new" for Added and
     // Context rows; in side-by-side it is "new" for the right pane. Reading
@@ -829,17 +883,36 @@ fn diff_target_at_point(
     // side-by-side, where the *pair's* new line number is stamped on both
     // panes' rows — the left pane of a Removed/Added pair would otherwise
     // resolve a removed line against the added line's number.
-    if row.get_attribute("data-anchor-side")? != "new" {
-        return None;
+    match row.get_attribute("data-anchor-side").as_deref() {
+        Some("new") => {}
+        Some("old") => return Err(DiffTargetMiss::RemovedLine),
+        _ => return Err(DiffTargetMiss::NotOverCode),
     }
-    let line_number: u32 = row.get_attribute("data-anchor-new-line")?.parse().ok()?;
-    let line_idx = (line_number.checked_sub(1)?) as usize;
+    let line_number: u32 = row
+        .get_attribute("data-anchor-new-line")
+        .and_then(|attr| attr.parse().ok())
+        .ok_or(DiffTargetMiss::NotOverCode)?;
+    let line_idx = line_number
+        .checked_sub(1)
+        .ok_or(DiffTargetMiss::NotOverCode)? as usize;
 
     let relative_path = row
         .closest(".diff-file")
         .ok()
-        .flatten()?
-        .get_attribute("data-diff-path")?;
+        .flatten()
+        .and_then(|file| file.get_attribute("data-diff-path"))
+        .ok_or(DiffTargetMiss::NotOverCode)?;
+
+    if !new_side_matches_worktree(
+        state,
+        &context.project_id,
+        &context.root,
+        &relative_path,
+        context.scope,
+    ) {
+        return Err(DiffTargetMiss::IndexDiffersFromWorktree);
+    }
+
     let key = FileResourceKey {
         host_id: context.host_id.clone(),
         project_id: context.project_id.clone(),
@@ -854,36 +927,43 @@ fn diff_target_at_point(
     // subscription may not exist, and any result we asked for would be dropped
     // by the occurrence guard on arrival — so decline rather than round-trip.
     if !state.diff_tab_holds_code_intel(context.tab, &key) {
-        return None;
+        return Err(DiffTargetMiss::NotReady);
     }
 
-    let (version, lines) = held_file_lines(state, cache, &key)?;
+    let (version, lines) = held_file_lines(state, cache, &key).ok_or(DiffTargetMiss::NotReady)?;
     if line_idx >= lines.len() {
-        return None;
+        return Err(DiffTargetMiss::RowStale);
     }
     let file_line = lines.line(line_idx).to_owned();
 
     // The row's rendered text must still be the file's text at that line. The
     // diff payload is a snapshot; if the file moved underneath it, answering
     // here would resolve a different symbol than the one on screen.
-    let code = row.query_selector(".diff-text").ok().flatten()?;
+    let code = row
+        .query_selector(".diff-text")
+        .ok()
+        .flatten()
+        .ok_or(DiffTargetMiss::NotOverCode)?;
     if code.text_content().unwrap_or_default() != file_line {
-        return None;
+        return Err(DiffTargetMiss::RowStale);
     }
 
     let code_node: &web_sys::Node = code.unchecked_ref();
-    let utf16_col = utf16_col_in_code(code_node, &caret.node, caret.offset)?;
+    let utf16_col = utf16_col_in_code(code_node, &caret.node, caret.offset)
+        .ok_or(DiffTargetMiss::NotOverCode)?;
     let line_byte = line_byte_for_utf16_col(&file_line, utf16_col);
     let (anchor_left, anchor_top, anchor_bottom) = match caret.rect {
         Some(rect) => (rect.left(), rect.top(), rect.bottom()),
         None => (client_x, client_y, client_y + 16.0),
     };
-    Some(DiffCodeIntelTarget {
+    Ok(DiffCodeIntelTarget {
         key,
         version,
+        line_idx,
         offset: lines.line_start(line_idx) + line_byte,
         line_text: file_line,
         line_byte,
+        code,
         anchor_left,
         anchor_top,
         anchor_bottom,
@@ -975,6 +1055,108 @@ fn ensure_diff_file_held(
 /// two surfaces feel the same.
 const DIFF_HOVER_DEBOUNCE_MS: i32 = 250;
 
+/// Where to draw the Cmd-held "this is clickable" underline, in coordinates
+/// relative to the diff's scrollport.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DiffCmdLink {
+    left: f64,
+    top: f64,
+    width: f64,
+    height: f64,
+}
+
+/// UTF-16 column of byte offset `byte` within `line` — the inverse of
+/// `line_byte_for_utf16_col`, needed to address rendered text through a DOM
+/// `Range`, which counts in UTF-16.
+fn utf16_col_for_line_byte(line: &str, byte: u32) -> u32 {
+    line.get(..byte as usize)
+        .unwrap_or(line)
+        .encode_utf16()
+        .count() as u32
+}
+
+/// Locate the (text node, in-node UTF-16 offset) for column `utf16_col` within
+/// `code`'s rendered text. Walks the same node order `utf16_col_in_code` sums,
+/// so the two are exact inverses over the same DOM.
+fn text_node_at_utf16_col(code: &web_sys::Node, utf16_col: u32) -> Option<(web_sys::Node, u32)> {
+    let mut seen = 0u32;
+    let nodes = crate::code_intel_dom::descendant_text_nodes(code);
+    for node in &nodes {
+        let len = node
+            .text_content()
+            .unwrap_or_default()
+            .encode_utf16()
+            .count() as u32;
+        if utf16_col <= seen + len {
+            return Some((node.clone(), utf16_col - seen));
+        }
+        seen += len;
+    }
+    // A column exactly at the end of the last node is still addressable.
+    nodes.last().map(|node| {
+        let len = node
+            .text_content()
+            .unwrap_or_default()
+            .encode_utf16()
+            .count() as u32;
+        (node.clone(), len)
+    })
+}
+
+/// Measure the on-screen box of the identifier under a resolved target, when
+/// the pushed model says it is navigable.
+///
+/// Drawn as an overlay rather than by splitting the row's spans. The file
+/// viewer splits because it also paints diagnostic squiggles, but the diff needs
+/// exactly one transient range, and the per-row text path is the one a wasm test
+/// guards against mangling (root `CLAUDE.md`) — an overlay cannot alter a single
+/// rendered character. `None` when nothing is navigable there.
+fn diff_cmd_link_box(
+    state: &AppState,
+    target: &DiffCodeIntelTarget,
+    lines: &FileLines,
+    scrollport: &web_sys::Element,
+) -> Option<DiffCmdLink> {
+    let code_intel_key = crate::state::CodeIntelKey::from(&target.key);
+    let range = state.code_intel.with_untracked(|map| {
+        map.get(&code_intel_key)?
+            .navigable_range_at(target.version, target.offset)
+    })?;
+
+    // Clamp the file-absolute range to the rendered line: a definition span can
+    // legitimately cover more than one line, and we only draw on this one.
+    let line_start = lines.line_start(target.line_idx);
+    let line_end = lines.line_content_end(target.line_idx);
+    let start = range.start.max(line_start);
+    let end = range.end.min(line_end);
+    if end <= start {
+        return None;
+    }
+
+    let start_col = utf16_col_for_line_byte(&target.line_text, start - line_start);
+    let end_col = utf16_col_for_line_byte(&target.line_text, end - line_start);
+    let code_node: &web_sys::Node = target.code.unchecked_ref();
+    let (start_node, start_offset) = text_node_at_utf16_col(code_node, start_col)?;
+    let (end_node, end_offset) = text_node_at_utf16_col(code_node, end_col)?;
+
+    let dom_range = web_sys::Range::new().ok()?;
+    dom_range.set_start(&start_node, start_offset).ok()?;
+    dom_range.set_end(&end_node, end_offset).ok()?;
+    let rect = dom_range.get_bounding_client_rect();
+    if rect.width() <= 0.0 {
+        return None;
+    }
+    // Convert to scrollport-relative coordinates so the overlay stays put while
+    // the diff is scrolled by other means (it is cleared on scroll anyway).
+    let host = scrollport.get_bounding_client_rect();
+    Some(DiffCmdLink {
+        left: rect.left() - host.left() + scrollport.scroll_left() as f64,
+        top: rect.top() - host.top() + scrollport.scroll_top() as f64,
+        width: rect.width(),
+        height: rect.height(),
+    })
+}
+
 /// A settled pointer over a new-side identifier fires one `code_intel_hover`.
 fn maybe_request_diff_hover(
     state: &AppState,
@@ -983,7 +1165,7 @@ fn maybe_request_diff_hover(
     client_x: f64,
     client_y: f64,
 ) {
-    let Some(target) = diff_target_at_point(state, context, cache, client_x, client_y) else {
+    let Ok(target) = diff_target_at_point(state, context, cache, client_x, client_y) else {
         crate::actions::dismiss_hover(state);
         return;
     };
@@ -1229,6 +1411,12 @@ fn DiffContent(
         }
     };
 
+    // Cmd-held underline under the symbol the pointer is on, so a navigable
+    // identifier is visibly clickable instead of something you have to guess at.
+    // Cleared whenever the thing it points at could have moved.
+    let cmd_link: RwSignal<Option<DiffCmdLink>> = RwSignal::new(None);
+    let hover_point: RwSignal<Option<(f64, f64)>> = RwSignal::new(None);
+
     let mousemove_context = code_intel_context.clone();
     let mousemove_state = state.clone();
     let mousemove_cache = lines_cache.clone();
@@ -1242,6 +1430,7 @@ fn DiffContent(
         clear_timeout_timer(hover_timer);
         let client_x = ev.client_x() as f64;
         let client_y = ev.client_y() as f64;
+        hover_point.set(Some((client_x, client_y)));
         // Pull contents + subscription for whatever file the pointer is over,
         // before the debounce, so the request that follows has something to
         // resolve against.
@@ -1261,6 +1450,43 @@ fn DiffContent(
         }
     };
 
+    // Recompute the underline whenever either input changes: the pointer moving
+    // while Cmd is down, or Cmd going down while the pointer is already
+    // parked on a symbol. Both must light it up.
+    {
+        let link_state = state.clone();
+        let link_context = code_intel_context.clone();
+        let link_cache = lines_cache.clone();
+        let cmd_held = state.cmd_held;
+        Effect::new(move |_| {
+            let held = cmd_held.get();
+            let point = hover_point.get();
+            let Some(context) = link_context.as_ref() else {
+                return;
+            };
+            let (Some((x, y)), true) = (point, held) else {
+                if cmd_link.get_untracked().is_some() {
+                    cmd_link.set(None);
+                }
+                return;
+            };
+            let Some(scrollport) = scroll_ref.get_untracked() else {
+                return;
+            };
+            let scrollport: web_sys::Element = scrollport.clone().unchecked_into();
+            let next = diff_target_at_point(&link_state, context, &link_cache, x, y)
+                .ok()
+                .filter(|target| is_identifier_byte(&target.line_text, target.line_byte))
+                .and_then(|target| {
+                    let (_, lines) = held_file_lines(&link_state, &link_cache, &target.key)?;
+                    diff_cmd_link_box(&link_state, &target, &lines, &scrollport)
+                });
+            if cmd_link.get_untracked() != next {
+                cmd_link.set(next);
+            }
+        });
+    }
+
     let leave_state = state.clone();
     let leave_has_code_intel = code_intel_context.is_some();
     let on_mouseleave = move |_: web_sys::MouseEvent| {
@@ -1268,12 +1494,16 @@ fn DiffContent(
             return;
         }
         clear_timeout_timer(hover_timer);
+        hover_point.set(None);
+        cmd_link.set(None);
         crate::actions::dismiss_hover(&leave_state);
     };
 
     // Cmd/Ctrl+click go-to-definition. Falls through to the on-demand
     // `code_intel_navigate` when no target has been pushed yet, exactly like the
-    // file viewer.
+    // file viewer. When the row cannot be resolved, say why rather than doing
+    // nothing — an explicit action that silently no-ops is indistinguishable
+    // from a broken feature.
     let click_context = code_intel_context.clone();
     let click_state = state.clone();
     let click_cache = lines_cache.clone();
@@ -1284,49 +1514,163 @@ fn DiffContent(
         if !(ev.ctrl_key() || ev.meta_key()) {
             return;
         }
-        let Some(target) = diff_target_at_point(
+        match diff_target_at_point(
             &click_state,
             context,
             &click_cache,
             ev.client_x() as f64,
             ev.client_y() as f64,
-        ) else {
-            return;
-        };
-        ev.prevent_default();
-        crate::actions::navigate_to_definition(
-            &click_state,
-            context.tab,
-            target.key,
-            target.version,
-            target.offset,
-        );
+        ) {
+            Ok(target) => {
+                ev.prevent_default();
+                crate::actions::navigate_to_definition(
+                    &click_state,
+                    context.tab,
+                    target.key,
+                    target.version,
+                    target.offset,
+                );
+            }
+            Err(miss) => {
+                if let Some(reason) = miss.reason() {
+                    ev.prevent_default();
+                    click_state
+                        .code_intel_notice
+                        .set(Some(crate::state::CodeIntelNotice {
+                            tab: context.tab,
+                            message: reason.to_owned(),
+                        }));
+                }
+            }
+        }
     };
 
+    // Right-click menu: Go to Definition / Show References, the same two actions
+    // the file viewer offers, against the position under the pointer. A row that
+    // cannot be resolved still opens the menu, disabled, carrying the reason.
+    let context_menu: RwSignal<Option<CodeIntelMenuState>> = RwSignal::new(None);
+    let menu_context = code_intel_context.clone();
+    let menu_state = state.clone();
+    let menu_cache = lines_cache.clone();
+    let on_contextmenu = move |ev: web_sys::MouseEvent| {
+        let Some(context) = menu_context.as_ref() else {
+            return;
+        };
+        let x = ev.client_x() as f64;
+        let y = ev.client_y() as f64;
+        match diff_target_at_point(&menu_state, context, &menu_cache, x, y) {
+            Ok(target) => {
+                ev.prevent_default();
+                let disabled_reason = crate::components::code_intel_ui::status_disabled_reason(
+                    &menu_state,
+                    &crate::state::CodeIntelKey::from(&target.key),
+                    target.version,
+                    Some(target.offset),
+                );
+                context_menu.set(Some(CodeIntelMenuState {
+                    x,
+                    y,
+                    target: Some(CodeIntelMenuTarget {
+                        tab_id: context.tab,
+                        key: target.key.clone(),
+                        version: target.version,
+                        offset: target.offset,
+                    }),
+                    disabled_reason,
+                }));
+            }
+            Err(miss) => {
+                // Nothing plausible under the pointer: leave the browser menu.
+                let Some(reason) = miss.reason() else { return };
+                ev.prevent_default();
+                context_menu.set(Some(CodeIntelMenuState {
+                    x,
+                    y,
+                    target: None,
+                    disabled_reason: Some(reason.to_owned()),
+                }));
+            }
+        }
+    };
+
+    if let Some(context) = code_intel_context.as_ref() {
+        crate::components::code_intel_ui::install_notice_auto_clear(context.tab);
+    }
+    let notice_signal = state.code_intel_notice;
+    let notice_tab = code_intel_context.as_ref().map(|context| context.tab);
+
     view! {
-        <div
-            class="diff-content"
-            node_ref=scroll_ref
-            on:scroll=on_scroll
-            on:mousemove=on_mousemove
-            on:mouseleave=on_mouseleave
-            on:click=on_click
-        >
+        <>
             {move || {
-                if state.find_bar_open.get() {
-                    Some(view! { <FindBar /> })
-                } else {
-                    None
-                }
+                let tab = notice_tab?;
+                notice_signal.with(|notice| {
+                    let notice = notice.as_ref().filter(|notice| notice.tab == tab)?;
+                    Some(view! {
+                        <div
+                            class="diff-code-intel-notice"
+                            data-test="diff-code-intel-notice"
+                        >
+                            {notice.message.clone()}
+                        </div>
+                    })
+                })
             }}
-            {diff.files.into_iter().enumerate().map(|(fi, file)| {
-                let hunk_offsets = file_hunk_offsets[fi].clone();
-                let root = diff.root.clone();
-                let rendered_offset = file_rendered_offsets[fi];
-                let decorations = decorations.clone();
-                view! { <DiffFileView file=file scope_label=scope_label scope=diff.scope root=root context_mode=diff.context_mode hunk_offsets=hunk_offsets rendered_offset=rendered_offset decorations=decorations review_mode=review_mode /> }
-            }).collect::<Vec<_>>()}
-        </div>
+            <div
+                // Reactive *class*, not style: `install_scrollport_width_observer`
+                // owns an inline custom property on this element, and a reactive
+                // style binding would clobber it.
+                class=move || if cmd_link.get().is_some() {
+                    "diff-content diff-content-cmd-link"
+                } else {
+                    "diff-content"
+                }
+                node_ref=scroll_ref
+                on:scroll=on_scroll
+                on:mousemove=on_mousemove
+                on:mouseleave=on_mouseleave
+                on:click=on_click
+                on:contextmenu=on_contextmenu
+            >
+                {move || {
+                    if state.find_bar_open.get() {
+                        Some(view! { <FindBar /> })
+                    } else {
+                        None
+                    }
+                }}
+                {move || cmd_link.get().map(|link| view! {
+                    <div
+                        class="diff-cmd-link"
+                        data-test="diff-cmd-link"
+                        style=format!(
+                            "left: {}px; top: {}px; width: {}px; height: {}px;",
+                            link.left, link.top, link.width, link.height,
+                        )
+                    ></div>
+                })}
+                {diff.files.into_iter().enumerate().map(|(fi, file)| {
+                    let hunk_offsets = file_hunk_offsets[fi].clone();
+                    let root = diff.root.clone();
+                    let rendered_offset = file_rendered_offsets[fi];
+                    let decorations = decorations.clone();
+                    view! { <DiffFileView file=file scope_label=scope_label scope=diff.scope root=root context_mode=diff.context_mode hunk_offsets=hunk_offsets rendered_offset=rendered_offset decorations=decorations review_mode=review_mode /> }
+                }).collect::<Vec<_>>()}
+            </div>
+            {move || {
+                // A miss still opens the menu — disabled, carrying its reason —
+                // so an unanswerable row explains itself instead of offering
+                // actions that would do nothing.
+                context_menu.get().map(|menu| view! {
+                    <CodeIntelContextMenu
+                        menu=context_menu
+                        x=menu.x
+                        y=menu.y
+                        target=menu.target.clone()
+                        disabled_reason=menu.disabled_reason.clone()
+                    />
+                })
+            }}
+        </>
     }
 }
 
@@ -4375,7 +4719,7 @@ mod wasm_tests {
 
     /// A one-file unstaged diff: one Context row then one Added row, plus a
     /// Removed row so the old side is represented too.
-    fn code_intel_diff(relative_path: &str) -> DiffViewState {
+    fn code_intel_diff(relative_path: &str, added_line: &str) -> DiffViewState {
         let hunk = ProjectGitDiffHunk {
             old_start: 1,
             old_count: 2,
@@ -4397,7 +4741,7 @@ mod wasm_tests {
                 },
                 ProjectGitDiffLine {
                     kind: ProjectGitDiffLineKind::Added,
-                    text: "    let 名前 = 2;".to_owned(),
+                    text: added_line.to_owned(),
                     old_line_number: None,
                     new_line_number: Some(2),
                 },
@@ -4422,15 +4766,69 @@ mod wasm_tests {
     ///
     /// `on_disk` is passed separately from the diff on purpose: a test can make
     /// them disagree to exercise the staleness guard.
+    /// What to seed alongside a mounted diff. Defaults are "nothing held, no
+    /// pushed model, no modifier" — the cold state a diff tab opens in.
+    #[derive(Clone, Copy, Default)]
+    struct MountOpts {
+        /// The diff tab already holds the file's contents + subscription, as it
+        /// would after the pointer has settled over one of its rows.
+        held: bool,
+        /// Seed a resolved definition for the identifier at the start of the
+        /// added row, so `navigable_range_at` answers.
+        with_model: bool,
+        /// The Cmd/Ctrl modifier is down.
+        cmd_held: bool,
+    }
+
     fn mount_code_intel_diff(
         container: HtmlElement,
         relative_path: &'static str,
         on_disk: &'static str,
-        tab: TabId,
         held: bool,
-    ) -> impl Sized {
-        let diff = code_intel_diff(relative_path);
-        mount_to(container, move || {
+    ) -> MountedDiff {
+        mount_code_intel_diff_with(
+            container,
+            relative_path,
+            on_disk,
+            "    let 名前 = 2;",
+            MountOpts {
+                held,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// A mounted diff plus the handles a test needs to drive it: the app state
+    /// it was given, and the id of the real diff tab it renders into.
+    struct MountedDiff {
+        _handle: Box<dyn std::any::Any>,
+        state: AppState,
+        tab: TabId,
+    }
+
+    /// Mount a live unstaged diff of `relative_path` whose added row shows
+    /// `added_line`, over a file whose on-disk contents are `on_disk`.
+    ///
+    /// `on_disk` is passed separately from the diff on purpose: a test can make
+    /// them disagree to exercise the staleness guard.
+    ///
+    /// A real `TabContent::Diff` tab is opened in the center zone rather than a
+    /// bare id being invented, because every code-intel request is gated on
+    /// `file_occurrence_is_current`, which looks the tab up there. Inventing an
+    /// id would make requests silently drop for a reason unrelated to what a
+    /// test is asserting.
+    fn mount_code_intel_diff_with(
+        container: HtmlElement,
+        relative_path: &'static str,
+        on_disk: &'static str,
+        added_line: &'static str,
+        opts: MountOpts,
+    ) -> MountedDiff {
+        let shared: std::rc::Rc<RefCell<Option<(AppState, TabId)>>> =
+            std::rc::Rc::new(RefCell::new(None));
+        let shared_for_mount = shared.clone();
+        let diff = code_intel_diff(relative_path, added_line);
+        let handle = mount_to(container, move || {
             let state = AppState::new();
             let key = code_intel_key(relative_path);
             state.diff_contents.update(|diffs| {
@@ -4457,15 +4855,59 @@ mod wasm_tests {
                     },
                 );
             });
-            if held {
+            let tab = state
+                .open_tab_in(
+                    crate::state::PaneId::Primary,
+                    crate::state::TabContent::Diff {
+                        host_id: CODE_INTEL_HOST.to_owned(),
+                        project_id: ProjectId(CODE_INTEL_PROJECT.to_owned()),
+                        root: code_intel_root(),
+                        scope: ProjectDiffScope::Unstaged,
+                        path: relative_path.to_owned(),
+                    },
+                    "diff".to_owned(),
+                    true,
+                )
+                .expect("diff tab opens");
+            if opts.held {
                 state.hold_diff_code_intel(tab, &key);
             }
+            if opts.with_model {
+                // The identifier occupying the first three bytes of file line 2
+                // (which starts at byte 12), with a definition elsewhere.
+                let model = protocol::CodeIntelFileModelPayload {
+                    path: key.path.clone(),
+                    version: ProjectFileVersion(1),
+                    provider: protocol::CodeIntelProviderId("rust-analyzer".to_owned()),
+                    language: protocol::CodeIntelLanguageId("rust".to_owned()),
+                    model_range: protocol::CodeIntelModelRange::FullFile,
+                    completeness: protocol::CodeIntelCompleteness::Complete,
+                    occurrences: vec![protocol::CodeIntelOccurrence {
+                        range: protocol::ByteRange { start: 12, end: 15 },
+                        role: protocol::CodeIntelRole::Reference,
+                        display: "let".to_owned(),
+                        definition: vec![protocol::CodeIntelLocation {
+                            path: key.path.clone(),
+                            range: protocol::ByteRange { start: 0, end: 2 },
+                        }],
+                    }],
+                };
+                state.code_intel.update(|map| {
+                    let file = map
+                        .entry(crate::state::CodeIntelKey::from(&key))
+                        .or_default();
+                    file.set_rendered_version(ProjectFileVersion(1));
+                    file.merge_versioned(ProjectFileVersion(1), |data| data.merge_model(model));
+                });
+            }
+            state.cmd_held.set(opts.cmd_held);
             state
                 .active_project
                 .set(Some(crate::state::ActiveProjectRef {
                     host_id: CODE_INTEL_HOST.to_owned(),
                     project_id: ProjectId(CODE_INTEL_PROJECT.to_owned()),
                 }));
+            shared_for_mount.borrow_mut().replace((state.clone(), tab));
             provide_context(state);
             view! {
                 <DiffView
@@ -4477,7 +4919,13 @@ mod wasm_tests {
                     path=relative_path.to_owned()
                 />
             }
-        })
+        });
+        let (state, tab) = shared.borrow().clone().expect("mount body ran");
+        MountedDiff {
+            _handle: Box::new(handle),
+            state,
+            tab,
+        }
     }
 
     /// The `.diff-text` element of the row whose `data-anchor-side` is `side`
@@ -4651,8 +5099,7 @@ mod wasm_tests {
 
         let on_disk = "fn main() {\n    let 名前 = 2;\n}\n";
         let container = make_code_intel_container();
-        let _handle =
-            mount_code_intel_diff(container.clone(), "main.rs", on_disk, TabId(30_001), true);
+        let _mounted = mount_code_intel_diff(container.clone(), "main.rs", on_disk, true);
         next_tick().await;
         next_tick().await;
 
@@ -4693,8 +5140,7 @@ mod wasm_tests {
 
         let on_disk = "fn main() {\n    let 名前 = 2;\n}\n";
         let container = make_code_intel_container();
-        let _handle =
-            mount_code_intel_diff(container.clone(), "main.rs", on_disk, TabId(30_002), true);
+        let _mounted = mount_code_intel_diff(container.clone(), "main.rs", on_disk, true);
         next_tick().await;
         next_tick().await;
 
@@ -4722,8 +5168,7 @@ mod wasm_tests {
         // Same line 1, but line 2 has been rewritten out from under the diff.
         let on_disk = "fn main() {\n    let something_else = 9;\n}\n";
         let container = make_code_intel_container();
-        let _handle =
-            mount_code_intel_diff(container.clone(), "main.rs", on_disk, TabId(30_003), true);
+        let _mounted = mount_code_intel_diff(container.clone(), "main.rs", on_disk, true);
         next_tick().await;
         next_tick().await;
 
@@ -4765,8 +5210,7 @@ mod wasm_tests {
 
         let on_disk = "fn main() {\n    let 名前 = 2;\n}\n";
         let container = make_code_intel_container();
-        let _handle =
-            mount_code_intel_diff(container.clone(), "main.rs", on_disk, TabId(30_004), false);
+        let _mounted = mount_code_intel_diff(container.clone(), "main.rs", on_disk, false);
         next_tick().await;
         next_tick().await;
 
@@ -4791,8 +5235,7 @@ mod wasm_tests {
         let on_disk = "fn main() {\n    let 名前 = 2;\n}\n";
         let container = make_code_intel_container();
         // Not pre-held: the hover itself is what must acquire the hold.
-        let _handle =
-            mount_code_intel_diff(container.clone(), "main.rs", on_disk, TabId(30_005), false);
+        let _mounted = mount_code_intel_diff(container.clone(), "main.rs", on_disk, false);
         next_tick().await;
         next_tick().await;
 
@@ -4831,8 +5274,7 @@ mod wasm_tests {
 
         let on_disk = "fn main() {\n    let 名前 = 2;\n}\n";
         let container = make_code_intel_container();
-        let _handle =
-            mount_code_intel_diff(container.clone(), "main.rs", on_disk, TabId(30_006), false);
+        let _mounted = mount_code_intel_diff(container.clone(), "main.rs", on_disk, false);
         next_tick().await;
         next_tick().await;
 
@@ -4843,6 +5285,273 @@ mod wasm_tests {
         }
 
         assert!(captured_frames("code_intel_subscribe_file").is_empty());
+    }
+
+    // ── Code-intel affordances: link cue, explanations, menu ───────────────
+
+    /// A file whose second line starts with an identifier at byte 12, matching
+    /// the occurrence `MountOpts::with_model` seeds.
+    const LINK_ON_DISK: &str = "fn main() {\nlet total = 2;\n}\n";
+    const LINK_ADDED_LINE: &str = "let total = 2;";
+
+    fn query_test(container: &HtmlElement, id: &str) -> Option<web_sys::Element> {
+        container
+            .query_selector(&format!("[data-test=\"{id}\"]"))
+            .unwrap()
+    }
+
+    /// Menus render at the document root (they are fixed-position overlays), so
+    /// they are not inside the mount container.
+    fn query_document(selector: &str) -> Option<web_sys::Element> {
+        web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .query_selector(selector)
+            .unwrap()
+    }
+
+    fn context_click(container: &HtmlElement, element: &web_sys::Element) {
+        let (x, y) = point_in(element);
+        let init = web_sys::MouseEventInit::new();
+        init.set_bubbles(true);
+        init.set_client_x(x as i32);
+        init.set_client_y(y as i32);
+        let event =
+            web_sys::MouseEvent::new_with_mouse_event_init_dict("contextmenu", &init).unwrap();
+        container
+            .query_selector(".diff-content")
+            .unwrap()
+            .expect("diff scroll container present")
+            .dispatch_event(&event)
+            .unwrap();
+    }
+
+    /// Holding Cmd/Ctrl over a navigable identifier marks it as clickable, and
+    /// the mark covers *the identifier*, not the whole line — otherwise it would
+    /// say nothing about where to click.
+    #[wasm_bindgen_test]
+    async fn cmd_held_marks_the_navigable_symbol_as_clickable() {
+        ensure_styles_loaded();
+        install_send_stub();
+
+        let container = make_code_intel_container();
+        let _mounted = mount_code_intel_diff_with(
+            container.clone(),
+            "main.rs",
+            LINK_ON_DISK,
+            LINK_ADDED_LINE,
+            MountOpts {
+                held: true,
+                with_model: true,
+                cmd_held: true,
+            },
+        );
+        next_tick().await;
+        next_tick().await;
+
+        let code = row_code_element(&container, "new", 2).expect("added row rendered");
+        mouse_move(&container, &code);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let link = query_test(&container, "diff-cmd-link")
+            .expect("holding the modifier over a navigable identifier should mark it clickable");
+        let link_rect = link.get_bounding_client_rect();
+        let code_rect = code.get_bounding_client_rect();
+        assert!(
+            link_rect.width() > 0.0,
+            "the mark must have width to be visible"
+        );
+        assert!(
+            link_rect.width() < code_rect.width(),
+            "the mark covers the identifier ({}px), so it must be narrower than the whole \
+             rendered line ({}px)",
+            link_rect.width(),
+            code_rect.width()
+        );
+        assert!(
+            link_rect.left() >= code_rect.left() - 1.0,
+            "the mark must sit within the rendered line, not left of it"
+        );
+    }
+
+    /// The mark is an affordance for a held modifier: releasing it takes the
+    /// mark away, so it never claims a plain click will navigate.
+    #[wasm_bindgen_test]
+    async fn releasing_the_modifier_removes_the_clickable_mark() {
+        ensure_styles_loaded();
+        install_send_stub();
+
+        let container = make_code_intel_container();
+        let mounted = mount_code_intel_diff_with(
+            container.clone(),
+            "main.rs",
+            LINK_ON_DISK,
+            LINK_ADDED_LINE,
+            MountOpts {
+                held: true,
+                with_model: true,
+                cmd_held: true,
+            },
+        );
+        next_tick().await;
+        next_tick().await;
+
+        let code = row_code_element(&container, "new", 2).expect("added row rendered");
+        mouse_move(&container, &code);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert!(query_test(&container, "diff-cmd-link").is_some());
+
+        // Release the modifier the way the app-level key handler does.
+        mounted.state.cmd_held.set(false);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert!(
+            query_test(&container, "diff-cmd-link").is_none(),
+            "the clickable mark must not outlive the modifier"
+        );
+    }
+
+    /// Cmd/Ctrl+clicking a removed line cannot resolve anything, and saying so
+    /// is the difference between "not supported here" and "this feature is
+    /// broken".
+    #[wasm_bindgen_test]
+    async fn cmd_click_on_a_removed_row_explains_itself() {
+        ensure_styles_loaded();
+        install_send_stub();
+
+        let on_disk = "fn main() {\n    let 名前 = 2;\n}\n";
+        let container = make_code_intel_container();
+        let _mounted = mount_code_intel_diff(container.clone(), "main.rs", on_disk, true);
+        next_tick().await;
+        next_tick().await;
+
+        let code = row_code_element(&container, "old", 2).expect("removed row rendered");
+        cmd_click(&container, &code);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let notice = query_test(&container, "diff-code-intel-notice")
+            .expect("an unanswerable explicit action must explain itself");
+        let text = notice.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Removed lines"),
+            "notice should name the reason, got {text:?}"
+        );
+        assert!(
+            captured_frames("code_intel_navigate").is_empty(),
+            "explaining must not also send a request"
+        );
+    }
+
+    /// Right-clicking a resolvable row offers Show References, and choosing it
+    /// asks the server — find-references works from a diff, not just a file.
+    #[wasm_bindgen_test]
+    async fn show_references_from_a_diff_row_queries_the_server() {
+        ensure_styles_loaded();
+        install_send_stub();
+
+        let container = make_code_intel_container();
+        let _mounted = mount_code_intel_diff_with(
+            container.clone(),
+            "main.rs",
+            LINK_ON_DISK,
+            LINK_ADDED_LINE,
+            MountOpts {
+                held: true,
+                with_model: true,
+                cmd_held: false,
+            },
+        );
+        next_tick().await;
+        next_tick().await;
+
+        let code = row_code_element(&container, "new", 2).expect("added row rendered");
+        context_click(&container, &code);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let menu = query_document(".context-menu").expect("right-click opens the code-intel menu");
+        let buttons = menu.query_selector_all("button").unwrap();
+        assert_eq!(buttons.length(), 2, "Go to Definition and Show References");
+        let references: web_sys::HtmlElement = buttons
+            .item(1)
+            .unwrap()
+            .dyn_into()
+            .expect("second action is an element");
+        assert!(
+            references
+                .text_content()
+                .unwrap_or_default()
+                .contains("References"),
+            "second action should be Show References"
+        );
+        references.click();
+        for _ in 0..10 {
+            next_tick().await;
+        }
+
+        let frames = captured_frames("code_intel_find_references");
+        assert_eq!(
+            frames.len(),
+            1,
+            "Show References should query the server once, got {frames:?}"
+        );
+        let payload: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
+        assert_eq!(payload["path"]["relative_path"], "main.rs");
+        assert_eq!(
+            payload["offset"], 12,
+            "the query addresses the identifier at the start of file line 2"
+        );
+    }
+
+    /// Right-clicking a row that cannot be resolved still opens the menu, with
+    /// the actions disabled and the reason shown — the same contract the file
+    /// viewer has, so a diff never presents an action that would do nothing.
+    #[wasm_bindgen_test]
+    async fn right_click_on_a_removed_row_disables_the_actions_and_says_why() {
+        ensure_styles_loaded();
+        install_send_stub();
+
+        let on_disk = "fn main() {\n    let 名前 = 2;\n}\n";
+        let container = make_code_intel_container();
+        let _mounted = mount_code_intel_diff(container.clone(), "main.rs", on_disk, true);
+        next_tick().await;
+        next_tick().await;
+
+        let code = row_code_element(&container, "old", 2).expect("removed row rendered");
+        context_click(&container, &code);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let menu = query_document(".context-menu").expect("right-click opens the menu");
+        let buttons = menu.query_selector_all("button").unwrap();
+        assert_eq!(buttons.length(), 2);
+        for i in 0..buttons.length() {
+            let button: web_sys::HtmlButtonElement =
+                buttons.item(i).unwrap().dyn_into().expect("action button");
+            assert!(
+                button.disabled(),
+                "a removed line has no position, so its actions must be disabled"
+            );
+        }
+        let hint = menu
+            .query_selector(".context-menu-hint")
+            .unwrap()
+            .expect("a disabled menu must carry its reason");
+        let text = hint.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Removed lines"),
+            "hint should name the reason, got {text:?}"
+        );
     }
 
     /// A diff with 1000 Added lines must NOT put all 1000 rows in the DOM.

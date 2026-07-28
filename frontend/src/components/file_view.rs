@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -10,6 +9,9 @@ use wasm_bindgen_futures::spawn_local;
 use crate::code_intel_dom::{
     TimeoutClosureSlot, caret_at_point, clear_timeout_timer, is_identifier_byte,
     line_byte_for_utf16_col, node_to_element, utf16_col_in_code,
+};
+use crate::components::code_intel_ui::{
+    CodeIntelContextMenu, CodeIntelMenuState, CodeIntelMenuTarget,
 };
 use crate::components::find_bar::{FindBar, FindState};
 use crate::line_source::FileLines;
@@ -95,186 +97,6 @@ const FALLBACK_CHUNK_LINES: usize = 200;
 /// realistically tokenize that much without freezing the UI even with
 /// chunking. Mirrors `syntax_highlight::MAX_LINES_TO_HIGHLIGHT`.
 const HIGHLIGHT_LINE_CAP: usize = 5000;
-
-/// State for the file-viewer right-click context menu: where it opened, the
-/// byte offset resolved under the click (if any), and — when the code-intel
-/// actions can't run — a human reason shown as a disabled hint. Held in a
-/// signal on `FileViewLoaded`; `None` means the menu is closed.
-#[derive(Clone, Debug, PartialEq)]
-struct FileMenuState {
-    x: f64,
-    y: f64,
-    offset: Option<u32>,
-    disabled_reason: Option<String>,
-}
-
-struct FileMenuEscListener {
-    window: web_sys::Window,
-    callback: Closure<dyn Fn(web_sys::Event)>,
-}
-
-thread_local! {
-    static FILE_MENU_ESC_LISTENER: RefCell<Option<FileMenuEscListener>> =
-        const { RefCell::new(None) };
-}
-
-fn clear_file_menu_esc_listener() {
-    FILE_MENU_ESC_LISTENER.with(|slot| {
-        if let Some(handle) = slot.borrow_mut().take() {
-            let _ = handle.window.remove_event_listener_with_callback(
-                "keydown",
-                handle.callback.as_ref().unchecked_ref(),
-            );
-        }
-    });
-}
-
-/// Reason the go-to-definition / find-references actions are unavailable for a
-/// right-click, or `None` when they can run. Mirrors the F12/Shift+F12
-/// preconditions: a symbol under the pointer and code-intel that isn't
-/// unsupported/unavailable/failed for the rendered file version. Resource
-/// routing comes from the view's exact `FileResourceKey`, not active project.
-fn file_context_menu_disabled_reason(
-    state: &AppState,
-    key: &CodeIntelKey,
-    version: ProjectFileVersion,
-    offset: Option<u32>,
-) -> Option<String> {
-    if offset.is_none() {
-        return Some("Right-click on a symbol".to_owned());
-    }
-    state.code_intel.with_untracked(|map| {
-        let file = map.get(key)?;
-        // Only judge against status the server resolved for the rendered text
-        // (version-equals-rendered); a mismatched version says nothing here.
-        if file.rendered_version != Some(version) {
-            return None;
-        }
-        let data = file.applied()?;
-        if let Some(error) = data.error.as_ref() {
-            return Some(format!("Code intelligence failed: {}", error.message));
-        }
-        match data.status.as_ref()?.state {
-            CodeIntelState::Unsupported => {
-                Some("Code intelligence unsupported for this file".to_owned())
-            }
-            CodeIntelState::Unavailable => Some("Code intelligence unavailable".to_owned()),
-            CodeIntelState::Failed => Some("Code intelligence failed".to_owned()),
-            CodeIntelState::Starting | CodeIntelState::Indexing | CodeIntelState::Ready => None,
-        }
-    })
-}
-
-/// Right-click context menu over file content: Go to Definition (F12) and Show
-/// References (Shift+F12). Positioned at the click, dismissed on Escape,
-/// outside-click/backdrop, or action selection. When `disabled_reason` is set
-/// the actions render disabled with the reason as a hint — never a silent
-/// no-op. Reuses the typed `navigate_to_definition` / `start_find_references`
-/// actions, matching the F12 keybindings exactly.
-#[component]
-fn FileContextMenu(
-    tab_id: TabId,
-    key: FileResourceKey,
-    version: ProjectFileVersion,
-    menu: RwSignal<Option<FileMenuState>>,
-    x: f64,
-    y: f64,
-    offset: Option<u32>,
-    disabled_reason: Option<String>,
-) -> impl IntoView {
-    let state = expect_context::<AppState>();
-    let disabled = disabled_reason.is_some();
-
-    // Window keydown listener for Escape dismissal, stored in a thread_local so
-    // on_cleanup can remove it with a plain fn pointer (Leptos requires the
-    // cleanup callback to be Send + Sync).
-    clear_file_menu_esc_listener();
-    let esc_cb = Closure::<dyn Fn(web_sys::Event)>::new(move |ev: web_sys::Event| {
-        if let Ok(kev) = ev.dyn_into::<web_sys::KeyboardEvent>()
-            && kev.key() == "Escape"
-        {
-            menu.set(None);
-        }
-    });
-    let window = web_sys::window().unwrap();
-    let _ = window.add_event_listener_with_callback("keydown", esc_cb.as_ref().unchecked_ref());
-    FILE_MENU_ESC_LISTENER.with(|slot| {
-        slot.borrow_mut().replace(FileMenuEscListener {
-            window,
-            callback: esc_cb,
-        });
-    });
-    on_cleanup(clear_file_menu_esc_listener);
-
-    let def_state = state.clone();
-    let def_key = key.clone();
-    let on_go_to_definition = move |_: web_sys::MouseEvent| {
-        menu.set(None);
-        if let Some(offset) = offset {
-            crate::actions::navigate_to_definition(
-                &def_state,
-                tab_id,
-                def_key.clone(),
-                version,
-                offset,
-            );
-        }
-    };
-
-    let ref_state = state.clone();
-    let ref_key = key.clone();
-    let on_show_references = move |_: web_sys::MouseEvent| {
-        menu.set(None);
-        if let Some(offset) = offset {
-            crate::actions::start_find_references(
-                &ref_state,
-                tab_id,
-                ref_key.clone(),
-                version,
-                offset,
-                None,
-            );
-        }
-    };
-
-    view! {
-        // Backdrop — catches click-outside / right-click-outside to dismiss.
-        <div
-            style="position: fixed; inset: 0; z-index: 1000;"
-            on:click=move |_| menu.set(None)
-            on:contextmenu=move |ev: web_sys::MouseEvent| {
-                ev.prevent_default();
-                menu.set(None);
-            }
-        />
-        <div
-            class="context-menu"
-            style=format!("left: {x}px; top: {y}px;")
-            on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()
-            on:contextmenu=|ev: web_sys::MouseEvent| ev.prevent_default()
-        >
-            <button
-                class="context-menu-item context-menu-item--with-shortcut"
-                disabled=disabled
-                on:click=on_go_to_definition
-            >
-                <span class="context-menu-label">"Go to Definition"</span>
-                <span class="context-menu-shortcut">"F12"</span>
-            </button>
-            <button
-                class="context-menu-item context-menu-item--with-shortcut"
-                disabled=disabled
-                on:click=on_show_references
-            >
-                <span class="context-menu-label">"Show References"</span>
-                <span class="context-menu-shortcut">"Shift+F12"</span>
-            </button>
-            {disabled_reason.map(|reason| view! {
-                <div class="context-menu-hint">{reason}</div>
-            })}
-        </div>
-    }
-}
 
 fn cancel_highlight_task(active_task_id: &Arc<Mutex<Option<u64>>>) {
     let Some(task_id) = active_task_id
@@ -829,7 +651,7 @@ fn FileViewLoaded(
     // Opening the menu resolves the byte offset under the pointer with the same
     // helper the F12 path uses and records this file as the code-intel focus,
     // so keyboard and menu agree on the target. `None` means the menu is closed.
-    let context_menu: RwSignal<Option<FileMenuState>> = RwSignal::new(None);
+    let context_menu: RwSignal<Option<CodeIntelMenuState>> = RwSignal::new(None);
     let lines_for_ctx = lines.clone();
     let state_for_ctx = state.clone();
     let ctx_resource_key = key.clone();
@@ -845,16 +667,21 @@ fn FileViewLoaded(
         let x = ev.client_x() as f64;
         let y = ev.client_y() as f64;
         let offset = byte_offset_at_point(&lines_for_ctx, x, y);
-        let disabled_reason = file_context_menu_disabled_reason(
+        let disabled_reason = crate::components::code_intel_ui::status_disabled_reason(
             &state_for_ctx,
             &ctx_code_intel_key,
             ctx_version,
             offset,
         );
-        context_menu.set(Some(FileMenuState {
+        context_menu.set(Some(CodeIntelMenuState {
             x,
             y,
-            offset,
+            target: offset.map(|offset| CodeIntelMenuTarget {
+                tab_id,
+                key: ctx_resource_key.clone(),
+                version: ctx_version,
+                offset,
+            }),
             disabled_reason,
         }));
     };
@@ -1036,36 +863,11 @@ fn FileViewLoaded(
     let lines_for_render = lines.clone();
     let highlighted_for_render = highlighted.clone();
     let find_for_render = find_state.clone();
-    let menu_key = key.clone();
 
     // Transient code-intel notice for this tab (e.g. "definition is outside
     // the project"). The banner clears itself after a few seconds.
     let notice_signal = state.code_intel_notice;
-    let notice_timer: TimeoutClosureSlot = StoredValue::new_local(None);
-    on_cleanup(move || clear_timeout_timer(notice_timer));
-    Effect::new(move |_| {
-        let is_mine =
-            notice_signal.with(|notice| notice.as_ref().is_some_and(|notice| notice.tab == tab_id));
-        if !is_mine {
-            return;
-        }
-        clear_timeout_timer(notice_timer);
-        if let Some(window) = web_sys::window() {
-            let cb = Closure::<dyn FnMut()>::new(move || {
-                notice_signal.update(|notice| {
-                    if notice.as_ref().is_some_and(|notice| notice.tab == tab_id) {
-                        *notice = None;
-                    }
-                });
-            });
-            if let Ok(id) = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                cb.as_ref().unchecked_ref(),
-                CODE_INTEL_NOTICE_MS,
-            ) {
-                notice_timer.update_value(|slot| *slot = Some((id, cb)));
-            }
-        }
-    });
+    crate::components::code_intel_ui::install_notice_auto_clear(tab_id);
 
     // Whether this file has been deleted on disk while its viewer is open.
     // Server-owned signal: a watcher-driven refresh read of a missing file
@@ -1233,14 +1035,11 @@ fn FileViewLoaded(
                             </pre>
                             {move || {
                                 context_menu.get().map(|m| view! {
-                                    <FileContextMenu
-                                        tab_id=tab_id
-                                        key=menu_key.clone()
-                                        version=code_intel_version
+                                    <CodeIntelContextMenu
                                         menu=context_menu
                                         x=m.x
                                         y=m.y
-                                        offset=m.offset
+                                        target=m.target.clone()
                                         disabled_reason=m.disabled_reason.clone()
                                     />
                                 })
@@ -1379,9 +1178,6 @@ fn file_line_class_with_diagnostics(
 
 /// How long the goto-target line stays highlighted after a jump.
 const GOTO_FLASH_MS: i32 = 1600;
-
-/// How long a transient code-intel notice banner stays visible.
-const CODE_INTEL_NOTICE_MS: i32 = 4000;
 
 /// Per-line diagnostic decorations: a gutter dot severity and the squiggle
 /// spans/link spans (byte ranges relative to the line start).
