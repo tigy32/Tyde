@@ -5,7 +5,9 @@ use wasm_bindgen_futures::spawn_local;
 use crate::app::{connect_one_host, refresh_configured_hosts};
 use crate::bridge::{self, HostTransportConfig as BridgeHostTransportConfig};
 use crate::send::send_frame;
-use crate::state::{AppState, DiffViewMode, NativeSettingsSaveState, ToolOutputMode};
+use crate::state::{
+    AppState, ConnectionStatus, DiffViewMode, NativeSettingsSaveState, ToolOutputMode,
+};
 
 use protocol::{
     BackendConfigField, BackendConfigFieldType, BackendConfigPersistenceMode,
@@ -632,6 +634,15 @@ enum SettingsTab {
     Debug,
 }
 
+/// What a settings page writes to. `Device` pages are local to this
+/// installation; `Host` pages read and write the settings of whichever host is
+/// selected in the scope bar, so switching hosts changes what they show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsScope {
+    Device,
+    Host,
+}
+
 impl SettingsTab {
     fn label(self) -> &'static str {
         match self {
@@ -649,6 +660,24 @@ impl SettingsTab {
         }
     }
 
+    /// Which host's settings this tab edits, if any. Every tab except the two
+    /// device-local ones reads `selected_host_settings()`, so the scope bar has
+    /// to say so.
+    fn scope(self) -> SettingsScope {
+        match self {
+            Self::Hosts | Self::Appearance => SettingsScope::Device,
+            Self::General
+            | Self::Supervisor
+            | Self::Backends
+            | Self::CustomAgents
+            | Self::McpServers
+            | Self::Steering
+            | Self::Skills
+            | Self::Mobile
+            | Self::Debug => SettingsScope::Host,
+        }
+    }
+
     /// All searchable text for this tab: labels, descriptions, option names.
     fn search_text(self) -> &'static [&'static str] {
         match self {
@@ -660,6 +689,9 @@ impl SettingsTab {
                 "Remote command",
                 "Auto-connect",
                 "Select host",
+                "Selected host",
+                "Settings scope",
+                "Which host settings apply to",
                 "Connect",
                 "Disconnect",
                 "Remove host",
@@ -823,12 +855,13 @@ const ALL_TABS: [SettingsTab; 11] = [
     SettingsTab::Debug,
 ];
 
-/// Tabs listed under the "Settings" sidebar group. `SettingsTab::Backends` is
-/// deliberately absent: it renders as the stable "Overview" entry of the
-/// dedicated Backends group.
-const SETTINGS_GROUP_TABS: [SettingsTab; 10] = [
-    SettingsTab::Hosts,
-    SettingsTab::Appearance,
+/// Device-local tabs, listed under the "This Device" sidebar group.
+const DEVICE_GROUP_TABS: [SettingsTab; 2] = [SettingsTab::Hosts, SettingsTab::Appearance];
+
+/// Host-scoped tabs, listed under a sidebar group titled with the selected
+/// host. `SettingsTab::Backends` is deliberately absent: it renders as the
+/// stable "Overview" entry of the dedicated Backends group.
+const HOST_GROUP_TABS: [SettingsTab; 8] = [
     SettingsTab::General,
     SettingsTab::Supervisor,
     SettingsTab::CustomAgents,
@@ -846,6 +879,16 @@ enum SettingsPage {
     Tab(SettingsTab),
     Complexity,
     Backend(BackendKind),
+}
+
+impl SettingsPage {
+    fn scope(self) -> SettingsScope {
+        match self {
+            Self::Tab(tab) => tab.scope(),
+            // Both are derived from the selected host's server-owned catalog.
+            Self::Complexity | Self::Backend(_) => SettingsScope::Host,
+        }
+    }
 }
 
 /// Backends that get their own sidebar page on the selected host, in the
@@ -915,6 +958,9 @@ fn backend_page_matches_query(state: &AppState, kind: BackendKind, query: &str) 
 #[component]
 pub fn SettingsPanel() -> impl IntoView {
     let state = expect_context::<AppState>();
+    let nav_state = state.clone();
+    let host_group_title =
+        Signal::derive(move || format!("Host · {}", selected_host_label(&nav_state)));
     let active_page = RwSignal::new(SettingsPage::Tab(SettingsTab::Appearance));
     let search_query = RwSignal::new(String::new());
 
@@ -963,6 +1009,8 @@ pub fn SettingsPanel() -> impl IntoView {
                 <div class="settings-root">
                     <button class="settings-close-btn" on:click=on_close title="Close settings">"×"</button>
 
+                    <SettingsScopeBar active_page />
+
                     <div class="settings-layout">
                         <nav class="settings-nav">
                             <div class="settings-search-wrap">
@@ -978,38 +1026,18 @@ pub fn SettingsPanel() -> impl IntoView {
                                     autocomplete="off"
                                 />
                             </div>
-                            <Show when=move || {
-                                SETTINGS_GROUP_TABS
-                                    .into_iter()
-                                    .any(|tab| tab.matches_query(&search_query.get()))
-                            }>
-                                <div class="settings-nav-group">
-                                    <div class="settings-nav-group-title">"Settings"</div>
-                                    <div class="settings-nav-group-items">
-                                        {SETTINGS_GROUP_TABS.map(|tab| {
-                                            let is_active = move || {
-                                                active_page.get() == SettingsPage::Tab(tab)
-                                            };
-                                            let matches_search = move || {
-                                                tab.matches_query(&search_query.get())
-                                            };
-                                            view! {
-                                                <Show when=matches_search>
-                                                    <button
-                                                        class="settings-nav-item"
-                                                        class:active=is_active
-                                                        on:click=move |_| {
-                                                            active_page.set(SettingsPage::Tab(tab))
-                                                        }
-                                                    >
-                                                        {tab.label()}
-                                                    </button>
-                                                </Show>
-                                            }
-                                        }).collect_view()}
-                                    </div>
-                                </div>
-                            </Show>
+                            <SettingsNavGroup
+                                title=Signal::derive(|| "This Device".to_owned())
+                                tabs=DEVICE_GROUP_TABS.to_vec()
+                                active_page
+                                search_query
+                            />
+                            <SettingsNavGroup
+                                title=host_group_title
+                                tabs=HOST_GROUP_TABS.to_vec()
+                                active_page
+                                search_query
+                            />
                             <BackendsNavGroup active_page search_query />
                             <div class="settings-nav-footer">
                                 <button class="settings-feedback-link" on:click=move |_| {
@@ -1049,6 +1077,263 @@ pub fn SettingsPanel() -> impl IntoView {
     }
 }
 
+/// Human-readable name of the host the host-scoped pages operate on. Falls
+/// back to the raw id only while the configured-host list is still loading, so
+/// the scope bar never silently names the wrong host.
+fn selected_host_label(state: &AppState) -> String {
+    match state.selected_host() {
+        Some(host) => host.label,
+        None => state
+            .selected_host_id
+            .get()
+            .unwrap_or_else(|| "no host".to_owned()),
+    }
+}
+
+/// Persist the settings-scope host and refresh the store, so every host-scoped
+/// page re-reads against the new host.
+async fn select_settings_host(state: AppState, host_id: String) -> Result<(), String> {
+    bridge::set_selected_host(bridge::SetSelectedHostRequest {
+        host_id: Some(host_id),
+    })
+    .await
+    .map_err(|e| format!("Failed to set selected host: {e}"))?;
+    refresh_configured_hosts(&state).await;
+    Ok(())
+}
+
+/// One titled group of sidebar tabs, hidden entirely when the search filters
+/// all of its entries out.
+#[component]
+fn SettingsNavGroup(
+    title: Signal<String>,
+    tabs: Vec<SettingsTab>,
+    active_page: RwSignal<SettingsPage>,
+    search_query: RwSignal<String>,
+) -> impl IntoView {
+    let group = move || {
+        let query = search_query.get();
+        let matching: Vec<SettingsTab> = tabs
+            .iter()
+            .copied()
+            .filter(|tab| tab.matches_query(&query))
+            .collect();
+        if matching.is_empty() {
+            return None;
+        }
+        let items = matching
+            .into_iter()
+            .map(|tab| {
+                view! {
+                    <button
+                        class="settings-nav-item"
+                        class:active=move || active_page.get() == SettingsPage::Tab(tab)
+                        on:click=move |_| active_page.set(SettingsPage::Tab(tab))
+                    >
+                        {tab.label()}
+                    </button>
+                }
+            })
+            .collect_view();
+        Some(view! {
+            <div class="settings-nav-group">
+                <div class="settings-nav-group-title">{move || title.get()}</div>
+                <div class="settings-nav-group-items">{items}</div>
+            </div>
+        })
+    };
+    view! { {group} }
+}
+
+/// Persistent banner naming what the visible page writes to. Host-scoped pages
+/// all read `selected_host_settings()`, which used to be selectable only from a
+/// single field buried in the Hosts tab.
+#[component]
+fn SettingsScopeBar(active_page: RwSignal<SettingsPage>) -> impl IntoView {
+    // Type-erased branches: the wasm test module runs every frontend test in
+    // one browser instance, and each distinct nested view type it monomorphizes
+    // costs module size against that ceiling.
+    let body = move || match active_page.get().scope() {
+        SettingsScope::Host => view! { <SettingsHostScope /> }.into_any(),
+        SettingsScope::Device => view! {
+            <span class="settings-scope-text">"These settings apply to this device only."</span>
+        }
+        .into_any(),
+    };
+    view! { <div class="settings-scope-bar">{body}</div> }
+}
+
+/// The host half of the scope bar: which host is being edited, whether it can
+/// currently be edited, and whether it is the host the open chat runs on.
+#[component]
+fn SettingsHostScope() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let label_state = state.clone();
+    let host_label = Signal::derive(move || selected_host_label(&label_state));
+    let status_state = state.clone();
+    let hosts_state = state.clone();
+    let change_state = state.clone();
+    let chat_state = state.clone();
+    let error_sig: RwSignal<Option<String>> = RwSignal::new(None);
+
+    let status_class = move || match status_state.selected_host_connection_status() {
+        ConnectionStatus::Connected => "status-dot connected",
+        ConnectionStatus::Connecting => "status-dot connecting",
+        ConnectionStatus::Disconnected => "status-dot disconnected",
+        ConnectionStatus::Error(_) => "status-dot error",
+    };
+
+    let on_change = move |ev: web_sys::Event| {
+        let Some(target) = ev.target() else { return };
+        let Ok(select) = target.dyn_into::<web_sys::HtmlSelectElement>() else {
+            return;
+        };
+        let state = change_state.clone();
+        let host_id = select.value();
+        spawn_local(async move {
+            match select_settings_host(state, host_id).await {
+                Ok(()) => error_sig.set(None),
+                Err(e) => error_sig.set(Some(e)),
+            }
+        });
+    };
+
+    // With a single configured host there is nothing to choose between, so the
+    // bar names it instead of rendering a one-entry dropdown.
+    let picker = move || {
+        if hosts_state.configured_hosts.get().len() <= 1 {
+            return view! { <span class="settings-scope-host">{move || host_label.get()}</span> }
+                .into_any();
+        }
+        let value_state = state.clone();
+        let options_state = state.clone();
+        view! {
+            <select
+                class="settings-scope-select"
+                aria-label="Host these settings apply to"
+                prop:value=move || value_state.selected_host_id.get().unwrap_or_default()
+                on:change=on_change.clone()
+            >
+                {move || {
+                    options_state
+                        .configured_hosts
+                        .get()
+                        .into_iter()
+                        .map(|host| view! { <option value=host.id>{host.label}</option> })
+                        .collect_view()
+                }}
+            </select>
+        }
+        .into_any()
+    };
+
+    view! {
+        <span class=status_class></span>
+        <span class="settings-scope-text">"Editing settings on"</span>
+        {picker}
+        <SettingsScopeNotices chat_state error_sig />
+    }
+}
+
+/// Everything the scope bar has to say beyond the host name: why the page may
+/// be read-only, and when the open chat runs somewhere else.
+#[component]
+fn SettingsScopeNotices(
+    chat_state: AppState,
+    error_sig: RwSignal<Option<String>>,
+) -> impl IntoView {
+    let connect_state = chat_state.clone();
+    let switch_state = chat_state.clone();
+    let mismatch_state = chat_state.clone();
+    let status_state = chat_state.clone();
+
+    // The host the visible chat actually runs on, when that is not the host
+    // being edited. `chat_context_host_id` deliberately prefers the active
+    // agent's or project's host, so the two can disagree.
+    let mismatch = move || {
+        let selected = mismatch_state.selected_host_id.get()?;
+        let chat_host = mismatch_state.chat_context_host_id()?;
+        if chat_host == selected {
+            return None;
+        }
+        let label = mismatch_state
+            .configured_hosts
+            .get()
+            .into_iter()
+            .find(|host| host.id == chat_host)
+            .map(|host| host.label)
+            .unwrap_or_else(|| chat_host.clone());
+        Some((chat_host, label))
+    };
+
+    let unavailable = move || match status_state.selected_host_connection_status() {
+        ConnectionStatus::Connected => None,
+        ConnectionStatus::Connecting => {
+            Some("Connecting — settings load once it is up.".to_owned())
+        }
+        ConnectionStatus::Disconnected => {
+            Some("Offline — connect it to read or change these settings.".to_owned())
+        }
+        ConnectionStatus::Error(message) => Some(message),
+    };
+
+    let on_connect = move |_| {
+        let Some(host_id) = connect_state.selected_host_id.get_untracked() else {
+            return;
+        };
+        spawn_local(connect_one_host(connect_state.clone(), host_id));
+    };
+
+    // One reactive block producing erased views, rather than three separately
+    // monomorphized ones — see the note in `SettingsScopeBar`.
+    let notices = move || {
+        let mut parts: Vec<AnyView> = Vec::new();
+        if let Some(message) = unavailable() {
+            parts.push(
+                view! {
+                    <span class="settings-scope-notice">{message}</span>
+                    <button class="settings-scope-action" on:click=on_connect.clone()>
+                        "Connect"
+                    </button>
+                }
+                .into_any(),
+            );
+        }
+        if let Some((host_id, label)) = mismatch() {
+            let state = switch_state.clone();
+            parts.push(
+                view! {
+                    <span class="settings-scope-notice">
+                        {format!("Your open chat runs on {label}.")}
+                    </span>
+                    <button
+                        class="settings-scope-action"
+                        on:click=move |_| {
+                            let state = state.clone();
+                            let host_id = host_id.clone();
+                            spawn_local(async move {
+                                match select_settings_host(state, host_id).await {
+                                    Ok(()) => error_sig.set(None),
+                                    Err(e) => error_sig.set(Some(e)),
+                                }
+                            });
+                        }
+                    >
+                        {format!("Edit {label} instead")}
+                    </button>
+                }
+                .into_any(),
+            );
+        }
+        if let Some(message) = error_sig.get() {
+            parts.push(view! { <span class="settings-scope-error">{message}</span> }.into_any());
+        }
+        parts
+    };
+
+    view! { {notices} }
+}
+
 /// The "Backends" sidebar group: a stable Overview entry plus one page per
 /// backend in the selected host's server-owned schema catalog.
 #[component]
@@ -1057,6 +1342,8 @@ fn BackendsNavGroup(
     search_query: RwSignal<String>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
+    let title_state = state.clone();
+    let title = Signal::derive(move || format!("Backends · {}", selected_host_label(&title_state)));
     let visible = move || {
         let query = search_query.get();
         SettingsTab::Backends.matches_query(&query)
@@ -1068,7 +1355,7 @@ fn BackendsNavGroup(
     view! {
         <Show when=visible>
             <div class="settings-nav-group">
-                <div class="settings-nav-group-title">"Backends"</div>
+                <div class="settings-nav-group-title">{move || title.get()}</div>
                 <div class="settings-nav-group-items">
                     <Show when=move || SettingsTab::Backends.matches_query(&search_query.get())>
                         <button
@@ -1212,20 +1499,20 @@ fn HostsTab() -> impl IntoView {
 
         <div class="settings-field">
             <label class="settings-label">"Selected Host"</label>
-            <p class="settings-description">"Choose which host the host-scoped settings tabs operate on."</p>
+            <p class="settings-description">"Which host the host-scoped settings pages — Backends, Custom Agents, MCP Servers, Skills and the rest — read and write. Shown at the top of every one of those pages."</p>
             <select
                 class="settings-select settings-select-full"
+                aria-label="Selected host"
                 prop:value=move || state.selected_host_id.get().unwrap_or_default()
                 on:change=move |ev: web_sys::Event| {
                     let target = ev.target().unwrap();
                     let select: web_sys::HtmlSelectElement = target.unchecked_into();
                     let state = state_for_selected_host.clone();
+                    let host_id = select.value();
                     spawn_local(async move {
-                        match bridge::set_selected_host(bridge::SetSelectedHostRequest {
-                            host_id: Some(select.value()),
-                        }).await {
-                            Ok(_) => refresh_configured_hosts(&state).await,
-                            Err(e) => error_sig.set(Some(format!("Failed to set selected host: {e}"))),
+                        match select_settings_host(state, host_id).await {
+                            Ok(()) => error_sig.set(None),
+                            Err(e) => error_sig.set(Some(e)),
                         }
                     });
                 }
@@ -10987,6 +11274,151 @@ mod wasm_tests {
         assert!(
             find_button_by_text(&container, "Hermes").is_none(),
             "the stale backend nav item must not linger after the host change"
+        );
+    }
+
+    fn settings_host(id: &str, label: &str) -> crate::bridge::ConfiguredHost {
+        crate::bridge::ConfiguredHost {
+            id: id.to_owned(),
+            label: label.to_owned(),
+            transport: crate::bridge::HostTransportConfig::SshStdio {
+                ssh_destination: id.to_owned(),
+                remote_command: None,
+                lifecycle: Default::default(),
+            },
+            auto_connect: false,
+        }
+    }
+
+    /// Two configured hosts with `dev2` selected, so the scope bar has a real
+    /// choice to render rather than collapsing to the single-host case.
+    fn install_scope_bar_hosts(state: &AppState, status: crate::state::ConnectionStatus) {
+        state.configured_hosts.set(vec![
+            settings_host("host-a", "dev2"),
+            settings_host("host-b", "laptop"),
+        ]);
+        state.selected_host_id.set(Some("host-a".to_owned()));
+        state.connection_statuses.update(|m| {
+            m.insert("host-a".to_owned(), status);
+        });
+        state.settings_open.set(true);
+    }
+
+    fn scope_bar_text(container: &HtmlElement) -> String {
+        container
+            .query_selector(".settings-scope-bar")
+            .unwrap()
+            .and_then(|el| el.text_content())
+            .expect("the settings panel must always render a scope bar")
+    }
+
+    /// Every host-scoped page states which host it writes to, and the
+    /// device-local pages say they are device-local. Before this, the host that
+    /// silently scoped Custom Agents, MCP Servers, Backends and the rest was
+    /// only visible as one field inside the Hosts tab.
+    #[wasm_bindgen_test]
+    async fn scope_bar_names_the_host_each_page_edits() {
+        let container = make_container();
+        let state = AppState::new();
+        install_scope_bar_hosts(&state, crate::state::ConnectionStatus::Connected);
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+
+        // Appearance is the default page and writes device-local preferences.
+        assert_eq!(panel_title(&container), "Appearance");
+        let bar = scope_bar_text(&container);
+        assert!(
+            bar.contains("this device"),
+            "a device-local page must say so: {bar:?}"
+        );
+        assert!(
+            !bar.contains("Editing settings on"),
+            "a device-local page must not claim to edit a host: {bar:?}"
+        );
+
+        click_tab(&container, "Custom Agents");
+        next_tick().await;
+
+        let bar = scope_bar_text(&container);
+        assert!(
+            bar.contains("Editing settings on"),
+            "a host-scoped page must name the host it writes to: {bar:?}"
+        );
+        let select: HtmlSelectElement = container
+            .query_selector(".settings-scope-bar select")
+            .unwrap()
+            .expect("with two hosts the scope bar must offer a picker")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            select.value(),
+            "host-a",
+            "the picker must reflect the host the page is reading"
+        );
+        let selected_label = select
+            .selected_index()
+            .try_into()
+            .ok()
+            .and_then(|i: u32| select.item(i))
+            .and_then(|node| node.dyn_into::<HtmlOptionElement>().ok())
+            .map(|option| option.text())
+            .unwrap_or_default();
+        assert_eq!(
+            selected_label, "dev2",
+            "the picker must show the host's label, not its id"
+        );
+
+        let nav = container.text_content().unwrap_or_default();
+        assert!(
+            nav.contains("Host · dev2"),
+            "the sidebar group holding host-scoped tabs must name the host: {nav:?}"
+        );
+    }
+
+    /// The scope bar states why a host-scoped page cannot be edited, and warns
+    /// when the open chat runs on a different host than the one being edited —
+    /// the case where a user configures an agent that their chat will not see.
+    #[wasm_bindgen_test]
+    async fn scope_bar_reports_offline_host_and_chat_running_elsewhere() {
+        let container = make_container();
+        let state = AppState::new();
+        install_scope_bar_hosts(&state, crate::state::ConnectionStatus::Disconnected);
+        state
+            .active_project
+            .set(Some(crate::state::ActiveProjectRef {
+                host_id: "host-b".to_owned(),
+                project_id: ProjectId("proj".to_owned()),
+            }));
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+
+        click_tab(&container, "MCP Servers");
+        next_tick().await;
+
+        let bar = scope_bar_text(&container);
+        assert!(
+            bar.contains("Offline"),
+            "an unreachable host must be stated, not silently disable the page: {bar:?}"
+        );
+        assert!(
+            find_button_by_text(&container, "Connect").is_some(),
+            "an offline scope host must offer a way to connect it"
+        );
+        assert!(
+            bar.contains("Your open chat runs on laptop."),
+            "editing a host other than the chat's host must be called out: {bar:?}"
+        );
+        assert!(
+            find_button_by_text(&container, "Edit laptop instead").is_some(),
+            "the mismatch notice must offer to switch to the chat's host"
         );
     }
 

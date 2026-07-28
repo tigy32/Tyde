@@ -7714,6 +7714,62 @@ kbd {
     margin: 0 auto;
 }
 
+/* --- Settings Scope Bar --- */
+
+.settings-scope-bar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    max-width: 1100px;
+    margin: 0 auto var(--space-5);
+    padding: var(--space-2) var(--space-3);
+    background: var(--surface-2);
+    border: 1px solid var(--border-primary);
+    border-radius: 6px;
+    font-size: 1rem;
+}
+
+.settings-scope-text {
+    color: var(--text-secondary);
+}
+
+.settings-scope-host {
+    color: var(--text-bright);
+    font-weight: 600;
+}
+
+.settings-scope-select {
+    padding: var(--space-1) var(--space-2);
+    font-family: var(--font-sans);
+    font-size: 1rem;
+    color: var(--text-primary);
+    background: var(--surface-1);
+    border: 1px solid var(--border-primary);
+    border-radius: 6px;
+}
+
+.settings-scope-notice {
+    color: var(--text-tertiary);
+}
+
+.settings-scope-error {
+    color: var(--error);
+}
+
+.settings-scope-action {
+    padding: var(--space-1) var(--space-2);
+    font-size: 0.923rem;
+    color: var(--accent-primary);
+    border: 1px solid var(--border-primary);
+    border-radius: 6px;
+    transition: background 0.15s;
+}
+
+.settings-scope-action:hover {
+    background: var(--surface-hover);
+}
+
 /* --- Settings Nav Sidebar --- */
 
 .settings-nav {
