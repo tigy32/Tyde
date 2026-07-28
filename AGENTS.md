@@ -48,6 +48,10 @@ Every commit message must follow these rules:
   read consistently and make the action obvious.
 - Do **not** add any AI attribution (no `Co-authored-by: Claude`, no
   `Generated with ...` trailers, no tool-name footers)
+- **Keep each feature or bug fix in exactly one commit.** Include its tests,
+  documentation, and required collateral fixes in that same commit. Do not
+  land a red regression test and its implementation as separate commits;
+  amend or squash the workbench history before landing.
 
 ### 2. Repository validation
 

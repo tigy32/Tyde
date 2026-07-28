@@ -101,6 +101,20 @@ def _tyde_make_agent(*args, **kwargs):
         agent.ephemeral_system_prompt = "\n\n".join(
             part for part in (existing, tyde_prompt) if part
         )
+    session_id = str(args[0] if args else kwargs.get("sid") or "")
+    original_step_callback = getattr(agent, "step_callback", None)
+    def _tyde_step_callback(iteration, previous_tools):
+        try:
+            if callable(original_step_callback):
+                original_step_callback(iteration, previous_tools)
+        finally:
+            if int(iteration or 0) > 1:
+                _tyde_original_emit(
+                    "provider.request.start",
+                    session_id,
+                    {"iteration": int(iteration), "usage": _tyde_get_usage(agent)},
+                )
+    agent.step_callback = _tyde_step_callback
     return agent
 
 def _tyde_emit(event_type, session_id, payload=None):
@@ -2851,6 +2865,7 @@ impl HermesEventMapper {
             "session.info" => self.map_session_info(payload),
             "session.title" => Ok(Vec::new()),
             "status.update" => self.map_status_update(payload),
+            "provider.request.start" => self.map_provider_request_start(payload),
             "message.start" => self.map_message_start(),
             "message.delta" => self.map_message_delta(payload),
             "message.complete" => self.map_message_complete(payload),
@@ -2983,6 +2998,53 @@ impl HermesEventMapper {
         self.current_message_id = Some(message_id.clone());
         self.current_text.clear();
         self.current_reasoning_seen = false;
+        events.push(ChatEvent::StreamStart(StreamStartData {
+            message_id: Some(message_id),
+            agent: HERMES_AGENT_NAME.to_string(),
+            model: self.model.clone(),
+        }));
+        Ok(events)
+    }
+
+    fn map_provider_request_start(
+        &mut self,
+        payload: Option<Value>,
+    ) -> Result<Vec<ChatEvent>, String> {
+        let payload = required_payload(payload, "provider.request.start")?;
+        let iteration = payload
+            .get("iteration")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                "Hermes provider.request.start missing required integer field iteration".to_string()
+            })?;
+        if iteration <= 1 {
+            return Err(
+                "Hermes provider.request.start iteration must be greater than one".to_string(),
+            );
+        }
+        if self.current_message_id.is_none() {
+            return Err("Hermes provider request started before message.start".to_string());
+        }
+        if !self.pending_tools.is_empty() {
+            return Err(format!(
+                "Hermes provider request started with unresolved tool calls: {}",
+                self.pending_tool_ids().join(", ")
+            ));
+        }
+
+        let (request_usage, cumulative_usage) = payload
+            .get("usage")
+            .and_then(token_usage_from_value)
+            .map(|usage| self.record_session_usage(usage))
+            .map_or((None, None), |(request, cumulative)| {
+                (Some(request), cumulative)
+            });
+        let mut events = self.finish_stream_events(None, request_usage, cumulative_usage, None);
+        self.turn_tools.clear();
+        self.next_turn_tool_order = 0;
+
+        let message_id = Uuid::new_v4().to_string();
+        self.current_message_id = Some(message_id.clone());
         events.push(ChatEvent::StreamStart(StreamStartData {
             message_id: Some(message_id),
             agent: HERMES_AGENT_NAME.to_string(),
@@ -8381,7 +8443,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn hermes_tool_offsets_preserve_pre_tool_post_interleaving() {
+    fn hermes_tool_offsets_count_unicode_scalars() {
         let mut mapper = HermesEventMapper::default();
         let mut events = mapper.map_event("message.start", None);
         events.extend(mapper.map_event("message.delta", Some(json!({ "text": "Pré🙂 " }))));
@@ -8401,42 +8463,10 @@ for line in sys.stdin:
                 "result": { "exit_code": 0, "stdout": "LIVE_TOOL_OK" }
             })),
         ));
-        events.extend(mapper.map_event("message.delta", Some(json!({ "text": "POST" }))));
         events.extend(mapper.map_event(
             "message.complete",
-            Some(json!({ "text": "POST", "status": "complete" })),
+            Some(json!({ "text": "Pré🙂 ", "status": "complete" })),
         ));
-
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event, ChatEvent::StreamStart(_)))
-                .count(),
-            1,
-            "one Hermes turn must remain one Tyde stream"
-        );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event, ChatEvent::StreamEnd(_)))
-                .count(),
-            1,
-            "tool boundaries must not synthesize intermediate StreamEnd events"
-        );
-        let tool_request_index = events
-            .iter()
-            .position(|event| matches!(event, ChatEvent::ToolRequest(_)))
-            .expect("tool request");
-        let post_delta_index = events
-            .iter()
-            .position(|event| {
-                matches!(
-                    event,
-                    ChatEvent::StreamDelta(StreamTextDeltaData { text, .. }) if text == "POST"
-                )
-            })
-            .expect("post-tool delta");
-        assert!(tool_request_index < post_delta_index);
 
         let end = events
             .iter()
@@ -8445,7 +8475,7 @@ for line in sys.stdin:
                 _ => None,
             })
             .expect("StreamEnd");
-        assert_eq!(end.message.content, "Pré🙂 POST");
+        assert_eq!(end.message.content, "Pré🙂 ");
         assert_eq!(end.message.tool_calls.len(), 1);
         assert_eq!(end.message.tool_calls[0].id, "terminal-1");
         assert_eq!(
@@ -8454,6 +8484,73 @@ for line in sys.stdin:
             "offsets count Unicode scalar values, not UTF-8 bytes"
         );
         assert_ne!("Pré🙂 ".len(), 5);
+    }
+
+    #[test]
+    fn hermes_provider_requests_are_distinct_chat_messages() {
+        let mut mapper = HermesEventMapper::default();
+        let mut events = mapper.map_event("message.start", None);
+        events.extend(mapper.map_event(
+            "message.delta",
+            Some(json!({ "text": "I will inspect the file." })),
+        ));
+        events.extend(mapper.map_event(
+            "tool.start",
+            Some(json!({
+                "tool_id": "read-1",
+                "name": "read_file",
+                "args": { "path": "src/main.rs" }
+            })),
+        ));
+        events.extend(mapper.map_event(
+            "tool.complete",
+            Some(json!({
+                "tool_id": "read-1",
+                "name": "read_file",
+                "result": { "content": "fn main() {}" }
+            })),
+        ));
+
+        // The tool cannot execute until the first provider response has ended,
+        // so output arriving after its completion belongs to a new request.
+        events.extend(mapper.map_event(
+            "provider.request.start",
+            Some(json!({
+                "iteration": 2,
+                "usage": { "input": 10, "output": 4, "total": 14 }
+            })),
+        ));
+        events.extend(mapper.map_event(
+            "message.delta",
+            Some(json!({ "text": "The file contains an empty main function." })),
+        ));
+        events.extend(mapper.map_event(
+            "message.complete",
+            Some(json!({
+                "text": "The file contains an empty main function.",
+                "status": "complete"
+            })),
+        ));
+
+        let messages = events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::StreamEnd(data) => Some(&data.message),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages.len(),
+            2,
+            "each Hermes provider request must produce its own Tyde chat message"
+        );
+        assert_eq!(messages[0].content, "I will inspect the file.");
+        assert_eq!(messages[0].tool_calls.len(), 1);
+        assert_eq!(
+            messages[1].content,
+            "The file contains an empty main function."
+        );
+        assert!(messages[1].tool_calls.is_empty());
     }
 
     #[test]
