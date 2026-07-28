@@ -7,11 +7,18 @@
 //!
 //! Server snapshots describe every discovered Hermes profile (the default
 //! `~/.hermes` home plus `~/.hermes/profiles/<name>` directories) together
-//! with the live provider states probed from that profile's gateway. Client
-//! saves send back the same document with edited per-profile `config`
-//! sections and optional write-only credential `actions`. Provider states are
-//! server-owned and ignored on save; credential actions are executed against
-//! the profile's gateway and are never echoed back in a snapshot.
+//! with the live provider and toolset states probed from that profile's
+//! gateway. Client saves send back the same document with edited per-profile
+//! `config` sections plus optional write-only `profile_actions` (create or
+//! delete a profile directory) and credential `actions`. Probed states are
+//! server-owned and ignored on save; the two action lists are executed
+//! against the host and the profile's gateway and are never echoed back in a
+//! snapshot.
+//!
+//! Which providers Tyde *offers* is deliberately not modeled here: Hermes has
+//! no provider enable/disable flag of its own, so that list is Tyde-owned host
+//! settings ([`crate::HostSettings::hermes_disabled_providers`]) and is never
+//! written into a Hermes `config.yaml`.
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +34,12 @@ pub struct HermesNativeSettingsDoc {
     pub version: u32,
     /// Discovery order: the default profile first, named profiles sorted.
     pub profiles: Vec<HermesProfileSettings>,
+    /// Write-only profile directory operations, executed before credential
+    /// actions and config writes so a freshly created profile can be
+    /// credentialed and configured by the same save. Never present in server
+    /// snapshots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profile_actions: Vec<HermesProfileAction>,
     /// Write-only credential operations, executed before config sections are
     /// applied. Never present in server snapshots.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -60,6 +73,42 @@ pub struct HermesProfileSettings {
     pub active_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_provider: Option<String>,
+    /// Toolsets this profile's gateway reports (`toolsets.list`), so the
+    /// disabled-toolsets control can offer real names instead of free text.
+    /// Server-owned; ignored on save. `None` means the probe failed — the
+    /// control falls back to free text rather than pretending the catalogue
+    /// is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolsets: Option<Vec<HermesToolsetInfo>>,
+}
+
+/// One toolset from the profile gateway's `toolsets.list` probe.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HermesToolsetInfo {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub tool_count: u32,
+}
+
+/// Write-only profile directory operation. A Hermes profile is an entire
+/// `HERMES_HOME`, so these mutate directories rather than a single file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HermesProfileAction {
+    /// Create `profiles/<name>/`, seeding it with a copy of `copy_config_from`'s
+    /// `config.yaml` (default: the default profile). Only the config file is
+    /// copied — credentials, sessions and state stay with the source profile,
+    /// because a Hermes profile exists precisely to keep those separate.
+    CreateProfile {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        copy_config_from: Option<String>,
+    },
+    /// Recursively delete `profiles/<name>/`. This removes that profile's
+    /// whole Hermes home — sessions, credentials, state and memories, not just
+    /// its config. The default profile cannot be deleted.
+    DeleteProfile { name: String },
 }
 
 /// The editable subset of a Hermes profile's `config.yaml`. Every leaf is
@@ -148,6 +197,11 @@ pub struct HermesProviderState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
     pub model_count: u32,
+    /// The provider's selectable model ids, so default-model and fallback
+    /// controls can be dropdowns instead of free text. Same source array as
+    /// `model_count`, so an empty list always pairs with a zero count.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
 }
 
 /// Write-only credential operation, executed against the named profile's

@@ -10,16 +10,16 @@ use crate::types::{
 use crate::{
     AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentClosedPayload, AgentOrigin,
     AgentStartPayload, AgentsViewPreferencesNotifyPayload, BackendCapacityPayload,
-    BackendConfigSchemasPayload, BackendConfigSnapshotsPayload, BackendKind, BackendSetupPayload,
-    CancelWorkflowPayload, ChatEvent, ChatMessage, ChatMessageId, ClientErrorPayload,
-    CodeIntelDiagnosticsPayload, CodeIntelErrorPayload, CodeIntelFileModelPayload,
-    CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload, CodeIntelOverviewPayload,
-    CodeIntelReferencesCompletePayload, CodeIntelReferencesResultsPayload, CodeIntelStatusPayload,
-    CommandErrorPayload, CustomAgentDeletePayload, CustomAgentNotifyPayload,
-    CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FetchSessionHistoryPayload,
-    FrameKind, HeartbeatPayload, HostBootstrapPayload, HostBrowseClosePayload,
-    HostBrowseEntriesPayload, HostBrowseErrorPayload, HostBrowseListPayload,
-    HostBrowseOpenedPayload, HostBrowseStartPayload, HostSettingsPayload,
+    BackendConfigSchemasPayload, BackendConfigSnapshotsPayload, BackendKind,
+    BackendSettingsRefreshPayload, BackendSetupPayload, CancelWorkflowPayload, ChatEvent,
+    ChatMessage, ChatMessageId, ClientErrorPayload, CodeIntelDiagnosticsPayload,
+    CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelHoverResultPayload,
+    CodeIntelNavigateResultPayload, CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
+    CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
+    CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
+    DeleteSessionPayload, Envelope, FetchSessionHistoryPayload, FrameKind, HeartbeatPayload,
+    HostBootstrapPayload, HostBrowseClosePayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
+    HostBrowseListPayload, HostBrowseOpenedPayload, HostBrowseStartPayload, HostSettingsPayload,
     LaunchProfileCatalogPayload, ListSessionsPayload, LoadAgentPayload, McpServerDeletePayload,
     McpServerNotifyPayload, McpServerUpsertPayload, MobileAccessStatePayload,
     MobileDeviceRenamePayload, MobileDeviceRevokePayload, MobilePairingCancelPayload,
@@ -501,6 +501,13 @@ impl ProtocolValidator {
             }
             FrameKind::SkillRefresh => {
                 parse_host_payload::<SkillRefreshPayload>(self, envelope, "SkillRefresh")
+            }
+            FrameKind::BackendSettingsRefresh => {
+                parse_host_payload::<BackendSettingsRefreshPayload>(
+                    self,
+                    envelope,
+                    "BackendSettingsRefresh",
+                )
             }
             FrameKind::McpServerUpsert => {
                 parse_host_payload::<McpServerUpsertPayload>(self, envelope, "McpServerUpsert")
@@ -1953,6 +1960,7 @@ mod tests {
                     code_intel: Default::default(),
                     backend_config: std::collections::HashMap::new(),
                     launch_profiles: Vec::new(),
+                    hermes_disabled_providers: Default::default(),
                 },
                 mobile_access: MobileAccessStatePayload {
                     broker_status: crate::MobileBrokerStatus::Disabled,
@@ -2363,6 +2371,7 @@ mod tests {
                     code_intel: Default::default(),
                     backend_config: std::collections::HashMap::new(),
                     launch_profiles: Vec::new(),
+                    hermes_disabled_providers: Default::default(),
                 },
             },
         )

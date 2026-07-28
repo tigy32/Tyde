@@ -1113,6 +1113,7 @@ pub enum FrameKind {
     SteeringUpsert,
     SteeringDelete,
     SkillRefresh,
+    BackendSettingsRefresh,
     McpServerUpsert,
     McpServerDelete,
     TeamCreate,
@@ -1286,6 +1287,7 @@ impl fmt::Display for FrameKind {
             Self::SteeringUpsert => f.write_str("steering_upsert"),
             Self::SteeringDelete => f.write_str("steering_delete"),
             Self::SkillRefresh => f.write_str("skill_refresh"),
+            Self::BackendSettingsRefresh => f.write_str("backend_settings_refresh"),
             Self::McpServerUpsert => f.write_str("mcp_server_upsert"),
             Self::McpServerDelete => f.write_str("mcp_server_delete"),
             Self::TeamCreate => f.write_str("team_create"),
@@ -2327,6 +2329,15 @@ pub struct HostSettings {
     /// over backend session settings; they are never inferred from model names.
     #[serde(default)]
     pub launch_profiles: Vec<HostLaunchProfileConfig>,
+    /// Provider slugs Tyde must not offer for a given Hermes profile, keyed by
+    /// profile name. Tyde-owned because Hermes itself has no provider
+    /// enable/disable flag: it reports every provider it can find credentials
+    /// for, and auto-harvested ones (GitHub Copilot via the `gh` CLI login)
+    /// come back after a disconnect. Entries here are filtered out of Tyde's
+    /// Hermes model options; they do not touch Hermes's own configuration, so
+    /// a `hermes` session started outside Tyde still sees the provider.
+    #[serde(default)]
+    pub hermes_disabled_providers: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2619,6 +2630,13 @@ pub enum HostSettingValue {
     LaunchProfiles {
         profiles: Vec<HostLaunchProfileConfig>,
     },
+    /// Replace the provider slugs Tyde must not offer for one Hermes profile.
+    /// Scoped to a single profile so two clients editing different profiles
+    /// cannot clobber each other's list.
+    HermesDisabledProviders {
+        profile: String,
+        providers: Vec<String>,
+    },
 }
 
 impl HostSettingValue {
@@ -2669,6 +2687,7 @@ impl HostSettingValue {
             Self::BackendConfig { .. } => HostSettingErrorTarget::BackendConfig,
             Self::BackendNativeSettings { .. } => HostSettingErrorTarget::BackendNativeSettings,
             Self::LaunchProfiles { .. } => HostSettingErrorTarget::LaunchProfiles,
+            Self::HermesDisabledProviders { .. } => HostSettingErrorTarget::HermesDisabledProviders,
         }
     }
 }
@@ -2703,6 +2722,7 @@ pub enum HostSettingErrorTarget {
     BackendConfig,
     BackendNativeSettings,
     LaunchProfiles,
+    HermesDisabledProviders,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4303,6 +4323,15 @@ pub struct SteeringDeletePayload {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillRefreshPayload {}
+
+/// Re-probe one backend's settings snapshot on demand. Backend settings are
+/// otherwise only re-read after a save, so a change made outside Tyde (a
+/// `hermes` CLI login, a hand-edited `config.yaml`) would sit stale until the
+/// next save. Carries no values — the server republishes whatever it finds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendSettingsRefreshPayload {
+    pub backend: BackendKind,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServerUpsertPayload {
@@ -8169,6 +8198,7 @@ mod search_serde_tests {
                 code_intel: CodeIntelSettings::default(),
                 backend_config: HashMap::new(),
                 launch_profiles: Vec::new(),
+                hermes_disabled_providers: Default::default(),
             },
             mobile_access: MobileAccessStatePayload {
                 broker_status: MobileBrokerStatus::Disabled,

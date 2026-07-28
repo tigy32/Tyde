@@ -23,8 +23,9 @@ use protocol::{
     AgentTagsUpdate, AgentWorkflowMetadata, AgentsViewPreferencesNotifyPayload,
     AgentsViewPreferencesSnapshot, AgentsViewPreferencesUpdate, BackendCapacityPayload,
     BackendCapacitySnapshot, BackendCapacityState, BackendConfigSnapshot,
-    BackendConfigSnapshotsPayload, BackendKind, BackendNativeSettingsSnapshot, BackendSetupPayload,
-    BrowseBootstrapListing, BrowseBootstrapPayload, CancelWorkflowPayload, ChatEvent, ChatMessage,
+    BackendConfigSnapshotsPayload, BackendKind, BackendNativeSettingsSnapshot,
+    BackendSettingsRefreshPayload, BackendSetupPayload, BrowseBootstrapListing,
+    BrowseBootstrapPayload, CancelWorkflowPayload, ChatEvent, ChatMessage,
     CodeIntelCancelReferencesPayload, CodeIntelFindReferencesPayload, CodeIntelHoverPayload,
     CodeIntelNavigatePayload, CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
     CodeIntelUnsubscribeFilePayload, CustomAgent, CustomAgentDeletePayload,
@@ -6625,6 +6626,31 @@ impl HostHandle {
         Ok(())
     }
 
+    /// Re-probe one backend's settings snapshot and session schema on demand.
+    /// Backend settings otherwise only re-read after a save, so a change made
+    /// outside Tyde — a `hermes` CLI login, a hand-edited `config.yaml`, a
+    /// profile created in a terminal — would sit stale until the next save.
+    pub(crate) async fn refresh_backend_settings(
+        &self,
+        payload: BackendSettingsRefreshPayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "backend_settings_refresh";
+        if !matches!(payload.backend, BackendKind::Hermes | BackendKind::Tycode) {
+            return Err(AppError::invalid(
+                OPERATION,
+                format!(
+                    "{:?} does not publish a backend-native settings snapshot to refresh",
+                    payload.backend
+                ),
+            ));
+        }
+        self.refresh_backend_config_snapshots_after_native_save()
+            .await;
+        self.refresh_session_schema_for_backend(payload.backend)
+            .await;
+        Ok(())
+    }
+
     pub(crate) async fn refresh_skills(&self, _payload: SkillRefreshPayload) -> AppResult<()> {
         const OPERATION: &str = "skill_refresh";
         let mut state = self.state.lock().await;
@@ -7638,6 +7664,14 @@ impl HostHandle {
             &payload.setting,
             protocol::HostSettingValue::EnabledBackends { .. }
         );
+        // Disabling a Hermes provider changes which models the schema offers,
+        // so the picker has to be rebuilt — otherwise a disabled provider's
+        // models stay selectable until something else forces a re-probe. Only
+        // Hermes is re-probed: nothing else reads this list.
+        let refresh_hermes_schema = matches!(
+            &payload.setting,
+            protocol::HostSettingValue::HermesDisabledProviders { .. }
+        );
         let refresh_backend_config_snapshots = matches!(
             &payload.setting,
             protocol::HostSettingValue::EnabledBackends { .. }
@@ -7657,10 +7691,14 @@ impl HostHandle {
         apply_agent_supervisor_setting(&mut state, &settings);
         state.mobile_access.settings_changed(settings);
         fan_out_launch_profile_catalog(&mut state).await;
-        if refresh_session_schemas || refresh_backend_config_snapshots {
+        if refresh_session_schemas || refresh_backend_config_snapshots || refresh_hermes_schema {
             drop(state);
             if refresh_session_schemas {
                 self.refresh_session_schemas().await;
+            }
+            if refresh_hermes_schema {
+                self.refresh_session_schema_for_backend(BackendKind::Hermes)
+                    .await;
             }
             if refresh_backend_config_snapshots {
                 self.refresh_backend_config_snapshots().await;
@@ -8102,12 +8140,11 @@ impl HostHandle {
                 prev_hermes_ready,
             )
         };
-        let enabled_backends = settings_store
-            .lock()
-            .await
-            .get()
-            .unwrap_or_else(|err| panic!("failed to load host settings for session schemas: {err}"))
-            .enabled_backends;
+        let host_settings = settings_store.lock().await.get().unwrap_or_else(|err| {
+            panic!("failed to load host settings for session schemas: {err}")
+        });
+        let enabled_backends = host_settings.enabled_backends.clone();
+        let hermes_disabled_providers = host_settings.hermes_disabled_providers.clone();
 
         let codex_session_schema = if !probe(protocol::BackendKind::Codex)
             || (!retry_unavailable && !matches!(&previous_codex, CodexSessionSchemaState::Pending))
@@ -8190,9 +8227,10 @@ impl HostHandle {
                 };
                 match hermes_probe_workspace_root() {
                     Ok(workspace_root) => {
-                        match crate::backend::hermes::probe_session_settings_schema(&[
-                            workspace_root,
-                        ])
+                        match crate::backend::hermes::probe_session_settings_schema(
+                            &[workspace_root],
+                            &hermes_disabled_providers,
+                        )
                         .await
                         {
                             Ok(probe) => (
@@ -21705,6 +21743,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             code_intel: Default::default(),
             backend_config: HashMap::new(),
             launch_profiles: Vec::new(),
+            hermes_disabled_providers: Default::default(),
         };
         let debug_mcp = DebugMcpHandle { url: String::new() };
         let agent_control = AgentControlMcpHandle::disabled();

@@ -8795,9 +8795,9 @@ kbd {
     font-size: 0.85rem;
 }
 
-/* Profile switcher. Deliberately boxed chips, because the section tabs below
-   are underlined text — two stacked strips that looked alike would read as one
-   confused two-row tab bar. */
+/* Profile switcher. A dropdown rather than a chip per profile: the list grows
+   without bound (every profile is a directory the user can create), and a
+   wrapping chip grid pushed the settings themselves below the fold. */
 .settings-hermes-profilebar {
     display: flex;
     align-items: flex-start;
@@ -8817,7 +8817,40 @@ kbd {
 .settings-hermes-profiles {
     display: flex;
     flex-wrap: wrap;
+    align-items: center;
     gap: var(--space-2);
+    flex: 1;
+    min-width: 0;
+}
+
+.settings-hermes-profile-select {
+    min-width: 22rem;
+    max-width: 34rem;
+}
+
+.settings-hermes-profile-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+}
+
+/* The create field takes the full row under the picker so the explanatory
+   line about what is (and is not) copied has room to be read. */
+.settings-hermes-profile-create {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+    flex-basis: 100%;
+}
+
+.settings-hermes-profile-create .settings-input {
+    min-width: 14rem;
+}
+
+.settings-hermes-profile-create .settings-description {
+    flex-basis: 100%;
+    margin: 0;
 }
 
 /* Section tabs. Underline style, so they read as navigation rather than as
@@ -8867,34 +8900,6 @@ kbd {
     display: flex;
     flex-direction: column;
     gap: var(--space-3);
-}
-
-.settings-hermes-profile-chip {
-    display: inline-flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 1px;
-    max-width: 20rem;
-    padding: 5px var(--space-3);
-    color: var(--text-secondary);
-    background: var(--surface-1);
-    border: 1px solid var(--border-primary);
-    border-radius: 8px;
-    cursor: pointer;
-    text-align: left;
-    transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
-}
-
-.settings-hermes-profile-chip:hover,
-.settings-hermes-profile-chip:focus-visible {
-    color: var(--text-primary);
-    border-color: var(--border-focus, var(--border-primary));
-}
-
-.settings-hermes-profile-chip-active {
-    color: var(--text-primary);
-    background: var(--surface-2);
-    border-color: var(--accent, var(--border-focus, var(--border-primary)));
 }
 
 .settings-hermes-profile-name {
@@ -9093,6 +9098,20 @@ kbd {
     color: var(--text-tertiary);
     background: var(--surface-2);
     border-color: var(--border-primary);
+}
+
+/* A provider Tyde is hiding. Deliberately not the danger colour: the provider
+   is connected and healthy, it is just switched off on Tyde's side. */
+.settings-hermes-badge-off {
+    color: var(--warning, #e8c56a);
+    background: rgba(232, 197, 106, 0.12);
+    border-color: rgba(232, 197, 106, 0.35);
+}
+
+.settings-hermes-provider-note {
+    margin: var(--space-1) 0 0;
+    font-size: 0.78rem;
+    color: var(--text-tertiary);
 }
 
 /* --- Add-a-provider dialog ---

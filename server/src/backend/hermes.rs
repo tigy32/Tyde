@@ -766,17 +766,37 @@ pub(crate) async fn probe_model_options(
     workspace_roots: &[String],
     profile: &HermesProfileRef,
 ) -> Result<Value, String> {
-    let (gateway, _events) = HermesGatewayHandle::spawn(
+    probe_profile_surfaces(workspace_roots, profile).await.0
+}
+
+/// Probe one profile's gateway for everything the settings page needs, on a
+/// single gateway spawn. Spawning a Hermes gateway is the expensive part of a
+/// snapshot (one per profile), so the toolset catalogue rides along with the
+/// model options rather than paying for a second one.
+///
+/// The two results are independent: a failed `toolsets.list` leaves the
+/// provider list intact and vice versa, because each only disables the control
+/// it feeds.
+pub(crate) async fn probe_profile_surfaces(
+    workspace_roots: &[String],
+    profile: &HermesProfileRef,
+) -> (Result<Value, String>, Result<Value, String>) {
+    let spawned = HermesGatewayHandle::spawn(
         workspace_roots,
         &[],
         &protocol::ToolPolicy::Unrestricted,
         profile,
         None,
     )
-    .await?;
+    .await;
+    let (gateway, _events) = match spawned {
+        Ok(spawned) => spawned,
+        Err(error) => return (Err(error.clone()), Err(error)),
+    };
     let options = gateway.request("model.options", json!({})).await;
+    let toolsets = gateway.request("toolsets.list", json!({})).await;
     gateway.shutdown().await;
-    options
+    (options, toolsets)
 }
 
 /// Build the Hermes backend-native settings snapshot: every discovered
@@ -825,16 +845,17 @@ async fn native_settings_doc(
     let probes = futures_util::future::join_all(
         profiles
             .iter()
-            .map(|profile| probe_model_options(workspace_roots, profile)),
+            .map(|profile| probe_profile_surfaces(workspace_roots, profile)),
     )
     .await;
 
     let mut doc = protocol::hermes_config::HermesNativeSettingsDoc {
         version: HERMES_NATIVE_SETTINGS_VERSION,
         profiles: Vec::new(),
+        profile_actions: Vec::new(),
         actions: Vec::new(),
     };
-    for (profile, payload) in profiles.iter().zip(probes) {
+    for (profile, (options, toolsets)) in profiles.iter().zip(probes) {
         let config = hermes_config::load_profile_config(&profile.home_dir)?;
         let mut settings = HermesProfileSettings {
             name: profile.name.clone(),
@@ -845,8 +866,9 @@ async fn native_settings_doc(
             providers_error: None,
             active_model: None,
             active_provider: None,
+            toolsets: None,
         };
-        match payload.and_then(|payload| {
+        match options.and_then(|payload| {
             provider_states_from_payload(&payload).map(|providers| (payload, providers))
         }) {
             Ok((payload, providers)) => {
@@ -858,9 +880,41 @@ async fn native_settings_doc(
             }
             Err(error) => settings.providers_error = Some(error),
         }
+        // A toolset probe failure is not surfaced as an error: the catalogue
+        // only upgrades the disabled-toolsets control from free text to a
+        // picker, so losing it degrades that one control instead of the page.
+        settings.toolsets = toolsets
+            .ok()
+            .and_then(|payload| toolset_infos_from_payload(&payload));
         doc.profiles.push(settings);
     }
     Ok(doc)
+}
+
+/// Parse a `toolsets.list` payload. Returns `None` when the payload is not the
+/// expected shape, so a Hermes that changes it degrades the control instead of
+/// rendering a half-parsed catalogue as if it were complete.
+fn toolset_infos_from_payload(
+    value: &Value,
+) -> Option<Vec<protocol::hermes_config::HermesToolsetInfo>> {
+    let toolsets = value.get("toolsets")?.as_array()?;
+    let mut infos = Vec::with_capacity(toolsets.len());
+    for toolset in toolsets {
+        let name = toolset.get("name")?.as_str()?.trim().to_owned();
+        if name.is_empty() {
+            return None;
+        }
+        infos.push(protocol::hermes_config::HermesToolsetInfo {
+            name,
+            description: optional_string(toolset, &["description"])
+                .filter(|text| !text.trim().is_empty()),
+            tool_count: toolset
+                .get("tool_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32,
+        });
+    }
+    Some(infos)
 }
 
 fn provider_states_from_payload(
@@ -879,11 +933,23 @@ fn provider_states_from_payload(
             .get("authenticated")
             .and_then(Value::as_bool)
             .ok_or_else(|| format!("{context}.authenticated must be a bool"))?;
-        let model_count = provider
+        // Hermes reports a provider's curated model ids here; carrying them
+        // through is what lets the default-model and fallback controls be
+        // dropdowns. Non-string entries are skipped rather than stringified —
+        // an id Tyde invented would be saved and then rejected by Hermes.
+        let models: Vec<String> = provider
             .get("models")
             .and_then(Value::as_array)
-            .map(|models| models.len() as u32)
-            .unwrap_or(0);
+            .map(|models| {
+                models
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
         states.push(protocol::hermes_config::HermesProviderState {
             slug,
             name,
@@ -891,7 +957,8 @@ fn provider_states_from_payload(
             auth_type: optional_string(provider, &["auth_type"]),
             key_env: optional_string(provider, &["key_env"]),
             warning: optional_string(provider, &["warning"]),
-            model_count,
+            model_count: models.len() as u32,
+            models,
         });
     }
     Ok(states)
@@ -926,6 +993,7 @@ pub(crate) async fn persist_native_settings(
 ) -> Result<HermesNativeSettingsSaveOutcome, String> {
     use protocol::hermes_config::{
         HERMES_NATIVE_SETTINGS_VERSION, HermesCredentialAction, HermesNativeSettingsDoc,
+        HermesProfileAction,
     };
 
     let doc: HermesNativeSettingsDoc = serde_json::from_value(settings)
@@ -949,6 +1017,57 @@ pub(crate) async fn persist_native_settings(
         })?;
     }
 
+    // A deleted profile's own config section is meaningless — the directory
+    // holding it is about to be removed — so collect the targets up front and
+    // skip them below instead of resolving a profile that will not exist.
+    let deleted_profiles: Vec<&str> = doc
+        .profile_actions
+        .iter()
+        .filter_map(|action| match action {
+            HermesProfileAction::DeleteProfile { name } => Some(name.as_str()),
+            HermesProfileAction::CreateProfile { .. } => None,
+        })
+        .collect();
+    for action in &doc.actions {
+        let profile_name = match action {
+            HermesCredentialAction::SaveApiKey { profile, .. }
+            | HermesCredentialAction::Disconnect { profile, .. } => profile.as_str(),
+        };
+        if deleted_profiles.contains(&profile_name) {
+            return Err(format!(
+                "cannot change credentials for Hermes profile '{profile_name}' in the same \
+                 save that deletes it"
+            ));
+        }
+    }
+
+    // Saves are serialized so two clients cannot interleave their
+    // check-then-write sequences and silently overwrite each other. The lock
+    // covers the profile actions too: a create must be visible to this save's
+    // own credential and config steps, and a concurrent save must not resolve
+    // a profile this one is in the middle of deleting.
+    static HERMES_PERSIST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _persist_guard = HERMES_PERSIST_LOCK.lock().await;
+
+    // Profile directories first, so the rest of this save sees the result.
+    // A failure here aborts the whole save rather than degrading to a partial
+    // outcome: the later steps are written against profiles that were supposed
+    // to exist (or not) and would otherwise act on the wrong set.
+    let home = hermes_config::hermes_home_dir()?;
+    for action in &doc.profile_actions {
+        match action {
+            HermesProfileAction::CreateProfile {
+                name,
+                copy_config_from,
+            } => {
+                hermes_config::create_profile_in(&home, name, copy_config_from.as_deref())?;
+            }
+            HermesProfileAction::DeleteProfile { name } => {
+                hermes_config::delete_profile_in(&home, name)?;
+            }
+        }
+    }
+
     // Group credential actions per profile so each profile pays for one
     // gateway spawn, and run them before config writes so a newly keyed
     // provider is usable by the saved config.
@@ -968,15 +1087,10 @@ pub(crate) async fn persist_native_settings(
         }
     }
     // Resolve profiles and conflict-check against the client's base BEFORE
-    // any mutation, so credential actions never run for a save whose config
-    // sections would then be refused: a save based on a stale snapshot must
-    // not silently overwrite whatever changed the config in the meantime
+    // any config mutation, so credential actions never run for a save whose
+    // config sections would then be refused: a save based on a stale snapshot
+    // must not silently overwrite whatever changed the config in the meantime
     // (Hermes CLI, another client).
-    // Saves are serialized so two clients cannot interleave their
-    // check-then-write sequences and silently overwrite each other.
-    static HERMES_PERSIST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let _persist_guard = HERMES_PERSIST_LOCK.lock().await;
-
     let stale_save = |name: &str| {
         format!(
             "Hermes profile '{name}' configuration changed since it was loaded; \
@@ -985,6 +1099,9 @@ pub(crate) async fn persist_native_settings(
     };
     let mut config_writes = Vec::new();
     for profile_settings in &doc.profiles {
+        if deleted_profiles.contains(&profile_settings.name.as_str()) {
+            continue;
+        }
         let profile = hermes_config::resolve_profile_ref(Some(&profile_settings.name))?;
         let current = hermes_config::load_profile_config(&profile.home_dir)?;
         if current == profile_settings.config {
@@ -1120,6 +1237,7 @@ pub(crate) struct HermesSessionSchemaProbe {
 
 pub(crate) async fn probe_session_settings_schema(
     workspace_roots: &[String],
+    disabled_providers: &HashMap<String, Vec<String>>,
 ) -> Result<HermesSessionSchemaProbe, String> {
     let profiles = hermes_config::discover_profiles()?;
     let probes = futures_util::future::join_all(
@@ -1128,7 +1246,7 @@ pub(crate) async fn probe_session_settings_schema(
             .map(|profile| probe_model_options(workspace_roots, profile)),
     )
     .await;
-    session_schema_probe_from_model_options(&profiles, probes)
+    session_schema_probe_from_model_options(&profiles, probes, disabled_providers)
 }
 
 /// Assemble the session schema from per-profile `model.options` payloads.
@@ -1139,6 +1257,7 @@ pub(crate) async fn probe_session_settings_schema(
 fn session_schema_probe_from_model_options(
     profiles: &[HermesProfileRef],
     payloads: Vec<Result<Value, String>>,
+    disabled_providers: &HashMap<String, Vec<String>>,
 ) -> Result<HermesSessionSchemaProbe, String> {
     struct ProfileModels {
         name: String,
@@ -1149,8 +1268,12 @@ fn session_schema_probe_from_model_options(
     let mut infos = Vec::new();
     let mut per_profile = Vec::new();
     for (profile, payload) in profiles.iter().zip(payloads) {
+        let disabled = disabled_providers
+            .get(&profile.name)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         let parsed = payload.and_then(|payload| {
-            model_select_options_from_payload(&payload)
+            model_select_options_from_payload(&payload, disabled)
                 .map(|(options, default)| (options, default, model_summary_from_payload(&payload)))
         });
         match parsed {
@@ -4130,8 +4253,13 @@ fn non_empty_trimmed(value: &str) -> Option<String> {
 
 /// Parse a `model.options` payload into the per-profile model Select options
 /// plus the option matching the profile's current selection.
+/// `disabled` holds provider slugs Tyde must not offer for this profile (see
+/// [`protocol::HostSettings::hermes_disabled_providers`]). They are dropped
+/// after parsing, never before: a malformed provider row is still a malformed
+/// payload whether or not the user has hidden that provider.
 fn model_select_options_from_payload(
     value: &Value,
+    disabled: &[String],
 ) -> Result<(Vec<SelectOption>, Option<String>), String> {
     let providers = value
         .get("providers")
@@ -4179,7 +4307,7 @@ fn model_select_options_from_payload(
                     "Hermes model.options providers[{provider_index}] '{slug}' models[{model_index}] must be non-empty"
                 ));
             };
-            if !authenticated {
+            if !authenticated || disabled.contains(&slug) {
                 continue;
             }
             let option_value = encode_model_option_value(&model, Some(&slug));
@@ -4197,10 +4325,19 @@ fn model_select_options_from_payload(
     }
 
     if model_options.is_empty() {
-        return Err(
+        // Say which of the two causes it is. "No models" reads as a broken
+        // Hermes install, and sending the user hunting for that when they
+        // simply disabled every provider in Tyde would be actively misleading.
+        return Err(if disabled.is_empty() {
             "Hermes model.options reported no authenticated providers with selectable models"
-                .to_string(),
-        );
+                .to_string()
+        } else {
+            format!(
+                "every authenticated Hermes provider is disabled in Tyde for this profile \
+                 ({}); re-enable one in the Hermes settings Providers tab",
+                disabled.join(", ")
+            )
+        });
     }
 
     Ok((model_options, model_default))
@@ -6581,9 +6718,12 @@ for line in sys.stdin:
         let home = TempDir::new().expect("hermes home");
         let _home_guard = TestHermesHomeGuard::set(home.path());
 
-        let probe = probe_session_settings_schema(&[dir.path().to_string_lossy().to_string()])
-            .await
-            .expect("schema");
+        let probe = probe_session_settings_schema(
+            &[dir.path().to_string_lossy().to_string()],
+            &HashMap::new(),
+        )
+        .await
+        .expect("schema");
 
         assert!(
             probe.schema.fields.iter().any(|field| field.key == "model"),
@@ -6709,6 +6849,7 @@ for line in sys.stdin:
                 Ok(claude_payload),
                 Err("gateway exploded".to_string()),
             ],
+            &HashMap::new(),
         )
         .expect("probe");
 
@@ -6770,6 +6911,77 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn hermes_disabled_providers_are_dropped_from_model_options() {
+        let payload = json!({
+            "provider": "bedrock",
+            "model": "claude-fable-5",
+            "providers": [
+                {
+                    "slug": "copilot", "name": "GitHub Copilot", "authenticated": true,
+                    "models": ["gpt-5.5", "claude-opus-4.8"]
+                },
+                {
+                    "slug": "bedrock", "name": "AWS Bedrock", "authenticated": true,
+                    "models": ["claude-fable-5"]
+                }
+            ]
+        });
+        let profiles = vec![HermesProfileRef {
+            name: protocol::hermes_config::HERMES_DEFAULT_PROFILE.to_string(),
+            home_dir: PathBuf::from("/hermes-home"),
+        }];
+        let disabled = HashMap::from([("default".to_string(), vec!["copilot".to_string()])]);
+
+        let probe =
+            session_schema_probe_from_model_options(&profiles, vec![Ok(payload)], &disabled)
+                .expect("probe");
+        let model_field = probe
+            .schema
+            .fields
+            .iter()
+            .find(|field| field.key == "model")
+            .expect("model field");
+        let SessionSettingFieldType::Select { options, .. } = &model_field.field_type else {
+            panic!("model field must be a select: {model_field:?}");
+        };
+        let values: Vec<&str> = options.iter().map(|o| o.value.as_str()).collect();
+        assert!(
+            values.iter().all(|value| !value.contains("copilot")),
+            "a disabled provider's models must not be offered: {values:?}"
+        );
+        assert!(
+            values.iter().any(|value| value.contains("bedrock")),
+            "an enabled provider must still be offered: {values:?}"
+        );
+    }
+
+    #[test]
+    fn hermes_disabling_every_provider_says_so_instead_of_blaming_hermes() {
+        let payload = json!({
+            "provider": "bedrock",
+            "model": "claude-fable-5",
+            "providers": [{
+                "slug": "bedrock", "name": "AWS Bedrock", "authenticated": true,
+                "models": ["claude-fable-5"]
+            }]
+        });
+        let profiles = vec![HermesProfileRef {
+            name: protocol::hermes_config::HERMES_DEFAULT_PROFILE.to_string(),
+            home_dir: PathBuf::from("/hermes-home"),
+        }];
+        let disabled = HashMap::from([("default".to_string(), vec!["bedrock".to_string()])]);
+
+        let error =
+            session_schema_probe_from_model_options(&profiles, vec![Ok(payload)], &disabled)
+                .expect_err("no selectable models must fail the schema");
+        assert!(
+            error.contains("disabled in Tyde"),
+            "the user disabled these, so the message must point at Tyde's own list: {error}"
+        );
+        assert!(error.contains("bedrock"), "{error}");
+    }
+
+    #[test]
     fn hermes_schema_fails_when_default_profile_probe_fails() {
         let profiles = vec![HermesProfileRef {
             name: "default".to_string(),
@@ -6778,6 +6990,7 @@ for line in sys.stdin:
         let error = session_schema_probe_from_model_options(
             &profiles,
             vec![Err("no authenticated providers".to_string())],
+            &HashMap::new(),
         )
         .expect_err("default profile failure must fail the schema");
         assert!(error.contains("no authenticated providers"), "{error}");
@@ -6900,6 +7113,7 @@ for line in sys.stdin:
         changed.model.model = Some("new/model".to_string());
         let doc = protocol::hermes_config::HermesNativeSettingsDoc {
             version: protocol::hermes_config::HERMES_NATIVE_SETTINGS_VERSION,
+            profile_actions: Vec::new(),
             profiles: vec![protocol::hermes_config::HermesProfileSettings {
                 name: "work".to_string(),
                 home_dir: profile_home.to_string_lossy().to_string(),
@@ -6909,6 +7123,7 @@ for line in sys.stdin:
                 providers_error: None,
                 active_model: None,
                 active_provider: None,
+                toolsets: None,
             }],
             actions: vec![
                 protocol::hermes_config::HermesCredentialAction::Disconnect {
@@ -6967,6 +7182,7 @@ for line in sys.stdin:
         // drop comments); build the doc directly from disk without a gateway.
         let doc = protocol::hermes_config::HermesNativeSettingsDoc {
             version: protocol::hermes_config::HERMES_NATIVE_SETTINGS_VERSION,
+            profile_actions: Vec::new(),
             profiles: vec![protocol::hermes_config::HermesProfileSettings {
                 name: "default".to_string(),
                 home_dir: home.path().to_string_lossy().to_string(),
@@ -6976,6 +7192,7 @@ for line in sys.stdin:
                 providers_error: None,
                 active_model: None,
                 active_provider: None,
+                toolsets: None,
             }],
             actions: Vec::new(),
         };
@@ -6987,6 +7204,112 @@ for line in sys.stdin:
         assert_eq!(after, original, "unchanged profile must not be rewritten");
     }
 
+    /// A save carrying profile actions applies them before anything else, so
+    /// the rest of that same save sees the resulting set of profiles.
+    #[tokio::test]
+    async fn hermes_persist_applies_profile_actions_before_config_writes() {
+        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
+        let home = TempDir::new().expect("hermes home");
+        fs::write(
+            home.path().join("config.yaml"),
+            "model:\n  provider: bedrock\n",
+        )
+        .expect("write config");
+        // A profile with history, to prove a delete takes the whole home.
+        let doomed = home.path().join("profiles/doomed");
+        fs::create_dir_all(doomed.join("sessions")).expect("profile dir");
+        fs::write(doomed.join("state.db"), "sqlite").expect("state");
+        let _home_guard = TestHermesHomeGuard::set(home.path());
+
+        let mut doc = protocol::hermes_config::HermesNativeSettingsDoc {
+            version: protocol::hermes_config::HERMES_NATIVE_SETTINGS_VERSION,
+            profile_actions: vec![
+                protocol::hermes_config::HermesProfileAction::CreateProfile {
+                    name: "fresh".to_string(),
+                    copy_config_from: None,
+                },
+                protocol::hermes_config::HermesProfileAction::DeleteProfile {
+                    name: "doomed".to_string(),
+                },
+            ],
+            profiles: Vec::new(),
+            actions: Vec::new(),
+        };
+        // The doomed profile is still in the client's document, exactly as a
+        // real save would carry it — it was on screen when the user hit
+        // delete. Its config section must be skipped, not resolved.
+        doc.profiles
+            .push(protocol::hermes_config::HermesProfileSettings {
+                name: "doomed".to_string(),
+                home_dir: doomed.to_string_lossy().to_string(),
+                config: protocol::hermes_config::HermesProfileConfig::default(),
+                base_config: Some(protocol::hermes_config::HermesProfileConfig::default()),
+                providers: None,
+                providers_error: None,
+                active_model: None,
+                active_provider: None,
+                toolsets: None,
+            });
+
+        persist_native_settings(serde_json::to_value(&doc).expect("doc"), &[])
+            .await
+            .expect("persist");
+
+        assert!(!doomed.exists(), "a deleted profile's whole home must go");
+        let fresh = home.path().join("profiles/fresh");
+        assert!(fresh.is_dir(), "the created profile must exist");
+        assert_eq!(
+            fs::read_to_string(fresh.join("config.yaml")).expect("copied config"),
+            "model:\n  provider: bedrock\n",
+            "a new profile starts from the source profile's config"
+        );
+
+        let names: Vec<String> = hermes_config::discover_profiles_in(home.path())
+            .expect("discover")
+            .into_iter()
+            .map(|profile| profile.name)
+            .collect();
+        assert_eq!(names, vec!["default".to_string(), "fresh".to_string()]);
+    }
+
+    /// Credentials are applied against a profile by name. Letting a save both
+    /// delete a profile and key it would run one of those against a directory
+    /// the other just removed, so the pair is refused outright.
+    #[tokio::test]
+    async fn hermes_persist_refuses_crediting_a_profile_the_same_save_deletes() {
+        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
+        let home = TempDir::new().expect("hermes home");
+        let profile = home.path().join("profiles/work");
+        fs::create_dir_all(&profile).expect("profile dir");
+        let _home_guard = TestHermesHomeGuard::set(home.path());
+
+        let doc = protocol::hermes_config::HermesNativeSettingsDoc {
+            version: protocol::hermes_config::HERMES_NATIVE_SETTINGS_VERSION,
+            profile_actions: vec![
+                protocol::hermes_config::HermesProfileAction::DeleteProfile {
+                    name: "work".to_string(),
+                },
+            ],
+            profiles: Vec::new(),
+            actions: vec![
+                protocol::hermes_config::HermesCredentialAction::SaveApiKey {
+                    profile: "work".to_string(),
+                    provider: "openrouter".to_string(),
+                    api_key: "sk-test".to_string(),
+                },
+            ],
+        };
+
+        let error = persist_native_settings(serde_json::to_value(&doc).expect("doc"), &[])
+            .await
+            .expect_err("a delete + credential save must be refused");
+        assert!(error.contains("same save that deletes it"), "{error}");
+        assert!(
+            profile.is_dir(),
+            "a refused save must not have deleted anything"
+        );
+    }
+
     fn default_profile_doc(
         home: &Path,
         config: protocol::hermes_config::HermesProfileConfig,
@@ -6994,6 +7317,7 @@ for line in sys.stdin:
     ) -> protocol::hermes_config::HermesNativeSettingsDoc {
         protocol::hermes_config::HermesNativeSettingsDoc {
             version: protocol::hermes_config::HERMES_NATIVE_SETTINGS_VERSION,
+            profile_actions: Vec::new(),
             profiles: vec![protocol::hermes_config::HermesProfileSettings {
                 name: "default".to_string(),
                 home_dir: home.to_string_lossy().to_string(),
@@ -7003,6 +7327,7 @@ for line in sys.stdin:
                 providers_error: None,
                 active_model: None,
                 active_provider: None,
+                toolsets: None,
             }],
             actions: Vec::new(),
         }
@@ -7621,8 +7946,12 @@ for line in sys.stdin:
             name: protocol::hermes_config::HERMES_DEFAULT_PROFILE.to_string(),
             home_dir: PathBuf::from("/nonexistent-hermes-home"),
         }];
-        session_schema_probe_from_model_options(&profiles, vec![Ok(payload.clone())])
-            .map(|probe| probe.schema)
+        session_schema_probe_from_model_options(
+            &profiles,
+            vec![Ok(payload.clone())],
+            &HashMap::new(),
+        )
+        .map(|probe| probe.schema)
     }
 
     #[test]

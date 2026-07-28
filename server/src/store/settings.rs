@@ -352,6 +352,30 @@ fn apply_setting(settings: &mut HostSettings, setting: HostSettingValue) -> Resu
         HostSettingValue::LaunchProfiles { profiles } => {
             settings.launch_profiles = validate_launch_profile_configs(profiles)?;
         }
+        HostSettingValue::HermesDisabledProviders { profile, providers } => {
+            let profile = profile.trim();
+            if profile.is_empty() {
+                return Err("hermes disabled providers need a profile name".to_owned());
+            }
+            let mut slugs: Vec<String> = Vec::new();
+            for slug in providers {
+                let slug = slug.trim().to_owned();
+                if slug.is_empty() || slugs.contains(&slug) {
+                    continue;
+                }
+                slugs.push(slug);
+            }
+            slugs.sort();
+            // An empty list is "nothing disabled", so drop the key entirely
+            // rather than persisting an empty vec that reads as configuration.
+            if slugs.is_empty() {
+                settings.hermes_disabled_providers.remove(profile);
+            } else {
+                settings
+                    .hermes_disabled_providers
+                    .insert(profile.to_owned(), slugs);
+            }
+        }
         HostSettingValue::BackgroundAgentFeatureEnabled { feature, enabled } => match feature {
             BackgroundAgentFeature::AutoGenerateAgentNames => {
                 settings.background_agent_features.auto_generate_agent_names = enabled;
@@ -532,6 +556,7 @@ fn empty_settings() -> HostSettings {
         code_intel: Default::default(),
         backend_config: std::collections::HashMap::new(),
         launch_profiles: Vec::new(),
+        hermes_disabled_providers: std::collections::HashMap::new(),
     }
 }
 
@@ -584,6 +609,28 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
 
     let code_intel = validate_code_intel_settings(settings.code_intel)?;
     let launch_profiles = validate_launch_profile_configs(settings.launch_profiles)?;
+    // Normalize on load exactly as `apply_setting` does on write, so a
+    // hand-edited store file cannot leave blank slugs or an empty list behind
+    // — an empty list would read as "this profile has a disable list" in the
+    // UI while disabling nothing.
+    let hermes_disabled_providers = settings
+        .hermes_disabled_providers
+        .into_iter()
+        .filter_map(|(profile, slugs)| {
+            let profile = profile.trim().to_owned();
+            if profile.is_empty() {
+                return None;
+            }
+            let mut slugs: Vec<String> = slugs
+                .into_iter()
+                .map(|slug| slug.trim().to_owned())
+                .filter(|slug| !slug.is_empty())
+                .collect();
+            slugs.sort();
+            slugs.dedup();
+            (!slugs.is_empty()).then_some((profile, slugs))
+        })
+        .collect();
 
     // Sanitize each backend's persisted deep config against its current schema
     // so a value that is no longer valid (renamed key, changed options) is
@@ -611,6 +658,7 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
         code_intel,
         backend_config,
         launch_profiles,
+        hermes_disabled_providers,
     })
 }
 
@@ -756,6 +804,76 @@ mod tests {
             vec![BackendKind::Claude, BackendKind::Codex]
         );
         assert_eq!(settings.default_backend, Some(BackendKind::Claude));
+    }
+
+    /// Hermes has no provider enable/disable flag, so Tyde owns this list. It
+    /// is scoped per profile, and clearing it must remove the key rather than
+    /// persist an empty vec — an empty list would read as "this profile has a
+    /// disable list" while disabling nothing.
+    #[test]
+    fn hermes_disabled_providers_are_per_profile_and_clear_to_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        let store = HostSettingsStore::load(path.clone()).expect("load empty store");
+
+        store
+            .apply(HostSettingValue::HermesDisabledProviders {
+                profile: "default".to_owned(),
+                // Duplicates and padding are normalized, not persisted as-is.
+                providers: vec![
+                    " copilot ".to_owned(),
+                    "copilot".to_owned(),
+                    String::new(),
+                    "bedrock".to_owned(),
+                ],
+            })
+            .expect("disable providers");
+        store
+            .apply(HostSettingValue::HermesDisabledProviders {
+                profile: "work".to_owned(),
+                providers: vec!["openrouter".to_owned()],
+            })
+            .expect("disable providers for another profile");
+
+        let settings = store.get().expect("get settings");
+        assert_eq!(
+            settings.hermes_disabled_providers.get("default"),
+            Some(&vec!["bedrock".to_owned(), "copilot".to_owned()])
+        );
+        // Editing one profile must not disturb another's list.
+        assert_eq!(
+            settings.hermes_disabled_providers.get("work"),
+            Some(&vec!["openrouter".to_owned()])
+        );
+
+        store
+            .apply(HostSettingValue::HermesDisabledProviders {
+                profile: "default".to_owned(),
+                providers: Vec::new(),
+            })
+            .expect("re-enable everything");
+        let settings = store.get().expect("get settings");
+        assert!(
+            !settings.hermes_disabled_providers.contains_key("default"),
+            "clearing the list must drop the key, not store an empty one"
+        );
+        assert_eq!(
+            settings.hermes_disabled_providers.get("work"),
+            Some(&vec!["openrouter".to_owned()]),
+            "clearing one profile must leave the others alone"
+        );
+
+        // The list has to survive a reload — it is what keeps a provider out
+        // of the model picker across restarts.
+        let reloaded = HostSettingsStore::load(path).expect("reload store");
+        assert_eq!(
+            reloaded
+                .get()
+                .expect("get settings")
+                .hermes_disabled_providers
+                .get("work"),
+            Some(&vec!["openrouter".to_owned()])
+        );
     }
 
     #[test]

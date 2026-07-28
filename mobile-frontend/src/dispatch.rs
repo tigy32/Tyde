@@ -120,6 +120,7 @@ pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
             code_intel: Default::default(),
             backend_config: std::collections::HashMap::new(),
             launch_profiles: Vec::new(),
+            hermes_disabled_providers: Default::default(),
         },
         mobile_access: BootstrapMobileAccess {
             broker_status: BootstrapBrokerStatus::Disabled,
@@ -3942,6 +3943,7 @@ mod wasm_tests {
                 code_intel: Default::default(),
                 backend_config: std::collections::HashMap::new(),
                 launch_profiles: Vec::new(),
+                hermes_disabled_providers: Default::default(),
             },
             mobile_access: protocol::MobileAccessStatePayload {
                 broker_status: protocol::MobileBrokerStatus::Disabled,

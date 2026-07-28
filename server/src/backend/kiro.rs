@@ -4731,6 +4731,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"sessionId":"kiro-real-legacy-s
                     code_intel: Default::default(),
                     backend_config: std::collections::HashMap::new(),
                     launch_profiles: Vec::new(),
+                    hermes_disabled_providers: Default::default(),
                 },
                 mobile_access: protocol::MobileAccessStatePayload {
                     broker_status: protocol::MobileBrokerStatus::Disabled,

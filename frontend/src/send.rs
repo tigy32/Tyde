@@ -7,10 +7,11 @@ use std::task::{Context, Poll, Waker};
 use protocol::types::{AgentCompactPayload, TeamCompactPayload};
 use protocol::{
     AgentGroupsUpdate, AgentPinsUpdate, AgentTagsUpdate, AgentsSmartViewsUpdate,
-    AgentsViewPreferencesUpdate, CancelWorkflowPayload, CloseAgentPayload, CustomAgent,
-    CustomAgentDeletePayload, CustomAgentId, CustomAgentUpsertPayload, Envelope, FrameKind,
-    ImageData, McpServerConfig, McpServerDeletePayload, McpServerId, McpServerUpsertPayload,
-    MobileDeviceId, MobileDeviceRevokePayload, MobilePairingCancelPayload, MobilePairingOfferId,
+    AgentsViewPreferencesUpdate, BackendKind, BackendSettingsRefreshPayload, CancelWorkflowPayload,
+    CloseAgentPayload, CustomAgent, CustomAgentDeletePayload, CustomAgentId,
+    CustomAgentUpsertPayload, Envelope, FrameKind, ImageData, McpServerConfig,
+    McpServerDeletePayload, McpServerId, McpServerUpsertPayload, MobileDeviceId,
+    MobileDeviceRevokePayload, MobilePairingCancelPayload, MobilePairingOfferId,
     MobilePairingStartPayload, ProjectId, SetAgentGroupsPayload, SetAgentPinsPayload,
     SetAgentTagsPayload, SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload,
     SkillRefreshPayload, Steering, SteeringDeletePayload, SteeringId, SteeringUpsertPayload,
@@ -588,6 +589,20 @@ pub async fn skill_refresh(host_id: &str, host_stream: StreamPath) -> Result<(),
         host_stream,
         FrameKind::SkillRefresh,
         &SkillRefreshPayload {},
+    )
+    .await
+}
+
+pub async fn backend_settings_refresh(
+    host_id: &str,
+    host_stream: StreamPath,
+    backend: BackendKind,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::BackendSettingsRefresh,
+        &BackendSettingsRefreshPayload { backend },
     )
     .await
 }

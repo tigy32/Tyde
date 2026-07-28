@@ -41,8 +41,8 @@ use crate::state::{AppState, NativeSettingsSaveState};
 
 use protocol::hermes_config::{
     HERMES_DEFAULT_PROFILE, HERMES_NATIVE_SETTINGS_VERSION, HermesCredentialAction,
-    HermesFallbackProvider, HermesNativeSettingsDoc, HermesProfileConfig, HermesProfileSettings,
-    HermesProviderState,
+    HermesFallbackProvider, HermesNativeSettingsDoc, HermesProfileAction, HermesProfileConfig,
+    HermesProfileSettings, HermesProviderState,
 };
 use protocol::{
     BackendConfigSnapshotStatus, BackendKind, BackendNativeSettingsSnapshot, FrameKind,
@@ -73,6 +73,8 @@ fn HermesSettingsBody(host_id: String) -> impl IntoView {
         tab: RwSignal::new(HermesTab::Providers),
         key_dialog: RwSignal::new(None),
         provider_query: RwSignal::new(String::new()),
+        new_profile: RwSignal::new(None),
+        delete_profile: RwSignal::new(None),
     };
     let drafts = view_state.drafts;
 
@@ -245,6 +247,14 @@ struct HermesViewState {
     /// that provider's key field or sign-in instructions.
     key_dialog: RwSignal<Option<(String, Option<String>)>>,
     provider_query: RwSignal<String>,
+    /// Name being typed into the create-profile field, or `None` when the
+    /// field is closed. Separate from `selected_profile` so an in-progress
+    /// name survives a snapshot republish.
+    new_profile: RwSignal<Option<String>>,
+    /// Profile whose delete confirmation is open. Deleting is destructive
+    /// enough to need a typed confirmation, and `window.prompt` is silently
+    /// no-op'd inside Tauri's webview, so the confirmation is an in-page modal.
+    delete_profile: RwSignal<Option<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +377,92 @@ fn queue_credential_action(state: &AppState, host_id: &str, action: HermesCreden
     send_hermes_save(state, host_id, base, &doc);
 }
 
+/// Immediate profile create/delete. Like a credential action this carries the
+/// ORIGINAL snapshot config sections, never the local drafts: adding or
+/// removing a profile must not silently commit unrelated config edits.
+fn queue_profile_action(state: &AppState, host_id: &str, action: HermesProfileAction) {
+    let Some((mut doc, base)) = current_doc_untracked(state, host_id) else {
+        mark_save_failed(
+            state,
+            host_id,
+            "Cannot change profiles: no current Hermes settings document.",
+        );
+        return;
+    };
+    doc.profile_actions = vec![action];
+    for profile in &mut doc.profiles {
+        profile.base_config = Some(profile.config.clone());
+    }
+    send_hermes_save(state, host_id, base, &doc);
+}
+
+/// Ask the host to re-probe Hermes. Nothing is saved: this exists because a
+/// change made outside Tyde (a `hermes` CLI login, a hand-edited config, a
+/// profile created in a terminal) is otherwise invisible until the next save.
+fn refresh_hermes_settings(state: &AppState, host_id: &str) {
+    let Some(host_stream) = state.host_stream_untracked(host_id) else {
+        mark_save_failed(
+            state,
+            host_id,
+            "Cannot refresh: the selected host is not connected.",
+        );
+        return;
+    };
+    let state = state.clone();
+    let host_id = host_id.to_owned();
+    spawn_local(async move {
+        if let Err(error) =
+            crate::send::backend_settings_refresh(&host_id, host_stream, BackendKind::Hermes).await
+        {
+            log::error!("failed to send Hermes BackendSettingsRefresh: {error}");
+            mark_save_failed(
+                &state,
+                &host_id,
+                "Failed to refresh settings. Check the connection and try again.",
+            );
+        }
+    });
+}
+
+/// Replace the Tyde-owned list of providers this profile must not offer. This
+/// is a Tyde host setting, not Hermes configuration: Hermes has no provider
+/// enable/disable flag, so hiding one can only ever be Tyde's own decision.
+fn set_disabled_providers(state: &AppState, host_id: &str, profile: &str, providers: Vec<String>) {
+    let Some(host_stream) = state.host_stream_untracked(host_id) else {
+        mark_save_failed(
+            state,
+            host_id,
+            "Cannot update providers: the selected host is not connected.",
+        );
+        return;
+    };
+    let state = state.clone();
+    let host_id = host_id.to_owned();
+    let profile = profile.to_owned();
+    spawn_local(async move {
+        let payload = SetSettingPayload {
+            setting: HostSettingValue::HermesDisabledProviders { profile, providers },
+        };
+        if let Err(error) = send_frame(&host_id, host_stream, FrameKind::SetSetting, &payload).await
+        {
+            log::error!("failed to send Hermes disabled providers: {error}");
+            mark_save_failed(
+                &state,
+                &host_id,
+                "Failed to update providers. Check the connection and try again.",
+            );
+        }
+    });
+}
+
+/// The provider slugs Tyde must not offer for `profile` on this host.
+fn disabled_providers(state: &AppState, profile: &str) -> Vec<String> {
+    state
+        .selected_host_settings()
+        .and_then(|settings| settings.hermes_disabled_providers.get(profile).cloned())
+        .unwrap_or_default()
+}
+
 /// Explicit Save: current snapshot document with each drafted profile's config
 /// section replaced. Fallback rows left fully blank are pruned (from the draft
 /// too, so the draft matches the republished document and the page reads
@@ -419,6 +515,7 @@ fn save_config_edits(
         }
     }
     doc.actions.clear();
+    doc.profile_actions.clear();
     send_hermes_save(state, host_id, base, &doc);
 }
 
@@ -523,6 +620,24 @@ fn profile_subtitle(profile: &HermesProfileSettings) -> String {
     }
 }
 
+// Unset labels for the controls whose key can be absent from `config.yaml`.
+//
+// "Hermes default" alone was actively confusing next to an explicit "Auto",
+// because for both of these Hermes's own default IS `auto` — the two entries
+// looked like different behaviors when they select the same one. The
+// difference is durability, not behavior: leaving the key out follows Hermes
+// if it ever changes its default, while picking a value pins it. Naming the
+// default makes that visible instead of leaving the user to guess.
+//
+// Values verified against the Hermes source these settings write to:
+// `hermes_cli/config.py` (`coding_context: "auto"`, `max_turns: 90`) and
+// `tools/tool_search.py` (`ToolSearchConfig::from_raw` → `enabled: "auto"`,
+// `threshold_pct: 10.0`).
+const HERMES_DEFAULT_CODING_CONTEXT: &str = "Hermes default (auto)";
+const HERMES_DEFAULT_TOOL_SEARCH: &str = "Hermes default (auto)";
+const HERMES_DEFAULT_MAX_TURNS: &str = "Hermes default (90)";
+const HERMES_DEFAULT_THRESHOLD_PCT: &str = "Hermes default (10)";
+
 /// Keep a select's current value selectable even when it is not one of the
 /// known options (e.g. a config written by hand or a newer Hermes). Without
 /// this the control would render as "Hermes default" while the config says
@@ -589,6 +704,8 @@ fn editor_view(
         tab,
         key_dialog,
         provider_query,
+        new_profile,
+        delete_profile,
     } = view_state;
 
     let disabled_banner = (!enabled).then(|| {
@@ -613,44 +730,47 @@ fn editor_view(
         })
     };
 
-    // Profiles are a radiogroup, not a tablist: they scope the whole page,
-    // including the tab strip below them. Two stacked tablists would be
-    // ambiguous both visually and to a screen reader.
-    let chips = doc
+    // One <select> rather than a chip per profile: the list grows without
+    // bound (every profile is a directory the user can create) and a wrapping
+    // chip grid pushed the actual settings below the fold at five profiles.
+    // The subtitle rides in the option label because a <select> cannot render
+    // two lines; losing it entirely would hide which model each profile
+    // actually resolves to.
+    let profile_options: Vec<(String, String)> = doc
         .profiles
         .iter()
         .map(|profile| {
-            let name = profile.name.clone();
-            let is_active = {
-                let name = name.clone();
-                Signal::derive(move || effective_profile.get() == name)
-            };
-            let on_click = {
-                let name = name.clone();
-                move |_| selected_profile.set(Some(name.clone()))
-            };
-            view! {
-                <button
-                    type="button"
-                    role="radio"
-                    class=move || {
-                        if is_active.get() {
-                            "settings-hermes-profile-chip settings-hermes-profile-chip-active"
-                        } else {
-                            "settings-hermes-profile-chip"
-                        }
-                    }
-                    aria-checked=move || is_active.get().to_string()
-                    on:click=on_click
-                >
-                    <span class="settings-hermes-profile-name">
-                        {profile_display_name(&name)}
-                    </span>
-                    <span class="settings-hermes-profile-sub">{profile_subtitle(profile)}</span>
-                </button>
-            }
+            (
+                profile.name.clone(),
+                format!(
+                    "{} — {}",
+                    profile_display_name(&profile.name),
+                    profile_subtitle(profile)
+                ),
+            )
         })
-        .collect::<Vec<_>>();
+        .collect();
+
+    let profile_select = select_control(
+        Some("Hermes profile".to_owned()),
+        Some("settings-hermes-profile-select"),
+        // No empty entry: a profile is always selected.
+        None,
+        saving,
+        Signal::derive(move || profile_options.clone()),
+        effective_profile,
+        Callback::new(move |name: String| selected_profile.set(Some(name))),
+    );
+
+    let profile_controls = profile_bar_controls(
+        state,
+        host_id,
+        effective_profile,
+        selected_profile,
+        new_profile,
+        delete_profile,
+        saving,
+    );
 
     let dirty_tabs = {
         let doc = doc.clone();
@@ -745,12 +865,12 @@ fn editor_view(
                 }
                 HermesTab::Model => view! {
                     {model_card(doc.clone(), drafts, profile)}
-                    {fallback_card(doc.clone(), drafts, &profile.name)}
+                    {fallback_card(doc.clone(), drafts, profile)}
                     {routing_card(doc.clone(), drafts, &profile.name)}
                 }
                 .into_any(),
                 HermesTab::Agent => view! {
-                    {agent_card(doc.clone(), drafts, &profile.name)}
+                    {agent_card(doc.clone(), drafts, profile)}
                     {tool_search_card(doc.clone(), drafts, &profile.name)}
                 }
                 .into_any(),
@@ -768,6 +888,14 @@ fn editor_view(
         provider_query,
         saving,
     );
+    let delete_dialog = delete_profile_dialog(
+        state,
+        host_id,
+        doc.clone(),
+        delete_profile,
+        selected_profile,
+        saving,
+    );
     let save_bar = save_bar(state, host_id, doc, drafts, saving, save_error);
 
     view! {
@@ -777,12 +905,9 @@ fn editor_view(
                 <span class="settings-hermes-profilebar-label" id="hermes-profile-label">
                     "Profile"
                 </span>
-                <div
-                    class="settings-hermes-profiles"
-                    role="radiogroup"
-                    aria-labelledby="hermes-profile-label"
-                >
-                    {chips}
+                <div class="settings-hermes-profiles">
+                    {profile_select}
+                    {profile_controls}
                 </div>
             </div>
             <div
@@ -795,10 +920,369 @@ fn editor_view(
             </div>
             <div class="settings-hermes-panel" role="tabpanel">{panel}</div>
             {dialog}
+            {delete_dialog}
             {save_bar}
         </div>
     }
     .into_any()
+}
+
+/// One profile-bar button, shared by add/delete/refresh.
+///
+/// These are one function rather than three inline `view!` blocks on purpose:
+/// each distinct `view!` monomorphizes its own deeply nested view type into the
+/// wasm test binary, which runs every frontend test in a single browser
+/// instance already close to its memory ceiling. Erasing to `AnyView` behind a
+/// shared signature keeps that binary flat as this page grows.
+fn profile_action_button(
+    label: &'static str,
+    danger: bool,
+    title: Option<&'static str>,
+    saving: bool,
+    on_click: Callback<()>,
+) -> AnyView {
+    let class = if danger {
+        "settings-btn settings-btn-danger settings-hermes-profile-action"
+    } else {
+        "settings-btn settings-hermes-profile-action"
+    };
+    view! {
+        <button
+            type="button"
+            class=class
+            disabled=saving
+            title=title
+            on:click=move |_| {
+                if !saving {
+                    on_click.run(());
+                }
+            }
+        >
+            {label}
+        </button>
+    }
+    .into_any()
+}
+
+/// Add / delete / refresh beside the profile picker.
+///
+/// Deleting is guarded by a typed confirmation, not a plain yes/no: a Hermes
+/// profile is a whole `HERMES_HOME`, so removing it destroys that profile's
+/// sessions, credentials, state and memories — not just its configuration —
+/// and there is nothing to undo afterwards.
+fn profile_bar_controls(
+    state: &AppState,
+    host_id: &str,
+    effective_profile: Signal<String>,
+    selected_profile: RwSignal<Option<String>>,
+    new_profile: RwSignal<Option<String>>,
+    delete_profile: RwSignal<Option<String>>,
+    saving: bool,
+) -> AnyView {
+    let add_button = profile_action_button(
+        "Add profile…",
+        false,
+        None,
+        saving,
+        Callback::new(move |()| {
+            if new_profile.get_untracked().is_none() {
+                new_profile.set(Some(String::new()));
+            }
+        }),
+    );
+
+    let delete_button = move || {
+        let active = effective_profile.get();
+        if active == HERMES_DEFAULT_PROFILE {
+            // The default profile IS ~/.hermes; there is no delete to offer.
+            return ().into_any();
+        }
+        profile_action_button(
+            "Delete profile",
+            true,
+            None,
+            saving,
+            Callback::new(move |()| delete_profile.set(Some(active.clone()))),
+        )
+    };
+
+    let refresh_button = {
+        let state = state.clone();
+        let host_id = host_id.to_owned();
+        profile_action_button(
+            "Refresh",
+            false,
+            Some("Re-read profiles, providers and config from the host"),
+            saving,
+            Callback::new(move |()| refresh_hermes_settings(&state, &host_id)),
+        )
+    };
+
+    // Gated on open/closed only. Tracking `new_profile` itself here would
+    // rebuild the field on every keystroke and throw away the caret; the text
+    // is read reactively by `prop:value` instead, which is the same split the
+    // provider dialog uses.
+    let create_open = Memo::new(move |_| new_profile.get().is_some());
+    let create_row = {
+        let state = state.clone();
+        let host_id = host_id.to_owned();
+        move || {
+            if !create_open.get() {
+                return ().into_any();
+            }
+            let state = state.clone();
+            let host_id = host_id.clone();
+            let submit = move || {
+                let name = new_profile.get_untracked().unwrap_or_default();
+                let name = name.trim().to_owned();
+                if name.is_empty() {
+                    return;
+                }
+                // Read at submit time, so a profile switch while the field is
+                // open copies the profile actually on screen.
+                let source = effective_profile.get_untracked();
+                new_profile.set(None);
+                // Select it now so the page lands on the new profile as soon
+                // as the host republishes with it.
+                selected_profile.set(Some(name.clone()));
+                queue_profile_action(
+                    &state,
+                    &host_id,
+                    HermesProfileAction::CreateProfile {
+                        name,
+                        copy_config_from: Some(source),
+                    },
+                );
+            };
+            let submit_on_key = submit.clone();
+            let on_key = move |ev: web_sys::KeyboardEvent| match ev.key().as_str() {
+                "Enter" => {
+                    ev.prevent_default();
+                    submit_on_key();
+                }
+                "Escape" => {
+                    ev.prevent_default();
+                    ev.stop_propagation();
+                    new_profile.set(None);
+                }
+                _ => {}
+            };
+            let on_submit = move |_| submit();
+            view! {
+                <div class="settings-hermes-profile-create">
+                    <input
+                        type="text"
+                        class="settings-input"
+                        placeholder="new-profile-name"
+                        aria-label="New Hermes profile name"
+                        autocomplete="off"
+                        prop:value=move || new_profile.get().unwrap_or_default()
+                        on:input=move |ev| new_profile.set(Some(event_target_value(&ev)))
+                        on:keydown=on_key
+                    />
+                    <button
+                        type="button"
+                        class="settings-btn settings-btn-primary"
+                        disabled=saving
+                        on:click=on_submit
+                    >
+                        "Create"
+                    </button>
+                    <button
+                        type="button"
+                        class="settings-btn"
+                        on:click=move |_| new_profile.set(None)
+                    >
+                        "Cancel"
+                    </button>
+                    <p class="settings-description">
+                        {move || format!(
+                            "Copies {}'s config.yaml into a new Hermes home. Credentials, \
+                             sessions and history are not copied.",
+                            profile_display_name(&effective_profile.get()),
+                        )}
+                    </p>
+                </div>
+            }
+            .into_any()
+        }
+    };
+
+    view! {
+        <div class="settings-hermes-profile-actions">
+            {add_button}
+            {delete_button}
+            {refresh_button}
+        </div>
+        {create_row}
+    }
+    .into_any()
+}
+
+/// The overlay + modal box both dialogs on this page sit in.
+///
+/// Shared rather than written twice: the backdrop-dismiss and Escape handling
+/// are a contract worth having in one place (a modal owns Escape outright —
+/// without `stop_propagation` the app's global handler also tears down the
+/// settings overlay behind it), and a second inline copy would monomorphize
+/// another deep view type into an already-large wasm test binary.
+/// Erased parameters, for the reason spelled out on [`select_control`].
+fn modal_shell(
+    aria_label: &'static str,
+    on_keydown: Callback<web_sys::KeyboardEvent>,
+    on_backdrop: Callback<()>,
+    body: AnyView,
+) -> AnyView {
+    view! {
+        <div class="settings-confirm-overlay" on:click=move |_| on_backdrop.run(())>
+            <div
+                class="settings-confirm-modal settings-hermes-dialog"
+                role="dialog"
+                aria-modal="true"
+                aria-label=aria_label
+                tabindex="-1"
+                on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()
+                on:keydown=move |ev: web_sys::KeyboardEvent| on_keydown.run(ev)
+            >
+                {body}
+            </div>
+        </div>
+    }
+    .into_any()
+}
+
+/// Typed delete confirmation.
+///
+/// A plain yes/no is not enough here. Deleting a Hermes profile removes an
+/// entire `HERMES_HOME`: the profile's chat sessions, saved credentials,
+/// `state.db` and memories go with it, and none of it is recoverable. The
+/// dialog therefore names the exact directory and only enables the destructive
+/// button once the user has typed the profile name back.
+fn delete_profile_dialog(
+    state: &AppState,
+    host_id: &str,
+    doc: Arc<HermesNativeSettingsDoc>,
+    delete_profile: RwSignal<Option<String>>,
+    selected_profile: RwSignal<Option<String>>,
+    saving: bool,
+) -> AnyView {
+    let state = state.clone();
+    let host_id = host_id.to_owned();
+    let shell = move || {
+        let Some(target) = delete_profile.get() else {
+            return ().into_any();
+        };
+        let home_dir = doc
+            .profiles
+            .iter()
+            .find(|p| p.name == target)
+            .map(|p| p.home_dir.clone())
+            .unwrap_or_default();
+
+        let typed = RwSignal::new(String::new());
+        let confirm_ref = NodeRef::<leptos::html::Input>::new();
+        Effect::new(move |_| {
+            if let Some(input) = confirm_ref.get() {
+                let _ = input.focus();
+            }
+        });
+
+        let close = move || {
+            typed.set(String::new());
+            delete_profile.set(None);
+        };
+        let matches = {
+            let target = target.clone();
+            Signal::derive(move || typed.get().trim() == target)
+        };
+
+        let state = state.clone();
+        let host_id = host_id.clone();
+        let confirm = {
+            let target = target.clone();
+            move || {
+                if saving || !matches.get_untracked() {
+                    return;
+                }
+                delete_profile.set(None);
+                // Drop the selection first: the profile is about to vanish
+                // from the republished document.
+                selected_profile.set(None);
+                queue_profile_action(
+                    &state,
+                    &host_id,
+                    HermesProfileAction::DeleteProfile {
+                        name: target.clone(),
+                    },
+                );
+            }
+        };
+        let confirm_on_key = confirm.clone();
+        let on_keydown = move |ev: web_sys::KeyboardEvent| match ev.key().as_str() {
+            "Escape" => {
+                // A modal owns Escape outright; without this the app's global
+                // handler would also tear down the settings overlay behind it.
+                ev.prevent_default();
+                ev.stop_propagation();
+                close();
+            }
+            "Enter" => {
+                ev.prevent_default();
+                confirm_on_key();
+            }
+            _ => {}
+        };
+        let on_confirm = move |_| confirm();
+
+        let body = view! {
+            <h3 class="settings-confirm-title">
+                {format!("Delete the \"{target}\" Hermes profile?")}
+            </h3>
+            <p class="settings-confirm-description">
+                "This deletes the profile's entire Hermes home directory, including its \
+                 chat sessions, saved credentials, state database and memories — not \
+                 just its configuration. It cannot be undone."
+            </p>
+            <p class="settings-hermes-dialog-hint">
+                <code>{home_dir}</code>
+            </p>
+            <div class="settings-native-field">
+                <span class="settings-form-label">
+                    {format!("Type \"{target}\" to confirm")}
+                </span>
+                <input
+                    type="text"
+                    class="settings-input"
+                    aria-label="Confirm the profile name"
+                    autocomplete="off"
+                    node_ref=confirm_ref
+                    prop:value=move || typed.get()
+                    on:input=move |ev| typed.set(event_target_value(&ev))
+                />
+            </div>
+            <div class="settings-hermes-dialog-footer">
+                <button type="button" class="settings-btn" on:click=move |_| close()>
+                    "Cancel"
+                </button>
+                <button
+                    type="button"
+                    class="settings-btn settings-btn-danger"
+                    disabled=move || saving || !matches.get()
+                    on:click=on_confirm
+                >
+                    "Delete profile"
+                </button>
+            </div>
+        }
+        .into_any();
+        modal_shell(
+            "Delete Hermes profile",
+            Callback::new(on_keydown),
+            Callback::new(move |()| close()),
+            body,
+        )
+    };
+    view! { {shell} }.into_any()
 }
 
 /// Card scaffold shared by every section. Reuses the native-group visual
@@ -883,6 +1367,7 @@ fn providers_panel(
         .collect();
     let available = providers.len() - connected.len();
     let profile_name = profile.name.clone();
+    let disabled = disabled_providers(state, &profile_name);
 
     let open_catalogue = {
         let profile_name = profile_name.clone();
@@ -901,12 +1386,23 @@ fn providers_panel(
         }
     });
 
-    let summary = match (connected.len(), available) {
-        (0, _) => "Nothing connected yet".to_owned(),
-        (1, 0) => "1 provider connected".to_owned(),
-        (n, 0) => format!("{n} providers connected"),
-        (1, more) => format!("1 provider connected · {more} more available"),
-        (n, more) => format!("{n} providers connected · {more} more available"),
+    let off_count = connected
+        .iter()
+        .filter(|p| disabled.contains(&p.slug))
+        .count();
+    let summary = {
+        let base = match (connected.len(), available) {
+            (0, _) => "Nothing connected yet".to_owned(),
+            (1, 0) => "1 provider connected".to_owned(),
+            (n, 0) => format!("{n} providers connected"),
+            (1, more) => format!("1 provider connected · {more} more available"),
+            (n, more) => format!("{n} providers connected · {more} more available"),
+        };
+        if off_count == 0 {
+            base
+        } else {
+            format!("{base} · {off_count} off in Tyde")
+        }
     };
 
     let body = if connected.is_empty() {
@@ -936,7 +1432,15 @@ fn providers_panel(
         let rows = connected
             .iter()
             .map(|provider| {
-                connected_provider_row(state, host_id, &profile_name, provider, key_dialog, saving)
+                connected_provider_row(
+                    state,
+                    host_id,
+                    &profile_name,
+                    provider,
+                    &disabled,
+                    key_dialog,
+                    saving,
+                )
             })
             .collect::<Vec<_>>();
         view! { <div class="settings-hermes-provider-list">{rows}</div> }.into_any()
@@ -967,6 +1471,7 @@ fn connected_provider_row(
     host_id: &str,
     profile_name: &str,
     provider: &HermesProviderState,
+    disabled: &[String],
     key_dialog: RwSignal<Option<(String, Option<String>)>>,
     saving: bool,
 ) -> AnyView {
@@ -978,6 +1483,42 @@ fn connected_provider_row(
         format!("{} models", provider.model_count)
     };
     let auth = auth_label(provider.auth_type.as_deref());
+    let is_off = disabled.contains(&slug);
+
+    // Hermes has no provider enable/disable flag, so this is Tyde's own list.
+    // It is the only control that reliably turns a provider off: a provider
+    // Hermes auto-detects (GitHub Copilot via the `gh` CLI login) reappears
+    // after a disconnect, because the credential was never Hermes's to delete.
+    let toggle_button = {
+        let state = state.clone();
+        let host_id = host_id.to_owned();
+        let profile_name = profile_name.to_owned();
+        let slug = slug.clone();
+        let mut next: Vec<String> = disabled.to_vec();
+        if is_off {
+            next.retain(|hidden| *hidden != slug);
+        } else {
+            next.push(slug.clone());
+        }
+        let on_click = move |_| {
+            if saving {
+                return;
+            }
+            set_disabled_providers(&state, &host_id, &profile_name, next.clone());
+        };
+        view! {
+            <button
+                type="button"
+                class="settings-btn"
+                aria-pressed=(!is_off).to_string()
+                disabled=saving
+                on:click=on_click
+            >
+                {if is_off { "Enable in Tyde" } else { "Disable in Tyde" }}
+            </button>
+        }
+        .into_any()
+    };
 
     // Replacing a key opens the same dialog, pre-selected — one credential
     // surface, one code path that can carry a key.
@@ -1011,7 +1552,8 @@ fn connected_provider_row(
                     "Remove {name}'s credentials from the \"{profile_name}\" Hermes profile? \
                      The credentials are deleted from that profile. Sources Hermes detects \
                      automatically (for example GitHub Copilot via the gh CLI login) may be \
-                     detected again by Hermes afterwards."
+                     detected again by Hermes afterwards — to keep a provider out of Tyde \
+                     regardless, use \"Disable in Tyde\" instead."
                 );
                 if !crate::bridge::confirm_dialog(&format!("Disconnect {name}"), &message).await {
                     return;
@@ -1058,15 +1600,28 @@ fn connected_provider_row(
                     </span>
                 </div>
                 <div class="settings-hermes-provider-actions">
-                    <span class="settings-hermes-badge settings-hermes-badge-connected">
-                        "Connected"
+                    <span class=if is_off {
+                        "settings-hermes-badge settings-hermes-badge-off"
+                    } else {
+                        "settings-hermes-badge settings-hermes-badge-connected"
+                    }>
+                        {if is_off { "Off in Tyde" } else { "Connected" }}
                     </span>
                     <span class="settings-hermes-provider-action-slot">
+                        {toggle_button}
                         {replace_button}
                         {disconnect_button}
                     </span>
                 </div>
             </div>
+            {is_off.then(|| {
+                view! {
+                    <p class="settings-hermes-provider-note">
+                        "Hidden from Tyde's Hermes model picker. Hermes still has the \
+                         credentials, so a hermes session started outside Tyde can use it."
+                    </p>
+                }
+            })}
         </div>
     }
     .into_any()
@@ -1135,7 +1690,6 @@ fn provider_dialog(
             provider_query.set(String::new());
             key_dialog.set(None);
         };
-        let on_backdrop = move |_| close();
         // Each step owns its own footer, so the dismiss action sits beside that
         // step's primary action rather than on a second row below it.
         let ctx = DialogCtx {
@@ -1177,22 +1731,12 @@ fn provider_dialog(
             }
         };
 
-        view! {
-            <div class="settings-confirm-overlay" on:click=on_backdrop>
-                <div
-                    class="settings-confirm-modal settings-hermes-dialog"
-                    role="dialog"
-                    aria-modal="true"
-                    aria-label="Add a provider"
-                    tabindex="-1"
-                    on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()
-                    on:keydown=on_keydown
-                >
-                    {contents}
-                </div>
-            </div>
-        }
-        .into_any()
+        modal_shell(
+            "Add a provider",
+            Callback::new(on_keydown),
+            Callback::new(move |()| close()),
+            view! { {contents} }.into_any(),
+        )
     };
     view! { {shell} }.into_any()
 }
@@ -1522,10 +2066,28 @@ fn model_card(
         )
     };
 
-    let body = view! {
-        <div class="settings-hermes-grid">
-            {provider_control}
-            {text_field(
+    // Default model: a dropdown of the selected provider's own models when the
+    // probe reported them, so the user picks an id Hermes will actually
+    // accept. Falls back to free text when the provider is unknown or reports
+    // no models — inventing an empty dropdown would make a valid config
+    // unreachable.
+    let model_control = {
+        let current = effective_config(&doc, &drafts.get_untracked(), &name);
+        let provider_models = current
+            .model
+            .provider
+            .as_ref()
+            .and_then(|slug| {
+                profile
+                    .providers
+                    .as_ref()?
+                    .iter()
+                    .find(|p| p.slug == *slug)
+                    .map(|p| p.models.clone())
+            })
+            .unwrap_or_default();
+        if provider_models.is_empty() {
+            text_field(
                 "Default model",
                 "Hermes default",
                 None,
@@ -1533,7 +2095,30 @@ fn model_card(
                     c.model.model.clone().unwrap_or_default()
                 }),
                 config_committer(doc.clone(), drafts, name.clone(), |c, v| c.model.model = v),
-            )}
+            )
+        } else {
+            let mut options: Vec<(String, String)> = provider_models
+                .into_iter()
+                .map(|model| (model.clone(), model))
+                .collect();
+            ensure_current_option(&mut options, current.model.model.clone());
+            select_field(
+                "Default model",
+                None,
+                "Hermes default",
+                options,
+                config_value(doc.clone(), drafts, name.clone(), |c| {
+                    c.model.model.clone().unwrap_or_default()
+                }),
+                config_committer(doc.clone(), drafts, name.clone(), |c, v| c.model.model = v),
+            )
+        }
+    };
+
+    let body = view! {
+        <div class="settings-hermes-grid">
+            {provider_control}
+            {model_control}
             {text_field(
                 "Base URL",
                 "Provider default",
@@ -1545,7 +2130,8 @@ fn model_card(
             )}
             {number_field(
                 "Context length",
-                Some("Context window override in tokens. Blank uses the model's own limit."),
+                Some("Context window override in tokens."),
+                "The model's own limit",
                 config_value(doc.clone(), drafts, name.clone(), |c| c.model.context_length),
                 config_committer(doc.clone(), drafts, name.clone(), |c, v| {
                     c.model.context_length = v;
@@ -1553,7 +2139,8 @@ fn model_card(
             )}
             {number_field(
                 "Max output tokens",
-                Some("Output token cap. Blank uses the model's own limit."),
+                Some("Output token cap."),
+                "The model's own limit",
                 config_value(doc.clone(), drafts, name.clone(), |c| c.model.max_tokens),
                 config_committer(doc.clone(), drafts, name.clone(), |c, v| {
                     c.model.max_tokens = v;
@@ -1605,6 +2192,9 @@ fn routing_card(
             "Only use",
             Some("Whitelist of upstream providers OpenRouter may route to."),
             "Add upstream provider…",
+            // OpenRouter's upstream provider names are not in any payload
+            // Hermes gives us, so these two stay free text.
+            Vec::new(),
             config_value(doc.clone(), drafts, name.clone(), |c| {
                 c.provider_routing.only.clone()
             }),
@@ -1616,6 +2206,7 @@ fn routing_card(
             "Ignore",
             Some("Upstream providers OpenRouter must never route to."),
             "Add upstream provider…",
+            Vec::new(),
             config_value(doc.clone(), drafts, name.clone(), |c| {
                 c.provider_routing.ignore.clone()
             }),
@@ -1640,30 +2231,38 @@ fn routing_card(
 fn fallback_card(
     doc: Arc<HermesNativeSettingsDoc>,
     drafts: RwSignal<HashMap<String, HermesProfileConfig>>,
-    profile: &str,
+    profile: &HermesProfileSettings,
 ) -> AnyView {
-    let name = profile.to_owned();
+    let name = profile.name.clone();
+    let providers = Arc::new(profile.providers.clone().unwrap_or_default());
 
-    // Rebuild rows only when the row count changes; text edits inside a row
-    // update the draft without tearing down the input being typed in. Existing
-    // entries keep their extra fields (base_url, api_mode, …) untouched —
-    // only provider/model are edited here; the rest round-trips on the struct.
-    let row_count = {
+    // Rebuild rows when the row count changes *or* a row names a different
+    // provider. The second half matters because each row's model dropdown is
+    // built from whichever provider that row currently names: without it, a
+    // row would keep offering the previous provider's models after the
+    // provider was switched. Editing only the model leaves the rows standing,
+    // so the control in use is not torn out from under the user. Existing
+    // entries keep their extra fields (base_url, api_mode, …) untouched — only
+    // provider/model are edited here; the rest round-trips on the struct.
+    let row_providers = {
         let doc = doc.clone();
         let name = name.clone();
         Memo::new(move |_| {
             effective_config(&doc, &drafts.get(), &name)
                 .fallback_providers
-                .len()
+                .iter()
+                .map(|fallback| fallback.provider.clone())
+                .collect::<Vec<_>>()
         })
     };
 
     let rows = {
         let doc = doc.clone();
         let name = name.clone();
+        let providers = providers.clone();
         move || {
-            (0..row_count.get())
-                .map(|idx| fallback_row(doc.clone(), drafts, name.clone(), idx))
+            (0..row_providers.get().len())
+                .map(|idx| fallback_row(doc.clone(), drafts, name.clone(), idx, providers.clone()))
                 .collect::<Vec<_>>()
         }
     };
@@ -1699,11 +2298,51 @@ fn fallback_card(
     )
 }
 
+/// One half of a fallback row: a dropdown of `choices`, or a free-text input
+/// when the host reported none.
+///
+/// A fallback entry is only valid with both halves filled (the server refuses a
+/// half-filled one), so the empty option is a "Choose …" prompt rather than an
+/// unset value. A current value the host did not offer stays selectable and is
+/// labelled as such — dropping it would silently rewrite a working config the
+/// moment the page rendered.
+/// Erased parameters, for the reason spelled out on [`select_control`].
+fn fallback_field(
+    aria_label: String,
+    text_placeholder: &'static str,
+    prompt: &'static str,
+    unknown_note: &'static str,
+    choices: Vec<(String, String)>,
+    value: Signal<String>,
+    commit: Callback<String>,
+) -> AnyView {
+    if choices.is_empty() {
+        return input_control("text", None, text_placeholder.to_owned(), value, commit);
+    }
+    // A current value the host did not offer is appended rather than dropped,
+    // so opening the page can never silently rewrite a working config.
+    let mut options = choices;
+    let current = value.get_untracked();
+    if !current.is_empty() && !options.iter().any(|(v, _)| *v == current) {
+        options.push((current.clone(), format!("{current} ({unknown_note})")));
+    }
+    select_control(
+        Some(aria_label),
+        None,
+        Some(prompt.to_owned()),
+        false,
+        Signal::derive(move || options.clone()),
+        value,
+        commit,
+    )
+}
+
 fn fallback_row(
     doc: Arc<HermesNativeSettingsDoc>,
     drafts: RwSignal<HashMap<String, HermesProfileConfig>>,
     profile: String,
     idx: usize,
+    providers: Arc<Vec<HermesProviderState>>,
 ) -> AnyView {
     let provider_value = config_value(doc.clone(), drafts, profile.clone(), move |c| {
         c.fallback_providers
@@ -1729,6 +2368,54 @@ fn fallback_row(
                 entry.model = v;
             }
         });
+
+    // Both halves are the same control with different data, so they share one
+    // builder: two inline `view!` blocks here would monomorphize two more deep
+    // view types into a wasm test binary that is already near its ceiling.
+    let current_provider = provider_value();
+    let provider_choices: Vec<(String, String)> = providers
+        .iter()
+        .map(|p| {
+            let label = if p.slug == p.name {
+                p.slug.clone()
+            } else {
+                format!("{} ({})", p.name, p.slug)
+            };
+            (p.slug.clone(), label)
+        })
+        .collect();
+    let provider_control = fallback_field(
+        format!("Fallback {} provider", idx + 1),
+        "provider",
+        "Choose a provider",
+        "not probed",
+        provider_choices,
+        Signal::derive(provider_value),
+        Callback::new(move |v: String| commit_provider(v)),
+    );
+
+    // The model list follows whichever provider this row currently names, so
+    // the pair is always internally consistent.
+    let model_choices: Vec<(String, String)> = providers
+        .iter()
+        .find(|p| p.slug == current_provider)
+        .map(|p| {
+            p.models
+                .iter()
+                .map(|model| (model.clone(), model.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let model_control = fallback_field(
+        format!("Fallback {} model", idx + 1),
+        "model",
+        "Choose a model",
+        "not offered by this provider",
+        model_choices,
+        Signal::derive(model_value),
+        Callback::new(move |v: String| commit_model(v)),
+    );
+
     let on_remove = {
         let doc = doc.clone();
         let profile = profile.clone();
@@ -1743,24 +2430,8 @@ fn fallback_row(
 
     view! {
         <div class="settings-hermes-fallback-row">
-            <input
-                type="text"
-                class="settings-input"
-                placeholder="provider"
-                aria-label=format!("Fallback {} provider", idx + 1)
-                autocomplete="off"
-                prop:value=provider_value
-                on:change=move |ev| commit_provider(event_target_value(&ev).trim().to_owned())
-            />
-            <input
-                type="text"
-                class="settings-input"
-                placeholder="model"
-                aria-label=format!("Fallback {} model", idx + 1)
-                autocomplete="off"
-                prop:value=model_value
-                on:change=move |ev| commit_model(event_target_value(&ev).trim().to_owned())
-            />
+            {provider_control}
+            {model_control}
             <button
                 type="button"
                 class="settings-btn"
@@ -1777,9 +2448,9 @@ fn fallback_row(
 fn agent_card(
     doc: Arc<HermesNativeSettingsDoc>,
     drafts: RwSignal<HashMap<String, HermesProfileConfig>>,
-    profile: &str,
+    profile: &HermesProfileSettings,
 ) -> AnyView {
-    let name = profile.to_owned();
+    let name = profile.name.clone();
     let mut context_options = vec![
         ("auto".to_owned(), "Auto".to_owned()),
         ("focus".to_owned(), "Focus".to_owned()),
@@ -1792,11 +2463,35 @@ fn agent_card(
             .agent
             .coding_context,
     );
+
+    // The catalogue turns this from "type a name and hope" into a picker.
+    // Without it (probe failed) the free-text list is still the right control,
+    // so the two share one committer.
+    let toolset_choices: Vec<(String, String)> = profile
+        .toolsets
+        .as_ref()
+        .map(|toolsets| {
+            toolsets
+                .iter()
+                .map(|toolset| {
+                    let label = match &toolset.description {
+                        Some(description) => {
+                            format!("{} — {description}", toolset.name)
+                        }
+                        None => toolset.name.clone(),
+                    };
+                    (toolset.name.clone(), label)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let body = view! {
         <div class="settings-hermes-grid">
             {number_field(
                 "Max turns",
-                Some("Cap on agent loop turns per request. Blank uses the Hermes default."),
+                Some("Cap on agent loop turns per request."),
+                HERMES_DEFAULT_MAX_TURNS,
                 config_value(doc.clone(), drafts, name.clone(), |c| c.agent.max_turns),
                 config_committer(doc.clone(), drafts, name.clone(), |c, v| {
                     c.agent.max_turns = v;
@@ -1805,7 +2500,7 @@ fn agent_card(
             {select_field(
                 "Coding context",
                 None,
-                "Hermes default",
+                HERMES_DEFAULT_CODING_CONTEXT,
                 context_options,
                 config_value(doc.clone(), drafts, name.clone(), |c| {
                     c.agent.coding_context.clone().unwrap_or_default()
@@ -1819,6 +2514,7 @@ fn agent_card(
             "Disabled toolsets",
             Some("Toolsets the agent must not load."),
             "Add toolset…",
+            toolset_choices,
             config_value(doc.clone(), drafts, name.clone(), |c| {
                 c.agent.disabled_toolsets.clone()
             }),
@@ -1858,7 +2554,7 @@ fn tool_search_card(
             {select_field(
                 "Enabled",
                 None,
-                "Hermes default",
+                HERMES_DEFAULT_TOOL_SEARCH,
                 enabled_options,
                 config_value(doc.clone(), drafts, name.clone(), |c| {
                     c.tool_search.enabled.clone().unwrap_or_default()
@@ -1870,6 +2566,7 @@ fn tool_search_card(
             {float_field(
                 "Activation threshold (%)",
                 Some("Percent of the context window at which auto mode activates."),
+                HERMES_DEFAULT_THRESHOLD_PCT,
                 config_value(doc.clone(), drafts, name.clone(), |c| {
                     c.tool_search.threshold_pct
                 }),
@@ -1979,6 +2676,39 @@ fn labeled_field(label: &str, hint: Option<&str>, control: AnyView) -> AnyView {
     .into_any()
 }
 
+/// The one `<input>` on this page.
+///
+/// Text, integer and float fields were three near-identical `view!` blocks
+/// taking `impl Fn` parameters, so each of their eleven call sites
+/// monomorphized its own copy of the input tree. Erased handles plus a single
+/// builder give one instantiation for all of them — see [`select_control`] for
+/// why that matters here.
+///
+/// The raw string is what crosses the boundary; parsing lives with the caller
+/// that knows the type. Blank always means "unset", which removes the key from
+/// Hermes's config; an unparseable number is ignored rather than committed as
+/// garbage, exactly as the typed fields did before.
+fn input_control(
+    input_type: &'static str,
+    step: Option<&'static str>,
+    placeholder: String,
+    value: Signal<String>,
+    commit: Callback<String>,
+) -> AnyView {
+    view! {
+        <input
+            type=input_type
+            step=step
+            class="settings-input settings-native-input"
+            placeholder=placeholder
+            autocomplete="off"
+            prop:value=move || value.get()
+            on:change=move |ev| commit.run(event_target_value(&ev).trim().to_owned())
+        />
+    }
+    .into_any()
+}
+
 /// Text input committing a trimmed `Option<String>` on change (blur/Enter).
 /// Blank commits `None`, which removes the key from Hermes's config.
 fn text_field(
@@ -1986,23 +2716,15 @@ fn text_field(
     placeholder: &str,
     hint: Option<&str>,
     value: impl Fn() -> String + Send + Sync + 'static,
-    commit: impl Fn(Option<String>) + 'static,
+    commit: impl Fn(Option<String>) + Send + Sync + 'static,
 ) -> AnyView {
-    let control = view! {
-        <input
-            type="text"
-            class="settings-input settings-native-input"
-            placeholder=placeholder.to_owned()
-            autocomplete="off"
-            prop:value=value
-            on:change=move |ev| {
-                let raw = event_target_value(&ev);
-                let trimmed = raw.trim();
-                commit((!trimmed.is_empty()).then(|| trimmed.to_owned()));
-            }
-        />
-    }
-    .into_any();
+    let control = input_control(
+        "text",
+        None,
+        placeholder.to_owned(),
+        Signal::derive(value),
+        Callback::new(move |raw: String| commit((!raw.is_empty()).then_some(raw))),
+    );
     labeled_field(label, hint, control)
 }
 
@@ -2011,29 +2733,23 @@ fn text_field(
 fn float_field(
     label: &str,
     hint: Option<&str>,
+    placeholder: &str,
     value: impl Fn() -> Option<f64> + Send + Sync + 'static,
-    commit: impl Fn(Option<f64>) + 'static,
+    commit: impl Fn(Option<f64>) + Send + Sync + 'static,
 ) -> AnyView {
-    let control = view! {
-        <input
-            type="number"
-            step="any"
-            class="settings-input settings-native-input"
-            placeholder="Hermes default"
-            autocomplete="off"
-            prop:value=move || value().map(|n| n.to_string()).unwrap_or_default()
-            on:change=move |ev| {
-                let raw = event_target_value(&ev);
-                let trimmed = raw.trim();
-                if trimmed.is_empty() {
-                    commit(None);
-                } else if let Ok(parsed) = trimmed.parse::<f64>() {
-                    commit(Some(parsed));
-                }
+    let control = input_control(
+        "number",
+        Some("any"),
+        placeholder.to_owned(),
+        Signal::derive(move || value().map(|n| n.to_string()).unwrap_or_default()),
+        Callback::new(move |raw: String| {
+            if raw.is_empty() {
+                commit(None);
+            } else if let Ok(parsed) = raw.parse::<f64>() {
+                commit(Some(parsed));
             }
-        />
-    }
-    .into_any();
+        }),
+    );
     labeled_field(label, hint, control)
 }
 
@@ -2041,83 +2757,124 @@ fn float_field(
 fn number_field(
     label: &str,
     hint: Option<&str>,
+    placeholder: &str,
     value: impl Fn() -> Option<i64> + Send + Sync + 'static,
-    commit: impl Fn(Option<i64>) + 'static,
+    commit: impl Fn(Option<i64>) + Send + Sync + 'static,
 ) -> AnyView {
-    let control = view! {
-        <input
-            type="number"
-            step="1"
-            class="settings-input settings-native-input"
-            placeholder="Hermes default"
-            autocomplete="off"
-            prop:value=move || value().map(|n| n.to_string()).unwrap_or_default()
-            on:change=move |ev| {
-                let raw = event_target_value(&ev);
-                let trimmed = raw.trim();
-                if trimmed.is_empty() {
-                    commit(None);
-                } else if let Ok(parsed) = trimmed.parse::<i64>() {
-                    commit(Some(parsed));
-                }
+    let control = input_control(
+        "number",
+        Some("1"),
+        placeholder.to_owned(),
+        Signal::derive(move || value().map(|n| n.to_string()).unwrap_or_default()),
+        Callback::new(move |raw: String| {
+            if raw.is_empty() {
+                commit(None);
+            } else if let Ok(parsed) = raw.parse::<i64>() {
+                commit(Some(parsed));
             }
-        />
-    }
-    .into_any();
+        }),
+    );
     labeled_field(label, hint, control)
 }
 
-/// Select with an explicit unset option ("" ↔ `None`). Selection is driven by
-/// a reactive `selected` prop on each option so the current value renders
-/// regardless of mount order.
+/// The one `<select>` on this page.
+///
+/// Every dropdown here — config field, fallback half, chip picker, profile
+/// switcher — is the same shape: an empty entry, then options, with selection
+/// driven by a reactive `selected` prop on each option so the current value
+/// renders regardless of mount order. They share this builder rather than
+/// spelling out four `view!` blocks, because each distinct one monomorphizes
+/// its own deeply nested view type into a wasm test binary that runs every
+/// frontend test in a single browser instance and is already at its memory
+/// ceiling. `options` is a closure so a caller whose list depends on other
+/// state (the toolset picker hides what is already chosen) stays reactive.
+/// Every parameter is a type-erased handle (`Signal` / `Callback`) rather than
+/// an `impl Fn` generic. That distinction is the whole point: a generic
+/// parameter monomorphizes the entire body — including this `view!` tree — once
+/// per call site, which makes a "shared" helper *bigger* than the inline blocks
+/// it replaced. Erased handles give exactly one instantiation.
+fn select_control(
+    aria_label: Option<String>,
+    extra_class: Option<&'static str>,
+    // `None` omits the empty entry, for a control whose value is never unset
+    // (the profile switcher always has a profile selected).
+    empty_label: Option<String>,
+    disabled: bool,
+    options: Signal<Vec<(String, String)>>,
+    value: Signal<String>,
+    commit: Callback<String>,
+) -> AnyView {
+    let class = match extra_class {
+        Some(extra) => format!("settings-select {extra}"),
+        None => "settings-select".to_owned(),
+    };
+    let option_views = move || {
+        options
+            .get()
+            .into_iter()
+            .map(|(option_value, option_label)| {
+                let selected = {
+                    let option_value = option_value.clone();
+                    move || value.get() == option_value
+                };
+                view! {
+                    <option value=option_value prop:selected=selected>{option_label}</option>
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let empty_option =
+        empty_label.map(|label| view! { <option value="" prop:selected=move || value.get().is_empty()>{label}</option> });
+    view! {
+        <select
+            class=class
+            aria-label=aria_label
+            disabled=disabled
+            on:change=move |ev| commit.run(event_target_value(&ev))
+        >
+            {empty_option}
+            {option_views}
+        </select>
+    }
+    .into_any()
+}
+
+/// Labelled select committing `Option<String>` ("" ↔ `None`, which removes the
+/// key from Hermes's config).
 fn select_field(
     label: &str,
     hint: Option<&str>,
     unset_label: &str,
     options: Vec<(String, String)>,
     value: impl Fn() -> String + Clone + Send + Sync + 'static,
-    commit: impl Fn(Option<String>) + 'static,
+    commit: impl Fn(Option<String>) + Send + Sync + 'static,
 ) -> AnyView {
-    let option_views = options
-        .into_iter()
-        .map(|(option_value, option_label)| {
-            let selected = {
-                let value = value.clone();
-                let option_value = option_value.clone();
-                move || value() == option_value
-            };
-            view! {
-                <option value=option_value prop:selected=selected>{option_label}</option>
-            }
-        })
-        .collect::<Vec<_>>();
-    let unset_selected = {
-        let value = value.clone();
-        move || value().is_empty()
-    };
-    let control = view! {
-        <select
-            class="settings-select"
-            on:change=move |ev| {
-                let selected = event_target_value(&ev);
-                commit((!selected.is_empty()).then_some(selected));
-            }
-        >
-            <option value="" prop:selected=unset_selected>{unset_label.to_owned()}</option>
-            {option_views}
-        </select>
-    }
-    .into_any();
+    let control = select_control(
+        None,
+        None,
+        Some(unset_label.to_owned()),
+        false,
+        Signal::derive(move || options.clone()),
+        Signal::derive(value),
+        Callback::new(move |selected: String| commit((!selected.is_empty()).then_some(selected))),
+    );
     labeled_field(label, hint, control)
 }
 
-/// Editable chip list: chips with a remove button, plus a text input + Add
-/// button (Enter also adds). Duplicates are ignored; the whole edited list is
+/// Editable chip list: chips with a remove button, plus an input + Add button
+/// (Enter also adds). Duplicates are ignored; the whole edited list is
 /// committed at once.
+///
+/// `choices` upgrades the input to a dropdown of the values the host actually
+/// reports, already-added ones filtered out. It is empty when the host could
+/// not tell us (a failed probe), and then the free-text input is the honest
+/// control: refusing to accept a value we cannot confirm would make a working
+/// config uneditable.
 fn chip_list(
     label: &str,
     hint: Option<&str>,
     placeholder: &str,
+    choices: Vec<(String, String)>,
     items: impl Fn() -> Vec<String> + Clone + Send + Sync + 'static,
     commit: impl Fn(Vec<String>) + Clone + Send + Sync + 'static,
 ) -> AnyView {
@@ -2197,18 +2954,44 @@ fn chip_list(
         move |_| add()
     };
 
-    let control = view! {
-        <div class="settings-hermes-chips">{chips}</div>
-        <div class="settings-hermes-chip-add">
+    let input = if choices.is_empty() {
+        view! {
             <input
                 type="text"
                 class="settings-input"
                 placeholder=placeholder.to_owned()
+                aria-label=placeholder.to_owned()
                 autocomplete="off"
                 prop:value=move || entry.get()
                 on:input=move |ev| entry.set(event_target_value(&ev))
                 on:keydown=add_on_key
             />
+        }
+        .into_any()
+    } else {
+        // Already-added values are chips, not repeat offers.
+        select_control(
+            Some(placeholder.to_owned()),
+            None,
+            Some(placeholder.to_owned()),
+            false,
+            Signal::derive(move || {
+                let chosen = items_memo.get();
+                choices
+                    .iter()
+                    .filter(|(value, _)| !chosen.contains(value))
+                    .cloned()
+                    .collect()
+            }),
+            Signal::derive(move || entry.get()),
+            Callback::new(move |selected: String| entry.set(selected)),
+        )
+    };
+
+    let control = view! {
+        <div class="settings-hermes-chips">{chips}</div>
+        <div class="settings-hermes-chip-add">
+            {input}
             <button type="button" class="settings-btn" on:click=add_on_click>
                 "Add"
             </button>
@@ -2305,6 +3088,10 @@ mod wasm_tests {
                             key_env: Some("OPENROUTER_API_KEY".to_owned()),
                             warning: None,
                             model_count: 42,
+                            // Deliberately empty: this profile exercises the
+                            // free-text model field a host whose probe reports
+                            // no model list still has to offer.
+                            models: Vec::new(),
                         },
                         HermesProviderState {
                             slug: "copilot".to_owned(),
@@ -2314,11 +3101,13 @@ mod wasm_tests {
                             key_env: None,
                             warning: Some("Run gh auth login to enable Copilot".to_owned()),
                             model_count: 0,
+                            models: Vec::new(),
                         },
                     ]),
                     providers_error: None,
                     active_model: Some("anthropic/claude-sonnet-4".to_owned()),
                     active_provider: Some("openrouter".to_owned()),
+                    toolsets: None,
                 },
                 HermesProfileSettings {
                     name: "work".to_owned(),
@@ -2335,8 +3124,10 @@ mod wasm_tests {
                     providers_error: None,
                     active_model: None,
                     active_provider: None,
+                    toolsets: None,
                 },
             ],
+            profile_actions: Vec::new(),
             actions: Vec::new(),
         }
     }
@@ -2358,6 +3149,11 @@ mod wasm_tests {
             key_env: (auth_type == "api_key").then(|| format!("{}_API_KEY", slug.to_uppercase())),
             warning: warning.map(str::to_owned),
             model_count: if authenticated { 7 } else { 0 },
+            models: if authenticated {
+                (1..=7).map(|n| format!("{slug}/model-{n}")).collect()
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -2373,9 +3169,45 @@ mod wasm_tests {
                 providers_error: None,
                 active_model: None,
                 active_provider: None,
+                toolsets: None,
             }],
+            profile_actions: Vec::new(),
             actions: Vec::new(),
         }
+    }
+
+    /// Every value the user can currently see in a form control, across both
+    /// inputs and selects. The "other profile's value must not render" checks
+    /// need this: a value that moved from an `<input>` into a `<select>` is
+    /// still on screen, and a check that only looked at inputs would call that
+    /// a pass.
+    fn control_values(container: &HtmlElement) -> Vec<String> {
+        let mut values = input_values(container);
+        let nodes = container.query_selector_all("select").unwrap();
+        for i in 0..nodes.length() {
+            if let Some(select) = nodes
+                .item(i)
+                .and_then(|node| node.dyn_into::<web_sys::HtmlSelectElement>().ok())
+            {
+                values.push(select.value());
+            }
+        }
+        values
+    }
+
+    /// Pick a profile the way the user does — the profile switcher is a
+    /// dropdown, so this sets and fires `change` on it.
+    fn select_profile(container: &HtmlElement, name: &str) {
+        let select: web_sys::HtmlSelectElement = container
+            .query_selector(".settings-hermes-profile-select")
+            .unwrap()
+            .expect("profile select")
+            .dyn_into()
+            .unwrap();
+        select.set_value(name);
+        select
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
     }
 
     fn install_doc(state: &AppState, doc: HermesNativeSettingsDoc) {
@@ -2441,10 +3273,45 @@ mod wasm_tests {
     }
 
     fn mount_doc(container: &HtmlElement, doc: HermesNativeSettingsDoc) -> impl Sized {
+        mount_doc_with_disabled(container, doc, Vec::new())
+    }
+
+    /// Mount with a Tyde-owned disabled-provider list for the default profile.
+    /// The list lives in host settings, not in the Hermes document, because
+    /// Hermes has no provider enable/disable flag of its own.
+    fn mount_doc_with_disabled(
+        container: &HtmlElement,
+        doc: HermesNativeSettingsDoc,
+        disabled: Vec<String>,
+    ) -> impl Sized {
         let container = container.clone();
         mount_to(container, move || {
             let state = AppState::new();
             install_doc(&state, doc.clone());
+            if !disabled.is_empty() {
+                let settings = protocol::HostSettings {
+                    enabled_backends: vec![BackendKind::Hermes],
+                    default_backend: None,
+                    enable_mobile_connections: false,
+                    mobile_broker_url: None,
+                    tyde_debug_mcp_enabled: false,
+                    tyde_agent_control_mcp_enabled: true,
+                    complexity_tiers_enabled: false,
+                    backend_tier_configs: HashMap::new(),
+                    background_agent_features: Default::default(),
+                    supervisor: Default::default(),
+                    code_intel: Default::default(),
+                    backend_config: HashMap::new(),
+                    launch_profiles: Vec::new(),
+                    hermes_disabled_providers: HashMap::from([(
+                        HERMES_DEFAULT_PROFILE.to_owned(),
+                        disabled.clone(),
+                    )]),
+                };
+                state.host_settings_by_host.update(|by_host| {
+                    by_host.insert("h".to_owned(), settings);
+                });
+            }
             provide_context(state);
             hermes_settings_page_body("h")
         })
@@ -2458,24 +3325,34 @@ mod wasm_tests {
         next_tick().await;
 
         let text = container_text(&container);
-        // Profile chips: clickable, the default profile labelled "Default",
-        // the named one by its name, each with its model as a subtitle — so a
-        // profile can be identified without selecting it first.
-        let default_chip = button_with_text(&container, "Default");
-        assert!(
-            default_chip
-                .text_content()
-                .unwrap_or_default()
-                .contains("anthropic/claude-sonnet-4"),
-            "default chip should show the profile's active model as a subtitle"
+        // The profile switcher is a dropdown (it used to be one chip per
+        // profile, which stopped fitting once profiles could be created from
+        // here). The contract it carries is unchanged and asserted here in
+        // full: every discovered profile is offered, the default one is
+        // labelled "Default" rather than by its internal slug, and each entry
+        // names the model that profile resolves to — so a profile can still be
+        // identified without selecting it first.
+        let options = elements(&container, ".settings-hermes-profile-select option");
+        let labels: Vec<String> = options
+            .iter()
+            .map(|option| option.text_content().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            labels.len(),
+            2,
+            "every discovered profile must be offered: {labels:?}"
         );
-        let work_chip = button_with_text(&container, "work");
         assert!(
-            work_chip
-                .text_content()
-                .unwrap_or_default()
-                .contains("openai/gpt-5"),
-            "work chip should show the profile's configured model as a subtitle"
+            labels
+                .iter()
+                .any(|l| l.contains("Default") && l.contains("anthropic/claude-sonnet-4")),
+            "the default profile must be named and show its active model: {labels:?}"
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.contains("work") && l.contains("openai/gpt-5")),
+            "a named profile must be named and show its configured model: {labels:?}"
         );
 
         // The Providers tab lists what this profile can actually use, with its
@@ -2581,7 +3458,11 @@ mod wasm_tests {
         next_tick().await;
 
         // The default profile's configured model is shown as an editable value.
-        let values = input_values(&container);
+        // Checked across inputs AND selects: the model control renders as a
+        // dropdown when the provider reports its models, and the point of the
+        // negative assertions below is that the other profile's value is not on
+        // screen at all — in any control.
+        let values = control_values(&container);
         assert!(
             values.iter().any(|v| v == "anthropic/claude-sonnet-4"),
             "default profile's model not editable: {values:?}"
@@ -2591,10 +3472,10 @@ mod wasm_tests {
             "other profile's model must not render while Default is selected: {values:?}"
         );
 
-        button_with_text(&container, "work").click();
+        select_profile(&container, "work");
         next_tick().await;
 
-        let values = input_values(&container);
+        let values = control_values(&container);
         assert!(
             values.iter().any(|v| v == "openai/gpt-5"),
             "work profile's model not shown after switching: {values:?}"
@@ -2774,6 +3655,273 @@ mod wasm_tests {
             rows(&container).len(),
             12,
             "clearing the search restores the full catalogue"
+        );
+    }
+
+    /// Hermes reports a provider as connected whenever it can find a
+    /// credential, and re-detects auto-harvested ones (GitHub Copilot via the
+    /// `gh` CLI) after a disconnect. Tyde's own disable list is therefore the
+    /// only control that reliably turns one off, so the row must say plainly
+    /// that it is off and that the reach of that is Tyde only.
+    #[wasm_bindgen_test]
+    async fn a_disabled_provider_reads_as_off_and_says_what_that_covers() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let _handle = mount_doc_with_disabled(
+            &container,
+            doc_with_providers(vec![
+                provider("copilot", "GitHub Copilot", true, "oauth_device_code", None),
+                provider("bedrock", "AWS Bedrock", true, "aws", None),
+            ]),
+            vec!["copilot".to_owned()],
+        );
+        next_tick().await;
+
+        let text = container_text(&container);
+        assert_eq!(
+            elements(&container, ".settings-hermes-badge-off").len(),
+            1,
+            "exactly the disabled provider should read as off: {text}"
+        );
+        assert_eq!(
+            elements(&container, ".settings-hermes-badge-connected").len(),
+            1,
+            "an enabled provider must still read as connected: {text}"
+        );
+        // The reach of the switch is stated, not implied: this hides the
+        // provider in Tyde and does not remove Hermes's credential.
+        assert!(
+            text.contains("hermes session started outside Tyde"),
+            "the row must say the provider is only hidden from Tyde: {text}"
+        );
+        // Both directions are reachable, so this is not a one-way door.
+        button_with_text(&container, "Enable in Tyde");
+        button_with_text(&container, "Disable in Tyde");
+    }
+
+    /// Deleting a Hermes profile removes a whole `HERMES_HOME`. The dialog has
+    /// to name that cost and refuse to fire until the user types the profile
+    /// name — a misclick must not be able to destroy chat history.
+    #[wasm_bindgen_test]
+    async fn deleting_a_profile_needs_the_name_typed_back() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let _handle = mount_doc(&container, fixture_doc());
+        next_tick().await;
+
+        // The default profile IS ~/.hermes, so it is not deletable at all.
+        assert!(
+            !container_text(&container).contains("Delete profile"),
+            "the default profile must not offer a delete"
+        );
+
+        select_profile(&container, "work");
+        next_tick().await;
+        button_with_text(&container, "Delete profile").click();
+        next_tick().await;
+
+        let dialog = container
+            .query_selector("[role='dialog']")
+            .unwrap()
+            .expect("delete confirmation dialog")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        let dialog_text = dialog.text_content().unwrap_or_default();
+        // What is lost has to be stated, because none of it is recoverable and
+        // "delete profile" alone reads like it only drops configuration.
+        for expected in ["sessions", "credentials", "cannot be undone"] {
+            assert!(
+                dialog_text.contains(expected),
+                "the dialog must say {expected:?} is at stake: {dialog_text}"
+            );
+        }
+        assert!(
+            dialog_text.contains("/home/u/.hermes/profiles/work"),
+            "the dialog must name the exact directory: {dialog_text}"
+        );
+
+        let confirm = elements(&container, "[role='dialog'] .settings-btn-danger")
+            .into_iter()
+            .next()
+            .expect("delete button");
+        assert!(
+            confirm.has_attribute("disabled"),
+            "the destructive button must start disabled"
+        );
+
+        let confirm_input: HtmlInputElement = dialog
+            .query_selector("input[type='text']")
+            .unwrap()
+            .expect("confirmation input")
+            .dyn_into()
+            .unwrap();
+        type_into(&confirm_input, "wor");
+        next_tick().await;
+        assert!(
+            elements(&container, "[role='dialog'] .settings-btn-danger")[0]
+                .has_attribute("disabled"),
+            "a partial name must not arm the delete"
+        );
+
+        type_into(&confirm_input, "work");
+        next_tick().await;
+        assert!(
+            !elements(&container, "[role='dialog'] .settings-btn-danger")[0]
+                .has_attribute("disabled"),
+            "the exact profile name must arm the delete"
+        );
+    }
+
+    /// Adding a profile must say what it copies. A Hermes profile is a whole
+    /// home directory, and a user who assumes credentials come along would
+    /// find the new profile unable to serve a model.
+    #[wasm_bindgen_test]
+    async fn adding_a_profile_states_what_is_copied() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let _handle = mount_doc(&container, fixture_doc());
+        next_tick().await;
+
+        button_with_text(&container, "Add profile").click();
+        next_tick().await;
+
+        let text = container_text(&container);
+        assert!(
+            text.contains("config.yaml"),
+            "the create field must say the config is copied: {text}"
+        );
+        assert!(
+            text.contains("Credentials, sessions and history are not copied"),
+            "the create field must say what is NOT copied: {text}"
+        );
+    }
+
+    /// "Hermes default" sat next to an explicit "Auto" in the same dropdown
+    /// while both selected the same behavior, which read as two different
+    /// modes. The unset entry must name the default it actually resolves to.
+    #[wasm_bindgen_test]
+    async fn unset_options_name_the_real_hermes_default() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let _handle = mount_doc(&container, fixture_doc());
+        next_tick().await;
+
+        button_with_text(&container, "Agent").click();
+        next_tick().await;
+
+        let offered: Vec<String> = elements(&container, "select option")
+            .iter()
+            .map(|option| option.text_content().unwrap_or_default())
+            .collect();
+        // Both selects on this tab (coding context, tool search) default to
+        // `auto` in Hermes, which is exactly the pair that used to look like
+        // two distinct modes.
+        assert_eq!(
+            offered
+                .iter()
+                .filter(|o| o.as_str() == "Hermes default (auto)")
+                .count(),
+            2,
+            "each unset option must name the default it resolves to: {offered:?}"
+        );
+        assert!(
+            !offered.iter().any(|o| o.as_str() == "Hermes default"),
+            "no unset option may be left as a bare 'Hermes default': {offered:?}"
+        );
+        // The placeholder for a numeric field carries its default the same way.
+        let max_turns: HtmlInputElement = container
+            .query_selector("input[type='number']")
+            .unwrap()
+            .expect("max turns input")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            max_turns.placeholder(),
+            "Hermes default (90)",
+            "a blank numeric field must say what Hermes will use instead"
+        );
+    }
+
+    /// The default-model field was free text, so a typo produced a config
+    /// Hermes would reject at spawn time. When the probe reports a provider's
+    /// models, the field offers exactly those.
+    #[wasm_bindgen_test]
+    async fn default_model_offers_the_providers_own_models() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let mut doc =
+            doc_with_providers(vec![provider("bedrock", "AWS Bedrock", true, "aws", None)]);
+        doc.profiles[0].config.model.provider = Some("bedrock".to_owned());
+        doc.profiles[0].config.model.model = Some("bedrock/model-3".to_owned());
+        let _handle = mount_doc(&container, doc);
+        next_tick().await;
+
+        button_with_text(&container, "Model").click();
+        next_tick().await;
+
+        let offered: Vec<String> = elements(&container, "select option")
+            .iter()
+            .map(|option| option.text_content().unwrap_or_default())
+            .collect();
+        assert!(
+            offered.iter().any(|o| o == "bedrock/model-3"),
+            "the configured model must be offered: {offered:?}"
+        );
+        assert!(
+            offered.iter().any(|o| o == "bedrock/model-7"),
+            "every model the provider reports must be offered: {offered:?}"
+        );
+        assert!(
+            control_values(&container).contains(&"bedrock/model-3".to_owned()),
+            "the configured model must be the selected one"
+        );
+    }
+
+    /// Disabled toolsets was a free-text field, so the only way to know a
+    /// toolset's name was to have it memorised. The probe's catalogue turns it
+    /// into a picker, with each toolset's own description.
+    #[wasm_bindgen_test]
+    async fn disabled_toolsets_offers_the_probed_catalogue() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let mut doc = fixture_doc();
+        doc.profiles[0].toolsets = Some(vec![
+            protocol::hermes_config::HermesToolsetInfo {
+                name: "browser".to_owned(),
+                description: Some("Drive a web browser".to_owned()),
+                tool_count: 9,
+            },
+            protocol::hermes_config::HermesToolsetInfo {
+                name: "spotify".to_owned(),
+                description: None,
+                tool_count: 4,
+            },
+        ]);
+        doc.profiles[0].config.agent.disabled_toolsets = vec!["spotify".to_owned()];
+        let _handle = mount_doc(&container, doc);
+        next_tick().await;
+
+        button_with_text(&container, "Agent").click();
+        next_tick().await;
+
+        let offered: Vec<String> = elements(&container, "select option")
+            .iter()
+            .map(|option| option.text_content().unwrap_or_default())
+            .collect();
+        assert!(
+            offered
+                .iter()
+                .any(|o| o.contains("browser") && o.contains("Drive a web browser")),
+            "a toolset must be offered with its description: {offered:?}"
+        );
+        // Already-disabled toolsets are chips, not repeat offers.
+        assert!(
+            !offered.iter().any(|o| o.contains("spotify")),
+            "an already-disabled toolset must not be offered again: {offered:?}"
+        );
+        assert!(
+            container_text(&container).contains("spotify"),
+            "the already-disabled toolset must still render as a chip"
         );
     }
 

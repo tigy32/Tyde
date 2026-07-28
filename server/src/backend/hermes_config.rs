@@ -196,6 +196,96 @@ pub(crate) fn resolve_profile_ref_in(
     })
 }
 
+// ── profile directory operations ───────────────────────────────────────
+
+/// Create `profiles/<name>/` and seed it with a copy of the source profile's
+/// `config.yaml`.
+///
+/// Only the config file is copied. A Hermes profile is a whole `HERMES_HOME`,
+/// and its entire purpose is to keep credentials, sessions, state and memories
+/// separate from other profiles — copying those would defeat the feature and
+/// silently duplicate secrets. A source profile with no `config.yaml` yet is
+/// fine: the new profile simply starts on Hermes's own defaults, which is what
+/// an absent config file already means everywhere else in this module.
+pub(crate) fn create_profile_in(
+    home: &Path,
+    name: &str,
+    copy_config_from: Option<&str>,
+) -> Result<HermesProfileRef, String> {
+    if !is_valid_profile_name(name) || name == HERMES_DEFAULT_PROFILE {
+        return Err(format!("invalid Hermes profile name '{name}'"));
+    }
+    let source = resolve_profile_ref_in(home, copy_config_from)?;
+    let destination = home.join(HERMES_PROFILES_DIR).join(name);
+    if destination.exists() {
+        return Err(format!("Hermes profile '{name}' already exists"));
+    }
+    fs::create_dir_all(&destination).map_err(|error| {
+        format!(
+            "Failed to create Hermes profile directory {}: {error}",
+            destination.display()
+        )
+    })?;
+    let source_config = source.home_dir.join(HERMES_CONFIG_FILE);
+    if source_config.is_file() {
+        let bytes = fs::read(&source_config).map_err(|error| {
+            format!(
+                "Failed to read Hermes config {}: {error}",
+                source_config.display()
+            )
+        })?;
+        write_atomic(&destination.join(HERMES_CONFIG_FILE), &bytes)?;
+    }
+    Ok(HermesProfileRef {
+        name: name.to_owned(),
+        home_dir: destination,
+    })
+}
+
+/// Recursively delete `profiles/<name>/`.
+///
+/// This destroys the profile's entire Hermes home — sessions, credentials,
+/// `state.db` and memories, not just its configuration. Callers must have
+/// confirmed that with the user first; there is nothing to undo afterwards.
+/// The default profile is `~/.hermes` itself and is never deletable.
+pub(crate) fn delete_profile_in(home: &Path, name: &str) -> Result<(), String> {
+    if name == HERMES_DEFAULT_PROFILE {
+        return Err("The default Hermes profile cannot be deleted".to_owned());
+    }
+    if !is_valid_profile_name(name) {
+        return Err(format!("invalid Hermes profile name '{name}'"));
+    }
+    let path = home.join(HERMES_PROFILES_DIR).join(name);
+    // `symlink_metadata` so a symlinked profile is removed as the link it is
+    // rather than followed into whatever it points at and deleted recursively.
+    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+        format!(
+            "Hermes profile '{name}' cannot be read at {}: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return fs::remove_file(&path).map_err(|error| {
+            format!(
+                "Failed to delete Hermes profile link {}: {error}",
+                path.display()
+            )
+        });
+    }
+    if !metadata.is_dir() {
+        return Err(format!(
+            "Hermes profile '{name}' is not a directory at {}",
+            path.display()
+        ));
+    }
+    fs::remove_dir_all(&path).map_err(|error| {
+        format!(
+            "Failed to delete Hermes profile {}: {error}",
+            path.display()
+        )
+    })
+}
+
 // ── config.yaml projection ─────────────────────────────────────────────
 
 /// Load the editable projection of a profile's `config.yaml`. A missing file
@@ -762,6 +852,121 @@ mod tests {
         let profiles = discover_profiles_in(home.path()).unwrap();
         assert_eq!(profiles.len(), 1);
         assert!(profiles[0].is_default());
+    }
+
+    #[test]
+    fn create_seeds_config_only_and_refuses_collisions() {
+        let home = temp_home();
+        fs::write(
+            home.path().join(HERMES_CONFIG_FILE),
+            "model:\n  provider: bedrock\n",
+        )
+        .unwrap();
+        // Data that must NOT follow the profile: a Hermes profile exists to
+        // keep credentials and history separate.
+        fs::write(home.path().join(".env"), "ANTHROPIC_API_KEY=secret").unwrap();
+        fs::create_dir_all(home.path().join("sessions")).unwrap();
+        fs::write(home.path().join("state.db"), "sqlite").unwrap();
+
+        let created = create_profile_in(home.path(), "work", None).expect("create");
+        assert_eq!(created.home_dir, home.path().join("profiles/work"));
+        assert_eq!(
+            fs::read_to_string(created.home_dir.join(HERMES_CONFIG_FILE)).unwrap(),
+            "model:\n  provider: bedrock\n"
+        );
+        assert!(!created.home_dir.join(".env").exists());
+        assert!(!created.home_dir.join("state.db").exists());
+        assert!(!created.home_dir.join("sessions").exists());
+
+        let duplicate = create_profile_in(home.path(), "work", None).unwrap_err();
+        assert!(duplicate.contains("already exists"), "{duplicate}");
+
+        let reserved = create_profile_in(home.path(), "default", None).unwrap_err();
+        assert!(
+            reserved.contains("invalid Hermes profile name"),
+            "{reserved}"
+        );
+        let traversal = create_profile_in(home.path(), "../evil", None).unwrap_err();
+        assert!(
+            traversal.contains("invalid Hermes profile name"),
+            "{traversal}"
+        );
+    }
+
+    #[test]
+    fn create_from_a_profile_without_config_starts_on_hermes_defaults() {
+        let home = temp_home();
+        let created = create_profile_in(home.path(), "fresh", None).expect("create");
+        assert!(created.home_dir.is_dir());
+        assert!(!created.home_dir.join(HERMES_CONFIG_FILE).exists());
+        // An absent config file already means "Hermes defaults" everywhere
+        // else, so the new profile must project as all-unset rather than fail.
+        assert_eq!(
+            load_profile_config(&created.home_dir).unwrap(),
+            HermesProfileConfig::default()
+        );
+    }
+
+    #[test]
+    fn create_copies_the_named_source_profile_config() {
+        let home = temp_home();
+        fs::write(
+            home.path().join(HERMES_CONFIG_FILE),
+            "model:\n  provider: bedrock\n",
+        )
+        .unwrap();
+        fs::create_dir_all(home.path().join("profiles/grok")).unwrap();
+        fs::write(
+            home.path().join("profiles/grok").join(HERMES_CONFIG_FILE),
+            "model:\n  provider: xai\n",
+        )
+        .unwrap();
+
+        let created = create_profile_in(home.path(), "grok2", Some("grok")).expect("create");
+        assert_eq!(
+            load_profile_config(&created.home_dir)
+                .unwrap()
+                .model
+                .provider,
+            Some("xai".to_owned())
+        );
+    }
+
+    #[test]
+    fn delete_removes_the_whole_profile_home_and_protects_the_default() {
+        let home = temp_home();
+        let profile = home.path().join("profiles/work");
+        fs::create_dir_all(profile.join("sessions")).unwrap();
+        fs::write(profile.join(HERMES_CONFIG_FILE), "model: {}\n").unwrap();
+        fs::write(profile.join("state.db"), "sqlite").unwrap();
+
+        delete_profile_in(home.path(), "work").expect("delete");
+        assert!(!profile.exists());
+        // The default profile is ~/.hermes itself — deleting it would take the
+        // whole Hermes install with it.
+        let protected = delete_profile_in(home.path(), "default").unwrap_err();
+        assert!(protected.contains("cannot be deleted"), "{protected}");
+        assert!(home.path().is_dir());
+
+        let missing = delete_profile_in(home.path(), "work").unwrap_err();
+        assert!(missing.contains("cannot be read"), "{missing}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_of_a_symlinked_profile_does_not_follow_the_link() {
+        let home = temp_home();
+        let outside = temp_home();
+        fs::write(outside.path().join("precious.txt"), "keep me").unwrap();
+        fs::create_dir_all(home.path().join("profiles")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), home.path().join("profiles/linked")).unwrap();
+
+        delete_profile_in(home.path(), "linked").expect("delete link");
+        assert!(!home.path().join("profiles/linked").exists());
+        assert!(
+            outside.path().join("precious.txt").exists(),
+            "deleting a symlinked profile must remove the link, not its target"
+        );
     }
 
     #[test]

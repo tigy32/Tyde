@@ -226,6 +226,7 @@ fn write_host_settings_with_launch_profiles(
         code_intel: Default::default(),
         backend_config: std::collections::HashMap::new(),
         launch_profiles,
+        hermes_disabled_providers: Default::default(),
     };
     let json = serde_json::json!({ "settings": settings });
     std::fs::write(

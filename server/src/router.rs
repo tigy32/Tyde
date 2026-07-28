@@ -3,10 +3,10 @@ use std::collections::HashSet;
 use anyhow::anyhow;
 use protocol::types::{AgentCompactPayload, CloseAgentPayload};
 use protocol::{
-    AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, CancelQueuedMessagePayload,
-    CancelWorkflowPayload, ClientErrorCode, ClientErrorPayload, CodeIntelCancelReferencesPayload,
-    CodeIntelFindReferencesPayload, CodeIntelHoverPayload, CodeIntelNavigatePayload,
-    CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
+    AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, BackendSettingsRefreshPayload,
+    CancelQueuedMessagePayload, CancelWorkflowPayload, ClientErrorCode, ClientErrorPayload,
+    CodeIntelCancelReferencesPayload, CodeIntelFindReferencesPayload, CodeIntelHoverPayload,
+    CodeIntelNavigatePayload, CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
     CodeIntelUnsubscribeFilePayload, CustomAgentDeletePayload, CustomAgentUpsertPayload,
     DeleteSessionPayload, EditQueuedMessagePayload, Envelope, FetchSessionHistoryPayload,
     FrameKind, HeartbeatPayload, HostBrowseClosePayload, HostBrowseInitial, HostBrowseListPayload,
@@ -224,6 +224,11 @@ pub(crate) async fn route_client_envelope(
             FrameKind::WorkflowRefresh => {
                 let _: WorkflowRefreshPayload = parse_payload(&envelope, "workflow_refresh")?;
                 host.refresh_workflows().await?;
+            }
+            FrameKind::BackendSettingsRefresh => {
+                let payload: BackendSettingsRefreshPayload =
+                    parse_payload(&envelope, "backend_settings_refresh")?;
+                host.refresh_backend_settings(payload).await?;
             }
             FrameKind::TriggerWorkflow => {
                 let payload: TriggerWorkflowPayload = parse_payload(&envelope, "trigger_workflow")?;

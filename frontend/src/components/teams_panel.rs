@@ -2576,6 +2576,7 @@ mod wasm_tests {
                     code_intel: Default::default(),
                     backend_config: std::collections::HashMap::new(),
                     launch_profiles: Vec::new(),
+                    hermes_disabled_providers: Default::default(),
                 },
             );
         });
