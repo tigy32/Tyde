@@ -66,6 +66,17 @@ const CODEX_INFERENCE_SANDBOX: &str = "read-only";
 const CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS: bool = true;
 const CODEX_REASONING_SUMMARY_LEVEL: &str = "detailed";
 const CODEX_MAX_GENERATED_IMAGE_BYTES: usize = 25 * 1024 * 1024;
+/// How often a thread is asked which of its command executions are still
+/// running as background terminals. Codex pushes no notification when a
+/// command backgrounds, so polling is the only way to learn it. The loop runs
+/// only while a `commandExecution` item is outstanding, so an idle thread
+/// issues no requests at all.
+const CODEX_BACKGROUND_TERMINAL_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Consecutive polls a background terminal may be missing from
+/// `thread/backgroundTerminals/list` before it is reported as stopped. The
+/// slack lets the authoritative `item/completed` — which carries the exit
+/// code — win the race when a process exits between polls.
+const CODEX_BACKGROUND_TERMINAL_MISSING_POLLS: u8 = 2;
 const MAX_CODEX_PROVIDER_SUPERSESSIONS_PER_TURN: u8 = 1;
 const MAX_CODEX_PROVIDER_ITEM_TOMBSTONES: usize = 8;
 const MAX_CODEX_TERMINATED_TURNS: usize = 8;
@@ -2037,6 +2048,8 @@ impl CodexSession {
                 tool_call_identities: CodexToolCallIdentities::default(),
                 background_commands: HashMap::new(),
                 background_command_owner_active: true,
+                outstanding_command_executions: HashMap::new(),
+                background_terminal_poll_active: false,
                 tool_container_images: Vec::new(),
                 cancelled_tool_call_ids: HashSet::new(),
                 close_active_stream_when_tools_idle: false,
@@ -3051,10 +3064,32 @@ struct CodexSubAgentActivity {
     kind: String,
 }
 
+/// A command execution Codex reports as a live background terminal.
 struct CodexBackgroundCommand {
     tool_call_id: String,
     task_id: String,
     description: Option<String>,
+    /// Consecutive polls this terminal has been absent from
+    /// `thread/backgroundTerminals/list` without an `item/completed`.
+    missing_polls: u8,
+}
+
+/// A `commandExecution` item between `item/started` and `item/completed`.
+///
+/// Whether it runs in the foreground or the background is not knowable from
+/// the item itself, so every one of them is tracked until Codex says which
+/// it is.
+struct CodexOutstandingCommand {
+    tool_call_id: String,
+    command: Option<String>,
+}
+
+/// One row of a `thread/backgroundTerminals/list` result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CodexBackgroundTerminalRow {
+    item_id: String,
+    process_id: String,
+    command: Option<String>,
 }
 
 impl CodexBackgroundCommand {
@@ -3117,6 +3152,13 @@ struct CodexState {
     tool_call_identities: CodexToolCallIdentities,
     background_commands: HashMap<(String, String), CodexBackgroundCommand>,
     background_command_owner_active: bool,
+    /// `commandExecution` items that have started and not yet completed, keyed
+    /// like `background_commands`. Codex holds the item open for as long as
+    /// the process lives, so this is exactly the set of commands that could
+    /// still be — or become — a background terminal.
+    outstanding_command_executions: HashMap<(String, String), CodexOutstandingCommand>,
+    /// Whether the background-terminal poll loop is already running.
+    background_terminal_poll_active: bool,
     tool_container_images: Vec<protocol::ImageData>,
     cancelled_tool_call_ids: HashSet<String>,
     close_active_stream_when_tools_idle: bool,
@@ -3271,27 +3313,117 @@ struct CodexInner {
 }
 
 impl CodexInner {
-    async fn register_background_command(
-        &self,
+    /// Record a command execution that has started but not finished, and arm
+    /// the poll that decides whether it is background work.
+    async fn track_command_execution(
+        self: &Arc<Self>,
         params: &Value,
         provider_item_id: &str,
         tool_call_id: &str,
         item: &Value,
-    ) -> Option<ToolProgressData> {
-        let command = codex_background_command(tool_call_id, item)?;
-        let mut state = self.state.lock().await;
-        if !state.background_command_owner_active {
-            return None;
+    ) {
+        {
+            let mut state = self.state.lock().await;
+            if !state.background_command_owner_active {
+                return;
+            }
+            let thread_id =
+                extract_notification_thread_id(params).unwrap_or_else(|| state.thread_id.clone());
+            state.outstanding_command_executions.insert(
+                (thread_id, provider_item_id.to_owned()),
+                CodexOutstandingCommand {
+                    tool_call_id: tool_call_id.to_owned(),
+                    command: codex_command_text(item),
+                },
+            );
         }
+        self.spawn_background_terminal_poll();
+    }
+
+    async fn forget_command_execution(&self, params: &Value, provider_item_id: &str) {
+        let mut state = self.state.lock().await;
         let thread_id =
             extract_notification_thread_id(params).unwrap_or_else(|| state.thread_id.clone());
-        let key = (thread_id, provider_item_id.to_owned());
-        if state.background_commands.contains_key(&key) {
-            return None;
+        state
+            .outstanding_command_executions
+            .remove(&(thread_id, provider_item_id.to_owned()));
+    }
+
+    /// Start watching `thread/backgroundTerminals/list` if nothing is watching
+    /// it yet. The loop ends as soon as no command execution is outstanding,
+    /// so an idle thread costs nothing.
+    ///
+    /// Holds a `Weak` reference: a process the user leaves running must not
+    /// keep the session — and its app-server child — alive after teardown.
+    fn spawn_background_terminal_poll(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            {
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                let mut state = inner.state.lock().await;
+                if state.background_terminal_poll_active {
+                    return;
+                }
+                state.background_terminal_poll_active = true;
+            }
+            loop {
+                tokio::time::sleep(CODEX_BACKGROUND_TERMINAL_POLL_INTERVAL).await;
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                if !inner.poll_background_terminals_once().await {
+                    inner.state.lock().await.background_terminal_poll_active = false;
+                    return;
+                }
+            }
+        });
+    }
+
+    /// One reconcile pass. Returns whether the loop should keep polling.
+    async fn poll_background_terminals_once(&self) -> bool {
+        let thread_id = {
+            let state = self.state.lock().await;
+            if state.outstanding_command_executions.is_empty() {
+                return false;
+            }
+            state.thread_id.clone()
+        };
+        let result = match self
+            .rpc
+            .request(
+                "thread/backgroundTerminals/list",
+                json!({ "threadId": thread_id }),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                // The app-server is gone or wedged. Nothing authoritative is
+                // left to report, so stop rather than guess at liveness.
+                tracing::debug!("Codex background terminal poll failed: {err}");
+                return false;
+            }
+        };
+        if result
+            .get("nextCursor")
+            .is_some_and(|cursor| !cursor.is_null())
+        {
+            tracing::warn!(
+                "Codex reported more background terminals than one page; \
+                 only the first page is tracked"
+            );
         }
-        let progress = command.progress(BackgroundTaskStatus::Running, None);
-        state.background_commands.insert(key, command);
-        Some(progress)
+        let listed = parse_codex_background_terminals(&result);
+        let progress = {
+            let mut state = self.state.lock().await;
+            reconcile_codex_background_terminals(&mut state, &thread_id, &listed)
+        };
+        for update in &progress {
+            self.emitter.tool_progress(update);
+        }
+        true
     }
 
     async fn take_background_command(
@@ -3311,6 +3443,7 @@ impl CodexInner {
         let commands = {
             let mut state = self.state.lock().await;
             state.background_command_owner_active = false;
+            state.outstanding_command_executions.clear();
             let commands = std::mem::take(&mut state.background_commands)
                 .into_values()
                 .collect::<Vec<_>>();
@@ -5404,7 +5537,7 @@ impl CodexInner {
         Ok(true)
     }
 
-    async fn handle_inbound(&self, inbound: CodexInbound) {
+    async fn handle_inbound(self: &Arc<Self>, inbound: CodexInbound) {
         match inbound {
             CodexInbound::Stderr(line) => {
                 self.emitter.subprocess_stderr(&line);
@@ -5431,7 +5564,7 @@ impl CodexInner {
         }
     }
 
-    async fn handle_notification(&self, method: &str, params: &Value) {
+    async fn handle_notification(self: &Arc<Self>, method: &str, params: &Value) {
         self.trace_notification_structure(method, params).await;
         self.trace_agent_message_identity_event(method, params)
             .await;
@@ -5512,6 +5645,8 @@ impl CodexInner {
                 && let Some(provider_item_id) = item.get("id").and_then(Value::as_str)
                 && let Some(command) = self.take_background_command(params, provider_item_id).await
             {
+                self.forget_command_execution(params, provider_item_id)
+                    .await;
                 self.state
                     .lock()
                     .await
@@ -8636,7 +8771,7 @@ impl CodexInner {
         estimate.tool_io_bytes = estimate.tool_io_bytes.saturating_add(bytes);
     }
 
-    async fn handle_item_started(&self, params: &Value) {
+    async fn handle_item_started(self: &Arc<Self>, params: &Value) {
         let Some(item) = params.get("item") else {
             return;
         };
@@ -8867,12 +9002,8 @@ impl CodexInner {
                     }),
                 )
                 .await;
-                if let Some(progress) = self
-                    .register_background_command(params, provider_item_id, &item_id, item)
-                    .await
-                {
-                    self.emitter.tool_progress(&progress);
-                }
+                self.track_command_execution(params, provider_item_id, &item_id, item)
+                    .await;
             }
             "fileChange" => {
                 let item_id = self
@@ -9273,6 +9404,8 @@ impl CodexInner {
                     .await;
                 let background_command =
                     self.take_background_command(params, provider_item_id).await;
+                self.forget_command_execution(params, provider_item_id)
+                    .await;
                 self.add_active_turn_tool_bytes(estimate_command_execution_tool_bytes(item))
                     .await;
                 let exit_code = item.get("exitCode").and_then(Value::as_i64).unwrap_or(-1) as i32;
@@ -11798,27 +11931,115 @@ fn estimate_command_execution_tool_bytes(item: &Value) -> u64 {
         .saturating_add(value_str_len(item, "aggregatedOutput"))
 }
 
-fn codex_background_command(tool_call_id: &str, item: &Value) -> Option<CodexBackgroundCommand> {
-    let process_id = item
-        .get("processId")
-        .or_else(|| item.get("process_id"))
-        .and_then(|value| {
-            value
-                .as_str()
-                .map(str::to_owned)
-                .or_else(|| value.as_u64().map(|value| value.to_string()))
-        })
-        .filter(|value| !value.trim().is_empty())?;
-    let command = item
-        .get("command")
+/// Fold one `thread/backgroundTerminals/list` snapshot into the tracked set,
+/// returning the progress updates that snapshot implies.
+///
+/// A terminal is announced the first poll it is listed, and reported stopped
+/// only after `CODEX_BACKGROUND_TERMINAL_MISSING_POLLS` consecutive polls
+/// without it. The slack lets `item/completed` — handled separately, and the
+/// only source of an exit code — win the race when a process exits between
+/// polls, so a normal exit never flashes as "Stopped".
+fn reconcile_codex_background_terminals(
+    state: &mut CodexState,
+    thread_id: &str,
+    listed: &[CodexBackgroundTerminalRow],
+) -> Vec<ToolProgressData> {
+    if !state.background_command_owner_active {
+        return Vec::new();
+    }
+    let mut progress = Vec::new();
+    for row in listed {
+        let key = (thread_id.to_owned(), row.item_id.clone());
+        if let Some(known) = state.background_commands.get_mut(&key) {
+            known.missing_polls = 0;
+            continue;
+        }
+        // The list is keyed by provider item id; without the matching
+        // `item/started` there is no card to attach progress to.
+        let Some(outstanding) = state.outstanding_command_executions.get(&key) else {
+            tracing::debug!(
+                "Codex reported a background terminal for unknown command execution '{}'",
+                row.item_id
+            );
+            continue;
+        };
+        let command = CodexBackgroundCommand {
+            tool_call_id: outstanding.tool_call_id.clone(),
+            task_id: row.process_id.clone(),
+            description: row.command.clone().or_else(|| outstanding.command.clone()),
+            missing_polls: 0,
+        };
+        progress.push(command.progress(BackgroundTaskStatus::Running, None));
+        state.background_commands.insert(key, command);
+    }
+
+    let listed_ids: HashSet<&str> = listed.iter().map(|row| row.item_id.as_str()).collect();
+    let mut stopped = Vec::new();
+    for (key, command) in state.background_commands.iter_mut() {
+        if key.0 != thread_id || listed_ids.contains(key.1.as_str()) {
+            continue;
+        }
+        command.missing_polls = command.missing_polls.saturating_add(1);
+        if command.missing_polls >= CODEX_BACKGROUND_TERMINAL_MISSING_POLLS {
+            stopped.push(key.clone());
+        }
+    }
+    for key in stopped {
+        let Some(command) = state.background_commands.remove(&key) else {
+            continue;
+        };
+        state.outstanding_command_executions.remove(&key);
+        progress.push(command.progress(BackgroundTaskStatus::Stopped, None));
+    }
+    progress
+}
+
+fn codex_command_text(item: &Value) -> Option<String> {
+    item.get("command")
         .and_then(Value::as_str)
-        .filter(|command| !command.trim().is_empty())
-        .map(str::to_owned);
-    Some(CodexBackgroundCommand {
-        tool_call_id: tool_call_id.to_owned(),
-        task_id: process_id,
-        description: command,
-    })
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .map(str::to_owned)
+}
+
+/// Rows of a `thread/backgroundTerminals/list` result.
+///
+/// This is the only authoritative background signal Codex offers. A command
+/// execution item is no help: every `unified_exec` command carries a
+/// `processId`, foreground ones included, so item fields cannot distinguish
+/// the two. Verified against codex-cli 0.144.3 — a foreground
+/// `/bin/zsh -lc 'echo …'` reports `"processId": "24852"` yet never appears
+/// in this list, while a process that outlives its exec call appears here and
+/// withholds `item/completed` until it exits.
+fn parse_codex_background_terminals(result: &Value) -> Vec<CodexBackgroundTerminalRow> {
+    let Some(rows) = result.get("data").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter_map(|row| {
+            let item_id = row
+                .get("itemId")
+                .or_else(|| row.get("item_id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|item_id| !item_id.is_empty())?;
+            let process_id = row
+                .get("processId")
+                .or_else(|| row.get("process_id"))
+                .and_then(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .or_else(|| value.as_u64().map(|value| value.to_string()))
+                })
+                .filter(|value| !value.trim().is_empty())?;
+            Some(CodexBackgroundTerminalRow {
+                item_id: item_id.to_owned(),
+                process_id,
+                command: codex_command_text(row),
+            })
+        })
+        .collect()
 }
 
 fn estimate_file_change_tool_bytes(item: &Value) -> u64 {
@@ -19328,6 +19549,8 @@ for line in sys.stdin:
             tool_call_identities: CodexToolCallIdentities::default(),
             background_commands: HashMap::new(),
             background_command_owner_active: true,
+            outstanding_command_executions: HashMap::new(),
+            background_terminal_poll_active: false,
             tool_container_images: Vec::new(),
             cancelled_tool_call_ids: HashSet::new(),
             close_active_stream_when_tools_idle: false,
@@ -19415,7 +19638,7 @@ for line in sys.stdin:
     }
 
     async fn start_test_codex_provider_item(
-        inner: &CodexInner,
+        inner: &Arc<CodexInner>,
         thread_id: &str,
         item_id: Option<&str>,
         kind: CodexProviderItemKind,
@@ -19437,7 +19660,7 @@ for line in sys.stdin:
     }
 
     async fn delta_test_codex_provider_item(
-        inner: &CodexInner,
+        inner: &Arc<CodexInner>,
         thread_id: &str,
         item_id: Option<&str>,
         kind: CodexProviderItemKind,
@@ -19455,7 +19678,7 @@ for line in sys.stdin:
     }
 
     async fn complete_test_codex_provider_item(
-        inner: &CodexInner,
+        inner: &Arc<CodexInner>,
         thread_id: &str,
         item_id: &str,
         kind: CodexProviderItemKind,
@@ -24809,6 +25032,25 @@ Do not describe the tool, and do not skip the tool call."#;
                     }),
                 )
                 .await;
+            // The process outlives its turn, which is precisely what makes it a
+            // background terminal — so Codex lists it, and that listing (not
+            // the item's `processId`) is what publishes the Running row.
+            assert!(
+                drain_events(&mut rx)
+                    .iter()
+                    .all(|event| event.get("kind").and_then(Value::as_str) != Some("ToolProgress")),
+                "a started command must not claim a tray row before Codex lists it"
+            );
+            apply_background_terminal_snapshot(
+                &inner,
+                "thread-test",
+                &[background_terminal_row(
+                    "cancelled-command",
+                    "4242",
+                    "sleep 30",
+                )],
+            )
+            .await;
             let started = drain_events(&mut rx);
             let running = started
                 .iter()
@@ -24950,8 +25192,47 @@ Do not describe the tool, and do not skip the tool call."#;
         });
     }
 
+    /// Apply the background-terminal snapshot Codex would return, exactly as
+    /// the poll loop does. `poll_background_terminals_once` only adds the RPC
+    /// that produces `rows`, which the fake app-server cannot answer.
+    async fn apply_background_terminal_snapshot(
+        inner: &Arc<CodexInner>,
+        thread_id: &str,
+        rows: &[CodexBackgroundTerminalRow],
+    ) {
+        let progress = {
+            let mut state = inner.state.lock().await;
+            reconcile_codex_background_terminals(&mut state, thread_id, rows)
+        };
+        for update in &progress {
+            inner.emitter.tool_progress(update);
+        }
+    }
+
+    fn background_terminal_row(
+        item_id: &str,
+        process_id: &str,
+        command: &str,
+    ) -> CodexBackgroundTerminalRow {
+        CodexBackgroundTerminalRow {
+            item_id: item_id.to_owned(),
+            process_id: process_id.to_owned(),
+            command: Some(command.to_owned()),
+        }
+    }
+
+    /// A slow *foreground* command interleaved with a later agent message.
+    ///
+    /// The fixture keeps its `processId` because every `unified_exec` command
+    /// has one — verified against codex-cli 0.144.3, where a plain
+    /// `/bin/zsh -lc 'echo …'` reports `"processId": "24852"` on `item/started`
+    /// and never appears in `thread/backgroundTerminals/list`. Reading that id
+    /// as a background marker put ordinary foreground commands in the in-flight
+    /// tray, so this now asserts the opposite of what it used to: the command
+    /// still keeps its identity across the later message, and emits no
+    /// background-task progress at all.
     #[test]
-    fn background_command_completes_during_later_codex_message() {
+    fn foreground_command_completes_during_later_codex_message() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -25074,13 +25355,11 @@ Do not describe the tool, and do not skip the tool call."#;
                     "StreamEnd",
                     "StreamStart",
                     "ToolRequest",
-                    "ToolProgress",
                     "StreamEnd",
                     "TypingStatusChanged",
                     "StreamStart",
                     "StreamDelta",
                     "ToolExecutionCompleted",
-                    "ToolProgress",
                     "StreamEnd",
                     "MessageMetadataUpdated",
                     "TypingStatusChanged",
@@ -25105,28 +25384,27 @@ Do not describe the tool, and do not skip the tool call."#;
                     .and_then(Value::as_bool),
                 Some(true)
             );
+            // The in-flight tray counts exactly the BackgroundTask rows, and a
+            // foreground command is not background work — its own `processId`
+            // must not put it there.
             let progress = events
                 .iter()
                 .filter(|event| event.get("kind").and_then(Value::as_str) == Some("ToolProgress"))
                 .collect::<Vec<_>>();
-            assert_eq!(progress.len(), 2);
-            assert_eq!(
-                progress[0]
-                    .pointer("/data/update/status")
-                    .and_then(Value::as_str),
-                Some("running")
+            assert!(
+                progress.is_empty(),
+                "foreground command emitted background progress: {progress:?}"
             );
-            assert_eq!(
-                progress[1]
-                    .pointer("/data/update/status")
-                    .and_then(Value::as_str),
-                Some("completed")
-            );
-            assert_eq!(
-                progress[0]
-                    .pointer("/data/update/task_id")
-                    .and_then(Value::as_str),
-                Some("1234")
+            // It is still tracked while it runs — that is what arms the poll
+            // that would notice if it did background — and released on exit.
+            assert!(
+                inner
+                    .state
+                    .lock()
+                    .await
+                    .outstanding_command_executions
+                    .is_empty(),
+                "completed command execution stayed outstanding"
             );
 
             inner
@@ -25152,6 +25430,283 @@ Do not describe the tool, and do not skip the tool call."#;
                 drain_events(&mut rx).is_empty(),
                 "normal command completion must emit progress and card completion exactly once"
             );
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    /// `thread/backgroundTerminals/list` payload shape, as codex-cli 0.144.3
+    /// returns it for a process that outlived its exec call.
+    fn background_terminal_list_result(rows: Value) -> Value {
+        json!({ "data": rows, "nextCursor": Value::Null })
+    }
+
+    #[test]
+    fn foreground_command_is_absent_from_the_background_terminal_list() {
+        let listed = parse_codex_background_terminals(&background_terminal_list_result(json!([])));
+        assert!(listed.is_empty());
+
+        let mut state = test_codex_state();
+        state.outstanding_command_executions.insert(
+            ("thread-test".to_owned(), "call_foreground".to_owned()),
+            CodexOutstandingCommand {
+                tool_call_id: "codex:thread-test:turn:call_foreground".to_owned(),
+                command: Some("echo hi".to_owned()),
+            },
+        );
+        let progress = reconcile_codex_background_terminals(&mut state, "thread-test", &listed);
+        assert!(
+            progress.is_empty(),
+            "an outstanding foreground command produced background progress: {progress:?}"
+        );
+        assert!(state.background_commands.is_empty());
+    }
+
+    #[test]
+    fn listed_background_terminal_is_announced_once() {
+        let listed = parse_codex_background_terminals(&background_terminal_list_result(json!([{
+            "itemId": "call_background",
+            "processId": "14671",
+            "command": "sleep 240",
+            "cwd": "/tmp",
+            "osPid": Value::Null,
+            "cpuPercent": Value::Null,
+            "rssKb": Value::Null,
+        }])));
+        assert_eq!(
+            listed,
+            vec![background_terminal_row(
+                "call_background",
+                "14671",
+                "sleep 240"
+            )]
+        );
+
+        let mut state = test_codex_state();
+        state.outstanding_command_executions.insert(
+            ("thread-test".to_owned(), "call_background".to_owned()),
+            CodexOutstandingCommand {
+                tool_call_id: "codex:thread-test:turn:call_background".to_owned(),
+                command: Some("sleep 240".to_owned()),
+            },
+        );
+
+        let progress = reconcile_codex_background_terminals(&mut state, "thread-test", &listed);
+        assert_eq!(progress.len(), 1);
+        assert_eq!(
+            progress[0].tool_call_id,
+            "codex:thread-test:turn:call_background"
+        );
+        let ToolProgressUpdate::BackgroundTask(task) = &progress[0].update else {
+            panic!(
+                "expected a BackgroundTask update, got {:?}",
+                progress[0].update
+            );
+        };
+        assert_eq!(task.status, BackgroundTaskStatus::Running);
+        assert_eq!(task.task_id, "14671");
+        assert_eq!(task.description.as_deref(), Some("sleep 240"));
+
+        // Still listed on the next poll: the row is already on screen, so a
+        // repeat snapshot must not re-announce it.
+        let repeat = reconcile_codex_background_terminals(&mut state, "thread-test", &listed);
+        assert!(
+            repeat.is_empty(),
+            "re-announced a terminal that was already running: {repeat:?}"
+        );
+    }
+
+    #[test]
+    fn background_terminal_stops_only_after_repeated_absence() {
+        let mut state = test_codex_state();
+        state.outstanding_command_executions.insert(
+            ("thread-test".to_owned(), "call_background".to_owned()),
+            CodexOutstandingCommand {
+                tool_call_id: "codex:thread-test:turn:call_background".to_owned(),
+                command: Some("sleep 240".to_owned()),
+            },
+        );
+        reconcile_codex_background_terminals(
+            &mut state,
+            "thread-test",
+            &[background_terminal_row(
+                "call_background",
+                "14671",
+                "sleep 240",
+            )],
+        );
+
+        // The first absent poll stays quiet so the authoritative
+        // `item/completed`, which carries the exit code, can land first.
+        let first = reconcile_codex_background_terminals(&mut state, "thread-test", &[]);
+        assert!(
+            first.is_empty(),
+            "reported a stop on the first absence: {first:?}"
+        );
+        assert!(
+            state
+                .background_commands
+                .contains_key(&("thread-test".to_owned(), "call_background".to_owned()))
+        );
+
+        let second = reconcile_codex_background_terminals(&mut state, "thread-test", &[]);
+        assert_eq!(second.len(), 1);
+        let ToolProgressUpdate::BackgroundTask(task) = &second[0].update else {
+            panic!(
+                "expected a BackgroundTask update, got {:?}",
+                second[0].update
+            );
+        };
+        assert_eq!(task.status, BackgroundTaskStatus::Stopped);
+        assert_eq!(task.task_id, "14671");
+        assert!(
+            state.background_commands.is_empty(),
+            "a stopped terminal stayed tracked and would report again"
+        );
+    }
+
+    /// The full background lifecycle: Codex lists the process, then delivers
+    /// `item/completed` for it — outside any turn, ~18s after `turn/completed`
+    /// in the captured trace — and that completion, not the poll, carries the
+    /// exit code.
+    #[test]
+    fn background_terminal_completion_reports_its_exit_code() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut rx) = test_codex_inner();
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({ "threadId": "thread-test", "turn": { "id": "turn-1" } }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/started",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turnId": "turn-1",
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "call_background",
+                            "command": "/bin/zsh -lc 'sleep 18'",
+                            "cwd": "/tmp",
+                            "processId": "71411",
+                            "source": "unifiedExecStartup",
+                            "status": "inProgress"
+                        }
+                    }),
+                )
+                .await;
+            drain_events(&mut rx);
+
+            apply_background_terminal_snapshot(
+                &inner,
+                "thread-test",
+                &[background_terminal_row(
+                    "call_background",
+                    "71411",
+                    "sleep 18",
+                )],
+            )
+            .await;
+            let running = drain_events(&mut rx);
+            let running = running
+                .iter()
+                .filter(|event| event.get("kind").and_then(Value::as_str) == Some("ToolProgress"))
+                .collect::<Vec<_>>();
+            assert_eq!(running.len(), 1, "expected one running row: {running:?}");
+            let tool_call_id = running[0]
+                .pointer("/data/tool_call_id")
+                .and_then(Value::as_str)
+                .expect("running row carries a tool call id")
+                .to_owned();
+            assert_eq!(
+                running[0]
+                    .pointer("/data/update/status")
+                    .and_then(Value::as_str),
+                Some("running")
+            );
+
+            inner
+                .handle_notification(
+                    "turn/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turn": { "id": "turn-1", "status": "completed" }
+                    }),
+                )
+                .await;
+            drain_events(&mut rx);
+
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turnId": "turn-1",
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "call_background",
+                            "command": "/bin/zsh -lc 'sleep 18'",
+                            "cwd": "/tmp",
+                            "processId": "71411",
+                            "source": "unifiedExecStartup",
+                            "status": "completed",
+                            "exitCode": 0,
+                            "durationMs": 17973,
+                            "aggregatedOutput": ""
+                        }
+                    }),
+                )
+                .await;
+
+            let events = drain_events(&mut rx);
+            let progress = events
+                .iter()
+                .filter(|event| event.get("kind").and_then(Value::as_str) == Some("ToolProgress"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                progress.len(),
+                1,
+                "expected exactly one terminal progress: {progress:?}"
+            );
+            assert_eq!(
+                progress[0]
+                    .pointer("/data/tool_call_id")
+                    .and_then(Value::as_str),
+                Some(tool_call_id.as_str()),
+                "the terminal row must land on the card that opened it"
+            );
+            assert_eq!(
+                progress[0]
+                    .pointer("/data/update/status")
+                    .and_then(Value::as_str),
+                Some("completed")
+            );
+            assert_eq!(
+                progress[0]
+                    .pointer("/data/update/task_id")
+                    .and_then(Value::as_str),
+                Some("71411")
+            );
+            assert_eq!(
+                progress[0]
+                    .pointer("/data/update/summary")
+                    .and_then(Value::as_str),
+                Some("Exited with code 0")
+            );
+            {
+                let state = inner.state.lock().await;
+                assert!(
+                    state.background_commands.is_empty()
+                        && state.outstanding_command_executions.is_empty(),
+                    "a finished background terminal stayed tracked"
+                );
+            }
             inner.rpc.shutdown().await;
         });
     }
@@ -25189,6 +25744,20 @@ Do not describe the tool, and do not skip the tool call."#;
                     }),
                 )
                 .await;
+            // `item/started` alone says nothing about backgrounding; the row
+            // exists only once Codex lists the process as a live terminal.
+            assert!(
+                drain_events(&mut rx).iter().all(|event| {
+                    event.get("kind").and_then(Value::as_str) != Some("ToolProgress")
+                }),
+                "a started command must not claim a tray row before Codex lists it"
+            );
+            apply_background_terminal_snapshot(
+                &inner,
+                "thread-test",
+                &[background_terminal_row("owner-command", "5252", "sleep 30")],
+            )
+            .await;
             let started = drain_events(&mut rx);
             assert_eq!(
                 started
@@ -25538,15 +26107,10 @@ Do not describe the tool, and do not skip the tool call."#;
                     )
                     .await;
                 drain_events(&mut rx);
-                start_test_codex_provider_item(
-                    inner.as_ref(),
-                    "thread-test",
-                    Some(&first_id),
-                    first_kind,
-                )
-                .await;
+                start_test_codex_provider_item(&inner, "thread-test", Some(&first_id), first_kind)
+                    .await;
                 delta_test_codex_provider_item(
-                    inner.as_ref(),
+                    &inner,
                     "thread-test",
                     Some(&first_id),
                     first_kind,
@@ -25554,14 +26118,14 @@ Do not describe the tool, and do not skip the tool call."#;
                 )
                 .await;
                 start_test_codex_provider_item(
-                    inner.as_ref(),
+                    &inner,
                     "thread-test",
                     Some(&second_id),
                     second_kind,
                 )
                 .await;
                 delta_test_codex_provider_item(
-                    inner.as_ref(),
+                    &inner,
                     "thread-test",
                     Some(&second_id),
                     second_kind,
@@ -25569,7 +26133,7 @@ Do not describe the tool, and do not skip the tool call."#;
                 )
                 .await;
                 complete_test_codex_provider_item(
-                    inner.as_ref(),
+                    &inner,
                     "thread-test",
                     &second_id,
                     second_kind,
@@ -25699,14 +26263,14 @@ Do not describe the tool, and do not skip the tool call."#;
             ] {
                 if item_id == "tool-after-rollover" {
                     start_test_codex_provider_item(
-                        inner.as_ref(),
+                        &inner,
                         "thread-test",
                         Some("reasoning-a"),
                         CodexProviderItemKind::Reasoning,
                     )
                     .await;
                     delta_test_codex_provider_item(
-                        inner.as_ref(),
+                        &inner,
                         "thread-test",
                         Some("reasoning-a"),
                         CodexProviderItemKind::Reasoning,
@@ -25714,14 +26278,14 @@ Do not describe the tool, and do not skip the tool call."#;
                     )
                     .await;
                     start_test_codex_provider_item(
-                        inner.as_ref(),
+                        &inner,
                         "thread-test",
                         Some("reasoning-b"),
                         CodexProviderItemKind::Reasoning,
                     )
                     .await;
                     delta_test_codex_provider_item(
-                        inner.as_ref(),
+                        &inner,
                         "thread-test",
                         Some("reasoning-b"),
                         CodexProviderItemKind::Reasoning,
@@ -25729,7 +26293,7 @@ Do not describe the tool, and do not skip the tool call."#;
                     )
                     .await;
                     complete_test_codex_provider_item(
-                        inner.as_ref(),
+                        &inner,
                         "thread-test",
                         "reasoning-b",
                         CodexProviderItemKind::Reasoning,
@@ -25767,14 +26331,14 @@ Do not describe the tool, and do not skip the tool call."#;
                     .await;
             }
             start_test_codex_provider_item(
-                inner.as_ref(),
+                &inner,
                 "thread-test",
                 Some("final-answer"),
                 CodexProviderItemKind::AgentMessage,
             )
             .await;
             delta_test_codex_provider_item(
-                inner.as_ref(),
+                &inner,
                 "thread-test",
                 Some("final-answer"),
                 CodexProviderItemKind::AgentMessage,
@@ -25782,7 +26346,7 @@ Do not describe the tool, and do not skip the tool call."#;
             )
             .await;
             complete_test_codex_provider_item(
-                inner.as_ref(),
+                &inner,
                 "thread-test",
                 "final-answer",
                 CodexProviderItemKind::AgentMessage,
@@ -25875,14 +26439,14 @@ Do not describe the tool, and do not skip the tool call."#;
             drain_events(&mut rx);
             for (item_id, content) in [("late-first", "accepted"), ("late-second", "replacement")] {
                 start_test_codex_provider_item(
-                    inner.as_ref(),
+                    &inner,
                     "thread-test",
                     Some(item_id),
                     CodexProviderItemKind::AgentMessage,
                 )
                 .await;
                 delta_test_codex_provider_item(
-                    inner.as_ref(),
+                    &inner,
                     "thread-test",
                     Some(item_id),
                     CodexProviderItemKind::AgentMessage,
@@ -25892,7 +26456,7 @@ Do not describe the tool, and do not skip the tool call."#;
             }
             drain_events(&mut rx);
             delta_test_codex_provider_item(
-                inner.as_ref(),
+                &inner,
                 "thread-test",
                 Some("late-first"),
                 CodexProviderItemKind::AgentMessage,
@@ -25900,7 +26464,7 @@ Do not describe the tool, and do not skip the tool call."#;
             )
             .await;
             complete_test_codex_provider_item(
-                inner.as_ref(),
+                &inner,
                 "thread-test",
                 "late-first",
                 CodexProviderItemKind::AgentMessage,
@@ -25913,7 +26477,7 @@ Do not describe the tool, and do not skip the tool call."#;
             );
 
             complete_test_codex_provider_item(
-                inner.as_ref(),
+                &inner,
                 "thread-test",
                 "late-first",
                 CodexProviderItemKind::AgentMessage,
@@ -25955,7 +26519,7 @@ Do not describe the tool, and do not skip the tool call."#;
                 .await;
             drain_events(&mut rx);
             complete_test_codex_provider_item(
-                inner.as_ref(),
+                &inner,
                 "thread-test",
                 "late-first",
                 CodexProviderItemKind::AgentMessage,
@@ -25985,14 +26549,14 @@ Do not describe the tool, and do not skip the tool call."#;
             drain_events(&mut rx);
             for item_id in ["late-reasoning-a", "late-reasoning-b"] {
                 start_test_codex_provider_item(
-                    inner.as_ref(),
+                    &inner,
                     "thread-test",
                     Some(item_id),
                     CodexProviderItemKind::Reasoning,
                 )
                 .await;
                 delta_test_codex_provider_item(
-                    inner.as_ref(),
+                    &inner,
                     "thread-test",
                     Some(item_id),
                     CodexProviderItemKind::Reasoning,
@@ -26002,7 +26566,7 @@ Do not describe the tool, and do not skip the tool call."#;
             }
             drain_events(&mut rx);
             delta_test_codex_provider_item(
-                inner.as_ref(),
+                &inner,
                 "thread-test",
                 Some("late-reasoning-a"),
                 CodexProviderItemKind::Reasoning,
@@ -26010,7 +26574,7 @@ Do not describe the tool, and do not skip the tool call."#;
             )
             .await;
             complete_test_codex_provider_item(
-                inner.as_ref(),
+                &inner,
                 "thread-test",
                 "late-reasoning-a",
                 CodexProviderItemKind::Reasoning,
@@ -26031,7 +26595,7 @@ Do not describe the tool, and do not skip the tool call."#;
                 tombstone.late_event_count = MAX_CODEX_LATE_SUPERSEDED_EVENTS;
             }
             delta_test_codex_provider_item(
-                inner.as_ref(),
+                &inner,
                 "thread-test",
                 Some("late-reasoning-a"),
                 CodexProviderItemKind::Reasoning,
@@ -26109,14 +26673,14 @@ Do not describe the tool, and do not skip the tool call."#;
             drain_events(&mut rx);
             for item_id in ["bounded-a", "bounded-b"] {
                 start_test_codex_provider_item(
-                    inner.as_ref(),
+                    &inner,
                     "thread-test",
                     Some(item_id),
                     CodexProviderItemKind::Reasoning,
                 )
                 .await;
                 delta_test_codex_provider_item(
-                    inner.as_ref(),
+                    &inner,
                     "thread-test",
                     Some(item_id),
                     CodexProviderItemKind::Reasoning,
@@ -26139,7 +26703,7 @@ Do not describe the tool, and do not skip the tool call."#;
                 "a duplicate turn start must not reset the recovery latch"
             );
             start_test_codex_provider_item(
-                inner.as_ref(),
+                &inner,
                 "thread-test",
                 Some("bounded-c"),
                 CodexProviderItemKind::AgentMessage,
@@ -26177,14 +26741,14 @@ Do not describe the tool, and do not skip the tool call."#;
                     .await;
                 drain_events(&mut rx);
                 start_test_codex_provider_item(
-                    inner.as_ref(),
+                    &inner,
                     "thread-test",
                     first_start_id,
                     CodexProviderItemKind::Reasoning,
                 )
                 .await;
                 delta_test_codex_provider_item(
-                    inner.as_ref(),
+                    &inner,
                     "thread-test",
                     first_id,
                     CodexProviderItemKind::Reasoning,
@@ -26193,7 +26757,7 @@ Do not describe the tool, and do not skip the tool call."#;
                 .await;
                 drain_events(&mut rx);
                 start_test_codex_provider_item(
-                    inner.as_ref(),
+                    &inner,
                     "thread-test",
                     second_id,
                     CodexProviderItemKind::Reasoning,
@@ -26238,14 +26802,14 @@ Do not describe the tool, and do not skip the tool call."#;
                     .await;
                 drain_events(&mut rx);
                 start_test_codex_provider_item(
-                    inner.as_ref(),
+                    &inner,
                     "thread-test",
                     Some("guarded-a"),
                     CodexProviderItemKind::Reasoning,
                 )
                 .await;
                 delta_test_codex_provider_item(
-                    inner.as_ref(),
+                    &inner,
                     "thread-test",
                     Some("guarded-a"),
                     CodexProviderItemKind::Reasoning,
@@ -26261,7 +26825,7 @@ Do not describe the tool, and do not skip the tool call."#;
                         .pending_tool_call_ids
                         .insert("pending-tool".to_string());
                     start_test_codex_provider_item(
-                        inner.as_ref(),
+                        &inner,
                         "thread-test",
                         Some("guarded-b"),
                         CodexProviderItemKind::AgentMessage,
@@ -26269,7 +26833,7 @@ Do not describe the tool, and do not skip the tool call."#;
                     .await;
                 } else {
                     delta_test_codex_provider_item(
-                        inner.as_ref(),
+                        &inner,
                         "thread-test",
                         Some("guarded-b"),
                         CodexProviderItemKind::AgentMessage,
@@ -27368,15 +27932,10 @@ Do not describe the tool, and do not skip the tool call."#;
                     )
                     .await;
                 drain_events(&mut child_rx);
-                start_test_codex_provider_item(
-                    inner.as_ref(),
-                    &child_thread,
-                    Some(&first_id),
-                    first_kind,
-                )
-                .await;
+                start_test_codex_provider_item(&inner, &child_thread, Some(&first_id), first_kind)
+                    .await;
                 delta_test_codex_provider_item(
-                    inner.as_ref(),
+                    &inner,
                     &child_thread,
                     Some(&first_id),
                     first_kind,
@@ -27384,14 +27943,14 @@ Do not describe the tool, and do not skip the tool call."#;
                 )
                 .await;
                 start_test_codex_provider_item(
-                    inner.as_ref(),
+                    &inner,
                     &child_thread,
                     Some(&second_id),
                     second_kind,
                 )
                 .await;
                 delta_test_codex_provider_item(
-                    inner.as_ref(),
+                    &inner,
                     &child_thread,
                     Some(&second_id),
                     second_kind,
@@ -27399,7 +27958,7 @@ Do not describe the tool, and do not skip the tool call."#;
                 )
                 .await;
                 delta_test_codex_provider_item(
-                    inner.as_ref(),
+                    &inner,
                     &child_thread,
                     Some(&first_id),
                     first_kind,
@@ -27407,7 +27966,7 @@ Do not describe the tool, and do not skip the tool call."#;
                 )
                 .await;
                 complete_test_codex_provider_item(
-                    inner.as_ref(),
+                    &inner,
                     &child_thread,
                     &first_id,
                     first_kind,
@@ -27419,7 +27978,7 @@ Do not describe the tool, and do not skip the tool call."#;
                 )
                 .await;
                 complete_test_codex_provider_item(
-                    inner.as_ref(),
+                    &inner,
                     &child_thread,
                     &second_id,
                     second_kind,

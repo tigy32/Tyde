@@ -405,7 +405,8 @@ and after replay.
    unique marker and a bounded sleep of at least five seconds before output.
    While sleeping, verify the tool card and agent are running. Afterward,
    verify the same card retains command, output, exit status, and terminal
-   state.
+   state. The in-flight tray must stay empty for the whole run: a command the
+   agent is waiting on is not background work, and a tray row for it is `FAIL`.
 2. **Multi-phase tool turn:** require two sequential tool calls with a bounded
    sleep between them, followed by a one-line answer. At every assistant/tool
    boundary, confirm the agent remains Thinking. It must not flash completed
@@ -417,8 +418,10 @@ and after replay.
    Verify permission behavior, typed modify card, before/after preview, actual
    file contents, and replay. Repeat in read-only mode and confirm no write
    occurs.
-5. **Background command:** start a bounded background process, continue the
-   turn, then check or wait for it. Confirm the original card and in-flight row
+5. **Background command:** start a bounded process that outlives the call that
+   launched it — on Codex, give the exec tool a short timeout so it returns
+   while the process is still alive — then continue the turn and check or wait
+   for it. Confirm the original card and in-flight row
    show the exact command that was executed, not a model-written description or
    completion summary. They must remain running until the process ends and
    transition once without acquiring a new identity. If the agent turn itself
