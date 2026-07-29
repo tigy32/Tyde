@@ -6287,7 +6287,10 @@ impl CodexInner {
     }
 
     async fn handle_notification(self: &Arc<Self>, method: &str, params: &Value) {
-        if self.intercept_continuation_notification(method, params).await {
+        if self
+            .intercept_continuation_notification(method, params)
+            .await
+        {
             return;
         }
         if self.intercept_compaction_notification(method, params).await {
