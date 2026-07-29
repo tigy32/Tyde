@@ -185,7 +185,7 @@ impl SkillDelivery {
             // Hermes replaces the shared skill block with its own name-only
             // catalog, so every body it was handed was read and thrown away.
             BackendKind::Hermes => Self::NamesOnly,
-            BackendKind::Kiro | BackendKind::Antigravity => Self::InlineBodies,
+            BackendKind::Acp | BackendKind::Antigravity => Self::InlineBodies,
         }
     }
 
@@ -654,7 +654,7 @@ mod tests {
         // The same store fails for a backend that must inline bodies, so the
         // fixture really is unreadable rather than quietly readable.
         let err = fixture
-            .resolve(BackendKind::Kiro, None)
+            .resolve(BackendKind::Acp, None)
             .expect_err("inline delivery must fail on an unreadable body");
         assert!(err.contains("Failed to read skill body"), "{err}");
     }
@@ -694,7 +694,7 @@ mod tests {
         BackendKind::Claude,
         BackendKind::Codex,
         BackendKind::Hermes,
-        BackendKind::Kiro,
+        BackendKind::Acp,
         BackendKind::Tycode,
         BackendKind::Antigravity,
     ];
@@ -815,7 +815,7 @@ mod tests {
             // behind `invoke_skill`.
             (BackendKind::Tycode, SkillDelivery::NativeDiscovery),
             (BackendKind::Hermes, SkillDelivery::NamesOnly),
-            (BackendKind::Kiro, SkillDelivery::InlineBodies),
+            (BackendKind::Acp, SkillDelivery::InlineBodies),
             (BackendKind::Antigravity, SkillDelivery::InlineBodies),
         ] {
             assert_eq!(
@@ -837,7 +837,7 @@ mod tests {
         fixture.install_skill("lint", BODY_SENTINEL);
 
         let resolved = fixture
-            .resolve(BackendKind::Kiro, None)
+            .resolve(BackendKind::Acp, None)
             .expect("resolve for Kiro");
         assert_eq!(resolved.skill_delivery, SkillDelivery::InlineBodies);
         assert!(resolved.skill_delivery.loads_bodies());
@@ -848,7 +848,7 @@ mod tests {
         // starting a session with a silently empty skill — for every backend,
         // since a native one could not discover it either.
         fixture.remove_skill_body("lint");
-        for backend_kind in [BackendKind::Kiro, BackendKind::Claude] {
+        for backend_kind in [BackendKind::Acp, BackendKind::Claude] {
             let err = fixture
                 .resolve(backend_kind, None)
                 .expect_err("resolution must fail when SKILL.md is gone");

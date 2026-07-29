@@ -78,7 +78,7 @@ pub(crate) async fn collect_backend_setup() -> BackendSetupPayload {
     let backends = futures_util::future::join_all(
         [
             BackendKind::Tycode,
-            BackendKind::Kiro,
+            BackendKind::Acp,
             BackendKind::Claude,
             BackendKind::Codex,
             BackendKind::Antigravity,
@@ -100,7 +100,7 @@ pub(crate) fn stub_backend_setup() -> BackendSetupPayload {
     let platform = host_platform();
     let backends = [
         BackendKind::Tycode,
-        BackendKind::Kiro,
+        BackendKind::Acp,
         BackendKind::Claude,
         BackendKind::Codex,
         BackendKind::Antigravity,
@@ -251,7 +251,7 @@ fn resolve_tycode_binary_path_for_home(home: &Path) -> Option<String> {
 async fn probe_backend(kind: BackendKind, platform: HostPlatform) -> BackendSetupInfo {
     let probe = match kind {
         BackendKind::Tycode => probe_installed_tycode().await,
-        BackendKind::Kiro => probe_candidates(&command_candidates(KIRO_CLI_CANDIDATES)).await,
+        BackendKind::Acp => probe_candidates(&command_candidates(KIRO_CLI_CANDIDATES)).await,
         BackendKind::Claude => probe_candidates(&command_candidates(CLAUDE_CLI_CANDIDATES)).await,
         BackendKind::Codex => probe_candidates(&command_candidates(CODEX_CLI_CANDIDATES)).await,
         BackendKind::Antigravity => probe_candidates(&antigravity_command_candidates()).await,
@@ -833,7 +833,7 @@ fn docs_url(kind: BackendKind) -> String {
         BackendKind::Tycode => {
             format!("https://github.com/tigy32/Tycode/releases/tag/v{TYCODE_VERSION}")
         }
-        BackendKind::Kiro => "https://kiro.dev/docs/cli/installation/".to_string(),
+        BackendKind::Acp => "https://kiro.dev/docs/cli/installation/".to_string(),
         BackendKind::Claude => {
             "https://docs.anthropic.com/en/docs/claude-code/getting-started".to_string()
         }
@@ -848,7 +848,7 @@ fn docs_url(kind: BackendKind) -> String {
 fn install_command(kind: BackendKind, platform: HostPlatform) -> Option<BackendSetupCommand> {
     match kind {
         BackendKind::Tycode => tycode_install_command(platform),
-        BackendKind::Kiro => Some(BackendSetupCommand {
+        BackendKind::Acp => Some(BackendSetupCommand {
             title: "Install CLI".to_string(),
             description: "Install Kiro CLI on this host. Kiro opens a browser for authentication after install.".to_string(),
             command: match platform {
@@ -899,7 +899,7 @@ fn sign_in_command(
 ) -> Option<BackendSetupCommand> {
     match kind {
         BackendKind::Tycode => None,
-        BackendKind::Kiro => Some(BackendSetupCommand {
+        BackendKind::Acp => Some(BackendSetupCommand {
             title: "Sign In".to_string(),
             description: "Start the Kiro login flow for this host.".to_string(),
             command: "kiro-cli login".to_string(),

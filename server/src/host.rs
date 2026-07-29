@@ -2020,7 +2020,7 @@ impl HostHandle {
             BackendKind::Codex => {
                 state.codex_session_schema = CodexSessionSchemaState::Ready(schema)
             }
-            BackendKind::Kiro => state.kiro_session_schema = KiroSessionSchemaState::Ready(schema),
+            BackendKind::Acp => state.kiro_session_schema = KiroSessionSchemaState::Ready(schema),
             BackendKind::Hermes => {
                 state.hermes_session_schema = HermesSessionSchemaState::Ready(schema)
             }
@@ -2058,7 +2058,7 @@ impl HostHandle {
                 state.codex_session_schema =
                     CodexSessionSchemaState::Unavailable(message.to_owned())
             }
-            BackendKind::Kiro => {
+            BackendKind::Acp => {
                 state.kiro_session_schema = KiroSessionSchemaState::Unavailable(message.to_owned())
             }
             BackendKind::Hermes => {
@@ -4849,6 +4849,7 @@ impl HostHandle {
                     session_settings,
                     session_settings_schema,
                     backend_config: resolve_backend_config_for_spawn(&host_settings, backend_kind),
+                    acp_agent: None,
                     startup_mcp_servers,
                     resolved_spawn_config,
                     resume_session_id: None,
@@ -4899,6 +4900,7 @@ impl HostHandle {
                             session_settings: None,
                             session_settings_schema: None,
                             backend_config: Default::default(),
+                            acp_agent: None,
                             startup_mcp_servers: Vec::new(),
                             resolved_spawn_config: ResolvedSpawnConfig::default(),
                             resume_session_id: Some(session_id.clone()),
@@ -4950,6 +4952,7 @@ impl HostHandle {
                             session_settings: None,
                             session_settings_schema: None,
                             backend_config: Default::default(),
+                            acp_agent: None,
                             startup_mcp_servers: Vec::new(),
                             resolved_spawn_config: ResolvedSpawnConfig::default(),
                             resume_session_id: Some(session_id.clone()),
@@ -5162,6 +5165,7 @@ impl HostHandle {
                         &host_settings,
                         record.backend_kind,
                     ),
+                    acp_agent: None,
                     startup_mcp_servers,
                     resolved_spawn_config,
                     resume_session_id: Some(session_id),
@@ -5224,6 +5228,7 @@ impl HostHandle {
                             session_settings: None,
                             session_settings_schema: None,
                             backend_config: Default::default(),
+                            acp_agent: None,
                             startup_mcp_servers: Vec::new(),
                             resolved_spawn_config,
                             resume_session_id: None,
@@ -5482,6 +5487,7 @@ impl HostHandle {
                         &host_settings,
                         record.backend_kind,
                     ),
+                    acp_agent: None,
                     startup_mcp_servers,
                     resolved_spawn_config,
                     resume_session_id: None,
@@ -5495,6 +5501,7 @@ impl HostHandle {
         };
 
         let request = self.apply_complexity_tier_settings(request).await;
+        let request = self.resolve_acp_agent(request).await;
         let diagnose_side_question_fanout = matches!(&request.origin, AgentOrigin::SideQuestion);
         tracing::info!(
             backend_kind = ?request.backend_kind,
@@ -5784,6 +5791,54 @@ impl HostHandle {
         Ok(((!merged.0.is_empty()).then_some(merged), source))
     }
 
+    /// Resolve which ACP agent a spawn should run.
+    ///
+    /// The agent lives on the session's launch profile. A profile that Tyde
+    /// synthesizes (the built-in `acp:kiro`) and one the user configured are
+    /// treated identically here — both just carry an `AcpAgentSpec`.
+    ///
+    /// A session with no profile, or one naming a profile that no longer
+    /// exists, falls back to the built-in Kiro agent. That keeps sessions
+    /// recorded before ACP profiles existed resumable; it is not a silent
+    /// substitution for a *user-configured* agent, because those always carry
+    /// a profile id.
+    async fn resolve_acp_agent(&self, mut request: ResolvedSpawnRequest) -> ResolvedSpawnRequest {
+        if request.backend_kind != protocol::BackendKind::Acp {
+            return request;
+        }
+
+        let settings_store = {
+            let state = self.state.lock().await;
+            Arc::clone(&state.settings_store)
+        };
+        let settings = match settings_store.lock().await.get() {
+            Ok(settings) => settings,
+            Err(error) => {
+                tracing::warn!(%error, "failed to read host settings while resolving ACP agent");
+                request.acp_agent = Some(builtin_kiro_agent_spec());
+                return request;
+            }
+        };
+
+        let profile_id = request
+            .launch_profile_id
+            .clone()
+            .unwrap_or_else(|| LaunchProfileId(protocol::KIRO_LAUNCH_PROFILE_ID.to_owned()));
+
+        request.acp_agent = Some(
+            acp_agent_for_profile(&settings, &profile_id).unwrap_or_else(|| {
+                if profile_id.0 != protocol::KIRO_LAUNCH_PROFILE_ID {
+                    tracing::warn!(
+                        profile = %profile_id,
+                        "launch profile not found; falling back to the built-in Kiro agent"
+                    );
+                }
+                builtin_kiro_agent_spec()
+            }),
+        );
+        request
+    }
+
     /// Applies the host-level "task complexity tiers" setting to a spawn request.
     ///
     /// When tiers are disabled (the default), the cost hint is dropped so every
@@ -5918,6 +5973,7 @@ impl HostHandle {
 
     async fn spawn_resolved_agent(&self, request: ResolvedSpawnRequest) -> AgentId {
         let request = self.apply_complexity_tier_settings(request).await;
+        let request = self.resolve_acp_agent(request).await;
         tracing::info!(
             backend_kind = ?request.backend_kind,
             workspace_roots = ?request.workspace_roots,
@@ -8427,7 +8483,7 @@ impl HostHandle {
             .enabled_backends;
         let hermes_enabled = enabled.contains(&protocol::BackendKind::Hermes);
         let any_pending = (codex_pending && enabled.contains(&protocol::BackendKind::Codex))
-            || (kiro_pending && enabled.contains(&protocol::BackendKind::Kiro))
+            || (kiro_pending && enabled.contains(&protocol::BackendKind::Acp))
             || (matches!(&hermes_state, HermesSessionSchemaState::Pending) && hermes_enabled);
         if any_pending {
             self.refresh_session_schemas_with_fanout_unlocked(false, false, None)
@@ -8480,7 +8536,7 @@ impl HostHandle {
                 if probe(protocol::BackendKind::Codex) {
                     state.codex_session_schema = CodexSessionSchemaState::Pending;
                 }
-                if probe(protocol::BackendKind::Kiro) {
+                if probe(protocol::BackendKind::Acp) {
                     state.kiro_session_schema = KiroSessionSchemaState::Pending;
                 }
                 if probe(protocol::BackendKind::Hermes) {
@@ -8532,11 +8588,11 @@ impl HostHandle {
             CodexSessionSchemaState::Pending
         };
 
-        let kiro_session_schema = if !probe(protocol::BackendKind::Kiro)
+        let kiro_session_schema = if !probe(protocol::BackendKind::Acp)
             || (!retry_unavailable && !matches!(&previous_kiro, KiroSessionSchemaState::Pending))
         {
             previous_kiro
-        } else if enabled_backends.contains(&protocol::BackendKind::Kiro) {
+        } else if enabled_backends.contains(&protocol::BackendKind::Acp) {
             match kiro_probe_workspace_root(configured_kiro_probe_workspace_root.as_deref()) {
                 Ok(workspace_root) => match crate::backend::kiro::probe_session_settings_schema(
                     &[workspace_root],
@@ -10157,6 +10213,7 @@ impl HostHandle {
             session_settings: None,
             session_settings_schema: None,
             backend_config: Default::default(),
+            acp_agent: None,
             startup_mcp_servers,
             resolved_spawn_config,
             resume_session_id: None,
@@ -12237,6 +12294,7 @@ impl HostHandle {
             session_settings: None,
             session_settings_schema,
             backend_config: Default::default(),
+            acp_agent: None,
             startup_mcp_servers,
             resolved_spawn_config,
             resume_session_id: None,
@@ -17406,7 +17464,7 @@ fn backend_system_tag(backend: BackendKind) -> (AgentSystemTagId, String) {
             AgentSystemTagId("system:backend:tycode".to_owned()),
             "Tycode".to_owned(),
         ),
-        BackendKind::Kiro => (
+        BackendKind::Acp => (
             AgentSystemTagId("system:backend:kiro".to_owned()),
             "Kiro".to_owned(),
         ),
@@ -19039,7 +19097,7 @@ async fn backend_config_snapshots_for_enabled_backends(
                     .push(crate::backend::tycode::native_settings_snapshot().await);
             }
             BackendKind::Hermes
-            | BackendKind::Kiro
+            | BackendKind::Acp
             | BackendKind::Claude
             | BackendKind::Codex
             | BackendKind::Antigravity => {}
@@ -19108,7 +19166,7 @@ async fn fan_out_backend_config_snapshots(state: &mut HostState, force_emit: boo
 fn initial_backend_capacity_snapshots() -> HashMap<BackendKind, BackendCapacitySnapshot> {
     const BACKENDS: [BackendKind; 6] = [
         BackendKind::Tycode,
-        BackendKind::Kiro,
+        BackendKind::Acp,
         BackendKind::Claude,
         BackendKind::Codex,
         BackendKind::Antigravity,
@@ -19173,7 +19231,7 @@ fn backend_capacity_snapshots(state: &HostState) -> Vec<BackendCapacitySnapshot>
         .collect::<Vec<_>>();
     snapshots.sort_by_key(|snapshot| match snapshot.backend_kind {
         BackendKind::Tycode => 0,
-        BackendKind::Kiro => 1,
+        BackendKind::Acp => 1,
         BackendKind::Claude => 2,
         BackendKind::Codex => 3,
         BackendKind::Antigravity => 4,
@@ -19563,7 +19621,7 @@ fn session_schema_for_backend(
             CodexSessionSchemaState::Ready(schema) => Some(schema.clone()),
             CodexSessionSchemaState::Pending | CodexSessionSchemaState::Unavailable(_) => None,
         },
-        protocol::BackendKind::Kiro => match &state.kiro_session_schema {
+        protocol::BackendKind::Acp => match &state.kiro_session_schema {
             KiroSessionSchemaState::Ready(schema) => Some(schema.clone()),
             KiroSessionSchemaState::Pending | KiroSessionSchemaState::Unavailable(_) => None,
         },
@@ -19589,7 +19647,7 @@ fn session_schema_resolution_for_backend(
                 SessionSchemaResolution::Unavailable(message.clone())
             }
         },
-        protocol::BackendKind::Kiro => match &state.kiro_session_schema {
+        protocol::BackendKind::Acp => match &state.kiro_session_schema {
             KiroSessionSchemaState::Pending => SessionSchemaResolution::Pending,
             KiroSessionSchemaState::Ready(schema) => SessionSchemaResolution::Ready(schema.clone()),
             KiroSessionSchemaState::Unavailable(message) => {
@@ -19682,7 +19740,7 @@ fn sanitize_stored_session_settings(
 fn backend_has_dynamic_session_schema(backend_kind: protocol::BackendKind) -> bool {
     matches!(
         backend_kind,
-        protocol::BackendKind::Kiro | protocol::BackendKind::Codex | protocol::BackendKind::Hermes
+        protocol::BackendKind::Acp | protocol::BackendKind::Codex | protocol::BackendKind::Hermes
     )
 }
 
@@ -19745,7 +19803,7 @@ fn session_schema_entry_for_backend(
                 message: message.clone(),
             },
         },
-        protocol::BackendKind::Kiro => match &state.kiro_session_schema {
+        protocol::BackendKind::Acp => match &state.kiro_session_schema {
             KiroSessionSchemaState::Ready(schema) => SessionSchemaEntry::Ready {
                 schema: schema.clone(),
             },
@@ -19788,6 +19846,11 @@ fn launch_profile_catalog_for_settings(
 ) -> LaunchProfileCatalog {
     let mut entries = Vec::new();
     for backend_kind in settings.enabled_backends.iter().copied() {
+        // ACP has no meaningful "backend default": a session is defined by
+        // which agent it runs, so every ACP entry is a named agent profile.
+        if backend_kind == protocol::BackendKind::Acp {
+            continue;
+        }
         entries.push(LaunchProfileEntry::Ready {
             profile: LaunchProfile {
                 id: default_launch_profile_id(backend_kind),
@@ -19813,6 +19876,18 @@ fn launch_profile_catalog_for_settings(
         synthesize_hermes_profile_entries(&state.hermes_launch_profiles, &mut entries);
     }
 
+    // The built-in Kiro agent. Every other ACP agent is a user-configured
+    // launch profile; this one ships with Tyde, so it is synthesized rather
+    // than persisted.
+    if settings
+        .enabled_backends
+        .contains(&protocol::BackendKind::Acp)
+    {
+        entries.push(LaunchProfileEntry::Ready {
+            profile: builtin_kiro_launch_profile(),
+        });
+    }
+
     for config in &settings.launch_profiles {
         if settings.enabled_backends.contains(&config.backend_kind) {
             entries.push(launch_profile_entry_for_config(state, config));
@@ -19827,6 +19902,55 @@ fn launch_profile_catalog_for_settings(
 
 /// Id namespace for launch profiles synthesized from Hermes profiles. Also
 /// reserved against user-configured launch-profile ids.
+/// The built-in Kiro agent.
+///
+/// A blank command is deliberate: the Kiro adapter resolves `kiro-cli-chat` as
+/// a sibling of `kiro-cli`, which survives version upgrades and toolbox
+/// wrappers that an absolute path would not.
+pub(crate) fn builtin_kiro_agent_spec() -> protocol::AcpAgentSpec {
+    protocol::AcpAgentSpec {
+        command: String::new(),
+        args: vec!["acp".to_owned()],
+        cwd: None,
+        env: Default::default(),
+        adapter: protocol::AcpAdapterId::Kiro,
+    }
+}
+
+/// The launch-profile entry Tyde synthesizes for the built-in Kiro agent.
+///
+/// Synthesized rather than seeded into user settings so it cannot be deleted
+/// or left stale, matching how named Hermes profiles are handled.
+pub(crate) fn builtin_kiro_launch_profile() -> LaunchProfile {
+    LaunchProfile {
+        id: LaunchProfileId(protocol::KIRO_LAUNCH_PROFILE_ID.to_owned()),
+        kind: LaunchProfileKind::BackendDefault,
+        label: "Kiro (ACP)".to_owned(),
+        description: Some("Kiro, over the Agent Client Protocol.".to_owned()),
+        backend_kind: protocol::BackendKind::Acp,
+        session_settings: protocol::SessionSettingsValues::default(),
+    }
+}
+
+/// Find the ACP agent a launch profile runs.
+///
+/// Checks the synthesized built-in first, then the user's configured
+/// profiles. Returns `None` when the id is unknown so the caller decides what
+/// an unresolvable profile means.
+pub(crate) fn acp_agent_for_profile(
+    settings: &protocol::HostSettings,
+    profile_id: &LaunchProfileId,
+) -> Option<protocol::AcpAgentSpec> {
+    if profile_id.0 == protocol::KIRO_LAUNCH_PROFILE_ID {
+        return Some(builtin_kiro_agent_spec());
+    }
+    settings
+        .launch_profiles
+        .iter()
+        .find(|profile| &profile.id == profile_id)
+        .and_then(|profile| profile.acp.clone())
+}
+
 pub(crate) const HERMES_PROFILE_LAUNCH_ID_PREFIX: &str = "hermes:profile:";
 
 /// Append one launch-profile entry per named Hermes profile: ready entries
@@ -19884,7 +20008,7 @@ fn default_launch_profile_id(backend_kind: protocol::BackendKind) -> LaunchProfi
 fn backend_slug(backend_kind: protocol::BackendKind) -> &'static str {
     match backend_kind {
         protocol::BackendKind::Tycode => "tycode",
-        protocol::BackendKind::Kiro => "kiro",
+        protocol::BackendKind::Acp => "kiro",
         protocol::BackendKind::Claude => "claude",
         protocol::BackendKind::Codex => "codex",
         protocol::BackendKind::Antigravity => "antigravity",
@@ -19895,7 +20019,7 @@ fn backend_slug(backend_kind: protocol::BackendKind) -> &'static str {
 fn backend_launch_profile_label(backend_kind: protocol::BackendKind) -> &'static str {
     match backend_kind {
         protocol::BackendKind::Tycode => "Tycode",
-        protocol::BackendKind::Kiro => "Kiro",
+        protocol::BackendKind::Acp => "Kiro",
         protocol::BackendKind::Claude => "Claude",
         protocol::BackendKind::Codex => "Codex",
         protocol::BackendKind::Antigravity => "Antigravity",
@@ -20547,7 +20671,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         );
         for backend_kind in [
             BackendKind::Tycode,
-            BackendKind::Kiro,
+            BackendKind::Acp,
             BackendKind::Claude,
             BackendKind::Codex,
             BackendKind::Antigravity,

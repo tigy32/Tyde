@@ -194,7 +194,7 @@ impl From<BackendKindInput> for BackendKind {
     fn from(value: BackendKindInput) -> Self {
         match value {
             BackendKindInput::Tycode => Self::Tycode,
-            BackendKindInput::Kiro => Self::Kiro,
+            BackendKindInput::Kiro => Self::Acp,
             BackendKindInput::Claude => Self::Claude,
             BackendKindInput::Codex => Self::Codex,
             BackendKindInput::Antigravity => Self::Antigravity,
@@ -2264,6 +2264,7 @@ mod tests {
             description: Some("Launch Hermes with an explicit Claude preset.".to_owned()),
             backend_kind: BackendKind::Hermes,
             session_settings: hermes_claude_session_settings(),
+            acp: None,
         }
     }
 

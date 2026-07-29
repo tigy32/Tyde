@@ -1108,7 +1108,7 @@ fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
         store.get().expect("read canonicalized settings"),
         HostSettings {
             enabled_backends: vec![
-                BackendKind::Kiro,
+                BackendKind::Acp,
                 BackendKind::Claude,
                 BackendKind::Antigravity,
             ],

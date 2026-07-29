@@ -1929,6 +1929,7 @@ pub(crate) fn agent_name_generation_spawn_config(
         provider_version: None,
         antigravity_conversations_dir: None,
         backend_config: Default::default(),
+        acp_agent: None,
         resolved_spawn_config: customization::ResolvedSpawnConfig {
             tool_policy: ToolPolicy::AllowList { tools: Vec::new() },
             access_mode: BackendAccessMode::ReadOnly,
@@ -2620,7 +2621,7 @@ async fn prepare_backend_handle_for_adoption(
     };
     match handle {
         crate::backend::PreparedBackendHandle::Tycode(backend) => Ok(backend),
-        crate::backend::PreparedBackendHandle::Kiro(backend) => Ok(backend),
+        crate::backend::PreparedBackendHandle::Acp(backend) => Ok(backend),
         crate::backend::PreparedBackendHandle::Claude(backend) => {
             backend.set_subagent_emitter(emitter()).await;
             Ok(backend)
@@ -2663,7 +2664,7 @@ async fn spawn_backend(
             let session_id = Backend::session_id(&b);
             Ok((Box::new(b), events, session_id))
         }
-        BackendKind::Kiro => {
+        BackendKind::Acp => {
             let (b, events) = KiroBackend::spawn(workspace_roots, config, initial_input).await?;
             let session_id = Backend::session_id(&b);
             Ok((Box::new(b), events, session_id))
@@ -2736,7 +2737,7 @@ async fn resume_backend(
             let (b, events) = TycodeBackend::resume(workspace_roots, config, session_id).await?;
             (Box::new(b), events)
         }
-        BackendKind::Kiro => {
+        BackendKind::Acp => {
             let (b, events) = KiroBackend::resume(workspace_roots, config, session_id).await?;
             (Box::new(b), events)
         }
@@ -2803,7 +2804,7 @@ async fn fork_backend(
             let session_id = Backend::session_id(&b);
             Ok((Box::new(b), events, session_id))
         }
-        BackendKind::Kiro => {
+        BackendKind::Acp => {
             let (b, events) =
                 KiroBackend::fork(workspace_roots, config, from_session_id, initial_input).await?;
             let session_id = Backend::session_id(&b);
@@ -2968,6 +2969,7 @@ pub(crate) fn spawn_agent_actor(
             session_settings,
             session_settings_schema,
             backend_config,
+            acp_agent,
             startup_mcp_servers,
             resolved_spawn_config,
             resume_session_id,
@@ -2990,6 +2992,7 @@ pub(crate) fn spawn_agent_actor(
             antigravity_conversations_dir: (backend_kind == BackendKind::Antigravity)
                 .then(|| antigravity_conversations_dir.clone()),
             backend_config: backend_config.clone(),
+            acp_agent: acp_agent.clone(),
             resolved_spawn_config: resolved_spawn_config.clone(),
         };
         let initial_cost_hint = spawn_config.cost_hint;
@@ -3016,6 +3019,7 @@ pub(crate) fn spawn_agent_actor(
                 execution_mode: BackendExecutionMode::Agent,
                 cost_hint: initial_cost_hint,
                 custom_agent_id: current_start.custom_agent_id.clone(),
+                acp_agent: None,
                 startup_mcp_servers: Vec::new(),
                 session_settings: initial_session_settings,
                 provider_version: spawn_config.provider_version.clone(),
@@ -8837,7 +8841,7 @@ fn backend_session_is_resumable(
             workspace_roots,
             resolved_spawn_config,
         ),
-        BackendKind::Tycode | BackendKind::Kiro | BackendKind::Claude | BackendKind::Codex => true,
+        BackendKind::Tycode | BackendKind::Acp | BackendKind::Claude | BackendKind::Codex => true,
     }
 }
 
@@ -12178,6 +12182,7 @@ mod tests {
             session_settings: None,
             session_settings_schema: None,
             backend_config: Default::default(),
+            acp_agent: None,
             startup_mcp_servers: Vec::new(),
             resolved_spawn_config: ResolvedSpawnConfig::default(),
             resume_session_id: None,
@@ -12281,6 +12286,7 @@ mod tests {
                 session_settings: None,
                 session_settings_schema: None,
                 backend_config: Default::default(),
+                acp_agent: None,
                 startup_mcp_servers: Vec::new(),
                 resolved_spawn_config: ResolvedSpawnConfig::default(),
                 resume_session_id: None,

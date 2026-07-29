@@ -1,4 +1,8 @@
 pub mod acp;
+/// Transitional alias while the ACP session lifecycle is being generalized:
+/// the generic backend still carries Kiro's type names. Removed once the
+/// lifecycle no longer names a specific agent.
+pub use acp::backend as kiro;
 pub mod agent_control_progress;
 pub mod antigravity;
 pub mod claude;
@@ -9,7 +13,6 @@ pub mod codex;
 pub(crate) mod compaction;
 pub mod hermes;
 pub mod hermes_config;
-pub mod kiro;
 pub mod mock;
 pub mod setup;
 pub mod skill_projection;
@@ -184,6 +187,11 @@ pub struct BackendSpawnConfig {
     /// Host-level deep configuration for this backend (see
     /// [`protocol::BackendConfigSchema`]). Empty when unconfigured.
     pub backend_config: BackendConfigValues,
+    /// Which ACP agent this session runs, resolved from its launch profile.
+    /// Only meaningful for [`BackendKind::Acp`]; `None` there means the
+    /// built-in Kiro agent, which keeps sessions recorded before ACP profiles
+    /// existed working.
+    pub acp_agent: Option<protocol::AcpAgentSpec>,
     pub resolved_spawn_config: ResolvedSpawnConfig,
 }
 
@@ -563,7 +571,7 @@ pub trait Backend: Send + Sync + 'static {
 
 pub(crate) enum PreparedBackendHandle {
     Tycode(Box<tycode::TycodeBackend>),
-    Kiro(Box<kiro::KiroBackend>),
+    Acp(Box<kiro::KiroBackend>),
     Claude(Box<claude::ClaudeBackend>),
     Codex(Box<codex::CodexBackend>),
     Antigravity(Box<antigravity::AntigravityBackend>),
@@ -583,7 +591,7 @@ impl PreparedBackendHandle {
     pub(crate) async fn shutdown(self) {
         match self {
             Self::Tycode(backend) => Backend::shutdown(*backend).await,
-            Self::Kiro(backend) => Backend::shutdown(*backend).await,
+            Self::Acp(backend) => Backend::shutdown(*backend).await,
             Self::Claude(backend) => Backend::shutdown(*backend).await,
             Self::Codex(backend) => Backend::shutdown(*backend).await,
             Self::Antigravity(backend) => Backend::shutdown(*backend).await,
@@ -612,11 +620,11 @@ pub(crate) async fn prepare_compacted_backend_binding(
                 continuation,
             })
         }
-        BackendKind::Kiro => {
+        BackendKind::Acp => {
             let (backend, events, provider_session_id, ready) =
                 prepare_concrete_backend_binding::<kiro::KiroBackend>(kind, spawn, seed).await?;
             Ok(PreparedBackendBinding {
-                backend: PreparedBackendHandle::Kiro(Box::new(backend)),
+                backend: PreparedBackendHandle::Acp(Box::new(backend)),
                 events,
                 provider_session_id,
                 ready,
@@ -946,7 +954,7 @@ pub(crate) fn session_settings_schema_for_backend(
 ) -> SessionSettingsSchema {
     match backend_kind {
         BackendKind::Tycode => tycode::TycodeBackend::session_settings_schema(),
-        BackendKind::Kiro => kiro::KiroBackend::session_settings_schema(),
+        BackendKind::Acp => kiro::KiroBackend::session_settings_schema(),
         BackendKind::Claude => claude::ClaudeBackend::session_settings_schema(),
         BackendKind::Codex => codex::CodexBackend::session_settings_schema(),
         BackendKind::Antigravity => antigravity::AntigravityBackend::session_settings_schema(),
@@ -960,7 +968,7 @@ pub(crate) fn backend_config_schema_for_backend(
 ) -> Option<BackendConfigSchema> {
     match backend_kind {
         BackendKind::Tycode => tycode::TycodeBackend::backend_config_schema(),
-        BackendKind::Kiro => kiro::KiroBackend::backend_config_schema(),
+        BackendKind::Acp => kiro::KiroBackend::backend_config_schema(),
         BackendKind::Claude => claude::ClaudeBackend::backend_config_schema(),
         BackendKind::Codex => codex::CodexBackend::backend_config_schema(),
         BackendKind::Antigravity => antigravity::AntigravityBackend::backend_config_schema(),
@@ -973,7 +981,7 @@ pub(crate) fn backend_config_schema_for_backend(
 pub(crate) fn backend_config_schema_catalog() -> Vec<BackendConfigSchema> {
     [
         BackendKind::Tycode,
-        BackendKind::Kiro,
+        BackendKind::Acp,
         BackendKind::Claude,
         BackendKind::Codex,
         BackendKind::Antigravity,
@@ -1132,7 +1140,7 @@ pub(crate) fn resolve_backend_session_settings(
 ) -> SessionSettingsValues {
     match backend_kind {
         BackendKind::Tycode => tycode::resolve_session_settings(config),
-        BackendKind::Kiro => kiro::resolve_session_settings(config),
+        BackendKind::Acp => kiro::resolve_session_settings(config),
         BackendKind::Claude => claude::resolve_session_settings(config),
         BackendKind::Codex => codex::resolve_session_settings(config),
         BackendKind::Antigravity => antigravity::resolve_session_settings(config),
@@ -1171,7 +1179,7 @@ pub(crate) fn validate_runtime_session_settings_update(
     match backend_kind {
         BackendKind::Tycode => tycode::validate_runtime_session_settings_update(update),
         BackendKind::Hermes => hermes::validate_runtime_session_settings_update(current, update),
-        BackendKind::Kiro | BackendKind::Claude | BackendKind::Codex | BackendKind::Antigravity => {
+        BackendKind::Acp | BackendKind::Claude | BackendKind::Codex | BackendKind::Antigravity => {
             Ok(())
         }
     }
@@ -1218,7 +1226,7 @@ pub(crate) fn builtin_tier_config(kind: BackendKind) -> BackendTierConfig {
             |_| SessionSettingsValues::default()
         }
         BackendKind::Antigravity => antigravity::antigravity_cost_hint_defaults,
-        BackendKind::Kiro => kiro::kiro_cost_hint_defaults,
+        BackendKind::Acp => kiro::kiro_cost_hint_defaults,
     };
     BackendTierConfig {
         low: defaults(SpawnCostHint::Low),

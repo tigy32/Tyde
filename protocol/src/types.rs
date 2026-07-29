@@ -858,7 +858,11 @@ impl fmt::Display for McpServerId {
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
     Tycode,
-    Kiro,
+    /// Any agent speaking the Agent Client Protocol over stdio. The specific
+    /// agent (binary, args, quirks adapter) is carried by the session's launch
+    /// profile via [`AcpAgentSpec`], not by this enum. Kiro is the built-in
+    /// `acp:kiro` profile.
+    Acp,
     Claude,
     Codex,
     Antigravity,
@@ -866,12 +870,61 @@ pub enum BackendKind {
 }
 
 impl BackendKind {
+    /// Coarse composer affordance: may this backend ever accept image input?
+    ///
+    /// For [`Self::Acp`] the authoritative answer is per-session — it comes
+    /// from `promptCapabilities.image` in the agent's `initialize` response,
+    /// which isn't known until the session is live. This returns `true` so the
+    /// composer offers attachment, and the ACP backend rejects an image sent to
+    /// an agent that declared no image support with an explicit error rather
+    /// than silently dropping it.
     pub const fn supports_image_input(self) -> bool {
         match self {
-            Self::Kiro | Self::Claude | Self::Codex => true,
+            Self::Acp | Self::Claude | Self::Codex => true,
             Self::Tycode | Self::Antigravity | Self::Hermes => false,
         }
     }
+}
+
+/// Serialized name of the backend kind Kiro had before it became an ACP
+/// launch profile. Only migrations should reference this.
+pub const LEGACY_KIRO_BACKEND: &str = "kiro";
+/// Serialized name of [`BackendKind::Acp`].
+pub const ACP_BACKEND: &str = "acp";
+/// Launch profile id of the built-in Kiro agent. Reserved against
+/// user-configured launch-profile ids.
+pub const KIRO_LAUNCH_PROFILE_ID: &str = "acp:kiro";
+
+/// Which quirks implementation drives an ACP agent. Stock speaks the
+/// specification only; other variants add agent-specific behavior that the
+/// protocol does not cover (non-standard notification families, filesystem
+/// session enumeration, stream sanitization).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpAdapterId {
+    /// Specification-only behavior. The correct choice for an unknown agent.
+    #[default]
+    Stock,
+    Kiro,
+}
+
+/// How to launch one ACP agent. Carried by a launch profile whose
+/// `backend_kind` is [`BackendKind::Acp`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AcpAgentSpec {
+    /// Executable to spawn. Resolved against the host PATH when not absolute.
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Working directory override. Defaults to the session workspace root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Extra environment for the agent process. `BTreeMap` so persisted
+    /// settings serialize in a stable order and diff cleanly.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub adapter: AcpAdapterId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -963,6 +1016,12 @@ pub struct HostLaunchProfileConfig {
     pub backend_kind: BackendKind,
     #[serde(default)]
     pub session_settings: SessionSettingsValues,
+    /// Required when `backend_kind` is [`BackendKind::Acp`], rejected
+    /// otherwise. Validated in the settings store rather than the type system
+    /// so an invalid persisted profile surfaces a named error instead of
+    /// failing to deserialize the whole settings file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp: Option<AcpAgentSpec>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
@@ -7042,7 +7101,7 @@ pub enum OrchestrationWorkflowPhase {
 /// Events a backend emits on a chat stream. Mirrors the Tycode
 /// `ChatEvent` enum in `tycode-core/src/chat/events.rs`; any semantic
 /// change must be made there first so every backend (Claude, Codex,
-/// Antigravity, Kiro, Tycode) shares one contract.
+/// Antigravity, ACP, Tycode) shares one contract.
 ///
 /// ## Invariants backends MUST uphold
 ///

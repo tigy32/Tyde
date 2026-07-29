@@ -1,3 +1,18 @@
+//! Agent Client Protocol support.
+//!
+//! * this module — the transport: JSON-RPC over the agent's stdio, plus the
+//!   client-side methods every ACP agent may call back into
+//!   (`fs/*`, `terminal/*`, `session/request_permission`).
+//! * [`adapter`] — the seam for agent-specific behavior the protocol doesn't
+//!   cover.
+//! * [`adapters`] — one implementation per known agent.
+//! * [`tools`] — specification-only tool mapping shared by all adapters.
+
+pub mod adapter;
+pub mod adapters;
+pub mod backend;
+pub mod tools;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -34,7 +49,7 @@ pub enum AcpInbound {
     },
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AcpSpawnSpec {
     pub display_name: String,
     pub local_program: String,

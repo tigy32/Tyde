@@ -51,7 +51,7 @@ fn backend_binary_available(backend_kind: BackendKind) -> bool {
         BackendKind::Codex => binary_available("codex"),
         BackendKind::Antigravity => binary_available("agy"),
         BackendKind::Tycode => binary_available("tycode-subprocess"),
-        BackendKind::Kiro => binary_available("kiro-cli-chat") || binary_available("kiro-cli"),
+        BackendKind::Acp => binary_available("kiro-cli-chat") || binary_available("kiro-cli"),
         BackendKind::Hermes => {
             std::env::var("HERMES_PYTHON").is_ok()
                 || binary_available("python3")
@@ -126,7 +126,7 @@ fn backend_runtime_available(backend_kind: BackendKind) -> bool {
 
     match backend_kind {
         BackendKind::Tycode => home_is_writable(),
-        BackendKind::Claude | BackendKind::Antigravity | BackendKind::Kiro => {
+        BackendKind::Claude | BackendKind::Antigravity | BackendKind::Acp => {
             home_is_writable() && remote_network_is_available()
         }
         BackendKind::Codex => remote_network_is_available(),
@@ -220,6 +220,7 @@ agy --model 'Gemini 3.5 Flash (Low)' --print-timeout 30s --dangerously-skip-perm
                 <server::backend::tycode::TycodeBackend as Backend>::spawn(
                     vec![workspace.path().to_string_lossy().to_string()],
                     server::backend::BackendSpawnConfig {
+                        acp_agent: None,
                         execution_mode: Default::default(),
                         cost_hint: cost_hint_for(BackendKind::Tycode),
                         custom_agent_id: None,
@@ -254,7 +255,7 @@ agy --model 'Gemini 3.5 Flash (Low)' --print-timeout 30s --dangerously-skip-perm
             .map_err(|_| "Tycode initial turn timed out".to_string())??;
             Ok(())
         }
-        BackendKind::Kiro => {
+        BackendKind::Acp => {
             let workspace = tempfile::tempdir().map_err(|err| format!("{err}"))?;
             std::fs::write(workspace.path().join("README.txt"), "probe workspace")
                 .map_err(|err| format!("failed to seed Kiro probe workspace: {err}"))?;
@@ -263,8 +264,9 @@ agy --model 'Gemini 3.5 Flash (Low)' --print-timeout 30s --dangerously-skip-perm
                 <server::backend::kiro::KiroBackend as Backend>::spawn(
                     vec![workspace.path().to_string_lossy().to_string()],
                     server::backend::BackendSpawnConfig {
+                        acp_agent: None,
                         execution_mode: Default::default(),
-                        cost_hint: cost_hint_for(BackendKind::Kiro),
+                        cost_hint: cost_hint_for(BackendKind::Acp),
                         custom_agent_id: None,
                         startup_mcp_servers: Vec::new(),
                         session_settings: Default::default(),
@@ -306,6 +308,7 @@ agy --model 'Gemini 3.5 Flash (Low)' --print-timeout 30s --dangerously-skip-perm
                 <server::backend::hermes::HermesBackend as Backend>::spawn(
                     vec![workspace.path().to_string_lossy().to_string()],
                     server::backend::BackendSpawnConfig {
+                        acp_agent: None,
                         execution_mode: Default::default(),
                         cost_hint: cost_hint_for(BackendKind::Hermes),
                         custom_agent_id: None,
@@ -356,7 +359,7 @@ fn backend_label(backend_kind: BackendKind) -> &'static str {
         BackendKind::Codex => "codex",
         BackendKind::Antigravity => "antigravity",
         BackendKind::Tycode => "tycode",
-        BackendKind::Kiro => "kiro",
+        BackendKind::Acp => "kiro",
         BackendKind::Hermes => "hermes",
     }
 }
@@ -2622,14 +2625,14 @@ async fn empty_workspace_spawn_is_accepted_for_all_backends() {
     let host = fixture.host_for_test();
     host.set_session_schema_ready_for_test(BackendKind::Codex)
         .await;
-    host.set_session_schema_ready_for_test(BackendKind::Kiro)
+    host.set_session_schema_ready_for_test(BackendKind::Acp)
         .await;
     host.set_session_schema_ready_for_test(BackendKind::Hermes)
         .await;
     let backends = [
         BackendKind::Claude,
         BackendKind::Codex,
-        BackendKind::Kiro,
+        BackendKind::Acp,
         BackendKind::Tycode,
         BackendKind::Antigravity,
         BackendKind::Hermes,
@@ -3673,7 +3676,7 @@ async fn kiro_dynamic_schema_discovery_uses_probe_models() {
         .client
         .set_setting(SetSettingPayload {
             setting: HostSettingValue::EnabledBackends {
-                enabled_backends: vec![BackendKind::Kiro],
+                enabled_backends: vec![BackendKind::Acp],
             },
         })
         .await
@@ -3695,7 +3698,7 @@ async fn kiro_dynamic_schema_discovery_uses_probe_models() {
             let Some(kiro_schema) = payload
                 .schemas
                 .into_iter()
-                .find(|schema| schema.backend_kind() == BackendKind::Kiro)
+                .find(|schema| schema.backend_kind() == BackendKind::Acp)
             else {
                 continue;
             };
@@ -3774,7 +3777,7 @@ async fn kiro_dynamic_schema_discovery_uses_probe_models() {
                 workspace_roots: vec!["/tmp/test".to_string()],
                 prompt: "hello".to_string(),
                 images: None,
-                backend_kind: BackendKind::Kiro,
+                backend_kind: BackendKind::Acp,
                 launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
@@ -6041,7 +6044,7 @@ async fn assert_backend_interrupts_long_running_command(
         BackendKind::Antigravity => {
             "Execute exactly `./interrupt_test.sh` in the current working directory. Start the command immediately. Do not use any other tools."
         }
-        BackendKind::Kiro => {
+        BackendKind::Acp => {
             "Use the available tools to run the test harness `./interrupt_test.sh` in the current working directory immediately. Do not ask for clarification, and do not only describe a plan."
         }
         BackendKind::Tycode => {
@@ -6302,10 +6305,86 @@ async fn real_codex_cumulative_turn_token_usage() {
     assert_backend_reports_cumulative_turn_token_usage(backend_kind).await;
 }
 
+/// End-to-end proof that a real ACP agent runs through the generic backend.
+///
+/// Deliberately does **not** call `backend_ready_or_skip`: that helper's 30s
+/// readiness probe is shorter than a cold Kiro turn, so gating on it turns this
+/// into a test that silently passes without ever reaching the agent. Only a
+/// missing binary skips here; a Kiro that is installed but broken fails.
+///
+/// What this pins that unit tests cannot: the adapter-built spawn spec resolves
+/// the real `kiro-cli-chat`, `initialize` negotiates real capabilities, and a
+/// real prompt turn reaches `StreamEnd` with assistant text.
+#[tokio::test]
+#[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
+async fn real_kiro_completes_a_turn_through_the_generic_acp_backend() {
+    const LIVE_TURN_BUDGET: Duration = Duration::from_secs(120);
+
+    if !backend_binary_available(BackendKind::Acp) {
+        eprintln!("SKIPPED: kiro not installed");
+        return;
+    }
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("README.txt"), "live acp workspace")
+        .expect("seed workspace");
+
+    let (_backend, mut events) = tokio::time::timeout(
+        LIVE_TURN_BUDGET,
+        <server::backend::kiro::KiroBackend as Backend>::spawn(
+            vec![workspace.path().to_string_lossy().to_string()],
+            server::backend::BackendSpawnConfig {
+                // `None` exercises the built-in Kiro agent resolution, which is
+                // what a migrated session resumes as.
+                acp_agent: None,
+                execution_mode: Default::default(),
+                cost_hint: cost_hint_for(BackendKind::Acp),
+                custom_agent_id: None,
+                startup_mcp_servers: Vec::new(),
+                session_settings: Default::default(),
+                backend_config: Default::default(),
+                resolved_spawn_config: Default::default(),
+                provider_version: None,
+                antigravity_conversations_dir: None,
+            },
+            protocol::SendMessagePayload {
+                message: "Reply with exactly the word READY and nothing else.".to_owned(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+        ),
+    )
+    .await
+    .expect("spawning a real Kiro ACP session timed out")
+    .expect("spawning a real Kiro ACP session failed");
+
+    let assistant_text = tokio::time::timeout(LIVE_TURN_BUDGET, async {
+        let mut text = String::new();
+        while let Some(event) = events.recv().await {
+            match event {
+                ChatEvent::StreamDelta(delta) => text.push_str(&delta.text),
+                ChatEvent::StreamEnd(_) => return Some(text),
+                _ => {}
+            }
+        }
+        None
+    })
+    .await
+    .expect("real Kiro turn timed out")
+    .expect("stream ended without StreamEnd");
+
+    assert!(
+        assistant_text.to_ascii_uppercase().contains("READY"),
+        "a real Kiro turn through the generic ACP backend produced no usable \
+         assistant text; got: {assistant_text:?}"
+    );
+}
+
 #[tokio::test]
 #[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
 async fn real_kiro_turn_token_usage_contract_if_reported() {
-    let backend_kind = BackendKind::Kiro;
+    let backend_kind = BackendKind::Acp;
     if !backend_ready_or_skip(backend_kind).await {
         return;
     }
@@ -6376,6 +6455,7 @@ async fn real_hermes_openrouter_emits_visible_content() {
     let (backend, mut events) = <server::backend::hermes::HermesBackend as Backend>::spawn(
         vec![workspace.path().to_string_lossy().to_string()],
         server::backend::BackendSpawnConfig {
+            acp_agent: None,
             execution_mode: Default::default(),
             cost_hint: cost_hint_for(BackendKind::Hermes),
             custom_agent_id: None,
@@ -6527,6 +6607,7 @@ for line in sys.stdin:
     let (backend, mut events) = <server::backend::hermes::HermesBackend as Backend>::spawn(
         vec![workspace.path().to_string_lossy().to_string()],
         server::backend::BackendSpawnConfig {
+            acp_agent: None,
             execution_mode: Default::default(),
             cost_hint: cost_hint_for(BackendKind::Hermes),
             custom_agent_id: None,
@@ -6664,7 +6745,7 @@ async fn real_backends_emit_stream_deltas() {
         BackendKind::Claude,
         BackendKind::Codex,
         BackendKind::Antigravity,
-        BackendKind::Kiro,
+        BackendKind::Acp,
     ];
     let mut failures = Vec::new();
 
@@ -6713,7 +6794,7 @@ async fn real_backends_emit_typing_status() {
         BackendKind::Claude,
         BackendKind::Codex,
         BackendKind::Antigravity,
-        BackendKind::Kiro,
+        BackendKind::Acp,
     ];
     let mut failures = Vec::new();
 
@@ -6937,7 +7018,7 @@ async fn real_codex_interrupts_long_running_command() {
 #[tokio::test]
 #[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
 async fn real_backends_interrupt_long_running_command() {
-    let backends = [BackendKind::Claude, BackendKind::Codex, BackendKind::Kiro];
+    let backends = [BackendKind::Claude, BackendKind::Codex, BackendKind::Acp];
     let mut failures = Vec::new();
 
     for backend_kind in backends {
@@ -6981,7 +7062,7 @@ async fn real_backends_interrupt_long_running_command() {
 #[tokio::test]
 #[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
 async fn real_kiro_emits_typing_and_streaming_on_follow_up_turns() {
-    let backend_kind = BackendKind::Kiro;
+    let backend_kind = BackendKind::Acp;
 
     if !backend_binary_available(backend_kind) {
         eprintln!("SKIPPED: {} not installed", backend_label(backend_kind));
@@ -7010,7 +7091,7 @@ async fn real_kiro_emits_typing_and_streaming_on_follow_up_turns() {
 #[tokio::test]
 #[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
 async fn real_kiro_follow_up_user_message_echo_is_not_duplicated() {
-    let backend_kind = BackendKind::Kiro;
+    let backend_kind = BackendKind::Acp;
 
     if !backend_binary_available(backend_kind) {
         eprintln!("SKIPPED: {} not installed", backend_label(backend_kind));

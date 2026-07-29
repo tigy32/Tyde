@@ -2938,6 +2938,7 @@ impl LaunchProfileForm {
             },
             backend_kind: self.backend_kind.get_untracked(),
             session_settings: self.session_settings.get_untracked(),
+            acp: None,
         })
     }
 }
@@ -6274,7 +6275,7 @@ fn send_host_setting(state: &AppState, setting: HostSettingValue) {
 fn all_backends() -> [BackendKind; 6] {
     [
         BackendKind::Tycode,
-        BackendKind::Kiro,
+        BackendKind::Acp,
         BackendKind::Claude,
         BackendKind::Codex,
         BackendKind::Antigravity,
@@ -6295,7 +6296,7 @@ fn is_reserved_launch_profile_id(id: &str) -> bool {
 fn parse_backend_kind(value: &str) -> Option<BackendKind> {
     match value {
         "tycode" => Some(BackendKind::Tycode),
-        "kiro" => Some(BackendKind::Kiro),
+        "kiro" => Some(BackendKind::Acp),
         "claude" => Some(BackendKind::Claude),
         "codex" => Some(BackendKind::Codex),
         "antigravity" => Some(BackendKind::Antigravity),
@@ -6307,7 +6308,7 @@ fn parse_backend_kind(value: &str) -> Option<BackendKind> {
 fn backend_value(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Tycode => "tycode",
-        BackendKind::Kiro => "kiro",
+        BackendKind::Acp => "kiro",
         BackendKind::Claude => "claude",
         BackendKind::Codex => "codex",
         BackendKind::Antigravity => "antigravity",
@@ -6318,7 +6319,7 @@ fn backend_value(kind: BackendKind) -> &'static str {
 fn backend_label(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Tycode => "Tycode",
-        BackendKind::Kiro => "Kiro",
+        BackendKind::Acp => "Kiro",
         BackendKind::Claude => "Claude",
         BackendKind::Codex => "Codex",
         BackendKind::Antigravity => "Antigravity",
@@ -6329,7 +6330,7 @@ fn backend_label(kind: BackendKind) -> &'static str {
 fn backend_description(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Tycode => "Tycode subprocess backend",
-        BackendKind::Kiro => "Kiro ACP backend",
+        BackendKind::Acp => "Kiro ACP backend",
         BackendKind::Claude => "Anthropic Claude — advanced reasoning and coding",
         BackendKind::Codex => "OpenAI Codex — code completion and generation",
         BackendKind::Antigravity => "Google Antigravity CLI — agentic coding assistant",
@@ -6340,7 +6341,7 @@ fn backend_description(kind: BackendKind) -> &'static str {
 fn backend_badge_class(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Tycode => "backend-badge tycode",
-        BackendKind::Kiro => "backend-badge kiro",
+        BackendKind::Acp => "backend-badge kiro",
         BackendKind::Claude => "backend-badge claude",
         BackendKind::Codex => "backend-badge codex",
         BackendKind::Antigravity => "backend-badge antigravity",
@@ -11509,6 +11510,7 @@ mod wasm_tests {
             description: None,
             backend_kind: BackendKind::Hermes,
             session_settings: SessionSettingsValues::default(),
+            acp: None,
         }
     }
 

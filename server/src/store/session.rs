@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocol::{
-    BackendKind, CompactionMethod, CompactionMetrics, CompactionMutation, CompactionOperationId,
-    CompactionTrigger, ContinuationInstallSummary, CustomAgentId, LaunchProfileId, ProjectId,
-    SessionId, SessionListScope, SessionSettingsValues, SessionSummary, TaskList,
+    ACP_BACKEND, BackendKind, CompactionMethod, CompactionMetrics, CompactionMutation,
+    CompactionOperationId, CompactionTrigger, ContinuationInstallSummary, CustomAgentId,
+    KIRO_LAUNCH_PROFILE_ID, LEGACY_KIRO_BACKEND, LaunchProfileId, ProjectId, SessionId,
+    SessionListScope, SessionSettingsValues, SessionSummary, TaskList,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -168,6 +169,7 @@ impl SessionStore {
     pub fn load_with_migration(path: PathBuf) -> Result<(Self, HashSet<SessionId>), String> {
         let purged_gemini_session_ids = Self::purge_legacy_gemini_sessions(&path)?;
         Self::mark_non_native_antigravity_sessions_non_resumable(&path)?;
+        Self::migrate_legacy_kiro_sessions(&path)?;
         let _ = Self::read_from_disk(&path)?;
         let store = Self { path };
         let _ = store.reconcile_incomplete_compactions()?;
@@ -819,6 +821,72 @@ impl SessionStore {
         Ok(purged)
     }
 
+    /// Repoint Kiro sessions at the ACP backend.
+    ///
+    /// Unlike the Gemini migration these sessions are *not* purged — the
+    /// underlying Kiro session files are untouched and still resumable. They
+    /// just need the new backend kind, and a launch profile binding so the
+    /// backend knows which ACP agent to start. A session that already names a
+    /// profile keeps it.
+    fn migrate_legacy_kiro_sessions(path: &Path) -> Result<(), String> {
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(format!(
+                    "Failed to read session store {}: {err}",
+                    path.display()
+                ));
+            }
+        };
+        let mut value = serde_json::from_str::<Value>(&contents)
+            .map_err(|err| format!("Failed to parse session store {}: {err}", path.display()))?;
+        let records = value
+            .get_mut("records")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                format!(
+                    "Failed to migrate session store {}: records must be an object",
+                    path.display()
+                )
+            })?;
+
+        let mut changed = false;
+        for record in records.values_mut() {
+            let Some(record) = record.as_object_mut() else {
+                continue;
+            };
+            if record.get("backend_kind").and_then(Value::as_str) != Some(LEGACY_KIRO_BACKEND) {
+                continue;
+            }
+            record.insert(
+                "backend_kind".to_string(),
+                Value::String(ACP_BACKEND.to_string()),
+            );
+            let needs_profile = !matches!(
+                record.get("launch_profile_id"),
+                Some(Value::String(existing)) if !existing.trim().is_empty()
+            );
+            if needs_profile {
+                record.insert(
+                    "launch_profile_id".to_string(),
+                    Value::String(KIRO_LAUNCH_PROFILE_ID.to_string()),
+                );
+            }
+            changed = true;
+        }
+
+        if changed {
+            write_json_value_atomically(path, &value).map_err(|err| {
+                format!(
+                    "Failed to rewrite migrated session store {}: {err}",
+                    path.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     fn mark_non_native_antigravity_sessions_non_resumable(path: &Path) -> Result<(), String> {
         let contents = match std::fs::read_to_string(path) {
             Ok(contents) => contents,
@@ -1027,7 +1095,7 @@ where
                 && is_antigravity_resumable(&record.id)
         }
         BackendKind::Tycode
-        | BackendKind::Kiro
+        | BackendKind::Acp
         | BackendKind::Claude
         | BackendKind::Codex
         | BackendKind::Hermes => record.resumable,

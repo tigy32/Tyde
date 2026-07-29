@@ -1018,7 +1018,7 @@ pub(crate) fn ReviewSidebar(
 fn backend_kind_label(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Tycode => "Tycode",
-        BackendKind::Kiro => "Kiro",
+        BackendKind::Acp => "Kiro",
         BackendKind::Claude => "Claude",
         BackendKind::Codex => "Codex",
         BackendKind::Antigravity => "Antigravity",
@@ -1130,7 +1130,7 @@ fn effective_submit_target(
 fn parse_backend_kind(s: &str) -> Option<BackendKind> {
     match s {
         "Tycode" => Some(BackendKind::Tycode),
-        "Kiro" => Some(BackendKind::Kiro),
+        "Kiro" => Some(BackendKind::Acp),
         "Claude" => Some(BackendKind::Claude),
         "Codex" => Some(BackendKind::Codex),
         "Antigravity" => Some(BackendKind::Antigravity),

@@ -78,7 +78,7 @@ impl From<BackendKindInput> for BackendKind {
     fn from(value: BackendKindInput) -> Self {
         match value {
             BackendKindInput::Tycode => Self::Tycode,
-            BackendKindInput::Kiro => Self::Kiro,
+            BackendKindInput::Kiro => Self::Acp,
             BackendKindInput::Claude => Self::Claude,
             BackendKindInput::Codex => Self::Codex,
             BackendKindInput::Antigravity => Self::Antigravity,

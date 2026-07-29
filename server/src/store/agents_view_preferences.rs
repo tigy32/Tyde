@@ -919,7 +919,7 @@ fn canonicalize_status_filters(mut statuses: Vec<AgentStatusFilter>) -> Vec<Agen
 fn canonicalize_backends(mut backends: Vec<BackendKind>) -> Vec<BackendKind> {
     backends.sort_by_key(|backend| match *backend {
         BackendKind::Tycode => 0,
-        BackendKind::Kiro => 1,
+        BackendKind::Acp => 1,
         BackendKind::Claude => 2,
         BackendKind::Codex => 3,
         BackendKind::Antigravity => 4,

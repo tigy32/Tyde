@@ -572,14 +572,14 @@ pub fn SessionSettingsBar(
             BackendKind::Codex => "Session Settings (Codex)",
             BackendKind::Antigravity => "Session Settings (Antigravity)",
             BackendKind::Hermes => "Session Settings (Hermes)",
-            BackendKind::Kiro => "Session Settings (Kiro)",
+            BackendKind::Acp => "Session Settings (Kiro)",
             BackendKind::Tycode => "Session Settings",
         }
     }
 
     fn missing_schema_message(backend_kind: BackendKind) -> &'static str {
         match backend_kind {
-            BackendKind::Kiro => "Kiro models unavailable — check installation",
+            BackendKind::Acp => "Kiro models unavailable — check installation",
             BackendKind::Claude => "Claude settings unavailable — check installation",
             BackendKind::Codex => "Codex settings unavailable — check installation",
             BackendKind::Antigravity => "Antigravity settings unavailable — check installation",
@@ -590,7 +590,7 @@ pub fn SessionSettingsBar(
 
     fn pending_schema_message(backend_kind: BackendKind) -> &'static str {
         match backend_kind {
-            BackendKind::Kiro => "Kiro models are loading...",
+            BackendKind::Acp => "Kiro models are loading...",
             BackendKind::Claude => "Claude settings are loading...",
             BackendKind::Codex => "Codex settings are loading...",
             BackendKind::Antigravity => "Antigravity settings are loading...",

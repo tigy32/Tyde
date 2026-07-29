@@ -322,6 +322,7 @@ fn supervision_spawn_config(
     session_settings: Option<SessionSettingsValues>,
 ) -> BackendSpawnConfig {
     BackendSpawnConfig {
+        acp_agent: None,
         execution_mode: BackendExecutionMode::InferenceOnly,
         cost_hint,
         custom_agent_id: None,

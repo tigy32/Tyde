@@ -1171,7 +1171,7 @@ fn parse_agent_id_from_stream(stream: &StreamPath) -> AgentId {
 #[serde(rename_all = "snake_case")]
 enum BackendKindInput {
     Tycode,
-    Kiro,
+    Acp,
     Claude,
     Codex,
     Antigravity,
@@ -1182,7 +1182,7 @@ impl From<BackendKindInput> for BackendKind {
     fn from(value: BackendKindInput) -> Self {
         match value {
             BackendKindInput::Tycode => Self::Tycode,
-            BackendKindInput::Kiro => Self::Kiro,
+            BackendKindInput::Acp => Self::Acp,
             BackendKindInput::Claude => Self::Claude,
             BackendKindInput::Codex => Self::Codex,
             BackendKindInput::Antigravity => Self::Antigravity,
@@ -1577,7 +1577,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
 fn backend_kind_schema() -> Value {
     json!({
         "type": "string",
-        "enum": ["tycode", "kiro", "claude", "codex", "antigravity", "hermes"]
+        "enum": ["tycode", "acp", "claude", "codex", "antigravity", "hermes"]
     })
 }
 

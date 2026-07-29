@@ -747,6 +747,7 @@ fn hermes_claude_launch_profile() -> HostLaunchProfileConfig {
         description: Some("Launch Hermes with an explicit Claude preset.".to_owned()),
         backend_kind: BackendKind::Hermes,
         session_settings: hermes_claude_session_settings(),
+        acp: None,
     }
 }
 

@@ -14,10 +14,12 @@ use protocol::{
     StreamIdentityViolation, TokenUsageUnavailableReason,
 };
 
+use crate::acp::adapter::{
+    AcpAgentAdapter, AcpCapabilities, AcpRequestCtx, AcpSessionKind, adapter_for_spec,
+};
 use crate::acp::{
-    AcpBridge, AcpInbound, AcpSpawnSpec, acp_mcp_servers_json, extract_message_id,
-    extract_text_from_update, extract_tool_call_id, map_plan_status, normalize_update_type,
-    parse_tool_call_completion, parse_tool_call_request,
+    AcpBridge, AcpInbound, acp_mcp_servers_json, extract_message_id, extract_text_from_update,
+    extract_tool_call_id, map_plan_status, parse_tool_call_completion, parse_tool_call_request,
 };
 use crate::backend::turn_emitter::{
     AgentName, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
@@ -29,9 +31,9 @@ use crate::backend::{
 use crate::process_env;
 use crate::subprocess::ImageAttachment;
 
-const KIRO_AGENT_NAME: &str = "kiro";
-const KIRO_ADMIN_SESSION_SUBDIR: &str = ".tyde/kiro-admin";
-const KIRO_EPHEMERAL_SESSION_SUBDIR: &str = ".tyde/kiro-ephemeral";
+pub(crate) const KIRO_AGENT_NAME: &str = "kiro";
+pub(crate) const KIRO_ADMIN_SESSION_SUBDIR: &str = ".tyde/kiro-admin";
+pub(crate) const KIRO_EPHEMERAL_SESSION_SUBDIR: &str = ".tyde/kiro-ephemeral";
 const KIRO_SCHEMA_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const KIRO_SCHEMA_PROBE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -59,14 +61,31 @@ impl KiroSchemaProbeStage {
 }
 
 struct KiroSpawnMode<'a> {
+    /// Which ACP agent to run, and how it deviates from the specification.
+    adapter: Arc<dyn AcpAgentAdapter>,
     ephemeral: bool,
     admin_session: bool,
     initial_model: Option<&'a str>,
     ssh_host: Option<String>,
     startup_mcp_servers: &'a [StartupMcpServer],
     steering_content: Option<&'a str>,
-    program_override: Option<String>,
     probe_deadline: Option<tokio::time::Instant>,
+}
+
+/// Build the adapter for the built-in Kiro agent.
+///
+/// `program_override` points the adapter at a specific binary; `None` lets it
+/// resolve `kiro-cli-chat` as a sibling of `kiro-cli`. Tests use the override
+/// to substitute a fake ACP agent, which means they exercise the same
+/// adapter-driven spawn path as production.
+fn kiro_adapter(program_override: Option<String>) -> Arc<dyn AcpAgentAdapter> {
+    adapter_for_spec(&protocol::AcpAgentSpec {
+        command: program_override.unwrap_or_default(),
+        args: vec!["acp".to_string()],
+        cwd: None,
+        env: Default::default(),
+        adapter: protocol::AcpAdapterId::Kiro,
+    })
 }
 
 async fn await_kiro_stage<T>(
@@ -89,22 +108,104 @@ async fn await_kiro_stage<T>(
     }
 }
 
-fn kiro_initialize_params() -> Value {
+/// ACP protocol version Tyde speaks.
+const ACP_CLIENT_PROTOCOL_VERSION: u32 = 1;
+
+fn acp_initialize_params(adapter: &dyn AcpAgentAdapter) -> Value {
     json!({
-        "protocolVersion": 1,
-        "clientCapabilities": {
-            "fs": {
-                "readTextFile": true,
-                "writeTextFile": true
-            },
-            "terminal": true
-        },
+        "protocolVersion": ACP_CLIENT_PROTOCOL_VERSION,
+        "clientCapabilities": adapter.client_capabilities(),
         "clientInfo": {
             "name": "tyde",
             "title": "Tyde",
             "version": "0.1.0"
         }
     })
+}
+
+/// Read what the agent said it can do.
+///
+/// Anything absent is treated as unsupported. An agent that doesn't advertise
+/// `loadSession` doesn't get `session/load` called on it, rather than Tyde
+/// trying and interpreting the failure.
+fn parse_capabilities(response: &Value) -> AcpCapabilities {
+    let agent_caps = response.get("agentCapabilities");
+    AcpCapabilities {
+        protocol_version: response
+            .get("protocolVersion")
+            .and_then(Value::as_u64)
+            .unwrap_or(ACP_CLIENT_PROTOCOL_VERSION as u64) as u32,
+        load_session: agent_caps
+            .and_then(|caps| caps.get("loadSession"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        image: agent_caps
+            .and_then(|caps| caps.get("promptCapabilities"))
+            .and_then(|caps| caps.get("image"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        auth_methods: response
+            .get("authMethods")
+            .and_then(Value::as_array)
+            .map(|methods| {
+                methods
+                    .iter()
+                    .filter_map(|method| {
+                        method
+                            .get("id")
+                            .or_else(|| method.get("methodId"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        agent_info: response
+            .get("agentInfo")
+            .and_then(|info| info.get("name"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
+}
+
+/// Run `authenticate` when the agent advertises auth methods.
+///
+/// Tries each advertised method in the order the agent listed them and
+/// succeeds on the first that works. If every method fails, that is a hard
+/// error naming the agent and the last failure — Tyde does not proceed to
+/// `session/new` hoping the agent will accept an unauthenticated session.
+async fn authenticate_if_required(
+    bridge: &AcpBridge,
+    capabilities: &AcpCapabilities,
+    agent: &str,
+) -> Result<(), String> {
+    if capabilities.auth_methods.is_empty() {
+        return Ok(());
+    }
+
+    let mut last_error = None;
+    for method_id in &capabilities.auth_methods {
+        match bridge
+            .request("authenticate", json!({ "methodId": method_id }))
+            .await
+        {
+            Ok(_) => {
+                tracing::debug!("{agent}: authenticated via ACP method '{method_id}'");
+                return Ok(());
+            }
+            Err(err) => {
+                tracing::debug!("{agent}: ACP auth method '{method_id}' failed: {err}");
+                last_error = Some(err);
+            }
+        }
+    }
+
+    Err(format!(
+        "{agent} requires authentication and every advertised method failed \
+         (tried: {}). Last error: {}",
+        capabilities.auth_methods.join(", "),
+        last_error.unwrap_or_else(|| "no methods advertised".to_string())
+    ))
 }
 
 #[derive(Clone)]
@@ -130,6 +231,29 @@ impl KiroSession {
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
+        Self::spawn_for_agent(
+            workspace_roots,
+            None,
+            initial_model,
+            ssh_host,
+            startup_mcp_servers,
+            steering_content,
+        )
+        .await
+    }
+
+    /// Start a session for a specific ACP agent.
+    ///
+    /// `agent` of `None` means the built-in Kiro agent, which is what a
+    /// session recorded before ACP launch profiles existed resumes as.
+    pub async fn spawn_for_agent(
+        workspace_roots: &[String],
+        agent: Option<&protocol::AcpAgentSpec>,
+        initial_model: Option<&str>,
+        ssh_host: Option<String>,
+        startup_mcp_servers: &[StartupMcpServer],
+        steering_content: Option<&str>,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
             KiroSpawnMode {
@@ -139,7 +263,7 @@ impl KiroSession {
                 ssh_host,
                 startup_mcp_servers,
                 steering_content,
-                program_override: None,
+                adapter: agent.map_or_else(|| kiro_adapter(None), adapter_for_spec),
                 probe_deadline: None,
             },
         )
@@ -162,7 +286,7 @@ impl KiroSession {
                 ssh_host,
                 startup_mcp_servers,
                 steering_content,
-                program_override: None,
+                adapter: kiro_adapter(None),
                 probe_deadline: None,
             },
         )
@@ -204,7 +328,7 @@ impl KiroSession {
                 ssh_host,
                 startup_mcp_servers,
                 steering_content,
-                program_override,
+                adapter: kiro_adapter(program_override),
                 probe_deadline: None,
             },
         )
@@ -225,7 +349,7 @@ impl KiroSession {
                 ssh_host: None,
                 startup_mcp_servers: &[],
                 steering_content: None,
-                program_override,
+                adapter: kiro_adapter(program_override),
                 probe_deadline: Some(probe_deadline),
             },
         )
@@ -236,24 +360,22 @@ impl KiroSession {
         workspace_roots: &[String],
         mode: KiroSpawnMode<'_>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
+        let adapter = mode.adapter.clone();
         let roots = await_kiro_stage(
             mode.probe_deadline,
             KiroSchemaProbeStage::WorkspaceSetup,
-            resolve_kiro_session_roots(
+            adapter.resolve_roots(
                 workspace_roots,
                 mode.ssh_host.as_deref(),
-                mode.admin_session,
-                mode.ephemeral,
+                AcpSessionKind {
+                    admin_session: mode.admin_session,
+                    ephemeral: mode.ephemeral,
+                },
             ),
         )
         .await?;
-        let acp_args: Vec<&str> = vec!["acp"];
 
-        let mut spawn_spec = AcpSpawnSpec::new("Kiro ACP", "kiro-cli-chat", &acp_args)
-            .with_local_cwd(roots.session_cwd.clone());
-        spawn_spec.local_program = mode
-            .program_override
-            .unwrap_or_else(resolve_kiro_chat_binary);
+        let mut spawn_spec = adapter.spawn_spec(&roots, mode.ssh_host.as_deref())?;
         if let Some(model) = mode
             .initial_model
             .map(str::trim)
@@ -264,38 +386,48 @@ impl KiroSession {
             spawn_spec.remote_args.push("--model".to_string());
             spawn_spec.remote_args.push(model.to_string());
         }
-        if mode.ssh_host.is_some() {
-            spawn_spec = spawn_spec.with_remote_cwd(roots.session_cwd.clone());
-        }
 
         let acp_program = spawn_spec.local_program.clone();
+        let agent_label = adapter.display_name().to_string();
         let (bridge, inbound_rx) =
             await_kiro_stage(mode.probe_deadline, KiroSchemaProbeStage::AcpSpawn, async {
                 AcpBridge::spawn(spawn_spec, mode.ssh_host.as_deref())
                     .await
                     .map_err(|err| {
-                        format!("Failed to start Kiro executable '{acp_program}': {err}")
+                        format!("Failed to start {agent_label} executable '{acp_program}': {err}")
                     })
             })
             .await?;
 
-        await_kiro_stage(
+        let initialize_response = await_kiro_stage(
             mode.probe_deadline,
             KiroSchemaProbeStage::Initialize,
-            bridge.request("initialize", kiro_initialize_params()),
+            bridge.request("initialize", acp_initialize_params(adapter.as_ref())),
         )
         .await?;
+        let capabilities = parse_capabilities(&initialize_response);
+
+        // Authenticate before creating a session when the agent advertises
+        // auth methods. Kiro advertises none, so this is a no-op for it; agents
+        // like Gemini CLI require it and would otherwise fail `session/new`
+        // with an opaque error.
+        authenticate_if_required(&bridge, &capabilities, adapter.display_name()).await?;
 
         let session_result: Result<(String, Value), String> = async {
             let mut session_params = json!({
                 "cwd": roots.session_cwd,
                 "mcpServers": acp_mcp_servers_json(mode.startup_mcp_servers)
             });
-            if let Some(content) = mode.steering_content
-                && !content.trim().is_empty()
-            {
-                session_params["systemPrompt"] = Value::String(content.to_string());
-            }
+            adapter.decorate_session_new(
+                &mut session_params,
+                &AcpRequestCtx {
+                    session_id: "",
+                    model: None,
+                    mode: None,
+                    system_prompt: mode.steering_content,
+                    capabilities: &capabilities,
+                },
+            );
             let session_started = await_kiro_stage(
                 mode.probe_deadline,
                 KiroSchemaProbeStage::SessionNew,
@@ -327,6 +459,8 @@ impl KiroSession {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         let inner = Arc::new(KiroInner {
+            adapter,
+            capabilities,
             bridge,
             emitter: Arc::new(TurnEmitter::new_for_agent(
                 event_tx,
@@ -344,6 +478,7 @@ impl KiroSession {
                 mode: initial_mode,
                 known_models: extract_known_models(&session_started),
                 active_message_id: None,
+                idless_message_ordinal: 0,
                 active_stream_text: String::new(),
                 active_stream_tool_calls: Vec::new(),
                 active_tool_contexts: HashMap::new(),
@@ -399,6 +534,10 @@ struct KiroState {
     mode: Option<String>,
     known_models: Vec<Value>,
     active_message_id: Option<ChatMessageId>,
+    /// Counts the assistant messages this session has had to name itself,
+    /// because the agent supplied no `messageId`. Monotonic for the life of the
+    /// session and never reused, so two id-less messages never collide.
+    idless_message_ordinal: u64,
     active_stream_text: String,
     active_stream_tool_calls: Vec<Value>,
     active_tool_contexts: HashMap<String, KiroToolContext>,
@@ -413,6 +552,23 @@ struct KiroState {
     replay_assistant_reasoning: String,
     replay_assistant_message_emitted_since_user: bool,
     replay_error: Option<String>,
+}
+
+/// Derives the `stream_epoch` used to name assistant messages from an agent
+/// that sends no `messageId`. Keyed on the ACP session so ids from different
+/// sessions cannot collide, and pure so the same session always derives the
+/// same epoch.
+fn idless_stream_epoch(session_id: &str) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"tyde:acp:idless-live-stream:v1");
+    hasher.update([0]);
+    hasher.update(session_id.as_bytes());
+    let digest = hasher.finalize();
+    u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 digest has at least eight bytes"),
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -538,14 +694,16 @@ struct PendingToolCompletion {
 }
 
 #[derive(Clone)]
-struct KiroToolContext {
+pub(crate) struct KiroToolContext {
     tool_name: String,
-    tool_type: Value,
+    pub(crate) tool_type: Value,
     request_emitted: bool,
     pending_completion: Option<PendingToolCompletion>,
 }
 
 struct KiroInner {
+    adapter: Arc<dyn AcpAgentAdapter>,
+    capabilities: AcpCapabilities,
     bridge: AcpBridge,
     emitter: Arc<TurnEmitter>,
     state: Mutex<KiroState>,
@@ -597,15 +755,16 @@ impl KiroInner {
                     "prompt": prompt_blocks,
                 });
 
-                if let Some(model_id) = model {
-                    params["modelId"] = Value::String(model_id);
-                }
-                if let Some(mode_id) = mode {
-                    params["modeId"] = Value::String(mode_id);
-                }
-                if let Some(ref s) = steering {
-                    params["systemPrompt"] = Value::String(s.clone());
-                }
+                self.adapter.decorate_prompt(
+                    &mut params,
+                    &AcpRequestCtx {
+                        session_id: &session_id,
+                        model: model.as_deref(),
+                        mode: mode.as_deref(),
+                        system_prompt: steering.as_deref(),
+                        capabilities: &self.capabilities,
+                    },
+                );
 
                 self.state.lock().await.cancelled = false;
 
@@ -843,10 +1002,9 @@ impl KiroInner {
         let normalized = normalize_optional_string(&Value::String(session_id))
             .ok_or("Invalid session id".to_string())?;
 
-        match &self.ssh_host {
-            Some(host) => delete_remote_kiro_session(host, &normalized).await,
-            None => delete_local_kiro_session(&normalized).await,
-        }
+        self.adapter
+            .delete_session(&normalized, self.ssh_host.as_deref())
+            .await
     }
 
     async fn resume_session(&self, session_id: String) -> Result<(), String> {
@@ -874,10 +1032,11 @@ impl KiroInner {
         // kiro-cli-chat doesn't check PID liveness when reading .lock files,
         // so stale locks from dead processes block session/load. Remove the
         // lock file before attempting to load.
-        let _ = match &self.ssh_host {
-            Some(host) => clear_remote_kiro_session_lock(host, &session_id).await,
-            None => clear_local_kiro_session_lock(&session_id).await,
-        };
+        // Agent-specific pre-load cleanup (Kiro's stale `.lock` files).
+        let _ = self
+            .adapter
+            .before_session_load(&session_id, self.ssh_host.as_deref())
+            .await;
 
         let response = match self
             .bridge
@@ -1035,19 +1194,24 @@ impl KiroInner {
     }
     async fn handle_notification(&self, method: &str, params: &Value) {
         match method {
-            "session/notification" => {
-                if !self.accept_replay_notification_session(params).await {
-                    return;
-                }
-                self.handle_kiro_notification(params).await;
-            }
             "session/update" => {
                 if !self.accept_replay_notification_session(params).await {
                     return;
                 }
                 self.handle_standard_update(params).await;
             }
-            _ => {}
+            other => {
+                // Anything that isn't the standard notification is only
+                // meaningful if this agent's adapter recognizes it.
+                let Some(normalized) = self.adapter.normalize_notification(other, params) else {
+                    return;
+                };
+                if !self.accept_replay_notification_session(params).await {
+                    return;
+                }
+                self.handle_normalized_update(normalized.session_update, &normalized.params)
+                    .await;
+            }
         }
     }
 
@@ -1084,96 +1248,61 @@ impl KiroInner {
         }
     }
 
-    async fn handle_kiro_notification(&self, params: &Value) {
-        let raw_type = params
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let normalized = normalize_update_type(raw_type);
-        if normalized != "error" {
-            let state = self.state.lock().await;
-            if !state.replaying_history && state.provider_turn_quarantined {
-                return;
-            }
-        }
+    /// Ask the adapter to describe a tool call.
+    ///
+    /// ACP carries the classification in `kind`; everything else in the
+    /// payload is agent-defined, which is why the adapter decides.
+    async fn map_tool_request(&self, params: &Value, args: &Value, workspace_root: &str) -> Value {
+        let kind = params.get("kind").and_then(Value::as_str).unwrap_or("");
+        self.adapter
+            .map_tool_request(kind, args, workspace_root)
+            .await
+    }
 
-        match normalized.as_str() {
-            "agentmessagechunk" => {
-                self.handle_agent_message_chunk(params).await;
-            }
-            "toolcall" => {
-                self.handle_tool_call(params).await;
-            }
-            "toolcallupdate" => {
-                self.handle_tool_call_update(params).await;
-            }
-            "turnend" => {
+    /// Handle an update an adapter rewrote into standard terms.
+    ///
+    /// The payload is already flat (no `update` envelope), so it goes straight
+    /// to the shared dispatch.
+    async fn handle_normalized_update(&self, update_type: &str, params: &Value) {
+        if self.should_drop_quarantined_update(update_type).await {
+            return;
+        }
+        self.dispatch_session_update(update_type, params).await;
+    }
+
+    /// A provider error quarantines the rest of the turn. Error updates still
+    /// get through, because that is how the quarantine is lifted and reported.
+    async fn should_drop_quarantined_update(&self, update_type: &str) -> bool {
+        if update_type == "error" {
+            return false;
+        }
+        let state = self.state.lock().await;
+        !state.replaying_history && state.provider_turn_quarantined
+    }
+
+    /// The one place a `session/update` discriminant is turned into behavior.
+    ///
+    /// Both the standard notification and anything an adapter normalized land
+    /// here, so an agent with a proprietary notification family gets exactly
+    /// the same handling as a conforming one.
+    async fn dispatch_session_update(&self, update_type: &str, update: &Value) {
+        match update_type {
+            "agent_message_chunk" => self.handle_agent_message_chunk(update).await,
+            "user_message_chunk" => self.handle_user_message_chunk(update).await,
+            "agent_thought_chunk" => self.handle_reasoning_chunk(update).await,
+            "tool_call" => self.handle_tool_call(update).await,
+            "tool_call_update" => self.handle_tool_call_update(update).await,
+            "error" => self.handle_error_notification(update).await,
+            "plan" => self.handle_plan_update(update),
+            // Not part of the standard update family; adapters for agents that
+            // signal end-of-turn out of band normalize onto this.
+            "turn_end" => {
                 if self.state.lock().await.replaying_history {
                     self.flush_replay_assistant_message().await;
                     return;
                 }
-                self.finalize_active_stream_if_any(Some(params.clone()), true)
+                self.finalize_active_stream_if_any(Some(update.clone()), true)
                     .await;
-            }
-            "error" => {
-                self.handle_error_notification(params).await;
-            }
-            "currentmodeupdate" => {
-                if let Some(mode) = extract_current_mode(params) {
-                    let mut state = self.state.lock().await;
-                    state.mode = Some(mode);
-                }
-            }
-            "configoptionupdate" => {
-                if let Some(model) = extract_current_model(params) {
-                    let mut state = self.state.lock().await;
-                    state.model = Some(model);
-                }
-                let models = extract_known_models(params);
-                if !models.is_empty() {
-                    let mut state = self.state.lock().await;
-                    state.known_models = models;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    async fn handle_standard_update(&self, params: &Value) {
-        let update = params.get("update").unwrap_or(params);
-        let update_type = update
-            .get("sessionUpdate")
-            .or_else(|| update.get("session_update"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if update_type != "error" {
-            let state = self.state.lock().await;
-            if !state.replaying_history && state.provider_turn_quarantined {
-                return;
-            }
-        }
-
-        match update_type {
-            "agent_message_chunk" => {
-                self.handle_agent_message_chunk(update).await;
-            }
-            "user_message_chunk" => {
-                self.handle_user_message_chunk(update).await;
-            }
-            "agent_thought_chunk" => {
-                self.handle_reasoning_chunk(update).await;
-            }
-            "tool_call" => {
-                self.handle_tool_call(update).await;
-            }
-            "tool_call_update" => {
-                self.handle_tool_call_update(update).await;
-            }
-            "error" => {
-                self.handle_error_notification(update).await;
-            }
-            "plan" => {
-                self.handle_plan_update(update);
             }
             "current_mode_update" => {
                 if let Some(mode) = extract_current_mode(update) {
@@ -1194,6 +1323,19 @@ impl KiroInner {
             }
             _ => {}
         }
+    }
+
+    async fn handle_standard_update(&self, params: &Value) {
+        let update = params.get("update").unwrap_or(params);
+        let update_type = update
+            .get("sessionUpdate")
+            .or_else(|| update.get("session_update"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if self.should_drop_quarantined_update(update_type).await {
+            return;
+        }
+        self.dispatch_session_update(update_type, update).await;
     }
 
     async fn handle_user_message_chunk(&self, params: &Value) {
@@ -1233,10 +1375,12 @@ impl KiroInner {
             return;
         }
 
-        let Some(message_id) = provider_message_id else {
-            self.reject_missing_stream_message_id().await;
-            return;
-        };
+        let message_id = self
+            .resolve_live_message_id(
+                provider_message_id,
+                ServerGeneratedChatMessageIdOrigin::IdlessReasoning,
+            )
+            .await;
 
         let (started, model, foreign_message_id) = {
             let mut state = self.state.lock().await;
@@ -1360,7 +1504,7 @@ impl KiroInner {
         if raw_delta.is_empty() {
             return;
         }
-        let delta = strip_ansi_and_controls(&raw_delta);
+        let delta = self.adapter.sanitize_stream_text(&raw_delta).into_owned();
         if delta.is_empty() {
             return;
         }
@@ -1384,10 +1528,12 @@ impl KiroInner {
             }
         }
 
-        let Some(chunk_message_id) = chunk_message_id else {
-            self.reject_missing_stream_message_id().await;
-            return;
-        };
+        let chunk_message_id = self
+            .resolve_live_message_id(
+                chunk_message_id,
+                ServerGeneratedChatMessageIdOrigin::IdlessProviderResponseItem,
+            )
+            .await;
 
         let (started, model, foreign_message_id) = {
             let mut state = self.state.lock().await;
@@ -1434,17 +1580,49 @@ impl KiroInner {
         self.emitter.stream_delta_with_id(chunk_message_id, &delta);
     }
 
-    async fn reject_missing_stream_message_id(&self) {
-        if self.emitter.is_stream_open() {
-            self.emitter.discard_open_stream_with_identity_violation(
-                StreamIdentityViolation::MissingMessageId,
-            );
-        } else {
-            self.emitter
-                .backend_error("Stream identity violation: missing message id");
+    /// Resolves the assistant-message identity for an inbound live update.
+    ///
+    /// `messageId` is **optional** in ACP — the field carries an explicit
+    /// "UNSTABLE — not part of the spec yet" marker in the schema — so a fully
+    /// conforming agent may never send one. Kiro 2.15.1 and hermes-agent both
+    /// omit it on every chunk. Requiring it therefore did not detect a
+    /// misbehaving agent; it silently discarded the entire visible response of
+    /// well-behaved ones.
+    ///
+    /// The contract the identity check protects is: *chunks carrying the same
+    /// id belong to one message, and a different id starts a different
+    /// message.* An agent that never sends ids makes no such distinction, so
+    /// its stream has exactly one message in flight at a time — which is what
+    /// this resolves to. The first id-less update of a message names it; every
+    /// later id-less update joins the open message. Agents that do send ids
+    /// take the explicit branch and are wholly unaffected, foreign-id
+    /// rejection included.
+    ///
+    /// The synthesized name is a `ServerGeneratedChatMessageIdentity`, not a
+    /// random id: that contract is deterministic in (session, ordinal), so the
+    /// same event sequence always yields the same id. A UUID here would render
+    /// duplicates on any path that re-derives ids for the same events.
+    async fn resolve_live_message_id(
+        &self,
+        explicit: Option<ChatMessageId>,
+        origin: ServerGeneratedChatMessageIdOrigin,
+    ) -> ChatMessageId {
+        if let Some(id) = explicit {
+            return id;
         }
-        self.clear_active_stream().await;
-        self.emitter.typing_status_changed(false);
+
+        let mut state = self.state.lock().await;
+        if let Some(active) = state.active_message_id.clone() {
+            return active;
+        }
+
+        let identity = ServerGeneratedChatMessageIdentity {
+            origin,
+            stream_epoch: idless_stream_epoch(&state.session_id),
+            item_ordinal: state.idless_message_ordinal,
+        };
+        state.idless_message_ordinal = state.idless_message_ordinal.saturating_add(1);
+        identity.message_id()
     }
 
     async fn reject_foreign_stream_message_id(&self, message_id: &ChatMessageId) {
@@ -1512,7 +1690,9 @@ impl KiroInner {
             return;
         };
         let workspace_root = self.state.lock().await.workspace_root.clone();
-        let tool_type = map_tool_request_type(params, &request.args, &workspace_root).await;
+        let tool_type = self
+            .map_tool_request(params, &request.args, &workspace_root)
+            .await;
         let canonical_id = normalize_tool_call_id_fragment(&raw_tool_call_id);
 
         {
@@ -1598,7 +1778,9 @@ impl KiroInner {
             };
 
             completion.tool_name = context.tool_name.clone();
-            let tool_result = map_tool_completion_result(&completion, Some(context));
+            let tool_result = self
+                .adapter
+                .map_tool_result(&completion, Some(&context.tool_type));
             let output = (
                 completion.tool_call_id.clone(),
                 completion.tool_name.clone(),
@@ -1641,10 +1823,12 @@ impl KiroInner {
         };
         let raw_tool_call_id = normalize_tool_call_id_fragment(&request.tool_call_id);
 
-        let Some(incoming_message_id) = extract_kiro_chat_message_id(params) else {
-            self.reject_missing_stream_message_id().await;
-            return;
-        };
+        let incoming_message_id = self
+            .resolve_live_message_id(
+                extract_kiro_chat_message_id(params),
+                ServerGeneratedChatMessageIdOrigin::IdlessProviderResponseItem,
+            )
+            .await;
         if let Some(active_message_id) = self.state.lock().await.active_message_id.clone()
             && active_message_id != incoming_message_id
         {
@@ -1664,7 +1848,9 @@ impl KiroInner {
             let canonical_id =
                 build_canonical_tool_call_id(&mut state, &stream_message_id.0, &raw_tool_call_id);
             let duplicate_request = state.active_tool_contexts.contains_key(&canonical_id);
-            let tool_type = map_tool_request_type(params, &request.args, &workspace_root).await;
+            let tool_type = self
+                .map_tool_request(params, &request.args, &workspace_root)
+                .await;
 
             let context = state
                 .active_tool_contexts
@@ -1857,7 +2043,9 @@ impl KiroInner {
                 if completion.tool_name == "tool" {
                     completion.tool_name = context.tool_name.clone();
                 }
-                let tool_result = map_tool_completion_result(&completion, Some(context));
+                let tool_result = self
+                    .adapter
+                    .map_tool_result(&completion, Some(&context.tool_type));
                 let pending = PendingToolCompletion {
                     tool_name: completion.tool_name.clone(),
                     tool_result,
@@ -2123,7 +2311,7 @@ impl KiroInner {
         force_emit: bool,
         end_typing: bool,
     ) {
-        let cleaned_text = strip_ansi_and_controls(&text);
+        let cleaned_text = self.adapter.sanitize_stream_text(&text).into_owned();
 
         let (session_id, model) = {
             let state = self.state.lock().await;
@@ -2260,7 +2448,7 @@ fn kiro_plan_status_to_task_status(raw: &str) -> protocol::TaskStatus {
     }
 }
 
-fn resolve_local_kiro_sessions_dir() -> Result<std::path::PathBuf, String> {
+pub(crate) fn resolve_local_kiro_sessions_dir() -> Result<std::path::PathBuf, String> {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .map_err(|_| "Could not determine home directory for Kiro sessions".to_string())?;
@@ -2270,12 +2458,12 @@ fn resolve_local_kiro_sessions_dir() -> Result<std::path::PathBuf, String> {
         .join("cli"))
 }
 
-struct KiroSessionRoots {
-    session_cwd: String,
-    scope_root: String,
+pub(crate) struct KiroSessionRoots {
+    pub(crate) session_cwd: String,
+    pub(crate) scope_root: String,
 }
 
-async fn resolve_kiro_session_roots(
+pub(crate) async fn resolve_kiro_session_roots(
     workspace_roots: &[String],
     ssh_host: Option<&str>,
     admin_session: bool,
@@ -2336,7 +2524,7 @@ async fn resolve_kiro_session_roots(
     })
 }
 
-async fn ensure_remote_directory(host: &str, dir: &str) -> Result<(), String> {
+pub(crate) async fn ensure_remote_directory(host: &str, dir: &str) -> Result<(), String> {
     let command = format!("mkdir -p {}", crate::remote::shell_quote_arg(dir));
     let output = crate::remote::run_ssh_raw(host, &command).await?;
     if output.status.success() {
@@ -2353,7 +2541,7 @@ async fn ensure_remote_directory(host: &str, dir: &str) -> Result<(), String> {
     ))
 }
 
-fn join_posix_path(base: &str, suffix: &str) -> String {
+pub(crate) fn join_posix_path(base: &str, suffix: &str) -> String {
     let base = base.trim_end_matches('/');
     let suffix = suffix.trim_start_matches('/');
     if base.is_empty() {
@@ -2363,7 +2551,7 @@ fn join_posix_path(base: &str, suffix: &str) -> String {
     }
 }
 
-fn strip_ansi_and_controls(input: &str) -> String {
+pub(crate) fn strip_ansi_and_controls(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -2456,7 +2644,7 @@ fn remove_tool_call_aliases(
     aliases.retain(|_, mapped| mapped != canonical_tool_call_id);
 }
 
-fn has_renderable_stream_text(input: &str) -> bool {
+pub(crate) fn has_renderable_stream_text(input: &str) -> bool {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return false;
@@ -2473,7 +2661,11 @@ fn is_stream_artifact_char(ch: char) -> bool {
 
 /// Maps Kiro ACP tool_call params to Tyde's internal tool type representation.
 /// Uses the ACP `kind` field directly: "execute" → RunCommand, "edit" → ModifyFile, "read" → ReadFiles.
-async fn map_tool_request_type(params: &Value, args: &Value, workspace_root: &str) -> Value {
+pub(crate) async fn map_tool_request_type(
+    params: &Value,
+    args: &Value,
+    workspace_root: &str,
+) -> Value {
     let acp_kind = params.get("kind").and_then(Value::as_str).unwrap_or("");
 
     match acp_kind {
@@ -2585,9 +2777,9 @@ fn extract_kiro_tool_call_id(value: &Value) -> Option<String> {
 /// The `rawOutput` for execute completions is: `{"items": [{"Json": {"exit_status": "exit status: N", "stdout": "...", "stderr": "..."}}]}`
 /// The `rawOutput` for read completions is: `{"items": [{"Text": "..."}]}`
 /// The `rawOutput` for edit completions is: `{"items": [{"Text": ""}]}`
-fn map_tool_completion_result(
+pub(crate) fn map_tool_completion_result(
     completion: &crate::acp::AcpToolCallCompletion,
-    context: Option<&KiroToolContext>,
+    request_payload: Option<&Value>,
 ) -> Value {
     if !completion.success {
         let short_message = completion
@@ -2627,12 +2819,12 @@ fn map_tool_completion_result(
             })
         }
         "edit" => {
-            let before = context
-                .and_then(|ctx| ctx.tool_type.get("before"))
+            let before = request_payload
+                .and_then(|payload| payload.get("before"))
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let after = context
-                .and_then(|ctx| ctx.tool_type.get("after"))
+            let after = request_payload
+                .and_then(|payload| payload.get("after"))
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let (lines_added, lines_removed) = estimate_line_diff_counts(before, after);
@@ -2643,8 +2835,8 @@ fn map_tool_completion_result(
             })
         }
         "read" => {
-            let file_paths = context
-                .and_then(|ctx| ctx.tool_type.get("file_paths"))
+            let file_paths = request_payload
+                .and_then(|payload| payload.get("file_paths"))
                 .and_then(Value::as_array);
             let text_len = extract_first_item_text(&completion.tool_result)
                 .map(|t| t.len() as u64)
@@ -2800,7 +2992,7 @@ const KIRO_ESTIMATED_BYTES_PER_TOKEN: u64 = 4;
 const KIRO_ESTIMATED_CONTEXT_WINDOW: u64 = 200_000;
 const KIRO_MIN_SYSTEM_PROMPT_BYTES: u64 = 1_024;
 
-fn normalize_token_usage(raw: Option<&Value>) -> Option<Value> {
+pub(crate) fn normalize_token_usage(raw: Option<&Value>) -> Option<Value> {
     let raw = raw?;
     let source = raw
         .get("last")
@@ -2948,7 +3140,7 @@ fn usage_u64(value: &Value, keys: &[&str]) -> Option<u64> {
     None
 }
 
-fn estimate_context_breakdown_from_usage(token_usage: &Value) -> Value {
+pub(crate) fn estimate_context_breakdown_from_usage(token_usage: &Value) -> Value {
     let base_input_tokens = token_usage
         .get("input_tokens")
         .and_then(Value::as_u64)
@@ -3154,7 +3346,7 @@ fn session_settings_schema_from_known_models(
     }
 
     Ok(protocol::SessionSettingsSchema {
-        backend_kind: protocol::BackendKind::Kiro,
+        backend_kind: protocol::BackendKind::Acp,
         fields: vec![protocol::SessionSettingField {
             key: "model".to_string(),
             label: "Model".to_string(),
@@ -3244,7 +3436,7 @@ fn normalize_optional_string(value: &Value) -> Option<String> {
         .map(|raw| raw.to_string())
 }
 
-fn find_in_path(binary: &str) -> Option<String> {
+pub(crate) fn find_in_path(binary: &str) -> Option<String> {
     process_env::find_executable_in_path(binary).map(|path| path.to_string_lossy().to_string())
 }
 
@@ -3264,7 +3456,7 @@ fn resolve_sibling_binary(known_binary: &str, sibling_name: &str) -> Option<Stri
     }
 }
 
-fn resolve_kiro_chat_binary() -> String {
+pub(crate) fn resolve_kiro_chat_binary() -> String {
     if let Some(path) = find_in_path("kiro-cli-chat") {
         return path;
     }
@@ -3274,7 +3466,7 @@ fn resolve_kiro_chat_binary() -> String {
     "kiro-cli-chat".to_string()
 }
 
-fn pick_workspace_root(workspace_roots: &[String]) -> Result<String, String> {
+pub(crate) fn pick_workspace_root(workspace_roots: &[String]) -> Result<String, String> {
     if let Some(root) = workspace_roots
         .iter()
         .find(|root| !root.trim().is_empty() && !root.trim_start().starts_with("ssh://"))
@@ -3291,7 +3483,7 @@ fn pick_workspace_root(workspace_roots: &[String]) -> Result<String, String> {
     crate::backend::tyde_owned_no_root_cwd("kiro")
 }
 
-fn parse_iso8601_to_unix_ms(s: &str) -> Option<u64> {
+pub(crate) fn parse_iso8601_to_unix_ms(s: &str) -> Option<u64> {
     let utc = s.trim().strip_suffix('Z').unwrap_or(s.trim());
     let (date, time) = utc.split_once('T')?;
     let mut dp = date.splitn(3, '-');
@@ -3322,7 +3514,7 @@ fn parse_iso8601_to_unix_ms(s: &str) -> Option<u64> {
     Some((days * 86400 + h * 3600 + min * 60 + sec) * 1000)
 }
 
-fn unix_now_ms() -> u64 {
+pub(crate) fn unix_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
@@ -3354,7 +3546,7 @@ fn is_pid_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-async fn clear_local_kiro_session_lock(session_id: &str) -> Result<(), String> {
+pub(crate) async fn clear_local_kiro_session_lock(session_id: &str) -> Result<(), String> {
     let sessions_dir = resolve_local_kiro_sessions_dir()?;
     let lock_path = sessions_dir.join(format!("{session_id}.lock"));
     if !lock_path.exists() {
@@ -3375,7 +3567,10 @@ async fn clear_local_kiro_session_lock(session_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn clear_remote_kiro_session_lock(host: &str, session_id: &str) -> Result<(), String> {
+pub(crate) async fn clear_remote_kiro_session_lock(
+    host: &str,
+    session_id: &str,
+) -> Result<(), String> {
     let cmd = format!(
         "LOCKFILE=~/.kiro/sessions/cli/{0}.lock; \
          if [ -f \"$LOCKFILE\" ]; then \
@@ -3394,7 +3589,7 @@ async fn clear_remote_kiro_session_lock(host: &str, session_id: &str) -> Result<
     Ok(())
 }
 
-async fn delete_local_kiro_session(session_id: &str) -> Result<(), String> {
+pub(crate) async fn delete_local_kiro_session(session_id: &str) -> Result<(), String> {
     let sessions_dir = resolve_local_kiro_sessions_dir()?;
     for ext in &["json", "jsonl", "lock"] {
         let path = sessions_dir.join(format!("{session_id}.{ext}"));
@@ -3407,7 +3602,7 @@ async fn delete_local_kiro_session(session_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn delete_remote_kiro_session(host: &str, session_id: &str) -> Result<(), String> {
+pub(crate) async fn delete_remote_kiro_session(host: &str, session_id: &str) -> Result<(), String> {
     let cmd = format!(
         "rm -f ~/.kiro/sessions/cli/{0}.json ~/.kiro/sessions/cli/{0}.jsonl ~/.kiro/sessions/cli/{0}.lock",
         crate::remote::shell_quote_arg(session_id)
@@ -3420,7 +3615,7 @@ async fn delete_remote_kiro_session(host: &str, session_id: &str) -> Result<(), 
     Ok(())
 }
 
-async fn load_local_kiro_sessions() -> Result<Vec<(String, Value)>, String> {
+pub(crate) async fn load_local_kiro_sessions() -> Result<Vec<(String, Value)>, String> {
     let dir = resolve_local_kiro_sessions_dir()?;
     if !dir.exists() {
         return Ok(Vec::new());
@@ -3467,7 +3662,7 @@ async fn load_local_kiro_sessions() -> Result<Vec<(String, Value)>, String> {
     Ok(result)
 }
 
-async fn load_remote_kiro_sessions(host: &str) -> Result<Vec<(String, Value)>, String> {
+pub(crate) async fn load_remote_kiro_sessions(host: &str) -> Result<Vec<(String, Value)>, String> {
     let cmd = concat!(
         "for f in ~/.kiro/sessions/cli/*.json; do ",
         "[ -f \"$f\" ] && ",
@@ -3521,7 +3716,7 @@ fn parse_remote_session_dump(dump: &str) -> Result<Vec<(String, Value)>, String>
     Ok(result)
 }
 
-fn extract_session_title(metadata: &Value) -> String {
+pub(crate) fn extract_session_title(metadata: &Value) -> String {
     metadata
         .get("title")
         .or_else(|| {
@@ -3536,7 +3731,7 @@ fn extract_session_title(metadata: &Value) -> String {
         .to_string()
 }
 
-fn extract_session_timestamp(metadata: &Value) -> u64 {
+pub(crate) fn extract_session_timestamp(metadata: &Value) -> u64 {
     let ts_field = metadata
         .get("updatedAt")
         .or_else(|| metadata.get("updated_at"))
@@ -3559,7 +3754,7 @@ use protocol::{
     SessionSettingValue, SpawnCostHint, StreamEndData, StreamStartData, StreamTextDeltaData,
 };
 
-use super::{
+use crate::backend::{
     Backend, BackendCompactionCapability, BackendCompactionUnavailableReason, BackendSession,
     BackendSpawnConfig, EventStream, empty_session_settings_schema, protocol_images_to_attachments,
     resolve_settings as resolve_backend_settings, session_settings_to_json,
@@ -3606,7 +3801,7 @@ pub(crate) fn resolve_session_settings(
 
 impl Backend for KiroBackend {
     fn session_settings_schema() -> protocol::SessionSettingsSchema {
-        empty_session_settings_schema(BackendKind::Kiro)
+        empty_session_settings_schema(BackendKind::Acp)
     }
 
     fn compaction_capability(&self) -> BackendCompactionCapability {
@@ -3634,8 +3829,9 @@ impl Backend for KiroBackend {
             let mut ready_tx: Option<oneshot::Sender<Result<(), String>>> = Some(ready_tx);
             let combined_instructions =
                 render_combined_spawn_instructions(&config.resolved_spawn_config);
-            let (session, mut raw_events) = match KiroSession::spawn(
+            let (session, mut raw_events) = match KiroSession::spawn_for_agent(
                 &workspace_roots,
+                config.acp_agent.as_ref(),
                 None,
                 None,
                 &config.startup_mcp_servers,
@@ -3811,8 +4007,9 @@ impl Backend for KiroBackend {
             let mut ready_tx: Option<oneshot::Sender<Result<(), String>>> = Some(ready_tx);
             let combined_instructions =
                 render_combined_spawn_instructions(&config.resolved_spawn_config);
-            let (session, mut raw_events) = match KiroSession::spawn(
+            let (session, mut raw_events) = match KiroSession::spawn_for_agent(
                 &workspace_roots,
+                config.acp_agent.as_ref(),
                 None,
                 None,
                 &config.startup_mcp_servers,
@@ -3984,7 +4181,7 @@ impl Backend for KiroBackend {
         _initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), BackendStartupError> {
         Err(BackendStartupError::unsupported(
-            backend_fork_unsupported_message(BackendKind::Kiro),
+            backend_fork_unsupported_message(BackendKind::Acp),
         ))
     }
 
@@ -4004,7 +4201,7 @@ impl Backend for KiroBackend {
             }
             sessions.push(BackendSession {
                 id: SessionId(session_id),
-                backend_kind: BackendKind::Kiro,
+                backend_kind: BackendKind::Acp,
                 workspace_roots: if cwd.is_empty() {
                     Vec::new()
                 } else {
@@ -4225,7 +4422,9 @@ mod tests {
 
     #[test]
     fn kiro_initialize_params_keeps_write_and_terminal_capabilities() {
-        let params = kiro_initialize_params();
+        // The capability declaration moved onto the adapter; assert through the
+        // real spawn-time path so this still guards what the agent is told.
+        let params = acp_initialize_params(kiro_adapter(None).as_ref());
 
         assert_eq!(
             params["clientCapabilities"]["fs"]["readTextFile"],
@@ -4236,6 +4435,39 @@ mod tests {
             Value::Bool(true)
         );
         assert_eq!(params["clientCapabilities"]["terminal"], Value::Bool(true));
+        assert_eq!(
+            params["protocolVersion"],
+            json!(ACP_CLIENT_PROTOCOL_VERSION),
+            "the client, not the adapter, owns the protocol version"
+        );
+    }
+
+    #[test]
+    fn capabilities_default_to_unsupported_when_the_agent_is_silent() {
+        let caps = parse_capabilities(&json!({ "protocolVersion": 1 }));
+        assert!(
+            !caps.load_session,
+            "session/load must not be attempted against an agent that never advertised it"
+        );
+        assert!(!caps.image);
+        assert!(caps.auth_methods.is_empty());
+    }
+
+    #[test]
+    fn capabilities_are_read_from_the_initialize_response() {
+        let caps = parse_capabilities(&json!({
+            "protocolVersion": 1,
+            "agentCapabilities": {
+                "loadSession": true,
+                "promptCapabilities": { "image": true }
+            },
+            "authMethods": [{ "id": "oauth" }, { "id": "api-key" }],
+            "agentInfo": { "name": "some-agent" }
+        }));
+        assert!(caps.load_session);
+        assert!(caps.image);
+        assert_eq!(caps.auth_methods, vec!["oauth", "api-key"]);
+        assert_eq!(caps.agent_info.as_deref(), Some("some-agent"));
     }
 
     #[tokio::test]
@@ -4329,7 +4561,7 @@ mod tests {
             tool_result: json!({"items":[{"Text":""}]}),
             error: None,
         };
-        let result = map_tool_completion_result(&completion, Some(&context));
+        let result = map_tool_completion_result(&completion, Some(&context.tool_type));
 
         assert_eq!(result["kind"], "ModifyFile");
         assert_eq!(result["lines_added"], 1);
@@ -4352,13 +4584,43 @@ mod tests {
             tool_result: json!({"items":[{"Text":"import random\nimport time\n"}]}),
             error: None,
         };
-        let result = map_tool_completion_result(&completion, Some(&context));
+        let result = map_tool_completion_result(&completion, Some(&context.tool_type));
 
         assert_eq!(result["kind"], "ReadFiles");
         let files = result["files"].as_array().unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0]["path"], "hello.py");
         assert_eq!(files[0]["bytes"], 26);
+    }
+
+    #[test]
+    fn idless_stream_epoch_is_deterministic_and_session_scoped() {
+        // Names for id-less messages must survive a restart unchanged: nothing
+        // persists the id, so any path that re-derives it for the same events
+        // has to land on the same value or the client renders duplicates.
+        assert_eq!(
+            idless_stream_epoch("session-a"),
+            idless_stream_epoch("session-a")
+        );
+        assert_ne!(
+            idless_stream_epoch("session-a"),
+            idless_stream_epoch("session-b")
+        );
+
+        let first = ServerGeneratedChatMessageIdentity {
+            origin: ServerGeneratedChatMessageIdOrigin::IdlessProviderResponseItem,
+            stream_epoch: idless_stream_epoch("session-a"),
+            item_ordinal: 0,
+        };
+        let second = ServerGeneratedChatMessageIdentity {
+            item_ordinal: 1,
+            ..first.clone()
+        };
+        assert_ne!(
+            first.message_id(),
+            second.message_id(),
+            "successive id-less messages in one session must not share an id"
+        );
     }
 
     fn write_fake_kiro_acp_program() -> PathBuf {
@@ -4409,6 +4671,8 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":
 printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}'
 read _
 printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-identity-session","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"unidentified"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-identity-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"part-one "}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-identity-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"part-two"}}}}'
 printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn"}}'
 read _
 printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-identity-session","update":{"sessionUpdate":"agent_message_chunk","messageId":"kiro-response-one","content":{"type":"text","text":"reused"}}}}'
@@ -4685,7 +4949,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"sessionId":"kiro-real-legacy-s
             agent_id: agent_id.clone(),
             name: "test".to_string(),
             origin: protocol::AgentOrigin::User,
-            backend_kind: protocol::BackendKind::Kiro,
+            backend_kind: protocol::BackendKind::Acp,
             launch_profile_id: None,
             workspace_roots: workspace_roots.clone(),
             custom_agent_id: None,
@@ -4724,8 +4988,8 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"sessionId":"kiro-real-legacy-s
             1,
             &protocol::HostBootstrapPayload {
                 settings: protocol::HostSettings {
-                    enabled_backends: vec![protocol::BackendKind::Kiro],
-                    default_backend: Some(protocol::BackendKind::Kiro),
+                    enabled_backends: vec![protocol::BackendKind::Acp],
+                    default_backend: Some(protocol::BackendKind::Acp),
                     enable_mobile_connections: false,
                     mobile_broker_url: None,
                     tyde_debug_mcp_enabled: false,
@@ -4790,7 +5054,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"sessionId":"kiro-real-legacy-s
                         agent_id,
                         name: "test".to_string(),
                         origin: protocol::AgentOrigin::User,
-                        backend_kind: protocol::BackendKind::Kiro,
+                        backend_kind: protocol::BackendKind::Acp,
                         launch_profile_id: None,
                         workspace_roots,
                         custom_agent_id: None,
@@ -5229,6 +5493,16 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"sessionId":"kiro-real-legacy-s
             Some("second")
         );
 
+        // `messageId` is optional in ACP (the schema marks it "UNSTABLE — not
+        // part of the spec yet"), and real Kiro 2.15.1 omits it on every chunk.
+        // This turn therefore models a *conforming* agent, not a misbehaving
+        // one, and the contract to enforce is the same one the identified turns
+        // above enforce: a turn resolves to exactly one identity, every chunk
+        // in it renders under that identity, and it is never confused with
+        // another turn's. Asserting these events were dropped asserted the
+        // opposite — that a conforming agent's whole visible response is
+        // discarded — so the assertions below replace that with the stricter
+        // per-event identity and content checks.
         handle
             .execute(SessionCommand::SendMessage {
                 message: "missing identity".to_string(),
@@ -5237,20 +5511,56 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"sessionId":"kiro-real-legacy-s
             .await
             .expect("send missing-identity fake Kiro request");
         let missing = collect_kiro_turn_events(&mut raw_events).await;
-        assert!(missing.iter().any(|event| {
-            event.get("kind").and_then(Value::as_str) == Some("Error")
-                && event.get("data").and_then(Value::as_str)
-                    == Some("Stream identity violation: missing message id")
-        }));
-        assert!(!missing.iter().any(|event| {
-            matches!(
-                event.get("kind").and_then(Value::as_str),
-                Some("StreamStart")
-                    | Some("StreamReasoningDelta")
-                    | Some("StreamDelta")
-                    | Some("StreamEnd")
-            )
-        }));
+        assert!(
+            !missing
+                .iter()
+                .any(|event| event.get("kind").and_then(Value::as_str) == Some("Error")),
+            "an agent that omits the optional messageId is conforming, not in violation: {missing:?}"
+        );
+        let missing_stream_events = missing
+            .iter()
+            .filter(|event| stream_event_message_id(event).is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            missing_stream_events
+                .iter()
+                .map(|event| event.get("kind").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec![
+                Some("StreamStart"),
+                Some("StreamReasoningDelta"),
+                Some("StreamDelta"),
+                Some("StreamDelta"),
+                Some("StreamEnd"),
+            ],
+            "an id-less turn must stream and terminate like any other: {missing:?}"
+        );
+        let synthesized_id = stream_event_message_id(missing_stream_events[0])
+            .expect("id-less turn must still open under some identity")
+            .to_string();
+        assert!(
+            missing_stream_events
+                .iter()
+                .all(|event| stream_event_message_id(event) == Some(synthesized_id.as_str())),
+            "every chunk of an id-less turn must share the one identity that turn resolved to"
+        );
+        assert!(
+            synthesized_id.starts_with("server-generated:"),
+            "an id-less turn must be named by the server-generated identity contract, \
+             not by a provider value or the message text: {synthesized_id}"
+        );
+        assert!(
+            !["kiro-response-one", "kiro-response-two"].contains(&synthesized_id.as_str()),
+            "a synthesized identity must never collide with a provider identity"
+        );
+        assert_eq!(
+            missing_stream_events
+                .last()
+                .and_then(|event| event.pointer("/data/message/content"))
+                .and_then(Value::as_str),
+            Some("part-one part-two"),
+            "id-less chunks after the first must join the open message, not start new ones"
+        );
 
         handle
             .execute(SessionCommand::SendMessage {

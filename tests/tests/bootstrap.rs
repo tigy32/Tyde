@@ -274,6 +274,7 @@ fn hermes_claude_launch_profile() -> HostLaunchProfileConfig {
         description: Some("Launch Hermes with an explicit Claude preset.".to_owned()),
         backend_kind: BackendKind::Hermes,
         session_settings: hermes_claude_session_settings(),
+        acp: None,
     }
 }
 
@@ -765,6 +766,7 @@ async fn host_bootstrap_includes_launch_profile_catalog() {
             description: Some("Launch Claude with Haiku.".to_owned()),
             backend_kind: BackendKind::Claude,
             session_settings: profile_settings,
+            acp: None,
         }],
     );
     let host = server::spawn_host_with_mock_backend(
@@ -865,7 +867,7 @@ async fn enabled_backend_change_emits_deduped_launch_profile_catalog() {
 async fn stable_reconnect_does_not_emit_unchanged_session_schemas_after_bootstrap() {
     let dir = tempfile::tempdir().expect("tempdir");
     let settings_path = dir.path().join("settings.json");
-    write_enabled_backends_settings(&settings_path, &[BackendKind::Kiro]);
+    write_enabled_backends_settings(&settings_path, &[BackendKind::Acp]);
     let missing_kiro = dir.path().join("missing-kiro-cli-chat");
     let kiro_workspace = tempfile::tempdir().expect("Kiro probe workspace tempdir");
     let host = server::spawn_host_with_mock_backend_and_runtime_config(
@@ -895,7 +897,7 @@ async fn stable_reconnect_does_not_emit_unchanged_session_schemas_after_bootstra
     let kiro_schema = first_schemas
         .schemas
         .iter()
-        .find(|schema| schema.backend_kind() == BackendKind::Kiro)
+        .find(|schema| schema.backend_kind() == BackendKind::Acp)
         .expect("Kiro schema should be present");
     let protocol::SessionSchemaEntry::Unavailable { message, .. } = kiro_schema else {
         panic!("missing Kiro executable should make its schema unavailable: {kiro_schema:?}");
@@ -948,6 +950,7 @@ async fn codex_session_schema_refresh_replaces_models_and_surfaces_errors() {
             description: None,
             backend_kind: BackendKind::Codex,
             session_settings: profile_settings,
+            acp: None,
         }],
     );
     let fake_codex = write_fake_codex_model_probe_program(&dir);
@@ -1611,6 +1614,7 @@ async fn launch_profile_errors_are_visible_command_errors() {
             description: None,
             backend_kind: BackendKind::Claude,
             session_settings: invalid_settings,
+            acp: None,
         }],
     );
     let host = server::spawn_host_with_mock_backend(

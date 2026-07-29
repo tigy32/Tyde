@@ -3,8 +3,8 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use protocol::{
-    BackendKind, BackgroundAgentFeature, BrokerUrl, CodeIntelSettings, HostLaunchProfileConfig,
-    HostSettingValue, HostSettings, LaunchProfileId,
+    ACP_BACKEND, BackendKind, BackgroundAgentFeature, BrokerUrl, CodeIntelSettings,
+    HostLaunchProfileConfig, HostSettingValue, HostSettings, LEGACY_KIRO_BACKEND, LaunchProfileId,
     SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX,
     SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN, SUPERVISOR_RETRY_ATTEMPTS_MAX,
     SUPERVISOR_RETRY_ATTEMPTS_MIN, SUPERVISOR_STALL_TIMEOUT_SECONDS_MAX,
@@ -15,7 +15,7 @@ use serde_json::Value;
 
 const CANONICAL_BACKENDS: [BackendKind; 6] = [
     BackendKind::Tycode,
-    BackendKind::Kiro,
+    BackendKind::Acp,
     BackendKind::Claude,
     BackendKind::Codex,
     BackendKind::Antigravity,
@@ -29,9 +29,22 @@ const DEFAULT_BACKEND_PREFERENCE: [BackendKind; 6] = [
     BackendKind::Codex,
     BackendKind::Antigravity,
     BackendKind::Hermes,
-    BackendKind::Kiro,
+    BackendKind::Acp,
     BackendKind::Tycode,
 ];
+
+/// The agent spec a migrated Kiro launch profile receives.
+///
+/// An empty command is intentional: the Kiro adapter resolves `kiro-cli-chat`
+/// as a sibling of `kiro-cli`, which is more reliable than whatever absolute
+/// path happened to be correct when the profile was first written.
+fn kiro_agent_spec_value() -> Value {
+    serde_json::json!({
+        "command": "",
+        "args": ["acp"],
+        "adapter": "kiro",
+    })
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct StoreFile {
@@ -45,6 +58,14 @@ pub struct HostSettingsStore {
 
 impl HostSettingsStore {
     pub fn load(path: PathBuf) -> Result<Self, String> {
+        // Order matters. Each migration below round-trips the file through
+        // typed `HostSettings`, which rejects any legacy kind still present —
+        // so every raw rename has to happen before the first typed pass.
+        // `migrate_legacy_kiro_settings` is a pure JSON rewrite for exactly
+        // that reason. It must also precede `read_from_disk`, which strips
+        // unrecognized backend kinds and would drop "kiro" rather than rename
+        // it.
+        Self::migrate_legacy_kiro_settings(&path)?;
         Self::migrate_legacy_gemini_settings(&path)?;
         let _ = Self::read_from_disk(&path)?;
         Ok(Self { path })
@@ -218,6 +239,131 @@ impl HostSettingsStore {
             })?;
             Self::save(path, &settings)?;
         }
+        Ok(())
+    }
+
+    /// Rename the retired `kiro` backend kind to `acp`.
+    ///
+    /// Kiro stopped being a backend of its own and became the built-in
+    /// `acp:kiro` launch profile. Every place the old kind was persisted is
+    /// rewritten here: the enabled list, the default, the tier-config and
+    /// backend-config maps (keyed by kind), and any user launch profile that
+    /// targeted it.
+    ///
+    /// A migrated launch profile also gains the Kiro agent spec, because an
+    /// `acp` profile without one fails validation.
+    fn migrate_legacy_kiro_settings(path: &Path) -> Result<(), String> {
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(format!(
+                    "Failed to read settings store {}: {err}",
+                    path.display()
+                ));
+            }
+        };
+        let mut value = serde_json::from_str::<Value>(&contents)
+            .map_err(|err| format!("Failed to parse settings store {}: {err}", path.display()))?;
+        let Some(settings) = value.get_mut("settings").and_then(Value::as_object_mut) else {
+            // An unreadable shape is the Gemini migration's problem to report;
+            // there is nothing here to rename.
+            return Ok(());
+        };
+
+        let mut changed = false;
+
+        if let Some(enabled) = settings
+            .get_mut("enabled_backends")
+            .and_then(Value::as_array_mut)
+        {
+            for backend in enabled.iter_mut() {
+                if backend.as_str() == Some(LEGACY_KIRO_BACKEND) {
+                    *backend = Value::String(ACP_BACKEND.to_string());
+                    changed = true;
+                }
+            }
+            // `kiro` and `acp` could both be present if a profile was already
+            // added by hand; collapse the duplicate rather than persisting it.
+            let mut seen = std::collections::HashSet::new();
+            let before = enabled.len();
+            enabled.retain(|backend| match backend.as_str() {
+                Some(name) => seen.insert(name.to_string()),
+                None => true,
+            });
+            changed |= enabled.len() != before;
+        }
+
+        if settings.get("default_backend").and_then(Value::as_str) == Some(LEGACY_KIRO_BACKEND) {
+            settings.insert(
+                "default_backend".to_string(),
+                Value::String(ACP_BACKEND.to_string()),
+            );
+            changed = true;
+        }
+
+        for map_key in ["backend_tier_configs", "backend_config"] {
+            if let Some(map) = settings.get_mut(map_key).and_then(Value::as_object_mut)
+                && let Some(existing) = map.remove(LEGACY_KIRO_BACKEND)
+            {
+                // A pre-existing `acp` entry was written deliberately by a
+                // newer build; don't let the legacy value clobber it.
+                map.entry(ACP_BACKEND.to_string()).or_insert(existing);
+                changed = true;
+            }
+        }
+
+        if let Some(profiles) = settings
+            .get_mut("launch_profiles")
+            .and_then(Value::as_array_mut)
+        {
+            for profile in profiles.iter_mut() {
+                let Some(profile) = profile.as_object_mut() else {
+                    continue;
+                };
+                if profile.get("backend_kind").and_then(Value::as_str) != Some(LEGACY_KIRO_BACKEND)
+                {
+                    continue;
+                }
+                profile.insert(
+                    "backend_kind".to_string(),
+                    Value::String(ACP_BACKEND.to_string()),
+                );
+                profile
+                    .entry("acp".to_string())
+                    .or_insert_with(kiro_agent_spec_value);
+                changed = true;
+            }
+        }
+
+        if changed {
+            // Deliberately a raw write, not `save`: the document may still hold
+            // other legacy kinds that a typed round-trip would reject. Later
+            // migrations and `read_from_disk` do the validating.
+            Self::save_raw(path, &value)?;
+        }
+        Ok(())
+    }
+
+    /// Write a settings document verbatim, without validating it as typed
+    /// `HostSettings`. Only migrations that run before validation use this.
+    fn save_raw(path: &Path, value: &Value) -> Result<(), String> {
+        let json = serde_json::to_string_pretty(value)
+            .map_err(|err| format!("Failed to serialize settings store: {err}"))?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| format!("Settings store path has no parent: {}", path.display()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("Failed to create settings store directory: {err}"))?;
+        let tmp_path = path.with_extension("json.tmp");
+        let mut file = std::fs::File::create(&tmp_path)
+            .map_err(|err| format!("Failed to create temp settings store file: {err}"))?;
+        file.write_all(json.as_bytes())
+            .map_err(|err| format!("Failed to write temp settings store file: {err}"))?;
+        file.sync_all()
+            .map_err(|err| format!("Failed to sync temp settings store file: {err}"))?;
+        std::fs::rename(&tmp_path, path)
+            .map_err(|err| format!("Failed to replace settings store: {err}"))?;
         Ok(())
     }
 
@@ -696,6 +842,12 @@ fn validate_launch_profile_configs(
                 profile.id
             ));
         }
+        if profile.id.0 == protocol::KIRO_LAUNCH_PROFILE_ID {
+            return Err(format!(
+                "launch profile {} conflicts with the built-in Kiro agent profile",
+                profile.id
+            ));
+        }
         if profile
             .id
             .0
@@ -709,6 +861,38 @@ fn validate_launch_profile_configs(
         if !seen.insert(profile.id.clone()) {
             return Err(format!("duplicate launch profile id {}", profile.id));
         }
+        // An ACP profile is nothing without a command to run, and an agent spec
+        // on a non-ACP profile would be silently ignored. Reject both rather
+        // than persisting a profile that can't launch or that lies about what
+        // it does.
+        match (profile.backend_kind, profile.acp.as_ref()) {
+            (BackendKind::Acp, None) => {
+                return Err(format!(
+                    "launch profile {} targets the ACP backend but has no agent command configured",
+                    profile.id
+                ));
+            }
+            // A named adapter knows how to find its own binary (the Kiro
+            // adapter resolves `kiro-cli-chat` as a sibling of `kiro-cli`), so
+            // it may leave the command blank. A stock agent cannot be
+            // discovered, so its command is required.
+            (BackendKind::Acp, Some(spec))
+                if spec.adapter == protocol::AcpAdapterId::Stock
+                    && spec.command.trim().is_empty() =>
+            {
+                return Err(format!(
+                    "launch profile {} must specify the ACP agent command to run",
+                    profile.id
+                ));
+            }
+            (kind, Some(_)) if kind != BackendKind::Acp => {
+                return Err(format!(
+                    "launch profile {} configures an ACP agent but targets {kind:?}",
+                    profile.id
+                ));
+            }
+            _ => {}
+        }
         validated.push(profile);
     }
     Ok(validated)
@@ -717,7 +901,7 @@ fn validate_launch_profile_configs(
 fn backend_slug(backend_kind: BackendKind) -> &'static str {
     match backend_kind {
         BackendKind::Tycode => "tycode",
-        BackendKind::Kiro => "kiro",
+        BackendKind::Acp => "kiro",
         BackendKind::Claude => "claude",
         BackendKind::Codex => "codex",
         BackendKind::Antigravity => "antigravity",
@@ -1183,6 +1367,181 @@ mod tests {
                 "Gemini 3.5 Flash (Low)".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn migrates_kiro_settings_to_acp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "settings": {
+    "enabled_backends": ["kiro", "claude"],
+    "default_backend": "kiro",
+    "complexity_tiers_enabled": true,
+    "backend_tier_configs": {
+      "kiro": {
+        "low": {"model": {"string": "kiro-low"}}
+      }
+    },
+    "launch_profiles": [
+      {
+        "id": "my-kiro",
+        "label": "My Kiro",
+        "backend_kind": "kiro",
+        "session_settings": {}
+      }
+    ]
+  }
+}"#,
+        )
+        .expect("write legacy settings");
+
+        let store = HostSettingsStore::load(path.clone()).expect("load migrated settings");
+        let settings = store.get().expect("get migrated settings");
+
+        assert!(
+            settings.enabled_backends.contains(&BackendKind::Acp),
+            "kiro must become acp in enabled_backends, got {:?}",
+            settings.enabled_backends
+        );
+        assert_eq!(settings.default_backend, Some(BackendKind::Acp));
+        let tiers = settings
+            .backend_tier_configs
+            .get(&BackendKind::Acp)
+            .expect("tier config keyed by the old kind must be re-keyed, not dropped");
+        assert_eq!(
+            tiers.low.0.get("model"),
+            Some(&SessionSettingValue::String("kiro-low".to_string())),
+            "the migrated tier config must keep its values"
+        );
+
+        let profile = settings
+            .launch_profiles
+            .iter()
+            .find(|profile| profile.id == LaunchProfileId("my-kiro".to_owned()))
+            .expect("user launch profile survived migration");
+        assert_eq!(profile.backend_kind, BackendKind::Acp);
+        let spec = profile
+            .acp
+            .as_ref()
+            .expect("migrated profile gains an agent spec so it still validates");
+        assert_eq!(spec.adapter, protocol::AcpAdapterId::Kiro);
+
+        // Assert on the backend *kind* specifically rather than the substring
+        // "kiro", which legitimately survives as the adapter id
+        // (`"adapter": "kiro"`) and inside the profile id `my-kiro`.
+        let raw: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read migrated file"))
+                .expect("migrated file is valid json");
+        let persisted = &raw["settings"];
+        assert!(
+            !persisted["enabled_backends"]
+                .as_array()
+                .expect("enabled_backends array")
+                .iter()
+                .any(|kind| kind == LEGACY_KIRO_BACKEND),
+            "enabled_backends still names the retired kind: {persisted}"
+        );
+        assert_ne!(persisted["default_backend"], LEGACY_KIRO_BACKEND);
+        assert!(
+            persisted["backend_tier_configs"]
+                .get(LEGACY_KIRO_BACKEND)
+                .is_none(),
+            "tier configs are still keyed by the retired kind"
+        );
+        for profile in persisted["launch_profiles"]
+            .as_array()
+            .expect("launch_profiles array")
+        {
+            assert_ne!(
+                profile["backend_kind"], LEGACY_KIRO_BACKEND,
+                "launch profile still targets the retired kind"
+            );
+        }
+    }
+
+    #[test]
+    fn kiro_migration_does_not_clobber_an_existing_acp_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "settings": {
+    "enabled_backends": ["kiro", "acp"],
+    "complexity_tiers_enabled": true,
+    "backend_tier_configs": {
+      "kiro": {"low": {"model": {"string": "legacy"}}},
+      "acp": {"low": {"model": {"string": "current"}}}
+    }
+  }
+}"#,
+        )
+        .expect("write settings");
+
+        let store = HostSettingsStore::load(path).expect("load migrated settings");
+        let settings = store.get().expect("get migrated settings");
+
+        assert_eq!(
+            settings
+                .enabled_backends
+                .iter()
+                .filter(|kind| **kind == BackendKind::Acp)
+                .count(),
+            1,
+            "collapsing kiro into acp must not leave a duplicate entry"
+        );
+        let tiers = settings
+            .backend_tier_configs
+            .get(&BackendKind::Acp)
+            .expect("acp tier config present");
+        assert_eq!(
+            tiers.low.0.get("model"),
+            Some(&SessionSettingValue::String("current".to_string())),
+            "a config written by a newer build must win over the legacy kiro one"
+        );
+    }
+
+    #[test]
+    fn stock_acp_launch_profile_requires_a_command() {
+        let err = validate_launch_profile_configs(vec![HostLaunchProfileConfig {
+            id: LaunchProfileId("custom".to_owned()),
+            label: "Custom".to_owned(),
+            description: None,
+            backend_kind: BackendKind::Acp,
+            session_settings: Default::default(),
+            acp: Some(protocol::AcpAgentSpec {
+                command: "   ".to_owned(),
+                args: Vec::new(),
+                cwd: None,
+                env: Default::default(),
+                adapter: protocol::AcpAdapterId::Stock,
+            }),
+        }])
+        .expect_err("blank command must be rejected");
+        assert!(err.contains("command"), "got: {err}");
+    }
+
+    #[test]
+    fn agent_spec_on_a_non_acp_profile_is_rejected() {
+        let err = validate_launch_profile_configs(vec![HostLaunchProfileConfig {
+            id: LaunchProfileId("weird".to_owned()),
+            label: "Weird".to_owned(),
+            description: None,
+            backend_kind: BackendKind::Claude,
+            session_settings: Default::default(),
+            acp: Some(protocol::AcpAgentSpec {
+                command: "claude".to_owned(),
+                args: Vec::new(),
+                cwd: None,
+                env: Default::default(),
+                adapter: protocol::AcpAdapterId::Stock,
+            }),
+        }])
+        .expect_err("agent spec on a non-ACP profile must be rejected");
+        assert!(err.contains("ACP agent"), "got: {err}");
     }
 
     #[test]
