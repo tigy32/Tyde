@@ -4,12 +4,14 @@ import {
   LIVE_URL,
   PROFILE_DIR,
   REPO_ROOT,
+  authenticateLiveContext,
   launchLiveContext,
   liveSessionStatus,
 } from "./profile.mjs";
 
 await mkdir(PROFILE_DIR, { recursive: true });
 const context = await launchLiveContext({ headless: false });
+await authenticateLiveContext(context);
 const pages = context.pages();
 const page = pages[0] ?? (await context.newPage());
 await page.goto(LIVE_URL, { waitUntil: "domcontentloaded" });

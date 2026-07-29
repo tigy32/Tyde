@@ -37,3 +37,28 @@ npm run mobile:live:show
 The smoke test deliberately does not send an agent prompt. A real prompt can
 start a paid backend turn and must remain an explicit, separately approved live
 test.
+
+## Deterministic E2E OAuth
+
+The secret-gated test provider signs in an allowlisted active-Pass fixture
+without putting the production caller key in browser JavaScript, URLs, storage,
+screenshots, traces, or logs:
+
+```bash
+npm run mobile:live:e2e:login
+npm run mobile:live:e2e:test
+```
+
+The first command uses a separate
+`.tyde-playwright/mobile-live-e2e-profile/`. Pair that profile to desktop Tyde
+once, then use the second command for repeated real connection and reload
+tests. The harness defaults to `active-pass-p1` and the production E2E OAuth
+secret. `TYDE_E2E_FIXTURE_ID`, `TYGGS_E2E_OAUTH_SECRET_ID`, and `AWS_REGION`
+may select another reviewed fixture or environment.
+
+The Node process fetches the dedicated secret from AWS Secrets Manager, asks
+the mobile service to bootstrap Account OAuth in `signin` mode, calls Account's
+single-use test callback, and redeems the resulting handoff through the normal
+mobile service endpoint. The browser receives only the normal HttpOnly mobile
+session cookie. Never move this authentication into page code or enable
+Playwright request tracing around it.

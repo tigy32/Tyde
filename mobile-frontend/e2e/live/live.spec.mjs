@@ -1,6 +1,7 @@
 import { test as base, expect } from "@playwright/test";
 import {
   LIVE_URL,
+  authenticateLiveContext,
   launchLiveContext,
   liveSessionStatus,
 } from "./profile.mjs";
@@ -11,6 +12,7 @@ const test = base.extend({
       const context = await launchLiveContext({
         headless: process.env.TYDE_LIVE_HEADED !== "1",
       });
+      await authenticateLiveContext(context);
       await use(context);
       await context.close();
     },
