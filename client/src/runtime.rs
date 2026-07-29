@@ -1322,7 +1322,7 @@ fn agent_event_session_id(event: &AgentEvent) -> Option<protocol::SessionId> {
 }
 
 fn bootstrap_agent_session_id(payload: &AgentBootstrapPayload) -> Option<protocol::SessionId> {
-    let mut logical_session_id = None;
+    let mut logical_session_id: Option<protocol::SessionId> = None;
     for event in &payload.events {
         let candidate = match event {
             protocol::AgentBootstrapEvent::AgentStart(payload) => payload.session_id.as_ref(),

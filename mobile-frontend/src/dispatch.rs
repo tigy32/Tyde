@@ -3446,7 +3446,7 @@ mod tests {
                 state
                     .context_compaction_operations
                     .with_untracked(|operations| operations.get(&agent_ref).cloned()),
-                Some(active),
+                Some(active.clone()),
                 "a terminal notify for another operation cannot clear the current one"
             );
 
