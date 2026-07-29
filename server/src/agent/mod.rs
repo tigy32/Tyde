@@ -11354,15 +11354,16 @@ fn legacy_claude_agent_result(tool_name: &str, result: &serde_json::Value) -> bo
 }
 
 fn session_history_entries_from_log(event_log: &[Envelope]) -> Vec<(u64, ChatEvent)> {
-    let entries = event_log.iter().filter_map(|envelope| {
-        (envelope.kind == FrameKind::ChatEvent).then(|| {
+    let entries = event_log
+        .iter()
+        .filter(|envelope| envelope.kind == FrameKind::ChatEvent)
+        .map(|envelope| {
             (
                 envelope.seq,
                 serde_json::from_value(envelope.payload.clone())
                     .expect("failed to parse ChatEvent from replay log"),
             )
-        })
-    });
+        });
     project_session_history_entries(entries)
 }
 

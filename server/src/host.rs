@@ -20311,7 +20311,7 @@ mod tests {
     use crate::review::ReviewHandle;
     use crate::store::agent_teams::AgentTeamsStoreFile;
     use protocol::{
-        AgentErrorPayload, BackendConfigSnapshotStatus, BackendConfigSnapshotsPayload, BackendKind,
+        BackendConfigSnapshotStatus, BackendConfigSnapshotsPayload, BackendKind,
         BackendNativeSettingsSnapshot, CompactionMetrics, CompactionTrigger, CustomAgentId,
         DiffContextMode, Envelope, HostSettingValue, ProjectDiffScope, ProjectGitDiffFile,
         ProjectGitDiffPayload, ProtocolValidator, Review, ReviewAiReviewerState,
