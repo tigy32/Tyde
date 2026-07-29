@@ -8131,13 +8131,8 @@ async fn park_terminal_agent(
             } => {
                 let authoritative = match session_id {
                     Some(session_id) => {
-                        authoritative_session_history_window(
-                            session_id,
-                            before_seq,
-                            limit,
-                            None,
-                        )
-                        .await
+                        authoritative_session_history_window(session_id, before_seq, limit, None)
+                            .await
                     }
                     None => None,
                 };
@@ -8916,11 +8911,8 @@ async fn append_chat_event_with_transcript_metadata(
     }
     record_chat_event_for_replay(canonical_stream, event_log, replay_state, event)
         .expect("preflighted replay event remains valid");
-    let provider_identities = transcript_provider_identities(
-        event_log,
-        replay_len_before,
-        transcript_metadata,
-    );
+    let provider_identities =
+        transcript_provider_identities(event_log, replay_len_before, transcript_metadata);
     journal_new_replay_records(
         canonical_stream,
         event_log,
@@ -8945,10 +8937,7 @@ fn transcript_provider_identities(
         .filter_map(|envelope| {
             let event = envelope.parse_payload::<ChatEvent>().ok()?;
             let metadata = events.transcript_metadata(&event);
-            match (
-                metadata.provider_session_id,
-                metadata.provider_event_id,
-            ) {
+            match (metadata.provider_session_id, metadata.provider_event_id) {
                 (Some(provider_session_id), Some(event_id)) => Some((
                     envelope.seq,
                     crate::store::transcript::ProviderEventIdentity {
@@ -18469,10 +18458,13 @@ mod tests {
         register_transcript_session(canonical_stream, &session_id);
 
         let (_events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
-        let events = EventStream::new_backend_with_transcript_metadata(events_rx, |event| {
-            match event {
+        let events =
+            EventStream::new_backend_with_transcript_metadata(events_rx, |event| match event {
                 ChatEvent::MessageAdded(message)
-                    if message.message_id.as_ref().is_some_and(|id| id.0 == "provider-item") =>
+                    if message
+                        .message_id
+                        .as_ref()
+                        .is_some_and(|id| id.0 == "provider-item") =>
                 {
                     BackendTranscriptEventMetadata::visible_provider_event(
                         SessionId("provider-thread".to_owned()),
@@ -18483,8 +18475,7 @@ mod tests {
                     provider_session_id: None,
                     provider_event_id: None,
                 },
-            }
-        });
+            });
         let event = ChatEvent::MessageAdded(ChatMessage {
             timestamp: 1,
             content: "provider response".to_owned(),

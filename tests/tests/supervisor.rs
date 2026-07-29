@@ -9,13 +9,12 @@ mod fixture;
 use fixture::Fixture;
 use protocol::{
     AgentBootstrapEvent, AgentBootstrapPayload, AgentClosedPayload, BackendKind, ChatEvent,
-    CommandErrorPayload, CompactionMethod, CompactionTrigger,
-    ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload, ContextCompactionStatus,
-    Envelope, FetchSessionHistoryPayload, FrameKind, HostSettingErrorTarget, HostSettingValue,
-    HostSettingsPayload, ListSessionsPayload, MessageSender, NewAgentPayload,
-    RequestedCompactionAvailability, RequestedCompactionRoute, SUPERVISOR_MESSAGE_PREFIX,
-    SUPERVISOR_STALL_INTERRUPT_NOTICE_PREFIX, SessionListPayload, SetSettingPayload,
-    SpawnAgentParams, SpawnAgentPayload, StreamPath,
+    CommandErrorPayload, CompactionMethod, CompactionTrigger, ContextCompactionCapabilityPayload,
+    ContextCompactionNotifyPayload, ContextCompactionStatus, Envelope, FetchSessionHistoryPayload,
+    FrameKind, HostSettingErrorTarget, HostSettingValue, HostSettingsPayload, ListSessionsPayload,
+    MessageSender, NewAgentPayload, RequestedCompactionAvailability, RequestedCompactionRoute,
+    SUPERVISOR_MESSAGE_PREFIX, SUPERVISOR_STALL_INTERRUPT_NOTICE_PREFIX, SessionListPayload,
+    SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
 };
 use std::time::Duration;
 
@@ -322,8 +321,7 @@ async fn spawn_supervised_agent_with_verdict(
                             AgentBootstrapEvent::ContextCompactionCapability(payload) => {
                                 if native_capability_matches(&payload, &new_agent) {
                                     saw_native_capability = true;
-                                    logical_session_id =
-                                        Some(payload.logical_session_id);
+                                    logical_session_id = Some(payload.logical_session_id);
                                 }
                             }
                             AgentBootstrapEvent::ChatEvent(event) => {

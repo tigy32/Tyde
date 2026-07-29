@@ -5513,9 +5513,8 @@ impl HostHandle {
                         ));
                     }
                     Some(_) => {}
-                    None
-                        if request.fork_from_session_id.is_some()
-                            && parent_session_lookup_failure.is_some() => {}
+                    None if request.fork_from_session_id.is_some()
+                        && parent_session_lookup_failure.is_some() => {}
                     None => {
                         return Err(AppError::conflict(
                             "spawn_agent",

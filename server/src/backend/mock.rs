@@ -2627,7 +2627,10 @@ mod tests {
             loop {
                 match events.recv_backend().await {
                     Some(BackendEvent::Chat(ChatEvent::StreamEnd(end)))
-                        if end.message.content.contains("ordinary turn after stale interrupt") =>
+                        if end
+                            .message
+                            .content
+                            .contains("ordinary turn after stale interrupt") =>
                     {
                         return;
                     }

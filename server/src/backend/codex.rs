@@ -14490,13 +14490,13 @@ fn codex_transcript_provider_event_id(event: &ChatEvent) -> Option<String> {
             "message",
             provider_id(message.message_id.as_ref()?.0.as_str())?,
         ),
-        ChatEvent::MessageMetadataUpdated(update) => {
-            ("message-metadata", provider_id(update.message_id.0.as_str())?)
-        }
-        ChatEvent::StreamStart(start) => (
-            "stream-start",
-            provider_id(start.message_id.as_deref()?)?,
+        ChatEvent::MessageMetadataUpdated(update) => (
+            "message-metadata",
+            provider_id(update.message_id.0.as_str())?,
         ),
+        ChatEvent::StreamStart(start) => {
+            ("stream-start", provider_id(start.message_id.as_deref()?)?)
+        }
         ChatEvent::StreamDelta(delta) => {
             ("stream-text", provider_id(delta.message_id.as_deref()?)?)
         }
@@ -15081,9 +15081,7 @@ impl Backend for CodexBackend {
             EventStream::new_backend_with_resume_replay_barrier_and_transcript_metadata(
                 events_rx,
                 resume_replay_complete_rx,
-                move |event| {
-                    codex_transcript_event_metadata(&transcript_session_id, event)
-                },
+                move |event| codex_transcript_event_metadata(&transcript_session_id, event),
             ),
         ))
     }

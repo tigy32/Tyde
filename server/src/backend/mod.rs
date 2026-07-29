@@ -337,17 +337,11 @@ impl EventStream {
         }
     }
 
-    pub(crate) fn transcript_metadata(
-        &self,
-        event: &ChatEvent,
-    ) -> BackendTranscriptEventMetadata {
-        let metadata = self
-            .transcript_metadata_projector
-            .as_ref()
-            .map_or_else(
-                BackendTranscriptEventMetadata::visible_without_provider_identity,
-                |f| f(event),
-            );
+    pub(crate) fn transcript_metadata(&self, event: &ChatEvent) -> BackendTranscriptEventMetadata {
+        let metadata = self.transcript_metadata_projector.as_ref().map_or_else(
+            BackendTranscriptEventMetadata::visible_without_provider_identity,
+            |f| f(event),
+        );
         debug_assert_eq!(
             metadata.provider_session_id.is_some(),
             metadata.provider_event_id.is_some(),
