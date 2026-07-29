@@ -4,17 +4,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use protocol::{
     AgentControlStatus, AgentErrorCode, AgentId, AgentOrigin, AgentStartPayload,
-    AgentWorkflowMetadata, BackendAccessMode, BackendKind, ChatEvent, CustomAgentId, ProjectId,
+    AgentWorkflowMetadata, BackendAccessMode, BackendKind, CustomAgentId, ProjectId,
     SendMessagePayload, SessionId, SessionSettingsSchema, SessionSettingsValues, SpawnCostHint,
     TeamId, TeamMemberId,
 };
-use tokio::sync::{Mutex, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, oneshot, watch};
 use uuid::Uuid;
 
 use crate::agent::customization::ResolvedSpawnConfig;
 use crate::agent::{
-    AgentActorRuntimeResources, AgentHandle, RelayEventReceivers, now_ms, spawn_agent_actor,
-    spawn_relay_agent_actor,
+    AgentActorRuntimeResources, AgentHandle, RelayAgentRuntimeResources, RelayEventReceivers,
+    now_ms, spawn_agent_actor, spawn_relay_agent_actor,
 };
 use crate::agent_control_mcp::{
     AGENT_CONTROL_AWAIT_MCP_SERVER_NAME, AGENT_CONTROL_MCP_SERVER_NAME, AgentControlMcpHandle,
@@ -23,8 +23,6 @@ use crate::backend::StartupMcpServer;
 use crate::backend::StartupMcpTransport;
 use crate::host::mcp_url_for_agent;
 use crate::review_mcp::REVIEW_FEEDBACK_MCP_SERVER_NAME;
-use crate::store::session::SessionStore;
-use crate::store::transcript::TranscriptStore;
 use crate::workflows::mcp::WORKFLOW_PROGRESS_MCP_SERVER_NAME;
 
 pub(crate) struct AgentRegistry {
@@ -323,12 +321,8 @@ impl AgentRegistry {
     pub fn spawn_relay(
         &mut self,
         request: RelaySpawnRequest,
-        events: mpsc::UnboundedReceiver<ChatEvent>,
-        model_usage: mpsc::UnboundedReceiver<protocol::ModelRequestTokenUsage>,
-        total_usage: mpsc::UnboundedReceiver<u64>,
-        session_store: Arc<Mutex<SessionStore>>,
-        transcript_store: TranscriptStore,
-        session_summary_count_tx: crate::host::HostSessionSummaryCountTx,
+        receivers: RelayEventReceivers,
+        runtime: RelayAgentRuntimeResources,
     ) -> SpawnedRelayAgent {
         let agent_id = AgentId(Uuid::new_v4().to_string());
         let start = AgentStartPayload {
@@ -352,15 +346,9 @@ impl AgentRegistry {
         let handle = spawn_relay_agent_actor(
             agent_id.clone(),
             start.clone(),
-            RelayEventReceivers {
-                events,
-                model_usage,
-                total_usage,
-            },
-            session_store,
-            transcript_store,
+            receivers,
+            runtime,
             request.session_id,
-            session_summary_count_tx,
             status_handle.clone(),
         );
 
@@ -484,6 +472,7 @@ mod tests {
     use super::*;
     use crate::agent::AgentCommand;
     use std::sync::atomic::AtomicBool;
+    use tokio::sync::mpsc;
 
     #[test]
     fn status_derivation_separates_recoverable_error_from_fatal_failure() {

@@ -7159,14 +7159,18 @@ pub(crate) struct RelayEventReceivers {
     pub total_usage: mpsc::UnboundedReceiver<u64>,
 }
 
+pub(crate) struct RelayAgentRuntimeResources {
+    pub session_store: Arc<Mutex<SessionStore>>,
+    pub transcript_store: TranscriptStore,
+    pub session_summary_count_tx: HostSessionSummaryCountTx,
+}
+
 pub(crate) fn spawn_relay_agent_actor(
     agent_id: AgentId,
     start: AgentStartPayload,
     receivers: RelayEventReceivers,
-    session_store: Arc<Mutex<SessionStore>>,
-    transcript_store: TranscriptStore,
+    runtime: RelayAgentRuntimeResources,
     session_id: SessionId,
-    session_summary_count_tx: HostSessionSummaryCountTx,
     status_handle: registry::AgentStatusHandle,
 ) -> AgentHandle {
     let RelayEventReceivers {
@@ -7174,6 +7178,11 @@ pub(crate) fn spawn_relay_agent_actor(
         mut model_usage,
         mut total_usage,
     } = receivers;
+    let RelayAgentRuntimeResources {
+        session_store,
+        transcript_store,
+        session_summary_count_tx,
+    } = runtime;
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentCommand>();
     let accepting_input = Arc::new(AtomicBool::new(true));
     let accepting_input_task = Arc::clone(&accepting_input);
@@ -11895,22 +11904,23 @@ mod tests {
         AgentReplayState, AgentStartupFailure, AgentStartupTestGate,
         AppendSupervisorWarningOutcome, CLOSE_TURN_GRACE, CompactionFlight,
         DELIVERY_REJECTED_CLOSING, GenerateAgentActivitySummaryRequest, InterruptOutcome,
-        RelayEventReceivers, ResolvedSpawnRequest, SequencedQueuedMessage,
-        SupervisorStallInterruptOutcome, SupervisorVerdictStart, SupervisorVerdictStartRejection,
-        TokenUsageSource, activity_history_snapshot, agent_name_generation_spawn_config,
-        agent_usage_snapshot_from_log, append_backend_chat_event, append_chat_event, append_event,
-        apply_generated_agent_name, apply_runtime_session_updates, attach_subscriber,
-        attach_subscriber_with_latest_output, collect_agent_activity_summary_events,
-        collect_agent_name_events, context_compaction_dispatch_is_safe,
-        context_compaction_fallback_allowed, current_latest_output,
-        generate_fallback_compaction_summary, generate_mock_name, ingest_gated_replay_event,
-        internal_compaction_input, known_turn_usage, mark_agent_turn_active, output_events_since,
-        project_legacy_native_collaboration_event, publish_resumed_agent_idle,
-        record_agent_started, record_chat_event_for_replay, register_transcript_session,
-        replay_envelope, resolve_backend_session_settings, sanitize_generated_agent_name,
-        session_history_entries_from_log, session_history_window, spawn_agent_actor,
-        spawn_relay_agent_actor, summarize_continuation_result, terminal_input_rejected_payload,
-        upsert_activity_stats_snapshot, upsert_context_compaction_snapshot,
+        RelayAgentRuntimeResources, RelayEventReceivers, ResolvedSpawnRequest,
+        SequencedQueuedMessage, SupervisorStallInterruptOutcome, SupervisorVerdictStart,
+        SupervisorVerdictStartRejection, TokenUsageSource, activity_history_snapshot,
+        agent_name_generation_spawn_config, agent_usage_snapshot_from_log,
+        append_backend_chat_event, append_chat_event, append_event, apply_generated_agent_name,
+        apply_runtime_session_updates, attach_subscriber, attach_subscriber_with_latest_output,
+        collect_agent_activity_summary_events, collect_agent_name_events,
+        context_compaction_dispatch_is_safe, context_compaction_fallback_allowed,
+        current_latest_output, generate_fallback_compaction_summary, generate_mock_name,
+        ingest_gated_replay_event, internal_compaction_input, known_turn_usage,
+        mark_agent_turn_active, output_events_since, project_legacy_native_collaboration_event,
+        publish_resumed_agent_idle, record_agent_started, record_chat_event_for_replay,
+        register_transcript_session, replay_envelope, resolve_backend_session_settings,
+        sanitize_generated_agent_name, session_history_entries_from_log, session_history_window,
+        spawn_agent_actor, spawn_relay_agent_actor, summarize_continuation_result,
+        terminal_input_rejected_payload, upsert_activity_stats_snapshot,
+        upsert_context_compaction_snapshot,
     };
     use crate::agent::customization::ResolvedSpawnConfig;
     use crate::agent::registry::AgentStatusHandle;
@@ -14498,10 +14508,12 @@ mod tests {
                 model_usage: model_usage_rx,
                 total_usage: total_usage_rx,
             },
-            session_store,
-            TranscriptStore::new(dir.path().join("transcripts")),
+            RelayAgentRuntimeResources {
+                session_store,
+                transcript_store: TranscriptStore::new(dir.path().join("transcripts")),
+                session_summary_count_tx: mpsc::unbounded_channel().0,
+            },
             SessionId("relay-session".to_owned()),
-            mpsc::unbounded_channel().0,
             status_handle,
         );
         let (output_tx, mut output_rx) = mpsc::unbounded_channel();
@@ -14611,10 +14623,12 @@ mod tests {
                 model_usage: model_usage_rx,
                 total_usage: total_usage_rx,
             },
-            session_store,
-            TranscriptStore::new(dir.path().join("transcripts")),
+            RelayAgentRuntimeResources {
+                session_store,
+                transcript_store: TranscriptStore::new(dir.path().join("transcripts")),
+                session_summary_count_tx: mpsc::unbounded_channel().0,
+            },
             SessionId("relay-codex-session".to_owned()),
-            mpsc::unbounded_channel().0,
             status_handle,
         );
         let (live_tx, mut live_rx) = mpsc::unbounded_channel();
@@ -15047,10 +15061,12 @@ mod tests {
                 model_usage: model_rx,
                 total_usage: total_rx,
             },
-            session_store,
-            TranscriptStore::new(dir.path().join("transcripts")),
+            RelayAgentRuntimeResources {
+                session_store,
+                transcript_store: TranscriptStore::new(dir.path().join("transcripts")),
+                session_summary_count_tx: mpsc::unbounded_channel().0,
+            },
             SessionId("relay-idle-session".to_owned()),
-            mpsc::unbounded_channel().0,
             status_handle,
         );
 
@@ -17742,10 +17758,12 @@ mod tests {
                 model_usage: model_usage_rx,
                 total_usage: total_usage_rx,
             },
-            session_store,
-            TranscriptStore::new(dir.path().join("transcripts")),
+            RelayAgentRuntimeResources {
+                session_store,
+                transcript_store: TranscriptStore::new(dir.path().join("transcripts")),
+                session_summary_count_tx,
+            },
             SessionId("relay-delivery-session".to_owned()),
-            session_summary_count_tx,
             status_handle.clone(),
         );
         let (tx, mut rx) = mpsc::unbounded_channel();

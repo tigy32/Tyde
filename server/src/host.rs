@@ -92,8 +92,8 @@ use crate::agent::{
     AgentHandle, AgentUsageSnapshot, AppendSupervisorWarningOutcome, CompactionStart,
     CompactionSummary, DEFAULT_COMPACTION_SUMMARY_MAX_BYTES, GenerateAgentActivitySummaryRequest,
     GenerateAgentNameRequest, InterruptOutcome, MAX_COMPACTION_SUMMARY_BYTES,
-    SupervisorVerdictStart, derive_agent_name, generate_agent_activity_summary,
-    generate_agent_name,
+    RelayAgentRuntimeResources, RelayEventReceivers, SupervisorVerdictStart, derive_agent_name,
+    generate_agent_activity_summary, generate_agent_name,
 };
 use crate::agent_control_mcp::AgentControlMcpHandle;
 use crate::backend::setup;
@@ -10840,12 +10840,16 @@ impl HostHandle {
             let transcript_store = state.transcript_store.clone();
             let spawned = state.registry.spawn_relay(
                 relay_request,
-                event_rx,
-                model_usage_rx,
-                total_usage_rx,
-                Arc::clone(&session_store),
-                transcript_store,
-                session_summary_count_tx,
+                RelayEventReceivers {
+                    events: event_rx,
+                    model_usage: model_usage_rx,
+                    total_usage: total_usage_rx,
+                },
+                RelayAgentRuntimeResources {
+                    session_store: Arc::clone(&session_store),
+                    transcript_store,
+                    session_summary_count_tx,
+                },
             );
             state
                 .agent_sessions
