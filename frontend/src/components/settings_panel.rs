@@ -10,15 +10,16 @@ use crate::state::{
 };
 
 use protocol::{
-    BackendConfigField, BackendConfigFieldType, BackendConfigPersistenceMode,
-    BackendConfigSnapshotStatus, BackendConfigValues, BackendKind, BackendNativeSettingsAdvisory,
-    BackendNativeSettingsGroup, BackendNativeSettingsGroupKind, BackendNativeSettingsSnapshot,
-    BackendSetupAction, BackendSetupInfo, BackendSetupStatus, BackgroundAgentFeature, BrokerUrl,
-    CodeIntelProviderId, CustomAgent, CustomAgentId, DiffContextMode, FrameKind,
-    HostExecutablePath, HostLaunchProfileConfig, HostSettingValue, LaunchProfileId,
-    McpServerConfig, McpServerId, McpTransportConfig, MobileAccessStatePayload, MobileBrokerStatus,
-    MobileDeviceState, MobilePairingOfferId, MobilePairingOfferPayload, MobilePairingState,
-    ProjectId, RunBackendSetupPayload, SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX,
+    AcpAdapterId, AcpAgentSpec, BackendConfigField, BackendConfigFieldType,
+    BackendConfigPersistenceMode, BackendConfigSnapshotStatus, BackendConfigValues, BackendKind,
+    BackendNativeSettingsAdvisory, BackendNativeSettingsGroup, BackendNativeSettingsGroupKind,
+    BackendNativeSettingsSnapshot, BackendSetupAction, BackendSetupInfo, BackendSetupStatus,
+    BackgroundAgentFeature, BrokerUrl, CodeIntelProviderId, CustomAgent, CustomAgentId,
+    DiffContextMode, FrameKind, HostExecutablePath, HostLaunchProfileConfig, HostSettingValue,
+    LaunchProfileId, McpServerConfig, McpServerId, McpTransportConfig, MobileAccessStatePayload,
+    MobileBrokerStatus, MobileDeviceState, MobilePairingOfferId, MobilePairingOfferPayload,
+    MobilePairingState, ProjectId, RunBackendSetupPayload,
+    SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MAX,
     SUPERVISOR_AUTO_COMPACT_INACTIVITY_DELAY_SECONDS_MIN, SUPERVISOR_RETRY_ATTEMPTS_MAX,
     SUPERVISOR_RETRY_ATTEMPTS_MIN, SUPERVISOR_STALL_TIMEOUT_SECONDS_MAX,
     SUPERVISOR_STALL_TIMEOUT_SECONDS_MIN, SessionSchemaEntry, SessionSettingField,
@@ -757,6 +758,7 @@ impl SettingsTab {
                 "Enabled Backends",
                 "Toggle which backends are available for creating agents",
                 "Tycode",
+                "ACP",
                 "Kiro",
                 "Claude",
                 "Codex",
@@ -2888,6 +2890,12 @@ struct LaunchProfileForm {
     description: RwSignal<String>,
     backend_kind: RwSignal<BackendKind>,
     session_settings: RwSignal<SessionSettingsValues>,
+    /// ACP agents are defined entirely by the profile: without a command there
+    /// is no agent to launch, so these are edited here rather than being
+    /// backend-wide settings.
+    acp_command: RwSignal<String>,
+    acp_args: RwSignal<String>,
+    acp_adapter: RwSignal<AcpAdapterId>,
 }
 
 impl LaunchProfileForm {
@@ -2899,6 +2907,27 @@ impl LaunchProfileForm {
             description: RwSignal::new(config.description.clone().unwrap_or_default()),
             backend_kind: RwSignal::new(config.backend_kind),
             session_settings: RwSignal::new(config.session_settings.clone()),
+            acp_command: RwSignal::new(
+                config
+                    .acp
+                    .as_ref()
+                    .map(|spec| spec.command.clone())
+                    .unwrap_or_default(),
+            ),
+            acp_args: RwSignal::new(
+                config
+                    .acp
+                    .as_ref()
+                    .map(|spec| spec.args.join(" "))
+                    .unwrap_or_default(),
+            ),
+            acp_adapter: RwSignal::new(
+                config
+                    .acp
+                    .as_ref()
+                    .map(|spec| spec.adapter)
+                    .unwrap_or(AcpAdapterId::Stock),
+            ),
         }
     }
 
@@ -2910,6 +2939,9 @@ impl LaunchProfileForm {
             description: RwSignal::new(String::new()),
             backend_kind: RwSignal::new(BackendKind::Hermes),
             session_settings: RwSignal::new(SessionSettingsValues::default()),
+            acp_command: RwSignal::new(String::new()),
+            acp_args: RwSignal::new(String::new()),
+            acp_adapter: RwSignal::new(AcpAdapterId::Stock),
         }
     }
 
@@ -2927,6 +2959,27 @@ impl LaunchProfileForm {
                 "\"{id}\" is reserved for a built-in default profile. Choose a different id."
             ));
         }
+        let backend_kind = self.backend_kind.get_untracked();
+        let acp = if backend_kind == BackendKind::Acp {
+            let command = self.acp_command.get_untracked().trim().to_string();
+            if command.is_empty() {
+                return Err("An ACP profile needs the command that starts the agent.".to_string());
+            }
+            Some(AcpAgentSpec {
+                command,
+                args: self
+                    .acp_args
+                    .get_untracked()
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect(),
+                cwd: None,
+                env: Default::default(),
+                adapter: self.acp_adapter.get_untracked(),
+            })
+        } else {
+            None
+        };
         let description = self.description.get_untracked().trim().to_string();
         Ok(HostLaunchProfileConfig {
             id: LaunchProfileId(id),
@@ -2936,9 +2989,9 @@ impl LaunchProfileForm {
             } else {
                 Some(description)
             },
-            backend_kind: self.backend_kind.get_untracked(),
+            backend_kind,
             session_settings: self.session_settings.get_untracked(),
-            acp: None,
+            acp,
         })
     }
 }
@@ -3095,6 +3148,10 @@ fn LaunchProfileEditor(
     let description_sig = form.description;
     let backend_kind_sig = form.backend_kind;
     let session_settings_sig = form.session_settings;
+    let acp_command_sig = form.acp_command;
+    let acp_args_sig = form.acp_args;
+    let acp_adapter_sig = form.acp_adapter;
+    let is_acp = move || backend_kind_sig.get() == BackendKind::Acp;
 
     let error_sig: RwSignal<Option<String>> = RwSignal::new(None);
 
@@ -3252,6 +3309,74 @@ fn LaunchProfileEditor(
                     <p class="settings-form-warning" role="note">
                         "This backend is not enabled on the selected host. The profile will be saved, but it won't appear in New Chat until you enable the backend."
                     </p>
+                </Show>
+
+                <Show when=is_acp>
+                    <label class="settings-form-label">
+                        <span>
+                            "Agent command"
+                            <span class="settings-form-hint">
+                                " the executable that speaks ACP over stdio"
+                            </span>
+                        </span>
+                        <input
+                            class="settings-text-input"
+                            type="text"
+                            placeholder="/usr/local/bin/my-acp-agent"
+                            prop:value=move || acp_command_sig.get()
+                            on:input=move |ev| acp_command_sig.set(event_target_value(&ev))
+                            spellcheck="false"
+                            {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                            autocapitalize="none"
+                            autocomplete="off"
+                        />
+                    </label>
+
+                    <label class="settings-form-label">
+                        <span>
+                            "Arguments"
+                            <span class="settings-form-hint">" (optional, space separated)"</span>
+                        </span>
+                        <input
+                            class="settings-text-input"
+                            type="text"
+                            placeholder="acp"
+                            prop:value=move || acp_args_sig.get()
+                            on:input=move |ev| acp_args_sig.set(event_target_value(&ev))
+                            spellcheck="false"
+                            {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                            autocapitalize="none"
+                            autocomplete="off"
+                        />
+                    </label>
+
+                    <label class="settings-form-label">
+                        <span>
+                            "Agent quirks"
+                            <span class="settings-form-hint">
+                                " use Standard unless this is a Kiro CLI"
+                            </span>
+                        </span>
+                        <select
+                            class="settings-select"
+                            prop:value=move || acp_adapter_value(acp_adapter_sig.get()).to_string()
+                            on:change=move |ev: web_sys::Event| {
+                                let target = ev.target().unwrap();
+                                let el: web_sys::HtmlSelectElement = target.unchecked_into();
+                                if let Some(adapter) = parse_acp_adapter(&el.value()) {
+                                    acp_adapter_sig.set(adapter);
+                                } else {
+                                    log::error!(
+                                        "unknown ACP adapter value {} in launch profile editor",
+                                        el.value()
+                                    );
+                                }
+                            }
+                        >
+                            <option value="stock">"Standard ACP"</option>
+                            <option value="kiro">"Kiro"</option>
+                        </select>
+                    </label>
                 </Show>
 
                 <div class="settings-form-label">
@@ -6293,10 +6418,27 @@ fn is_reserved_launch_profile_id(id: &str) -> bool {
         .any(|kind| id == format!("{}:default", backend_value(kind)))
 }
 
+fn acp_adapter_value(adapter: AcpAdapterId) -> &'static str {
+    match adapter {
+        AcpAdapterId::Stock => "stock",
+        AcpAdapterId::Kiro => "kiro",
+    }
+}
+
+fn parse_acp_adapter(value: &str) -> Option<AcpAdapterId> {
+    match value {
+        "stock" => Some(AcpAdapterId::Stock),
+        "kiro" => Some(AcpAdapterId::Kiro),
+        _ => None,
+    }
+}
+
 fn parse_backend_kind(value: &str) -> Option<BackendKind> {
     match value {
         "tycode" => Some(BackendKind::Tycode),
-        "kiro" => Some(BackendKind::Acp),
+        // "kiro" is the pre-rename spelling; still accepted so a stale
+        // select value cannot silently fail to parse.
+        "acp" | "kiro" => Some(BackendKind::Acp),
         "claude" => Some(BackendKind::Claude),
         "codex" => Some(BackendKind::Codex),
         "antigravity" => Some(BackendKind::Antigravity),
@@ -6308,7 +6450,7 @@ fn parse_backend_kind(value: &str) -> Option<BackendKind> {
 fn backend_value(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Tycode => "tycode",
-        BackendKind::Acp => "kiro",
+        BackendKind::Acp => "acp",
         BackendKind::Claude => "claude",
         BackendKind::Codex => "codex",
         BackendKind::Antigravity => "antigravity",
@@ -6319,7 +6461,7 @@ fn backend_value(kind: BackendKind) -> &'static str {
 fn backend_label(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Tycode => "Tycode",
-        BackendKind::Acp => "Kiro",
+        BackendKind::Acp => "ACP",
         BackendKind::Claude => "Claude",
         BackendKind::Codex => "Codex",
         BackendKind::Antigravity => "Antigravity",
@@ -6330,7 +6472,7 @@ fn backend_label(kind: BackendKind) -> &'static str {
 fn backend_description(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Tycode => "Tycode subprocess backend",
-        BackendKind::Acp => "Kiro ACP backend",
+        BackendKind::Acp => "Agent Client Protocol — Kiro and any other ACP agent",
         BackendKind::Claude => "Anthropic Claude — advanced reasoning and coding",
         BackendKind::Codex => "OpenAI Codex — code completion and generation",
         BackendKind::Antigravity => "Google Antigravity CLI — agentic coding assistant",
@@ -6341,7 +6483,7 @@ fn backend_description(kind: BackendKind) -> &'static str {
 fn backend_badge_class(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Tycode => "backend-badge tycode",
-        BackendKind::Acp => "backend-badge kiro",
+        BackendKind::Acp => "backend-badge acp",
         BackendKind::Claude => "backend-badge claude",
         BackendKind::Codex => "backend-badge codex",
         BackendKind::Antigravity => "backend-badge antigravity",
@@ -8019,6 +8161,64 @@ mod wasm_tests {
     use web_sys::{HtmlElement, HtmlInputElement, HtmlOptionElement, HtmlSelectElement};
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    // Signal-only: builds the form directly rather than mounting the settings
+    // page, because the settings panel is close to the wasm test instance's
+    // memory ceiling and a full mount here has OOM'd before.
+    #[wasm_bindgen_test]
+    fn acp_launch_profile_requires_a_command_and_keeps_args_and_adapter() {
+        let form = LaunchProfileForm::blank();
+        form.id.set("acp:my-agent".to_owned());
+        form.label.set("My Agent".to_owned());
+        form.backend_kind.set(BackendKind::Acp);
+
+        // Without a command there is nothing to launch, and the server rejects
+        // it too — failing here is what keeps the user from saving a profile
+        // that can only fail at spawn time.
+        let error = form
+            .validate_and_build()
+            .expect_err("an ACP profile with no command must not be saveable");
+        assert!(
+            error.to_lowercase().contains("command"),
+            "the error must name the missing field, got {error:?}"
+        );
+
+        form.acp_command
+            .set("  /usr/local/bin/my-agent  ".to_owned());
+        form.acp_args.set("  acp   --stdio ".to_owned());
+        form.acp_adapter.set(AcpAdapterId::Kiro);
+        let config = form
+            .validate_and_build()
+            .expect("a command is all an ACP profile needs");
+        let spec = config
+            .acp
+            .expect("an ACP profile must carry its agent spec");
+        assert_eq!(spec.command, "/usr/local/bin/my-agent");
+        assert_eq!(
+            spec.args,
+            vec!["acp".to_owned(), "--stdio".to_owned()],
+            "arguments split on whitespace and drop padding, so a stray space \
+             cannot become an empty argv entry the agent chokes on"
+        );
+        assert_eq!(spec.adapter, AcpAdapterId::Kiro);
+    }
+
+    #[wasm_bindgen_test]
+    fn non_acp_launch_profiles_carry_no_agent_spec() {
+        let form = LaunchProfileForm::blank();
+        form.id.set("hermes:custom".to_owned());
+        form.label.set("Custom".to_owned());
+        form.backend_kind.set(BackendKind::Hermes);
+        // Left over from switching the backend select away from ACP.
+        form.acp_command.set("/usr/local/bin/my-agent".to_owned());
+
+        let config = form.validate_and_build().expect("valid Hermes profile");
+        assert!(
+            config.acp.is_none(),
+            "the server rejects an agent spec on a non-ACP profile, so a stale \
+             command must not be carried over when the backend is switched"
+        );
+    }
 
     fn make_container() -> HtmlElement {
         let document = web_sys::window().unwrap().document().unwrap();

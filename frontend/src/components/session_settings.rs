@@ -579,7 +579,7 @@ pub fn SessionSettingsBar(
 
     fn missing_schema_message(backend_kind: BackendKind) -> &'static str {
         match backend_kind {
-            BackendKind::Acp => "Kiro models unavailable — check installation",
+            BackendKind::Acp => "ACP agent models unavailable — check the agent command",
             BackendKind::Claude => "Claude settings unavailable — check installation",
             BackendKind::Codex => "Codex settings unavailable — check installation",
             BackendKind::Antigravity => "Antigravity settings unavailable — check installation",
@@ -590,7 +590,7 @@ pub fn SessionSettingsBar(
 
     fn pending_schema_message(backend_kind: BackendKind) -> &'static str {
         match backend_kind {
-            BackendKind::Acp => "Kiro models are loading...",
+            BackendKind::Acp => "ACP agent models are loading...",
             BackendKind::Claude => "Claude settings are loading...",
             BackendKind::Codex => "Codex settings are loading...",
             BackendKind::Antigravity => "Antigravity settings are loading...",

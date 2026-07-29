@@ -122,7 +122,7 @@ pub(crate) fn backend_class(kind: protocol::BackendKind) -> &'static str {
 pub(crate) fn backend_label(kind: protocol::BackendKind) -> &'static str {
     match kind {
         protocol::BackendKind::Tycode => "Tycode",
-        protocol::BackendKind::Acp => "Kiro",
+        protocol::BackendKind::Acp => "ACP",
         protocol::BackendKind::Claude => "Claude",
         protocol::BackendKind::Codex => "Codex",
         protocol::BackendKind::Antigravity => "Antigravity",

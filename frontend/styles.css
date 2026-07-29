@@ -1819,6 +1819,7 @@ kbd {
     color: #9a9a9a;
 }
 
+.backend-badge.acp,
 .backend-badge.kiro {
     background: rgba(147, 100, 255, 0.2);
     color: #b794f6;

@@ -233,7 +233,7 @@ enum DraftBackendNotice {
 fn draft_backend_label(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Tycode => "Tycode",
-        BackendKind::Acp => "Kiro",
+        BackendKind::Acp => "ACP",
         BackendKind::Claude => "Claude",
         BackendKind::Codex => "Codex",
         BackendKind::Antigravity => "Antigravity",
