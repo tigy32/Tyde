@@ -51,6 +51,7 @@ use crate::store::session::{
     CommitCompactedBinding, CompactionOperationRecord, FinishCompactionOperation, SessionStore,
     StoredCompactionState,
 };
+use crate::store::transcript::TranscriptStore;
 use crate::stream::Stream;
 use crate::sub_agent::HostSubAgentSpawnTx;
 
@@ -136,6 +137,7 @@ struct InitialFollowUpContext<'a> {
     in_turn: &'a mut bool,
     idle_transition_armed: &'a mut bool,
     session_store: &'a Arc<Mutex<SessionStore>>,
+    transcript_store: &'a TranscriptStore,
     current_session_id: Option<&'a SessionId>,
     pending_alias: &'a mut Option<InitialAgentAlias>,
     current_start: &'a mut AgentStartPayload,
@@ -165,6 +167,7 @@ struct AgentNameChangeContext<'a> {
 
 pub(crate) struct AgentActorRuntimeContext {
     pub(crate) session_store: Arc<Mutex<SessionStore>>,
+    pub(crate) transcript_store: TranscriptStore,
     pub(crate) host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
     pub(crate) capacity_tx: HostCapacityTx,
     pub(crate) session_summary_count_tx: HostSessionSummaryCountTx,
@@ -176,6 +179,7 @@ pub(crate) struct AgentActorRuntimeContext {
 
 pub(crate) struct AgentActorRuntimeResources {
     pub(crate) session_store: Arc<Mutex<SessionStore>>,
+    pub(crate) transcript_store: TranscriptStore,
     pub(crate) host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
     pub(crate) capacity_tx: HostCapacityTx,
     pub(crate) session_summary_count_tx: HostSessionSummaryCountTx,
@@ -191,6 +195,7 @@ impl AgentActorRuntimeResources {
     ) -> AgentActorRuntimeContext {
         AgentActorRuntimeContext {
             session_store: self.session_store,
+            transcript_store: self.transcript_store,
             host_sub_agent_spawn_tx: self.host_sub_agent_spawn_tx,
             capacity_tx: self.capacity_tx,
             session_summary_count_tx: self.session_summary_count_tx,
@@ -1832,6 +1837,7 @@ struct PrepareContextFallbackRequest {
     backend_kind: BackendKind,
     workspace_roots: Vec<String>,
     logical_session_id: SessionId,
+    transcript_store: TranscriptStore,
     transcript_high_water: u64,
     requested_focus: Option<String>,
     continuation: crate::backend::BackendContinuationContext,
@@ -2043,6 +2049,7 @@ async fn prepare_context_fallback(
     request: PrepareContextFallbackRequest,
 ) -> Result<PreparedContextFallback, String> {
     let rendered_transcript = load_authoritative_compaction_transcript(
+        &request.transcript_store,
         &request.logical_session_id,
         request.transcript_high_water,
     )
@@ -2121,6 +2128,7 @@ async fn prepare_context_fallback(
 }
 
 async fn load_authoritative_compaction_transcript(
+    store: &TranscriptStore,
     session_id: &SessionId,
     high_water: u64,
 ) -> Result<String, String> {
@@ -2128,9 +2136,8 @@ async fn load_authoritative_compaction_transcript(
         return Err("canonical transcript storage is unavailable".to_owned());
     }
     let session_id = session_id.clone();
+    let store = store.clone();
     tokio::task::spawn_blocking(move || {
-        let root = crate::store::transcript::TranscriptStore::default_root()?;
-        let store = crate::store::transcript::TranscriptStore::new(root);
         if !store.is_authoritative(&session_id) {
             return Err("canonical transcript is not authoritative".to_owned());
         }
@@ -2927,6 +2934,7 @@ pub(crate) fn spawn_agent_actor(
 ) -> (AgentHandle, oneshot::Receiver<Result<SessionId, String>>) {
     let AgentActorRuntimeContext {
         session_store,
+        transcript_store,
         host_sub_agent_spawn_tx,
         capacity_tx,
         session_summary_count_tx,
@@ -3362,6 +3370,7 @@ pub(crate) fn spawn_agent_actor(
                 .await;
                 park_terminal_agent(
                     &session_store,
+                    &transcript_store,
                     current_session_id.as_ref(),
                     &mut pending_alias,
                     &mut current_start,
@@ -3399,7 +3408,7 @@ pub(crate) fn spawn_agent_actor(
         let mut context_compaction: Option<CompactionFlight> = None;
         let mut compaction_blocked = false;
         current_session_id = Some(actor_session_id.clone());
-        register_transcript_session(&canonical_stream, &actor_session_id);
+        register_transcript_session(&canonical_stream, &actor_session_id, &transcript_store);
         current_start.session_id = Some(actor_session_id.clone());
         let _ = start_tx.send(current_start.clone());
         let mut resume_replay_gate_pending = false;
@@ -3482,7 +3491,7 @@ pub(crate) fn spawn_agent_actor(
                 availability: crate::host::requested_compaction_availability(
                     &backend_capability,
                     &crate::host::CompactionRoutingPolicy::default(),
-                    transcript_is_authoritative(&actor_session_id).await,
+                    transcript_is_authoritative(&transcript_store, &actor_session_id).await,
                 ),
             },
         )
@@ -3547,6 +3556,7 @@ pub(crate) fn spawn_agent_actor(
                     in_turn: &mut in_turn,
                     idle_transition_armed: &mut idle_transition_armed,
                     session_store: &session_store,
+                    transcript_store: &transcript_store,
                     current_session_id: current_session_id.as_ref(),
                     pending_alias: &mut pending_alias,
                     current_start: &mut current_start,
@@ -3667,6 +3677,7 @@ pub(crate) fn spawn_agent_actor(
                             }
                             park_terminal_agent(
                                 &session_store,
+                                &transcript_store,
                                 current_session_id.as_ref(),
                                 &mut pending_alias,
                                 &mut current_start,
@@ -3721,6 +3732,7 @@ pub(crate) fn spawn_agent_actor(
                         .await;
                         park_terminal_agent(
                             &session_store,
+                            &transcript_store,
                             current_session_id.as_ref(),
                             &mut pending_alias,
                             &mut current_start,
@@ -3845,6 +3857,7 @@ pub(crate) fn spawn_agent_actor(
                             .await
                             {
                                 persist_compaction_marker(
+                                    &canonical_stream,
                                     current_session_id
                                         .as_ref()
                                         .expect("live agent must have session_id"),
@@ -4183,7 +4196,7 @@ pub(crate) fn spawn_agent_actor(
                         let session_id = current_session_id
                             .as_ref()
                             .expect("live agent must have session_id");
-                        mark_transcript_authoritative(session_id).await;
+                        mark_transcript_authoritative(&transcript_store, session_id).await;
                         let capability = backend
                             .as_ref()
                             .expect("backend must exist while actor is running")
@@ -4199,7 +4212,8 @@ pub(crate) fn spawn_agent_actor(
                                     crate::host::requested_compaction_availability(
                                         &capability,
                                         &crate::host::CompactionRoutingPolicy::default(),
-                                        transcript_is_authoritative(session_id).await,
+                                        transcript_is_authoritative(&transcript_store, session_id)
+                                            .await,
                                     ),
                             },
                         )
@@ -4257,6 +4271,7 @@ pub(crate) fn spawn_agent_actor(
                                     .expect("backend must exist while actor is running")
                                     .as_ref(),
                                 session_store: &session_store,
+                                transcript_store: &transcript_store,
                                 session_id: current_session_id
                                     .as_ref()
                                     .expect("live agent must have session_id"),
@@ -4394,6 +4409,7 @@ pub(crate) fn spawn_agent_actor(
                                 .await;
                                 park_terminal_agent(
                                     &session_store,
+                                    &transcript_store,
                                     current_session_id.as_ref(),
                                     &mut pending_alias,
                                     &mut current_start,
@@ -4561,7 +4577,8 @@ pub(crate) fn spawn_agent_actor(
                                     let session_id = current_session_id
                                         .as_ref()
                                         .expect("live agent must have session_id");
-                                    mark_transcript_authoritative(session_id).await;
+                                    mark_transcript_authoritative(&transcript_store, session_id)
+                                        .await;
                                     let capability = backend
                                         .as_ref()
                                         .expect(
@@ -4581,6 +4598,7 @@ pub(crate) fn spawn_agent_actor(
                                                     &capability,
                                                     &crate::host::CompactionRoutingPolicy::default(),
                                                     transcript_is_authoritative(
+                                                        &transcript_store,
                                                         session_id,
                                                     )
                                                     .await,
@@ -4626,6 +4644,7 @@ pub(crate) fn spawn_agent_actor(
                                                 in_turn: &mut in_turn,
                                                 idle_transition_armed: &mut idle_transition_armed,
                                                 session_store: &session_store,
+                                                transcript_store: &transcript_store,
                                                 current_session_id: current_session_id.as_ref(),
                                                 pending_alias: &mut pending_alias,
                                                 current_start: &mut current_start,
@@ -4702,6 +4721,7 @@ pub(crate) fn spawn_agent_actor(
                                     }
                                     park_terminal_agent(
                                         &session_store,
+                                        &transcript_store,
                                         current_session_id.as_ref(),
                                         &mut pending_alias,
                                         &mut current_start,
@@ -5002,6 +5022,7 @@ pub(crate) fn spawn_agent_actor(
                                             .await;
                                             park_terminal_agent(
                                                 &session_store,
+                                                &transcript_store,
                                                 current_session_id.as_ref(),
                                                 &mut pending_alias,
                                                 &mut current_start,
@@ -5272,6 +5293,7 @@ pub(crate) fn spawn_agent_actor(
                                             .await;
                                             park_terminal_agent(
                                                 &session_store,
+                                                &transcript_store,
                                                 current_session_id.as_ref(),
                                                 &mut pending_alias,
                                                 &mut current_start,
@@ -5883,6 +5905,7 @@ pub(crate) fn spawn_agent_actor(
                                         .expect("backend must exist while actor is running")
                                         .as_ref(),
                                     session_store: &session_store,
+                                    transcript_store: &transcript_store,
                                     session_id,
                                     start: &current_start,
                                     status_handle: &status_handle,
@@ -5949,6 +5972,7 @@ pub(crate) fn spawn_agent_actor(
                                         .expect("backend must exist while actor is running")
                                         .as_ref(),
                                     session_store: &session_store,
+                                    transcript_store: &transcript_store,
                                     session_id: current_session_id
                                         .as_ref()
                                         .expect("live agent must have session_id"),
@@ -6191,7 +6215,11 @@ pub(crate) fn spawn_agent_actor(
                                         crate::host::requested_compaction_availability(
                                             &adopted_capability,
                                             &crate::host::CompactionRoutingPolicy::default(),
-                                            transcript_is_authoritative(session_id).await,
+                                            transcript_is_authoritative(
+                                                &transcript_store,
+                                                session_id,
+                                            )
+                                            .await,
                                         ),
                                 },
                             )
@@ -6663,6 +6691,7 @@ pub(crate) fn spawn_agent_actor(
                             reply,
                         } => {
                             let window = authoritative_session_history_window(
+                                &transcript_store,
                                 current_session_id
                                     .as_ref()
                                     .expect("live agent must have session_id"),
@@ -7135,6 +7164,7 @@ pub(crate) fn spawn_relay_agent_actor(
     start: AgentStartPayload,
     receivers: RelayEventReceivers,
     session_store: Arc<Mutex<SessionStore>>,
+    transcript_store: TranscriptStore,
     session_id: SessionId,
     session_summary_count_tx: HostSessionSummaryCountTx,
     status_handle: registry::AgentStatusHandle,
@@ -7152,7 +7182,7 @@ pub(crate) fn spawn_relay_agent_actor(
 
     tokio::spawn(async move {
         let canonical_stream = format!("/agent/{}", agent_id);
-        register_transcript_session(&canonical_stream, &session_id);
+        register_transcript_session(&canonical_stream, &session_id, &transcript_store);
         let mut event_log: Vec<Envelope> = Vec::new();
         let mut latest_output = AgentControlLatestOutput::default();
         let mut replay_state = AgentReplayState::default();
@@ -7291,6 +7321,7 @@ pub(crate) fn spawn_relay_agent_actor(
                         // find us, until the host explicitly closes the agent.
                         park_relay_terminal_agent(
                             &session_store,
+                            &transcript_store,
                             &session_id,
                             &mut pending_alias,
                             &mut current_start,
@@ -7616,6 +7647,7 @@ pub(crate) fn spawn_relay_agent_actor(
                             reply,
                         } => {
                             let window = authoritative_session_history_window(
+                                &transcript_store,
                                 &session_id,
                                 before_seq,
                                 limit,
@@ -7746,16 +7778,13 @@ where
     .map_err(|error| format!("session persistence task failed: {error}"))?
 }
 
-async fn transcript_is_authoritative(session_id: &SessionId) -> bool {
+async fn transcript_is_authoritative(store: &TranscriptStore, session_id: &SessionId) -> bool {
     if !actor_transcript_io_enabled() {
         return false;
     }
     let session_id = session_id.clone();
-    tokio::task::spawn_blocking(move || {
-        crate::store::transcript::TranscriptStore::default_root()
-            .map(crate::store::transcript::TranscriptStore::new)
-            .is_ok_and(|store| store.is_authoritative(&session_id))
-    })
+    let store = store.clone();
+    tokio::task::spawn_blocking(move || store.is_authoritative(&session_id))
     .await
     .unwrap_or(false)
 }
@@ -8058,6 +8087,7 @@ async fn next_agent_command(
 #[allow(clippy::too_many_arguments)]
 async fn park_terminal_agent(
     session_store: &Arc<Mutex<SessionStore>>,
+    transcript_store: &TranscriptStore,
     session_id: Option<&SessionId>,
     pending_alias: &mut Option<InitialAgentAlias>,
     current_start: &mut AgentStartPayload,
@@ -8131,8 +8161,14 @@ async fn park_terminal_agent(
             } => {
                 let authoritative = match session_id {
                     Some(session_id) => {
-                        authoritative_session_history_window(session_id, before_seq, limit, None)
-                            .await
+                        authoritative_session_history_window(
+                            transcript_store,
+                            session_id,
+                            before_seq,
+                            limit,
+                            None,
+                        )
+                        .await
                     }
                     None => None,
                 };
@@ -8243,6 +8279,7 @@ async fn park_terminal_agent(
 #[allow(clippy::too_many_arguments)]
 async fn park_relay_terminal_agent(
     session_store: &Arc<Mutex<SessionStore>>,
+    transcript_store: &TranscriptStore,
     session_id: &SessionId,
     pending_alias: &mut Option<InitialAgentAlias>,
     current_start: &mut AgentStartPayload,
@@ -8317,7 +8354,13 @@ async fn park_relay_terminal_agent(
                 reply,
             } => {
                 let window =
-                    authoritative_session_history_window(session_id, before_seq, limit, None)
+                    authoritative_session_history_window(
+                        transcript_store,
+                        session_id,
+                        before_seq,
+                        limit,
+                        None,
+                    )
                         .await
                         .unwrap_or_else(|| {
                             session_history_window(event_log, before_seq, limit, None)
@@ -8952,17 +8995,35 @@ fn transcript_provider_identities(
         .collect()
 }
 
-fn transcript_session_registry() -> &'static std::sync::Mutex<HashMap<String, SessionId>> {
-    static REGISTRY: std::sync::OnceLock<std::sync::Mutex<HashMap<String, SessionId>>> =
-        std::sync::OnceLock::new();
+#[derive(Clone)]
+struct RegisteredTranscriptSession {
+    session_id: SessionId,
+    store: TranscriptStore,
+}
+
+type TranscriptSessionRegistry =
+    std::sync::Mutex<HashMap<String, RegisteredTranscriptSession>>;
+
+fn transcript_session_registry() -> &'static TranscriptSessionRegistry {
+    static REGISTRY: std::sync::OnceLock<TranscriptSessionRegistry> = std::sync::OnceLock::new();
     REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-fn register_transcript_session(canonical_stream: &str, session_id: &SessionId) {
+fn register_transcript_session(
+    canonical_stream: &str,
+    session_id: &SessionId,
+    store: &TranscriptStore,
+) {
     transcript_session_registry()
         .lock()
         .expect("transcript session registry poisoned")
-        .insert(canonical_stream.to_owned(), session_id.clone());
+        .insert(
+            canonical_stream.to_owned(),
+            RegisteredTranscriptSession {
+                session_id: session_id.clone(),
+                store: store.clone(),
+            },
+        );
 }
 
 async fn journal_new_replay_records(
@@ -8974,7 +9035,7 @@ async fn journal_new_replay_records(
     if !actor_transcript_io_enabled() {
         return;
     }
-    let Some(session_id) = transcript_session_registry()
+    let Some(registered) = transcript_session_registry()
         .lock()
         .expect("transcript session registry poisoned")
         .get(canonical_stream)
@@ -8982,6 +9043,8 @@ async fn journal_new_replay_records(
     else {
         return;
     };
+    let session_id = registered.session_id;
+    let store = registered.store;
     let records = event_log[start..]
         .iter()
         .filter(|envelope| envelope.kind == FrameKind::ChatEvent)
@@ -9012,8 +9075,6 @@ async fn journal_new_replay_records(
         return;
     }
     let persistence = tokio::task::spawn_blocking(move || {
-        let root = crate::store::transcript::TranscriptStore::default_root()?;
-        let store = crate::store::transcript::TranscriptStore::new(root);
         for record in &records {
             store.append_import_if_missing(record)?;
         }
@@ -9039,17 +9100,15 @@ async fn journal_new_replay_records(
     }
 }
 
-async fn mark_transcript_authoritative(session_id: &SessionId) {
+async fn mark_transcript_authoritative(store: &TranscriptStore, session_id: &SessionId) {
     if !actor_transcript_io_enabled() {
         return;
     }
     let session_id = session_id.clone();
+    let store = store.clone();
     let persisted = tokio::task::spawn_blocking({
         let session_id = session_id.clone();
-        move || {
-            let root = crate::store::transcript::TranscriptStore::default_root()?;
-            crate::store::transcript::TranscriptStore::new(root).mark_authoritative(&session_id)
-        }
+        move || store.mark_authoritative(&session_id)
     })
     .await;
     match persisted {
@@ -9222,6 +9281,7 @@ async fn send_initial_follow_up_or_park(
     .await;
     park_terminal_agent(
         context.session_store,
+        context.transcript_store,
         context.current_session_id,
         context.pending_alias,
         context.current_start,
@@ -10291,6 +10351,7 @@ struct ContextCompactionDispatchContext<'a> {
     actor_tx: &'a mpsc::UnboundedSender<AgentCommand>,
     backend: &'a dyn BackendSender,
     session_store: &'a Arc<Mutex<SessionStore>>,
+    transcript_store: &'a TranscriptStore,
     session_id: &'a SessionId,
     start: &'a AgentStartPayload,
     status_handle: &'a registry::AgentStatusHandle,
@@ -10464,7 +10525,7 @@ async fn record_context_compaction_terminal(
     )
     .await
     {
-        persist_compaction_marker(session_id, sequence, &marker).await;
+        persist_compaction_marker(canonical_stream, session_id, sequence, &marker).await;
     }
     upsert_context_compaction_snapshot(
         canonical_stream,
@@ -10661,7 +10722,11 @@ async fn try_dispatch_context_compaction(
         operation_id: active.operation_id.clone(),
         trigger: active.trigger,
         focus: active.focus.clone(),
-        transcript_authoritative: transcript_is_authoritative(context.session_id).await,
+        transcript_authoritative: transcript_is_authoritative(
+            context.transcript_store,
+            context.session_id,
+        )
+        .await,
         continuation: active.continuation.clone(),
     };
     match context.backend.begin_compaction(request).await {
@@ -10825,6 +10890,7 @@ async fn try_dispatch_context_compaction(
                 backend_kind: context.start.backend_kind,
                 workspace_roots: context.start.workspace_roots.clone(),
                 logical_session_id: context.session_id.clone(),
+                transcript_store: context.transcript_store.clone(),
                 transcript_high_water,
                 requested_focus: active.focus.clone(),
                 continuation: active.continuation.clone(),
@@ -10946,6 +11012,7 @@ async fn append_compaction_marker_once(
 }
 
 async fn persist_compaction_marker(
+    canonical_stream: &str,
     session_id: &SessionId,
     sequence: u64,
     marker: &ContextCompactionTimelineEvent,
@@ -10953,6 +11020,14 @@ async fn persist_compaction_marker(
     if !actor_transcript_io_enabled() {
         return;
     }
+    let Some(store) = transcript_session_registry()
+        .lock()
+        .expect("transcript session registry poisoned")
+        .get(canonical_stream)
+        .map(|registered| registered.store.clone())
+    else {
+        return;
+    };
     let record = crate::store::transcript::TranscriptRecord {
         logical_session_id: session_id.clone(),
         sequence,
@@ -10974,9 +11049,7 @@ async fn persist_compaction_marker(
     let session_id = session_id.clone();
     let marker_id = marker.marker_id.0.clone();
     let persisted = tokio::task::spawn_blocking(move || {
-        let root = crate::store::transcript::TranscriptStore::default_root()?;
-        crate::store::transcript::TranscriptStore::new(root)
-            .append_import_if_missing(&record)
+        store.append_import_if_missing(&record)
             .map(|_| ())
     })
     .await;
@@ -11218,6 +11291,7 @@ fn session_history_window(
 }
 
 async fn authoritative_session_history_window(
+    store: &TranscriptStore,
     session_id: &SessionId,
     before_seq: Option<u64>,
     limit: usize,
@@ -11227,9 +11301,8 @@ async fn authoritative_session_history_window(
         return None;
     }
     let session_id = session_id.clone();
+    let store = store.clone();
     tokio::task::spawn_blocking(move || {
-        let root = crate::store::transcript::TranscriptStore::default_root().ok()?;
-        let store = crate::store::transcript::TranscriptStore::new(root);
         if !store.is_authoritative(&session_id) {
             return None;
         }
@@ -11856,6 +11929,7 @@ mod tests {
     use crate::store::project::ProjectStore;
     use crate::store::review::ReviewStore;
     use crate::store::session::{SessionStore, StoredCompactionState};
+    use crate::store::transcript::TranscriptStore;
     use crate::stream::Stream;
 
     static AGENT_STARTUP_ACTOR_TEST_LOCK: Mutex<()> = Mutex::const_new(());
@@ -12115,6 +12189,7 @@ mod tests {
         };
         let runtime = AgentActorRuntimeContext {
             session_store,
+            transcript_store: TranscriptStore::new(dir.path().join("transcripts")),
             host_sub_agent_spawn_tx,
             capacity_tx,
             session_summary_count_tx,
@@ -12237,6 +12312,7 @@ mod tests {
                 request,
                 AgentActorRuntimeContext {
                     session_store: Arc::clone(&session_store),
+                    transcript_store: TranscriptStore::new(dir.path().join("transcripts")),
                     host_sub_agent_spawn_tx,
                     capacity_tx,
                     session_summary_count_tx: mpsc::unbounded_channel().0,
@@ -14429,6 +14505,7 @@ mod tests {
                 total_usage: total_usage_rx,
             },
             session_store,
+            TranscriptStore::new(dir.path().join("transcripts")),
             SessionId("relay-session".to_owned()),
             mpsc::unbounded_channel().0,
             status_handle,
@@ -14541,6 +14618,7 @@ mod tests {
                 total_usage: total_usage_rx,
             },
             session_store,
+            TranscriptStore::new(dir.path().join("transcripts")),
             SessionId("relay-codex-session".to_owned()),
             mpsc::unbounded_channel().0,
             status_handle,
@@ -14976,6 +15054,7 @@ mod tests {
                 total_usage: total_rx,
             },
             session_store,
+            TranscriptStore::new(dir.path().join("transcripts")),
             SessionId("relay-idle-session".to_owned()),
             mpsc::unbounded_channel().0,
             status_handle,
@@ -17670,6 +17749,7 @@ mod tests {
                 total_usage: total_usage_rx,
             },
             session_store,
+            TranscriptStore::new(dir.path().join("transcripts")),
             SessionId("relay-delivery-session".to_owned()),
             session_summary_count_tx,
             status_handle.clone(),
@@ -18455,7 +18535,8 @@ mod tests {
         let _transcript_env = TranscriptEnvGuard::install(transcript_dir.path());
         let session_id = SessionId("logical-provider-metadata".to_owned());
         let canonical_stream = "/agent/provider-metadata";
-        register_transcript_session(canonical_stream, &session_id);
+        let transcript_store = TranscriptStore::new(transcript_dir.path().to_path_buf());
+        register_transcript_session(canonical_stream, &session_id, &transcript_store);
 
         let (_events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let events =
@@ -18504,12 +18585,9 @@ mod tests {
         )
         .await;
 
-        let records = crate::store::transcript::TranscriptStore::new(
-            crate::store::transcript::TranscriptStore::default_root()
-                .expect("test transcript root"),
-        )
-        .load(&session_id)
-        .expect("authoritative transcript records");
+        let records = transcript_store
+            .load(&session_id)
+            .expect("authoritative transcript records");
         assert_eq!(records.len(), 1);
         assert_eq!(
             records[0].provider_identity.as_ref(),

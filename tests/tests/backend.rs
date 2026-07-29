@@ -591,6 +591,7 @@ while IFS= read -r _; do :; done
 struct CodexIdentityFake {
     _dir: tempfile::TempDir,
     binary: PathBuf,
+    thread_id: String,
     late_events_written: PathBuf,
     settings_update: PathBuf,
     followup_release: PathBuf,
@@ -600,9 +601,13 @@ impl CodexIdentityFake {
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("create Codex identity fake tempdir");
         let binary = dir.path().join("codex-identity-app-server.py");
-        std::fs::write(
-            &binary,
-            r#"#!/usr/bin/env python3
+        // Each thread/start is a fresh provider binding. Reusing a fixed
+        // provider session would make the durable identity journal correctly
+        // treat records from an earlier test process as this session's history.
+        let identity_suffix = Uuid::new_v4();
+        let thread_id = format!("identity-thread-{identity_suffix}");
+        let child_thread_id = format!("identity-child-{identity_suffix}");
+        let program = r#"#!/usr/bin/env python3
 import json
 import os
 import sys
@@ -668,9 +673,10 @@ for line in sys.stdin:
         with open(__file__ + ".settings-update", "w", encoding="utf-8") as settings_file:
             json.dump(params, settings_file, separators=(",", ":"))
         send({"jsonrpc":"2.0","id":request_id,"result":{}})
-"#,
-        )
-        .expect("write Codex identity fake");
+"#
+        .replace("identity-thread", &thread_id)
+        .replace("identity-child", &child_thread_id);
+        std::fs::write(&binary, program).expect("write Codex identity fake");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -689,6 +695,7 @@ for line in sys.stdin:
         Self {
             _dir: dir,
             binary,
+            thread_id,
             late_events_written,
             settings_update,
             followup_release,
@@ -1055,7 +1062,7 @@ async fn fake_codex_provider_items_keep_identity_live_late_and_same_host_reconne
     assert_eq!(
         settings_update,
         json!({
-            "threadId": "identity-thread",
+            "threadId": fake.thread_id.clone(),
             "model": "fake-codex-model",
             "effort": "high",
             "approvalPolicy": "never"

@@ -24,6 +24,7 @@ use crate::backend::StartupMcpTransport;
 use crate::host::mcp_url_for_agent;
 use crate::review_mcp::REVIEW_FEEDBACK_MCP_SERVER_NAME;
 use crate::store::session::SessionStore;
+use crate::store::transcript::TranscriptStore;
 use crate::workflows::mcp::WORKFLOW_PROGRESS_MCP_SERVER_NAME;
 
 pub(crate) struct AgentRegistry {
@@ -326,6 +327,7 @@ impl AgentRegistry {
         model_usage: mpsc::UnboundedReceiver<protocol::ModelRequestTokenUsage>,
         total_usage: mpsc::UnboundedReceiver<u64>,
         session_store: Arc<Mutex<SessionStore>>,
+        transcript_store: TranscriptStore,
         session_summary_count_tx: crate::host::HostSessionSummaryCountTx,
     ) -> SpawnedRelayAgent {
         let agent_id = AgentId(Uuid::new_v4().to_string());
@@ -356,6 +358,7 @@ impl AgentRegistry {
                 total_usage,
             },
             session_store,
+            transcript_store,
             request.session_id,
             session_summary_count_tx,
             status_handle.clone(),

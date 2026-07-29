@@ -154,6 +154,7 @@ use crate::store::session::{
 use crate::store::settings::HostSettingsStore;
 use crate::store::skills::SkillStore;
 use crate::store::steering::SteeringStore;
+use crate::store::transcript::TranscriptStore;
 use crate::stream::{Stream, StreamClosed};
 use crate::sub_agent::{
     HostSubAgentSpawnRequest, HostSubAgentSpawnRx, HostSubAgentSpawnTx, SubAgentEmitter,
@@ -1004,6 +1005,7 @@ pub(crate) struct HostState {
     pub settings_store: Arc<Mutex<HostSettingsStore>>,
     pub agents_view_preferences_store: Option<Arc<Mutex<AgentsViewPreferencesStore>>>,
     pub session_store: Arc<Mutex<SessionStore>>,
+    pub transcript_store: TranscriptStore,
     pub custom_agent_store: Arc<Mutex<CustomAgentStore>>,
     pub mcp_server_store: Arc<Mutex<McpServerStore>>,
     pub steering_store: Arc<Mutex<SteeringStore>>,
@@ -5533,11 +5535,13 @@ impl HostHandle {
             let provider_version =
                 installed_backend_version(&state.backend_setup, request.backend_kind);
             let antigravity_conversations_dir = state.antigravity_conversations_dir.clone();
+            let transcript_store = state.transcript_store.clone();
             let spawned = state.registry.spawn(
                 request,
                 &agent_control_mcp,
                 crate::agent::AgentActorRuntimeResources {
                     session_store: Arc::clone(&session_store),
+                    transcript_store,
                     host_sub_agent_spawn_tx: sub_agent_spawn_tx,
                     capacity_tx,
                     session_summary_count_tx: session_summary_count_tx.clone(),
@@ -5933,11 +5937,13 @@ impl HostHandle {
             let provider_version =
                 installed_backend_version(&state.backend_setup, request.backend_kind);
             let antigravity_conversations_dir = state.antigravity_conversations_dir.clone();
+            let transcript_store = state.transcript_store.clone();
             let spawned = state.registry.spawn(
                 request,
                 &agent_control_mcp,
                 crate::agent::AgentActorRuntimeResources {
                     session_store,
+                    transcript_store,
                     host_sub_agent_spawn_tx: sub_agent_spawn_tx,
                     capacity_tx,
                     session_summary_count_tx: session_summary_count_tx.clone(),
@@ -10831,12 +10837,14 @@ impl HostHandle {
         let (start, agent_handle, agent_visibility) = {
             let mut state = self.state.lock().await;
             let session_summary_count_tx = state.session_summary_count_tx.clone();
+            let transcript_store = state.transcript_store.clone();
             let spawned = state.registry.spawn_relay(
                 relay_request,
                 event_rx,
                 model_usage_rx,
                 total_usage_rx,
                 Arc::clone(&session_store),
+                transcript_store,
                 session_summary_count_tx,
             );
             state
@@ -13373,6 +13381,14 @@ fn spawn_host_inner(
     use_mock_backend: bool,
     runtime_config: HostRuntimeConfig,
 ) -> Result<HostHandle, String> {
+    let transcript_root = if std::env::var("TYDE_TRANSCRIPT_STORE_DIR")
+        .is_ok_and(|path| !path.trim().is_empty())
+    {
+        TranscriptStore::default_root()?
+    } else {
+        paths.session.with_file_name("transcripts")
+    };
+    let transcript_store = TranscriptStore::new(transcript_root);
     let antigravity_conversations_dir =
         crate::backend::antigravity::resolve_antigravity_conversations_dir(
             runtime_config.antigravity_conversations_dir.as_deref(),
@@ -13510,6 +13526,7 @@ fn spawn_host_inner(
             agents_view_preferences_store: agents_view_preferences_store
                 .map(|store| Arc::new(Mutex::new(store))),
             session_store: Arc::new(Mutex::new(session_store)),
+            transcript_store,
             custom_agent_store: Arc::new(Mutex::new(custom_agent_store)),
             mcp_server_store: Arc::new(Mutex::new(mcp_server_store)),
             steering_store: Arc::new(Mutex::new(steering_store)),

@@ -2116,11 +2116,12 @@ async fn spawn_parent_with_native_child(
 
     let child_new = expect_new_agent(client, "native child NewAgent").await;
 
-    let env = expect_next_event(client, "native child AgentStart").await;
-    assert_eq!(env.kind, FrameKind::AgentStart);
-    assert_eq!(env.stream, child_new.instance_stream);
-    let child_start: AgentStartPayload =
-        env.parse_payload().expect("parse native child AgentStart");
+    let child_start = expect_agent_start_on_stream(
+        client,
+        &child_new.instance_stream,
+        "native child AgentStart",
+    )
+    .await;
 
     expect_native_child_prompt_on_stream(client, &child_new.instance_stream, "parent prompt").await;
     expect_turn_on_stream(
@@ -6021,8 +6022,12 @@ async fn backend_native_child_with_closed_event_stream_still_replays_to_late_cli
 
     let child_new = expect_new_agent(&mut fixture.client, "native child NewAgent").await;
 
-    let child_start_env = expect_next_event(&mut fixture.client, "native child AgentStart").await;
-    assert_eq!(child_start_env.kind, FrameKind::AgentStart);
+    expect_agent_start_on_stream(
+        &mut fixture.client,
+        &child_new.instance_stream,
+        "native child AgentStart",
+    )
+    .await;
 
     expect_native_child_prompt_on_stream(
         &mut fixture.client,
@@ -6210,8 +6215,12 @@ async fn interrupting_parked_backend_native_child_emits_relay_rejection() {
 
     let child_new = expect_new_agent(&mut fixture.client, "native child NewAgent").await;
 
-    let child_start_env = expect_next_event(&mut fixture.client, "native child AgentStart").await;
-    assert_eq!(child_start_env.kind, FrameKind::AgentStart);
+    expect_agent_start_on_stream(
+        &mut fixture.client,
+        &child_new.instance_stream,
+        "native child AgentStart",
+    )
+    .await;
 
     expect_native_child_prompt_on_stream(
         &mut fixture.client,
