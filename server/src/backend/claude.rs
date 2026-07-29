@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -99,6 +99,10 @@ const CLAUDE_ESTIMATED_CONTEXT_WINDOW_1M: u64 = 1_000_000;
 const CLAUDE_ESTIMATED_BYTES_PER_TOKEN: u64 = 4;
 const CLAUDE_MIN_SYSTEM_PROMPT_BYTES: u64 = 1_024;
 const CLAUDE_DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
+/// How long the stdout reader waits for a finished turn's finalizer to hand
+/// off before adopting a CLI wake turn. Bounded because the reader is blocked
+/// meanwhile; the frames it is waiting to route simply queue behind it.
+const CLAUDE_WAKE_QUIESCE_WAIT: Duration = Duration::from_secs(5);
 // Claude plan mode blocks build/test Bash; ReadOnly is advisory in Tyde.
 const CLAUDE_READ_ONLY_PERMISSION_MODE: &str = "acceptEdits";
 const CLAUDE_CONVERSATION_COMPACTED_NOTICE: &str = "Conversation compacted.";
@@ -517,6 +521,7 @@ impl ClaudeSession {
             background_tasks: StdMutex::new(BackgroundTaskRegistry::active()),
             skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
             skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
+            pending_cli_wake: std::sync::atomic::AtomicBool::new(false),
         });
 
         // Armed through the same call every other caller uses, immediately after
@@ -748,6 +753,12 @@ struct ClaudeInner {
     /// one; the flag clears when the next process arms. Atomic because the
     /// hot-path predicate that reads it is synchronous.
     skill_verification_abandoned: std::sync::atomic::AtomicBool,
+    /// Armed when a background task reports a terminal status on the root
+    /// stream, because that is what makes the CLI wake the model and run a
+    /// turn no user message initiated. Adoption of such a turn requires this
+    /// token, so a stray frame arriving after a `result` can never open one.
+    /// Atomic because the reader consults it synchronously per frame.
+    pending_cli_wake: std::sync::atomic::AtomicBool,
 }
 
 struct BackgroundTaskRegistry {
@@ -1832,6 +1843,102 @@ impl ClaudeInner {
         if self.take_restart_process_after_turn().await {
             self.shutdown_process().await;
         }
+    }
+
+    fn arm_cli_wake(&self) {
+        self.pending_cli_wake
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn disarm_cli_wake(&self) {
+        self.pending_cli_wake
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn take_pending_cli_wake(&self) -> bool {
+        self.pending_cli_wake
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Wait until no turn is installed, i.e. the previous turn's finalizer has
+    /// run. The finalizer is a spawned task, so a turn that has already
+    /// produced its `result` stays installed for a short window afterwards —
+    /// and the CLI can deliver an entire wake burst inside that window.
+    /// Retrying per frame is not enough, because every frame of the burst can
+    /// land before the hand-off completes. Returns false on timeout.
+    /// Safe to await while holding `turn_event_gate`: the finalizer never
+    /// takes that gate.
+    async fn await_active_turn_quiesced(&self, wait: Duration) -> bool {
+        let quiesced_rx = {
+            let mut state = self.state.lock().await;
+            let Some(active) = state.active_turn.as_mut() else {
+                return true;
+            };
+            let (quiesced_tx, quiesced_rx) = oneshot::channel();
+            active.quiesced_waiters.push(quiesced_tx);
+            quiesced_rx
+        };
+        matches!(
+            tokio::time::timeout(wait, quiesced_rx).await,
+            Ok(Ok(())) | Err(_)
+        ) && self.state.lock().await.active_turn.is_none()
+    }
+
+    /// Open a turn for output the Claude CLI produced on its own initiative,
+    /// with no pending user message — the CLI wakes the model when a
+    /// background task finishes, and that turn is the only way the model gets
+    /// to act on the result. Mirrors the scaffolding `start_turn` builds
+    /// (allocate a turn id, emit typing + stream start, spawn the finalizer
+    /// that awaits the outcome) so the unsolicited turn flows through the
+    /// exact same completion path as a user-initiated one. It deliberately
+    /// emits no user bubble. Returns `None` if a turn is somehow already
+    /// active, or if the backend is closing.
+    async fn begin_cli_initiated_turn(self: &Arc<Self>) -> Option<u64> {
+        let (turn_id, ephemeral, conversation_history_bytes, model_hint, outcome_rx) = {
+            let mut state = self.state.lock().await;
+            if state.closing || state.active_turn.is_some() {
+                return None;
+            }
+            let turn_id = CLAUDE_TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let (outcome_tx, outcome_rx) = oneshot::channel();
+            state.active_turn = Some(ActiveTurn {
+                id: turn_id,
+                outcome_tx: Some(outcome_tx),
+                interrupt_requested: false,
+                pending_ask_user_question: None,
+                pending_exit_plan_mode: None,
+                quiesced_waiters: Vec::new(),
+            });
+            (
+                turn_id,
+                state.ephemeral,
+                state.conversation_bytes_total,
+                state.model.clone(),
+                outcome_rx,
+            )
+        };
+
+        let message_id = format!("claude-msg-{turn_id}");
+        self.emit_typing_status(true);
+        self.emit_stream_start(&message_id, model_hint.clone());
+
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let outcome = outcome_rx.await.unwrap_or_else(|_| TurnOutcome::Failed {
+                summary: ClaudeStdoutSummary::default(),
+                error: "Claude turn ended before returning a result".to_string(),
+            });
+            this.finalize_turn(
+                turn_id,
+                outcome,
+                ephemeral,
+                conversation_history_bytes,
+                model_hint,
+            )
+            .await;
+        });
+
+        Some(turn_id)
     }
 
     async fn write_turn_to_persistent_process(
@@ -4160,6 +4267,7 @@ async fn read_claude_stdout_persistent(
     // Keyed by task_id; lives at loop scope (not per-turn) because a
     // workflow's task frames keep arriving after its turn completes.
     let mut workflow_runs: HashMap<String, WorkflowRunEntry> = HashMap::new();
+    let mut recent_system_subtypes = DroppedTurnStartLog::default();
     // Frames held back while skill verification is still Pending. The `init`
     // frame arrives at the head of the CLI's response to the first user
     // message, so anything the model says can reach this reader *before* Tyde
@@ -4341,6 +4449,14 @@ async fn read_claude_stdout_persistent(
             continue;
         }
 
+        // Arm before the task handlers below consume the frame. A completing
+        // task is what makes the CLI wake the model, so this has to see the
+        // notification whether it belongs to a workflow or a background task.
+        if claude_frame_arms_cli_wake(&value) {
+            inner.arm_cli_wake();
+        }
+        recent_system_subtypes.observe(&value);
+
         if handle_workflow_task_frame(&value, &mut workflow_runs, &inner.emitter) {
             continue;
         }
@@ -4411,16 +4527,56 @@ async fn read_claude_stdout_persistent(
         }
 
         let _turn_event_guard = inner.turn_event_gate.lock().await;
-        let Some((turn_id, model_hint)) =
-            prepare_persistent_stdout_turn(&inner, &mut turn_state).await
-        else {
-            // Background-child completion is already materialized on the
-            // child's stream above. Claude may subsequently wake the parent
-            // and emit an unsolicited init/assistant/result sequence; it has
-            // no user turn to own it, so it must not become a duplicate parent
-            // response.
-            continue;
-        };
+        let (turn_id, model_hint) =
+            match prepare_persistent_stdout_turn(&inner, &mut turn_state).await {
+                Some(turn) => turn,
+                None => {
+                    // No user-initiated turn is active, yet the CLI is emitting
+                    // fresh turn content. That happens when a completed
+                    // background task wakes the model: the launching turn's
+                    // `result` already landed, then a new init + assistant +
+                    // `result` sequence arrives. It is the model's own turn —
+                    // it can call tools, not just narrate — so adopt it rather
+                    // than drop it. The wake token is what separates this from
+                    // a stray frame trailing a finished turn.
+                    if !is_cli_turn_start_event(&value) {
+                        recent_system_subtypes.warn_once_on_dropped_frame(&value);
+                        continue;
+                    }
+                    if !inner.take_pending_cli_wake() {
+                        recent_system_subtypes.warn_once_on_dropped_turn_start(&value);
+                        continue;
+                    }
+                    if inner.begin_cli_initiated_turn().await.is_none() {
+                        // The finished turn is still installed because its
+                        // finalizer runs concurrently. Wait for the hand-off:
+                        // the CLI can deliver every frame of the wake burst
+                        // inside that window, so retrying on the next frame is
+                        // not enough to save the turn.
+                        if !inner
+                            .await_active_turn_quiesced(CLAUDE_WAKE_QUIESCE_WAIT)
+                            .await
+                            || inner.begin_cli_initiated_turn().await.is_none()
+                        {
+                            // The wake could not be adopted even after waiting
+                            // for the hand-off. The token goes back so a later
+                            // frame can retry, but this is the fix's own
+                            // failure mode and must be visible.
+                            tracing::warn!(
+                                wait_secs = CLAUDE_WAKE_QUIESCE_WAIT.as_secs(),
+                                "could not open a turn for a Claude wake; the previous turn \
+                                 did not hand off in time or the backend is closing"
+                            );
+                            inner.arm_cli_wake();
+                            continue;
+                        }
+                    }
+                    match prepare_persistent_stdout_turn(&inner, &mut turn_state).await {
+                        Some(turn) => turn,
+                        None => continue,
+                    }
+                }
+            };
 
         let interrupt_requested = inner.active_turn_interrupted(turn_id).await;
         consume_claude_stream_value_with_interrupt(
@@ -4497,6 +4653,106 @@ async fn read_claude_stdout_persistent(
     inner.mark_process_exited().await;
 }
 
+/// Whether a frame is the kind of completion that makes the CLI wake the
+/// model and run a turn of its own. Any `task_notification` qualifies — the
+/// CLI only emits one when a task reaches a terminal state — but a task owned
+/// by a sub-agent wakes that sub-agent's stream, not the root, so anything
+/// carrying a parent tool id is excluded. Status strings are deliberately not
+/// matched: an unrecognized one must not silently cost us the wake turn.
+fn claude_frame_arms_cli_wake(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("system")
+        && value.get("subtype").and_then(Value::as_str) == Some("task_notification")
+        && background_task_parent_tool_use_id(value).is_none()
+}
+
+/// Whether a parent-stream frame (already excluded from sub-agent routing)
+/// marks the start of fresh turn content. Deliberately excludes lone `result`
+/// and `user` frames so a stray terminal frame never spawns an empty turn.
+/// This is only the frame *shape*: adoption also requires an armed wake token.
+fn is_cli_turn_start_event(value: &Value) -> bool {
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match event_type {
+        "assistant" | "stream_event" | "event" => true,
+        "system" => value.get("subtype").and_then(Value::as_str) == Some("init"),
+        other => is_stream_event_type(other),
+    }
+}
+
+/// Bounded record of the `system` subtypes seen since the last turn-terminal
+/// frame, so that dropping turn-start content without an armed wake token is
+/// reported *with the trigger that preceded it*. A dropped wake is roughly
+/// eight frames, so this warns once per burst rather than once per frame:
+/// the silent `continue` that this replaces is why the original regression
+/// went unnoticed for six weeks.
+#[derive(Default)]
+struct DroppedTurnStartLog {
+    recent: VecDeque<String>,
+    warned: bool,
+    warned_non_start: bool,
+}
+
+impl DroppedTurnStartLog {
+    const RECENT_LIMIT: usize = 6;
+
+    fn observe(&mut self, value: &Value) {
+        if value.get("type").and_then(Value::as_str) == Some("result") {
+            self.recent.clear();
+            self.warned = false;
+            self.warned_non_start = false;
+            return;
+        }
+        if value.get("type").and_then(Value::as_str) != Some("system") {
+            return;
+        }
+        let Some(subtype) = value.get("subtype").and_then(Value::as_str) else {
+            return;
+        };
+        if self.recent.len() == Self::RECENT_LIMIT {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(subtype.to_string());
+    }
+
+    fn warn_once_on_dropped_turn_start(&mut self, value: &Value) {
+        if self.warned {
+            return;
+        }
+        self.warned = true;
+        // Resolved before the macro: inside it, `Value` names `tracing`'s own
+        // field trait rather than `serde_json::Value`.
+        let frame_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+        tracing::warn!(
+            frame_type,
+            recent_system_subtypes = ?self.recent,
+            "dropping Claude turn-start content with no active turn and no armed wake \
+             trigger; if this is a real CLI wake, its trigger is not yet recognized"
+        );
+    }
+
+    /// Frames that are not turn-start shaped and arrive with no turn to own
+    /// them are discarded. Most are inert, but a `user` (tool_result) or
+    /// `result` frame landing here means a wake turn was missed upstream and
+    /// its remainder is being thrown away — the same shape as the regression
+    /// this module exists to prevent, so it must not be silent either.
+    fn warn_once_on_dropped_frame(&mut self, value: &Value) {
+        if self.warned_non_start {
+            return;
+        }
+        self.warned_non_start = true;
+        let frame_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+        let subtype = value.get("subtype").and_then(Value::as_str).unwrap_or("");
+        tracing::warn!(
+            frame_type,
+            subtype,
+            recent_system_subtypes = ?self.recent,
+            "discarding a Claude frame with no turn to own it"
+        );
+    }
+}
+
 async fn prepare_persistent_stdout_turn(
     inner: &Arc<ClaudeInner>,
     turn_state: &mut PersistentStdoutTurnState,
@@ -4504,8 +4760,14 @@ async fn prepare_persistent_stdout_turn(
     let (turn_id, model_hint) = {
         let state = inner.state.lock().await;
         let active = state.active_turn.as_ref()?;
+        // A turn that has already handed off its outcome is finished; the
+        // finalizer that clears it runs concurrently with this reader, so
+        // without this check a wake turn arriving inside that window would be
+        // consumed against a message id the finalizer has already closed.
+        active.outcome_tx.as_ref()?;
         (active.id, state.model.clone())
     };
+    inner.disarm_cli_wake();
 
     if turn_state.active_turn_id != Some(turn_id) {
         let base_message_id = format!("claude-msg-{turn_id}");
@@ -5348,6 +5610,7 @@ async fn ensure_subagent_stream(
         background_tasks: StdMutex::new(BackgroundTaskRegistry::active()),
         skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
         skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
+        pending_cli_wake: std::sync::atomic::AtomicBool::new(false),
     });
     let sa_message_id = format!("subagent-{}", tool_use_id);
 
@@ -12150,6 +12413,7 @@ mod tests {
             background_tasks: StdMutex::new(BackgroundTaskRegistry::active()),
             skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
             skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
+            pending_cli_wake: std::sync::atomic::AtomicBool::new(false),
         };
         (inner, event_rx)
     }
@@ -23155,6 +23419,7 @@ for raw_line in sys.stdin:
                 background_tasks: StdMutex::new(BackgroundTaskRegistry::active()),
                 skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
                 skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
+                pending_cli_wake: std::sync::atomic::AtomicBool::new(false),
             }),
             event_rx,
         )
@@ -23533,6 +23798,989 @@ for raw_line in sys.stdin:
         assert!(
             completion_index < next_stream_start_index,
             "Expected next StreamStart after ToolExecutionCompleted. Events:\n{events_dump}"
+        );
+    }
+
+    /// Replays the frame shape captured from Claude Code 2.1.220 when a
+    /// background task completes: the launching turn's `result`, then the
+    /// task's terminal notification, then a full `init` + assistant +
+    /// `result` sequence the CLI produced on its own initiative. Unlike the
+    /// live test this runs inside `./dev.sh check`, which is what the original
+    /// regression escaped through — its live regression test was `#[ignore]`d
+    /// and therefore invisible to both mandatory gates.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_background_task_completion_adopts_a_wake_turn() {
+        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let fake = workspace.path().join("fake-claude-wake.py");
+        std::fs::write(
+            &fake,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+args = sys.argv[1:]
+session_id = "fake-wake"
+if "--session-id" in args:
+    session_id = args[args.index("--session-id") + 1]
+elif "--resume" in args:
+    session_id = args[args.index("--resume") + 1]
+
+def emit(value):
+    print(json.dumps(value), flush=True)
+
+def turn(message_id, text, output_tokens, turn_usage):
+    emit({"type": "system", "subtype": "init", "session_id": session_id, "model": "fake-model"})
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {
+            "type": "message_start",
+            "message": {"id": message_id, "model": "fake-model", "usage": {"input_tokens": 7}},
+        },
+    })
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+    })
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}},
+    })
+    emit({
+        "type": "assistant",
+        "session_id": session_id,
+        "message": {
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "model": "fake-model",
+            "content": [{"type": "text", "text": text}],
+        },
+    })
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {"type": "content_block_stop", "index": 0},
+    })
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {
+            "type": "message_delta",
+            "usage": {"input_tokens": 7, "output_tokens": output_tokens},
+        },
+    })
+    emit({"type": "stream_event", "session_id": session_id, "event": {"type": "message_stop"}})
+    # Claude reports `result` usage per turn, not session-cumulative (verified
+    # against a captured 2.1.220 stream, where the second turn's input_tokens
+    # is smaller than the first's). Tyde accumulates it into the session total.
+    emit({
+        "type": "result",
+        "subtype": "success",
+        "session_id": session_id,
+        "result": text,
+        "usage": turn_usage,
+    })
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        value = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if value.get("type") == "control_request":
+        request = value.get("request", {})
+        request_id = value.get("request_id") or request.get("request_id")
+        if request.get("subtype") == "initialize":
+            emit({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": request_id,
+                    "response": {},
+                },
+            })
+        continue
+    if value.get("type") != "user":
+        continue
+    turn("launch-msg", "LAUNCHED", 3,
+         {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10})
+    # The launching turn is over. The task completing is what makes the real
+    # CLI wake the model, so the notification precedes the unsolicited turn.
+    emit({
+        "type": "system",
+        "subtype": "task_notification",
+        "session_id": session_id,
+        "task_id": "waketask",
+        "tool_use_id": "toolu_wake_probe",
+        "status": "completed",
+        "summary": 'Background command "probe" completed (exit code 0)',
+    })
+    turn("wake-msg", "the background command finished", 11,
+         {"input_tokens": 7, "output_tokens": 11, "total_tokens": 18})
+"#,
+        )
+        .expect("write fake claude");
+        make_executable(&fake);
+
+        let previous_claude_bin = std::env::var_os(TYDE_CLAUDE_BIN_ENV);
+        // SAFETY: guarded by FAKE_CLAUDE_ENV_LOCK for the whole window where
+        // the process-global environment points at the fake binary.
+        unsafe {
+            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
+        }
+
+        let (session, mut rx) = ClaudeSession::spawn(
+            &[workspace.path().to_string_lossy().to_string()],
+            None,
+            &[],
+            None,
+            None,
+            ToolPolicy::Unrestricted,
+            BackendAccessMode::Unrestricted,
+        )
+        .await
+        .expect("spawn fake Claude session");
+        session
+            .inner
+            .ensure_process_ready()
+            .await
+            .expect("initialize persistent fake Claude process");
+        session
+            .command_handle()
+            .execute(SessionCommand::SendMessage {
+                message: "launch a background command".to_string(),
+                images: None,
+            })
+            .await
+            .expect("send launching turn");
+
+        let mut events: Vec<Value> = Vec::new();
+        let collected = timeout(Duration::from_secs(20), async {
+            let mut idle_count = 0usize;
+            loop {
+                let event = rx
+                    .recv()
+                    .await
+                    .expect("Claude event channel should stay open");
+                let idle = event_kind(&event) == Some("TypingStatusChanged")
+                    && event.get("data").and_then(Value::as_bool) == Some(false);
+                events.push(event);
+                if idle {
+                    idle_count += 1;
+                    // One idle closes the launching turn; the second closes
+                    // the wake turn.
+                    if idle_count == 2 {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+
+        unsafe {
+            match previous_claude_bin {
+                Some(value) => std::env::set_var(TYDE_CLAUDE_BIN_ENV, value),
+                None => std::env::remove_var(TYDE_CLAUDE_BIN_ENV),
+            }
+        }
+
+        let dump = format_live_events(&events);
+        collected.unwrap_or_else(|_| {
+            panic!("the wake turn never reached the client. Events:\n{dump}");
+        });
+
+        let stream_ends: Vec<&Value> = events
+            .iter()
+            .filter(|event| event_kind(event) == Some("StreamEnd"))
+            .collect();
+        assert_eq!(
+            stream_ends.len(),
+            2,
+            "expected the launching turn and the wake turn. Events:\n{dump}"
+        );
+        assert_eq!(
+            stream_end_message(stream_ends[0])
+                .get("content")
+                .and_then(Value::as_str),
+            Some("LAUNCHED")
+        );
+        assert_eq!(
+            stream_end_message(stream_ends[1])
+                .get("content")
+                .and_then(Value::as_str),
+            Some("the background command finished"),
+            "the wake turn must carry the model's own content. Events:\n{dump}"
+        );
+        // The wake turn's tokens are real spend and belong to a real turn;
+        // dropping the turn used to drop its usage silently too.
+        assert_eq!(
+            stream_end_turn_total_tokens(stream_ends[0]),
+            Some(10),
+            "the launching turn's own usage. Events:\n{dump}"
+        );
+        assert_eq!(
+            stream_end_turn_total_tokens(stream_ends[1]),
+            Some(18),
+            "the wake turn must report its own usage. Events:\n{dump}"
+        );
+        // And it must land in the session total exactly once — a wake turn
+        // counted twice, or not at all, is invisible in the footer.
+        assert_eq!(
+            stream_end_cumulative_total_tokens(stream_ends[1]),
+            Some(28),
+            "the wake turn must accumulate into the session total exactly once. \
+             Events:\n{dump}"
+        );
+    }
+
+    /// The reason a wake turn must be adopted as a *turn*, rather than
+    /// summarized into a progress notice, is that the model can act in it. A
+    /// wake turn that renders text but silently swallows its tool calls would
+    /// leave the agent doing work the transcript never shows.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_wake_turn_can_call_tools() {
+        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let fake = workspace.path().join("fake-claude-wake-tool.py");
+        std::fs::write(
+            &fake,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+args = sys.argv[1:]
+session_id = "fake-wake-tool"
+if "--session-id" in args:
+    session_id = args[args.index("--session-id") + 1]
+elif "--resume" in args:
+    session_id = args[args.index("--resume") + 1]
+
+TOOL = "toolu_wake_followup"
+INPUT = {"command": "cat /tmp/probe.out", "description": "read the probe output"}
+
+def emit(value):
+    print(json.dumps(value), flush=True)
+
+def launching_turn():
+    emit({"type": "system", "subtype": "init", "session_id": session_id, "model": "fake-model"})
+    emit({
+        "type": "assistant",
+        "session_id": session_id,
+        "message": {
+            "id": "launch-msg",
+            "type": "message",
+            "role": "assistant",
+            "model": "fake-model",
+            "content": [{"type": "text", "text": "LAUNCHED"}],
+        },
+    })
+    emit({
+        "type": "result",
+        "subtype": "success",
+        "session_id": session_id,
+        "result": "LAUNCHED",
+        "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+    })
+
+def wake_turn_with_tool():
+    emit({"type": "system", "subtype": "init", "session_id": session_id, "model": "fake-model"})
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {
+            "type": "message_start",
+            "message": {"id": "wake-msg", "model": "fake-model", "usage": {"input_tokens": 5}},
+        },
+    })
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": TOOL,
+                "name": "Bash",
+                "input": {},
+                "caller": {"type": "direct"},
+            },
+        },
+    })
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": json.dumps(INPUT)},
+        },
+    })
+    emit({
+        "type": "assistant",
+        "session_id": session_id,
+        "message": {
+            "id": "wake-msg",
+            "type": "message",
+            "role": "assistant",
+            "model": "fake-model",
+            "content": [{
+                "type": "tool_use",
+                "id": TOOL,
+                "name": "Bash",
+                "input": INPUT,
+                "caller": {"type": "direct"},
+            }],
+        },
+    })
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {"type": "content_block_stop", "index": 0},
+    })
+    # The CLI runs its own tools and reports the result back on the stream.
+    emit({
+        "type": "user",
+        "session_id": session_id,
+        "message": {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": TOOL,
+                "content": "PROBE_OUTPUT",
+                "is_error": False,
+            }],
+        },
+    })
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {"type": "message_delta", "usage": {"input_tokens": 5, "output_tokens": 6}},
+    })
+    emit({"type": "stream_event", "session_id": session_id, "event": {"type": "message_stop"}})
+    emit({
+        "type": "result",
+        "subtype": "success",
+        "session_id": session_id,
+        "result": "read the probe output",
+        "usage": {"input_tokens": 5, "output_tokens": 6, "total_tokens": 11},
+    })
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        value = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if value.get("type") == "control_request":
+        request = value.get("request", {})
+        request_id = value.get("request_id") or request.get("request_id")
+        if request.get("subtype") == "initialize":
+            emit({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": request_id,
+                    "response": {},
+                },
+            })
+        continue
+    if value.get("type") != "user":
+        continue
+    launching_turn()
+    emit({
+        "type": "system",
+        "subtype": "task_notification",
+        "session_id": session_id,
+        "task_id": "waketask",
+        "tool_use_id": "toolu_wake_probe",
+        "status": "completed",
+        "summary": 'Background command "probe" completed (exit code 0)',
+    })
+    wake_turn_with_tool()
+"#,
+        )
+        .expect("write fake claude");
+        make_executable(&fake);
+
+        let previous_claude_bin = std::env::var_os(TYDE_CLAUDE_BIN_ENV);
+        // SAFETY: guarded by FAKE_CLAUDE_ENV_LOCK for the whole window where
+        // the process-global environment points at the fake binary.
+        unsafe {
+            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
+        }
+
+        let (session, mut rx) = ClaudeSession::spawn(
+            &[workspace.path().to_string_lossy().to_string()],
+            None,
+            &[],
+            None,
+            None,
+            ToolPolicy::Unrestricted,
+            BackendAccessMode::Unrestricted,
+        )
+        .await
+        .expect("spawn fake Claude session");
+        session
+            .inner
+            .ensure_process_ready()
+            .await
+            .expect("initialize persistent fake Claude process");
+        session
+            .command_handle()
+            .execute(SessionCommand::SendMessage {
+                message: "launch a background command".to_string(),
+                images: None,
+            })
+            .await
+            .expect("send launching turn");
+
+        let mut events: Vec<Value> = Vec::new();
+        let collected = timeout(Duration::from_secs(20), async {
+            let mut idle_count = 0usize;
+            loop {
+                let event = rx
+                    .recv()
+                    .await
+                    .expect("Claude event channel should stay open");
+                let idle = event_kind(&event) == Some("TypingStatusChanged")
+                    && event.get("data").and_then(Value::as_bool) == Some(false);
+                events.push(event);
+                if idle {
+                    idle_count += 1;
+                    if idle_count == 2 {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+
+        unsafe {
+            match previous_claude_bin {
+                Some(value) => std::env::set_var(TYDE_CLAUDE_BIN_ENV, value),
+                None => std::env::remove_var(TYDE_CLAUDE_BIN_ENV),
+            }
+        }
+
+        let dump = format_live_events(&events);
+        collected.unwrap_or_else(|_| {
+            panic!("the wake turn never reached the client. Events:\n{dump}");
+        });
+
+        let tool_request = events
+            .iter()
+            .find(|event| {
+                event_kind(event) == Some("ToolRequest")
+                    && event
+                        .get("data")
+                        .and_then(|data| data.get("tool_call_id"))
+                        .and_then(Value::as_str)
+                        == Some("toolu_wake_followup")
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "the wake turn's tool call never reached the client — adopting the turn \
+                     is pointless if the model's actions are invisible. Events:\n{dump}"
+                );
+            });
+        assert_eq!(
+            tool_request
+                .get("data")
+                .and_then(|data| data.get("tool_name"))
+                .and_then(Value::as_str),
+            Some("Bash")
+        );
+        assert!(
+            events.iter().any(|event| {
+                event_kind(event) == Some("ToolExecutionCompleted")
+                    && event
+                        .get("data")
+                        .and_then(|data| data.get("tool_call_id"))
+                        .and_then(Value::as_str)
+                        == Some("toolu_wake_followup")
+            }),
+            "the wake turn's tool must reach a terminal state. Events:\n{dump}"
+        );
+    }
+
+    /// The wake token is the necessary condition: turn-start-shaped frames
+    /// trailing a finished turn, with no completion to justify them, must not
+    /// open a phantom turn.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_stray_frames_after_result_do_not_open_a_turn() {
+        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let fake = workspace.path().join("fake-claude-stray.py");
+        std::fs::write(
+            &fake,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+args = sys.argv[1:]
+session_id = "fake-stray"
+if "--session-id" in args:
+    session_id = args[args.index("--session-id") + 1]
+elif "--resume" in args:
+    session_id = args[args.index("--resume") + 1]
+
+def emit(value):
+    print(json.dumps(value), flush=True)
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        value = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if value.get("type") == "control_request":
+        request = value.get("request", {})
+        request_id = value.get("request_id") or request.get("request_id")
+        if request.get("subtype") == "initialize":
+            emit({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": request_id,
+                    "response": {},
+                },
+            })
+        continue
+    if value.get("type") != "user":
+        continue
+    emit({"type": "system", "subtype": "init", "session_id": session_id, "model": "fake-model"})
+    emit({
+        "type": "assistant",
+        "session_id": session_id,
+        "message": {
+            "id": "only-msg",
+            "type": "message",
+            "role": "assistant",
+            "model": "fake-model",
+            "content": [{"type": "text", "text": "ANSWER"}],
+        },
+    })
+    emit({"type": "result", "subtype": "success", "session_id": session_id, "result": "ANSWER"})
+    # No task completed, so nothing justifies a new turn. These trail the
+    # finished turn and must be dropped, not adopted.
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {"type": "message_stop"},
+    })
+    emit({
+        "type": "assistant",
+        "session_id": session_id,
+        "message": {
+            "id": "stray-msg",
+            "type": "message",
+            "role": "assistant",
+            "model": "fake-model",
+            "content": [{"type": "text", "text": "STRAY"}],
+        },
+    })
+"#,
+        )
+        .expect("write fake claude");
+        make_executable(&fake);
+
+        let previous_claude_bin = std::env::var_os(TYDE_CLAUDE_BIN_ENV);
+        // SAFETY: guarded by FAKE_CLAUDE_ENV_LOCK for the whole window where
+        // the process-global environment points at the fake binary.
+        unsafe {
+            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
+        }
+
+        let (session, mut rx) = ClaudeSession::spawn(
+            &[workspace.path().to_string_lossy().to_string()],
+            None,
+            &[],
+            None,
+            None,
+            ToolPolicy::Unrestricted,
+            BackendAccessMode::Unrestricted,
+        )
+        .await
+        .expect("spawn fake Claude session");
+        session
+            .inner
+            .ensure_process_ready()
+            .await
+            .expect("initialize persistent fake Claude process");
+        session
+            .command_handle()
+            .execute(SessionCommand::SendMessage {
+                message: "answer once".to_string(),
+                images: None,
+            })
+            .await
+            .expect("send the only turn");
+
+        let mut events: Vec<Value> = Vec::new();
+        let _ = timeout(Duration::from_secs(5), async {
+            loop {
+                let Some(event) = rx.recv().await else {
+                    return;
+                };
+                events.push(event);
+            }
+        })
+        .await;
+
+        unsafe {
+            match previous_claude_bin {
+                Some(value) => std::env::set_var(TYDE_CLAUDE_BIN_ENV, value),
+                None => std::env::remove_var(TYDE_CLAUDE_BIN_ENV),
+            }
+        }
+
+        let dump = format_live_events(&events);
+        let stream_ends = events
+            .iter()
+            .filter(|event| event_kind(event) == Some("StreamEnd"))
+            .count();
+        assert_eq!(
+            stream_ends, 1,
+            "stray frames after a result must not open a second turn. Events:\n{dump}"
+        );
+        assert!(
+            !events.iter().any(|event| {
+                event_kind(event) == Some("StreamEnd")
+                    && stream_end_message(event)
+                        .get("content")
+                        .and_then(Value::as_str)
+                        == Some("STRAY")
+            }),
+            "stray content must never reach the client. Events:\n{dump}"
+        );
+    }
+
+    /// A wake arriving after shutdown must not open a turn — the guard that
+    /// `bd390355` added and that restoring the pre-`bd390355` implementation
+    /// would have silently reverted.
+    #[tokio::test]
+    async fn closing_backend_refuses_a_cli_initiated_turn() {
+        let (inner, mut rx) = make_test_inner();
+        let inner = Arc::new(inner);
+        {
+            let mut state = inner.state.lock().await;
+            state.closing = true;
+        }
+
+        assert!(
+            inner.begin_cli_initiated_turn().await.is_none(),
+            "a closing backend must not open a CLI-initiated turn"
+        );
+        assert!(
+            inner.state.lock().await.active_turn.is_none(),
+            "no turn may be installed by a refused wake"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a refused wake must emit nothing to the client"
+        );
+    }
+
+    /// An already-active turn owns the stream; a wake must not open a second
+    /// one on top of it.
+    #[tokio::test]
+    async fn active_turn_blocks_a_cli_initiated_turn() {
+        let (inner, _rx) = make_test_inner();
+        let inner = Arc::new(inner);
+        {
+            let mut state = inner.state.lock().await;
+            let (outcome_tx, _outcome_rx) = oneshot::channel();
+            state.active_turn = Some(ActiveTurn {
+                id: 7,
+                outcome_tx: Some(outcome_tx),
+                interrupt_requested: false,
+                pending_ask_user_question: None,
+                pending_exit_plan_mode: None,
+                quiesced_waiters: Vec::new(),
+            });
+        }
+
+        assert!(inner.begin_cli_initiated_turn().await.is_none());
+        assert_eq!(
+            inner.state.lock().await.active_turn.as_ref().map(|a| a.id),
+            Some(7),
+            "the live turn must be left untouched"
+        );
+    }
+
+    /// A turn that has already handed off its outcome is finished even though
+    /// its finalizer has not cleared it yet. Frames arriving in that window
+    /// must not be consumed against the closed turn's message id.
+    #[tokio::test]
+    async fn a_turn_that_handed_off_its_outcome_stops_accepting_frames() {
+        let (inner, _rx) = make_test_inner();
+        let inner = Arc::new(inner);
+        {
+            let mut state = inner.state.lock().await;
+            let (outcome_tx, _outcome_rx) = oneshot::channel();
+            state.active_turn = Some(ActiveTurn {
+                id: 11,
+                outcome_tx: Some(outcome_tx),
+                interrupt_requested: false,
+                pending_ask_user_question: None,
+                pending_exit_plan_mode: None,
+                quiesced_waiters: Vec::new(),
+            });
+        }
+        let mut turn_state = PersistentStdoutTurnState::default();
+        assert_eq!(
+            prepare_persistent_stdout_turn(&inner, &mut turn_state)
+                .await
+                .map(|(id, _)| id),
+            Some(11),
+            "a live turn still owns the stream"
+        );
+
+        inner
+            .complete_active_turn_with_outcome(
+                11,
+                TurnOutcome::Completed {
+                    summary: ClaudeStdoutSummary::default(),
+                    model_hint: None,
+                },
+            )
+            .await;
+
+        assert!(
+            prepare_persistent_stdout_turn(&inner, &mut turn_state)
+                .await
+                .is_none(),
+            "a turn that produced its result must not absorb further frames"
+        );
+    }
+
+    #[test]
+    fn is_cli_turn_start_event_classifies_frames() {
+        // Fresh turn content opens a CLI-initiated turn.
+        assert!(is_cli_turn_start_event(&json!({"type": "assistant"})));
+        assert!(is_cli_turn_start_event(
+            &json!({"type": "system", "subtype": "init"})
+        ));
+        assert!(is_cli_turn_start_event(&json!({"type": "stream_event"})));
+        assert!(is_cli_turn_start_event(&json!({"type": "message_start"})));
+
+        // Terminal / non-content frames must NOT spawn an empty turn.
+        assert!(!is_cli_turn_start_event(&json!({"type": "result"})));
+        assert!(!is_cli_turn_start_event(&json!({"type": "user"})));
+        assert!(!is_cli_turn_start_event(
+            &json!({"type": "system", "subtype": "task_notification"})
+        ));
+        assert!(!is_cli_turn_start_event(
+            &json!({"type": "rate_limit_event"})
+        ));
+    }
+
+    /// The wake token is what separates a real CLI wake from a stray frame
+    /// trailing a finished turn, so what arms it is load-bearing.
+    #[test]
+    fn only_root_owned_task_notifications_arm_the_cli_wake() {
+        assert!(claude_frame_arms_cli_wake(&json!({
+            "type": "system",
+            "subtype": "task_notification",
+            "task_id": "bmv4kco4r",
+            "status": "completed",
+        })));
+        // An unrecognized status must still arm: failing closed here costs the
+        // whole wake turn, which is the bug this exists to prevent.
+        assert!(claude_frame_arms_cli_wake(&json!({
+            "type": "system",
+            "subtype": "task_notification",
+            "status": "some-future-status",
+        })));
+
+        // A task owned by a sub-agent wakes that sub-agent's stream, not the
+        // root — in all three shapes the parent id is carried in.
+        for parented in [
+            json!({
+                "type": "system",
+                "subtype": "task_notification",
+                "status": "completed",
+                "parent_tool_use_id": "toolu_parent",
+            }),
+            json!({
+                "type": "system",
+                "subtype": "task_notification",
+                "status": "completed",
+                "data": { "parent_tool_use_id": "toolu_parent" },
+            }),
+            json!({
+                "type": "system",
+                "subtype": "task_notification",
+                "status": "completed",
+                "message": { "parent_tool_use_id": "toolu_parent" },
+            }),
+        ] {
+            assert!(
+                !claude_frame_arms_cli_wake(&parented),
+                "sub-agent-owned notification must not arm the root wake: {parented}"
+            );
+        }
+
+        // Non-terminal task frames are not wake triggers.
+        assert!(!claude_frame_arms_cli_wake(&json!({
+            "type": "system",
+            "subtype": "task_started",
+            "task_type": "local_bash",
+        })));
+        assert!(!claude_frame_arms_cli_wake(&json!({
+            "type": "system",
+            "subtype": "init",
+        })));
+    }
+
+    /// A dropped wake is ~8 frames; warning per frame would bury the signal.
+    #[test]
+    fn dropped_turn_start_warns_once_per_burst() {
+        let mut log = DroppedTurnStartLog::default();
+        log.observe(&json!({"type": "system", "subtype": "task_notification"}));
+        log.observe(&json!({"type": "system", "subtype": "init"}));
+        assert_eq!(log.recent.len(), 2);
+
+        log.warn_once_on_dropped_turn_start(&json!({"type": "system", "subtype": "init"}));
+        assert!(log.warned);
+        log.warn_once_on_dropped_turn_start(&json!({"type": "assistant"}));
+        assert!(
+            log.warned,
+            "the burst must stay warned, not re-warn per frame"
+        );
+
+        // A turn-terminal frame ends the burst and re-arms the warning.
+        log.observe(&json!({"type": "result"}));
+        assert!(!log.warned);
+        assert!(log.recent.is_empty());
+    }
+
+    /// Haiku is enough to prove the wake path: the assertion is about which
+    /// frames Tyde materializes, not about reasoning quality.
+    const LIVE_WAKE_PROBE_MODEL: &str = "claude-haiku-4-5-20251001";
+
+    fn live_background_task_status(event: &Value) -> Option<BackgroundTaskStatus> {
+        if event_kind(event) != Some("ToolProgress") {
+            return None;
+        }
+        let data: ToolProgressData = serde_json::from_value(event.get("data").cloned()?).ok()?;
+        match data.update {
+            ToolProgressUpdate::BackgroundTask(state) => Some(state.status),
+            _ => None,
+        }
+    }
+
+    /// When a background task finishes, the CLI wakes the model and runs a
+    /// *new* turn that no user message initiated. That wake turn is the only
+    /// mechanism by which the model can act on a background result at all —
+    /// it can call tools, not just narrate — so Tyde has to materialize it as
+    /// a turn instead of dropping it for lack of an owner.
+    #[tokio::test]
+    #[ignore = "requires --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
+    async fn live_claude_background_task_completion_wakes_a_new_turn() {
+        if !live_claude_tests_enabled() {
+            skip_live_claude_test();
+            return;
+        }
+
+        let (inner, mut rx) = make_live_test_inner(live_test_workspace_root());
+        {
+            let mut state = inner.state.lock().await;
+            state.model = Some(LIVE_WAKE_PROBE_MODEL.to_string());
+            state.effort = None;
+        }
+
+        let prompt = "Use the Bash tool exactly once, with run_in_background set to true, to \
+            run `sleep 20 && echo TYDE_WAKE_PROBE_DONE`. Do not wait for it, do not poll it, \
+            and do not read its output. Immediately reply with the single word LAUNCHED and \
+            end your turn.";
+        inner.clone().start_turn(prompt.to_string(), None).await;
+
+        let mut events: Vec<Value> = Vec::new();
+        let mut first_turn_idle: Option<usize> = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(180);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Some(event)) = timeout(remaining, rx.recv()).await else {
+                break;
+            };
+            let kind = event_kind(&event).map(str::to_string);
+            let idle = kind.as_deref() == Some("TypingStatusChanged")
+                && event.get("data").and_then(Value::as_bool) == Some(false);
+            events.push(event);
+            if idle && first_turn_idle.is_none() {
+                first_turn_idle = Some(events.len() - 1);
+                continue;
+            }
+            // The wake turn has landed once a second assistant message closes.
+            if first_turn_idle.is_some() && kind.as_deref() == Some("StreamEnd") {
+                break;
+            }
+        }
+
+        let dump = format_live_events(&events);
+        let first_turn_idle = first_turn_idle.unwrap_or_else(|| {
+            panic!("The launching turn never went idle. Events:\n{dump}");
+        });
+
+        // Precondition, not the claim under test: if the model ran the command
+        // in the foreground there is no background completion to wake on, and
+        // a failure below would say nothing about Tyde.
+        assert!(
+            events
+                .iter()
+                .any(|event| live_background_task_status(event).is_some()),
+            "Precondition failed: the model never launched a background task, so no wake \
+             could occur. Events:\n{dump}"
+        );
+
+        let wake_start = events
+            .iter()
+            .enumerate()
+            .skip(first_turn_idle + 1)
+            .find(|(_, event)| event_kind(event) == Some("StreamStart"))
+            .map(|(index, _)| index)
+            .unwrap_or_else(|| {
+                panic!(
+                    "The background task completed and the CLI woke the model, but Tyde \
+                     materialized no turn for it: no StreamStart follows the launching turn. \
+                     Events:\n{dump}"
+                );
+            });
+        let wake_end = events
+            .iter()
+            .enumerate()
+            .skip(wake_start + 1)
+            .find(|(_, event)| event_kind(event) == Some("StreamEnd"))
+            .map(|(index, _)| index)
+            .unwrap_or_else(|| {
+                panic!("The wake turn opened but never closed. Events:\n{dump}");
+            });
+
+        let wake_text = stream_end_message(&events[wake_end])
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            !wake_text.trim().is_empty(),
+            "The wake turn produced an empty assistant message. Events:\n{dump}"
         );
     }
 
@@ -25134,6 +26382,7 @@ for raw_line in sys.stdin:
                     background_tasks: StdMutex::new(BackgroundTaskRegistry::active()),
                     skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
                     skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
+                    pending_cli_wake: std::sync::atomic::AtomicBool::new(false),
                 }),
                 parent_tool_use_id: "toolu_spawn".to_string(),
                 parent_tool_name: "Task".to_string(),

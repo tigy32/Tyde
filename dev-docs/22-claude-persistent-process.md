@@ -85,6 +85,36 @@ over the stream-json **control protocol** on a persistent stdin/stdout pipe.
 - The process staying alive across turns means **no per-turn `--resume`** and no
   per-turn re-spawn.
 
+### 2.2.1 CLI-initiated turns
+
+Not every turn begins with a user message. When a background task reaches a
+terminal state, the CLI **wakes the model on its own initiative** and runs a
+full turn — `system init`, assistant content, `result` — on the root stream
+with `parent_tool_use_id: null` and no `user` frame in front of it. This is how
+the model gets to act on a background result at all: the wake turn can call
+tools, not merely narrate.
+
+The backend adopts that sequence as a first-class turn via
+`begin_cli_initiated_turn`, which mirrors `start_turn`'s scaffolding but emits
+no user bubble. Adoption requires two conditions together:
+
+1. an **armed wake token** — set when a root-owned `task_notification` is seen,
+   which is what actually makes the CLI wake; and
+2. a **turn-start frame shape** (`is_cli_turn_start_event`).
+
+The token is the necessary half: without it a stray frame trailing a finished
+turn could open a phantom turn. The frame shape is the sufficient half, kept
+broad on purpose — a wake that omitted `init` would otherwise lose its entire
+turn. Turn-start content dropped with no armed token is logged once per burst,
+with the preceding `system` subtypes, so an unrecognized wake trigger surfaces
+instead of vanishing.
+
+The agent actor is built for this: a backend that is busy with a self-started
+turn hands sends back via `SendOutcome::Busy` and the actor requeues them
+(`tests/tests/agents.rs` → `agent_requeues_message_when_backend_is_busy_with_self_started_turn`).
+One user-visible consequence: a settled agent re-enters **Active** when a wake
+turn opens, so team compaction is transiently refused and team messages queue.
+
 ### 2.3 Interrupt
 
 - Interrupt is a stream-json **`control_request` with subtype `interrupt`**

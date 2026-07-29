@@ -578,10 +578,16 @@ unique name, prompt marker, command marker, and final-answer marker.
    targets the same child.
 5. After the child completes, confirm parent progress, child status, final
    answer, and in-flight surfaces transition exactly once.
-6. Confirm a background-completion notification does not create an unsolicited
-   second assistant turn in the parent or duplicate the child's final answer.
-   Any parent notification must remain typed status/progress with its own clear
-   identity and must not add answer usage as a new parent response.
+6. Confirm **Tyde** does not synthesize a parent response out of the
+   background-completion notification. Any parent notification Tyde emits must
+   remain typed status/progress with its own clear identity, and Tyde must not
+   render the child's final answer a second time on the parent.
+7. Confirm the CLI's **own** wake turn appears in the parent exactly once. When
+   a background task completes, the CLI wakes the model and runs a real turn
+   with no user message behind it; that turn is legitimate parent content, gets
+   its own usage, and must not be dropped. Note that the model's wake text
+   often quotes the child's answer — that is the CLI's content, not a Tyde
+   rendering duplicate, and is not a defect.
 
 ### Native child usage
 
