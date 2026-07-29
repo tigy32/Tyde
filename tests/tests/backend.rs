@@ -492,16 +492,21 @@ async fn expect_fixture_agent_start_with_chat_events(
     }
 }
 
-async fn expect_fixture_initial_stream_end(
+async fn expect_fixture_initial_turn_completion(
     client: &mut client::Connection,
     agent_stream: &StreamPath,
     bootstrap_chat_events: Vec<ChatEvent>,
     context: &str,
 ) {
-    if bootstrap_chat_events
-        .iter()
-        .any(|event| matches!(event, ChatEvent::StreamEnd(_)))
-    {
+    // Settled no-tool streams are canonicalized to one assistant MessageAdded in replay.
+    if bootstrap_chat_events.iter().any(|event| {
+        matches!(event, ChatEvent::StreamEnd(_))
+            || matches!(
+                event,
+                ChatEvent::MessageAdded(message)
+                    if matches!(message.sender, MessageSender::Assistant { .. })
+            )
+    }) {
         return;
     }
     loop {
@@ -2692,7 +2697,7 @@ async fn empty_workspace_spawn_is_accepted_for_all_backends() {
             .unwrap_or_else(|| panic!("{backend_kind:?} empty-root AgentStart missing session_id"));
         session_ids.push((backend_kind, session_id));
 
-        expect_fixture_initial_stream_end(
+        expect_fixture_initial_turn_completion(
             &mut fixture.client,
             &new_agent.instance_stream,
             bootstrap_chat_events,
@@ -3133,7 +3138,7 @@ async fn antigravity_native_uuid_session_remains_resumable_after_close() {
         .clone()
         .expect("Antigravity AgentStart session_id");
 
-    expect_fixture_initial_stream_end(
+    expect_fixture_initial_turn_completion(
         &mut fixture.client,
         &new_agent.instance_stream,
         bootstrap_chat_events,
@@ -3338,7 +3343,7 @@ async fn antigravity_direct_resume_missing_native_db_reports_startup_failure() {
         .clone()
         .expect("Antigravity AgentStart session_id");
 
-    expect_fixture_initial_stream_end(
+    expect_fixture_initial_turn_completion(
         &mut fixture.client,
         &new_agent.instance_stream,
         bootstrap_chat_events,
@@ -3795,7 +3800,7 @@ async fn kiro_dynamic_schema_discovery_uses_probe_models() {
         "Kiro AgentStart",
     )
     .await;
-    expect_fixture_initial_stream_end(
+    expect_fixture_initial_turn_completion(
         &mut fixture.client,
         &agent_stream,
         bootstrap_chat_events,

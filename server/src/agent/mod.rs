@@ -18794,6 +18794,7 @@ mod tests {
                 ));
             }
             let session_store = Arc::clone(&runtime.session_store);
+            let transcript_store = runtime.transcript_store.clone();
             let (handle, startup_rx) =
                 spawn_agent_actor(start.agent_id.clone(), start, request, runtime);
             let session_id = startup_rx
@@ -18876,12 +18877,9 @@ mod tests {
                 stored.is_terminal(),
                 "{path:?} must persist a terminal record"
             );
-            let transcript = crate::store::transcript::TranscriptStore::new(
-                crate::store::transcript::TranscriptStore::default_root()
-                    .expect("test transcript root"),
-            )
-            .load(&session_id)
-            .expect("canonical transcript records");
+            let transcript = transcript_store
+                .load(&session_id)
+                .expect("canonical transcript records");
             assert_eq!(
                 transcript
                     .iter()
@@ -18907,6 +18905,7 @@ mod tests {
                 resume_request.resume_session_id = Some(session_id.clone());
                 resume_request.initial_input = None;
                 resume_runtime.session_store = Arc::clone(&session_store);
+                resume_runtime.transcript_store = transcript_store.clone();
                 let (resumed, resumed_startup) = spawn_agent_actor(
                     resume_start.agent_id.clone(),
                     resume_start,

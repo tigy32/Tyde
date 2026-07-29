@@ -6105,8 +6105,7 @@ async fn cancelling_parent_terminally_closes_live_native_child_and_replays_idle(
             .await;
     }
 
-    let child_env = expect_kind(&mut fixture.client, FrameKind::NewAgent, "child NewAgent").await;
-    let child: NewAgentPayload = child_env.parse_payload().expect("parse child NewAgent");
+    let child = expect_new_agent(&mut fixture.client, "child NewAgent").await;
     expect_agent_start_on_stream(&mut fixture.client, &child.instance_stream, "child start").await;
     expect_native_child_prompt_on_stream(
         &mut fixture.client,
