@@ -125,6 +125,8 @@ fn bootstrap_event_envelope(
         AgentBootstrapEvent::SessionSettings(_)
         | AgentBootstrapEvent::QueuedMessages(_)
         | AgentBootstrapEvent::AgentActivityStats(_)
+        | AgentBootstrapEvent::ContextCompaction(_)
+        | AgentBootstrapEvent::ContextCompactionCapability(_)
         | AgentBootstrapEvent::HasPriorHistory { .. } => None,
     }
     .map(|result| result.expect("serialize AgentBootstrap event"))

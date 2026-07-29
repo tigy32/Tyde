@@ -428,6 +428,7 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                 | HostEvent::TeamMemberBindingNotify(_)
                 | HostEvent::TeamPresetCatalogNotify(_)
                 | HostEvent::TeamDraftNotify(_)
+                | HostEvent::TeamContextCompactionNotify(_)
                 | HostEvent::TeamMemberShuffleSuggestionNotify(_) => {}
             }
         }
@@ -506,6 +507,8 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                             | AgentBootstrapEvent::SessionSettings(_)
                             | AgentBootstrapEvent::QueuedMessages(_)
                             | AgentBootstrapEvent::AgentActivityStats(_)
+                            | AgentBootstrapEvent::ContextCompaction(_)
+                            | AgentBootstrapEvent::ContextCompactionCapability(_)
                             | AgentBootstrapEvent::HasPriorHistory { .. } => {}
                         }
                     }
@@ -528,6 +531,8 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                 | AgentEvent::SessionSettings(_)
                 | AgentEvent::QueuedMessages(_)
                 | AgentEvent::SessionHistory(_)
+                | AgentEvent::ContextCompactionNotify(_)
+                | AgentEvent::ContextCompactionCapability(_)
                 | AgentEvent::ActivityStats(_) => {}
                 AgentEvent::Error(err) => panic!("unexpected agent error: {}", err.message),
             }

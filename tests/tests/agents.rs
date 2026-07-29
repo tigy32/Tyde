@@ -147,6 +147,8 @@ fn agent_bootstrap_event_envelope(
             &payload,
         )),
         AgentBootstrapEvent::AgentActivityStats(_)
+        | AgentBootstrapEvent::ContextCompaction(_)
+        | AgentBootstrapEvent::ContextCompactionCapability(_)
         | AgentBootstrapEvent::HasPriorHistory { .. } => None,
     }
     .map(|result| result.expect("serialize synthetic bootstrap event"))

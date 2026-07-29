@@ -934,6 +934,8 @@ async fn workflow_child_agents_inherit_context_and_backend_allowlist() {
                     | AgentBootstrapEvent::QueuedMessages(_)
                     | AgentBootstrapEvent::AgentActivityStats(_)
                     | AgentBootstrapEvent::ChatEvent(_)
+                    | AgentBootstrapEvent::ContextCompaction(_)
+                    | AgentBootstrapEvent::ContextCompactionCapability(_)
                     | AgentBootstrapEvent::HasPriorHistory { .. } => None,
                 }) else {
                     continue;

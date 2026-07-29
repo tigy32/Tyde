@@ -1025,11 +1025,14 @@ async fn fake_codex_provider_items_keep_identity_live_late_and_same_host_reconne
         "parent-tool",
         "late Codex attach replay",
     );
+    let history_request_id =
+        protocol::HistoryPageRequestId("fake-codex-paged-history".to_owned());
     late_client
         .fetch_session_history(
             &late_agent.instance_stream,
             FetchSessionHistoryPayload {
                 agent_id: parent.agent_id.clone(),
+                request_id: history_request_id.clone(),
                 before_seq: None,
                 limit: 100,
             },
@@ -1044,6 +1047,7 @@ async fn fake_codex_provider_items_keep_identity_live_late_and_same_host_reconne
                 .expect("parse fake Codex paged history");
         }
     };
+    assert_eq!(paged_history.request_id, history_request_id);
     let mut paged_observation = CodexIdentityObservation::default();
     for event in paged_history.events.clone() {
         paged_observation.observe(event);
