@@ -23596,10 +23596,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         CompactFixture { _dir: dir, host }
     }
 
-    async fn assert_native_context_compaction_route(
-        host: &HostHandle,
-        agent_id: &AgentId,
-    ) {
+    async fn assert_native_context_compaction_route(host: &HostHandle, agent_id: &AgentId) {
         let capability = host
             .agent_handle(agent_id)
             .await
@@ -25122,9 +25119,8 @@ Rules: Record only what remains true and useful for future work; drop transient 
             if envelope.kind != FrameKind::ContextCompactionNotify {
                 continue;
             }
-            let payload: ContextCompactionNotifyPayload = envelope
-                .parse_payload()
-                .expect("context compaction notify");
+            let payload: ContextCompactionNotifyPayload =
+                envelope.parse_payload().expect("context compaction notify");
             if payload.status.is_terminal() {
                 assert_eq!(payload.status, ContextCompactionStatus::Completed);
                 break;
@@ -25216,9 +25212,8 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 .expect("output envelope");
             match envelope.kind {
                 FrameKind::ContextCompactionNotify => {
-                    let payload: ContextCompactionNotifyPayload = envelope
-                        .parse_payload()
-                        .expect("context compaction notify");
+                    let payload: ContextCompactionNotifyPayload =
+                        envelope.parse_payload().expect("context compaction notify");
                     if payload.status.is_terminal() {
                         assert_eq!(payload.status, ContextCompactionStatus::Completed);
                         terminal_seen = true;
