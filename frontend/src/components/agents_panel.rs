@@ -3504,7 +3504,10 @@ mod wasm_tests {
 
         // Capability unknown → visible, disabled, and it says why.
         let (_, enabled, label) = compact_btn_state(&container);
-        assert!(!enabled, "unknown capability must not optimistically enable");
+        assert!(
+            !enabled,
+            "unknown capability must not optimistically enable"
+        );
         assert!(
             label.contains("unavailable:"),
             "and the reason must be on the accessible name: {label}"
@@ -3852,7 +3855,10 @@ mod wasm_tests {
         );
         // And the same gate refuses a second submit.
         let (btn, enabled, _) = compact_btn_state(&container);
-        assert!(!enabled, "the control disables while its request is in flight");
+        assert!(
+            !enabled,
+            "the control disables while its request is in flight"
+        );
         btn.click();
         for _ in 0..8 {
             next_tick().await;

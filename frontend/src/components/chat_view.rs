@@ -2754,7 +2754,10 @@ mod wasm_tests {
         // sharper: it covers every sender (User/System/Warning/Error/Assistant)
         // rather than two literals, and prose can never satisfy it.
         assert!(
-            marker.query_selector(".chat-card-sender").unwrap().is_none(),
+            marker
+                .query_selector(".chat-card-sender")
+                .unwrap()
+                .is_none(),
             "a marker carries no sender label element: {text}"
         );
         assert!(
