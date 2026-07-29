@@ -1121,11 +1121,18 @@ may map `SpawnCostHint` differently:
   WebSocket, PTY/xterm, or ANSI parsing
 - `Acp`: any Agent Client Protocol agent over stdio. Capabilities are
   negotiated from the `initialize` response rather than assumed —
-  `agentCapabilities.loadSession` gates resume and `promptCapabilities.image`
-  gates image input — and an agent advertising `authMethods` is authenticated
+  `agentCapabilities.loadSession` gates resume, `promptCapabilities.image`
+  gates image input, and `agentCapabilities.sessionCapabilities.list` gates
+  `session/list` — and an agent advertising `authMethods` is authenticated
   before `session/new`. `messageId` is optional in ACP, so an agent that omits
   it gets a deterministic server-generated message identity instead of having
   its output dropped.
+
+  Session enumeration prefers the spec: an agent advertising
+  `sessionCapabilities.list` is listed with `session/list`, following
+  `nextCursor` and filtering by `cwd`, so it needs no adapter code to be
+  resumable. Adapters cover only agents that list out of band — Kiro reads its
+  own JSON session files (locally or over ssh) and advertises nothing.
 - Others: backend-specific model selection where supported
 
 ### Key design decisions

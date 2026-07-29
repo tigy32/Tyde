@@ -58,6 +58,10 @@ pub struct AcpCapabilities {
     pub load_session: bool,
     /// `promptCapabilities.image` — may prompts carry image content blocks?
     pub image: bool,
+    /// `agentCapabilities.sessionCapabilities.list` — may we call
+    /// `session/list`? This is the spec's own way to enumerate sessions, so an
+    /// agent advertising it needs no adapter support to be resumable.
+    pub session_list: bool,
     /// `authMethods[].id`, in the order the agent listed them.
     pub auth_methods: Vec<String>,
     /// Agent name/version from `agentInfo`, for diagnostics.

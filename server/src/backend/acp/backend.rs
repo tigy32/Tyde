@@ -144,6 +144,13 @@ fn parse_capabilities(response: &Value) -> AcpCapabilities {
             .and_then(|caps| caps.get("image"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        // `sessionCapabilities.list` is an object, not a bool: the spec gates
+        // the method on the key being present at all, and the object carries
+        // only `_meta`. Treat any non-null value as support.
+        session_list: agent_caps
+            .and_then(|caps| caps.get("sessionCapabilities"))
+            .and_then(|caps| caps.get("list"))
+            .is_some_and(|value| !value.is_null()),
         auth_methods: response
             .get("authMethods")
             .and_then(Value::as_array)
@@ -943,6 +950,59 @@ impl KiroInner {
         }
     }
 
+    /// Enumerates sessions with the spec's `session/list`, following
+    /// `nextCursor` until the agent stops paginating.
+    ///
+    /// The page count is bounded: a buggy agent that always echoes a cursor
+    /// would otherwise spin here forever holding the session list open. Hitting
+    /// the bound returns what was collected rather than failing, because a
+    /// truncated list is more useful than none.
+    async fn list_sessions_via_acp(&self) -> Result<Vec<BackendSession>, String> {
+        const MAX_PAGES: usize = 100;
+
+        let workspace_root = self.state.lock().await.workspace_root.clone();
+        let mut sessions = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        for page in 0..MAX_PAGES {
+            let mut params = json!({});
+            if !workspace_root.is_empty() {
+                params["cwd"] = Value::String(workspace_root.clone());
+            }
+            if let Some(cursor) = &cursor {
+                params["cursor"] = Value::String(cursor.clone());
+            }
+
+            let response = self.bridge.request("session/list", params).await?;
+            let page_sessions = response
+                .get("sessions")
+                .and_then(Value::as_array)
+                .ok_or_else(|| format!("ACP session/list response missing sessions: {response}"))?;
+            for session in page_sessions {
+                if let Some(session) = acp_session_info_to_backend_session(session) {
+                    sessions.push(session);
+                }
+            }
+
+            cursor = response
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|cursor| !cursor.is_empty());
+            if cursor.is_none() {
+                return Ok(sessions);
+            }
+            if page + 1 == MAX_PAGES {
+                tracing::warn!(
+                    pages = MAX_PAGES,
+                    "ACP session/list kept paginating; returning a truncated list"
+                );
+            }
+        }
+
+        Ok(sessions)
+    }
+
     async fn list_sessions(&self) -> Result<(), String> {
         let excluded_session_id = {
             let state = self.state.lock().await;
@@ -953,12 +1013,15 @@ impl KiroInner {
             }
         };
 
-        // Session storage is entirely agent-specific — Kiro keeps JSON files in
-        // its own directory, another agent may expose ACP `session/list` or
-        // nothing at all. Ask the adapter rather than reading Kiro's layout, or
-        // a stock agent would be handed Kiro's session list as if it were its
-        // own.
-        let listed = self.adapter.list_sessions(self.ssh_host.as_deref()).await?;
+        // `session/list` is the spec's own way to enumerate sessions, so an
+        // agent that advertises it needs no adapter support at all. Adapters
+        // only cover agents that list out of band: Kiro reads its own JSON
+        // files (locally or over ssh) and advertises nothing.
+        let listed = if self.capabilities.session_list {
+            self.list_sessions_via_acp().await?
+        } else {
+            self.adapter.list_sessions(self.ssh_host.as_deref()).await?
+        };
 
         let mut sessions = listed
             .into_iter()
@@ -3489,6 +3552,49 @@ pub(crate) fn pick_workspace_root(workspace_roots: &[String]) -> Result<String, 
     crate::backend::tyde_owned_no_root_cwd("kiro")
 }
 
+/// Maps one ACP `SessionInfo` onto Tyde's `BackendSession`.
+///
+/// `sessionId` is the only required field, so an entry without one is dropped
+/// rather than surfaced as an unresumable row. `updatedAt` is ISO 8601 in the
+/// spec; the spec carries no created-at or token count, so those stay unset
+/// instead of being invented from the timestamp we do have.
+///
+/// `resumable` is reported as true because `session/list` exists to enumerate
+/// sessions for resuming. An agent that lists a session it cannot load is
+/// misbehaving, and `session/load` reports that at the point it happens.
+fn acp_session_info_to_backend_session(info: &Value) -> Option<BackendSession> {
+    let session_id = info
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())?;
+    let cwd = info
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty());
+    let updated_at_ms = info
+        .get("updatedAt")
+        .and_then(Value::as_str)
+        .and_then(parse_iso8601_to_unix_ms);
+
+    Some(BackendSession {
+        id: SessionId(session_id.to_string()),
+        backend_kind: BackendKind::Acp,
+        workspace_roots: cwd.map(|cwd| vec![cwd.to_string()]).unwrap_or_default(),
+        title: info
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(str::to_string),
+        token_count: None,
+        created_at_ms: None,
+        updated_at_ms,
+        resumable: true,
+    })
+}
+
 pub(crate) fn parse_iso8601_to_unix_ms(s: &str) -> Option<u64> {
     let utc = s.trim().strip_suffix('Z').unwrap_or(s.trim());
     let (date, time) = utc.split_once('T')?;
@@ -4615,6 +4721,182 @@ mod tests {
     /// `loadSession: false`, sends no `messageId` on any chunk, and uses none of
     /// Kiro's extensions. This is the fixture that proves the generic path works
     /// for a third-party agent rather than only for the agent it grew up around.
+    /// A spec-conforming agent that advertises `sessionCapabilities.list` and
+    /// paginates its answer, so the generic `session/list` path is exercised
+    /// end to end including `nextCursor`.
+    #[test]
+    fn session_list_capability_is_gated_on_the_key_being_present() {
+        // The spec gates `session/list` on the key existing; the object itself
+        // carries only `_meta`, so testing for `true` would never match a real
+        // agent.
+        let advertised = parse_capabilities(&json!({
+            "agentCapabilities": {"sessionCapabilities": {"list": {}}}
+        }));
+        assert!(advertised.session_list);
+
+        let silent = parse_capabilities(&json!({
+            "agentCapabilities": {"sessionCapabilities": {}}
+        }));
+        assert!(
+            !silent.session_list,
+            "an agent that does not advertise the method must fall back to its adapter"
+        );
+
+        let none = parse_capabilities(&json!({"agentCapabilities": {}}));
+        assert!(!none.session_list);
+
+        let explicit_null = parse_capabilities(&json!({
+            "agentCapabilities": {"sessionCapabilities": {"list": null}}
+        }));
+        assert!(
+            !explicit_null.session_list,
+            "an explicit null is not an advertisement"
+        );
+    }
+
+    #[test]
+    fn acp_session_info_maps_only_what_the_spec_actually_carries() {
+        let mapped = acp_session_info_to_backend_session(&json!({
+            "sessionId": "s1",
+            "cwd": "/repo",
+            "title": "Title",
+            "updatedAt": "2026-07-01T00:00:00Z"
+        }))
+        .expect("a complete SessionInfo maps");
+        assert_eq!(mapped.id.0, "s1");
+        assert_eq!(mapped.workspace_roots, vec!["/repo".to_string()]);
+        assert_eq!(mapped.title.as_deref(), Some("Title"));
+        assert!(mapped.updated_at_ms.is_some());
+        assert!(
+            mapped.created_at_ms.is_none() && mapped.token_count.is_none(),
+            "the spec carries neither, so neither may be invented from updatedAt"
+        );
+
+        assert!(
+            acp_session_info_to_backend_session(&json!({"cwd": "/repo"})).is_none(),
+            "an entry with no sessionId cannot be resumed and must be dropped"
+        );
+        assert!(
+            acp_session_info_to_backend_session(&json!({"sessionId": "   "})).is_none(),
+            "a blank sessionId is as unusable as a missing one"
+        );
+
+        let sparse = acp_session_info_to_backend_session(&json!({"sessionId": "s2"}))
+            .expect("sessionId is the only required field");
+        assert!(sparse.workspace_roots.is_empty());
+        assert_eq!(sparse.title, None);
+        assert_eq!(sparse.updated_at_ms, None);
+    }
+
+    fn write_fake_session_list_program() -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("tyde-acp-session-list-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create fake session-list tempdir");
+        let path = dir.join("fake-session-list-acp");
+        let script = r#"#!/bin/sh
+read line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"list":{}}}}}'
+read line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"live-session"}}'
+read line
+case "$line" in
+  *'"cursor"'*)
+    printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessions":[{"sessionId":"s2","cwd":"/repo/two","title":"Second","updatedAt":"2026-07-02T00:00:00Z"}]}}'
+    ;;
+  *)
+    printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessions":[{"sessionId":"s1","cwd":"/repo/one","title":"First","updatedAt":"2026-07-01T00:00:00Z"},{"cwd":"/repo/broken"}],"nextCursor":"page-2"}}'
+    read line
+    printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"sessions":[{"sessionId":"s2","cwd":"/repo/two","title":"Second","updatedAt":"2026-07-02T00:00:00Z"}]}}'
+    ;;
+esac
+sleep 5
+"#;
+        std::fs::write(&path, script).expect("write fake session-list program");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path)
+                .expect("stat fake session-list program")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod fake session-list program");
+        }
+        path
+    }
+
+    #[tokio::test]
+    async fn an_agent_advertising_session_list_is_enumerated_over_acp() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("tyde-acp-list-ws-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create session-list workspace");
+        let program = write_fake_session_list_program();
+
+        let agent = protocol::AcpAgentSpec {
+            command: program.to_string_lossy().to_string(),
+            args: Vec::new(),
+            cwd: None,
+            env: Default::default(),
+            adapter: protocol::AcpAdapterId::Stock,
+        };
+
+        let (session, mut raw_events) = KiroSession::spawn_for_agent(
+            &[workspace_root.to_string_lossy().to_string()],
+            Some(&agent),
+            None,
+            None,
+            &[],
+            None,
+        )
+        .await
+        .expect("spawn session-list agent");
+
+        session
+            .command_handle()
+            .execute(SessionCommand::ListSessions)
+            .await
+            .expect("list sessions");
+
+        let events = collect_kiro_turn_events(&mut raw_events).await;
+        let listed = events
+            .iter()
+            .find(|event| event.get("kind").and_then(Value::as_str) == Some("SessionsList"))
+            .and_then(|event| event.pointer("/data/sessions"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_else(|| panic!("no SessionsList event: {events:?}"));
+
+        let ids = listed
+            .iter()
+            .filter_map(|session| session.get("session_id").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec!["s2", "s1"],
+            "both pages must be followed via nextCursor, newest first: {listed:?}"
+        );
+        assert_eq!(
+            listed[1].get("title").and_then(Value::as_str),
+            Some("First")
+        );
+        assert_eq!(
+            listed[1].get("workspace_root").and_then(Value::as_str),
+            Some("/repo/one")
+        );
+        assert!(
+            listed
+                .iter()
+                .all(|session| session.get("session_id").and_then(Value::as_str) != Some("")),
+            "an entry with no sessionId is unusable and must be dropped, not listed blank"
+        );
+        assert_eq!(
+            listed.len(),
+            2,
+            "the malformed entry with no sessionId must not appear: {listed:?}"
+        );
+
+        session.shutdown().await;
+    }
+
     fn write_fake_stock_acp_program() -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("tyde-stock-acp-test-{}", uuid::Uuid::new_v4()));
