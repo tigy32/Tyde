@@ -25039,7 +25039,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 let expected_content = expected_content.to_owned();
                 let visible = tokio::task::spawn_blocking(move || {
                     if !store.is_authoritative(&session_id) {
-                        return Ok(None);
+                        return Ok::<Option<HashSet<String>>, String>(None);
                     }
                     let records = store.load(&session_id)?;
                     let has_expected_message = records.iter().any(|record| {
