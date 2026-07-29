@@ -337,7 +337,7 @@ impl KiroSession {
 
     async fn spawn_schema_probe(
         workspace_roots: &[String],
-        program_override: Option<String>,
+        adapter: Arc<dyn AcpAgentAdapter>,
         probe_deadline: tokio::time::Instant,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
@@ -349,7 +349,7 @@ impl KiroSession {
                 ssh_host: None,
                 startup_mcp_servers: &[],
                 steering_content: None,
-                adapter: kiro_adapter(program_override),
+                adapter,
                 probe_deadline: Some(probe_deadline),
             },
         )
@@ -3362,13 +3362,24 @@ fn session_settings_schema_from_known_models(
     })
 }
 
+/// Probes one ACP agent for its session settings schema.
+///
+/// The schema comes from the agent's own `ModelsList`, so each configured agent
+/// has to be probed separately — `agent` selects which one. `None` probes the
+/// built-in Kiro agent, optionally with `program_override` pointing at a
+/// different binary (used by tests and the Kiro probe-path setting).
 pub(crate) async fn probe_session_settings_schema(
     workspace_roots: &[String],
     program_override: Option<String>,
+    agent: Option<&protocol::AcpAgentSpec>,
 ) -> Result<protocol::SessionSettingsSchema, String> {
+    let adapter = match agent {
+        Some(spec) => adapter_for_spec(spec),
+        None => kiro_adapter(program_override),
+    };
     let deadline = tokio::time::Instant::now() + KIRO_SCHEMA_PROBE_TIMEOUT;
     let (session, mut raw_events) =
-        KiroSession::spawn_schema_probe(workspace_roots, program_override, deadline).await?;
+        KiroSession::spawn_schema_probe(workspace_roots, adapter, deadline).await?;
     let handle = session.command_handle();
 
     let probe_result = await_kiro_stage(Some(deadline), KiroSchemaProbeStage::ModelsList, async {

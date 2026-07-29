@@ -974,8 +974,12 @@ struct AgentCompaction {
     summary_rx: oneshot::Receiver<Result<CompactionSummary, String>>,
 }
 
+/// Per-ACP-agent session schema. Unlike the other backends there is no single
+/// ACP schema: the models and modes come from probing the agent itself, so two
+/// configured agents legitimately expose different settings. State is therefore
+/// keyed by launch profile rather than living in one field.
 #[derive(Clone, Debug)]
-enum KiroSessionSchemaState {
+enum AcpSessionSchemaState {
     Pending,
     Ready(SessionSettingsSchema),
     Unavailable(String),
@@ -1042,7 +1046,9 @@ pub(crate) struct HostState {
     pub workflow_run_store: WorkflowRunStore,
     pub mobile_access: MobileAccessHandle,
     codex_session_schema: CodexSessionSchemaState,
-    kiro_session_schema: KiroSessionSchemaState,
+    /// One entry per configured ACP launch profile. A missing key means the
+    /// profile has not been probed yet and reads as `Pending`.
+    acp_session_schemas: HashMap<LaunchProfileId, AcpSessionSchemaState>,
     hermes_session_schema: HermesSessionSchemaState,
     /// Hermes profiles discovered by the last session-schema probe; drives
     /// the synthesized "Hermes — <profile>" launch-profile entries.
@@ -2020,7 +2026,14 @@ impl HostHandle {
             BackendKind::Codex => {
                 state.codex_session_schema = CodexSessionSchemaState::Ready(schema)
             }
-            BackendKind::Acp => state.kiro_session_schema = KiroSessionSchemaState::Ready(schema),
+            BackendKind::Acp => {
+                // Tests drive the built-in agent; per-profile schemas are set
+                // by the real probe loop.
+                state.acp_session_schemas.insert(
+                    LaunchProfileId(protocol::KIRO_LAUNCH_PROFILE_ID.to_owned()),
+                    AcpSessionSchemaState::Ready(schema),
+                );
+            }
             BackendKind::Hermes => {
                 state.hermes_session_schema = HermesSessionSchemaState::Ready(schema)
             }
@@ -2033,9 +2046,13 @@ impl HostHandle {
             state.codex_session_schema =
                 CodexSessionSchemaState::Unavailable("test schema not configured".to_owned());
         }
-        if matches!(&state.kiro_session_schema, KiroSessionSchemaState::Pending) {
-            state.kiro_session_schema =
-                KiroSessionSchemaState::Unavailable("test schema not configured".to_owned());
+        let builtin_acp = state
+            .acp_session_schemas
+            .entry(LaunchProfileId(protocol::KIRO_LAUNCH_PROFILE_ID.to_owned()))
+            .or_insert(AcpSessionSchemaState::Pending);
+        if matches!(builtin_acp, AcpSessionSchemaState::Pending) {
+            *builtin_acp =
+                AcpSessionSchemaState::Unavailable("test schema not configured".to_owned());
         }
         if matches!(
             &state.hermes_session_schema,
@@ -2059,7 +2076,10 @@ impl HostHandle {
                     CodexSessionSchemaState::Unavailable(message.to_owned())
             }
             BackendKind::Acp => {
-                state.kiro_session_schema = KiroSessionSchemaState::Unavailable(message.to_owned())
+                state.acp_session_schemas.insert(
+                    LaunchProfileId(protocol::KIRO_LAUNCH_PROFILE_ID.to_owned()),
+                    AcpSessionSchemaState::Unavailable(message.to_owned()),
+                );
             }
             BackendKind::Hermes => {
                 state.hermes_session_schema =
@@ -2071,6 +2091,32 @@ impl HostHandle {
 
     pub async fn session_schema_probe_count_for_test(&self) -> u64 {
         self.state.lock().await.session_schema_probe_count
+    }
+
+    /// Sets one ACP agent's schema. Unlike the per-kind helpers above this is
+    /// profile-scoped, because two configured ACP agents legitimately expose
+    /// different settings.
+    pub async fn set_acp_session_schema_for_test(
+        &self,
+        profile_id: &LaunchProfileId,
+        schema: SessionSettingsSchema,
+    ) {
+        let _refresh_guard = self.session_schema_refresh_lock.lock().await;
+        let mut state = self.state.lock().await;
+        state
+            .acp_session_schemas
+            .insert(profile_id.clone(), AcpSessionSchemaState::Ready(schema));
+    }
+
+    pub async fn acp_session_schema_for_test(
+        &self,
+        profile_id: &LaunchProfileId,
+    ) -> Option<SessionSettingsSchema> {
+        let state = self.state.lock().await;
+        match acp_schema_state(&state.acp_session_schemas, Some(profile_id)) {
+            AcpSessionSchemaState::Ready(schema) => Some(schema.clone()),
+            AcpSessionSchemaState::Pending | AcpSessionSchemaState::Unavailable(_) => None,
+        }
     }
 }
 
@@ -4775,11 +4821,13 @@ impl HostHandle {
                 }
                 let startup_mcp_servers =
                     protocol_mcp_servers_to_startup(&resolved_spawn_config.mcp_servers);
-                let (session_settings_schema, schema_failure) =
-                    match self.resolve_session_schema_for_spawn(backend_kind).await {
-                        Ok(schema) => (schema, None),
-                        Err(failure) => (None, Some(failure)),
-                    };
+                let (session_settings_schema, schema_failure) = match self
+                    .resolve_session_schema_for_spawn(backend_kind, launch_profile_id.as_ref())
+                    .await
+                {
+                    Ok(schema) => (schema, None),
+                    Err(failure) => (None, Some(failure)),
+                };
                 let settings_failure = session_settings.as_ref().and_then(|settings| {
                     session_settings_startup_failure(
                         backend_kind,
@@ -5098,7 +5146,10 @@ impl HostHandle {
                 let startup_mcp_servers =
                     protocol_mcp_servers_to_startup(&resolved_spawn_config.mcp_servers);
                 let (session_settings_schema, schema_failure) = match self
-                    .resolve_session_schema_for_spawn(record.backend_kind)
+                    .resolve_session_schema_for_spawn(
+                        record.backend_kind,
+                        record.launch_profile_id.as_ref(),
+                    )
                     .await
                 {
                     Ok(schema) => (schema, None),
@@ -5399,9 +5450,22 @@ impl HostHandle {
                 let (session_settings_schema, schema_failure) =
                     if parent_agent_mismatch_failure.is_some() {
                         let state = self.state.lock().await;
-                        (session_schema_for_backend(&state, backend_kind), None)
+                        (
+                            session_schema_for_backend(
+                                &state,
+                                backend_kind,
+                                record.launch_profile_id.as_ref(),
+                            ),
+                            None,
+                        )
                     } else {
-                        match self.resolve_session_schema_for_spawn(backend_kind).await {
+                        match self
+                            .resolve_session_schema_for_spawn(
+                                backend_kind,
+                                record.launch_profile_id.as_ref(),
+                            )
+                            .await
+                        {
                             Ok(schema) => (schema, None),
                             Err(failure) => (None, Some(failure)),
                         }
@@ -8058,7 +8122,7 @@ impl HostHandle {
         {
             let schema = {
                 let state = self.state.lock().await;
-                session_schema_for_backend(&state, *backend)
+                session_schema_for_backend(&state, *backend, None)
             }
             .ok_or_else(|| {
                 AppError::invalid(
@@ -8425,6 +8489,7 @@ impl HostHandle {
     async fn resolve_session_schema_for_spawn(
         &self,
         backend_kind: protocol::BackendKind,
+        profile_id: Option<&LaunchProfileId>,
     ) -> Result<Option<SessionSettingsSchema>, AgentStartupFailure> {
         if !backend_has_dynamic_session_schema(backend_kind) {
             return Ok(Some(session_settings_schema_for_backend(backend_kind)));
@@ -8432,14 +8497,14 @@ impl HostHandle {
         let _refresh_guard = self.session_schema_refresh_lock.lock().await;
         let mut resolution = {
             let state = self.state.lock().await;
-            session_schema_resolution_for_backend(&state, backend_kind)
+            session_schema_resolution_for_backend(&state, backend_kind, profile_id)
         };
         if matches!(&resolution, SessionSchemaResolution::Pending) {
             self.refresh_session_schemas_with_fanout_unlocked(false, false, Some(backend_kind))
                 .await;
             resolution = {
                 let state = self.state.lock().await;
-                session_schema_resolution_for_backend(&state, backend_kind)
+                session_schema_resolution_for_backend(&state, backend_kind, profile_id)
             };
         }
         match resolution {
@@ -8471,7 +8536,10 @@ impl HostHandle {
                     &state.codex_session_schema,
                     CodexSessionSchemaState::Pending
                 ),
-                matches!(&state.kiro_session_schema, KiroSessionSchemaState::Pending),
+                matches!(
+                    acp_schema_state(&state.acp_session_schemas, None),
+                    AcpSessionSchemaState::Pending
+                ),
                 state.hermes_session_schema.clone(),
             )
         };
@@ -8513,7 +8581,7 @@ impl HostHandle {
             configured_kiro_probe_workspace_root,
             skip_real_backend_probe,
             previous_codex,
-            previous_kiro,
+            previous_acp,
             previous_hermes,
             prev_hermes_ready,
         ) = {
@@ -8530,14 +8598,14 @@ impl HostHandle {
                 }
             };
             let previous_codex = state.codex_session_schema.clone();
-            let previous_kiro = state.kiro_session_schema.clone();
+            let previous_acp = state.acp_session_schemas.clone();
             let previous_hermes = state.hermes_session_schema.clone();
             if retry_unavailable {
                 if probe(protocol::BackendKind::Codex) {
                     state.codex_session_schema = CodexSessionSchemaState::Pending;
                 }
                 if probe(protocol::BackendKind::Acp) {
-                    state.kiro_session_schema = KiroSessionSchemaState::Pending;
+                    state.acp_session_schemas.clear();
                 }
                 if probe(protocol::BackendKind::Hermes) {
                     state.hermes_session_schema = HermesSessionSchemaState::Pending;
@@ -8550,7 +8618,7 @@ impl HostHandle {
                 state.kiro_probe_workspace_root.clone(),
                 state.skip_real_backend_probe,
                 previous_codex,
-                previous_kiro,
+                previous_acp,
                 previous_hermes,
                 prev_hermes_ready,
             )
@@ -8558,6 +8626,13 @@ impl HostHandle {
         let host_settings = settings_store.lock().await.get().unwrap_or_else(|err| {
             panic!("failed to load host settings for session schemas: {err}")
         });
+        let acp_profile_ids = configured_acp_profile_ids(&host_settings);
+        let acp_agents_by_profile = acp_profile_ids
+            .iter()
+            .filter_map(|id| {
+                acp_agent_for_profile(&host_settings, id).map(|agent| (id.clone(), agent))
+            })
+            .collect::<HashMap<_, _>>();
         let enabled_backends = host_settings.enabled_backends.clone();
         let hermes_disabled_providers = host_settings.hermes_disabled_providers.clone();
 
@@ -8588,31 +8663,61 @@ impl HostHandle {
             CodexSessionSchemaState::Pending
         };
 
-        let kiro_session_schema = if !probe(protocol::BackendKind::Acp)
-            || (!retry_unavailable && !matches!(&previous_kiro, KiroSessionSchemaState::Pending))
-        {
-            previous_kiro
+        // One probe per configured ACP agent: the schema comes from the agent's
+        // own model list, so a user-added agent must not inherit Kiro's.
+        let acp_session_schemas = if !probe(protocol::BackendKind::Acp) {
+            previous_acp
         } else if enabled_backends.contains(&protocol::BackendKind::Acp) {
-            match kiro_probe_workspace_root(configured_kiro_probe_workspace_root.as_deref()) {
-                Ok(workspace_root) => match crate::backend::kiro::probe_session_settings_schema(
+            let mut schemas = HashMap::new();
+            let workspace_root =
+                kiro_probe_workspace_root(configured_kiro_probe_workspace_root.as_deref());
+            for profile_id in &acp_profile_ids {
+                let previous = previous_acp.get(profile_id);
+                // Skip agents already resolved, unless this is an explicit retry
+                // of the failures.
+                if !retry_unavailable
+                    && let Some(previous) = previous
+                    && !matches!(previous, AcpSessionSchemaState::Pending)
+                {
+                    schemas.insert(profile_id.clone(), previous.clone());
+                    continue;
+                }
+                let is_builtin_kiro = profile_id.0 == protocol::KIRO_LAUNCH_PROFILE_ID;
+                let agent = acp_agents_by_profile.get(profile_id);
+                let workspace_root = match &workspace_root {
+                    Ok(root) => root.clone(),
+                    Err(err) => {
+                        tracing::error!("failed to resolve ACP probe workspace root: {err}");
+                        schemas.insert(
+                            profile_id.clone(),
+                            AcpSessionSchemaState::Unavailable(err.clone()),
+                        );
+                        continue;
+                    }
+                };
+                let state = match crate::backend::kiro::probe_session_settings_schema(
                     &[workspace_root],
-                    kiro_probe_program,
+                    is_builtin_kiro
+                        .then(|| kiro_probe_program.clone())
+                        .flatten(),
+                    (!is_builtin_kiro).then_some(agent).flatten(),
                 )
                 .await
                 {
-                    Ok(schema) => KiroSessionSchemaState::Ready(schema),
+                    Ok(schema) => AcpSessionSchemaState::Ready(schema),
                     Err(err) => {
-                        tracing::error!("failed to refresh Kiro session schema: {err}");
-                        KiroSessionSchemaState::Unavailable(err)
+                        tracing::error!(
+                            profile = %profile_id.0,
+                            "failed to refresh ACP session schema: {err}"
+                        );
+                        AcpSessionSchemaState::Unavailable(err)
                     }
-                },
-                Err(err) => {
-                    tracing::error!("failed to resolve Kiro probe workspace root: {err}");
-                    KiroSessionSchemaState::Unavailable(err)
-                }
+                };
+                schemas.insert(profile_id.clone(), state);
             }
+            schemas
         } else {
-            KiroSessionSchemaState::Pending
+            HashMap::new()
         };
 
         // `None` keeps the previously discovered Hermes profiles (when the
@@ -8670,7 +8775,7 @@ impl HostHandle {
 
         let mut state = self.state.lock().await;
         state.codex_session_schema = codex_session_schema;
-        state.kiro_session_schema = kiro_session_schema;
+        state.acp_session_schemas = acp_session_schemas;
         state.hermes_session_schema = hermes_session_schema;
         if let Some(hermes_profiles) = hermes_profiles {
             state.hermes_launch_profiles = hermes_profiles;
@@ -12253,14 +12358,14 @@ impl HostHandle {
             protocol_mcp_servers_to_startup(&resolved_spawn_config.mcp_servers);
         let session_settings_schema = {
             let state = self.state.lock().await;
-            session_schema_for_backend(&state, backend_kind)
+            session_schema_for_backend(&state, backend_kind, None)
         };
         let session_settings_schema = if backend_has_dynamic_session_schema(backend_kind)
             && session_settings_schema.is_none()
         {
             self.refresh_session_schema_for_backend(backend_kind).await;
             let state = self.state.lock().await;
-            session_schema_for_backend(&state, backend_kind)
+            session_schema_for_backend(&state, backend_kind, None)
         } else {
             session_settings_schema
         };
@@ -13624,7 +13729,7 @@ fn spawn_host_inner(
             workflow_run_store,
             mobile_access: mobile_access.clone(),
             codex_session_schema: CodexSessionSchemaState::Pending,
-            kiro_session_schema: KiroSessionSchemaState::Pending,
+            acp_session_schemas: HashMap::new(),
             hermes_session_schema: HermesSessionSchemaState::Pending,
             hermes_launch_profiles: Vec::new(),
             backend_config_snapshots: Vec::new(),
@@ -19615,16 +19720,19 @@ fn resolve_backend_config_for_spawn(
 fn session_schema_for_backend(
     state: &HostState,
     backend_kind: protocol::BackendKind,
+    profile_id: Option<&LaunchProfileId>,
 ) -> Option<SessionSettingsSchema> {
     match backend_kind {
         protocol::BackendKind::Codex => match &state.codex_session_schema {
             CodexSessionSchemaState::Ready(schema) => Some(schema.clone()),
             CodexSessionSchemaState::Pending | CodexSessionSchemaState::Unavailable(_) => None,
         },
-        protocol::BackendKind::Acp => match &state.kiro_session_schema {
-            KiroSessionSchemaState::Ready(schema) => Some(schema.clone()),
-            KiroSessionSchemaState::Pending | KiroSessionSchemaState::Unavailable(_) => None,
-        },
+        protocol::BackendKind::Acp => {
+            match acp_schema_state(&state.acp_session_schemas, profile_id) {
+                AcpSessionSchemaState::Ready(schema) => Some(schema.clone()),
+                AcpSessionSchemaState::Pending | AcpSessionSchemaState::Unavailable(_) => None,
+            }
+        }
         protocol::BackendKind::Hermes => match &state.hermes_session_schema {
             HermesSessionSchemaState::Ready(schema) => Some(schema.clone()),
             HermesSessionSchemaState::Pending | HermesSessionSchemaState::Unavailable(_) => None,
@@ -19636,6 +19744,7 @@ fn session_schema_for_backend(
 fn session_schema_resolution_for_backend(
     state: &HostState,
     backend_kind: protocol::BackendKind,
+    profile_id: Option<&LaunchProfileId>,
 ) -> SessionSchemaResolution {
     match backend_kind {
         protocol::BackendKind::Codex => match &state.codex_session_schema {
@@ -19647,13 +19756,17 @@ fn session_schema_resolution_for_backend(
                 SessionSchemaResolution::Unavailable(message.clone())
             }
         },
-        protocol::BackendKind::Acp => match &state.kiro_session_schema {
-            KiroSessionSchemaState::Pending => SessionSchemaResolution::Pending,
-            KiroSessionSchemaState::Ready(schema) => SessionSchemaResolution::Ready(schema.clone()),
-            KiroSessionSchemaState::Unavailable(message) => {
-                SessionSchemaResolution::Unavailable(message.clone())
+        protocol::BackendKind::Acp => {
+            match acp_schema_state(&state.acp_session_schemas, profile_id) {
+                AcpSessionSchemaState::Pending => SessionSchemaResolution::Pending,
+                AcpSessionSchemaState::Ready(schema) => {
+                    SessionSchemaResolution::Ready(schema.clone())
+                }
+                AcpSessionSchemaState::Unavailable(message) => {
+                    SessionSchemaResolution::Unavailable(message.clone())
+                }
             }
-        },
+        }
         protocol::BackendKind::Hermes => match &state.hermes_session_schema {
             HermesSessionSchemaState::Pending => SessionSchemaResolution::Pending,
             HermesSessionSchemaState::Ready(schema) => {
@@ -19791,6 +19904,7 @@ fn hidden_helper_reasoning_effort(
 fn session_schema_entry_for_backend(
     state: &HostState,
     backend_kind: protocol::BackendKind,
+    profile_id: Option<&LaunchProfileId>,
 ) -> SessionSchemaEntry {
     match backend_kind {
         protocol::BackendKind::Codex => match &state.codex_session_schema {
@@ -19803,16 +19917,18 @@ fn session_schema_entry_for_backend(
                 message: message.clone(),
             },
         },
-        protocol::BackendKind::Acp => match &state.kiro_session_schema {
-            KiroSessionSchemaState::Ready(schema) => SessionSchemaEntry::Ready {
-                schema: schema.clone(),
-            },
-            KiroSessionSchemaState::Pending => SessionSchemaEntry::Pending { backend_kind },
-            KiroSessionSchemaState::Unavailable(message) => SessionSchemaEntry::Unavailable {
-                backend_kind,
-                message: message.clone(),
-            },
-        },
+        protocol::BackendKind::Acp => {
+            match acp_schema_state(&state.acp_session_schemas, profile_id) {
+                AcpSessionSchemaState::Ready(schema) => SessionSchemaEntry::Ready {
+                    schema: schema.clone(),
+                },
+                AcpSessionSchemaState::Pending => SessionSchemaEntry::Pending { backend_kind },
+                AcpSessionSchemaState::Unavailable(message) => SessionSchemaEntry::Unavailable {
+                    backend_kind,
+                    message: message.clone(),
+                },
+            }
+        }
         protocol::BackendKind::Hermes => match &state.hermes_session_schema {
             HermesSessionSchemaState::Ready(schema) => SessionSchemaEntry::Ready {
                 schema: schema.clone(),
@@ -19836,7 +19952,7 @@ fn session_schemas_for_enabled_backends(
     enabled_backends
         .iter()
         .copied()
-        .map(|backend_kind| session_schema_entry_for_backend(state, backend_kind))
+        .map(|backend_kind| session_schema_entry_for_backend(state, backend_kind, None))
         .collect()
 }
 
@@ -19951,6 +20067,43 @@ pub(crate) fn acp_agent_for_profile(
         .and_then(|profile| profile.acp.clone())
 }
 
+/// Every ACP launch profile the host knows about: the built-in Kiro agent plus
+/// any the user configured. Probing and schema lookup both key off this, so a
+/// user-added agent gets its own schema rather than inheriting Kiro's.
+pub(crate) fn configured_acp_profile_ids(
+    settings: &protocol::HostSettings,
+) -> Vec<LaunchProfileId> {
+    let mut ids = vec![LaunchProfileId(protocol::KIRO_LAUNCH_PROFILE_ID.to_owned())];
+    for profile in &settings.launch_profiles {
+        if profile.backend_kind == protocol::BackendKind::Acp
+            && profile.id.0 != protocol::KIRO_LAUNCH_PROFILE_ID
+        {
+            ids.push(profile.id.clone());
+        }
+    }
+    ids
+}
+
+/// Resolves the ACP schema slot for a profile, defaulting to the built-in Kiro
+/// agent.
+///
+/// Some surfaces are keyed by `BackendKind` and have no profile in hand —
+/// `backend_tier_configs` is per-kind by product design, not per-agent. Those
+/// resolve against the built-in profile, which preserves the behaviour ACP had
+/// when Kiro was the only possible agent. Surfaces that *do* know their profile
+/// (launch-profile validation, session spawn) pass it and get that agent's own
+/// schema.
+fn acp_schema_state<'a>(
+    schemas: &'a HashMap<LaunchProfileId, AcpSessionSchemaState>,
+    profile_id: Option<&LaunchProfileId>,
+) -> &'a AcpSessionSchemaState {
+    const PENDING: &AcpSessionSchemaState = &AcpSessionSchemaState::Pending;
+    let key = profile_id
+        .cloned()
+        .unwrap_or(LaunchProfileId(protocol::KIRO_LAUNCH_PROFILE_ID.to_owned()));
+    schemas.get(&key).unwrap_or(PENDING)
+}
+
 pub(crate) const HERMES_PROFILE_LAUNCH_ID_PREFIX: &str = "hermes:profile:";
 
 /// Append one launch-profile entry per named Hermes profile: ready entries
@@ -20044,7 +20197,7 @@ fn launch_profile_entry_for_config(
         };
     }
 
-    match session_schema_entry_for_backend(state, config.backend_kind) {
+    match session_schema_entry_for_backend(state, config.backend_kind, Some(&config.id)) {
         SessionSchemaEntry::Ready { schema } => {
             match validate_session_settings_values(&schema, &config.session_settings) {
                 Ok(()) => LaunchProfileEntry::Ready {
@@ -30098,6 +30251,86 @@ Rules: Record only what remains true and useful for future work; drop transient 
         assert_eq!(
             compaction_barrier_timeout(Some(Duration::from_secs(900))),
             Duration::from_secs(930)
+        );
+    }
+
+    fn acp_profile_config(id: &str, command: &str) -> protocol::HostLaunchProfileConfig {
+        protocol::HostLaunchProfileConfig {
+            id: LaunchProfileId(id.to_owned()),
+            label: id.to_owned(),
+            description: None,
+            backend_kind: BackendKind::Acp,
+            session_settings: protocol::SessionSettingsValues::default(),
+            acp: Some(protocol::AcpAgentSpec {
+                command: command.to_owned(),
+                args: Vec::new(),
+                cwd: None,
+                env: Default::default(),
+                adapter: protocol::AcpAdapterId::Stock,
+            }),
+        }
+    }
+
+    #[test]
+    fn configured_acp_profiles_always_include_the_builtin_kiro_agent() {
+        let mut settings = crate::store::settings::empty_settings_for_test();
+        settings.launch_profiles = vec![
+            acp_profile_config("acp:my-agent", "/usr/local/bin/my-agent"),
+            // A non-ACP profile must not be probed as an ACP agent.
+            protocol::HostLaunchProfileConfig {
+                backend_kind: BackendKind::Claude,
+                acp: None,
+                ..acp_profile_config("claude:custom", "")
+            },
+        ];
+
+        let ids = configured_acp_profile_ids(&settings);
+
+        assert_eq!(
+            ids,
+            vec![
+                LaunchProfileId(protocol::KIRO_LAUNCH_PROFILE_ID.to_owned()),
+                LaunchProfileId("acp:my-agent".to_owned()),
+            ],
+            "probing must cover the built-in agent plus every configured ACP agent, and nothing else"
+        );
+    }
+
+    #[test]
+    fn acp_schemas_are_per_agent_and_do_not_leak_across_profiles() {
+        // The schema comes from probing the agent's own model list, so two
+        // configured agents must not share one. A regression here would show a
+        // user their Kiro models while they are configuring a different agent.
+        let kiro = LaunchProfileId(protocol::KIRO_LAUNCH_PROFILE_ID.to_owned());
+        let other = LaunchProfileId("acp:my-agent".to_owned());
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            kiro.clone(),
+            AcpSessionSchemaState::Ready(crate::backend::empty_session_settings_schema(
+                BackendKind::Acp,
+            )),
+        );
+
+        assert!(
+            matches!(
+                acp_schema_state(&schemas, Some(&kiro)),
+                AcpSessionSchemaState::Ready(_)
+            ),
+            "the probed agent resolves to its own schema"
+        );
+        assert!(
+            matches!(
+                acp_schema_state(&schemas, Some(&other)),
+                AcpSessionSchemaState::Pending
+            ),
+            "an unprobed agent must read as Pending, never inherit another agent's schema"
+        );
+        assert!(
+            matches!(
+                acp_schema_state(&schemas, None),
+                AcpSessionSchemaState::Ready(_)
+            ),
+            "kind-scoped surfaces with no profile fall back to the built-in agent"
         );
     }
 }

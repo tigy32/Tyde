@@ -687,6 +687,13 @@ fn is_known_backend_kind(value: &serde_json::Value) -> bool {
     serde_json::from_value::<BackendKind>(value.clone()).is_ok()
 }
 
+/// A settings value with every field at its unset default, for tests that need
+/// to build one field without spelling out the rest.
+#[cfg(test)]
+pub(crate) fn empty_settings_for_test() -> HostSettings {
+    empty_settings()
+}
+
 fn empty_settings() -> HostSettings {
     HostSettings {
         enabled_backends: Vec::new(),
