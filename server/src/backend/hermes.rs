@@ -818,7 +818,9 @@ impl Backend for HermesBackend {
         // is unbounded and its receiver is returned below, so this survives
         // until the client attaches.
         if let Some(notice) = dropped_skills_notice {
-            let _ = events_tx.send(ChatEvent::MessageAdded(warning_message(notice)));
+            let _ = events_tx.send(BackendEvent::Chat(ChatEvent::MessageAdded(
+                warning_message(notice),
+            )));
         }
 
         let stored_session_id = Arc::new(std::sync::Mutex::new(ids.stored_session_id));
@@ -10652,6 +10654,7 @@ for line in sys.stdin:
             cwd: None,
             remote_host: None,
             display_program: "hermes".to_string(),
+            provider_version: None,
         };
 
         let confirming = dir.path().join("fake_python_confirms.sh");
