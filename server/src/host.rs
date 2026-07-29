@@ -25391,29 +25391,136 @@ Rules: Record only what remains true and useful for future work; drop transient 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let host_path = StreamPath(format!("/host/legacy-compact-{}", Uuid::new_v4()));
         let host_stream = Stream::new(host_path.clone(), tx);
-        assert!(
-            fixture
-                .host
-                .register_host_stream(host_stream.clone(), AgentReplayMode::Eager)
-                .await
-                .is_empty()
+        let deferred_attachments = fixture
+            .host
+            .register_host_stream(host_stream.clone(), AgentReplayMode::Eager)
+            .await;
+        let host_bootstrap_envelope = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("eager host bootstrap should arrive")
+            .expect("host output envelope");
+        assert_eq!(host_bootstrap_envelope.stream, host_path);
+        assert_eq!(host_bootstrap_envelope.kind, FrameKind::HostBootstrap);
+        let host_bootstrap: HostBootstrapPayload = host_bootstrap_envelope
+            .parse_payload()
+            .expect("HostBootstrap payload");
+        let old_bootstrap_agent = host_bootstrap
+            .agents
+            .iter()
+            .find(|agent| agent.agent_id == old_agent_id)
+            .expect("live legacy agent advertised in HostBootstrap");
+        assert_eq!(
+            old_bootstrap_agent.session_id.as_ref(),
+            Some(&old_session_id)
         );
-        let old_instance_stream = loop {
+        let old_instance_stream = old_bootstrap_agent.instance_stream.clone();
+        let old_bootstrap_session = host_bootstrap
+            .sessions
+            .iter()
+            .find(|session| session.id == old_session_id)
+            .expect("legacy session advertised in HostBootstrap");
+        assert!(
+            old_bootstrap_session.resumable,
+            "uncompacted legacy session must initially be resumable"
+        );
+        assert!(old_bootstrap_session.compacted_to_session_id.is_none());
+        assert_eq!(deferred_attachments.len(), 1);
+        let attachment = deferred_attachments
+            .into_iter()
+            .next()
+            .expect("eager legacy agent attachment");
+        assert_eq!(attachment.host_stream, host_path);
+        assert_eq!(attachment.agent_stream, old_instance_stream);
+        assert_eq!(
+            attachment
+                .agent_handle
+                .as_ref()
+                .expect("existing-agent attachment handle")
+                .snapshot()
+                .agent_id,
+            old_agent_id
+        );
+        fixture
+            .host
+            .attach_deferred_agent_stream(attachment)
+            .await;
+
+        let old_agent_bootstrap = loop {
             let envelope = tokio::time::timeout(Duration::from_secs(1), rx.recv())
                 .await
-                .expect("old agent replay should arrive")
+                .expect("old agent bootstrap should arrive")
                 .expect("host output envelope");
-            if envelope.kind != FrameKind::NewAgent {
-                continue;
+            assert_ne!(
+                envelope.kind,
+                FrameKind::ContextCompactionNotify,
+                "registration must not fabricate a context compaction operation"
+            );
+            if envelope.stream == old_instance_stream {
+                assert_eq!(envelope.kind, FrameKind::AgentBootstrap);
+                break envelope
+                    .parse_payload::<protocol::AgentBootstrapPayload>()
+                    .expect("old AgentBootstrap payload");
             }
-            let payload: NewAgentPayload = envelope.parse_payload().expect("NewAgent payload");
-            if payload.agent_id == old_agent_id {
-                break payload.instance_stream;
+            assert_eq!(envelope.stream, host_path);
+            assert!(
+                matches!(
+                    envelope.kind,
+                    FrameKind::BackendConfigSnapshots | FrameKind::SessionSchemas
+                ),
+                "unexpected eager-registration follow-up frame: {}",
+                envelope.kind
+            );
+        };
+        let mut old_start_seen = false;
+        let mut old_capability_seen = false;
+        let mut visible_assistant_seen = false;
+        for event in &old_agent_bootstrap.events {
+            match event {
+                protocol::AgentBootstrapEvent::AgentStart(start) => {
+                    assert_eq!(start.agent_id, old_agent_id);
+                    assert_eq!(start.session_id.as_ref(), Some(&old_session_id));
+                    assert!(!old_start_seen, "old bootstrap repeated AgentStart");
+                    old_start_seen = true;
+                }
+                protocol::AgentBootstrapEvent::ContextCompactionCapability(capability) => {
+                    assert_eq!(capability.agent_id, old_agent_id);
+                    assert_eq!(capability.logical_session_id, old_session_id);
+                    old_capability_seen = true;
+                }
+                protocol::AgentBootstrapEvent::ContextCompaction(compaction) => {
+                    panic!(
+                        "registration replayed unexpected context compaction operation {:?}",
+                        compaction.operation_id
+                    );
+                }
+                protocol::AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message))
+                    if matches!(&message.sender, MessageSender::Assistant { .. })
+                        && message.content.contains("legacy transcript remains visible") =>
+                {
+                    visible_assistant_seen = true;
+                }
+                protocol::AgentBootstrapEvent::AgentError(error) => {
+                    panic!("live legacy bootstrap contained agent error: {}", error.message);
+                }
+                protocol::AgentBootstrapEvent::SessionSettings(_)
+                | protocol::AgentBootstrapEvent::QueuedMessages(_)
+                | protocol::AgentBootstrapEvent::AgentActivityStats(_)
+                | protocol::AgentBootstrapEvent::ChatEvent(_)
+                | protocol::AgentBootstrapEvent::HasPriorHistory { .. } => {}
             }
         };
+        assert!(old_start_seen, "old AgentBootstrap must prove the agent is live");
+        assert!(
+            old_capability_seen,
+            "old AgentBootstrap must expose its compaction capability"
+        );
+        assert!(
+            visible_assistant_seen,
+            "old AgentBootstrap must expose the authoritative visible response"
+        );
 
         let compact = protocol::Envelope::from_payload(
-            old_instance_stream,
+            old_instance_stream.clone(),
             FrameKind::AgentCompact,
             0,
             &AgentCompactPayload::default(),
@@ -25424,6 +25531,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .expect("route legacy compaction");
 
         let mut started = false;
+        let mut compact_frames = Vec::new();
         let completed = loop {
             let envelope = tokio::time::timeout(Duration::from_secs(10), rx.recv())
                 .await
@@ -25434,17 +25542,27 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 FrameKind::ContextCompactionNotify,
                 "LegacyReplacement must stay on the replacement protocol"
             );
-            if envelope.kind != FrameKind::AgentCompactNotify {
-                continue;
-            }
-            let payload: AgentCompactNotifyPayload =
-                envelope.parse_payload().expect("legacy compact notify");
-            match payload.status {
-                AgentCompactStatus::Started => started = true,
-                AgentCompactStatus::Completed => break payload,
-                AgentCompactStatus::Failed => {
-                    panic!("legacy replacement failed: {:?}", payload.message)
+            let completed = if envelope.kind == FrameKind::AgentCompactNotify {
+                let payload: AgentCompactNotifyPayload =
+                    envelope.parse_payload().expect("legacy compact notify");
+                assert_eq!(envelope.stream, old_instance_stream);
+                match payload.status {
+                    AgentCompactStatus::Started => {
+                        assert!(!started, "legacy replacement admitted more than once");
+                        started = true;
+                        None
+                    }
+                    AgentCompactStatus::Completed => Some(payload),
+                    AgentCompactStatus::Failed => {
+                        panic!("legacy replacement failed: {:?}", payload.message)
+                    }
                 }
+            } else {
+                None
+            };
+            compact_frames.push(envelope);
+            if let Some(payload) = completed {
+                break payload;
             }
         };
         assert!(started, "legacy replacement must report admission");
@@ -25460,6 +25578,98 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .expect("replacement session id");
         assert_ne!(new_agent_id, old_agent_id);
         assert_ne!(new_session_id, old_session_id);
+
+        let replacement_agent = compact_frames
+            .iter()
+            .find_map(|envelope| {
+                if envelope.kind != FrameKind::NewAgent {
+                    return None;
+                }
+                let payload = envelope
+                    .parse_payload::<NewAgentPayload>()
+                    .expect("replacement NewAgent payload");
+                (payload.agent_id == new_agent_id).then_some(payload)
+            })
+            .expect("legacy replacement must advertise the new live agent");
+        assert!(
+            replacement_agent.session_id.is_none(),
+            "NewAgent is the pre-startup advertisement; AgentBootstrap owns the bound session"
+        );
+        let compacted_session = compact_frames
+            .iter()
+            .filter(|envelope| envelope.kind == FrameKind::SessionList)
+            .flat_map(|envelope| {
+                envelope
+                    .parse_payload::<SessionListPayload>()
+                    .expect("compaction SessionList payload")
+                    .sessions
+            })
+            .find(|session| {
+                session.id == old_session_id
+                    && session.compacted_to_session_id.as_ref() == Some(&new_session_id)
+            })
+            .expect("replacement must publish the compacted old session");
+        assert!(
+            !compacted_session.resumable,
+            "published compacted session must not remain resumable"
+        );
+        let replacement_bootstrap = compact_frames
+            .iter()
+            .find_map(|envelope| {
+                (envelope.kind == FrameKind::AgentBootstrap
+                    && envelope.stream == replacement_agent.instance_stream)
+                    .then(|| {
+                        envelope
+                            .parse_payload::<protocol::AgentBootstrapPayload>()
+                            .expect("replacement AgentBootstrap payload")
+                    })
+            })
+            .expect("legacy replacement must eagerly bootstrap the new agent");
+        let mut replacement_start_seen = false;
+        for event in &replacement_bootstrap.events {
+            match event {
+                protocol::AgentBootstrapEvent::AgentStart(start) => {
+                    assert_eq!(start.agent_id, new_agent_id);
+                    assert_eq!(start.session_id.as_ref(), Some(&new_session_id));
+                    assert!(
+                        !replacement_start_seen,
+                        "replacement bootstrap repeated AgentStart"
+                    );
+                    replacement_start_seen = true;
+                }
+                protocol::AgentBootstrapEvent::ContextCompaction(compaction) => {
+                    panic!(
+                        "replacement bootstrap carried native compaction operation {:?}",
+                        compaction.operation_id
+                    );
+                }
+                protocol::AgentBootstrapEvent::ChatEvent(ChatEvent::ContextCompaction(marker)) => {
+                    panic!(
+                        "replacement bootstrap carried native compaction marker {}",
+                        marker.marker_id.0
+                    );
+                }
+                protocol::AgentBootstrapEvent::AgentError(error) => {
+                    panic!(
+                        "replacement bootstrap contained agent error: {}",
+                        error.message
+                    );
+                }
+                protocol::AgentBootstrapEvent::ContextCompactionCapability(capability) => {
+                    assert_eq!(capability.agent_id, new_agent_id);
+                    assert_eq!(capability.logical_session_id, new_session_id);
+                }
+                protocol::AgentBootstrapEvent::SessionSettings(_)
+                | protocol::AgentBootstrapEvent::QueuedMessages(_)
+                | protocol::AgentBootstrapEvent::AgentActivityStats(_)
+                | protocol::AgentBootstrapEvent::ChatEvent(_)
+                | protocol::AgentBootstrapEvent::HasPriorHistory { .. } => {}
+            }
+        }
+        assert!(
+            replacement_start_seen,
+            "replacement bootstrap must contain its AgentStart"
+        );
 
         tokio::time::timeout(Duration::from_secs(1), async {
             while fixture.host.agent_handle(&old_agent_id).await.is_some() {
