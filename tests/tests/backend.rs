@@ -1025,8 +1025,7 @@ async fn fake_codex_provider_items_keep_identity_live_late_and_same_host_reconne
         "parent-tool",
         "late Codex attach replay",
     );
-    let history_request_id =
-        protocol::HistoryPageRequestId("fake-codex-paged-history".to_owned());
+    let history_request_id = protocol::HistoryPageRequestId("fake-codex-paged-history".to_owned());
     late_client
         .fetch_session_history(
             &late_agent.instance_stream,
