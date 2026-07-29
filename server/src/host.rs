@@ -25059,9 +25059,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                     Ok(Some(
                         records
                             .into_iter()
-                            .filter(|record| {
-                                record.visibility == TranscriptVisibility::Visible
-                            })
+                            .filter(|record| record.visibility == TranscriptVisibility::Visible)
                             .map(|record| record.event_id)
                             .collect::<HashSet<_>>(),
                     ))
