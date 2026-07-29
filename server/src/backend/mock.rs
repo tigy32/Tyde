@@ -190,7 +190,7 @@ fn agent_control_await_mcp(
 
 pub struct MockBackend {
     command_tx: mpsc::UnboundedSender<MockCommand>,
-    events_tx: Option<MockEventSender>,
+    events_tx: Option<WeakMockEventSender>,
     session_id: SessionId,
     subagent_emitter_tx: watch::Sender<Option<Arc<dyn SubAgentEmitter>>>,
     busy_self_turn_fired: Arc<std::sync::atomic::AtomicBool>,
@@ -226,7 +226,20 @@ struct MockEventSender {
     active_turn: Arc<std::sync::atomic::AtomicBool>,
 }
 
+#[derive(Clone)]
+struct WeakMockEventSender {
+    tx: mpsc::WeakUnboundedSender<BackendEvent>,
+    active_turn: Arc<std::sync::atomic::AtomicBool>,
+}
+
 impl MockEventSender {
+    fn downgrade(&self) -> WeakMockEventSender {
+        WeakMockEventSender {
+            tx: self.tx.downgrade(),
+            active_turn: Arc::clone(&self.active_turn),
+        }
+    }
+
     fn send(&self, event: ChatEvent) -> Result<(), Box<mpsc::error::SendError<ChatEvent>>> {
         match event {
             ChatEvent::TypingStatusChanged(active) => {
@@ -264,6 +277,15 @@ impl MockEventSender {
 
     fn is_active(&self) -> bool {
         self.active_turn.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl WeakMockEventSender {
+    fn upgrade(&self) -> Option<MockEventSender> {
+        Some(MockEventSender {
+            tx: self.tx.upgrade()?,
+            active_turn: Arc::clone(&self.active_turn),
+        })
     }
 }
 
@@ -399,7 +421,7 @@ impl Backend for MockBackend {
         Ok((
             Self {
                 command_tx,
-                events_tx: Some(events_tx),
+                events_tx: Some(events_tx.downgrade()),
                 session_id,
                 subagent_emitter_tx,
                 busy_self_turn_fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -515,7 +537,7 @@ impl Backend for MockBackend {
         Ok((
             Self {
                 command_tx,
-                events_tx: Some(events_tx),
+                events_tx: Some(events_tx.downgrade()),
                 session_id,
                 subagent_emitter_tx,
                 busy_self_turn_fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -609,7 +631,7 @@ impl Backend for MockBackend {
         Ok((
             Self {
                 command_tx,
-                events_tx: Some(events_tx),
+                events_tx: Some(events_tx.downgrade()),
                 session_id,
                 subagent_emitter_tx,
                 busy_self_turn_fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -655,7 +677,11 @@ impl Backend for MockBackend {
         {
             return start;
         }
-        let Some(events_tx) = self.events_tx.as_ref().cloned() else {
+        let Some(events_tx) = self
+            .events_tx
+            .as_ref()
+            .and_then(WeakMockEventSender::upgrade)
+        else {
             return BackendCompactionStart::NotDispatched {
                 reason: BackendCompactionNotDispatchedReason::BackendClosed,
                 fallback_safe: false,
@@ -2478,6 +2504,37 @@ mod tests {
             .get(&backend.session_id.0)
             .expect("mock session record");
         assert_eq!(record.access_mode, BackendAccessMode::ReadOnly);
+    }
+
+    #[tokio::test]
+    async fn backend_handle_does_not_retain_event_stream_after_loop_exit() {
+        let (_backend, mut events) = MockBackend::spawn(
+            vec!["/tmp".to_owned()],
+            BackendSpawnConfig::default(),
+            protocol::SendMessagePayload {
+                message: MOCK_DIE_AFTER_BUSY_SENTINEL.to_owned(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+        )
+        .await
+        .expect("spawn terminating mock");
+
+        let first = tokio::time::timeout(Duration::from_secs(1), events.recv_backend())
+            .await
+            .expect("terminating mock emits busy status")
+            .expect("terminating mock stream remains open through busy status");
+        assert!(matches!(
+            first,
+            BackendEvent::Chat(ChatEvent::TypingStatusChanged(true))
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv_backend())
+                .await
+                .expect("terminating mock event stream reaches EOF")
+                .is_none()
+        );
     }
 
     #[tokio::test]

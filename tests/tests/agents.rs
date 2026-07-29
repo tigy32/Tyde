@@ -75,6 +75,8 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::SessionList
                 | FrameKind::TaskTokenUsage
                 | FrameKind::WorkflowNotify
+                | FrameKind::ContextCompactionNotify
+                | FrameKind::ContextCompactionCapability
         ) {
             continue;
         }
@@ -240,6 +242,8 @@ async fn expect_kind(client: &mut client::Connection, kind: FrameKind, context: 
                 | FrameKind::QueuedMessages
                 | FrameKind::TaskTokenUsage
                 | FrameKind::WorkflowNotify
+                | FrameKind::ContextCompactionNotify
+                | FrameKind::ContextCompactionCapability
         ) {
             continue;
         }
@@ -331,6 +335,8 @@ async fn expect_no_event(client: &mut client::Connection, duration: Duration, co
                             | FrameKind::WorkflowNotify
                             | FrameKind::AgentActivityStats
                             | FrameKind::TaskTokenUsage
+                            | FrameKind::ContextCompactionNotify
+                            | FrameKind::ContextCompactionCapability
                     ) =>
             {
                 continue;
@@ -1887,6 +1893,8 @@ async fn expect_no_agent_error_message(
                             | FrameKind::SessionList
                             | FrameKind::TaskTokenUsage
                             | FrameKind::WorkflowNotify
+                            | FrameKind::ContextCompactionNotify
+                            | FrameKind::ContextCompactionCapability
                     ) =>
             {
                 continue;
@@ -2042,9 +2050,7 @@ async fn spawn_user_child(
         .await
         .unwrap_or_else(|error| panic!("spawn {name} failed: {error:?}"));
 
-    let env = expect_next_event(client, &format!("{name} NewAgent")).await;
-    assert_eq!(env.kind, FrameKind::NewAgent);
-    let child_new: NewAgentPayload = env.parse_payload().expect("parse child NewAgent");
+    let child_new = expect_new_agent(client, &format!("{name} NewAgent")).await;
     assert_eq!(child_new.parent_agent_id.as_ref(), Some(parent_agent_id));
 
     let child_start =
@@ -2108,9 +2114,7 @@ async fn spawn_parent_with_native_child(
     )
     .await;
 
-    let env = expect_next_event(client, "native child NewAgent").await;
-    assert_eq!(env.kind, FrameKind::NewAgent);
-    let child_new: NewAgentPayload = env.parse_payload().expect("parse native child NewAgent");
+    let child_new = expect_new_agent(client, "native child NewAgent").await;
 
     let env = expect_next_event(client, "native child AgentStart").await;
     assert_eq!(env.kind, FrameKind::AgentStart);
@@ -2308,9 +2312,8 @@ async fn subagent_turn_token_usage_is_strictly_self() {
         MOCK_TURN_TOKEN_TOTAL,
     );
 
-    let env = expect_next_event(&mut fixture.client, "strict-self native child NewAgent").await;
-    assert_eq!(env.kind, FrameKind::NewAgent);
-    let child_new: NewAgentPayload = env.parse_payload().expect("parse child NewAgent");
+    let child_new =
+        expect_new_agent(&mut fixture.client, "strict-self native child NewAgent").await;
     expect_agent_start_on_stream(
         &mut fixture.client,
         &child_new.instance_stream,
@@ -6012,11 +6015,7 @@ async fn backend_native_child_with_closed_event_stream_still_replays_to_late_cli
     )
     .await;
 
-    let child_new_env = expect_next_event(&mut fixture.client, "native child NewAgent").await;
-    assert_eq!(child_new_env.kind, FrameKind::NewAgent);
-    let child_new: NewAgentPayload = child_new_env
-        .parse_payload()
-        .expect("parse native child NewAgent");
+    let child_new = expect_new_agent(&mut fixture.client, "native child NewAgent").await;
 
     let child_start_env = expect_next_event(&mut fixture.client, "native child AgentStart").await;
     assert_eq!(child_start_env.kind, FrameKind::AgentStart);
@@ -6205,11 +6204,7 @@ async fn interrupting_parked_backend_native_child_emits_relay_rejection() {
     )
     .await;
 
-    let child_new_env = expect_next_event(&mut fixture.client, "native child NewAgent").await;
-    assert_eq!(child_new_env.kind, FrameKind::NewAgent);
-    let child_new: NewAgentPayload = child_new_env
-        .parse_payload()
-        .expect("parse native child NewAgent");
+    let child_new = expect_new_agent(&mut fixture.client, "native child NewAgent").await;
 
     let child_start_env = expect_next_event(&mut fixture.client, "native child AgentStart").await;
     assert_eq!(child_start_env.kind, FrameKind::AgentStart);

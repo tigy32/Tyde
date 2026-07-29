@@ -5501,6 +5501,28 @@ impl HostHandle {
 
         let (start, agent_handle, startup_rx, agent_visibility, session_summary_count_tx) = {
             let mut state = self.state.lock().await;
+            if let Some(parent_agent_id) = request.parent_agent_id.as_ref() {
+                let parent = state.registry.agent_handle(parent_agent_id);
+                match parent {
+                    Some(handle) if handle.is_closing() => {
+                        return Err(AppError::conflict(
+                            "spawn_agent",
+                            format!(
+                                "cannot spawn a child of agent {parent_agent_id}: the agent is closing"
+                            ),
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        return Err(AppError::conflict(
+                            "spawn_agent",
+                            format!(
+                                "cannot spawn a child of agent {parent_agent_id}: the agent is closing or no longer running"
+                            ),
+                        ));
+                    }
+                }
+            }
             let sub_agent_spawn_tx = state.sub_agent_spawn_tx.clone();
             let capacity_tx = state.capacity_tx.clone();
             let session_summary_count_tx = state.session_summary_count_tx.clone();
@@ -9055,6 +9077,9 @@ impl HostHandle {
             if close_targets.is_empty() {
                 return false;
             }
+            for (_, agent_handle) in &close_targets {
+                agent_handle.begin_closing();
+            }
             let host_streams = state
                 .host_streams
                 .iter()
@@ -9541,20 +9566,27 @@ impl HostHandle {
         // that snapshot is never part of the teardown: it outlives the parent
         // that owns it and nothing subsequently closes it.
         //
-        // Scoped to `closing` deliberately. A merely terminated parent is a
-        // different situation: parked actors still host a valid agent-control
-        // caller, and refusing them would break spawns that have always been
-        // legitimate. Only an in-progress teardown has a subtree snapshot that
-        // a new child can escape.
+        // A registered, merely terminated parent is different: parked actors
+        // still host a valid agent-control caller. An in-progress teardown has
+        // a subtree snapshot that a new child can escape, while an absent
+        // parent has no subtree to own the child.
         if let Some(parent_agent_id) = payload.parent_agent_id.as_ref().or(caller_agent_id) {
             let agent_handle = {
                 let state = self.state.lock().await;
                 state.registry.agent_handle(parent_agent_id)
             };
-            if agent_handle.is_some_and(|handle| handle.is_closing()) {
-                return Err(format!(
-                    "cannot spawn a child of agent {parent_agent_id}: the agent is closing"
-                ));
+            match agent_handle {
+                Some(handle) if handle.is_closing() => {
+                    return Err(format!(
+                        "cannot spawn a child of agent {parent_agent_id}: the agent is closing"
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    return Err(format!(
+                        "cannot spawn a child of agent {parent_agent_id}: the agent is closing or no longer running"
+                    ));
+                }
             }
         }
         let workflow = if let Some(caller_agent_id) = caller_agent_id {
@@ -23564,6 +23596,29 @@ Rules: Record only what remains true and useful for future work; drop transient 
         CompactFixture { _dir: dir, host }
     }
 
+    async fn assert_native_context_compaction_route(
+        host: &HostHandle,
+        agent_id: &AgentId,
+    ) {
+        let capability = host
+            .agent_handle(agent_id)
+            .await
+            .expect("live compaction target")
+            .compaction_capability()
+            .await
+            .expect("compaction capability");
+        assert_eq!(
+            capability.coordinator,
+            crate::backend::BackendCompactionCoordinator::ContextOperation
+        );
+        assert!(matches!(
+            capability.availability,
+            crate::backend::BackendCompactionAvailability::Native {
+                mechanism: crate::backend::BackendCompactionMechanism::JsonRpcRequest
+            }
+        ));
+    }
+
     fn task_usage_amount(input_tokens: u64, output_tokens: u64) -> TaskTokenUsageAmount {
         TaskTokenUsageAmount {
             total_tokens: input_tokens + output_tokens,
@@ -24971,10 +25026,26 @@ Rules: Record only what remains true and useful for future work; drop transient 
     }
 
     #[tokio::test]
-    async fn agent_compaction_route_does_not_block_host_commands() {
+    async fn native_agent_compaction_route_does_not_block_host_commands() {
         let fixture = compact_fixture().await;
         let (old_agent_id, _) =
             spawn_idle_user_agent(&fixture.host, "remember routing responsiveness").await;
+        let handle = fixture
+            .host
+            .agent_handle(&old_agent_id)
+            .await
+            .expect("live compaction target");
+        assert_native_context_compaction_route(&fixture.host, &old_agent_id).await;
+        handle
+            .deliver_message(SendMessagePayload {
+                message: format!("{MOCK_SLOW_TURN_SENTINEL} hold native compaction"),
+                images: None,
+                origin: Some(MessageOrigin::User),
+                tool_response: None,
+            })
+            .await
+            .expect("start deterministic active turn");
+        wait_for_agent_active(&fixture.host, &old_agent_id).await;
         let (tx, mut rx) = mpsc::unbounded_channel();
         let host_path = StreamPath(format!("/host/compact-route-{}", Uuid::new_v4()));
         let host_stream = Stream::new(host_path.clone(), tx);
@@ -24991,7 +25062,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             FrameKind::AgentCompact,
             0,
             &AgentCompactPayload {
-                summary_prompt: Some(format!("{MOCK_SLOW_TURN_SENTINEL} summarize")),
+                summary_prompt: None,
                 max_summary_bytes: None,
             },
         )
@@ -25033,39 +25104,36 @@ Rules: Record only what remains true and useful for future work; drop transient 
             if envelope.kind == FrameKind::SessionList {
                 break;
             }
-            if envelope.kind == FrameKind::AgentCompactNotify {
-                let payload: AgentCompactNotifyPayload =
-                    envelope.parse_payload().expect("compact notify");
-                assert_ne!(
-                    payload.status,
-                    AgentCompactStatus::Completed,
-                    "slow compaction completed before ListSessions was processed"
+            if envelope.kind == FrameKind::ContextCompactionNotify {
+                let payload: ContextCompactionNotifyPayload =
+                    envelope.parse_payload().expect("context compaction notify");
+                assert!(
+                    !payload.status.is_terminal(),
+                    "deferred native compaction completed before ListSessions was processed"
                 );
             }
         }
 
         loop {
-            let envelope = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            let envelope = tokio::time::timeout(Duration::from_secs(10), rx.recv())
                 .await
                 .expect("background compaction should finish")
                 .expect("output envelope");
-            if envelope.kind != FrameKind::AgentCompactNotify {
+            if envelope.kind != FrameKind::ContextCompactionNotify {
                 continue;
             }
-            let payload: AgentCompactNotifyPayload =
-                envelope.parse_payload().expect("compact notify");
-            if matches!(
-                payload.status,
-                AgentCompactStatus::Completed | AgentCompactStatus::Failed
-            ) {
-                assert_eq!(payload.status, AgentCompactStatus::Completed);
+            let payload: ContextCompactionNotifyPayload = envelope
+                .parse_payload()
+                .expect("context compaction notify");
+            if payload.status.is_terminal() {
+                assert_eq!(payload.status, ContextCompactionStatus::Completed);
                 break;
             }
         }
     }
 
     #[tokio::test]
-    async fn agent_compaction_route_orders_later_agent_input_after_compact() {
+    async fn native_agent_compaction_route_orders_later_input_after_terminal() {
         let fixture = compact_fixture().await;
         let (tx, mut rx) = mpsc::unbounded_channel();
         let host_path = StreamPath(format!("/host/compact-ordering-{}", Uuid::new_v4()));
@@ -25080,6 +25148,22 @@ Rules: Record only what remains true and useful for future work; drop transient 
 
         let (old_agent_id, _) =
             spawn_idle_user_agent(&fixture.host, "remember input ordering").await;
+        let handle = fixture
+            .host
+            .agent_handle(&old_agent_id)
+            .await
+            .expect("live compaction target");
+        assert_native_context_compaction_route(&fixture.host, &old_agent_id).await;
+        handle
+            .deliver_message(SendMessagePayload {
+                message: format!("{MOCK_SLOW_TURN_SENTINEL} hold native compaction"),
+                images: None,
+                origin: Some(MessageOrigin::User),
+                tool_response: None,
+            })
+            .await
+            .expect("start deterministic active turn");
+        wait_for_agent_active(&fixture.host, &old_agent_id).await;
         let old_instance_stream = loop {
             let envelope = tokio::time::timeout(Duration::from_secs(1), rx.recv())
                 .await
@@ -25099,7 +25183,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
             FrameKind::AgentCompact,
             0,
             &AgentCompactPayload {
-                summary_prompt: Some(format!("{MOCK_SLOW_TURN_SENTINEL} summarize")),
+                summary_prompt: None,
                 max_summary_bytes: None,
             },
         )
@@ -25124,38 +25208,39 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .await
             .expect("route send");
 
+        let mut terminal_seen = false;
         loop {
-            let envelope = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            let envelope = tokio::time::timeout(Duration::from_secs(10), rx.recv())
                 .await
-                .expect("compacting agent should reject later input")
+                .expect("native compaction and queued follow-up should finish")
                 .expect("output envelope");
-            if envelope.kind != FrameKind::AgentError {
-                continue;
-            }
-            let payload: AgentErrorPayload = envelope.parse_payload().expect("agent error payload");
-            if payload.agent_id == old_agent_id
-                && payload.message.contains("compaction is in progress")
-            {
-                break;
-            }
-        }
-
-        loop {
-            let envelope = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-                .await
-                .expect("background compaction should finish")
-                .expect("output envelope");
-            if envelope.kind != FrameKind::AgentCompactNotify {
-                continue;
-            }
-            let payload: AgentCompactNotifyPayload =
-                envelope.parse_payload().expect("compact notify");
-            if matches!(
-                payload.status,
-                AgentCompactStatus::Completed | AgentCompactStatus::Failed
-            ) {
-                assert_eq!(payload.status, AgentCompactStatus::Completed);
-                break;
+            match envelope.kind {
+                FrameKind::ContextCompactionNotify => {
+                    let payload: ContextCompactionNotifyPayload = envelope
+                        .parse_payload()
+                        .expect("context compaction notify");
+                    if payload.status.is_terminal() {
+                        assert_eq!(payload.status, ContextCompactionStatus::Completed);
+                        terminal_seen = true;
+                    }
+                }
+                FrameKind::ChatEvent => {
+                    let event: ChatEvent = envelope.parse_payload().expect("chat event");
+                    if matches!(
+                        event,
+                        ChatEvent::StreamEnd(ref end)
+                            if end.message.content.contains(
+                                "This input must wait behind compaction"
+                            )
+                    ) {
+                        assert!(
+                            terminal_seen,
+                            "queued input reached the backend before native compaction terminated"
+                        );
+                        break;
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -25547,7 +25632,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
     }
 
     #[tokio::test]
-    async fn team_compaction_rejects_busy_team() {
+    async fn native_team_compaction_defers_busy_member_until_idle() {
         let fixture = team_fixture().await;
         let manager = fixture
             .host
@@ -25558,14 +25643,15 @@ Rules: Record only what remains true and useful for future work; drop transient 
             )
             .await
             .expect("activate busy manager");
+        assert_native_context_compaction_route(&fixture.host, &manager.agent_id).await;
         wait_for_agent_active(&fixture.host, &manager.agent_id).await;
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let stream = Stream::new(
             StreamPath(format!("/host/team-compact-busy-{}", Uuid::new_v4())),
             tx,
         );
 
-        let error = fixture
+        fixture
             .host
             .compact_team(
                 TeamCompactPayload {
@@ -25576,16 +25662,40 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 stream,
             )
             .await
-            .expect_err("busy team should reject compaction");
-        assert!(
-            error.message.contains("not idle"),
-            "unexpected error: {error}"
+            .expect("busy native team compaction should defer");
+        let started = rx.recv().await.expect("team context compaction started");
+        assert_eq!(started.kind, FrameKind::TeamContextCompactionNotify);
+        let started: TeamContextCompactionNotifyPayload = started
+            .parse_payload()
+            .expect("team context compaction started payload");
+        assert_eq!(started.status, TeamContextCompactionStatus::Started);
+
+        let terminal = loop {
+            let envelope = timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("busy team compaction reaches terminal")
+                .expect("team compaction stream remains open");
+            if envelope.kind != FrameKind::TeamContextCompactionNotify {
+                continue;
+            }
+            let payload: TeamContextCompactionNotifyPayload = envelope
+                .parse_payload()
+                .expect("team context compaction terminal payload");
+            if payload.status != TeamContextCompactionStatus::Started {
+                break payload;
+            }
+        };
+        assert_eq!(terminal.status, TeamContextCompactionStatus::Completed);
+        assert_eq!(terminal.members.len(), 1);
+        assert_eq!(terminal.members[0].agent_id, manager.agent_id);
+        assert_eq!(
+            terminal.members[0].status,
+            ContextCompactionStatus::Completed
         );
-        wait_for_agent_idle(&fixture.host, &manager.agent_id).await;
     }
 
     #[tokio::test]
-    async fn team_compaction_rotates_live_idle_members() {
+    async fn native_team_compaction_preserves_live_idle_member_bindings() {
         let fixture = team_fixture().await;
         let manager = fixture
             .host
@@ -25611,6 +25721,8 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .expect("message report");
         wait_for_agent_idle(&fixture.host, &report.agent_id).await;
         wait_for_team_member_binding_idle(&fixture.host, &fixture.report.id).await;
+        assert_native_context_compaction_route(&fixture.host, &manager.agent_id).await;
+        assert_native_context_compaction_route(&fixture.host, &report.agent_id).await;
         let old_agent_ids = HashSet::from([manager.agent_id.clone(), report.agent_id.clone()]);
 
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -25635,39 +25747,40 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .await
             .expect("team compaction started notify")
             .expect("team compaction started envelope");
-        assert_eq!(started.kind, FrameKind::TeamCompactNotify);
-        let started: TeamCompactNotifyPayload =
-            started.parse_payload().expect("team compact started");
-        assert_eq!(started.status, TeamCompactStatus::Started);
-        assert_eq!(started.agent_ids.len(), 2);
+        assert_eq!(started.kind, FrameKind::TeamContextCompactionNotify);
+        let started: TeamContextCompactionNotifyPayload = started
+            .parse_payload()
+            .expect("team context compaction started");
+        assert_eq!(started.status, TeamContextCompactionStatus::Started);
 
         let completed = loop {
             let envelope = tokio::time::timeout(Duration::from_secs(10), rx.recv())
                 .await
                 .expect("team compaction should finish")
                 .expect("team compact envelope");
-            if envelope.kind != FrameKind::TeamCompactNotify {
+            if envelope.kind != FrameKind::TeamContextCompactionNotify {
                 continue;
             }
-            let payload: TeamCompactNotifyPayload =
-                envelope.parse_payload().expect("team compact notify");
-            if payload.status != TeamCompactStatus::Started {
+            let payload: TeamContextCompactionNotifyPayload = envelope
+                .parse_payload()
+                .expect("team context compaction notify");
+            if payload.status != TeamContextCompactionStatus::Started {
                 break payload;
             }
         };
-        assert_eq!(completed.status, TeamCompactStatus::Completed);
-        assert_eq!(completed.results.len(), 2);
+        assert_eq!(completed.status, TeamContextCompactionStatus::Completed);
+        assert_eq!(completed.members.len(), 2);
         assert!(
             completed
-                .results
+                .members
                 .iter()
-                .all(|result| result.status == AgentCompactStatus::Completed)
+                .all(|result| result.status == ContextCompactionStatus::Completed)
         );
         assert!(
             completed
-                .results
+                .members
                 .iter()
-                .all(|result| old_agent_ids.contains(&result.old_agent_id))
+                .all(|result| old_agent_ids.contains(&result.agent_id))
         );
 
         let snapshot = team_snapshot(&fixture.host).await;
@@ -25683,13 +25796,13 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 .current_agent_id
                 .as_ref()
                 .expect("member remains live-bound");
-            assert!(!old_agent_ids.contains(new_agent_id));
+            assert!(old_agent_ids.contains(new_agent_id));
             let result = completed
-                .results
+                .members
                 .iter()
-                .find(|result| result.new_agent_id.as_ref() == Some(new_agent_id))
-                .expect("completed result for new agent");
-            assert_eq!(result.new_session_id.as_ref(), Some(&session_id));
+                .find(|result| &result.agent_id == new_agent_id)
+                .expect("completed result for preserved agent");
+            assert_eq!(result.logical_session_id, session_id);
         }
     }
 
@@ -28516,6 +28629,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
         agent_id: &AgentId,
         setting: HostSettingValue,
     ) {
+        assert_native_context_compaction_route(&fixture.host, agent_id).await;
         let status = fixture
             .host
             .agent_status_snapshot(agent_id)
@@ -28633,6 +28747,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
     async fn actor_gate_linearizes_activity_before_conditional_compaction() {
         let fixture = compact_fixture().await;
         let (agent_id, _) = spawn_idle_user_agent(&fixture.host, "activity wins race").await;
+        assert_native_context_compaction_route(&fixture.host, &agent_id).await;
         let observation = fixture
             .host
             .activity_summary_observation(&agent_id)
@@ -28675,6 +28790,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
     async fn actor_gate_accepts_compaction_that_linearizes_first() {
         let fixture = compact_fixture().await;
         let (agent_id, _) = spawn_idle_user_agent(&fixture.host, "compaction wins race").await;
+        assert_native_context_compaction_route(&fixture.host, &agent_id).await;
         let observation = fixture
             .host
             .activity_summary_observation(&agent_id)

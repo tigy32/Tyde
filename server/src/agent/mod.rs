@@ -1301,12 +1301,16 @@ impl AgentHandle {
     /// closing agent is still running, and saying otherwise sends people
     /// looking for a crash that never happened.
     ///
-    /// The flag is monotonic: [`AgentHandle::close`] is the only writer and
-    /// only ever sets it. Reading it after a failed send is therefore not a
-    /// race — if it reads true now it was already true when the send was
-    /// refused.
+    /// The flag is monotonic: close admission sets it before teardown and
+    /// never clears it. Reading it after a failed send is therefore not a race
+    /// — if it reads true now it was already true when the send was refused.
     pub(crate) fn is_closing(&self) -> bool {
         self.closing.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn begin_closing(&self) {
+        self.closing.store(true, Ordering::SeqCst);
+        self.accepting_input.store(false, Ordering::SeqCst);
     }
 
     /// Delivers an agent-control follow-up and waits for the actor's own
@@ -1714,8 +1718,7 @@ impl AgentHandle {
     }
 
     pub async fn close(&self) -> bool {
-        self.closing.store(true, Ordering::SeqCst);
-        self.accepting_input.store(false, Ordering::SeqCst);
+        self.begin_closing();
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .tx
@@ -5671,6 +5674,12 @@ pub(crate) fn spawn_agent_actor(
                                 let _ = reply.send(Err("agent is closing".to_owned()));
                                 continue;
                             }
+                            if inactivity_gate.is_some() {
+                                wait_for_compact_if_inactive_test_gate(
+                                    &current_start.agent_id,
+                                )
+                                .await;
+                            }
                             if let Some((
                                 expected_activity_counter,
                                 expected_supervisor_settings_epoch,
@@ -6715,10 +6724,12 @@ pub(crate) fn spawn_agent_actor(
                                 continue;
                             }
                             if let Some(flight) = context_compaction.as_ref() {
-                                if matches!(
-                                    flight.state,
-                                    StoredCompactionState::NativeAccepted
-                                ) {
+                                if in_turn
+                                    || matches!(
+                                        flight.state,
+                                        StoredCompactionState::NativeAccepted
+                                    )
+                                {
                                     let _ = backend
                                         .as_ref()
                                         .expect("backend must exist during compaction interrupt")
@@ -11140,6 +11151,7 @@ async fn authoritative_session_history_window(
             })
             .map(|record| (record.sequence, record.event))
             .collect::<Vec<_>>();
+        let entries = project_session_history_entries(entries);
         let end = entries.len();
         let start = history_start_for_message_limit(&entries, end, limit.max(1));
         let selected = &entries[start..end];
@@ -11342,13 +11354,23 @@ fn legacy_claude_agent_result(tool_name: &str, result: &serde_json::Value) -> bo
 }
 
 fn session_history_entries_from_log(event_log: &[Envelope]) -> Vec<(u64, ChatEvent)> {
+    let entries = event_log.iter().filter_map(|envelope| {
+        (envelope.kind == FrameKind::ChatEvent).then(|| {
+            (
+                envelope.seq,
+                serde_json::from_value(envelope.payload.clone())
+                    .expect("failed to parse ChatEvent from replay log"),
+            )
+        })
+    });
+    project_session_history_entries(entries)
+}
+
+fn project_session_history_entries(
+    entries: impl IntoIterator<Item = (u64, ChatEvent)>,
+) -> Vec<(u64, ChatEvent)> {
     let mut events = Vec::new();
-    for envelope in event_log {
-        if envelope.kind != FrameKind::ChatEvent {
-            continue;
-        }
-        let mut event: ChatEvent = serde_json::from_value(envelope.payload.clone())
-            .expect("failed to parse ChatEvent from replay log");
+    for (sequence, mut event) in entries {
         project_legacy_native_collaboration_event(&mut event);
         match event {
             ChatEvent::MessageMetadataUpdated(update) => {
@@ -11360,7 +11382,7 @@ fn session_history_entries_from_log(event_log: &[Envelope]) -> Vec<(u64, ChatEve
                 }
             }
             ChatEvent::TypingStatusChanged(_) => {}
-            event => events.push((envelope.seq, event)),
+            event => events.push((sequence, event)),
         }
     }
     events
@@ -12314,7 +12336,7 @@ mod tests {
             .parse_payload()
             .expect("startup AgentBootstrap payload");
         assert!(bootstrap.turn_active);
-        assert_eq!(bootstrap.events.len(), 4);
+        assert_eq!(bootstrap.events.len(), 5);
         let expected_start = handle.snapshot();
         let AgentBootstrapEvent::AgentStart(bootstrap_start) = &bootstrap.events[0] else {
             panic!("startup bootstrap must begin with AgentStart");
@@ -12331,10 +12353,17 @@ mod tests {
         ));
         assert!(matches!(
             &bootstrap.events[2],
-            AgentBootstrapEvent::SessionSettings(payload) if payload.values == expected_settings
+            AgentBootstrapEvent::ContextCompactionCapability(payload)
+                if payload.agent_id == expected_start.agent_id
+                    && payload.logical_session_id
+                        == expected_start.session_id.clone().expect("startup session id")
         ));
         assert!(matches!(
             &bootstrap.events[3],
+            AgentBootstrapEvent::SessionSettings(payload) if payload.values == expected_settings
+        ));
+        assert!(matches!(
+            &bootstrap.events[4],
             AgentBootstrapEvent::QueuedMessages(payload) if payload.messages.is_empty()
         ));
 
@@ -18403,6 +18432,7 @@ mod tests {
         rx: &mut mpsc::UnboundedReceiver<Envelope>,
         path: &str,
         mut terminal_count: usize,
+        release_held_turn: bool,
     ) {
         let follow_up = format!("ordinary follow-up after {path}");
         assert_eq!(
@@ -18410,6 +18440,13 @@ mod tests {
             Ok(()),
             "{path} must release the actor input barrier"
         );
+        if release_held_turn {
+            assert_eq!(
+                handle.interrupt().await,
+                InterruptOutcome::Interrupted,
+                "{path} held turn must remain interruptible after compaction terminal"
+            );
+        }
         timeout(Duration::from_secs(5), async {
             loop {
                 let envelope = rx.recv().await.expect("agent stream stays open");
@@ -18450,7 +18487,7 @@ mod tests {
         enum TerminalPath {
             NativeSuccess,
             NativeProviderFailure,
-            NativeTimeoutOrEof,
+            DeferredDeadline,
             ContinuationInjectionFailure,
             FallbackSummaryFailure,
             PreparedBindingFailure,
@@ -18462,7 +18499,7 @@ mod tests {
         let rows = [
             TerminalPath::NativeSuccess,
             TerminalPath::NativeProviderFailure,
-            TerminalPath::NativeTimeoutOrEof,
+            TerminalPath::DeferredDeadline,
             TerminalPath::ContinuationInjectionFailure,
             TerminalPath::FallbackSummaryFailure,
             TerminalPath::PreparedBindingFailure,
@@ -18495,11 +18532,10 @@ mod tests {
                 TerminalPath::NativeProviderFailure => {
                     Some(crate::backend::mock::MOCK_COMPACT_FAIL_POST_DISPATCH_SENTINEL.to_owned())
                 }
-                TerminalPath::NativeTimeoutOrEof
-                | TerminalPath::Interrupt
-                | TerminalPath::ActorClose => {
+                TerminalPath::ActorClose => {
                     Some(crate::backend::mock::MOCK_COMPACT_HANG_SENTINEL.to_owned())
                 }
+                TerminalPath::DeferredDeadline | TerminalPath::Interrupt => None,
                 TerminalPath::ContinuationInjectionFailure => {
                     Some("__test_fail_continuation__".to_owned())
                 }
@@ -18519,24 +18555,40 @@ mod tests {
                     Some(crate::backend::mock::MOCK_COMPACT_FAIL_PRE_DISPATCH_SENTINEL.to_owned())
                 }
             };
+            if matches!(
+                path,
+                TerminalPath::DeferredDeadline | TerminalPath::Interrupt
+            ) {
+                assert_eq!(
+                    handle
+                        .deliver_message(delivery_payload(
+                            "__mock_hold_until_interrupt__ hold compaction safe point",
+                        ))
+                        .await,
+                    Ok(())
+                );
+                timeout(Duration::from_secs(5), async {
+                    while !status_handle.snapshot().await.is_active() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("held turn becomes active before deferred compaction");
+            }
+            let barrier_timeout = if matches!(path, TerminalPath::DeferredDeadline) {
+                Duration::from_millis(50)
+            } else {
+                Duration::from_secs(30)
+            };
             let operation_id = handle
                 .request_context_compaction(
                     CompactionTrigger::UserRequested,
                     focus,
-                    Duration::from_secs(30),
+                    barrier_timeout,
                 )
                 .await
                 .unwrap_or_else(|error| panic!("{path:?} admission failed: {error}"));
             match path {
-                TerminalPath::NativeTimeoutOrEof => {
-                    handle
-                        .tx
-                        .send(AgentCommand::ContextCompactionTerminal {
-                            operation_id: operation_id.clone(),
-                            result: Err("test adapter timeout".to_owned()),
-                        })
-                        .expect("inject timeout terminal");
-                }
                 TerminalPath::Interrupt => {
                     assert_eq!(handle.interrupt().await, InterruptOutcome::Interrupted);
                 }
@@ -18620,6 +18672,7 @@ mod tests {
                     &mut rx,
                     &format!("{path:?}"),
                     terminal_count,
+                    matches!(path, TerminalPath::DeferredDeadline),
                 )
                 .await;
                 assert!(handle.close().await);

@@ -126,6 +126,8 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::WorkflowNotify
                 | FrameKind::AgentsViewPreferencesNotify
                 | FrameKind::AgentActivityStats
+                | FrameKind::ContextCompactionNotify
+                | FrameKind::ContextCompactionCapability
         ) {
             continue;
         }
@@ -169,6 +171,8 @@ async fn expect_raw_event_on_stream(
                 | FrameKind::TaskTokenUsage
                 | FrameKind::WorkflowNotify
                 | FrameKind::AgentsViewPreferencesNotify
+                | FrameKind::ContextCompactionNotify
+                | FrameKind::ContextCompactionCapability
         ) {
             continue;
         }

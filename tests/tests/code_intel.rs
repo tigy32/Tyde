@@ -359,7 +359,9 @@ async fn wait_for_code_intel_unavailable_with_overview(
             | FrameKind::TeamPresetCatalogNotify
             | FrameKind::SessionList
             | FrameKind::WorkflowNotify
-            | FrameKind::AgentsViewPreferencesNotify => {}
+            | FrameKind::AgentsViewPreferencesNotify
+            | FrameKind::ContextCompactionNotify
+            | FrameKind::ContextCompactionCapability => {}
             other => panic!("unexpected frame while waiting for code-intel overview: {other}"),
         }
     }
@@ -438,7 +440,9 @@ async fn wait_for_code_intel_warm_unavailable_overview(
             | FrameKind::TeamPresetCatalogNotify
             | FrameKind::SessionList
             | FrameKind::WorkflowNotify
-            | FrameKind::AgentsViewPreferencesNotify => {}
+            | FrameKind::AgentsViewPreferencesNotify
+            | FrameKind::ContextCompactionNotify
+            | FrameKind::ContextCompactionCapability => {}
             other => panic!("unexpected frame while waiting for warm overview: {other}"),
         }
     }

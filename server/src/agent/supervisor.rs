@@ -1404,7 +1404,7 @@ stopped mid-task, or that the agent could have done more are NOT grounds for con
                     ..protocol::TokenUsage::default()
                 }),
             ),
-            context_breakdown: None,
+            context_breakdown: Some(context_breakdown(800)),
             images: None,
         });
         let marker = ChatEvent::ContextCompaction(protocol::ContextCompactionTimelineEvent {

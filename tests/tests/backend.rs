@@ -441,17 +441,29 @@ async fn expect_fixture_event(client: &mut client::Connection, context: &str) ->
     }
 }
 
-fn agent_start_from_bootstrap(env: Envelope, context: &str) -> AgentStartPayload {
+fn agent_start_and_chat_events_from_bootstrap(
+    env: Envelope,
+    context: &str,
+) -> (AgentStartPayload, Vec<ChatEvent>) {
     assert_eq!(env.kind, FrameKind::AgentBootstrap, "expected {context}");
     let payload: AgentBootstrapPayload = env.parse_payload().expect("parse AgentBootstrap");
-    payload
-        .events
-        .into_iter()
-        .find_map(|event| match event {
-            AgentBootstrapEvent::AgentStart(start) => Some(start),
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("AgentBootstrap missing AgentStart for {context}"))
+    let mut start = None;
+    let mut chat_events = Vec::new();
+    for event in payload.events {
+        match event {
+            AgentBootstrapEvent::AgentStart(value) => start = Some(value),
+            AgentBootstrapEvent::ChatEvent(event) => chat_events.push(event),
+            _ => {}
+        }
+    }
+    (
+        start.unwrap_or_else(|| panic!("AgentBootstrap missing AgentStart for {context}")),
+        chat_events,
+    )
+}
+
+fn agent_start_from_bootstrap(env: Envelope, context: &str) -> AgentStartPayload {
+    agent_start_and_chat_events_from_bootstrap(env, context).0
 }
 
 async fn expect_fixture_agent_start(
@@ -463,6 +475,43 @@ async fn expect_fixture_agent_start(
         let env = expect_fixture_event(client, context).await;
         if env.kind == FrameKind::AgentBootstrap && env.stream == *agent_stream {
             return agent_start_from_bootstrap(env, context);
+        }
+    }
+}
+
+async fn expect_fixture_agent_start_with_chat_events(
+    client: &mut client::Connection,
+    agent_stream: &StreamPath,
+    context: &str,
+) -> (AgentStartPayload, Vec<ChatEvent>) {
+    loop {
+        let env = expect_fixture_event(client, context).await;
+        if env.kind == FrameKind::AgentBootstrap && env.stream == *agent_stream {
+            return agent_start_and_chat_events_from_bootstrap(env, context);
+        }
+    }
+}
+
+async fn expect_fixture_initial_stream_end(
+    client: &mut client::Connection,
+    agent_stream: &StreamPath,
+    bootstrap_chat_events: Vec<ChatEvent>,
+    context: &str,
+) {
+    if bootstrap_chat_events
+        .iter()
+        .any(|event| matches!(event, ChatEvent::StreamEnd(_)))
+    {
+        return;
+    }
+    loop {
+        let env = expect_fixture_event(client, context).await;
+        if env.kind != FrameKind::ChatEvent || env.stream != *agent_stream {
+            continue;
+        }
+        let event: ChatEvent = env.parse_payload().expect("parse initial ChatEvent");
+        if matches!(event, ChatEvent::StreamEnd(_)) {
+            return;
         }
     }
 }
@@ -3068,7 +3117,7 @@ async fn antigravity_native_uuid_session_remains_resumable_after_close() {
     let new_agent: NewAgentPayload = env.parse_payload().expect("parse Antigravity NewAgent");
     assert_eq!(new_agent.backend_kind, BackendKind::Antigravity);
 
-    let start = expect_fixture_agent_start(
+    let (start, bootstrap_chat_events) = expect_fixture_agent_start_with_chat_events(
         &mut fixture.client,
         &new_agent.instance_stream,
         "Antigravity AgentStart",
@@ -3080,16 +3129,13 @@ async fn antigravity_native_uuid_session_remains_resumable_after_close() {
         .clone()
         .expect("Antigravity AgentStart session_id");
 
-    loop {
-        let env = expect_fixture_event(&mut fixture.client, "Antigravity ChatEvent").await;
-        if env.kind != FrameKind::ChatEvent || env.stream != new_agent.instance_stream {
-            continue;
-        }
-        let event: ChatEvent = env.parse_payload().expect("parse Antigravity ChatEvent");
-        if matches!(event, ChatEvent::StreamEnd(_)) {
-            break;
-        }
-    }
+    expect_fixture_initial_stream_end(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        bootstrap_chat_events,
+        "Antigravity ChatEvent",
+    )
+    .await;
 
     fixture
         .client
@@ -3277,7 +3323,7 @@ async fn antigravity_direct_resume_missing_native_db_reports_startup_failure() {
     let env = expect_fixture_event(&mut fixture.client, "Antigravity NewAgent").await;
     assert_eq!(env.kind, FrameKind::NewAgent);
     let new_agent: NewAgentPayload = env.parse_payload().expect("parse Antigravity NewAgent");
-    let start = expect_fixture_agent_start(
+    let (start, bootstrap_chat_events) = expect_fixture_agent_start_with_chat_events(
         &mut fixture.client,
         &new_agent.instance_stream,
         "Antigravity AgentStart",
@@ -3288,16 +3334,13 @@ async fn antigravity_direct_resume_missing_native_db_reports_startup_failure() {
         .clone()
         .expect("Antigravity AgentStart session_id");
 
-    loop {
-        let env = expect_fixture_event(&mut fixture.client, "Antigravity ChatEvent").await;
-        if env.kind != FrameKind::ChatEvent || env.stream != new_agent.instance_stream {
-            continue;
-        }
-        let event: ChatEvent = env.parse_payload().expect("parse Antigravity ChatEvent");
-        if matches!(event, ChatEvent::StreamEnd(_)) {
-            break;
-        }
-    }
+    expect_fixture_initial_stream_end(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        bootstrap_chat_events,
+        "Antigravity ChatEvent",
+    )
+    .await;
 
     let db_guard = AntigravityConversationDbGuard::create(
         fixture.antigravity_conversations_dir(),

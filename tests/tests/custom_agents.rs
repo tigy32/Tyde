@@ -91,6 +91,8 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::ProjectFileList
                 | FrameKind::CodeIntelOverview
                 | FrameKind::ProjectEvent
+                | FrameKind::ContextCompactionNotify
+                | FrameKind::ContextCompactionCapability
         ) {
             continue;
         }
