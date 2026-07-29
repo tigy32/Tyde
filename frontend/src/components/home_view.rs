@@ -4,6 +4,18 @@ use crate::actions::begin_new_chat_default;
 use crate::components::host_browser::open_project_browser;
 use crate::components::launch_menu::{LaunchMenuBody, SubmenuAlign};
 use crate::state::{AppState, ConnectionStatus};
+use protocol::{BackendKind, BackendSetupStatus};
+
+fn backend_name(kind: BackendKind) -> &'static str {
+    match kind {
+        BackendKind::Tycode => "Tycode",
+        BackendKind::Acp => "ACP",
+        BackendKind::Claude => "Claude",
+        BackendKind::Codex => "Codex",
+        BackendKind::Antigravity => "Antigravity",
+        BackendKind::Hermes => "Hermes",
+    }
+}
 
 #[component]
 pub fn HomeView() -> impl IntoView {
@@ -16,17 +28,76 @@ pub fn HomeView() -> impl IntoView {
             ConnectionStatus::Connected
         )
     });
+    let connection_problem_state = state.clone();
+    let connection_problem = Memo::new(move |_| {
+        connection_problem_state.selected_host_id.get()?;
+        match connection_problem_state.selected_host_connection_status() {
+            ConnectionStatus::Error(message) => Some(format!(
+                "Tyde could not connect to the selected host: {message}"
+            )),
+            ConnectionStatus::Disconnected => Some(
+                "The selected host is offline. Connect it before creating projects or starting chats."
+                    .to_owned(),
+            ),
+            ConnectionStatus::Connecting | ConnectionStatus::Connected => None,
+        }
+    });
 
     // Setup progress for the getting-started guide. The guide is always on
     // screen — it doubles as orientation for returning users — and only the
     // step markers and CTAs react to progress.
     let backend_state = state.clone();
     let has_backend = Memo::new(move |_| {
-        backend_state
+        let settings = backend_state.host_settings_by_host.get();
+        let setup = backend_state.backend_setup_by_host.get();
+        settings.iter().any(|(host_id, settings)| {
+            settings.enabled_backends.iter().any(|enabled| {
+                setup.get(host_id).is_some_and(|infos| {
+                    infos.iter().any(|info| {
+                        info.backend_kind == *enabled
+                            && info.status == BackendSetupStatus::Installed
+                    })
+                })
+            })
+        })
+    });
+    let backend_problem_state = state.clone();
+    let backend_problem = Memo::new(move |_| {
+        let host_id = backend_problem_state.selected_host_id.get()?;
+        let settings = backend_problem_state
             .host_settings_by_host
             .get()
-            .values()
-            .any(|settings| !settings.enabled_backends.is_empty())
+            .get(&host_id)
+            .cloned()?;
+        let setup = backend_problem_state.backend_setup_by_host.get();
+        let infos = setup.get(&host_id)?;
+        settings.enabled_backends.iter().find_map(|enabled| {
+            let info = infos
+                .iter()
+                .find(|info| info.backend_kind == *enabled)?;
+            match info.status {
+                BackendSetupStatus::Installed => None,
+                BackendSetupStatus::NotInstalled => Some(format!(
+                    "{} is enabled but was not found on this host. Open Backend settings to install or repair it.",
+                    backend_name(*enabled)
+                )),
+                BackendSetupStatus::Unavailable => Some(
+                    info.diagnostic
+                        .as_ref()
+                        .map(|diagnostic| diagnostic.message.clone())
+                        .unwrap_or_else(|| {
+                            format!(
+                                "{} is installed but unavailable. Open Backend settings for repair steps.",
+                                backend_name(*enabled)
+                            )
+                        }),
+                ),
+                BackendSetupStatus::Unsupported => Some(format!(
+                    "{} is enabled but unsupported on this host.",
+                    backend_name(*enabled)
+                )),
+            }
+        })
     });
     let project_state = state.clone();
     let has_project = Memo::new(move |_| !project_state.projects.get().is_empty());
@@ -63,6 +134,16 @@ pub fn HomeView() -> impl IntoView {
 
             <div class="home-getstarted">
                 <h2 class="home-getstarted-title">"Getting started"</h2>
+                <Show when=move || connection_problem.get().is_some()>
+                    <div class="home-connection-error" role="alert">
+                        {move || connection_problem.get().unwrap_or_default()}
+                    </div>
+                </Show>
+                <Show when=move || backend_problem.get().is_some()>
+                    <div class="home-backend-error" role="alert">
+                        {move || backend_problem.get().unwrap_or_default()}
+                    </div>
+                </Show>
                 <p class="home-getstarted-lede">
                     "Tyde is a control center for AI coding agents. It runs the agent backends you already know — Claude, Codex, Antigravity and more — and keeps every session organized, so you can run many agents across many projects at once."
                 </p>
@@ -275,6 +356,20 @@ mod wasm_tests {
                 },
             );
         });
+        state.backend_setup_by_host.update(|map| {
+            map.insert(
+                host_id.to_owned(),
+                vec![protocol::BackendSetupInfo {
+                    backend_kind: BackendKind::Claude,
+                    status: BackendSetupStatus::Installed,
+                    installed_version: Some("Claude Code test".to_owned()),
+                    docs_url: "https://example.com".to_owned(),
+                    install_command: None,
+                    diagnostic: None,
+                    sign_in_command: None,
+                }],
+            );
+        });
     }
 
     fn add_project(state: &AppState, host_id: &str) {
@@ -438,6 +533,84 @@ mod wasm_tests {
             state.help_tour_step.get_untracked(),
             Some(0),
             "Help button must start the guided tour at step 1"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn first_run_host_failure_is_explained_inline() {
+        let container = make_container();
+        let state = AppState::new();
+        state.selected_host_id.set(Some("local".to_owned()));
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(
+                "local".to_owned(),
+                ConnectionStatus::Error("embedded host failed to start".to_owned()),
+            );
+        });
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <HomeView /> }
+        });
+
+        next_tick().await;
+        let error = container
+            .query_selector(".home-connection-error")
+            .unwrap()
+            .expect("first-run host failure must render inline");
+        assert_eq!(error.get_attribute("role").as_deref(), Some("alert"));
+        let text = error.text_content().unwrap_or_default();
+        assert!(
+            text.contains("embedded host failed to start"),
+            "the real connection error must be visible: {text}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn enabled_but_broken_backend_is_not_reported_as_ready() {
+        let container = make_container();
+        let state = AppState::new();
+        state.selected_host_id.set(Some("local".to_owned()));
+        enable_backend(&state, "local");
+        state.backend_setup_by_host.update(|setup| {
+            setup.insert(
+                "local".to_owned(),
+                vec![protocol::BackendSetupInfo {
+                    backend_kind: BackendKind::Claude,
+                    status: BackendSetupStatus::Unavailable,
+                    installed_version: None,
+                    docs_url: "https://example.com".to_owned(),
+                    install_command: None,
+                    diagnostic: Some(protocol::BackendSetupDiagnostic {
+                        code: protocol::BackendSetupDiagnosticCode::CommandTimedOut,
+                        message:
+                            "Tyde found claude, but its --version check did not finish within 2 seconds"
+                                .to_owned(),
+                    }),
+                    sign_in_command: None,
+                }],
+            );
+        });
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <HomeView /> }
+        });
+
+        next_tick().await;
+        assert_eq!(
+            checkmark_count(&container),
+            0,
+            "an enabled but unusable backend must not complete first-run setup"
+        );
+        let warning = container
+            .query_selector(".home-backend-error")
+            .unwrap()
+            .expect("broken enabled backend must be explained on Home");
+        let text = warning.text_content().unwrap_or_default();
+        assert!(
+            text.contains("found claude") && text.contains("within 2 seconds"),
+            "Home must show the backend probe's real diagnostic: {text}"
         );
     }
 }

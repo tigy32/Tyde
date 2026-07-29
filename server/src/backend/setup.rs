@@ -426,19 +426,24 @@ async fn probe_acp_agents(agents: &[ConfiguredAcpAgent]) -> ProbeResult {
 
 async fn probe_candidates(candidates: &[String]) -> ProbeResult {
     for candidate in candidates {
-        let Some(version) = probe_command(candidate).await else {
+        if Path::new(candidate).components().count() == 1
+            && process_env::find_executable_in_path(candidate).is_none()
+        {
             continue;
-        };
-        return ProbeResult::installed(version);
+        }
+        match probe_command(candidate).await {
+            Ok(version) => return ProbeResult::installed(version),
+            Err(failure) => {
+                return ProbeResult::unavailable(version_command_failure(candidate, failure));
+            }
+        }
     }
     ProbeResult::not_installed()
 }
 
-async fn probe_command(command: &str) -> Option<Option<String>> {
+async fn probe_command(command: &str) -> Result<Option<String>, VersionCommandFailure> {
     let child_path = process_env::resolved_child_process_path().map(std::ffi::OsStr::to_os_string);
-    let output = run_version_command_with_child_path(command, child_path)
-        .await
-        .ok()?;
+    let output = run_version_command_with_child_path(command, child_path).await?;
     let version = output
         .stdout
         .lines()
@@ -446,7 +451,7 @@ async fn probe_command(command: &str) -> Option<Option<String>> {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .map(|line| line.to_string());
-    Some(version)
+    Ok(version)
 }
 
 struct VersionCommandOutput {
@@ -462,6 +467,45 @@ enum VersionCommandFailure {
         stdout: String,
         stderr: String,
     },
+}
+
+fn version_command_failure(
+    command: &str,
+    failure: VersionCommandFailure,
+) -> BackendSetupDiagnostic {
+    match failure {
+        VersionCommandFailure::Start(error) => BackendSetupDiagnostic {
+            code: BackendSetupDiagnosticCode::CommandFailed,
+            message: format!(
+                "Tyde found {command}, but could not run its --version check: {error}"
+            ),
+        },
+        VersionCommandFailure::TimedOut => BackendSetupDiagnostic {
+            code: BackendSetupDiagnosticCode::CommandTimedOut,
+            message: format!(
+                "Tyde found {command}, but its --version check did not finish within 2 seconds"
+            ),
+        },
+        VersionCommandFailure::NonZero {
+            status,
+            stdout,
+            stderr,
+        } => {
+            let detail = stderr
+                .lines()
+                .chain(stdout.lines())
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(|line| format!(": {line}"))
+                .unwrap_or_default();
+            BackendSetupDiagnostic {
+                code: BackendSetupDiagnosticCode::CommandFailed,
+                message: format!(
+                    "Tyde found {command}, but its --version check exited with {status}{detail}"
+                ),
+            }
+        }
+    }
 }
 
 async fn wait_for_version_command_group(
@@ -1529,6 +1573,42 @@ mod tests {
                 && diagnostic.message.contains("exited unsuccessfully")
                 && diagnostic.message.contains("9"),
             "diagnostic should preserve exact output and failed status: {}",
+            diagnostic.message
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn found_backend_with_failed_version_probe_is_unavailable() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let command = dir.path().join("claude");
+        write_executable(
+            &command,
+            "#!/bin/sh\nprintf 'startup policy blocked this command\\n' >&2\nexit 7\n",
+        );
+
+        let result = probe_candidates(&[command.to_string_lossy().into_owned()]).await;
+
+        assert_eq!(result.status, BackendSetupStatus::Unavailable);
+        let diagnostic = result.diagnostic.expect("failed probe diagnostic");
+        assert_eq!(diagnostic.code, BackendSetupDiagnosticCode::CommandFailed);
+        assert!(
+            diagnostic.message.contains("startup policy blocked")
+                && diagnostic.message.contains("7"),
+            "the setup page must explain the real probe failure: {}",
+            diagnostic.message
+        );
+    }
+
+    #[test]
+    fn timed_out_backend_probe_has_actionable_diagnostic() {
+        let diagnostic = version_command_failure("claude", VersionCommandFailure::TimedOut);
+
+        assert_eq!(diagnostic.code, BackendSetupDiagnosticCode::CommandTimedOut);
+        assert!(
+            diagnostic.message.contains("found claude")
+                && diagnostic.message.contains("within 2 seconds"),
+            "the setup page must distinguish a timeout from a missing CLI: {}",
             diagnostic.message
         );
     }

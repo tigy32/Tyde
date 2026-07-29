@@ -265,14 +265,18 @@ pub async fn send_frame<T: Serialize>(
         Ok(envelope) => envelope,
         Err(error) => {
             release_seq_if_last(host_id, &stream, reservation);
-            return Err(error.to_string());
+            let error = error.to_string();
+            report_send_failure(host_id, kind, &error);
+            return Err(error);
         }
     };
     let line = match serde_json::to_string(&envelope) {
         Ok(line) => line,
         Err(error) => {
             release_seq_if_last(host_id, &stream, reservation);
-            return Err(error.to_string());
+            let error = error.to_string();
+            report_send_failure(host_id, kind, &error);
+            return Err(error);
         }
     };
     match bridge::send_host_line(bridge::SendHostLineRequest {
@@ -292,9 +296,17 @@ pub async fn send_frame<T: Serialize>(
                 kind,
                 e
             );
+            report_send_failure(host_id, kind, &e);
             Err(e)
         }
     }
+}
+
+fn report_send_failure(host_id: &str, kind: FrameKind, error: &str) {
+    let action = kind.to_string().replace('_', " ");
+    crate::components::header::report_user_error(format!(
+        "Tyde could not send “{action}” to host “{host_id}”. {error}"
+    ));
 }
 
 /// Send an Agents-view preference mutation to the primary local host. The
@@ -1056,6 +1068,14 @@ mod wasm_tests {
         .await;
         assert!(rejected.is_err());
         assert_eq!(current_seq(host_id, &stream), 0);
+        let visible_error = crate::components::header::current_user_error()
+            .expect("transport rejection must produce visible feedback");
+        assert!(
+            visible_error.contains("client error")
+                && visible_error.contains("host-sequence")
+                && visible_error.contains("simulated bridge rejection"),
+            "visible feedback must identify the action, host, and cause: {visible_error}"
+        );
 
         send_frame(
             host_id,

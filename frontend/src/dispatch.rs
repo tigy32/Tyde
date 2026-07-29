@@ -496,6 +496,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     payload.code,
                     payload.message
                 );
+                crate::components::header::report_user_error(message.clone());
                 state.command_errors_by_host.update(|errors| {
                     errors.insert(host_id.to_string(), message);
                 });
@@ -2267,6 +2268,10 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
         FrameKind::TerminalError => match envelope.parse_payload::<TerminalErrorPayload>() {
             Ok(payload) => {
                 log::error!("terminal error ({:?}): {}", payload.code, payload.message);
+                crate::components::header::report_user_error(format!(
+                    "Terminal failed: {}",
+                    payload.message
+                ));
                 if payload.fatal {
                     state.terminals.update(|terminals| {
                         if let Some(terminal) = terminals.iter_mut().find(|terminal| {

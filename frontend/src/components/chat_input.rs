@@ -353,6 +353,10 @@ fn submit_chat_input(
                     "submit_chat_input: host stream missing for {host}",
                     host = pending.host_id
                 );
+                crate::components::header::report_user_error(format!(
+                    "Tyde could not send the message because host “{}” is not connected.",
+                    pending.host_id
+                ));
                 return;
             };
             composer.text.set(String::new());
@@ -411,6 +415,9 @@ fn submit_chat_input(
         Some(stream) => stream,
         None => {
             log::error!("submit_chat_input: active agent stream missing");
+            crate::components::header::report_user_error(
+                "Tyde could not send the message because the agent is no longer connected.",
+            );
             return;
         }
     };
@@ -477,7 +484,12 @@ fn interrupt_target_turn(state: &AppState, agent_ref: Signal<Option<ActiveAgentR
 
     let instance_stream = match target_instance_stream(state, agent_ref) {
         Some(stream) => stream,
-        None => return,
+        None => {
+            crate::components::header::report_user_error(
+                "Tyde could not cancel the turn because the agent is no longer connected.",
+            );
+            return;
+        }
     };
 
     // Claim the interrupt slot before the frame goes out. The disabled markup
@@ -553,6 +565,9 @@ fn steer_chat_input(
         Some(stream) => stream,
         None => {
             log::error!("steer_chat_input: active agent stream missing");
+            crate::components::header::report_user_error(
+                "Tyde could not steer the agent because it is no longer connected.",
+            );
             return;
         }
     };

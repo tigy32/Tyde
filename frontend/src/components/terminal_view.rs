@@ -72,8 +72,11 @@ fn TerminalTabBar() -> impl IntoView {
             terminal_roots_for_new.get(),
             selected_root_for_new.get(),
         ) {
-            Some(v) => v,
-            None => return,
+            Ok(request) => request,
+            Err(message) => {
+                crate::components::header::report_user_error(message);
+                return;
+            }
         };
 
         let payload = TerminalCreatePayload {
@@ -95,17 +98,6 @@ fn TerminalTabBar() -> impl IntoView {
         });
     };
 
-    let state_for_disabled = state.clone();
-    let terminal_roots_for_disabled = terminal_roots;
-    let selected_root_for_disabled = selected_root;
-    let btn_disabled = move || {
-        terminal_create_request(
-            &state_for_disabled,
-            terminal_roots_for_disabled.get(),
-            selected_root_for_disabled.get(),
-        )
-        .is_none()
-    };
     let state_for_tabs = state.clone();
     let root_options = terminal_roots;
     let selected_root_for_value = selected_root;
@@ -157,7 +149,6 @@ fn TerminalTabBar() -> impl IntoView {
                 class="terminal-new-btn"
                 on:click=on_new_terminal
                 title="New Terminal"
-                disabled=btn_disabled
             >
                 "+"
             </button>
@@ -169,13 +160,20 @@ fn terminal_create_request(
     state: &AppState,
     project_roots: Option<Vec<ProjectRootPath>>,
     selected_root: Option<ProjectRootPath>,
-) -> Option<(String, StreamPath, TerminalLaunchTarget)> {
+) -> Result<(String, StreamPath, TerminalLaunchTarget), String> {
     let (host_id, target) = match state.active_project.get() {
         Some(active_project) => {
-            let roots = project_roots?;
+            let roots = project_roots.ok_or_else(|| {
+                "Tyde could not open a terminal because the active project has no available root."
+                    .to_owned()
+            })?;
             let root = selected_root
                 .filter(|selected| roots.iter().any(|root| root == selected))
-                .or_else(|| roots.first().cloned())?;
+                .or_else(|| roots.first().cloned())
+                .ok_or_else(|| {
+                    "Tyde could not open a terminal because the active project has no available root."
+                        .to_owned()
+                })?;
             let host_id = active_project.host_id;
             (
                 host_id,
@@ -187,12 +185,22 @@ fn terminal_create_request(
             )
         }
         None => (
-            state.selected_host_id.get()?,
+            state.selected_host_id.get().ok_or_else(|| {
+                "Tyde could not open a terminal because no host is selected. Select or connect a host first."
+                    .to_owned()
+            })?,
             TerminalLaunchTarget::HostDefault,
         ),
     };
-    let host_stream = state.host_streams.get().get(&host_id)?.clone();
-    Some((host_id, host_stream, target))
+    let host_stream = state
+        .host_streams
+        .get()
+        .get(&host_id)
+        .cloned()
+        .ok_or_else(|| {
+            format!("Tyde could not open a terminal because host “{host_id}” is not connected.")
+        })?;
+    Ok((host_id, host_stream, target))
 }
 
 #[component]
@@ -621,6 +629,38 @@ mod wasm_tests {
         assert_eq!(
             target, r#"{"kind":"host_default"}"#,
             "Home terminal must ask the host to launch in Tyde's cwd"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn unavailable_home_terminal_explains_why() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(AppState::new());
+            view! {
+                <crate::components::header::Header />
+                <TerminalView />
+            }
+        });
+
+        next_tick().await;
+        container
+            .query_selector(".terminal-new-btn")
+            .unwrap()
+            .expect("new terminal button remains actionable")
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+
+        let banner = container
+            .query_selector(".user-error-banner")
+            .unwrap()
+            .expect("terminal refusal must render a visible explanation");
+        let text = banner.text_content().unwrap_or_default();
+        assert!(
+            text.contains("no host is selected"),
+            "terminal refusal must say what the user needs to fix: {text}"
         );
     }
 }

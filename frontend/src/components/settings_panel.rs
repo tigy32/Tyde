@@ -4384,6 +4384,9 @@ fn commit_native_setting(
         log::error!(
             "cannot edit backend-native settings for {kind:?}: no current settings document"
         );
+        crate::components::header::report_user_error(format!(
+            "Tyde cannot edit {kind:?} settings because their current values have not loaded."
+        ));
         return;
     };
     let mut root = base.clone();
@@ -4411,10 +4414,16 @@ fn commit_native_setting(
                 log::error!(
                     "cannot edit {kind:?} settings: profile '{name}' is not in the current document"
                 );
+                crate::components::header::report_user_error(format!(
+                    "Tyde cannot edit profile “{name}” because it is no longer in the current {kind:?} settings."
+                ));
                 return;
             };
             let Some(original) = entry.get("settings").cloned() else {
                 log::error!("cannot edit {kind:?} settings: profile '{name}' has no settings");
+                crate::components::header::report_user_error(format!(
+                    "Tyde cannot edit profile “{name}” because its {kind:?} settings are missing."
+                ));
                 return;
             };
             let mut edited = original.clone();
@@ -4442,6 +4451,9 @@ fn commit_native_setting(
 fn send_native_settings_document(state: &AppState, kind: BackendKind, base: Value, root: Value) {
     let Some((host_id, host_stream)) = state.selected_host_stream_untracked() else {
         log::error!("cannot save backend-native settings for {kind:?}: no selected host stream");
+        crate::components::header::report_user_error(format!(
+            "Tyde cannot save {kind:?} settings because the selected host is not connected."
+        ));
         return;
     };
     // Guard the wire path: if a save against this same base is already in
@@ -4498,11 +4510,17 @@ fn send_tycode_profile_actions(state: &AppState, actions: Value) {
     let kind = BackendKind::Tycode;
     let Some(base) = native_settings_root(state, kind) else {
         log::error!("cannot modify Tycode profiles: no current settings document");
+        crate::components::header::report_user_error(
+            "Tyde cannot change Tycode profiles because their current values have not loaded.",
+        );
         return;
     };
     let mut root = base.clone();
     let Some(object) = root.as_object_mut() else {
         log::error!("cannot modify Tycode profiles: settings document is not an object");
+        crate::components::header::report_user_error(
+            "Tyde cannot change Tycode profiles because the settings file has an invalid structure.",
+        );
         return;
     };
     object.insert("actions".to_owned(), actions);
@@ -6171,6 +6189,9 @@ fn BackendCard(kind: BackendKind, active_page: RwSignal<SettingsPage>) -> impl I
             let input: web_sys::HtmlInputElement = target.unchecked_into();
             let Some(settings) = state.selected_host_settings_untracked() else {
                 log::error!("backend toggle fired before host settings loaded");
+                crate::components::header::report_user_error(
+                    "Tyde cannot change this backend yet because host settings are still loading.",
+                );
                 return;
             };
 
@@ -6334,6 +6355,9 @@ fn BackendCard(kind: BackendKind, active_page: RwSignal<SettingsPage>) -> impl I
 fn send_run_backend_setup(state: &AppState, backend_kind: BackendKind, action: BackendSetupAction) {
     let Some((host_id, host_stream)) = state.selected_host_stream_untracked() else {
         log::error!("send_run_backend_setup called without a selected host stream");
+        crate::components::header::report_user_error(
+            "Tyde cannot run backend setup because the selected host is not connected.",
+        );
         return;
     };
 
@@ -6380,6 +6404,9 @@ fn backend_setup_status_class(info: Option<&BackendSetupInfo>) -> &'static str {
 fn send_host_setting(state: &AppState, setting: HostSettingValue) {
     let Some((host_id, host_stream)) = state.selected_host_stream_untracked() else {
         log::error!("send_host_setting called without a selected host stream");
+        crate::components::header::report_user_error(
+            "Tyde cannot save this setting because the selected host is not connected.",
+        );
         return;
     };
 
@@ -8084,10 +8111,16 @@ fn SkillsTab() -> impl IntoView {
     let on_refresh = move |_| {
         let Some(host_id) = state_for_refresh.selected_host_id.get_untracked() else {
             log::error!("skills: refresh clicked without a selected host");
+            crate::components::header::report_user_error(
+                "Tyde cannot refresh skills because no host is selected.",
+            );
             return;
         };
         let Some((host_id, host_stream)) = host_stream_with_id(&state_for_refresh, &host_id) else {
             log::error!("skills: refresh clicked without a host stream");
+            crate::components::header::report_user_error(format!(
+                "Tyde cannot refresh skills because host “{host_id}” is not connected."
+            ));
             return;
         };
         spawn_local(async move {

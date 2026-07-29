@@ -44,6 +44,9 @@ fn pick_initial_host(state: &AppState) -> Option<(String, StreamPath)> {
 pub fn open_project_browser(state: &AppState) {
     let Some((host_id, host_stream)) = pick_initial_host(state) else {
         log::error!("cannot open browser: no connected host available");
+        crate::components::header::report_user_error(
+            "Tyde cannot open the folder browser because no host is connected.",
+        );
         return;
     };
     open_browser_for(state, host_id, host_stream, BrowsePurpose::OpenProject);
@@ -52,6 +55,9 @@ pub fn open_project_browser(state: &AppState) {
 pub fn open_add_root_browser(state: &AppState) {
     let Some(active_project) = state.active_project_ref_untracked() else {
         log::error!("cannot add a root without an active project");
+        crate::components::header::report_user_error(
+            "Tyde cannot add a folder because no project is active.",
+        );
         return;
     };
     // §6.5: ProjectAddRoot is invalid on a workbench and on a parent that
@@ -64,6 +70,9 @@ pub fn open_add_root_browser(state: &AppState) {
             "cannot add a root for project {}: workbench or parent-of-workbench",
             active_project.project_id
         );
+        crate::components::header::report_user_error(
+            "Folders cannot be changed for a workbench or for a project that currently has workbenches.",
+        );
         return;
     }
     let Some(host_stream) = state.host_stream_untracked(&active_project.host_id) else {
@@ -71,6 +80,10 @@ pub fn open_add_root_browser(state: &AppState) {
             "cannot add a root: host {} has no active stream",
             active_project.host_id
         );
+        crate::components::header::report_user_error(format!(
+            "Tyde cannot add a folder because host “{}” is not connected.",
+            active_project.host_id
+        ));
         return;
     };
     open_browser_for(
@@ -435,6 +448,9 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
     let host_id_for_confirm = host_id_signal.clone();
     let on_confirm = move |_| {
         let Some(path) = current_path_for_confirm.get_untracked() else {
+            crate::components::header::report_user_error(
+                "Tyde cannot use this folder because no folder is selected.",
+            );
             return;
         };
         match dialog_purpose.clone() {
@@ -448,6 +464,9 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
                 let host_id = host_id_for_confirm.get_untracked();
                 let Some(host_stream) = state_for_confirm.host_stream_untracked(&host_id) else {
                     log::error!("cannot create project without a connected dialog host");
+                    crate::components::header::report_user_error(format!(
+                        "Tyde cannot create the project because host “{host_id}” is not connected."
+                    ));
                     return;
                 };
                 spawn_local(async move {
@@ -471,6 +490,9 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
                 let host_id = host_id_for_confirm.get_untracked();
                 let Some(host_stream) = state_for_confirm.host_stream_untracked(&host_id) else {
                     log::error!("cannot add root without a connected dialog host");
+                    crate::components::header::report_user_error(format!(
+                        "Tyde cannot add the folder because host “{host_id}” is not connected."
+                    ));
                     return;
                 };
                 spawn_local(async move {

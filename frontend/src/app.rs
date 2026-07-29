@@ -908,6 +908,9 @@ pub fn App() -> impl IntoView {
             yield_to_browser().await;
             if let Err(error) = bridge::mark_frontend_ready().await {
                 log::error!("failed to acknowledge frontend readiness: {error}");
+                crate::components::header::report_user_error(format!(
+                    "Tyde’s interface loaded, but the desktop shell did not acknowledge it. Restart Tyde. {error}"
+                ));
             }
         });
     });
@@ -1027,6 +1030,9 @@ async fn initialize_hosts(state: AppState, listener_token: u64) {
         Ok(handles) => handles,
         Err(error) => {
             log::error!("failed to install host listeners: {error}");
+            crate::components::header::report_user_error(format!(
+                "Tyde could not start its host event listeners. Restart Tyde. {error}"
+            ));
             return;
         }
     };
@@ -1135,6 +1141,10 @@ async fn install_host_listeners(state: AppState) -> Result<Vec<bridge::UnlistenH
     handles.push(
         bridge::listen_host_error(move |event| {
             log::error!("host {} error: {}", event.host_id, event.message);
+            crate::components::header::report_user_error(format!(
+                "Host “{}” reported an error. {}",
+                event.host_id, event.message
+            ));
             error_state.connection_statuses.update(|statuses| {
                 statuses.insert(event.host_id, ConnectionStatus::Error(event.message));
             });
@@ -1174,6 +1184,9 @@ pub async fn refresh_configured_hosts(state: &AppState) {
         }
         Err(error) => {
             log::error!("failed to load configured hosts: {error}");
+            crate::components::header::report_user_error(format!(
+                "Tyde could not load the configured hosts, so setup cannot continue. {error}"
+            ));
         }
     }
 }
@@ -1196,6 +1209,9 @@ pub async fn connect_one_host(state: AppState, host_id: String) {
             }
             Err(error) => {
                 log::error!("failed to prepare remote host {}: {}", host_id, error);
+                crate::components::header::report_user_error(format!(
+                    "Tyde could not prepare host “{host_id}”. {error}"
+                ));
                 state.host_lifecycle_statuses.update(|statuses| {
                     statuses.insert(
                         host_id.clone(),
@@ -1221,6 +1237,9 @@ pub async fn connect_one_host(state: AppState, host_id: String) {
     .await
     {
         log::error!("failed to connect host {}: {}", host_id, error);
+        crate::components::header::report_user_error(format!(
+            "Tyde could not connect to host “{host_id}”. {error}"
+        ));
         state.connection_statuses.update(|statuses| {
             statuses.insert(host_id, ConnectionStatus::Error(error));
         });
