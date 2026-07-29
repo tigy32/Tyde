@@ -14571,6 +14571,8 @@ async fn launch_supervision_verdict(
     let cost_hint = settings.settings.cost_tier.as_cost_hint();
     let last_assistant_message = context.last_assistant_message;
     let last_error = context.last_error_since_user_message;
+    let last_kick_message = context.last_kick_message;
+    let last_reply_to_kick = context.last_reply_to_kick;
     let stall_interrupted = context.last_turn_was_stall_interrupted;
     let tx = verdict_tx.clone();
     let verdict_settings = VerdictSettingsFingerprint::from(settings.settings);
@@ -14658,7 +14660,8 @@ async fn launch_supervision_verdict(
             last_error,
             stall_interrupted,
             kicks_so_far: baseline.kicks_since_user_message,
-            max_kicks,
+            last_kick_message,
+            last_reply_to_kick,
             cost_hint,
             session_settings: supervisor_session_settings,
             use_mock_backend,

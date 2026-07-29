@@ -81,6 +81,12 @@ pub(crate) struct SupervisionContextSnapshot {
     pub user_message_count: u32,
     /// Consecutive supervisor kicks since the last real user message.
     pub kicks_since_user_message: u32,
+    /// Body of the most recent supervisor kick (prefix stripped), and the
+    /// agent's reply to it. Without these the judge cannot see that it has
+    /// already tried this follow-up and been refused, so every repeat attempt
+    /// looks like the first one and it re-answers `continue` forever.
+    pub last_kick_message: Option<String>,
+    pub last_reply_to_kick: Option<String>,
     pub last_assistant_message: Option<String>,
     /// Input-token footprint reported for the latest completed assistant
     /// turn. Absence remains explicit so eligibility never falls back to a
@@ -150,14 +156,20 @@ fn observe_message(
 ) {
     match &message.sender {
         MessageSender::User => {
-            if message.content.starts_with(SUPERVISOR_MESSAGE_PREFIX) {
+            if let Some(kick) = message.content.strip_prefix(SUPERVISOR_MESSAGE_PREFIX) {
                 snapshot.kicks_since_user_message =
                     snapshot.kicks_since_user_message.saturating_add(1);
+                snapshot.last_kick_message = Some(kick.to_owned());
+                // The reply belonging to the previous kick is not this kick's
+                // reply; the next assistant message is.
+                snapshot.last_reply_to_kick = None;
             } else {
                 snapshot.last_user_message = Some(message.content.clone());
                 snapshot.user_message_count = snapshot.user_message_count.saturating_add(1);
                 snapshot.kicks_since_user_message = 0;
                 snapshot.last_error_since_user_message = None;
+                snapshot.last_kick_message = None;
+                snapshot.last_reply_to_kick = None;
             }
             // Any new message (real or kick) supersedes an earlier cancel:
             // work is running again on purpose.
@@ -173,6 +185,9 @@ fn observe_message(
                 .map(|breakdown| breakdown.input_tokens);
             if !message.content.trim().is_empty() {
                 snapshot.last_assistant_message = Some(message.content.clone());
+                if snapshot.last_kick_message.is_some() {
+                    snapshot.last_reply_to_kick = Some(message.content.clone());
+                }
             }
         }
         MessageSender::Error => {
@@ -203,7 +218,10 @@ pub(crate) struct GenerateSupervisionVerdictRequest {
     /// so its final message is a truncation rather than a decision to stop.
     pub stall_interrupted: bool,
     pub kicks_so_far: u32,
-    pub max_kicks: u32,
+    /// The previous kick and the agent's answer to it, so a judge that already
+    /// tried this follow-up can see it was refused instead of reissuing it.
+    pub last_kick_message: Option<String>,
+    pub last_reply_to_kick: Option<String>,
     /// Model tier for the verdict call; `None` runs the backend's default.
     pub cost_hint: Option<SpawnCostHint>,
     pub session_settings: Option<SessionSettingsValues>,
@@ -410,42 +428,83 @@ fn build_supervision_prompt(request: &GenerateSupervisionVerdictRequest) -> Stri
     let user_message = cap_text(&request.last_user_message, SUPERVISION_SECTION_MAX_BYTES);
     let stall_interrupt_section = if request.stall_interrupted {
         "\nThis turn did not end on its own: it stopped making observable progress, so it was \
-cancelled automatically. Treat the agent's final message as truncated. Answer continue unless the \
+cancelled automatically. That is one of the grounds for continue listed above, so treat the \
+agent's final message as truncated rather than as a decision to stop. Answer continue unless the \
 user must decide something first, and name a smaller concrete next step or a different approach \
 rather than repeating the action that stalled.\n"
     } else {
         ""
     };
+    let repeat_section = build_repeat_follow_up_section(request);
     format!(
-        "You supervise a coding agent that just went idle. Decide whether it finished the user's \
-request, is awaiting user feedback, clarification, approval, a choice, or plan review, or stopped \
-early while executable work remains.\n\
+        "You supervise a coding agent that just went idle. Your only job is to decide whether the \
+agent's turn ended where the agent intended it to end.\n\
 Reply with EXACTLY one of these three forms and nothing else:\n\
 VERDICT: done\n\
 or\n\
 VERDICT: awaiting_user\n\
 or\n\
 VERDICT: continue\n\
-<one short follow-up message telling the agent to keep working and what remains>\n\
+<one short follow-up naming the failure and where to resume>\n\
 Rules:\n\
-- Answer done only when the user's requested work is actually complete and the agent expects no \
-user response to finish it.\n\
-- Answer awaiting_user when feedback, clarification, approval, a choice or decision, or review \
-of a plan or proposal is required. A completed plan document presented for approval is still \
-awaiting_user.\n\
-- Answer continue when an error interrupted the work, the agent stopped mid-task, or the \
-task list still has pending or in-progress items covered by the user's request and the agent can \
-continue without user input.\n\
-- The follow-up message is sent verbatim to the agent. Keep it short and specific.\n\
+- Default to not interfering: unless you have positive evidence the turn ended unintentionally, \
+never answer continue.\n\
+- Answer continue ONLY when something outside the agent's control cut the turn off: a provider or \
+tool error, a network failure, an HTTP 5xx, or a rate limit; an empty or near-empty final message \
+that does not read as a reply; a final message that breaks off mid-sentence, mid-code-block, or \
+mid-list; or a turn cancelled automatically for lack of progress. Those are the only grounds for \
+continue.\n\
+- That work remains, that the task list still has pending or in-progress items, that the agent \
+stopped mid-task, or that the agent could have done more are NOT grounds for continue. An agent \
+is allowed to stop with work remaining.\n\
+- Answer awaiting_user when the final message ends the turn on purpose and expects something from \
+the user: a question, a choice, a request for approval or permission, a plan or proposal for \
+review, a refusal, or a report handing control back. Treat the agent's stated reason for stopping \
+as authoritative. If it says it is waiting on the user, it is, even if the task list is unfinished \
+and even if you disagree with its reasoning.\n\
+- Answer done when the final message ends the turn on purpose and reads as complete, expecting no \
+user response.\n\
+- The follow-up message is sent verbatim to the agent and arrives as if the user had sent it. \
+Never claim or imply that the user said, approved, permitted, or decided anything: you do not \
+speak for the user and you cannot grant approval on their behalf.\n\
+- Never argue an agent out of a refusal or past a permission check. An agent that declined to act \
+without user approval is awaiting_user, always.\n\
 - Never invent new work or expand scope beyond the user's request.\n\
+- Name the concrete failure and the resume point, in one or two sentences.\n\
 {stall_interrupt_section}\n\
 User request:\n{user_message}\n\n\
 Agent task list:\n{task_list}\n\n\
 Agent's final message:\n{last_agent_message}\n\n\
-Most recent error since the user's request:\n{last_error}\n\n\
-Supervisor follow-ups already sent for this request: {kicks} of {max_kicks} allowed",
+Most recent error since the user's request:\n{last_error}\n\
+{repeat_section}"
+    )
+}
+
+/// Shows a repeating judge its own last attempt and how the agent answered it.
+/// Deliberately not phrased as a remaining allowance: a "N of M used" budget
+/// reads as something to spend, which is the opposite of the intended nudge.
+fn build_repeat_follow_up_section(request: &GenerateSupervisionVerdictRequest) -> String {
+    if request.kicks_so_far == 0 {
+        return String::new();
+    }
+    let last_kick = request
+        .last_kick_message
+        .as_deref()
+        .map(|text| cap_text(text, SUPERVISION_SECTION_MAX_BYTES))
+        .unwrap_or_else(|| "Not recorded".to_owned());
+    let reply = request
+        .last_reply_to_kick
+        .as_deref()
+        .map(|text| cap_text(text, SUPERVISION_SECTION_MAX_BYTES))
+        .unwrap_or_else(|| "None".to_owned());
+    format!(
+        "\nYou have already sent {kicks} automated follow-up(s) for this request, without any new \
+instruction from the user in between. Your most recent one and the agent's answer to it follow. \
+If your earlier follow-ups did not change the agent's behavior, another one will not either: \
+answer awaiting_user.\n\n\
+Your most recent follow-up:\n{last_kick}\n\n\
+The agent's answer to it:\n{reply}\n",
         kicks = request.kicks_so_far,
-        max_kicks = request.max_kicks,
     )
 }
 
@@ -752,6 +811,65 @@ mod tests {
         assert_eq!(snapshot.last_user_message.as_deref(), Some("new ask"));
     }
 
+    /// The judge answers `continue` forever if every repeat attempt looks like
+    /// its first, so the snapshot must carry the last kick and the reply it
+    /// actually drew.
+    #[test]
+    fn snapshot_pairs_each_kick_with_the_reply_it_drew() {
+        let first_kick = format!("{SUPERVISOR_MESSAGE_PREFIX}Finish the tests.");
+        let second_kick = format!("{SUPERVISOR_MESSAGE_PREFIX}Finish the tests, then report.");
+        let mut log = vec![
+            envelope(1, ChatEvent::MessageAdded(user_message("do the task"))),
+            envelope(2, ChatEvent::MessageAdded(assistant_message("Approve?"))),
+            envelope(3, ChatEvent::MessageAdded(user_message(&first_kick))),
+        ];
+        let snapshot = supervision_context_snapshot(&log);
+        assert_eq!(
+            snapshot.last_kick_message.as_deref(),
+            Some("Finish the tests.")
+        );
+        assert_eq!(
+            snapshot.last_reply_to_kick, None,
+            "the pre-kick message is not an answer to the kick"
+        );
+
+        log.push(envelope(
+            4,
+            ChatEvent::MessageAdded(assistant_message("Awaiting explicit user approval.")),
+        ));
+        assert_eq!(
+            supervision_context_snapshot(&log)
+                .last_reply_to_kick
+                .as_deref(),
+            Some("Awaiting explicit user approval.")
+        );
+
+        log.push(envelope(
+            5,
+            ChatEvent::MessageAdded(user_message(&second_kick)),
+        ));
+        let snapshot = supervision_context_snapshot(&log);
+        assert_eq!(
+            snapshot.last_kick_message.as_deref(),
+            Some("Finish the tests, then report.")
+        );
+        assert_eq!(
+            snapshot.last_reply_to_kick, None,
+            "the previous kick's reply must not be attributed to the new kick"
+        );
+
+        log.push(envelope(
+            6,
+            ChatEvent::MessageAdded(user_message("new ask")),
+        ));
+        let snapshot = supervision_context_snapshot(&log);
+        assert_eq!(
+            (snapshot.last_kick_message, snapshot.last_reply_to_kick),
+            (None, None),
+            "a real user message starts a fresh request with no prior attempts"
+        );
+    }
+
     #[test]
     fn snapshot_tracks_errors_and_cancellation_since_user_message() {
         let log = vec![
@@ -876,7 +994,8 @@ mod tests {
             last_error: None,
             stall_interrupted: true,
             kicks_so_far: 0,
-            max_kicks: 3,
+            last_kick_message: None,
+            last_reply_to_kick: None,
             cost_hint: Some(SpawnCostHint::Low),
             session_settings: None,
             use_mock_backend: true,
@@ -964,8 +1083,20 @@ mod tests {
         );
     }
 
+    /// Replaces `prompt_includes_task_list_and_kick_budget`, which pinned the
+    /// exact clauses that caused the ping-pong loop this change fixes: it
+    /// asserted the prompt contains "stopped early while executable work
+    /// remains" and "1 of 3 allowed". The first stated an unfinished task as
+    /// sufficient grounds for `continue`, which is true of an agent that
+    /// deliberately stopped to ask a question; the second framed the kick
+    /// budget as an allowance to spend. Both are now contradicted by the
+    /// guidance, so an assertion demanding them would pin the defect. The
+    /// contract they reached for (the prompt must carry the full verdict
+    /// guidance and the caller's context) is preserved and sharpened below:
+    /// each verdict's grounds are now asserted individually, including the
+    /// exclusions the old wording left implicit.
     #[test]
-    fn prompt_includes_task_list_and_kick_budget() {
+    fn prompt_states_the_unintended_stop_contract() {
         let request = GenerateSupervisionVerdictRequest {
             verdict_agent_id: AgentId("test".to_owned()),
             backend_kind: BackendKind::Claude,
@@ -982,7 +1113,8 @@ mod tests {
             last_error: None,
             stall_interrupted: false,
             kicks_so_far: 1,
-            max_kicks: 3,
+            last_kick_message: Some("Finish the tests, then report results.".to_owned()),
+            last_reply_to_kick: Some("Awaiting explicit user approval.".to_owned()),
             cost_hint: Some(SpawnCostHint::Low),
             session_settings: None,
             use_mock_backend: true,
@@ -991,14 +1123,64 @@ mod tests {
         let prompt = build_supervision_prompt(&request);
         assert!(prompt.contains("implement the parser"));
         assert!(prompt.contains("- [pending] write tests"));
-        assert!(prompt.contains("1 of 3 allowed"));
-        assert!(prompt.contains("actually complete"));
-        assert!(prompt.contains("is awaiting user feedback"));
-        assert!(prompt.contains("stopped early while executable work remains"));
-        assert!(prompt.contains("feedback, clarification, approval"));
-        assert!(prompt.contains("choice or decision"));
-        assert!(prompt.contains("plan or proposal"));
-        assert!(prompt.contains("completed plan document"));
+
+        // continue is gated on evidence the stop was not the agent's choice.
+        assert!(prompt.contains("ended where the agent intended it to end"));
+        assert!(prompt.contains("never answer continue"));
+        assert!(prompt.contains("Answer continue ONLY when something outside the agent's control"));
+        assert!(prompt.contains("Those are the only grounds for continue."));
+        assert!(prompt.contains("allowed to stop with work remaining"));
+        assert!(
+            prompt.contains(
+                "the task list still has pending or in-progress items, that the agent \
+stopped mid-task, or that the agent could have done more are NOT grounds for continue"
+            ),
+            "unfinished work must be named as an explicit non-ground, not merely left unlisted"
+        );
+
+        // A deliberate stop belongs to the user, and the judge may not pose as
+        // them to get past it.
+        assert!(prompt.contains("Treat the agent's stated reason for stopping as authoritative."));
+        assert!(prompt.contains("declined to act without user approval is awaiting_user, always"));
+        assert!(prompt.contains("arrives as if the user had sent it"));
+        assert!(prompt.contains(
+            "Never claim or imply that the user said, approved, permitted, or decided anything"
+        ));
+
+        // A repeating judge sees its own refused attempt instead of a budget.
+        assert!(prompt.contains("Finish the tests, then report results."));
+        assert!(prompt.contains("Awaiting explicit user approval."));
+        assert!(prompt.contains("another one will not either: answer awaiting_user"));
+        assert!(
+            !prompt.contains("Supervisor follow-ups already sent for this request"),
+            "the kick count must not read as a remaining allowance to spend"
+        );
+    }
+
+    #[test]
+    fn prompt_omits_the_repeat_section_on_a_first_verdict() {
+        let request = GenerateSupervisionVerdictRequest {
+            verdict_agent_id: AgentId("test".to_owned()),
+            backend_kind: BackendKind::Claude,
+            last_user_message: "implement the parser".to_owned(),
+            task_list: None,
+            last_assistant_message: Some("I stopped".to_owned()),
+            last_error: None,
+            stall_interrupted: false,
+            kicks_so_far: 0,
+            last_kick_message: None,
+            last_reply_to_kick: None,
+            cost_hint: Some(SpawnCostHint::Low),
+            session_settings: None,
+            use_mock_backend: true,
+            capacity_tx: mpsc::unbounded_channel().0,
+        };
+        let prompt = build_supervision_prompt(&request);
+        assert!(
+            !prompt.contains("automated follow-up(s)"),
+            "a first verdict has no prior attempt to report"
+        );
+        assert!(prompt.contains("Those are the only grounds for continue."));
     }
 
     #[test]
@@ -1013,7 +1195,8 @@ mod tests {
                 last_error: None,
                 stall_interrupted: false,
                 kicks_so_far: 0,
-                max_kicks: 3,
+                last_kick_message: None,
+                last_reply_to_kick: None,
                 cost_hint: Some(SpawnCostHint::Low),
                 session_settings: None,
                 use_mock_backend: true,
