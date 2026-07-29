@@ -22,7 +22,7 @@ use tokio::process::{ChildStderr, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-use crate::agent::customization::ResolvedSpawnConfig;
+use crate::agent::customization::{ResolvedSpawnConfig, SkillSelection};
 use crate::backend::agent_control_progress::{
     PendingToolNormalizationFailure, await_progress_data_for_tool, normalize_tyde_chat_event,
     spawn_progress_data_for_tool_result,
@@ -200,6 +200,50 @@ if existing != managed:
 from tui_gateway.server import _load_enabled_toolsets
 selected = _load_enabled_toolsets()
 print(json.dumps(selected))
+"#;
+
+/// Make Tyde's skill store discoverable by Hermes' own skill loader.
+///
+/// Hermes discovers skills from `<HERMES_HOME>/skills` plus the directories
+/// named by `skills.external_dirs` in that home's `config.yaml`. There is no env
+/// var and no per-session flag for it, so registering the store in the profile's
+/// config is the only way a Tyde-installed skill can appear in `skills_list` at
+/// all — without it, naming those skills in the prompt points the model at files
+/// it cannot find.
+///
+/// Idempotent and additive: entries are compared after `expanduser`, an existing
+/// entry is left alone, and every directory the user configured themselves is
+/// preserved. `save_config` is only called when something actually changed, so a
+/// repeat session does not rewrite the file (Hermes caches this list on
+/// `config.yaml`'s mtime).
+const HERMES_SKILLS_DIR_REGISTRATION: &str = r#"
+import json
+import sys
+from pathlib import Path
+
+from hermes_cli.config import read_raw_config, save_config
+
+wanted = sys.argv[1]
+config = read_raw_config()
+if not isinstance(config, dict):
+    config = {}
+skills = config.get("skills")
+if not isinstance(skills, dict):
+    skills = {}
+    config["skills"] = skills
+raw = skills.get("external_dirs")
+if isinstance(raw, str):
+    raw = [raw]
+if not isinstance(raw, list):
+    raw = []
+existing = {
+    str(Path(entry).expanduser()) for entry in raw if isinstance(entry, str)
+}
+if str(Path(wanted).expanduser()) not in existing:
+    raw = list(raw) + [wanted]
+    skills["external_dirs"] = raw
+    save_config(config)
+print(json.dumps(skills.get("external_dirs", [])))
 "#;
 
 #[cfg(test)]
@@ -476,13 +520,21 @@ impl Backend for HermesBackend {
         let resolved_settings = resolve_session_settings(&config);
         let profile = resolve_session_profile(&resolved_settings)?;
         let expects_mcp_tools = !config.startup_mcp_servers.is_empty();
-        let spawn_instructions = render_hermes_spawn_instructions(&config.resolved_spawn_config);
+        let remote_host =
+            crate::remote::parse_remote_workspace_roots(&workspace_roots)?.map(|(host, _)| host);
+        let dropped_skills_notice =
+            hermes_remote_skill_gate(&config.resolved_spawn_config, remote_host.as_deref())?;
+        let expose_skills =
+            remote_host.is_none() && !config.resolved_spawn_config.skills.is_empty();
+        let spawn_instructions =
+            render_hermes_spawn_instructions(&config.resolved_spawn_config, expose_skills);
         let (gateway, mut gateway_events_rx) = HermesGatewayHandle::spawn(
             &workspace_roots,
             &config.startup_mcp_servers,
             &config.resolved_spawn_config.tool_policy,
             &profile,
             spawn_instructions.as_deref(),
+            expose_skills,
         )
         .await?;
         let history_instructions = (!gateway.system_overlay_installed)
@@ -510,6 +562,12 @@ impl Backend for HermesBackend {
         };
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (events_tx, events_rx) = mpsc::unbounded_channel();
+        // A Default session that could not bring its skills says so. The channel
+        // is unbounded and its receiver is returned below, so this survives
+        // until the client attaches.
+        if let Some(notice) = dropped_skills_notice {
+            let _ = events_tx.send(ChatEvent::MessageAdded(warning_message(notice)));
+        }
         let actor = HermesSessionActor {
             gateway: gateway.clone(),
             live_session_id: ids.live_session_id.clone(),
@@ -540,13 +598,23 @@ impl Backend for HermesBackend {
         reject_unverified_resume_capabilities(&config)?;
         let resolved_settings = resolve_session_settings(&config);
         let profile = resolve_session_profile(&resolved_settings)?;
-        let spawn_instructions = render_hermes_spawn_instructions(&config.resolved_spawn_config);
+        let remote_host =
+            crate::remote::parse_remote_workspace_roots(&workspace_roots)?.map(|(host, _)| host);
+        // Resume refuses any session whose instructions cannot be installed
+        // remotely (below), so the gate's notice has nowhere to go and only its
+        // refusal matters here.
+        hermes_remote_skill_gate(&config.resolved_spawn_config, remote_host.as_deref())?;
+        let expose_skills =
+            remote_host.is_none() && !config.resolved_spawn_config.skills.is_empty();
+        let spawn_instructions =
+            render_hermes_spawn_instructions(&config.resolved_spawn_config, expose_skills);
         let (gateway, gateway_events_rx) = HermesGatewayHandle::spawn(
             &workspace_roots,
             &config.startup_mcp_servers,
             &config.resolved_spawn_config.tool_policy,
             &profile,
             spawn_instructions.as_deref(),
+            expose_skills,
         )
         .await?;
         if spawn_instructions.is_some() && !gateway.system_overlay_installed {
@@ -631,6 +699,7 @@ impl Backend for HermesBackend {
             &protocol::ToolPolicy::Unrestricted,
             &profile,
             None,
+            false,
         )
         .await?;
         let result = gateway
@@ -787,6 +856,7 @@ pub(crate) async fn probe_profile_surfaces(
         &protocol::ToolPolicy::Unrestricted,
         profile,
         None,
+        false,
     )
     .await;
     let (gateway, _events) = match spawned {
@@ -1179,6 +1249,7 @@ async fn run_credential_actions_for_profile(
         &protocol::ToolPolicy::Unrestricted,
         profile,
         None,
+        false,
     )
     .await?;
     for action in gateway_actions {
@@ -2032,6 +2103,7 @@ impl HermesGatewayHandle {
         tool_policy: &protocol::ToolPolicy,
         profile: &HermesProfileRef,
         spawn_instructions: Option<&str>,
+        expose_skills: bool,
     ) -> Result<(Self, mpsc::UnboundedReceiver<HermesGatewayEvent>), String> {
         let mut target = resolve_gateway_spawn_target(workspace_roots).await?;
         // A named profile is selected by pointing HERMES_HOME at its
@@ -2051,6 +2123,14 @@ impl HermesGatewayHandle {
                 crate::backend::hermes_config::HERMES_HOME_ENV.to_string(),
                 profile.home_dir.to_string_lossy().to_string(),
             );
+        }
+        // Before the gateway starts, so a store Hermes cannot see is a clean
+        // startup error rather than a session that reports every selected skill
+        // as missing. Remote targets never get here: the caller drops or refuses
+        // their skills, because this edits a config file on *this* machine.
+        if expose_skills && target.remote_host.is_none() {
+            let skills_root = crate::store::skills::SkillStore::default_root_dir()?;
+            register_hermes_skill_dir(&target, &skills_root).await?;
         }
         let system_overlay_installed = target.remote_host.is_none();
         if system_overlay_installed && let Some(spawn_instructions) = spawn_instructions {
@@ -2823,6 +2903,98 @@ async fn register_hermes_mcp_bridge(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Some(selected))
+}
+
+/// Register Tyde's skill store as an external skills directory for the profile
+/// this session will run against, and prove it took.
+///
+/// Fail-closed: a session that names Tyde skills in its prompt but whose store
+/// Hermes cannot see would report every one of them as missing, which is exactly
+/// the failure this closes. So a registration that errors, or that comes back
+/// without the store in the list, stops the spawn instead of starting a session
+/// that lies about what it has.
+async fn register_hermes_skill_dir(
+    target: &HermesSpawnTarget,
+    skills_root: &Path,
+) -> Result<(), String> {
+    let skills_root = skills_root.to_string_lossy().to_string();
+    let mut command = Command::new(&target.program);
+    command.args(["-c", HERMES_SKILLS_DIR_REGISTRATION, &skills_root]);
+    // Same reason the MCP bridge registration does this: `target.env` carries
+    // the selected profile's HERMES_HOME, and without it the script would edit
+    // the default profile's `config.yaml` while the gateway reads another's.
+    command.envs(&target.env);
+    command.env_remove(HERMES_TOOLSETS_ENV);
+    if let Some(path) = process_env::resolved_child_process_path() {
+        command.env("PATH", path);
+    }
+    if let Some(cwd) = target.cwd.as_deref() {
+        command.current_dir(cwd);
+    }
+    let output = command.output().await.map_err(|error| {
+        format!(
+            "Failed to register the Tyde skills directory with Hermes using {}: {error}",
+            target.display_program
+        )
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!(
+                "Hermes rejected Tyde skills-directory registration with status {}",
+                output.status
+            )
+        } else {
+            format!("Hermes rejected Tyde skills-directory registration: {stderr}")
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let registered = stdout
+        .lines()
+        .chain(stderr.lines())
+        .rev()
+        .find_map(|line| serde_json::from_str::<Vec<String>>(line.trim()).ok())
+        .ok_or_else(|| {
+            format!(
+                "Hermes skills-directory registration did not report the configured directories; \
+                 stdout={stdout:?}; stderr={stderr:?}"
+            )
+        })?;
+    // Compare the way Hermes resolves the list, so a `~`-prefixed entry the user
+    // already had counts as the same directory rather than a second one.
+    let expanded = expand_hermes_path(&skills_root);
+    if !registered
+        .iter()
+        .any(|entry| expand_hermes_path(entry) == expanded)
+    {
+        return Err(format!(
+            "Hermes did not register the Tyde skills directory {skills_root}; its configured \
+             external skill directories are {registered:?}"
+        ));
+    }
+    tracing::debug!(
+        skills_root = %skills_root,
+        "Hermes discovers Tyde skills through skills.external_dirs"
+    );
+    Ok(())
+}
+
+/// Expand a leading `~` the way Hermes' own `Path.expanduser` does, so two
+/// spellings of the same directory compare equal.
+fn expand_hermes_path(path: &str) -> PathBuf {
+    let Some(rest) = path.strip_prefix('~') else {
+        return PathBuf::from(path);
+    };
+    let Ok(home) = crate::paths::home_dir() else {
+        return PathBuf::from(path);
+    };
+    match rest.strip_prefix('/') {
+        Some(rest) => home.join(rest),
+        // `~otheruser/...` is not this user's home; leave it alone.
+        None if !rest.is_empty() => PathBuf::from(path),
+        _ => home,
+    }
 }
 
 fn prepare_hermes_managed_toolsets(
@@ -4141,13 +4313,27 @@ fn build_session_create_params(
     Ok(params)
 }
 
-fn render_hermes_spawn_instructions(resolved: &ResolvedSpawnConfig) -> Option<String> {
+/// Render the session's instructions, naming skills only when Hermes can
+/// actually load them.
+///
+/// `skills_discoverable` is the whole point of the flag: Tyde makes its store
+/// visible to Hermes by registering it in the profile's `config.yaml`, which is
+/// a file on *this* machine. A gateway running over SSH reads a different
+/// machine's config and a different machine's disk, so naming the skills there
+/// promises instructions that do not exist — which is precisely how a remote
+/// session ends up reporting every selected skill as missing. When they are not
+/// discoverable the block is omitted entirely rather than downgraded: a name
+/// with nothing behind it is worse than silence.
+fn render_hermes_spawn_instructions(
+    resolved: &ResolvedSpawnConfig,
+    skills_discoverable: bool,
+) -> Option<String> {
     let mut without_skills = resolved.clone();
     without_skills.skills.clear();
     let mut sections = render_combined_spawn_instructions(&without_skills)
         .into_iter()
         .collect::<Vec<_>>();
-    if !resolved.skills.is_empty() {
+    if skills_discoverable && !resolved.skills.is_empty() {
         let names = resolved
             .skills
             .iter()
@@ -4157,10 +4343,16 @@ fn render_hermes_spawn_instructions(resolved: &ResolvedSpawnConfig) -> Option<St
             })
             .collect::<Vec<_>>()
             .join("\n");
+        // Tyde registers its whole store, not a per-session subset: Hermes reads
+        // `skills.external_dirs` per HERMES_HOME, and there is no per-session
+        // seam to scope it further. So this names what the agent selected
+        // without claiming the others are hidden.
         sections.push(format!(
-            "Selected Tyde skills:\n{names}\n\nUse Hermes skill discovery to load matching \
-             skill instructions on demand. If a selected skill is unavailable, report that \
-             instead of inventing its instructions."
+            "Selected Tyde skills:\n{names}\n\nThese are installed in Tyde's skill store, which \
+             this session's Hermes discovers alongside its own; load them with Hermes skill \
+             discovery on demand. Other installed skills may also be listed — prefer the ones \
+             above. If a selected skill is unavailable, report that instead of inventing its \
+             instructions."
         ));
     }
     if sections.is_empty() {
@@ -4170,15 +4362,52 @@ fn render_hermes_spawn_instructions(resolved: &ResolvedSpawnConfig) -> Option<St
     }
 }
 
+/// Decide what a session does about skills it may not be able to expose.
+///
+/// Mirrors the policy every other backend uses. An explicit selection is
+/// fail-closed, because a custom agent naming its skills is stating what the
+/// session is for. The Default agent degrades, because it selects every
+/// installed skill and running remotely must not become impossible just because
+/// the store cannot travel — but it says so.
+fn hermes_remote_skill_gate(
+    resolved: &ResolvedSpawnConfig,
+    remote_host: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(host) = remote_host else {
+        return Ok(None);
+    };
+    if resolved.skills.is_empty() {
+        return Ok(None);
+    }
+    if resolved.skill_selection == SkillSelection::Explicit {
+        return Err(format!(
+            "Hermes skills are not available over SSH. This session selected {} skill(s), but \
+             Tyde exposes them by registering its skill store with the Hermes install on the \
+             machine it runs on, which the gateway on '{host}' cannot read. Remove the skills \
+             from this agent to run it remotely.",
+            resolved.skills.len()
+        ));
+    }
+    Ok(Some(format!(
+        "Tyde started this Hermes session without its {} installed skill(s): the gateway runs on \
+         '{host}' over SSH, and Tyde's skill store is on this machine. The session works \
+         normally otherwise, and any skills installed on '{host}' are still available.",
+        resolved.skills.len()
+    )))
+}
+
 pub(crate) fn session_is_resumable_for_workspace_roots(
     workspace_roots: &[String],
     resolved: &ResolvedSpawnConfig,
 ) -> bool {
-    render_hermes_spawn_instructions(resolved).is_none()
-        || matches!(
-            crate::remote::parse_remote_workspace_roots(workspace_roots),
-            Ok(None)
-        )
+    let local = matches!(
+        crate::remote::parse_remote_workspace_roots(workspace_roots),
+        Ok(None)
+    );
+    // Skills are only named when they are discoverable, which a remote gateway's
+    // never are — so a remote session whose *only* instructions were its skills
+    // has nothing left to install and stays resumable.
+    render_hermes_spawn_instructions(resolved, local).is_none() || local
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5951,9 +6180,23 @@ mod tests {
         }
     }
 
+    /// Tyde invokes the Hermes program two ways: as the gateway, and as
+    /// `hermes -c <script> <arg>` to edit the profile's config. A fake that only
+    /// models the first would answer a registration with gateway chatter, so
+    /// every fake gateway answers the skills-directory registration the way a
+    /// real install does — by running the script, which reports the configured
+    /// directories.
+    const FAKE_SKILL_REGISTRATION_PRELUDE: &str = r#"
+import json as _json, sys as _sys
+if len(_sys.argv) > 3 and _sys.argv[1] == "-c" and "external_dirs" in _sys.argv[2]:
+    print(_json.dumps([_sys.argv[3]]), flush=True)
+    raise SystemExit(0)
+"#;
+
     fn write_fake_gateway(dir: &TempDir, body: &str) -> String {
         let script = dir.path().join("fake_gateway.py");
-        fs::write(&script, body).expect("write fake gateway");
+        fs::write(&script, format!("{FAKE_SKILL_REGISTRATION_PRELUDE}{body}"))
+            .expect("write fake gateway");
         let launcher = dir.path().join("fake_python.sh");
         fs::write(
             &launcher,
@@ -7712,7 +7955,7 @@ with open({survived:?}, "w") as output:
             params.get("messages").is_none(),
             "Tyde instructions must not be persisted as ordinary history"
         );
-        let instructions = render_hermes_spawn_instructions(&resolved).expect("instructions");
+        let instructions = render_hermes_spawn_instructions(&resolved, true).expect("instructions");
         assert!(instructions.contains("Backend access mode is read-only"));
         assert!(HERMES_MCP_GATEWAY_ENTRY.contains("ephemeral_system_prompt"));
         assert!(HERMES_MCP_GATEWAY_ENTRY.contains(TYDE_HERMES_SYSTEM_PROMPT_ENV));
@@ -7745,7 +7988,7 @@ with open({survived:?}, "w") as output:
             ..ResolvedSpawnConfig::default()
         };
 
-        let seed = render_hermes_spawn_instructions(&resolved).expect("system overlay");
+        let seed = render_hermes_spawn_instructions(&resolved, true).expect("system overlay");
 
         assert!(seed.contains("Review changes"));
         assert!(seed.contains("Trace failures"));
@@ -9725,5 +9968,139 @@ for line in sys.stdin:
             ChatEvent::TaskUpdate(tasks)
                 if matches!(tasks.tasks[0].status, protocol::TaskStatus::Completed)
         )));
+    }
+    fn skill_resolved_config(selection: SkillSelection) -> ResolvedSpawnConfig {
+        ResolvedSpawnConfig {
+            skills: vec![
+                crate::agent::customization::ResolvedSkill::test_fixture("axdb-ops", ""),
+                crate::agent::customization::ResolvedSkill::test_fixture("eazy-ecs", ""),
+            ],
+            skill_selection: selection,
+            ..ResolvedSpawnConfig::default()
+        }
+    }
+
+    /// The failure this closes: a remote gateway reads another machine's config
+    /// and another machine's disk, so naming Tyde's skills there promises
+    /// instructions that do not exist. The model then reports every one of them
+    /// as missing.
+    #[test]
+    fn remote_instructions_never_name_a_skill_hermes_cannot_load() {
+        let resolved = skill_resolved_config(SkillSelection::AllInstalled);
+
+        let local = render_hermes_spawn_instructions(&resolved, true).expect("local overlay");
+        assert!(local.contains("axdb-ops"), "{local}");
+        assert!(local.contains("skill discovery"), "{local}");
+
+        assert_eq!(
+            render_hermes_spawn_instructions(&resolved, false),
+            None,
+            "a remote session must not be handed skill names with nothing behind them"
+        );
+    }
+
+    #[test]
+    fn remote_hermes_refuses_an_explicit_selection_and_reports_a_degraded_default() {
+        let explicit = skill_resolved_config(SkillSelection::Explicit);
+        let err = hermes_remote_skill_gate(&explicit, Some("builder.example"))
+            .expect_err("an explicit selection must fail closed rather than start without it");
+        assert!(err.contains("not available over SSH"), "{err}");
+        assert!(err.contains("builder.example"), "{err}");
+        assert!(err.contains("2 skill(s)"), "{err}");
+
+        let notice = hermes_remote_skill_gate(
+            &skill_resolved_config(SkillSelection::AllInstalled),
+            Some("builder.example"),
+        )
+        .expect("the Default agent still starts remotely")
+        .expect("but never silently");
+        assert!(notice.contains("2 installed skill(s)"), "{notice}");
+        assert!(notice.contains("builder.example"), "{notice}");
+
+        // Local sessions are unaffected, and a skill-less remote session has
+        // nothing to report either way.
+        assert_eq!(hermes_remote_skill_gate(&explicit, None), Ok(None));
+        assert_eq!(
+            hermes_remote_skill_gate(&ResolvedSpawnConfig::default(), Some("builder.example")),
+            Ok(None)
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_fake_hermes_python(path: &Path, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(path, script).expect("write fake python");
+        let mut perms = fs::metadata(path).expect("launcher metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).expect("chmod launcher");
+    }
+
+    /// Registration is verified, not assumed. Hermes silently ignores an
+    /// external skills directory it did not record, and a session that believed
+    /// otherwise would name skills `skills_list` cannot see — the exact failure
+    /// this work fixes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hermes_skill_dir_registration_is_verified_not_assumed() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = dir.path().join("skills");
+        let target = |program: &Path| HermesSpawnTarget {
+            program: program.to_string_lossy().to_string(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            remote_host: None,
+            display_program: "hermes".to_string(),
+        };
+
+        let confirming = dir.path().join("fake_python_confirms.sh");
+        write_fake_hermes_python(
+            &confirming,
+            &format!(
+                "#!/bin/sh\nprintf '[\"%s\"]\\n' \"{}\"\n",
+                store.to_string_lossy()
+            ),
+        );
+        register_hermes_skill_dir(&target(&confirming), &store)
+            .await
+            .expect("a registration Hermes confirms must be accepted");
+
+        // Hermes reports a list without the store: registration silently did not
+        // take, so the session must not start.
+        let ignoring = dir.path().join("fake_python_ignores.sh");
+        write_fake_hermes_python(&ignoring, "#!/bin/sh\necho '[\"/somewhere/else\"]'\n");
+        let err = register_hermes_skill_dir(&target(&ignoring), &store)
+            .await
+            .expect_err("an unregistered store must fail the spawn");
+        assert!(err.contains("did not register"), "{err}");
+        assert!(err.contains("/somewhere/else"), "{err}");
+
+        let failing = dir.path().join("fake_python_fails.sh");
+        write_fake_hermes_python(&failing, "#!/bin/sh\necho 'boom' >&2\nexit 1\n");
+        let err = register_hermes_skill_dir(&target(&failing), &store)
+            .await
+            .expect_err("a rejected registration must fail the spawn");
+        assert!(err.contains("boom"), "{err}");
+    }
+
+    /// A `~`-spelled entry the user already configured is the same directory, so
+    /// registration must not append a duplicate or claim it is missing.
+    #[test]
+    fn hermes_external_dir_comparison_expands_the_home_shorthand() {
+        let home = crate::paths::home_dir().expect("home dir");
+        assert_eq!(
+            expand_hermes_path("~/.tyde/skills"),
+            home.join(".tyde/skills")
+        );
+        assert_eq!(expand_hermes_path("~"), home);
+        assert_eq!(
+            expand_hermes_path("/absolute/skills"),
+            PathBuf::from("/absolute/skills")
+        );
+        // Another user's home is not this one's.
+        assert_eq!(
+            expand_hermes_path("~someone/skills"),
+            PathBuf::from("~someone/skills")
+        );
     }
 }
