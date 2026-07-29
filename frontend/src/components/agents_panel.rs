@@ -3895,7 +3895,10 @@ mod wasm_tests {
             next_tick().await;
         }
         let (_, enabled, _) = compact_btn_state(&container);
-        assert!(!enabled, "the mounted control disables when capability is withdrawn");
+        assert!(
+            !enabled,
+            "the mounted control disables when capability is withdrawn"
+        );
 
         release_held_dialog();
         for _ in 0..8 {

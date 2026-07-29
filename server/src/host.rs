@@ -25274,11 +25274,9 @@ Rules: Record only what remains true and useful for future work; drop transient 
     #[tokio::test]
     async fn legacy_agent_compaction_route_preserves_transcript_and_replaces_session() {
         let fixture = compact_fixture().await;
-        let prompt = format!(
-            "{MOCK_COMPACT_LEGACY_REPLACEMENT_SENTINEL} legacy transcript remains visible"
-        );
-        let (old_agent_id, old_session_id) =
-            spawn_idle_user_agent(&fixture.host, &prompt).await;
+        let prompt =
+            format!("{MOCK_COMPACT_LEGACY_REPLACEMENT_SENTINEL} legacy transcript remains visible");
+        let (old_agent_id, old_session_id) = spawn_idle_user_agent(&fixture.host, &prompt).await;
         let capability = fixture
             .host
             .agent_handle(&old_agent_id)
@@ -25348,14 +25346,9 @@ Rules: Record only what remains true and useful for future work; drop transient 
             &AgentCompactPayload::default(),
         )
         .expect("legacy compact envelope");
-        crate::router::route_client_envelope(
-            &fixture.host,
-            &host_path,
-            &host_stream,
-            compact,
-        )
-        .await
-        .expect("route legacy compaction");
+        crate::router::route_client_envelope(&fixture.host, &host_path, &host_stream, compact)
+            .await
+            .expect("route legacy compaction");
 
         let mut started = false;
         let completed = loop {
