@@ -104,7 +104,17 @@ fn default_path_for_home(home_dir: &Path) -> PathBuf {
 fn read_from_disk(path: &Path) -> Result<HashMap<WorkflowRunId, WorkflowRunSnapshot>, String> {
     match std::fs::read_to_string(path) {
         Ok(contents) => {
-            let store: StoreFile = serde_json::from_str(&contents).map_err(|err| {
+            let mut value: serde_json::Value = serde_json::from_str(&contents).map_err(|err| {
+                format!(
+                    "failed to parse workflow run store {}: {err}",
+                    path.display()
+                )
+            })?;
+            // A coordinator spec persists a typed `BackendKind`, so a run
+            // recorded against the old `"kiro"` name would fail the whole file
+            // and take every other run's history with it.
+            crate::store::legacy_backend_kind::rewrite_legacy_kiro_backend_kinds(&mut value);
+            let store: StoreFile = serde_json::from_value(value).map_err(|err| {
                 format!(
                     "failed to parse workflow run store {}: {err}",
                     path.display()
@@ -204,6 +214,32 @@ mod tests {
             updated_at_ms: 1,
             completed_at_ms: None,
         }
+    }
+
+    #[test]
+    fn legacy_kiro_coordinator_migrates_instead_of_failing_the_whole_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("workflow_runs.json");
+        // Seed a real run, then rewrite its coordinator back to the legacy
+        // spelling — the shape an install that predates the rename has on disk.
+        let mut store = WorkflowRunStore::load(path.clone()).unwrap();
+        store
+            .upsert(run(WorkflowRunSnapshotStatus::Completed))
+            .unwrap();
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        raw["runs"]["run-1"]["coordinator"]["backend"] = serde_json::json!("kiro");
+        std::fs::write(&path, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
+
+        let reloaded = WorkflowRunStore::load(path)
+            .expect("a run recorded under the old backend name must not fail the whole run store");
+        let loaded = reloaded.get(&WorkflowRunId("run-1".to_owned())).unwrap();
+        assert_eq!(loaded.coordinator.backend, BackendKind::Acp);
+        assert_eq!(
+            loaded.coordinator.access_mode,
+            BackendAccessMode::ReadOnly,
+            "the rest of the coordinator spec must survive the rename"
+        );
     }
 
     #[test]

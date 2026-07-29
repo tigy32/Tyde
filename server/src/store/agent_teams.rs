@@ -818,6 +818,12 @@ fn migrate_store_file(
     if migrate_legacy_gemini_members(path, &mut value, refs)? {
         changed = true;
     }
+    // Unlike the Gemini rename this needs no session purge: an ACP session is
+    // the same Kiro session under a new backend name, so members keep their
+    // `session_id` and stay resumable.
+    if crate::store::legacy_backend_kind::rewrite_legacy_kiro_backend_kinds(&mut value) {
+        changed = true;
+    }
     let file = serde_json::from_value::<AgentTeamsStoreFile>(value).map_err(|err| {
         format!(
             "Failed to parse agent teams store {}: {err}",
@@ -1549,6 +1555,92 @@ mod tests {
         let rewritten = std::fs::read_to_string(path).expect("read rewritten teams store");
         assert!(!rewritten.contains("gemini"));
         assert!(!rewritten.contains("purged-session"));
+    }
+
+    #[test]
+    fn migrates_kiro_members_to_acp_and_keeps_their_sessions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent_teams.json");
+        let contents = json!({
+            "version": STORE_VERSION,
+            "teams": {
+                "team-1": {
+                    "id": "team-1",
+                    // A team a user named after the backend: the rename must
+                    // not touch free text, only the backend-kind fields.
+                    "name": "kiro",
+                    "manager_member_id": "member-manager",
+                    "created_at_ms": 1,
+                    "updated_at_ms": 1
+                }
+            },
+            "members": {
+                "member-manager": {
+                    "id": "member-manager",
+                    "team_id": "team-1",
+                    "role": "manager",
+                    "state": "active",
+                    "name": "Manager",
+                    "description": "Coordinates work",
+                    "custom_agent_id": "custom-1",
+                    "backend_kind": "kiro",
+                    "session_id": "kiro-session",
+                    "project_ids": ["project-1"],
+                    "created_at_ms": 1,
+                    "updated_at_ms": 1
+                },
+                "member-report": {
+                    "id": "member-report",
+                    "team_id": "team-1",
+                    "role": "report",
+                    "state": "active",
+                    "name": "Report",
+                    "description": "Reports work",
+                    "custom_agent_id": "custom-1",
+                    "backend_kind": "claude",
+                    "session_id": "claude-session",
+                    "project_ids": ["project-1"],
+                    "created_at_ms": 1,
+                    "updated_at_ms": 1
+                }
+            }
+        });
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&contents).expect("serialize teams store"),
+        )
+        .expect("write teams store");
+        let mut refs = refs();
+        refs.enabled_backend_kinds.insert(BackendKind::Acp);
+
+        let store = AgentTeamsStore::load(path.clone(), &refs).expect("load migrated teams store");
+        let snapshot = store.snapshot();
+        let manager = snapshot
+            .members
+            .get(&TeamMemberId("member-manager".to_string()))
+            .expect("manager");
+        assert_eq!(manager.backend_kind, BackendKind::Acp);
+        assert_eq!(
+            manager.session_id,
+            Some(SessionId("kiro-session".to_string())),
+            "an ACP session is the same Kiro session renamed, so it stays resumable"
+        );
+        let report = snapshot
+            .members
+            .get(&TeamMemberId("member-report".to_string()))
+            .expect("report");
+        assert_eq!(report.backend_kind, BackendKind::Claude);
+
+        let rewritten = std::fs::read_to_string(path).expect("read rewritten teams store");
+        let rewritten: Value = serde_json::from_str(&rewritten).expect("parse rewritten store");
+        assert_eq!(
+            rewritten["members"]["member-manager"]["backend_kind"],
+            "acp"
+        );
+        assert_eq!(
+            rewritten["teams"]["team-1"]["name"], "kiro",
+            "the rename must be key-directed, not a blanket string replace"
+        );
     }
 
     #[test]

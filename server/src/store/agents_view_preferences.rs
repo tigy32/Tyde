@@ -391,7 +391,7 @@ impl AgentsViewPreferencesStore {
             }
         };
 
-        let value = serde_json::from_str::<Value>(&contents).map_err(|err| {
+        let mut value = serde_json::from_str::<Value>(&contents).map_err(|err| {
             store_error(
                 AgentsViewPreferencesStoreErrorKind::Corrupt,
                 format!(
@@ -400,6 +400,10 @@ impl AgentsViewPreferencesStore {
                 ),
             )
         })?;
+        // Saved filters and smart views hold `Vec<BackendKind>`, which rejects
+        // the legacy `"kiro"` spelling outright — without this rename the whole
+        // store reads as corrupt and the user loses every saved view.
+        crate::store::legacy_backend_kind::rewrite_legacy_kiro_backend_kinds(&mut value);
         let version = value
             .get("version")
             .and_then(Value::as_u64)
@@ -1968,6 +1972,58 @@ mod tests {
         assert!(snapshot.groups.groups.is_empty());
         assert!(snapshot.groups.assignments.is_empty());
         assert_eq!(snapshot.sidebar, AgentsSidebarPreferences::default());
+    }
+
+    #[test]
+    fn legacy_kiro_backend_filter_migrates_instead_of_corrupting_the_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agents_view_preferences.json");
+        let legacy = serde_json::json!({
+            "version": 1,
+            "preferences": {
+                "filters": {
+                    "host_ids": ["local"],
+                    "project_ids": [],
+                    "statuses": ["idle"],
+                    "backends": ["kiro", "codex"],
+                    "origins": ["user"]
+                },
+                "sort_mode": "name_asc",
+                "group_mode": "status",
+                "density": "compact",
+                "hide_finished": true,
+                "manual_order": []
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&legacy).expect("json"))
+            .expect("write legacy store");
+
+        let store = AgentsViewPreferencesStore::load(path);
+        let snapshot = store.snapshot();
+
+        // `Vec<BackendKind>` rejects "kiro" outright, so without the rename the
+        // load fails as corrupt and every saved preference is silently lost.
+        // Asserting on the filter contents — not just "it loaded" — is what
+        // catches a rename that drops the entry instead of converting it.
+        assert!(
+            snapshot
+                .preferences
+                .filters
+                .backends
+                .contains(&BackendKind::Acp),
+            "the legacy kiro filter must survive as Acp, got {:?}",
+            snapshot.preferences.filters.backends
+        );
+        assert!(
+            snapshot
+                .preferences
+                .filters
+                .backends
+                .contains(&BackendKind::Codex),
+            "unrelated filters must be preserved"
+        );
+        assert_eq!(snapshot.preferences.density, AgentListDensity::Compact);
+        assert!(snapshot.preferences.hide_finished);
     }
 
     #[test]
