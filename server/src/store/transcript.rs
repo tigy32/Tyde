@@ -37,11 +37,34 @@ pub(crate) struct TranscriptRecord {
 #[derive(Debug, Clone)]
 pub(crate) struct TranscriptStore {
     root: PathBuf,
+    #[cfg(test)]
+    actor_io_enabled: bool,
 }
 
 impl TranscriptStore {
     pub(crate) fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            #[cfg(test)]
+            actor_io_enabled: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_actor_io_enabled(mut self, enabled: bool) -> Self {
+        self.actor_io_enabled = enabled;
+        self
+    }
+
+    pub(crate) fn actor_io_enabled(&self) -> bool {
+        #[cfg(not(test))]
+        {
+            true
+        }
+        #[cfg(test)]
+        {
+            self.actor_io_enabled || std::env::var_os("TYDE_TRANSCRIPT_STORE_DIR").is_some()
+        }
     }
 
     pub(crate) fn default_root() -> Result<PathBuf, String> {

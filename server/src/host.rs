@@ -359,6 +359,8 @@ pub struct HostRuntimeConfig {
     pub agents_view_preferences_primary: bool,
     #[cfg(test)]
     pub start_agent_supervisor_worker: bool,
+    #[cfg(test)]
+    pub enable_actor_transcript_io: bool,
 }
 
 impl Default for HostRuntimeConfig {
@@ -378,6 +380,8 @@ impl Default for HostRuntimeConfig {
             agents_view_preferences_primary: true,
             #[cfg(test)]
             start_agent_supervisor_worker: true,
+            #[cfg(test)]
+            enable_actor_transcript_io: false,
         }
     }
 }
@@ -13392,6 +13396,9 @@ fn spawn_host_inner(
             paths.session.with_file_name("transcripts")
         };
     let transcript_store = TranscriptStore::new(transcript_root);
+    #[cfg(test)]
+    let transcript_store =
+        transcript_store.with_actor_io_enabled(runtime_config.enable_actor_transcript_io);
     let antigravity_conversations_dir =
         crate::backend::antigravity::resolve_antigravity_conversations_dir(
             runtime_config.antigravity_conversations_dir.as_deref(),
@@ -23592,6 +23599,36 @@ Rules: Record only what remains true and useful for future work; drop transient 
         CompactFixture { _dir: dir, host }
     }
 
+    async fn compact_fixture_with_transcript_io() -> CompactFixture {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = spawn_host_with_mock_backend_and_runtime_config(
+            dir.path().join("sessions.json"),
+            dir.path().join("projects.json"),
+            dir.path().join("settings.json"),
+            HostRuntimeConfig {
+                skip_real_backend_probe: true,
+                enable_actor_transcript_io: true,
+                ..HostRuntimeConfig::default()
+            },
+        )
+        .expect("spawn mock host with transcript persistence");
+        host.set_setting(SetSettingPayload {
+            setting: HostSettingValue::EnabledBackends {
+                enabled_backends: vec![BackendKind::Claude],
+            },
+        })
+        .await
+        .expect("enable backend");
+        host.set_setting(SetSettingPayload {
+            setting: HostSettingValue::DefaultBackend {
+                default_backend: Some(BackendKind::Claude),
+            },
+        })
+        .await
+        .expect("set default backend");
+        CompactFixture { _dir: dir, host }
+    }
+
     async fn compact_fixture_without_supervisor_worker() -> CompactFixture {
         let dir = tempfile::tempdir().expect("tempdir");
         let host = spawn_host_with_mock_backend_and_runtime_config(
@@ -24986,6 +25023,62 @@ Rules: Record only what remains true and useful for future work; drop transient 
         }
     }
 
+    async fn wait_for_authoritative_visible_assistant_transcript(
+        host: &HostHandle,
+        session_id: &SessionId,
+        expected_content: &str,
+    ) -> HashSet<String> {
+        let transcript_store = {
+            let state = host.state.lock().await;
+            state.transcript_store.clone()
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let store = transcript_store.clone();
+                let session_id = session_id.clone();
+                let expected_content = expected_content.to_owned();
+                let visible = tokio::task::spawn_blocking(move || {
+                    if !store.is_authoritative(&session_id) {
+                        return Ok(None);
+                    }
+                    let records = store.load(&session_id)?;
+                    let has_expected_message = records.iter().any(|record| {
+                        record.visibility == TranscriptVisibility::Visible
+                            && matches!(
+                                &record.event,
+                                ChatEvent::MessageAdded(message)
+                                    if matches!(
+                                        &message.sender,
+                                        MessageSender::Assistant { .. }
+                                    ) && message.content.contains(&expected_content)
+                            )
+                    });
+                    if !has_expected_message {
+                        return Ok(None);
+                    }
+                    Ok(Some(
+                        records
+                            .into_iter()
+                            .filter(|record| {
+                                record.visibility == TranscriptVisibility::Visible
+                            })
+                            .map(|record| record.event_id)
+                            .collect::<HashSet<_>>(),
+                    ))
+                })
+                .await
+                .expect("authoritative transcript read task")
+                .expect("authoritative transcript read");
+                if let Some(visible) = visible {
+                    return visible;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("agent transcript should become authoritative with visible history")
+    }
+
     async fn wait_for_agent_active(host: &HostHandle, agent_id: &AgentId) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -25273,7 +25366,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
 
     #[tokio::test]
     async fn legacy_agent_compaction_route_preserves_transcript_and_replaces_session() {
-        let fixture = compact_fixture().await;
+        let fixture = compact_fixture_with_transcript_io().await;
         let prompt =
             format!("{MOCK_COMPACT_LEGACY_REPLACEMENT_SENTINEL} legacy transcript remains visible");
         let (old_agent_id, old_session_id) = spawn_idle_user_agent(&fixture.host, &prompt).await;
@@ -25290,35 +25383,12 @@ Rules: Record only what remains true and useful for future work; drop transient 
             crate::backend::BackendCompactionCoordinator::LegacyReplacement
         );
 
-        let transcript_store = {
-            let state = fixture.host.state.lock().await;
-            state.transcript_store.clone()
-        };
-        let records = transcript_store
-            .load(&old_session_id)
-            .expect("old transcript before compaction");
-        assert!(
-            transcript_store.is_authoritative(&old_session_id),
-            "precondition: the legacy target transcript is authoritative"
-        );
-        let saw_visible_context = records.iter().any(|record| {
-            record.visibility == TranscriptVisibility::Visible
-                && matches!(
-                    &record.event,
-                    ChatEvent::MessageAdded(message)
-                        if matches!(&message.sender, MessageSender::Assistant { .. })
-                            && message.content.contains("legacy transcript remains visible")
-                )
-        });
-        let visible_before = records
-            .into_iter()
-            .filter(|record| record.visibility == TranscriptVisibility::Visible)
-            .map(|record| record.event_id)
-            .collect::<HashSet<_>>();
-        assert!(
-            saw_visible_context,
-            "precondition: the legacy target persisted its visible response"
-        );
+        let visible_before = wait_for_authoritative_visible_assistant_transcript(
+            &fixture.host,
+            &old_session_id,
+            "legacy transcript remains visible",
+        )
+        .await;
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let host_path = StreamPath(format!("/host/legacy-compact-{}", Uuid::new_v4()));
@@ -25416,6 +25486,10 @@ Rules: Record only what remains true and useful for future work; drop transient 
             .filter(|record| record.visibility == TranscriptVisibility::Visible)
             .map(|record| record.event_id)
             .collect::<HashSet<_>>();
+        assert!(
+            transcript_store.is_authoritative(&old_session_id),
+            "replacement must preserve transcript authority"
+        );
         let store = session_store.lock().await;
         let old_record = store.get(&old_session_id).expect("old session record");
         let new_record = store

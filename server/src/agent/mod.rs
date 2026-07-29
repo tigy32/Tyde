@@ -2132,7 +2132,7 @@ async fn load_authoritative_compaction_transcript(
     session_id: &SessionId,
     high_water: u64,
 ) -> Result<String, String> {
-    if !actor_transcript_io_enabled() {
+    if !store.actor_io_enabled() {
         return Err("canonical transcript storage is unavailable".to_owned());
     }
     let session_id = session_id.clone();
@@ -7788,7 +7788,7 @@ where
 }
 
 async fn transcript_is_authoritative(store: &TranscriptStore, session_id: &SessionId) -> bool {
-    if !actor_transcript_io_enabled() {
+    if !store.actor_io_enabled() {
         return false;
     }
     let session_id = session_id.clone();
@@ -7796,10 +7796,6 @@ async fn transcript_is_authoritative(store: &TranscriptStore, session_id: &Sessi
     tokio::task::spawn_blocking(move || store.is_authoritative(&session_id))
         .await
         .unwrap_or(false)
-}
-
-fn actor_transcript_io_enabled() -> bool {
-    !cfg!(test) || std::env::var_os("TYDE_TRANSCRIPT_STORE_DIR").is_some()
 }
 
 /// Renders a stall window the way a person would read it: whole minutes when
@@ -9037,9 +9033,6 @@ async fn journal_new_replay_records(
     start: usize,
     provider_identities: HashMap<u64, crate::store::transcript::ProviderEventIdentity>,
 ) {
-    if !actor_transcript_io_enabled() {
-        return;
-    }
     let Some(registered) = transcript_session_registry()
         .lock()
         .expect("transcript session registry poisoned")
@@ -9050,6 +9043,9 @@ async fn journal_new_replay_records(
     };
     let session_id = registered.session_id;
     let store = registered.store;
+    if !store.actor_io_enabled() {
+        return;
+    }
     let records = event_log[start..]
         .iter()
         .filter(|envelope| envelope.kind == FrameKind::ChatEvent)
@@ -9106,7 +9102,7 @@ async fn journal_new_replay_records(
 }
 
 async fn mark_transcript_authoritative(store: &TranscriptStore, session_id: &SessionId) {
-    if !actor_transcript_io_enabled() {
+    if !store.actor_io_enabled() {
         return;
     }
     let session_id = session_id.clone();
@@ -11022,9 +11018,6 @@ async fn persist_compaction_marker(
     sequence: u64,
     marker: &ContextCompactionTimelineEvent,
 ) {
-    if !actor_transcript_io_enabled() {
-        return;
-    }
     let Some(store) = transcript_session_registry()
         .lock()
         .expect("transcript session registry poisoned")
@@ -11033,6 +11026,9 @@ async fn persist_compaction_marker(
     else {
         return;
     };
+    if !store.actor_io_enabled() {
+        return;
+    }
     let record = crate::store::transcript::TranscriptRecord {
         logical_session_id: session_id.clone(),
         sequence,
@@ -11300,7 +11296,7 @@ async fn authoritative_session_history_window(
     limit: usize,
     completed_stream_filter: Option<CompletedStreamHistoryFilter>,
 ) -> Option<SessionHistoryWindow> {
-    if !actor_transcript_io_enabled() {
+    if !store.actor_io_enabled() {
         return None;
     }
     let session_id = session_id.clone();
