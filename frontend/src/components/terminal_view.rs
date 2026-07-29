@@ -7,8 +7,8 @@ use crate::state::{AppState, DockVisibility, TerminalInfo, root_display_name};
 use crate::term_bridge;
 
 use protocol::{
-    FrameKind, ProjectRootPath, TerminalClosePayload, TerminalCreatePayload, TerminalId,
-    TerminalLaunchTarget, TerminalResizePayload, TerminalSendPayload,
+    FrameKind, ProjectRootPath, StreamPath, TerminalClosePayload, TerminalCreatePayload,
+    TerminalId, TerminalLaunchTarget, TerminalResizePayload, TerminalSendPayload,
 };
 
 #[component]
@@ -63,33 +63,17 @@ fn TerminalTabBar() -> impl IntoView {
         Some(project.project.root_paths())
     });
 
-    let can_create_terminal = move || {
-        let active_project = state.active_project.get()?;
-        let roots = terminal_roots.get()?;
-        let root = selected_root
-            .get()
-            .filter(|selected| roots.iter().any(|root| root == selected))
-            .or_else(|| roots.first().cloned())?;
-        Some((active_project, root))
-    };
-
     let state_for_new_terminal = state.clone();
-    let can_create_terminal_for_new = can_create_terminal;
+    let terminal_roots_for_new = terminal_roots;
+    let selected_root_for_new = selected_root;
     let on_new_terminal = move |_| {
-        let (active_project, root) = match can_create_terminal_for_new() {
+        let (host_id, host_stream, target) = match terminal_create_request(
+            &state_for_new_terminal,
+            terminal_roots_for_new.get(),
+            selected_root_for_new.get(),
+        ) {
             Some(v) => v,
             None => return,
-        };
-        let host_id = active_project.host_id.clone();
-        let host_stream = match state_for_new_terminal.host_stream_untracked(&host_id) {
-            Some(stream) => stream,
-            None => return,
-        };
-
-        let target = TerminalLaunchTarget::Project {
-            project_id: active_project.project_id,
-            root,
-            relative_cwd: None,
         };
 
         let payload = TerminalCreatePayload {
@@ -111,7 +95,17 @@ fn TerminalTabBar() -> impl IntoView {
         });
     };
 
-    let btn_disabled = move || can_create_terminal().is_none();
+    let state_for_disabled = state.clone();
+    let terminal_roots_for_disabled = terminal_roots;
+    let selected_root_for_disabled = selected_root;
+    let btn_disabled = move || {
+        terminal_create_request(
+            &state_for_disabled,
+            terminal_roots_for_disabled.get(),
+            selected_root_for_disabled.get(),
+        )
+        .is_none()
+    };
     let state_for_tabs = state.clone();
     let root_options = terminal_roots;
     let selected_root_for_value = selected_root;
@@ -169,6 +163,36 @@ fn TerminalTabBar() -> impl IntoView {
             </button>
         </div>
     }
+}
+
+fn terminal_create_request(
+    state: &AppState,
+    project_roots: Option<Vec<ProjectRootPath>>,
+    selected_root: Option<ProjectRootPath>,
+) -> Option<(String, StreamPath, TerminalLaunchTarget)> {
+    let (host_id, target) = match state.active_project.get() {
+        Some(active_project) => {
+            let roots = project_roots?;
+            let root = selected_root
+                .filter(|selected| roots.iter().any(|root| root == selected))
+                .or_else(|| roots.first().cloned())?;
+            let host_id = active_project.host_id;
+            (
+                host_id,
+                TerminalLaunchTarget::Project {
+                    project_id: active_project.project_id,
+                    root,
+                    relative_cwd: None,
+                },
+            )
+        }
+        None => (
+            state.selected_host_id.get()?,
+            TerminalLaunchTarget::HostDefault,
+        ),
+    };
+    let host_stream = state.host_streams.get().get(&host_id)?.clone();
+    Some((host_id, host_stream, target))
 }
 
 #[component]
@@ -500,4 +524,103 @@ fn remove_terminal(state: &AppState, host_id: &str, tid: &TerminalId) {
 fn short_id(id: &TerminalId) -> &str {
     let s = &id.0;
     if s.len() > 8 { &s[..8] } else { s }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use leptos::mount::mount_to;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::*;
+    use web_sys::HtmlElement;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    fn make_container() -> HtmlElement {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document.create_element("div").unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        container.dyn_into::<HtmlElement>().unwrap()
+    }
+
+    fn install_send_stub() {
+        js_sys::eval(
+            r#"
+            (function() {
+                window.__test_terminal_send_calls = [];
+                window.__TAURI__ = window.__TAURI__ || {};
+                window.__TAURI__.core = window.__TAURI__.core || {};
+                window.__TAURI__.core.invoke = function(cmd, args) {
+                    window.__test_terminal_send_calls.push([cmd, JSON.stringify(args || {})]);
+                    return Promise.resolve();
+                };
+            })();
+            "#,
+        )
+        .expect("install send stub");
+    }
+
+    async fn next_tick() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
+                .unwrap();
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn home_terminal_opens_in_host_default_cwd() {
+        install_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.selected_host_id.set(Some("local".to_owned()));
+            state.host_streams.update(|streams| {
+                streams.insert("local".to_owned(), StreamPath("/host/local".to_owned()));
+            });
+            provide_context(state);
+            view! { <TerminalView /> }
+        });
+
+        next_tick().await;
+        let button = container
+            .query_selector(".terminal-new-btn")
+            .unwrap()
+            .expect("new terminal button");
+        assert!(
+            !button.has_attribute("disabled"),
+            "Home must allow a terminal when its selected host is connected"
+        );
+        button
+            .dyn_into::<HtmlElement>()
+            .expect("terminal button is an HtmlElement")
+            .click();
+        for _ in 0..5 {
+            next_tick().await;
+        }
+
+        let target = js_sys::eval(
+            r#"
+            (function() {
+                for (const [cmd, args] of (window.__test_terminal_send_calls || [])) {
+                    if (cmd !== "send_host_line") continue;
+                    const envelope = JSON.parse(JSON.parse(args).line);
+                    if (envelope.kind === "terminal_create") {
+                        return JSON.stringify(envelope.payload.target);
+                    }
+                }
+                return "";
+            })()
+            "#,
+        )
+        .expect("probe terminal create")
+        .as_string()
+        .unwrap_or_default();
+        assert_eq!(
+            target, r#"{"kind":"host_default"}"#,
+            "Home terminal must ask the host to launch in Tyde's cwd"
+        );
+    }
 }
