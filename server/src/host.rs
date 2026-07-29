@@ -25440,10 +25440,7 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 .agent_id,
             old_agent_id
         );
-        fixture
-            .host
-            .attach_deferred_agent_stream(attachment)
-            .await;
+        fixture.host.attach_deferred_agent_stream(attachment).await;
 
         let old_agent_bootstrap = loop {
             let envelope = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -25495,12 +25492,17 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 }
                 protocol::AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message))
                     if matches!(&message.sender, MessageSender::Assistant { .. })
-                        && message.content.contains("legacy transcript remains visible") =>
+                        && message
+                            .content
+                            .contains("legacy transcript remains visible") =>
                 {
                     visible_assistant_seen = true;
                 }
                 protocol::AgentBootstrapEvent::AgentError(error) => {
-                    panic!("live legacy bootstrap contained agent error: {}", error.message);
+                    panic!(
+                        "live legacy bootstrap contained agent error: {}",
+                        error.message
+                    );
                 }
                 protocol::AgentBootstrapEvent::SessionSettings(_)
                 | protocol::AgentBootstrapEvent::QueuedMessages(_)
@@ -25508,8 +25510,11 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 | protocol::AgentBootstrapEvent::ChatEvent(_)
                 | protocol::AgentBootstrapEvent::HasPriorHistory { .. } => {}
             }
-        };
-        assert!(old_start_seen, "old AgentBootstrap must prove the agent is live");
+        }
+        assert!(
+            old_start_seen,
+            "old AgentBootstrap must prove the agent is live"
+        );
         assert!(
             old_capability_seen,
             "old AgentBootstrap must expose its compaction capability"
