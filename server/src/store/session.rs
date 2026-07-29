@@ -76,6 +76,27 @@ impl CompactionOperationRecord {
     }
 }
 
+pub(crate) struct FinishCompactionOperation {
+    pub operation_id: CompactionOperationId,
+    pub state: StoredCompactionState,
+    pub accepted: bool,
+    pub mutation: CompactionMutation,
+    pub method: Option<CompactionMethod>,
+    pub metrics: CompactionMetrics,
+    pub continuation: Option<ContinuationInstallSummary>,
+    pub message: Option<String>,
+}
+
+pub(crate) struct CommitCompactedBinding {
+    pub operation_id: CompactionOperationId,
+    pub expected_generation: u64,
+    pub backend_kind: BackendKind,
+    pub provider_session_id: SessionId,
+    pub metrics: CompactionMetrics,
+    pub continuation: Option<ContinuationInstallSummary>,
+    pub message: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub id: SessionId,
@@ -115,13 +136,13 @@ pub struct SessionRecord {
     #[serde(default)]
     pub compaction_summary_preview: Option<String>,
     #[serde(default)]
-    pub backend_bindings: Vec<BackendSessionBinding>,
+    pub(crate) backend_bindings: Vec<BackendSessionBinding>,
     #[serde(default)]
     pub active_backend_binding_generation: u64,
     #[serde(default)]
     pub compaction_epoch: u64,
     #[serde(default)]
-    pub compaction_operations: Vec<CompactionOperationRecord>,
+    pub(crate) compaction_operations: Vec<CompactionOperationRecord>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -498,15 +519,18 @@ impl SessionStore {
     pub(crate) fn finish_compaction_operation(
         &self,
         session_id: &SessionId,
-        operation_id: &CompactionOperationId,
-        state: StoredCompactionState,
-        accepted: bool,
-        mutation: CompactionMutation,
-        method: Option<CompactionMethod>,
-        metrics: CompactionMetrics,
-        continuation: Option<ContinuationInstallSummary>,
-        message: Option<String>,
+        update: FinishCompactionOperation,
     ) -> Result<CompactionOperationRecord, String> {
+        let FinishCompactionOperation {
+            operation_id,
+            state,
+            accepted,
+            mutation,
+            method,
+            metrics,
+            continuation,
+            message,
+        } = update;
         if !matches!(
             state,
             StoredCompactionState::Completed | StoredCompactionState::Failed
@@ -520,7 +544,7 @@ impl SessionStore {
             let operation = record
                 .compaction_operations
                 .iter_mut()
-                .find(|operation| operation.operation_id == *operation_id)
+                .find(|operation| operation.operation_id == operation_id)
                 .ok_or_else(|| format!("missing compaction operation {}", operation_id.0))?;
             if operation.is_terminal() {
                 return Ok(operation.clone());
@@ -542,14 +566,17 @@ impl SessionStore {
     pub(crate) fn commit_compacted_binding(
         &self,
         session_id: &SessionId,
-        operation_id: &CompactionOperationId,
-        expected_generation: u64,
-        backend_kind: BackendKind,
-        provider_session_id: SessionId,
-        metrics: CompactionMetrics,
-        continuation: Option<ContinuationInstallSummary>,
-        message: Option<String>,
+        commit: CommitCompactedBinding,
     ) -> Result<(BackendSessionBinding, CompactionOperationRecord), String> {
+        let CommitCompactedBinding {
+            operation_id,
+            expected_generation,
+            backend_kind,
+            provider_session_id,
+            metrics,
+            continuation,
+            message,
+        } = commit;
         self.read_modify_write(|records| {
             let record = records
                 .get_mut(&session_id.0)
@@ -564,7 +591,7 @@ impl SessionStore {
             let operation_index = record
                 .compaction_operations
                 .iter()
-                .position(|operation| operation.operation_id == *operation_id)
+                .position(|operation| operation.operation_id == operation_id)
                 .ok_or_else(|| format!("missing compaction operation {}", operation_id.0))?;
             if record.compaction_operations[operation_index].is_terminal() {
                 return Err(format!(
@@ -578,7 +605,7 @@ impl SessionStore {
                 backend_kind,
                 provider_session_id,
                 created_at_ms: now_ms(),
-                created_by_compaction: Some(operation_id.clone()),
+                created_by_compaction: Some(operation_id),
             };
             record.backend_bindings.push(binding.clone());
             record.active_backend_binding_generation = generation;

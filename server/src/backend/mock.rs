@@ -49,6 +49,7 @@ pub(crate) const SPAWN_NATIVE_CHILD_AND_DROP_SENTINEL: &str =
     "__mock_spawn_native_child_and_drop__";
 const MOCK_CANCEL_TURN_SENTINEL: &str = "__mock_cancel__";
 const MOCK_COMPACT_SENTINEL: &str = "/compact";
+#[cfg(test)]
 pub(crate) const MOCK_NATIVE_COMPACT_SENTINEL: &str = "__mock_native_compact__";
 pub(crate) const MOCK_COMPACT_AUTO_SENTINEL: &str = "__mock_compact_auto__";
 pub(crate) const MOCK_COMPACT_FAIL_PRE_DISPATCH_SENTINEL: &str = "__mock_compact_fail_pre__";
@@ -226,7 +227,7 @@ struct MockEventSender {
 }
 
 impl MockEventSender {
-    fn send(&self, event: ChatEvent) -> Result<(), mpsc::error::SendError<ChatEvent>> {
+    fn send(&self, event: ChatEvent) -> Result<(), Box<mpsc::error::SendError<ChatEvent>>> {
         match event {
             ChatEvent::TypingStatusChanged(active) => {
                 self.active_turn
@@ -234,7 +235,7 @@ impl MockEventSender {
                 self.tx
                     .send(BackendEvent::Chat(ChatEvent::TypingStatusChanged(active)))
                     .map_err(|error| match error.0 {
-                        BackendEvent::Chat(event) => mpsc::error::SendError(event),
+                        BackendEvent::Chat(event) => Box::new(mpsc::error::SendError(event)),
                         BackendEvent::ModelRequestTokenUsage(_) | BackendEvent::Compaction(_) => {
                             unreachable!()
                         }
@@ -244,7 +245,7 @@ impl MockEventSender {
                 .tx
                 .send(BackendEvent::Chat(event))
                 .map_err(|error| match error.0 {
-                    BackendEvent::Chat(event) => mpsc::error::SendError(event),
+                    BackendEvent::Chat(event) => Box::new(mpsc::error::SendError(event)),
                     BackendEvent::ModelRequestTokenUsage(_) | BackendEvent::Compaction(_) => {
                         unreachable!()
                     }
@@ -255,8 +256,10 @@ impl MockEventSender {
     fn send_compaction(
         &self,
         event: BackendCompactionEvent,
-    ) -> Result<(), mpsc::error::SendError<BackendEvent>> {
-        self.tx.send(BackendEvent::Compaction(event))
+    ) -> Result<(), Box<mpsc::error::SendError<BackendEvent>>> {
+        self.tx
+            .send(BackendEvent::Compaction(event))
+            .map_err(Box::new)
     }
 
     fn is_active(&self) -> bool {
@@ -1275,7 +1278,7 @@ fn emit_mock_compaction_observation(
     let event_id = format!("prompt-{prompt_index}-compact");
     events_tx
         .send_compaction(BackendCompactionEvent::Observed(
-            BackendObservedCompaction {
+            Box::new(BackendObservedCompaction {
                 observation_id: super::compaction::stable_observation_id(
                     "mock",
                     &session_id.0,
@@ -1291,7 +1294,7 @@ fn emit_mock_compaction_observation(
                 },
                 source: BackendCompactionObservationSource::MockEvent { event_id },
                 user_focus: None,
-            },
+            }),
         ))
         .is_ok()
 }

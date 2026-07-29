@@ -1870,7 +1870,7 @@ impl HermesSessionActor {
                     stored_before,
                     error,
                 );
-                return BackendCompactionStart::DispatchUncertain(result);
+                return BackendCompactionStart::DispatchUncertain(Box::new(result));
             }
         };
         *self

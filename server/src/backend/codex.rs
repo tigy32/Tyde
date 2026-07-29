@@ -3902,7 +3902,7 @@ impl CodexInner {
         }
         if let Some(observed) = observed {
             self.emitter
-                .compaction_event(&BackendCompactionEvent::Observed(observed));
+                .compaction_event(&BackendCompactionEvent::Observed(Box::new(observed)));
             return true;
         }
         false
@@ -6017,7 +6017,7 @@ impl CodexInner {
                         let thread_id = self.state.lock().await.thread_id.clone();
                         self.emitter
                             .compaction_event(&BackendCompactionEvent::Observed(
-                                BackendObservedCompaction {
+                                Box::new(BackendObservedCompaction {
                                     observation_id: super::compaction::stable_observation_id(
                                         "codex",
                                         &thread_id,
@@ -6033,7 +6033,7 @@ impl CodexInner {
                                         item_id: item_id.to_string(),
                                     },
                                     user_focus: None,
-                                },
+                                }),
                             ));
                     }
                     "userMessage" => {
@@ -13712,8 +13712,8 @@ use protocol::{
 };
 
 use super::{
-    Backend, BackendCompactionAvailability, BackendCompactionCapability,
-    BackendCompactionCapabilityEvidence, BackendCompactionDeferredReason,
+    Backend, BackendCompactionCapability, BackendCompactionCapabilityEvidence,
+    BackendCompactionDeferredReason,
     BackendCompactionDispatchState, BackendCompactionEvent, BackendCompactionFailure,
     BackendCompactionFailureKind, BackendCompactionMechanism, BackendCompactionMutationState,
     BackendCompactionObservationSource, BackendCompactionProgress,
@@ -15365,6 +15365,7 @@ impl Backend for CodexBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::BackendCompactionAvailability;
     use crate::sub_agent::SubAgentHandle;
     use protocol::{
         AgentBootstrapEvent, AgentBootstrapPayload, AgentControlProgressKind, AgentErrorCode,

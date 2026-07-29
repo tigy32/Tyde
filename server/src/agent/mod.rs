@@ -47,7 +47,10 @@ use crate::host::{
     HostSessionSummaryCountUpdate, HostSubAgentEmitter,
 };
 use crate::review::ReviewRegistryHandle;
-use crate::store::session::{CompactionOperationRecord, SessionStore, StoredCompactionState};
+use crate::store::session::{
+    CommitCompactedBinding, CompactionOperationRecord, FinishCompactionOperation, SessionStore,
+    StoredCompactionState,
+};
 use crate::stream::Stream;
 use crate::sub_agent::HostSubAgentSpawnTx;
 
@@ -3159,7 +3162,7 @@ pub(crate) fn spawn_agent_actor(
             {
                 AgentStartupEvent::Completed(result) => break result,
                 AgentStartupEvent::Command(command) => {
-                    let Some(command) = command else {
+                    let Some(command) = *command else {
                         return;
                     };
                     match command {
@@ -4265,12 +4268,16 @@ pub(crate) fn spawn_agent_actor(
                                     &compaction_antigravity_conversations_dir,
                             },
                             &mut context_compaction,
-                            &queue,
-                            in_turn,
-                            resume_replay_gate_pending,
-                            &open_tool_call_ids,
-                            &pending_tool_response_ids,
-                            !replay_state.active_background_progress.is_empty(),
+                            ContextCompactionDispatchReadiness {
+                                queue: &queue,
+                                in_turn,
+                                replay_pending: resume_replay_gate_pending,
+                                open_tool_call_ids: &open_tool_call_ids,
+                                pending_tool_response_ids: &pending_tool_response_ids,
+                                background_mutation_active: !replay_state
+                                    .active_background_progress
+                                    .is_empty(),
+                            },
                         )
                         .await;
                     }
@@ -5879,12 +5886,16 @@ pub(crate) fn spawn_agent_actor(
                                         &compaction_antigravity_conversations_dir,
                                 },
                                 &mut context_compaction,
-                                &queue,
-                                in_turn,
-                                resume_replay_gate_pending,
-                                &open_tool_call_ids,
-                                &pending_tool_response_ids,
-                                !replay_state.active_background_progress.is_empty(),
+                                ContextCompactionDispatchReadiness {
+                                    queue: &queue,
+                                    in_turn,
+                                    replay_pending: resume_replay_gate_pending,
+                                    open_tool_call_ids: &open_tool_call_ids,
+                                    pending_tool_response_ids: &pending_tool_response_ids,
+                                    background_mutation_active: !replay_state
+                                        .active_background_progress
+                                        .is_empty(),
+                                },
                             )
                             .await;
                         }
@@ -5943,12 +5954,16 @@ pub(crate) fn spawn_agent_actor(
                                         &compaction_antigravity_conversations_dir,
                                 },
                                 &mut context_compaction,
-                                &queue,
-                                in_turn,
-                                resume_replay_gate_pending,
-                                &open_tool_call_ids,
-                                &pending_tool_response_ids,
-                                !replay_state.active_background_progress.is_empty(),
+                                ContextCompactionDispatchReadiness {
+                                    queue: &queue,
+                                    in_turn,
+                                    replay_pending: resume_replay_gate_pending,
+                                    open_tool_call_ids: &open_tool_call_ids,
+                                    pending_tool_response_ids: &pending_tool_response_ids,
+                                    background_mutation_active: !replay_state
+                                        .active_background_progress
+                                        .is_empty(),
+                                },
                             )
                             .await;
                             if let Some(active) = context_compaction.as_mut().filter(|flight| {
@@ -6115,13 +6130,16 @@ pub(crate) fn spawn_agent_actor(
                                     store
                                         .commit_compacted_binding(
                                             &session_id_for_commit,
-                                            &operation_id_for_commit,
-                                            expected_generation,
-                                            backend_kind,
-                                            provider_session_id_for_commit,
-                                            commit_metrics,
-                                            commit_continuation,
-                                            commit_message,
+                                            CommitCompactedBinding {
+                                                operation_id: operation_id_for_commit,
+                                                expected_generation,
+                                                backend_kind,
+                                                provider_session_id:
+                                                    provider_session_id_for_commit,
+                                                metrics: commit_metrics,
+                                                continuation: commit_continuation,
+                                                message: commit_message,
+                                            },
                                         )
                                         .map(|_| ())
                                 },
@@ -6217,7 +6235,7 @@ pub(crate) fn spawn_agent_actor(
                             operation_id,
                             result,
                         } => {
-                            let Some(mut flight) = context_compaction.take() else {
+                            let Some(flight) = context_compaction.take() else {
                                 continue;
                             };
                             if flight.operation_id != operation_id {
@@ -6895,7 +6913,7 @@ pub(crate) fn spawn_agent_actor(
 
 enum AgentStartupEvent<T> {
     Completed(T),
-    Command(Option<AgentCommand>),
+    Command(Box<Option<AgentCommand>>),
 }
 
 fn backend_startup_drop_cancels_workers(backend_kind: BackendKind) -> bool {
@@ -7085,7 +7103,9 @@ where
 {
     tokio::select! {
         biased;
-        command = rx.recv(), if cancellation_supported => AgentStartupEvent::Command(command),
+        command = rx.recv(), if cancellation_supported => {
+            AgentStartupEvent::Command(Box::new(command))
+        },
         result = startup => AgentStartupEvent::Completed(result),
     }
 }
@@ -10178,6 +10198,15 @@ struct ContextCompactionDispatchContext<'a> {
     antigravity_conversations_dir: &'a PathBuf,
 }
 
+struct ContextCompactionDispatchReadiness<'a> {
+    queue: &'a VecDeque<SequencedQueuedMessage>,
+    in_turn: bool,
+    replay_pending: bool,
+    open_tool_call_ids: &'a HashSet<String>,
+    pending_tool_response_ids: &'a HashSet<String>,
+    background_mutation_active: bool,
+}
+
 fn backend_continuation_context(
     start: &AgentStartPayload,
     session_id: &SessionId,
@@ -10274,14 +10303,16 @@ async fn record_context_compaction_terminal(
         store
             .finish_compaction_operation(
                 &persisted_session_id,
-                &persisted_operation_id,
-                terminal_state,
-                persisted_accepted,
-                persisted_mutation,
-                persisted_method,
-                persisted_metrics,
-                persisted_continuation,
-                persisted_message,
+                FinishCompactionOperation {
+                    operation_id: persisted_operation_id,
+                    state: terminal_state,
+                    accepted: persisted_accepted,
+                    mutation: persisted_mutation,
+                    method: persisted_method,
+                    metrics: persisted_metrics,
+                    continuation: persisted_continuation,
+                    message: persisted_message,
+                },
             )
             .map(|_| ())
     })
@@ -10410,24 +10441,19 @@ async fn release_context_compaction_barrier(
 async fn try_dispatch_context_compaction(
     context: ContextCompactionDispatchContext<'_>,
     flight: &mut Option<CompactionFlight>,
-    queue: &VecDeque<SequencedQueuedMessage>,
-    in_turn: bool,
-    replay_pending: bool,
-    open_tool_call_ids: &HashSet<String>,
-    pending_tool_response_ids: &HashSet<String>,
-    background_mutation_active: bool,
+    readiness: ContextCompactionDispatchReadiness<'_>,
 ) {
     let Some(active) = flight.as_mut() else {
         return;
     };
     if !context_compaction_dispatch_is_safe(
         active,
-        queue,
-        in_turn,
-        replay_pending,
-        open_tool_call_ids,
-        pending_tool_response_ids,
-        background_mutation_active,
+        readiness.queue,
+        readiness.in_turn,
+        readiness.replay_pending,
+        readiness.open_tool_call_ids,
+        readiness.pending_tool_response_ids,
+        readiness.background_mutation_active,
     ) {
         return;
     }
@@ -10718,7 +10744,7 @@ async fn try_dispatch_context_compaction(
                 .actor_tx
                 .send(AgentCommand::ContextCompactionTerminal {
                     operation_id: active.operation_id.clone(),
-                    result: Ok(result),
+                    result: Ok(*result),
                 });
         }
     }
@@ -18243,7 +18269,7 @@ mod tests {
 
     #[test]
     fn compaction_snapshot_replacement_preserves_single_envelope() {
-        let mut log = vec![Envelope {
+        let mut log = [Envelope {
             stream: protocol::StreamPath("/agent/a".to_owned()),
             kind: FrameKind::ContextCompactionNotify,
             seq: 4,

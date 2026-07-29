@@ -29173,10 +29173,12 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 user_message_count: 3,
             } if *stored_idle == idle_since
         ));
-        let mut enabled = protocol::SupervisorSettings::default();
-        enabled.enabled = true;
-        enabled.auto_compact_on_success = true;
-        enabled.auto_compact_min_context_tokens = 0;
+        let enabled = protocol::SupervisorSettings {
+            enabled: true,
+            auto_compact_on_success: true,
+            auto_compact_min_context_tokens: 0,
+            ..Default::default()
+        };
         assert_eq!(
             supervisor_next_deadline(
                 &entries,

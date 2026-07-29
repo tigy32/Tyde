@@ -854,16 +854,15 @@ pub fn ChatView() -> impl IntoView {
                             {
                                 log::error!("failed to send fetch_session_history: {error}");
                                 state_for_error.session_history.update(|map| {
-                                    if let Some(history) = map.get_mut(&key_for_send) {
-                                        if history
+                                    if let Some(history) = map.get_mut(&key_for_send)
+                                        && history
                                             .pending_request
                                             .as_ref()
                                             .is_some_and(|pending| {
                                                 pending.request_id == request_id
                                             })
-                                        {
-                                            history.pending_request = None;
-                                        }
+                                    {
+                                        history.pending_request = None;
                                     }
                                 });
                             }

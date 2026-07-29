@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use protocol::{ChatEvent, SessionId};
 use serde::{Deserialize, Serialize};
@@ -145,7 +145,8 @@ impl TranscriptStore {
         Ok(records)
     }
 
-    pub(crate) fn window_before(
+    #[cfg(test)]
+    fn window_before(
         &self,
         session_id: &SessionId,
         before_sequence: Option<u64>,

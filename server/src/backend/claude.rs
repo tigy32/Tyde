@@ -1045,8 +1045,6 @@ struct ClaudeSystemFrame {
     #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
-    claude_code_version: Option<String>,
-    #[serde(default)]
     summary: Option<String>,
     #[serde(default)]
     task_id: Option<String>,
@@ -1907,7 +1905,7 @@ impl ClaudeInner {
                 .unwrap_or_else(|| {
                     dispatch_uncertain_claude_result(request.operation_id.clone(), error)
                 });
-            return BackendCompactionStart::DispatchUncertain(result);
+            return BackendCompactionStart::DispatchUncertain(Box::new(result));
         }
         {
             let mut state = self.state.lock().await;
@@ -2350,7 +2348,7 @@ impl ClaudeInner {
                             ) {
                                 self.emitter
                                     .compaction_event(&BackendCompactionEvent::Observed(
-                                        observation,
+                                        Box::new(observation),
                                     ));
                             }
                             return;
@@ -3996,7 +3994,7 @@ impl ClaudeInner {
                 }
                 ClaudeHistoryReplayItem::Compaction(observation) => {
                     self.emitter
-                        .compaction_event(&BackendCompactionEvent::Observed(observation));
+                        .compaction_event(&BackendCompactionEvent::Observed(Box::new(observation)));
                 }
             }
         }
@@ -7761,7 +7759,9 @@ fn consume_claude_stream_value_with_interrupt(
                     ) {
                         inner
                             .emitter
-                            .compaction_event(&BackendCompactionEvent::Observed(observation));
+                            .compaction_event(&BackendCompactionEvent::Observed(Box::new(
+                                observation,
+                            )));
                     }
                 }
                 // Workflow and local_bash background-command task frames
@@ -11589,8 +11589,8 @@ use protocol::{
 };
 
 use super::{
-    Backend, BackendCompactionAvailability, BackendCompactionCapability,
-    BackendCompactionCapabilityEvidence, BackendCompactionDeferredReason,
+    Backend, BackendCompactionCapability, BackendCompactionCapabilityEvidence,
+    BackendCompactionDeferredReason,
     BackendCompactionDispatchState, BackendCompactionEvent, BackendCompactionFailure,
     BackendCompactionFailureKind, BackendCompactionMechanism, BackendCompactionMutationState,
     BackendCompactionNotDispatchedReason, BackendCompactionObservationSource,
@@ -13164,7 +13164,7 @@ async fn signal_ready(ready_tx: &ClaudeReadyTx, result: Result<(), String>) {
 mod tests {
     use super::*;
     use crate::agent::customization::ResolvedSkill;
-    use crate::backend::Backend;
+    use crate::backend::{Backend, BackendCompactionAvailability};
     use protocol::{
         AgentBootstrapEvent, AgentBootstrapPayload, AgentId, AgentOrigin, AgentStartPayload,
         BackendKind, BackendSetupPayload, ChatEvent, Envelope, FrameKind, HostBootstrapPayload,

@@ -496,10 +496,7 @@ pub(crate) enum PreparedBackendHandle {
     Codex(Box<codex::CodexBackend>),
     Antigravity(Box<antigravity::AntigravityBackend>),
     Hermes(Box<hermes::HermesBackend>),
-    Mock {
-        declared_kind: BackendKind,
-        backend: Box<mock::MockBackend>,
-    },
+    Mock { backend: Box<mock::MockBackend> },
 }
 
 pub(crate) struct PreparedBackendBinding {
@@ -511,18 +508,6 @@ pub(crate) struct PreparedBackendBinding {
 }
 
 impl PreparedBackendHandle {
-    pub(crate) fn backend_kind(&self) -> BackendKind {
-        match self {
-            Self::Tycode(_) => BackendKind::Tycode,
-            Self::Kiro(_) => BackendKind::Kiro,
-            Self::Claude(_) => BackendKind::Claude,
-            Self::Codex(_) => BackendKind::Codex,
-            Self::Antigravity(_) => BackendKind::Antigravity,
-            Self::Hermes(_) => BackendKind::Hermes,
-            Self::Mock { declared_kind, .. } => *declared_kind,
-        }
-    }
-
     pub(crate) async fn shutdown(self) {
         match self {
             Self::Tycode(backend) => Backend::shutdown(*backend).await,
@@ -627,7 +612,6 @@ pub(crate) async fn prepare_mock_compacted_backend_binding(
         prepare_concrete_backend_binding::<mock::MockBackend>(kind, spawn, seed).await?;
     Ok(PreparedBackendBinding {
         backend: PreparedBackendHandle::Mock {
-            declared_kind: kind,
             backend: Box::new(backend),
         },
         events,
@@ -1596,17 +1580,14 @@ mod tests {
         assert!(prepared.ready.bootstrap_terminal_seen);
         assert!(prepared.ready.provider_idle_seen);
         assert!(prepared.ready.replay_or_setup_drained);
-        assert_eq!(prepared.backend.backend_kind(), BackendKind::Claude);
+        assert_eq!(prepared.ready.backend_kind, BackendKind::Claude);
         assert!(matches!(
             prepared.events.try_recv_backend(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
         assert!(matches!(
             &prepared.backend,
-            super::PreparedBackendHandle::Mock {
-                declared_kind: BackendKind::Claude,
-                ..
-            }
+            super::PreparedBackendHandle::Mock { .. }
         ));
         prepared.backend.shutdown().await;
     }

@@ -30,11 +30,13 @@ use protocol::{
 
 use crate::bridge;
 use crate::state::MobileShellError;
+#[cfg(test)]
+use crate::state::PendingSessionHistoryRequest;
 use crate::state::{
     ActiveAgentRef, AgentInfo, AgentRef, AppState, ChatMessageEntry, ConnectionStatus,
-    HostBrowseSession, LocalHostId, PendingSessionHistoryRequest, PositionedCompactionMarker,
-    ProjectDiffRef, ProjectFileRef, ProjectFileState, ProjectInfo, ReviewRef, SessionHistoryState,
-    SessionInfo, SessionListLoadState, StreamingState, ToolRequestEntry, TransientEvent,
+    HostBrowseSession, LocalHostId, PositionedCompactionMarker, ProjectDiffRef, ProjectFileRef,
+    ProjectFileState, ProjectInfo, ReviewRef, SessionHistoryState, SessionInfo,
+    SessionListLoadState, StreamingState, ToolRequestEntry, TransientEvent,
     reduce_project_diff_response, sort_project_infos,
 };
 

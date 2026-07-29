@@ -352,7 +352,7 @@ pub enum BackendCompactionStart {
         reason: BackendCompactionNotDispatchedReason,
         fallback_safe: bool,
     },
-    DispatchUncertain(BackendCompactionResult),
+    DispatchUncertain(Box<BackendCompactionResult>),
 }
 
 #[derive(Debug)]
@@ -459,7 +459,7 @@ pub enum BackendCompactionTerminalEvidence {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum BackendCompactionEvent {
     Progress(BackendCompactionProgress),
-    Observed(BackendObservedCompaction),
+    Observed(Box<BackendObservedCompaction>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
