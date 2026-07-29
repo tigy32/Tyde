@@ -4711,7 +4711,14 @@ impl AppState {
         let already = self
             .context_compactions
             .with_untracked(|map| map.get(agent_id).is_some_and(|state| state.is_in_flight()));
-        if already {
+        // The legacy replacement protocol keeps its own in-flight record, and
+        // it is still live. Arbitrating only the typed one would let the two
+        // protocols each admit a request the other is already running, so this
+        // gate spans both — every caller shares it, individual and team alike.
+        let legacy_already = self
+            .compaction_in_progress
+            .with_untracked(|map| map.contains_key(agent_id));
+        if already || legacy_already {
             return false;
         }
         self.context_compactions.update(|map| {

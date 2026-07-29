@@ -20329,9 +20329,13 @@ fn validate_terminal_relative_path(path: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::mock::{MOCK_DIE_AFTER_BUSY_SENTINEL, MOCK_SLOW_TURN_SENTINEL};
+    use crate::backend::mock::{
+        MOCK_COMPACT_LEGACY_REPLACEMENT_SENTINEL, MOCK_DIE_AFTER_BUSY_SENTINEL,
+        MOCK_SLOW_TURN_SENTINEL,
+    };
     use crate::review::ReviewHandle;
     use crate::store::agent_teams::AgentTeamsStoreFile;
+    use crate::store::transcript::TranscriptVisibility;
     use protocol::{
         BackendConfigSnapshotStatus, BackendConfigSnapshotsPayload, BackendKind,
         BackendNativeSettingsSnapshot, CompactionMetrics, CompactionTrigger, CustomAgentId,
@@ -25265,6 +25269,173 @@ Rules: Record only what remains true and useful for future work; drop transient 
                 _ => {}
             }
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_agent_compaction_route_preserves_transcript_and_replaces_session() {
+        let fixture = compact_fixture().await;
+        let prompt = format!(
+            "{MOCK_COMPACT_LEGACY_REPLACEMENT_SENTINEL} legacy transcript remains visible"
+        );
+        let (old_agent_id, old_session_id) =
+            spawn_idle_user_agent(&fixture.host, &prompt).await;
+        let capability = fixture
+            .host
+            .agent_handle(&old_agent_id)
+            .await
+            .expect("live legacy compaction target")
+            .compaction_capability()
+            .await
+            .expect("legacy compaction capability");
+        assert_eq!(
+            capability.coordinator,
+            crate::backend::BackendCompactionCoordinator::LegacyReplacement
+        );
+
+        let transcript_store = {
+            let state = fixture.host.state.lock().await;
+            state.transcript_store.clone()
+        };
+        let records = transcript_store
+            .load(&old_session_id)
+            .expect("old transcript before compaction");
+        let saw_visible_context = records.iter().any(|record| {
+            record.visibility == TranscriptVisibility::Visible
+                && matches!(
+                    &record.event,
+                    ChatEvent::StreamEnd(end)
+                        if end.message.content.contains("legacy transcript remains visible")
+                )
+        });
+        let visible_before = records
+            .into_iter()
+            .filter(|record| record.visibility == TranscriptVisibility::Visible)
+            .map(|record| record.event_id)
+            .collect::<HashSet<_>>();
+        assert!(
+            saw_visible_context,
+            "precondition: the legacy target persisted its visible response"
+        );
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let host_path = StreamPath(format!("/host/legacy-compact-{}", Uuid::new_v4()));
+        let host_stream = Stream::new(host_path.clone(), tx);
+        assert!(
+            fixture
+                .host
+                .register_host_stream(host_stream.clone(), AgentReplayMode::Eager)
+                .await
+                .is_empty()
+        );
+        let old_instance_stream = loop {
+            let envelope = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("old agent replay should arrive")
+                .expect("host output envelope");
+            if envelope.kind != FrameKind::NewAgent {
+                continue;
+            }
+            let payload: NewAgentPayload = envelope.parse_payload().expect("NewAgent payload");
+            if payload.agent_id == old_agent_id {
+                break payload.instance_stream;
+            }
+        };
+
+        let compact = protocol::Envelope::from_payload(
+            old_instance_stream,
+            FrameKind::AgentCompact,
+            0,
+            &AgentCompactPayload::default(),
+        )
+        .expect("legacy compact envelope");
+        crate::router::route_client_envelope(
+            &fixture.host,
+            &host_path,
+            &host_stream,
+            compact,
+        )
+        .await
+        .expect("route legacy compaction");
+
+        let mut started = false;
+        let completed = loop {
+            let envelope = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("legacy replacement should finish")
+                .expect("legacy compact output");
+            assert_ne!(
+                envelope.kind,
+                FrameKind::ContextCompactionNotify,
+                "LegacyReplacement must stay on the replacement protocol"
+            );
+            if envelope.kind != FrameKind::AgentCompactNotify {
+                continue;
+            }
+            let payload: AgentCompactNotifyPayload =
+                envelope.parse_payload().expect("legacy compact notify");
+            match payload.status {
+                AgentCompactStatus::Started => started = true,
+                AgentCompactStatus::Completed => break payload,
+                AgentCompactStatus::Failed => {
+                    panic!("legacy replacement failed: {:?}", payload.message)
+                }
+            }
+        };
+        assert!(started, "legacy replacement must report admission");
+        assert_eq!(completed.old_agent_id, old_agent_id);
+        assert_eq!(completed.old_session_id.as_ref(), Some(&old_session_id));
+        let new_agent_id = completed
+            .new_agent_id
+            .clone()
+            .expect("replacement agent id");
+        let new_session_id = completed
+            .new_session_id
+            .clone()
+            .expect("replacement session id");
+        assert_ne!(new_agent_id, old_agent_id);
+        assert_ne!(new_session_id, old_session_id);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while fixture.host.agent_handle(&old_agent_id).await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("old agent should close after the completed notify");
+        assert!(fixture.host.agent_handle(&new_agent_id).await.is_some());
+
+        let (transcript_store, session_store) = {
+            let state = fixture.host.state.lock().await;
+            (
+                state.transcript_store.clone(),
+                Arc::clone(&state.session_store),
+            )
+        };
+        let visible_after = transcript_store
+            .load(&old_session_id)
+            .expect("old transcript after compaction")
+            .into_iter()
+            .filter(|record| record.visibility == TranscriptVisibility::Visible)
+            .map(|record| record.event_id)
+            .collect::<HashSet<_>>();
+        let store = session_store.lock().await;
+        let old_record = store.get(&old_session_id).expect("old session record");
+        let new_record = store
+            .get(&new_session_id)
+            .expect("replacement session record");
+        assert!(
+            visible_before.is_subset(&visible_after),
+            "replacement must not hide or remove the old visible transcript"
+        );
+        assert!(!old_record.resumable);
+        assert_eq!(
+            old_record.compacted_to_session_id.as_ref(),
+            Some(&new_session_id)
+        );
+        assert_eq!(
+            new_record.compacted_from_session_id.as_ref(),
+            Some(&old_session_id)
+        );
     }
 
     #[tokio::test]

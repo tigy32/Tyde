@@ -2580,6 +2580,40 @@ mod wasm_tests {
     /// `"Ok"` (the user clicked OK on the native confirm), and everything
     /// else resolves to undefined. The recorded JS array is returned so
     /// tests can read it after triggering UI actions.
+    /// Like `install_send_stub_with_dialog_ok`, but the confirmation promise is
+    /// held open until the test releases it, so state can be mutated strictly
+    /// between the pre-dialog eligibility check and the claim.
+    fn install_send_stub_with_held_dialog() -> js_sys::Array {
+        let calls = js_sys::eval(
+            r#"
+            (function() {
+                window.__test_send_calls = [];
+                window.__test_release_dialog = null;
+                window.__TAURI__ = window.__TAURI__ || {};
+                window.__TAURI__.core = window.__TAURI__.core || {};
+                window.__TAURI__.core.invoke = function(cmd, args) {
+                    window.__test_send_calls.push([cmd, JSON.stringify(args || {})]);
+                    if (cmd === 'plugin:dialog|message') {
+                        return new Promise(function (resolve) {
+                            window.__test_release_dialog = function () { resolve('Ok'); };
+                        });
+                    }
+                    return Promise.resolve();
+                };
+                window.__TAURI__.event = window.__TAURI__.event || {};
+                window.__TAURI__.event.listen = function() { return Promise.resolve(null); };
+                return window.__test_send_calls;
+            })();
+            "#,
+        )
+        .expect("install tauri stub");
+        calls.dyn_into::<js_sys::Array>().expect("array")
+    }
+
+    fn release_held_dialog() {
+        let _ = js_sys::eval("window.__test_release_dialog && window.__test_release_dialog();");
+    }
+
     fn install_send_stub_with_dialog_ok() -> js_sys::Array {
         let calls = js_sys::eval(
             r#"
@@ -3753,6 +3787,133 @@ mod wasm_tests {
         assert!(
             class.contains("running"),
             "compacting status pill should use the running class for the blue pulse, got: {class}"
+        );
+    }
+
+    /// The individual post-confirmation race, mirroring the team one.
+    ///
+    /// The confirmation dialog is open for as long as the user takes to read
+    /// it. Everything the decision rests on can change in that window, and the
+    /// pre-dialog check is stale by the time the user accepts. Two distinct
+    /// invalidations are covered because they fail through different gates:
+    /// a **legacy** compaction starting (the cross-protocol duplicate gate),
+    /// and capability being **revoked** (the fail-closed gate). Neither may
+    /// dispatch, and neither may strand a typed `Requesting` claim.
+    #[wasm_bindgen_test]
+    async fn compact_aborts_when_a_legacy_compaction_starts_during_confirmation() {
+        let calls = install_send_stub_with_held_dialog();
+        let container = make_container();
+        let state = make_app_state("h");
+        push_agent(&state, "h", "a-race-legacy", "Agent", true);
+        seed_chat_row(&state, "a-race-legacy");
+        declare_compaction_available(&state, "a-race-legacy");
+        let _handle = mount_panel(&container, state.clone());
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let (btn, enabled, _) = compact_btn_state(&container);
+        assert!(enabled, "precondition: the control is offered");
+        btn.click();
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        // The legacy replacement protocol starts a compaction for this agent
+        // while the dialog is still open.
+        state.mark_compaction_started("h", AgentId("a-race-legacy".to_owned()));
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let (_, enabled, label) = compact_btn_state(&container);
+        assert!(
+            !enabled && label.contains("already in progress"),
+            "the mounted control reflects the change while the dialog is open: {label}"
+        );
+
+        release_held_dialog();
+        for _ in 0..8 {
+            next_tick().await;
+        }
+
+        let frames = recorded_frames(&calls);
+        assert!(
+            frames
+                .iter()
+                .all(|(kind, _, _)| kind != &FrameKind::AgentCompact.to_string()),
+            "accepting a stale confirmation must not dispatch: {frames:?}"
+        );
+        assert!(
+            state
+                .context_compactions
+                .with_untracked(|map| !map.contains_key(&AgentId("a-race-legacy".to_owned()))),
+            "and must not strand a typed request claim"
+        );
+        assert!(
+            state
+                .compaction_in_progress
+                .with_untracked(|map| map.contains_key(&AgentId("a-race-legacy".to_owned()))),
+            "while the legacy operation that won the race is left untouched"
+        );
+    }
+
+    /// Same race, invalidated through the fail-closed capability gate instead
+    /// of the cross-protocol one.
+    #[wasm_bindgen_test]
+    async fn compact_aborts_when_capability_is_revoked_during_confirmation() {
+        let calls = install_send_stub_with_held_dialog();
+        let container = make_container();
+        let state = make_app_state("h");
+        push_agent(&state, "h", "a-race-cap", "Agent", true);
+        seed_chat_row(&state, "a-race-cap");
+        declare_compaction_available(&state, "a-race-cap");
+        let _handle = mount_panel(&container, state.clone());
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let (btn, enabled, _) = compact_btn_state(&container);
+        assert!(enabled, "precondition: the control is offered");
+        btn.click();
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        // The server withdraws the route while the dialog is open.
+        state.compaction_capability.update(|map| {
+            map.insert(
+                AgentId("a-race-cap".to_owned()),
+                crate::state::CompactionCapabilitySnapshot {
+                    logical_session_id: protocol::SessionId(String::new()),
+                    availability: protocol::RequestedCompactionAvailability::Unavailable {
+                        reason: protocol::CompactionAvailabilityReason::NativeTriggerUnavailable,
+                    },
+                },
+            );
+        });
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let (_, enabled, _) = compact_btn_state(&container);
+        assert!(!enabled, "the mounted control disables when capability is withdrawn");
+
+        release_held_dialog();
+        for _ in 0..8 {
+            next_tick().await;
+        }
+
+        let frames = recorded_frames(&calls);
+        assert!(
+            frames
+                .iter()
+                .all(|(kind, _, _)| kind != &FrameKind::AgentCompact.to_string()),
+            "a withdrawn route must not be dispatched against: {frames:?}"
+        );
+        assert!(
+            state
+                .context_compactions
+                .with_untracked(|map| !map.contains_key(&AgentId("a-race-cap".to_owned()))),
+            "and must not strand a typed request claim"
         );
     }
 

@@ -2251,6 +2251,21 @@ pub async fn request_context_compaction(
     if !crate::bridge::confirm_dialog("Compact context", &message).await {
         return;
     }
+
+    // Re-evaluate after the await, exactly as the team action does. The dialog
+    // is open for as long as the user takes to read it, and every input to the
+    // decision can change in that window: a legacy compaction can start, the
+    // server can revoke capability, the host can disconnect, the agent can die.
+    // Eligibility established before the dialog is stale by the time we act on
+    // it, and `begin_compaction_request` is not an equivalent recheck — it
+    // arbitrates only the typed protocol.
+    if !compaction_control_state(&state, &agent).is_enabled() {
+        log::info!(
+            "compact: agent {} is no longer eligible after confirmation; not sending",
+            agent.agent_id.0
+        );
+        return;
+    }
     if !state.begin_compaction_request(&agent.agent_id) {
         return;
     }

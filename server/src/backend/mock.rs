@@ -60,6 +60,8 @@ pub(crate) const MOCK_COMPACT_CAPABILITY_UNKNOWN_SENTINEL: &str =
     "__mock_compact_capability_unknown__";
 pub(crate) const MOCK_COMPACT_CAPABILITY_UNAVAILABLE_SENTINEL: &str =
     "__mock_compact_capability_unavailable__";
+pub(crate) const MOCK_COMPACT_LEGACY_REPLACEMENT_SENTINEL: &str =
+    "__mock_compact_legacy_replacement__";
 /// Causes `emit_turn` to sleep (see `MOCK_SLOW_SLEEP_MS`) before emitting
 /// `TypingStatusChanged(false)`.  This gives tests a reliable window to send
 /// queued messages while the agent is still in-turn, without relying on
@@ -310,6 +312,11 @@ fn native_mock_compaction_capability() -> BackendCompactionCapability {
 }
 
 fn mock_compaction_capability_for_control(control: &str) -> BackendCompactionCapability {
+    if control.contains(MOCK_COMPACT_LEGACY_REPLACEMENT_SENTINEL) {
+        return BackendCompactionCapability::legacy_unavailable(
+            super::BackendCompactionUnavailableReason::AdapterHasNoManualTransport,
+        );
+    }
     if control.contains(MOCK_COMPACT_CAPABILITY_UNKNOWN_SENTINEL) {
         return BackendCompactionCapability::unknown(
             super::BackendCompactionUnknownReason::ProtocolNotAllowlisted,
@@ -2493,7 +2500,7 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::agent::customization::ResolvedSpawnConfig;
-    use crate::backend::BackendContinuationContext;
+    use crate::backend::{BackendCompactionUnavailableReason, BackendContinuationContext};
 
     #[tokio::test]
     async fn mock_backend_records_read_only_access_mode() {
@@ -2764,7 +2771,19 @@ mod tests {
     }
 
     #[test]
-    fn mock_capability_controls_distinguish_unknown_from_unavailable() {
+    fn mock_capability_controls_cover_legacy_unknown_and_unavailable() {
+        let legacy =
+            mock_compaction_capability_for_control(MOCK_COMPACT_LEGACY_REPLACEMENT_SENTINEL);
+        assert_eq!(
+            legacy.coordinator,
+            BackendCompactionCoordinator::LegacyReplacement
+        );
+        assert!(matches!(
+            legacy.availability,
+            BackendCompactionAvailability::Unavailable {
+                reason: BackendCompactionUnavailableReason::AdapterHasNoManualTransport
+            }
+        ));
         let unknown =
             mock_compaction_capability_for_control(MOCK_COMPACT_CAPABILITY_UNKNOWN_SENTINEL);
         assert!(matches!(
