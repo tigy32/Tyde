@@ -1,4 +1,5 @@
 use std::fmt;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +41,7 @@ pub(crate) struct ConnectionPlan {
     pub(crate) config: MqttConnectConfig,
     pub(crate) broker: LinkBrokerConfig,
     pub(crate) topics: TopicScheme,
+    pub(crate) session_expires_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +113,7 @@ impl ConnectionPlan {
                 client_id: LinkClientId::Random(config.role),
             },
             topics: TopicScheme::Legacy,
+            session_expires_at_ms: None,
             config,
         }
     }
@@ -130,6 +133,7 @@ impl ConnectionPlan {
         mode: ManagedConnectionMode,
     ) -> Result<Self, MqttTransportError> {
         let connect = validate_managed_config(&config, mode)?;
+        let session_expires_at_ms = config.credentials.expires_at_ms;
         let endpoint = BrokerEndpoint {
             url: config.broker.endpoint.clone(),
             auth: BrokerAuth::Anonymous,
@@ -149,8 +153,24 @@ impl ConnectionPlan {
             topics: TopicScheme::Managed {
                 namespace: config.credentials.scope.namespace,
             },
+            session_expires_at_ms: Some(session_expires_at_ms),
         })
     }
+
+    pub(crate) fn session_renewal_after(&self, now_ms: u64) -> Option<Duration> {
+        self.session_expires_at_ms
+            .map(|expires_at_ms| managed_session_renewal_after(expires_at_ms, now_ms))
+    }
+}
+
+const MANAGED_SESSION_RENEWAL_MARGIN_MS: u64 = 60_000;
+
+fn managed_session_renewal_after(expires_at_ms: u64, now_ms: u64) -> Duration {
+    Duration::from_millis(
+        expires_at_ms
+            .saturating_sub(MANAGED_SESSION_RENEWAL_MARGIN_MS)
+            .saturating_sub(now_ms),
+    )
 }
 
 impl TopicScheme {
@@ -779,6 +799,18 @@ mod tests {
             psk: PreSharedKey::from_slice(&[9_u8; crate::types::PRE_SHARED_KEY_LEN]).expect("psk"),
             role,
         }
+    }
+
+    #[test]
+    fn managed_session_renews_before_expiry_and_immediately_when_late() {
+        assert_eq!(
+            managed_session_renewal_after(900_000, 100_000),
+            Duration::from_millis(740_000)
+        );
+        assert_eq!(
+            managed_session_renewal_after(900_000, 850_000),
+            Duration::ZERO
+        );
     }
 
     #[test]

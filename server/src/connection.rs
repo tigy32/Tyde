@@ -20,6 +20,11 @@ enum ConnectionOrigin {
 }
 
 const BOOTSTRAP_REPLAY_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
+const MOBILE_CLIENT_LIVENESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn has_peer_liveness_deadline(origin: ConnectionOrigin) -> bool {
+    origin == ConnectionOrigin::Mobile
+}
 
 struct AppLoopResources {
     host: HostHandle,
@@ -303,6 +308,16 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
+            _ = tokio::time::sleep(MOBILE_CLIENT_LIVENESS_TIMEOUT),
+                if has_peer_liveness_deadline(origin) =>
+            {
+                tracing::warn!(
+                    stream = %host_stream,
+                    timeout_ms = MOBILE_CLIENT_LIVENESS_TIMEOUT.as_millis(),
+                    "closing mobile connection after client liveness timeout",
+                );
+                return Ok(());
+            }
             maybe_envelope = inbound_rx.recv() => {
                 let Some(envelope) = maybe_envelope else {
                     return Ok(());
@@ -499,6 +514,13 @@ mod tests {
 
         assert!(!is_terminal_control_command(FrameKind::SendMessage));
         assert!(!is_terminal_control_command(FrameKind::HostBrowseStart));
+    }
+
+    #[test]
+    fn only_mobile_connections_have_a_peer_liveness_deadline() {
+        assert!(has_peer_liveness_deadline(ConnectionOrigin::Mobile));
+        assert!(!has_peer_liveness_deadline(ConnectionOrigin::Desktop));
+        assert!(MOBILE_CLIENT_LIVENESS_TIMEOUT > std::time::Duration::from_secs(10));
     }
 
     #[test]

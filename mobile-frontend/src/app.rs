@@ -885,9 +885,9 @@ fn apply_connection_status(
             let host_for_hello = host.clone();
             let state_for_hello_error = state.clone();
             spawn_local(async move {
-                if let Err(error) = send_frame(
+                let hello_result = send_frame(
                     &host_for_hello,
-                    stream,
+                    stream.clone(),
                     protocol::FrameKind::Hello,
                     &protocol::HelloPayload {
                         protocol_version: protocol::PROTOCOL_VERSION,
@@ -896,8 +896,8 @@ fn apply_connection_status(
                         platform: "ios".to_string(),
                     },
                 )
-                .await
-                {
+                .await;
+                if let Err(error) = hello_result {
                     let message = format!("failed to send hello to {host_for_hello}: {error}");
                     log::error!("{message}");
                     report_shell_error(
@@ -905,6 +905,30 @@ fn apply_connection_status(
                         MobileAccessErrorCode::TransportFailed,
                         message,
                     );
+                    return;
+                }
+                let now = unix_time_ms();
+                state_for_hello_error
+                    .heartbeat_pending_since_by_host
+                    .update(|pending| {
+                        pending.insert(host_for_hello.clone(), now);
+                    });
+                if let Err(error) = send_frame(
+                    &host_for_hello,
+                    stream,
+                    FrameKind::Heartbeat,
+                    &HeartbeatPayload {
+                        client_sent_at_ms: now,
+                    },
+                )
+                .await
+                {
+                    state_for_hello_error
+                        .heartbeat_pending_since_by_host
+                        .update(|pending| {
+                            pending.remove(&host_for_hello);
+                        });
+                    log::warn!("failed to send initial heartbeat to {host_for_hello}: {error}");
                 }
             });
             if state.active_local_host_id.get_untracked().is_none() {

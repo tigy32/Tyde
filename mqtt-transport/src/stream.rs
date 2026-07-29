@@ -6,6 +6,7 @@ use std::task::{Context, Poll, ready};
 
 use futures_channel::mpsc::Sender;
 use futures_util::Sink;
+use futures_util::future::AbortHandle;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc::Receiver, oneshot};
 
@@ -67,6 +68,7 @@ pub struct EnvelopeStream {
     pending_chunk: Option<PendingChunk>,
     outstanding_acks: VecDeque<oneshot::Receiver<Result<(), String>>>,
     shutdown_started: bool,
+    actor_abort: Option<AbortHandle>,
 }
 
 impl EnvelopeStream {
@@ -82,7 +84,14 @@ impl EnvelopeStream {
             pending_chunk: None,
             outstanding_acks: VecDeque::new(),
             shutdown_started: false,
+            actor_abort: None,
         }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn with_actor_abort(mut self, actor_abort: AbortHandle) -> Self {
+        self.actor_abort = Some(actor_abort);
+        self
     }
 
     fn poll_send_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -151,6 +160,14 @@ impl EnvelopeStream {
 }
 
 impl Unpin for EnvelopeStream {}
+
+impl Drop for EnvelopeStream {
+    fn drop(&mut self) {
+        if let Some(actor_abort) = self.actor_abort.take() {
+            actor_abort.abort();
+        }
+    }
+}
 
 impl AsyncRead for EnvelopeStream {
     fn poll_read(

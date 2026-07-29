@@ -20,3 +20,20 @@ pub(crate) use tokio::time::{Instant, interval_at, sleep};
 pub(crate) use wasmtimer::std::Instant;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use wasmtimer::tokio::{Interval, interval_at, sleep};
+
+pub(crate) fn unix_time_ms() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::now().max(0.0) as u64
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+}

@@ -1397,7 +1397,8 @@ fn transport_error_code(error: &MqttTransportError) -> MobileAccessErrorCode {
         MqttTransportError::BrokerConnect { .. }
         | MqttTransportError::Subscribe { .. }
         | MqttTransportError::SubscribeRejected { .. }
-        | MqttTransportError::BrokerDisconnected { .. } => {
+        | MqttTransportError::BrokerDisconnected { .. }
+        | MqttTransportError::ManagedSessionExpired => {
             MobileAccessErrorCode::BrokerConnectionFailed
         }
         MqttTransportError::Publish { .. } | MqttTransportError::PublishRejected { .. } => {

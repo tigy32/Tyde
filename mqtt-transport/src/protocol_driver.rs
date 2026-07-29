@@ -14,6 +14,7 @@
 //! wasm32, so they are used directly as well.
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::str;
 #[cfg(test)]
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use std::time::Duration;
 
 use futures_channel::mpsc::Receiver as OutboundReceiver;
 use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use rand::RngCore;
 use rand::rngs::OsRng;
 #[cfg(test)]
@@ -53,6 +55,7 @@ const PUBLISH_RETRY_INITIAL: Duration = Duration::from_millis(250);
 const PUBLISH_RETRY_MAX: Duration = Duration::from_secs(30);
 const PUBLISH_RETRY_ATTEMPTS: u8 = 5;
 const RENDEZVOUS_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_RENDEZVOUS_CANDIDATES: usize = 3;
 const CREDIT_EMIT_THRESHOLD: u64 = (DATA_CREDIT_WINDOW / 2) as u64;
 const CREDIT_DEBOUNCE: Duration = Duration::from_millis(25);
 #[cfg(not(test))]
@@ -77,6 +80,7 @@ pub(crate) struct ProtocolDriver<L: MqttLink> {
     pub(crate) inbound_tx: mpsc::Sender<InboundEvent>,
     pub(crate) ready_tx: Option<oneshot::Sender<Result<(), MqttTransportError>>>,
     pub(crate) publish_pacer: PublishPacer,
+    pub(crate) session_renewal_after: Option<Duration>,
     #[cfg(test)]
     pub(crate) subscribe_barrier: Option<Arc<Barrier>>,
 }
@@ -280,6 +284,11 @@ impl<L: MqttLink> ProtocolDriver<L> {
         let mut in_flight = InflightPublishes::new();
         let mut outbound_closed = false;
         let mut credit_blocked_since: Option<Instant> = None;
+        let session_renewal_timer = sleep(
+            self.session_renewal_after
+                .unwrap_or(Duration::from_secs(365 * 24 * 60 * 60)),
+        );
+        tokio::pin!(session_renewal_timer);
         loop {
             if let Err(error) = self
                 .publish_due_credit(&mut cipher, &mut in_flight, &mut credit)
@@ -337,6 +346,12 @@ impl<L: MqttLink> ProtocolDriver<L> {
                 && in_flight.has_data_slot()
                 && in_flight.has_broker_capacity();
             tokio::select! {
+                _ = &mut session_renewal_timer, if self.session_renewal_after.is_some() => {
+                    let error = MqttTransportError::ManagedSessionExpired;
+                    ack_deferred_outbound(&mut deferred_outbound, &error);
+                    self.fail_stream(&mut in_flight, error).await;
+                    return;
+                }
                 _ = &mut credit_block_timer, if credit_block_delay.is_some() => {
                     let error = MqttTransportError::ReceiverCreditTimeout {
                         data_counter: cipher.next_send_data_counter(),
@@ -1211,13 +1226,13 @@ fn publish_error_is_quota_exceeded(error: &MqttTransportError) -> bool {
 }
 
 fn retryable_publish_error(error: &MqttTransportError) -> bool {
-    matches!(
-        error,
+    match error {
+        MqttTransportError::PublishRejected { reason } => !reason.is_not_authorized(),
         MqttTransportError::BrokerConnect { .. }
-            | MqttTransportError::Publish { .. }
-            | MqttTransportError::PublishRejected { .. }
-            | MqttTransportError::BrokerDisconnected { .. }
-    )
+        | MqttTransportError::Publish { .. }
+        | MqttTransportError::BrokerDisconnected { .. } => true,
+        _ => false,
+    }
 }
 
 struct BoxcarBatch {
@@ -1337,6 +1352,121 @@ pub(crate) async fn negotiate_ephemeral_data_room<L: MqttLink>(
     }
 }
 
+pub(crate) async fn accept_ephemeral_data_connections<L, F, Fut, T>(
+    config: &MqttConnectConfig,
+    inbound_topic: &str,
+    outbound_topic: &str,
+    link: &mut L,
+    mut connect_candidate: F,
+) -> Result<T, MqttTransportError>
+where
+    L: MqttLink,
+    F: FnMut(ConnectionId, EphemeralDataRoom) -> Fut,
+    Fut: Future<Output = (ConnectionId, Result<T, MqttTransportError>)>,
+{
+    link.subscribe(inbound_topic).await?;
+    await_suback(link, "rendezvous subscribe").await?;
+
+    let mut candidates = FuturesUnordered::new();
+    let mut accepts = HashMap::<ConnectionId, OpenAccept>::new();
+    loop {
+        tokio::select! {
+            candidate = candidates.next(), if !candidates.is_empty() => {
+                if let Some((connection_id, result)) = candidate {
+                    accepts.remove(&connection_id);
+                    if let Ok(connected) = result {
+                        link.disconnect().await;
+                        return Ok(connected);
+                    }
+                }
+            }
+            event = link.poll() => {
+                match event? {
+                    LinkEvent::Publish(publish) => {
+                        let topic = publish_topic_string(&publish.topic)?;
+                        if topic != inbound_topic {
+                            return Err(MqttTransportError::Framing(FramingError::InvalidTopic {
+                                message: format!(
+                                    "received publish for topic {topic:?}; expected {inbound_topic:?}"
+                                ),
+                            }));
+                        }
+                        let request = match decode_open_request(
+                            &config.room,
+                            &config.psk,
+                            &publish.payload,
+                        ) {
+                            Ok(request) => request,
+                            Err(FramingError::UnknownTag { .. }) => continue,
+                            Err(error) => return Err(MqttTransportError::Framing(error)),
+                        };
+                        if request.proposed_data_room == config.room {
+                            return Err(MqttTransportError::Framing(FramingError::InvalidTopic {
+                                message: "rendezvous request proposed the rendezvous room as its data room"
+                                    .to_owned(),
+                            }));
+                        }
+
+                        if let Some(accept) = accepts.get(&request.connection_id) {
+                            if accept.client_nonce != request.client_nonce
+                                || accept.data_room != request.proposed_data_room
+                            {
+                                return Err(MqttTransportError::Framing(
+                                    FramingError::InvalidTopic {
+                                        message: "rendezvous connection id was reused with different parameters"
+                                            .to_owned(),
+                                    },
+                                ));
+                            }
+                            let frame = encode_open_accept(&config.room, &config.psk, accept)?;
+                            publish_control_frame(link, outbound_topic, frame).await?;
+                            continue;
+                        }
+                        if candidates.len() >= MAX_RENDEZVOUS_CANDIDATES {
+                            tracing::warn!(
+                                candidate_count = candidates.len(),
+                                "ignoring MQTT rendezvous request while candidate limit is full"
+                            );
+                            continue;
+                        }
+
+                        let accept = OpenAccept {
+                            connection_id: request.connection_id,
+                            client_nonce: request.client_nonce,
+                            server_nonce: random_nonce(),
+                            data_room: request.proposed_data_room,
+                        };
+                        let frame = encode_open_accept(&config.room, &config.psk, &accept)?;
+                        publish_control_frame(link, outbound_topic, frame).await?;
+                        let psk = derive_ephemeral_psk(
+                            &config.psk,
+                            &config.room,
+                            accept.connection_id,
+                            &accept.client_nonce,
+                            &accept.server_nonce,
+                            &accept.data_room,
+                        )?;
+                        let connection_id = accept.connection_id;
+                        let data = EphemeralDataRoom {
+                            room: accept.data_room,
+                            psk,
+                        };
+                        accepts.insert(connection_id, accept);
+                        candidates.push(connect_candidate(connection_id, data));
+                    }
+                    LinkEvent::PubAck(ack) => ack.result?,
+                    LinkEvent::Disconnect { reason } => {
+                        return Err(MqttTransportError::BrokerDisconnected {
+                            reason: format!("disconnect during rendezvous accept: {reason}"),
+                        });
+                    }
+                    LinkEvent::SubAck { .. } | LinkEvent::Other => {}
+                }
+            }
+        }
+    }
+}
+
 async fn await_open_and_accept<L: MqttLink>(
     config: &MqttConnectConfig,
     link: &mut L,
@@ -1355,6 +1485,12 @@ async fn await_open_and_accept<L: MqttLink>(
                     }));
                 }
                 let request = decode_open_request(&config.room, &config.psk, &publish.payload)?;
+                if request.proposed_data_room == config.room {
+                    return Err(MqttTransportError::Framing(FramingError::InvalidTopic {
+                        message: "rendezvous request proposed the rendezvous room as its data room"
+                            .to_owned(),
+                    }));
+                }
                 let server_nonce = random_nonce();
                 let accept = OpenAccept {
                     connection_id: request.connection_id,
@@ -1438,6 +1574,14 @@ async fn open_and_await_accept<L: MqttLink>(
                             || accept.client_nonce != request.client_nonce
                         {
                             continue;
+                        }
+                        if accept.data_room != request.proposed_data_room
+                            || accept.data_room == config.room
+                        {
+                            return Err(MqttTransportError::Framing(FramingError::InvalidTopic {
+                                message: "rendezvous accept selected an invalid data room"
+                                    .to_owned(),
+                            }));
                         }
                         let psk = derive_ephemeral_psk(
                             &config.psk,
@@ -1658,6 +1802,12 @@ mod tests {
     }
 
     fn spawn_stream_driver() -> Result<DriverHarness, MqttTransportError> {
+        spawn_stream_driver_with_renewal(None)
+    }
+
+    fn spawn_stream_driver_with_renewal(
+        session_renewal_after: Option<Duration>,
+    ) -> Result<DriverHarness, MqttTransportError> {
         let (outbound_tx, outbound_rx) = channel::<OutboundChunk>(64);
         let (inbound_tx, inbound_rx) = mpsc::channel::<InboundEvent>(64);
         let (poll_tx, poll_rx) =
@@ -1703,6 +1853,7 @@ mod tests {
             inbound_tx,
             ready_tx: None,
             publish_pacer: PublishPacer::new(),
+            session_renewal_after,
             subscribe_barrier: None,
         };
         let driver = tokio::spawn(driver.run_stream(cipher, ReceiverCreditState::new()));
@@ -1713,6 +1864,22 @@ mod tests {
             publish_rx,
             driver,
         })
+    }
+
+    #[tokio::test]
+    async fn managed_session_deadline_closes_the_stream_for_credential_renewal() {
+        let mut harness =
+            spawn_stream_driver_with_renewal(Some(Duration::from_millis(10))).unwrap();
+
+        let event = timeout(Duration::from_secs(1), harness.inbound_rx.recv())
+            .await
+            .expect("session renewal timer did not fire")
+            .expect("driver closed without reporting the renewal");
+        assert!(matches!(
+            event,
+            InboundEvent::Error(error)
+                if matches!(*error, MqttTransportError::ManagedSessionExpired)
+        ));
     }
 
     fn full_chunk(byte: u8) -> (OutboundChunk, oneshot::Receiver<Result<(), String>>) {

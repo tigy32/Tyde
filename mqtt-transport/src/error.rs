@@ -29,6 +29,9 @@ pub enum MqttTransportError {
     #[error("MQTT publish was rejected: {reason}")]
     PublishRejected { reason: PublishRejection },
 
+    #[error("managed MQTT session reached its credential renewal deadline")]
+    ManagedSessionExpired,
+
     #[error(
         "MQTT PUBACK did not match an outstanding publish (packet id {packet_id:?}, token {token:?})"
     )]
@@ -63,16 +66,17 @@ pub enum MqttTransportError {
 
 impl MqttTransportError {
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
+        match self {
+            Self::PublishRejected { reason } => !reason.is_not_authorized(),
             Self::BrokerConnect { .. }
-                | Self::Subscribe { .. }
-                | Self::SubscribeRejected { .. }
-                | Self::Publish { .. }
-                | Self::PublishRejected { .. }
-                | Self::BrokerDisconnected { .. }
-                | Self::ActorClosed
-        )
+            | Self::Subscribe { .. }
+            | Self::SubscribeRejected { .. }
+            | Self::Publish { .. }
+            | Self::BrokerDisconnected { .. }
+            | Self::ManagedSessionExpired
+            | Self::ActorClosed => true,
+            _ => false,
+        }
     }
 }
 
@@ -91,6 +95,10 @@ pub struct PublishRejection {
 impl PublishRejection {
     pub fn is_quota_exceeded(&self) -> bool {
         self.code == PUBACK_QUOTA_EXCEEDED
+    }
+
+    pub fn is_not_authorized(&self) -> bool {
+        self.code == 0x87
     }
 }
 
@@ -194,5 +202,31 @@ impl fmt::Display for CounterViolation {
                 "receiver credit {credit_next} exceeds next local data counter {sent_next}"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authorization_rejection_is_terminal_but_quota_is_retryable() {
+        let not_authorized = MqttTransportError::PublishRejected {
+            reason: PublishRejection {
+                code: 0x87,
+                code_name: "NotAuthorized".to_owned(),
+                reason_string: None,
+            },
+        };
+        let quota = MqttTransportError::PublishRejected {
+            reason: PublishRejection {
+                code: PUBACK_QUOTA_EXCEEDED,
+                code_name: "QuotaExceeded".to_owned(),
+                reason_string: None,
+            },
+        };
+
+        assert!(!not_authorized.is_retryable());
+        assert!(quota.is_retryable());
     }
 }

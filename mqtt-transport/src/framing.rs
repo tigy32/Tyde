@@ -1,6 +1,6 @@
 use crate::error::FramingError;
 
-pub const MQTT_TRANSPORT_VERSION: u8 = 0x02;
+pub const MQTT_TRANSPORT_VERSION: u8 = 0x03;
 pub const HANDSHAKE_TAG: u8 = 0x01;
 pub const DATA_TAG: u8 = 0x02;
 pub const CREDIT_TAG: u8 = 0x05;

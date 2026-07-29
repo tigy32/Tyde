@@ -29,8 +29,8 @@ use crate::link_native::NativeMqttLink;
 #[cfg(test)]
 use crate::link_native::TestConnectionDiagnosticContext;
 use crate::protocol_driver::{
-    EphemeralDataRoom, ProtocolDriver, PublishPacer, generate_session_salt,
-    negotiate_ephemeral_data_room,
+    EphemeralDataRoom, ProtocolDriver, PublishPacer, accept_ephemeral_data_connections,
+    generate_session_salt, negotiate_ephemeral_data_room,
 };
 use crate::stream::{EnvelopeStream, InboundEvent, OutboundChunk};
 
@@ -204,10 +204,12 @@ async fn connect_plan(
     plan: ConnectionPlan,
     overrides: ConnectOverrides,
 ) -> Result<EnvelopeStream, MqttTransportError> {
+    let session_renewal_after = plan.session_renewal_after(crate::time::unix_time_ms());
     let ConnectionPlan {
         config,
         broker,
         topics,
+        session_expires_at_ms: _,
     } = plan;
     let local_salt = match overrides.fixed_session_salt {
         Some(salt) => salt,
@@ -255,6 +257,7 @@ async fn connect_plan(
         inbound_tx,
         ready_tx: Some(ready_tx),
         publish_pacer: PublishPacer::new(),
+        session_renewal_after,
         #[cfg(test)]
         subscribe_barrier: overrides.subscribe_barrier,
     };
@@ -282,6 +285,9 @@ async fn connect_ephemeral_plan(
             diagnostic.phase,
             diagnostic.started_at.elapsed().as_millis()
         );
+    }
+    if plan.config.role == crate::config::ParticipantRole::Host {
+        return connect_ephemeral_host(plan, overrides).await;
     }
     let data = match negotiate_ephemeral_data_room_native(&plan, &overrides).await {
         Ok(data) => data,
@@ -318,6 +324,7 @@ async fn connect_ephemeral_plan(
         config: data_config,
         broker: plan.broker,
         topics: plan.topics,
+        session_expires_at_ms: plan.session_expires_at_ms,
     };
     #[cfg(test)]
     let data_overrides = {
@@ -345,6 +352,79 @@ async fn connect_ephemeral_plan(
         eprintln!("mqtt transport test data-room boundary failed error={error:?}");
     }
     connected?
+}
+
+async fn connect_ephemeral_host(
+    plan: ConnectionPlan,
+    overrides: ConnectOverrides,
+) -> Result<EnvelopeStream, MqttTransportError> {
+    let config = &plan.config;
+    let inbound_topic = plan.topics.inbound_topic(config.role, &config.room)?;
+    let outbound_topic = plan.topics.outbound_topic(config.role, &config.room)?;
+    let mut link = NativeMqttLink::connect(&plan.broker, overrides.tls_ca_pem.clone())?;
+    #[cfg(test)]
+    {
+        link.set_accepted_publish_count_for_test(overrides.accepted_publish_count.clone());
+        if let Some(diagnostic) = overrides.diagnostic.as_ref() {
+            link.set_test_connection_diagnostic(TestConnectionDiagnosticContext {
+                label: diagnostic.label.clone(),
+                phase: diagnostic.phase,
+                started_at: diagnostic.started_at,
+                role: format!("{:?}", config.role),
+                inbound_topic: inbound_topic.clone(),
+                outbound_topic: outbound_topic.clone(),
+                client_identity: format!("{:?}", plan.broker.client_id),
+            });
+        }
+    }
+    let endpoint = plan.config.endpoint.clone();
+    let broker = plan.broker.clone();
+    let topics = plan.topics.clone();
+    let session_expires_at_ms = plan.session_expires_at_ms;
+    accept_ephemeral_data_connections(
+        &plan.config,
+        &inbound_topic,
+        &outbound_topic,
+        &mut link,
+        move |connection_id, data| {
+            let data_plan = ConnectionPlan {
+                config: MqttConnectConfig {
+                    endpoint: endpoint.clone(),
+                    room: data.room,
+                    psk: data.psk,
+                    role: crate::config::ParticipantRole::Host,
+                },
+                broker: broker.clone(),
+                topics: topics.clone(),
+                session_expires_at_ms,
+            };
+            let data_overrides = overrides.clone();
+            #[cfg(test)]
+            let data_overrides = ConnectOverrides {
+                diagnostic: data_overrides
+                    .diagnostic
+                    .as_ref()
+                    .map(TestConnectionDiagnostic::data_room),
+                ..data_overrides
+            };
+            async move {
+                let result = tokio::time::timeout(
+                    RENDEZVOUS_DATA_CONNECT_TIMEOUT,
+                    connect_plan(data_plan, data_overrides),
+                )
+                .await
+                .map_err(|_| MqttTransportError::BrokerDisconnected {
+                    reason: format!(
+                        "timed out waiting for MQTT ephemeral data room after {:?}",
+                        RENDEZVOUS_DATA_CONNECT_TIMEOUT
+                    ),
+                })
+                .and_then(|result| result);
+                (connection_id, result)
+            }
+        },
+    )
+    .await
 }
 
 /// Construct the native link for the main (rendezvous) room and run the

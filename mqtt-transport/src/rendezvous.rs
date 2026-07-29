@@ -165,8 +165,9 @@ fn encode_control_frame(
 ) -> Result<Vec<u8>, CryptoError> {
     let key = derive_rendezvous_key(main_room, psk)?;
     let cipher = ChaCha20Poly1305::new_from_slice(&key).map_err(|_| CryptoError::HkdfExpand)?;
-    let nonce = rendezvous_nonce(tag, connection_id);
-    let aad = rendezvous_aad(main_room, tag, connection_id);
+    let mut nonce = [0_u8; AEAD_NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+    let aad = rendezvous_aad(main_room, tag, connection_id, &nonce);
     let ciphertext_with_tag = cipher
         .encrypt(
             (&nonce).into(),
@@ -176,10 +177,12 @@ fn encode_control_frame(
             },
         )
         .map_err(|_| CryptoError::AeadFailure)?;
-    let mut frame = Vec::with_capacity(2 + CONNECTION_ID_LEN + ciphertext_with_tag.len());
+    let mut frame =
+        Vec::with_capacity(2 + CONNECTION_ID_LEN + AEAD_NONCE_LEN + ciphertext_with_tag.len());
     frame.push(MQTT_TRANSPORT_VERSION);
     frame.push(tag);
     frame.extend_from_slice(&connection_id.0);
+    frame.extend_from_slice(&nonce);
     frame.extend_from_slice(&ciphertext_with_tag);
     Ok(frame)
 }
@@ -207,7 +210,7 @@ fn decode_control_frame(
     if tag != expected_tag {
         return Err(FramingError::UnknownTag { tag });
     }
-    let minimum = 2 + CONNECTION_ID_LEN + crate::framing::AEAD_TAG_LEN;
+    let minimum = 2 + CONNECTION_ID_LEN + AEAD_NONCE_LEN + crate::framing::AEAD_TAG_LEN;
     if payload.len() < minimum {
         return Err(FramingError::DataFrameTooShort {
             minimum,
@@ -217,16 +220,19 @@ fn decode_control_frame(
     let mut id = [0_u8; CONNECTION_ID_LEN];
     id.copy_from_slice(&payload[2..2 + CONNECTION_ID_LEN]);
     let connection_id = ConnectionId(id);
+    let nonce_start = 2 + CONNECTION_ID_LEN;
+    let ciphertext_start = nonce_start + AEAD_NONCE_LEN;
+    let mut nonce = [0_u8; AEAD_NONCE_LEN];
+    nonce.copy_from_slice(&payload[nonce_start..ciphertext_start]);
     let key = derive_rendezvous_key(main_room, psk).map_err(FramingError::Crypto)?;
     let cipher = ChaCha20Poly1305::new_from_slice(&key)
         .map_err(|_| FramingError::Crypto(CryptoError::HkdfExpand))?;
-    let nonce = rendezvous_nonce(tag, connection_id);
-    let aad = rendezvous_aad(main_room, tag, connection_id);
+    let aad = rendezvous_aad(main_room, tag, connection_id, &nonce);
     let plaintext = cipher
         .decrypt(
             (&nonce).into(),
             Payload {
-                msg: &payload[2 + CONNECTION_ID_LEN..],
+                msg: &payload[ciphertext_start..],
                 aad: &aad,
             },
         )
@@ -245,21 +251,24 @@ fn derive_rendezvous_key(
     Ok(key)
 }
 
-fn rendezvous_nonce(tag: u8, connection_id: ConnectionId) -> [u8; AEAD_NONCE_LEN] {
-    let mut nonce = [0_u8; AEAD_NONCE_LEN];
-    nonce[0] = tag;
-    nonce[1..].copy_from_slice(&connection_id.0[..AEAD_NONCE_LEN - 1]);
-    nonce
-}
-
-fn rendezvous_aad(main_room: &RoomId, tag: u8, connection_id: ConnectionId) -> Vec<u8> {
+fn rendezvous_aad(
+    main_room: &RoomId,
+    tag: u8,
+    connection_id: ConnectionId,
+    nonce: &[u8; AEAD_NONCE_LEN],
+) -> Vec<u8> {
     let mut aad = Vec::with_capacity(
-        RENDEZVOUS_KEY_INFO.len() + crate::types::ROOM_ID_LEN + 1 + CONNECTION_ID_LEN,
+        RENDEZVOUS_KEY_INFO.len()
+            + crate::types::ROOM_ID_LEN
+            + 1
+            + CONNECTION_ID_LEN
+            + AEAD_NONCE_LEN,
     );
     aad.extend_from_slice(RENDEZVOUS_KEY_INFO);
     aad.extend_from_slice(main_room.as_bytes());
     aad.push(tag);
     aad.extend_from_slice(&connection_id.0);
+    aad.extend_from_slice(nonce);
     aad
 }
 
@@ -311,6 +320,31 @@ mod tests {
             &decoded.data_room,
         )?;
         assert_eq!(host, client);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_control_frames_use_unique_nonces() -> Result<(), Box<dyn std::error::Error>> {
+        let room = RoomId([1_u8; crate::types::ROOM_ID_LEN]);
+        let psk = PreSharedKey([2_u8; crate::types::PRE_SHARED_KEY_LEN]);
+        let accept = OpenAccept {
+            connection_id: ConnectionId([3_u8; CONNECTION_ID_LEN]),
+            client_nonce: [4_u8; CONNECTION_ID_LEN],
+            server_nonce: [5_u8; CONNECTION_ID_LEN],
+            data_room: RoomId([6_u8; crate::types::ROOM_ID_LEN]),
+        };
+
+        let first = encode_open_accept(&room, &psk, &accept)?;
+        let second = encode_open_accept(&room, &psk, &accept)?;
+        let nonce_start = 2 + CONNECTION_ID_LEN;
+        let nonce_end = nonce_start + AEAD_NONCE_LEN;
+
+        assert_ne!(
+            &first[nonce_start..nonce_end],
+            &second[nonce_start..nonce_end]
+        );
+        assert_eq!(decode_open_accept(&room, &psk, &first)?, accept);
+        assert_eq!(decode_open_accept(&room, &psk, &second)?, accept);
         Ok(())
     }
 }

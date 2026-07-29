@@ -103,6 +103,13 @@ pub(crate) struct WasmMqttLink {
 }
 
 impl WasmMqttLink {
+    fn detach_callbacks(&self) {
+        self.ws.set_onopen(None);
+        self.ws.set_onmessage(None);
+        self.ws.set_onclose(None);
+        self.ws.set_onerror(None);
+    }
+
     /// Open the WebSocket, perform the MQTT5 CONNECT/CONNACK handshake, and return
     /// a link ready for `subscribe`/`publish`/`poll`.
     pub(crate) async fn connect(broker: &LinkBrokerConfig) -> Result<Self, MqttTransportError> {
@@ -431,6 +438,14 @@ impl MqttLink for WasmMqttLink {
         if let Ok(bytes) = encode_disconnect() {
             let _send_result = self.send_bytes(&bytes);
         }
+        self.detach_callbacks();
+        let _close_result = self.ws.close();
+    }
+}
+
+impl Drop for WasmMqttLink {
+    fn drop(&mut self) {
+        self.detach_callbacks();
         let _close_result = self.ws.close();
     }
 }
