@@ -71,10 +71,11 @@ Tyde reports unsupported behavior instead.
   not pre-seeded with the parent id; Tyde waits for Claude's emitted child
   session id and stores that as the child `SessionId`, avoiding the existing
   session-id rotation guard.
-- **Kiro**: unsupported for now. ACP has an unstable `session/fork` method with
-  `sessionId`, `cwd`, and `mcpServers`, but Tyde does not currently capture an
-  advertised `session.fork` capability from Kiro's initialize response. Do not
-  copy Kiro session files as a fallback.
+- **ACP**: unsupported for now. ACP has an unstable `session/fork` method with
+  `sessionId`, `cwd`, and `mcpServers`. Tyde now parses the `initialize`
+  response into typed capabilities, but `session.fork` is not among the ones it
+  captures, so there is nothing to gate a fork on. Do not copy an agent's
+  session files as a fallback.
 - **Tycode**: unsupported for now. Tycode source lives outside this repo and the
   currently consumed `tycode-subprocess` protocol exposes `UserInput`, image
   input, cancel, and resume but no `ForkSession` command in Tyde2's write scope.

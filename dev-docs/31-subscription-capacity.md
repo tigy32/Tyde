@@ -37,7 +37,7 @@ arithmetic.
 |---|---|---|---|
 | **Claude** | `rate_limit_event` on the existing stream-json pipe | zero | `RepresentativeBucketOnly` |
 | **Codex** | `account/rateLimits/updated` on the existing app-server connection | zero | `AllVendorBuckets` |
-| Antigravity, Hermes, Kiro, Tycode | — | — | `Unsupported { BackendHasNoCapacitySource }` |
+| Antigravity, Hermes, ACP, Tycode | — | — | `Unsupported { BackendHasNoCapacitySource }` |
 
 Both sources are frames Tyde's subprocess pipes **already carry** and previously
 dropped. Consuming them costs no new process, no network call, no credential

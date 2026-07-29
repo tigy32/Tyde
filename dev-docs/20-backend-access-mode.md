@@ -124,9 +124,9 @@ reviewer, the Tyde agent-control MCP endpoint rejects mutating calls from
 read-only agents, so only the reviewer read/list/await/comment tools remain
 usable.
 
-### Kiro / ACP
+### ACP
 
-Kiro read-only uses ACP advisory behavior rather than ACP hard blocking:
+ACP read-only uses ACP advisory behavior rather than ACP hard blocking:
 
 - ACP `initialize` advertises filesystem reads, filesystem writes, and terminal
   access even for read-only sessions.

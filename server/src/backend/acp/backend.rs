@@ -4634,6 +4634,110 @@ mod tests {
         );
     }
 
+    /// A spec-only ACP agent that is deliberately *not* Kiro: it advertises an
+    /// auth method and requires `authenticate` before `session/new`, declares
+    /// `loadSession: false`, sends no `messageId` on any chunk, and uses none of
+    /// Kiro's extensions. This is the fixture that proves the generic path works
+    /// for a third-party agent rather than only for the agent it grew up around.
+    fn write_fake_stock_acp_program() -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("tyde-stock-acp-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create fake stock acp tempdir");
+        let path = dir.join("fake-stock-acp");
+        let script = r#"#!/bin/sh
+read line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[{"id":"api-key","name":"API key"}],"agentCapabilities":{"loadSession":false},"promptCapabilities":{"image":false}}}'
+read line
+case "$line" in
+  *authenticate*)
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+    read line
+    printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"stock-session"}}'
+    ;;
+  *)
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"auth_required"}}'
+    read line
+    printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"stock-session"}}'
+    ;;
+esac
+read line
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"stock-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"stock "}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"stock-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"agent ok"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}'
+sleep 5
+"#;
+        std::fs::write(&path, script).expect("write fake stock acp program");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path)
+                .expect("stat fake stock acp program")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod fake stock acp program");
+        }
+        path
+    }
+
+    #[tokio::test]
+    async fn a_stock_acp_agent_completes_a_turn_without_any_kiro_behaviour() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("tyde-stock-acp-ws-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create stock acp workspace");
+        let program = write_fake_stock_acp_program();
+
+        let agent = protocol::AcpAgentSpec {
+            command: program.to_string_lossy().to_string(),
+            args: Vec::new(),
+            cwd: None,
+            env: Default::default(),
+            adapter: protocol::AcpAdapterId::Stock,
+        };
+
+        let (session, mut raw_events) = KiroSession::spawn_for_agent(
+            &[workspace_root.to_string_lossy().to_string()],
+            Some(&agent),
+            None,
+            None,
+            &[],
+            None,
+        )
+        .await
+        .expect("a spec-only ACP agent must spawn through the generic backend");
+
+        let handle = session.command_handle();
+        handle
+            .execute(SessionCommand::SendMessage {
+                message: "hello".to_string(),
+                images: None,
+            })
+            .await
+            .expect("send message to stock acp agent");
+
+        let events = collect_kiro_turn_events(&mut raw_events).await;
+        let stream_events = events
+            .iter()
+            .filter(|event| stream_event_message_id(event).is_some())
+            .collect::<Vec<_>>();
+
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.get("kind").and_then(Value::as_str) == Some("Error")),
+            "a conforming spec-only agent must not trip any error path: {events:?}"
+        );
+        assert_eq!(
+            stream_events
+                .last()
+                .and_then(|event| event.pointer("/data/message/content"))
+                .and_then(Value::as_str),
+            Some("stock agent ok"),
+            "the agent's text must reach the user: {events:?}"
+        );
+
+        session.shutdown().await;
+    }
+
     fn write_fake_kiro_acp_program() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("tyde-kiro-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create fake kiro tempdir");

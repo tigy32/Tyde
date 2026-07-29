@@ -388,7 +388,7 @@ impl fmt::Display for AgentId {
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
     Tycode,
-    Kiro,
+    Acp,
     Claude,
     Codex,
     Antigravity,
@@ -396,8 +396,22 @@ pub enum BackendKind {
 }
 ```
 
-These variants match the backends currently exposed by Tyde2: `Tycode`,
-`Kiro`, `Claude`, `Codex`, `Antigravity`, and `Hermes`.
+These variants match the backends currently exposed by Tyde2: `Tycode`, `Acp`,
+`Claude`, `Codex`, `Antigravity`, and `Hermes`.
+
+`Acp` is the one open variant. It is not a single vendor's agent but any agent
+that speaks the Agent Client Protocol over stdio, and *which* agent runs is a
+property of the launch profile rather than the backend kind:
+
+- The built-in `acp:kiro` profile, shown as **Kiro (ACP)**, is always present.
+- Any other agent is added from Settings → Launch Profiles by giving a command,
+  optional arguments, and an adapter (`stock` for a spec-conforming agent,
+  `kiro` for the Kiro CLI's quirks). No code change is needed to add one.
+
+Because the agent is per profile, so is everything derived from it: the session
+settings schema is probed per agent, and backend setup probes each configured
+agent's command. Surfaces that are keyed by `BackendKind` and have no profile in
+hand — notably `backend_tier_configs` — resolve against the built-in profile.
 
 ### AgentErrorCode
 
@@ -1105,7 +1119,14 @@ may map `SpawnCostHint` differently:
 - `Hermes`: native `tui_gateway.entry` JSON-RPC over stdio; Tyde maps gateway
   events directly to `ChatEvent` and does not use ACP, the dashboard
   WebSocket, PTY/xterm, or ANSI parsing
-- `Kiro` / others: backend-specific model selection where supported
+- `Acp`: any Agent Client Protocol agent over stdio. Capabilities are
+  negotiated from the `initialize` response rather than assumed —
+  `agentCapabilities.loadSession` gates resume and `promptCapabilities.image`
+  gates image input — and an agent advertising `authMethods` is authenticated
+  before `session/new`. `messageId` is optional in ACP, so an agent that omits
+  it gets a deterministic server-generated message identity instead of having
+  its output dropped.
+- Others: backend-specific model selection where supported
 
 ### Key design decisions
 

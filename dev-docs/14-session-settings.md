@@ -21,7 +21,7 @@ backend-specific defaults. This is useful for programmatic/orchestrator use
 We need per-backend session settings (model selection, reasoning effort, etc.)
 where each backend defines what it supports and the frontend renders controls
 automatically — no frontend changes when a backend adds a setting. Some
-backends have static schemas; others, including Kiro and Hermes, publish
+backends have static schemas; others, including ACP and Hermes, publish
 server-owned dynamic schema states because their valid model lists come from
 the backend runtime.
 
@@ -447,7 +447,7 @@ settings and any subsequent changes in order.
 
 The host actor collects schema entries from all enabled backends at startup and
 whenever enabled backends change. Static backends return `Ready` immediately;
-dynamic backends such as Kiro and Hermes may report `Pending` or `Unavailable`
+dynamic backends such as ACP and Hermes may report `Pending` or `Unavailable`
 while the server probes backend-native model/schema sources.
 
 ```rust
@@ -465,7 +465,7 @@ fn collect_session_schemas(enabled: &[BackendKind]) -> Vec<SessionSchemaEntry> {
         BackendKind::Tycode => SessionSchemaEntry::Ready {
             schema: TycodeBackend::session_settings_schema(),
         },
-        BackendKind::Kiro => probe_kiro_schema_state(),
+        BackendKind::Acp => probe_acp_schema_state(profile_id),
         BackendKind::Hermes => probe_hermes_schema_state(),
         // The test-only mock backend uses an empty static schema.
     }).collect()
@@ -738,7 +738,7 @@ a speculative abstraction — and gives the frontend a concrete input widget
 
 ### Why schema entries instead of only static schemas?
 
-Some backends have static schemas, but Kiro and Hermes need backend-native
+Some backends have static schemas, but ACP and Hermes need backend-native
 model discovery. `SessionSchemaEntry` lets the server report `Ready`,
 `Pending`, or `Unavailable` as typed state without frontend caches or guessed
 fallback model lists.
@@ -762,7 +762,7 @@ fallback model lists.
 ### Server crate
 - Add static backend schemas and host-owned dynamic schema refresh for backends
   that need native model discovery.
-- Implement for each backend (Claude, Codex, Antigravity, Mock, Tycode, Kiro,
+- Implement for each backend (Claude, Codex, Antigravity, Mock, Tycode, ACP,
   Hermes).
 - Add `session_settings: SessionSettingsValues` to `BackendSpawnConfig`
   (keep existing `cost_hint`).

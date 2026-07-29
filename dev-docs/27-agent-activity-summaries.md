@@ -95,7 +95,7 @@ The backend-level cheap mappings are already backend-owned:
   Normal complexity tiers are resolved by the host from current Codex model
   metadata; direct helper spawns use the provider default rather than risking
   an unsupported hardcoded effort.
-- Kiro Low maps to `claude-haiku-4.5` (`server/src/backend/kiro.rs:3105-3123`).
+- ACP Low maps to `claude-haiku-4.5` (`server/src/backend/acp/backend.rs`).
 - Antigravity Low maps to `ANTIGRAVITY_LOW_MODEL`
   (`server/src/backend/antigravity.rs:1221-1232`).
 - The generic resolver applies cost-hint defaults before explicit settings and
