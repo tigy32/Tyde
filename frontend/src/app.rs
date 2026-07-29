@@ -785,8 +785,22 @@ fn decode_hex_nibble(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{drag_type_is_files, is_external_href, resolve_chat_file_href};
+    use super::{
+        configured_host_label, connect_host_failure_message, drag_type_is_files, is_external_href,
+        prepare_host_failure_message, reported_host_error_message, resolve_chat_file_href,
+    };
+    #[cfg(target_arch = "wasm32")]
+    use crate::components::header::Header;
+    use crate::state::AppState;
+    use leptos::prelude::Set;
+    #[cfg(target_arch = "wasm32")]
+    use leptos::prelude::{GetUntracked, Update};
     use protocol::{ProjectPath, ProjectRootPath};
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen::JsCast;
+
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
     #[test]
     fn recognizes_browser_file_drag_type() {
@@ -853,6 +867,328 @@ mod tests {
         let resolved = resolve_chat_file_href("/tmp/outside.rs:12", &roots);
 
         assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn host_failure_copy_uses_configured_label_or_neutral_fallback() {
+        let state = AppState::new();
+        state
+            .configured_hosts
+            .set(vec![crate::bridge::ConfiguredHost {
+                id: "7ca-test-id".to_owned(),
+                label: "Offline QA".to_owned(),
+                transport: crate::bridge::HostTransportConfig::SshStdio {
+                    ssh_destination: "offline.invalid".to_owned(),
+                    remote_command: None,
+                    lifecycle: crate::bridge::RemoteHostLifecycleConfig::ManagedTyde,
+                },
+                auto_connect: false,
+            }]);
+
+        let label = configured_host_label(&state, "7ca-test-id");
+        assert_eq!(label.as_deref(), Some("Offline QA"));
+        assert_eq!(
+            prepare_host_failure_message(label.as_deref(), "release unavailable"),
+            "Tyde could not prepare host “Offline QA”: release unavailable"
+        );
+        assert_eq!(
+            connect_host_failure_message(label.as_deref(), "SSH unavailable"),
+            "Tyde could not connect to host “Offline QA”: SSH unavailable"
+        );
+        assert_eq!(
+            reported_host_error_message(label.as_deref(), "connection dropped"),
+            "Host “Offline QA” reported an error. connection dropped"
+        );
+
+        assert_eq!(configured_host_label(&state, "missing"), None);
+        assert_eq!(
+            prepare_host_failure_message(None, "release unavailable"),
+            "Tyde could not prepare this host: release unavailable"
+        );
+        assert_eq!(
+            connect_host_failure_message(None, "SSH unavailable"),
+            "Tyde could not connect to this host: SSH unavailable"
+        );
+        assert_eq!(
+            reported_host_error_message(None, "connection dropped"),
+            "A host reported an error. connection dropped"
+        );
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    thread_local! {
+        static HOST_STUB_TEST_LOCKED: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    struct HostStubTestLock;
+
+    #[cfg(target_arch = "wasm32")]
+    impl Drop for HostStubTestLock {
+        fn drop(&mut self) {
+            HOST_STUB_TEST_LOCKED.with(|locked| locked.set(false));
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn acquire_host_stub_test_lock() -> HostStubTestLock {
+        loop {
+            let acquired = HOST_STUB_TEST_LOCKED.with(|locked| {
+                if locked.get() {
+                    false
+                } else {
+                    locked.set(true);
+                    true
+                }
+            });
+            if acquired {
+                return HostStubTestLock;
+            }
+            next_tick().await;
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    struct WindowPropertySnapshot {
+        name: &'static str,
+        existed: bool,
+        value: wasm_bindgen::JsValue,
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    impl WindowPropertySnapshot {
+        fn capture(window: &web_sys::Window, name: &'static str) -> Self {
+            let key = wasm_bindgen::JsValue::from_str(name);
+            Self {
+                name,
+                existed: js_sys::Reflect::has(window, &key).unwrap_or(false),
+                value: js_sys::Reflect::get(window, &key)
+                    .unwrap_or(wasm_bindgen::JsValue::UNDEFINED),
+            }
+        }
+
+        fn restore(&self, window: &web_sys::Window) {
+            let key = wasm_bindgen::JsValue::from_str(self.name);
+            if self.existed {
+                let _ = js_sys::Reflect::set(window, &key, &self.value);
+            } else {
+                let target: &js_sys::Object = window.unchecked_ref();
+                let _ = js_sys::Reflect::delete_property(target, &key);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    struct TauriStubGuard {
+        tauri: WindowPropertySnapshot,
+        reject: WindowPropertySnapshot,
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    impl Drop for TauriStubGuard {
+        fn drop(&mut self) {
+            let window = web_sys::window().expect("window");
+            self.reject.restore(&window);
+            self.tauri.restore(&window);
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn install_delayed_host_prepare_rejection() -> TauriStubGuard {
+        let window = web_sys::window().expect("window");
+        let tauri = WindowPropertySnapshot::capture(&window, "__TAURI__");
+        let reject = WindowPropertySnapshot::capture(&window, "__qa_reject_host_prepare");
+        js_sys::eval(
+            r#"
+            (function() {
+                window.__qa_reject_host_prepare = undefined;
+                window.__TAURI__ = {
+                    core: {
+                        invoke: function(cmd) {
+                            if (cmd === "ensure_configured_host_ready") {
+                                return new Promise(function(_resolve, reject) {
+                                    window.__qa_reject_host_prepare = reject;
+                                });
+                            }
+                            return Promise.resolve(null);
+                        }
+                    }
+                };
+            })();
+            "#,
+        )
+        .expect("install delayed host preparation rejection");
+        TauriStubGuard { tauri, reject }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    struct UserErrorStateGuard {
+        previous: Option<String>,
+        container: web_sys::HtmlElement,
+        restored: bool,
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    impl UserErrorStateGuard {
+        fn capture(container: web_sys::HtmlElement) -> Self {
+            Self {
+                previous: crate::components::header::current_user_error(),
+                container,
+                restored: false,
+            }
+        }
+
+        fn restore(&mut self) {
+            if self.restored {
+                return;
+            }
+            if let Some(button) = self
+                .container
+                .query_selector(".user-error-banner-dismiss")
+                .expect("query error dismissal")
+            {
+                button
+                    .dyn_into::<web_sys::HtmlElement>()
+                    .expect("error dismissal button")
+                    .click();
+            }
+            if let Some(previous) = self.previous.clone() {
+                crate::components::header::report_user_error(previous);
+            }
+            self.restored = true;
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    impl Drop for UserErrorStateGuard {
+        fn drop(&mut self) {
+            self.restore();
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn next_tick() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .expect("window")
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
+                .expect("schedule tick");
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    async fn managed_prepare_failure_keeps_captured_label_and_exact_status_contract() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let _test_lock = acquire_host_stub_test_lock().await;
+        let _tauri_stub = install_delayed_host_prepare_rejection();
+        let state = AppState::new();
+        state
+            .configured_hosts
+            .set(vec![crate::bridge::ConfiguredHost {
+                id: "7ca-test-id".to_owned(),
+                label: "Offline QA".to_owned(),
+                transport: crate::bridge::HostTransportConfig::SshStdio {
+                    ssh_destination: "offline.invalid".to_owned(),
+                    remote_command: None,
+                    lifecycle: crate::bridge::RemoteHostLifecycleConfig::ManagedTyde,
+                },
+                auto_connect: false,
+            }]);
+        let document = web_sys::window()
+            .expect("window")
+            .document()
+            .expect("document");
+        let container = document
+            .create_element("div")
+            .expect("create container")
+            .dyn_into::<web_sys::HtmlElement>()
+            .expect("html container");
+        document
+            .body()
+            .expect("document body")
+            .append_child(&container)
+            .expect("append container");
+        let header_state = state.clone();
+        let _header = leptos::mount::mount_to(container.clone(), move || {
+            leptos::prelude::provide_context(header_state.clone());
+            leptos::view! { <Header /> }
+        });
+        let mut user_error_state = UserErrorStateGuard::capture(container.clone());
+        let completed = Rc::new(Cell::new(false));
+        let completed_task = Rc::clone(&completed);
+        let task_state = state.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            super::connect_one_host(task_state, "7ca-test-id".to_owned()).await;
+            completed_task.set(true);
+        });
+        next_tick().await;
+
+        state.configured_hosts.update(|hosts| {
+            hosts[0].label = "Renamed after connect".to_owned();
+        });
+        let window = web_sys::window().expect("window");
+        let reject = js_sys::Reflect::get(
+            &window,
+            &wasm_bindgen::JsValue::from_str("__qa_reject_host_prepare"),
+        )
+        .expect("read delayed rejection")
+        .dyn_into::<js_sys::Function>()
+        .expect("rejection callback");
+        reject
+            .call1(
+                &wasm_bindgen::JsValue::UNDEFINED,
+                &wasm_bindgen::JsValue::from_str("release metadata unavailable"),
+            )
+            .expect("reject preparation");
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        assert!(
+            completed.get(),
+            "connection attempt must finish after rejection"
+        );
+        let banner = crate::components::header::current_user_error()
+            .expect("preparation failure must be user-visible");
+        assert!(
+            banner.contains("host “Offline QA”")
+                && banner.contains("release metadata unavailable")
+                && !banner.contains("7ca-test-id")
+                && !banner.contains("JsValue("),
+            "banner must use the pre-await label and clean reason: {banner}"
+        );
+        assert_eq!(
+            state
+                .host_lifecycle_statuses
+                .get_untracked()
+                .get("7ca-test-id"),
+            Some(&crate::bridge::RemoteHostLifecycleStatus::Error {
+                message: "release metadata unavailable".to_owned(),
+            })
+        );
+        assert_eq!(
+            state.connection_statuses.get_untracked().get("7ca-test-id"),
+            Some(&crate::state::ConnectionStatus::Error(
+                "failed to prepare remote host: release metadata unavailable".to_owned()
+            ))
+        );
+        assert!(
+            container
+                .query_selector(".user-error-banner-dismiss")
+                .expect("query error dismissal")
+                .is_some(),
+            "reported user error must be dismissible before cleanup"
+        );
+        user_error_state.restore();
+        assert_eq!(
+            crate::components::header::current_user_error(),
+            user_error_state.previous
+        );
     }
 }
 
@@ -1070,6 +1406,36 @@ async fn initialize_hosts(state: AppState, listener_token: u64) {
     }
 }
 
+fn configured_host_label(state: &AppState, host_id: &str) -> Option<String> {
+    state.configured_hosts.with_untracked(|hosts| {
+        hosts
+            .iter()
+            .find(|host| host.id == host_id)
+            .map(|host| host.label.clone())
+    })
+}
+
+fn prepare_host_failure_message(label: Option<&str>, error: &str) -> String {
+    match label {
+        Some(label) => format!("Tyde could not prepare host “{label}”: {error}"),
+        None => format!("Tyde could not prepare this host: {error}"),
+    }
+}
+
+fn connect_host_failure_message(label: Option<&str>, error: &str) -> String {
+    match label {
+        Some(label) => format!("Tyde could not connect to host “{label}”: {error}"),
+        None => format!("Tyde could not connect to this host: {error}"),
+    }
+}
+
+fn reported_host_error_message(label: Option<&str>, error: &str) -> String {
+    match label {
+        Some(label) => format!("Host “{label}” reported an error. {error}"),
+        None => format!("A host reported an error. {error}"),
+    }
+}
+
 async fn install_host_listeners(state: AppState) -> Result<Vec<bridge::UnlistenHandle>, String> {
     let mut handles = Vec::with_capacity(4);
 
@@ -1141,9 +1507,10 @@ async fn install_host_listeners(state: AppState) -> Result<Vec<bridge::UnlistenH
     handles.push(
         bridge::listen_host_error(move |event| {
             log::error!("host {} error: {}", event.host_id, event.message);
-            crate::components::header::report_user_error(format!(
-                "Host “{}” reported an error. {}",
-                event.host_id, event.message
+            let label = configured_host_label(&error_state, &event.host_id);
+            crate::components::header::report_user_error(reported_host_error_message(
+                label.as_deref(),
+                &event.message,
             ));
             error_state.connection_statuses.update(|statuses| {
                 statuses.insert(event.host_id, ConnectionStatus::Error(event.message));
@@ -1192,6 +1559,7 @@ pub async fn refresh_configured_hosts(state: &AppState) {
 }
 
 pub async fn connect_one_host(state: AppState, host_id: String) {
+    let target_label = configured_host_label(&state, &host_id);
     log::info!("host.connect.start host={}", host_id);
     state.connection_statuses.update(|statuses| {
         statuses.insert(host_id.clone(), ConnectionStatus::Connecting);
@@ -1209,8 +1577,9 @@ pub async fn connect_one_host(state: AppState, host_id: String) {
             }
             Err(error) => {
                 log::error!("failed to prepare remote host {}: {}", host_id, error);
-                crate::components::header::report_user_error(format!(
-                    "Tyde could not prepare host “{host_id}”. {error}"
+                crate::components::header::report_user_error(prepare_host_failure_message(
+                    target_label.as_deref(),
+                    &error,
                 ));
                 state.host_lifecycle_statuses.update(|statuses| {
                     statuses.insert(
@@ -1237,8 +1606,9 @@ pub async fn connect_one_host(state: AppState, host_id: String) {
     .await
     {
         log::error!("failed to connect host {}: {}", host_id, error);
-        crate::components::header::report_user_error(format!(
-            "Tyde could not connect to host “{host_id}”. {error}"
+        crate::components::header::report_user_error(connect_host_failure_message(
+            target_label.as_deref(),
+            &error,
         ));
         state.connection_statuses.update(|statuses| {
             statuses.insert(host_id, ConnectionStatus::Error(error));

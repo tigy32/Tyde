@@ -43,11 +43,50 @@ struct TauriEvent<T> {
 
 // --- Command invocations ---
 
+const UNKNOWN_DESKTOP_HOST_ERROR: &str = "The desktop host returned an unknown error.";
+
+fn tauri_error_message(command: &'static str, value: JsValue) -> String {
+    if let Some(message) = value.as_string() {
+        let message = message.trim();
+        if !message.is_empty() {
+            return message.to_owned();
+        }
+        log::warn!("Tauri command {command} rejected with blank_string");
+        return UNKNOWN_DESKTOP_HOST_ERROR.to_owned();
+    }
+
+    let message = match js_sys::Reflect::get(&value, &JsValue::from_str("message")) {
+        Ok(message) => message,
+        Err(_) => {
+            log::warn!("Tauri command {command} rejected with message_getter_failed");
+            return UNKNOWN_DESKTOP_HOST_ERROR.to_owned();
+        }
+    };
+    if let Some(message) = message.as_string() {
+        let message = message.trim();
+        if !message.is_empty() {
+            return message.to_owned();
+        }
+    }
+
+    let category = if value.is_null() {
+        "null"
+    } else if value.is_undefined() {
+        "undefined"
+    } else if value.is_object() {
+        "object_without_string_message"
+    } else {
+        "non_string_primitive"
+    };
+    log::warn!("Tauri command {command} rejected with {category}");
+    UNKNOWN_DESKTOP_HOST_ERROR.to_owned()
+}
+
 pub async fn connect_host(request: HostIdRequest) -> Result<(), String> {
     let args = serde_wasm_bindgen::to_value(&request).map_err(|e| e.to_string())?;
     tauri_invoke("connect_host", args)
         .await
-        .map_err(|e| format!("{e:?}"))?;
+        .map_err(|error| tauri_error_message("connect_host", error))?;
     Ok(())
 }
 
@@ -115,7 +154,7 @@ pub async fn ensure_configured_host_ready(
         serde_wasm_bindgen::to_value(&HostIdRequest { host_id }).map_err(|e| e.to_string())?;
     let value = tauri_invoke("ensure_configured_host_ready", args)
         .await
-        .map_err(|e| format!("{e:?}"))?;
+        .map_err(|error| tauri_error_message("ensure_configured_host_ready", error))?;
     serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
 }
 
@@ -132,7 +171,7 @@ pub async fn force_upgrade_managed_host(
         serde_wasm_bindgen::to_value(&HostIdRequest { host_id }).map_err(|e| e.to_string())?;
     let value = tauri_invoke("force_upgrade_managed_host", args)
         .await
-        .map_err(|e| format!("{e:?}"))?;
+        .map_err(|error| tauri_error_message("force_upgrade_managed_host", error))?;
     serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
 }
 
@@ -353,4 +392,63 @@ async fn listen_event(
         _closure: closure,
         unlisten,
     })
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    fn host_rejection_uses_plain_string_or_exception_safe_message() {
+        assert_eq!(
+            tauri_error_message("connect_host", JsValue::from_str("  SSH unavailable  ")),
+            "SSH unavailable"
+        );
+
+        let error = js_sys::Error::new("SSH authentication failed");
+        assert_eq!(
+            tauri_error_message("connect_host", error.into()),
+            "SSH authentication failed"
+        );
+
+        let throwing =
+            js_sys::eval("new Proxy({}, { get() { throw new Error('private getter detail'); } })")
+                .expect("construct throwing error proxy");
+        assert_eq!(
+            tauri_error_message("connect_host", throwing),
+            UNKNOWN_DESKTOP_HOST_ERROR,
+            "a throwing message getter must not escape or expose its exception"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn host_rejection_never_serializes_unknown_values() {
+        let unknown = js_sys::Object::new();
+        js_sys::Reflect::set(
+            &unknown,
+            &JsValue::from_str("credential"),
+            &JsValue::from_str("sentinel-secret"),
+        )
+        .expect("seed unrelated private field");
+
+        for value in [
+            JsValue::NULL,
+            JsValue::UNDEFINED,
+            JsValue::from_f64(42.0),
+            unknown.into(),
+        ] {
+            let message = tauri_error_message("ensure_configured_host_ready", value);
+            assert_eq!(message, UNKNOWN_DESKTOP_HOST_ERROR);
+            assert!(!message.contains("sentinel-secret"));
+            assert!(!message.contains("JsValue("));
+        }
+
+        assert_eq!(
+            tauri_error_message("connect_host", JsValue::from_str("   ")),
+            UNKNOWN_DESKTOP_HOST_ERROR
+        );
+    }
 }
