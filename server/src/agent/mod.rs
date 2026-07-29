@@ -19,10 +19,11 @@ use protocol::{
     MessageMetadataUpdateData, MessageOrigin, MessageSender, MessageTokenUsage, ModelInfo,
     ModelRequestId, ModelRequestTokenUsage, QueuedMessageEntry, QueuedMessageId,
     QueuedMessagesPayload, ReasoningData, ReviewErrorContext, SendMessagePayload, SessionId,
-    SessionSettingsPayload, SessionSettingsValues, SessionSummaryCountUpdatedPayload, SpawnCostHint,
-    StreamEndData, StreamStartData, StreamTextDeltaData, TaskTokenUsageAmount, TaskTokenUsageScope,
-    TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
-    ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy, ToolRequestType,
+    SessionSettingsPayload, SessionSettingsValues, SessionSummaryCountUpdatedPayload,
+    SpawnCostHint, StreamEndData, StreamStartData, StreamTextDeltaData, TaskTokenUsageAmount,
+    TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope,
+    TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy,
+    ToolRequestType,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -11656,17 +11657,17 @@ mod tests {
     use protocol::{
         AgentActivityStats, AgentActivityStatsPayload, AgentBootstrapEvent, AgentBootstrapPayload,
         AgentControlLatestOutput, AgentControlOutput, AgentControlStatus, AgentId, AgentInput,
-        AgentStartPayload, BackendKind, ChatEvent, ChatMessage, ChatMessageId,
-        CompactionMetrics, CompactionOperationId, CompactionStage, CompactionTrigger,
-        ContextCompactionNotifyPayload, ContextCompactionStatus, ContextCompactionTimelineEvent,
-        Envelope, FrameKind, MessageMetadataUpdateData, MessageOrigin, MessageSender,
-        MessageTokenUsage, ModelInfo, ModelRequestId, ModelRequestTokenUsage, ModelTurnId,
-        QueuedMessageEntry, QueuedMessageId, QueuedMessagesPayload, ReasoningData,
-        ServerGeneratedChatMessageIdOrigin, ServerGeneratedChatMessageIdentity, SessionId,
-        SessionSettingValue, SessionSettingsValues, StreamEndData, StreamPath, StreamStartData,
-        StreamTextDeltaData, TaskList, TaskTokenUsageScope, TaskTokenUsageUnavailableReason,
-        TokenUsage, TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData,
-        ToolExecutionResult, ToolRequest, ToolRequestType, ToolUseData,
+        AgentStartPayload, BackendKind, ChatEvent, ChatMessage, ChatMessageId, CompactionMetrics,
+        CompactionOperationId, CompactionStage, CompactionTrigger, ContextCompactionNotifyPayload,
+        ContextCompactionStatus, ContextCompactionTimelineEvent, Envelope, FrameKind,
+        MessageMetadataUpdateData, MessageOrigin, MessageSender, MessageTokenUsage, ModelInfo,
+        ModelRequestId, ModelRequestTokenUsage, ModelTurnId, QueuedMessageEntry, QueuedMessageId,
+        QueuedMessagesPayload, ReasoningData, ServerGeneratedChatMessageIdOrigin,
+        ServerGeneratedChatMessageIdentity, SessionId, SessionSettingValue, SessionSettingsValues,
+        StreamEndData, StreamPath, StreamStartData, StreamTextDeltaData, TaskList,
+        TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope,
+        TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult, ToolRequest,
+        ToolRequestType, ToolUseData,
     };
     use tokio::sync::{Mutex, mpsc, watch};
     use tokio::time::timeout;
@@ -11693,9 +11694,9 @@ mod tests {
         spawn_relay_agent_actor, summarize_continuation_result, terminal_input_rejected_payload,
         upsert_activity_stats_snapshot, upsert_context_compaction_snapshot,
     };
-    use crate::agent::{backend_turn_visibly_busy, supervisor};
     use crate::agent::customization::ResolvedSpawnConfig;
     use crate::agent::registry::AgentStatusHandle;
+    use crate::agent::{backend_turn_visibly_busy, supervisor};
     use crate::backend::{
         Backend, BackendEvent, BackendExecutionMode, BackendSession, BackendSpawnConfig,
         EventStream,
