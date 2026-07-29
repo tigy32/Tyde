@@ -2883,6 +2883,32 @@ mod wasm_tests {
         });
     }
 
+    /// Declare the capability the server would send. The control fails closed
+    /// without one, so any test that expects an *enabled* control must install
+    /// it — that is the gate, not an incidental setup step.
+    fn declare_compaction_available(state: &AppState, agent_id: &str) {
+        state.compaction_capability.update(|map| {
+            map.insert(
+                AgentId(agent_id.to_owned()),
+                crate::state::CompactionCapabilitySnapshot {
+                    logical_session_id: protocol::SessionId(String::new()),
+                    availability: protocol::RequestedCompactionAvailability::Available {
+                        route: protocol::RequestedCompactionRoute::NativePreferred,
+                    },
+                },
+            );
+        });
+    }
+
+    /// The control is always rendered; unavailability is reported through
+    /// `aria-disabled` plus a reason on the accessible name.
+    fn compact_btn_state(container: &HtmlElement) -> (HtmlElement, bool, String) {
+        let btn = compact_btn(container).expect("the compact control is always rendered");
+        let enabled = btn.get_attribute("aria-disabled").as_deref() == Some("false");
+        let label = btn.get_attribute("aria-label").unwrap_or_default();
+        (btn, enabled, label)
+    }
+
     fn compact_btn(container: &HtmlElement) -> Option<HtmlElement> {
         container
             .query_selector(".agent-card-compact")
@@ -3455,23 +3481,49 @@ mod wasm_tests {
         );
     }
 
-    /// Idle agent on a connected host with at least one chat row should
-    /// expose the Compact action.
+    /// An idle agent on a connected host whose backend has declared a
+    /// compaction route exposes an enabled Compact action.
+    ///
+    /// Evidence for the change: the control now renders
+    /// `"Compact context — unavailable: Still checking what this backend
+    /// supports"` when no capability snapshot exists, because the gate fails
+    /// closed. The labelled-affordance contract is unchanged and is asserted
+    /// more precisely below — label *and* enabled state, rather than label
+    /// alone.
     #[wasm_bindgen_test]
-    async fn compact_button_visible_when_idle_with_history_and_connected() {
+    async fn compact_button_enabled_when_idle_connected_and_capability_declared() {
         let container = make_container();
         let state = make_app_state("h");
         push_agent(&state, "h", "a-idle", "Agent", true);
         seed_chat_row(&state, "a-idle");
-        let _handle = mount_panel(&container, state);
+
+        let _handle = mount_panel(&container, state.clone());
         for _ in 0..4 {
             next_tick().await;
         }
-        let btn = compact_btn(&container).expect("compact button should render for idle agent");
+
+        // Capability unknown → visible, disabled, and it says why.
+        let (_, enabled, label) = compact_btn_state(&container);
+        assert!(!enabled, "unknown capability must not optimistically enable");
+        assert!(
+            label.contains("unavailable:"),
+            "and the reason must be on the accessible name: {label}"
+        );
+
+        declare_compaction_available(&state, "a-idle");
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let (btn, enabled, label) = compact_btn_state(&container);
+        assert!(enabled, "a declared-available idle agent is compactable");
         assert_eq!(
-            btn.get_attribute("aria-label").as_deref(),
-            Some("Compact agent"),
+            label, "Compact context",
             "compact button must keep a labelled affordance"
+        );
+        assert!(
+            !btn.has_attribute("disabled"),
+            "and stays focusable, so the reason is reachable without a pointer"
         );
     }
 
@@ -3503,10 +3555,13 @@ mod wasm_tests {
     }
 
     /// Initializing (server hasn't echoed AgentStart) — Compact must be
-    /// hidden so the user can't fire a rotation before the agent is even
-    /// ready.
+    /// refused so the user can't fire a request before the agent is ready.
+    ///
+    /// The refusal is now *visible and explained* rather than hidden: a control
+    /// that disappears teaches the user it does not exist, and this blocker is
+    /// transient. The guarantee (no request while initializing) is unchanged.
     #[wasm_bindgen_test]
-    async fn compact_button_hidden_when_initializing() {
+    async fn compact_button_disabled_when_initializing() {
         let container = make_container();
         let state = make_app_state("h");
         push_agent(&state, "h", "a-init", "Agent", false);
@@ -3519,15 +3574,25 @@ mod wasm_tests {
             container.query_selector(".agent-card").unwrap().is_some(),
             "agent card itself should render for the initializing agent"
         );
+        let (_, enabled, label) = compact_btn_state(&container);
         assert!(
-            compact_btn(&container).is_none(),
-            "compact button must be hidden while the agent is still initializing"
+            !enabled,
+            "compact must be refused while the agent is still initializing"
+        );
+        assert!(
+            label.contains("still starting"),
+            "and must say so rather than vanishing: {label}"
         );
     }
 
-    /// Thinking (turn active or streaming open) — Compact must be hidden.
+    /// A running turn is **not** a refusal any more.
+    ///
+    /// The server defers a compaction request to a safe point and reports it
+    /// deferred, so a client-side idle gate refused requests the server
+    /// accepts. This test now pins the inverted contract deliberately: mid-turn
+    /// and declared-available, the control is offered.
     #[wasm_bindgen_test]
-    async fn compact_button_hidden_when_thinking() {
+    async fn compact_button_stays_offered_while_the_agent_is_thinking() {
         let container = make_container();
         let state = make_app_state("h");
         push_agent(&state, "h", "a-thinking", "Agent", true);
@@ -3535,6 +3600,7 @@ mod wasm_tests {
         state.agent_turn_active.update(|m| {
             m.insert(AgentId("a-thinking".to_owned()), true);
         });
+        declare_compaction_available(&state, "a-thinking");
         let _handle = mount_panel(&container, state);
         for _ in 0..4 {
             next_tick().await;
@@ -3543,9 +3609,10 @@ mod wasm_tests {
             container.query_selector(".agent-card").unwrap().is_some(),
             "agent card itself should render for the thinking agent"
         );
+        let (_, enabled, label) = compact_btn_state(&container);
         assert!(
-            compact_btn(&container).is_none(),
-            "compact button must be hidden while the agent is taking a turn"
+            enabled,
+            "an active turn must not refuse a request the server would defer: {label}"
         );
     }
 
@@ -3579,13 +3646,20 @@ mod wasm_tests {
         assert_eq!(glyph.get_attribute("aria-hidden").as_deref(), Some("true"));
     }
 
-    /// No chat rows yet — compaction is wasted spend on an unused agent.
+    /// Loaded chat rows are **not** a capability signal.
+    ///
+    /// The old gate required at least one loaded row, which was wrong rather
+    /// than merely conservative: a restored session that renders only the
+    /// collapsed-history banner has zero loaded rows, so the control hid on
+    /// exactly the long sessions that most need compacting. Availability is the
+    /// server's to declare.
     #[wasm_bindgen_test]
-    async fn compact_button_hidden_when_no_chat_history() {
+    async fn compact_button_does_not_depend_on_loaded_chat_rows() {
         let container = make_container();
         let state = make_app_state("h");
         push_agent(&state, "h", "a-blank", "Agent", true);
-        let _handle = mount_panel(&container, state);
+        declare_compaction_available(&state, "a-blank");
+        let _handle = mount_panel(&container, state.clone());
         for _ in 0..4 {
             next_tick().await;
         }
@@ -3594,15 +3668,22 @@ mod wasm_tests {
             "agent card itself should render even with no chat rows"
         );
         assert!(
-            compact_btn(&container).is_none(),
-            "compact button must be hidden for agents that have no chat rows yet"
+            state
+                .chat_rows
+                .with_untracked(|map| map.get(&AgentId("a-blank".to_owned())).is_none()),
+            "precondition: this agent has no loaded rows"
+        );
+        let (_, enabled, label) = compact_btn_state(&container);
+        assert!(
+            enabled,
+            "an agent with no loaded rows is still compactable when declared available: {label}"
         );
     }
 
-    /// Disconnected host — Compact must be hidden because the request
-    /// can't reach the server.
+    /// Disconnected host — Compact must be refused because the request can't
+    /// reach the server. Visible and explained rather than hidden.
     #[wasm_bindgen_test]
-    async fn compact_button_hidden_when_host_disconnected() {
+    async fn compact_button_disabled_when_host_disconnected() {
         let container = make_container();
         let state = make_app_state("h");
         state.connection_statuses.update(|m| {
@@ -3618,29 +3699,46 @@ mod wasm_tests {
             container.query_selector(".agent-card").unwrap().is_some(),
             "agent card itself should render even when host is disconnected"
         );
+        let (_, enabled, label) = compact_btn_state(&container);
         assert!(
-            compact_btn(&container).is_none(),
-            "compact button must be hidden when the host is disconnected"
+            !enabled,
+            "compact must be refused when the host is disconnected"
+        );
+        assert!(
+            label.contains("not connected"),
+            "and must name the blocker: {label}"
         );
     }
 
-    /// Already compacting — Compact button must be hidden so the user
-    /// can't double-fire, and the status pill must render the running-
-    /// blue style we use elsewhere for in-flight work.
+    /// Already compacting — the user must not be able to double-fire, and the
+    /// status pill must render the running-blue style used for in-flight work.
+    ///
+    /// Both guarantees are unchanged; only the presentation of the first moved
+    /// from hidden to visible-and-disabled. This case covers the **legacy
+    /// replacement** protocol, whose in-flight flag the shared gate must honour
+    /// as well as its own — otherwise the two protocols each guard only
+    /// themselves and a legacy compaction leaves this control armed.
     #[wasm_bindgen_test]
-    async fn compacting_state_hides_button_and_shows_running_pill() {
+    async fn compacting_state_disables_button_and_shows_running_pill() {
         let container = make_container();
         let state = make_app_state("h");
         push_agent(&state, "h", "a-busy", "Agent", true);
         seed_chat_row(&state, "a-busy");
+        // Declared available, so capability is not what disables it here.
+        declare_compaction_available(&state, "a-busy");
         state.mark_compaction_started("h", AgentId("a-busy".to_owned()));
         let _handle = mount_panel(&container, state);
         for _ in 0..4 {
             next_tick().await;
         }
+        let (_, enabled, label) = compact_btn_state(&container);
         assert!(
-            compact_btn(&container).is_none(),
-            "compact button must be hidden once a compaction is in flight"
+            !enabled,
+            "compact must be refused once a compaction is in flight"
+        );
+        assert!(
+            label.contains("already in progress"),
+            "and must say why: {label}"
         );
         let status_pill: HtmlElement = container
             .query_selector(".agent-card-status")
@@ -3664,6 +3762,7 @@ mod wasm_tests {
         let state = make_app_state("h");
         push_agent(&state, "h", "a-fail", "Agent", true);
         seed_chat_row(&state, "a-fail");
+        declare_compaction_available(&state, "a-fail");
         state.finish_compaction_failure(
             AgentId("a-fail".to_owned()),
             "summary backend returned an error".to_owned(),
@@ -3686,9 +3785,13 @@ mod wasm_tests {
                 .contains("summary backend"),
             "error row should display the server-reported reason"
         );
+        // `is_some()` became vacuous when the control stopped hiding: it is now
+        // rendered for every agent card regardless of state. Assert what the
+        // line was actually claiming — that the control is *offered* again.
+        let (_, enabled, label) = compact_btn_state(&container);
         assert!(
-            compact_btn(&container).is_some(),
-            "compact button should be offered again after a non-fatal failure"
+            enabled,
+            "compact should be offered again after a non-fatal failure: {label}"
         );
     }
 
@@ -3704,12 +3807,16 @@ mod wasm_tests {
         let state = make_app_state("h");
         push_agent(&state, "h", "a-click", "Agent", true);
         seed_chat_row(&state, "a-click");
+        // The control fails closed without a declared route, so the send path
+        // is only reachable once the server has spoken.
+        declare_compaction_available(&state, "a-click");
         let _handle = mount_panel(&container, state.clone());
         for _ in 0..4 {
             next_tick().await;
         }
 
-        let btn = compact_btn(&container).expect("compact button should render");
+        let (btn, enabled, _) = compact_btn_state(&container);
+        assert!(enabled, "precondition: the control is offered");
         btn.click();
         for _ in 0..8 {
             next_tick().await;
@@ -3735,11 +3842,28 @@ mod wasm_tests {
             &serde_json::json!({}),
             "default AgentCompactPayload omits the optional tuning fields"
         );
+        // In-flight now lives on the shared request gate that every compaction
+        // control claims, rather than on the legacy replacement flag.
         assert!(
-            state
-                .compaction_in_progress
-                .with(|map| map.contains_key(&AgentId("a-click".to_owned()))),
+            state.context_compactions.with_untracked(|map| map
+                .get(&AgentId("a-click".to_owned()))
+                .is_some_and(|operation| operation.is_in_flight())),
             "agent should be flagged as in-flight while the server processes"
+        );
+        // And the same gate refuses a second submit.
+        let (btn, enabled, _) = compact_btn_state(&container);
+        assert!(!enabled, "the control disables while its request is in flight");
+        btn.click();
+        for _ in 0..8 {
+            next_tick().await;
+        }
+        assert_eq!(
+            recorded_frames(&calls)
+                .iter()
+                .filter(|(kind, _, _)| kind == &FrameKind::AgentCompact.to_string())
+                .count(),
+            1,
+            "a second click must not send another frame"
         );
     }
 

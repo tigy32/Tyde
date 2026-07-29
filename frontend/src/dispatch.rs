@@ -5822,7 +5822,9 @@ fn group_digits(value: u64) -> String {
 /// `169775` → `"2 minutes 50 seconds"`. The visible row abbreviates to
 /// `2m 50s`, which is read as letters.
 fn spoken_duration(duration_ms: u64) -> String {
-    let seconds = duration_ms / 1000;
+    // Same rounding as the visible row, so the two never describe the same
+    // event differently.
+    let seconds = crate::components::chat_view::compaction_duration_seconds(duration_ms);
     let minutes = seconds / 60;
     let rest = seconds % 60;
     let unit = |value: u64, name: &str| {

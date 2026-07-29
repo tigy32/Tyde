@@ -1292,9 +1292,19 @@ fn compaction_token_text(tokens: u64) -> String {
     crate::components::chat_message::format_compact(tokens)
 }
 
+/// Elapsed milliseconds to whole seconds, rounded to nearest.
+///
+/// Truncating understates every duration by up to a second, so the real
+/// corpus figure 169_775 ms rendered as `2m 49s` rather than the `2m 50s` it
+/// actually is. The visible row and the accessible sentence must round the
+/// same way or they disagree about the same event.
+pub(crate) fn compaction_duration_seconds(duration_ms: u64) -> u64 {
+    duration_ms.saturating_add(500) / 1000
+}
+
 /// `169775` → `"2m 50s"`, `48200` → `"48s"`.
 fn compaction_duration_text(duration_ms: u64) -> String {
-    let seconds = duration_ms / 1000;
+    let seconds = compaction_duration_seconds(duration_ms);
     if seconds < 60 {
         return format!("{seconds}s");
     }
@@ -2734,9 +2744,18 @@ mod wasm_tests {
             text.contains("Context compacted"),
             "the marker states what happened: {text}"
         );
+        // Corrected assertion. Evidence: the rendered marker text is
+        // "Context compacted. 384,168 tokens reduced to 12,518. Took 2 minutes
+        // 50 seconds. Your conversation history here is unchanged." — the
+        // accessible sentence — so a substring test for "You" matches the word
+        // "Your" and rejects correct output. The contract it was reaching for
+        // is "the marker carries no sender label", and `.chat-card-sender` is
+        // the element that renders one. Asserting its absence is strictly
+        // sharper: it covers every sender (User/System/Warning/Error/Assistant)
+        // rather than two literals, and prose can never satisfy it.
         assert!(
-            !text.contains("You") && !text.contains("System"),
-            "a marker has no sender label: {text}"
+            marker.query_selector(".chat-card-sender").unwrap().is_none(),
+            "a marker carries no sender label element: {text}"
         );
         assert!(
             marker.query_selector(".chat-card").unwrap().is_none(),

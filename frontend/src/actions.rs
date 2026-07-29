@@ -2131,7 +2131,13 @@ pub fn compaction_control_state(
         return CompactionControlState::Disabled("Host is not connected");
     }
 
-    let agent_info = state.agents.with_untracked(|agents| {
+    // Tracked reads throughout. This selector is called from inside view
+    // closures, so an untracked read means the control renders once and never
+    // updates — it would sit at "still determining" forever after the server
+    // sends capability, and would not disable when another surface starts a
+    // compaction. Callers in event handlers run outside a reactive owner, where
+    // a tracked read simply registers nothing.
+    let agent_info = state.agents.with(|agents| {
         agents
             .iter()
             .find(|candidate| {
@@ -2154,8 +2160,14 @@ pub fn compaction_control_state(
     // and every other control disables until it terminates.
     let in_flight = state
         .context_compactions
-        .with_untracked(|map| map.get(&agent.agent_id).is_some_and(|op| op.is_in_flight()));
-    if in_flight {
+        .with(|map| map.get(&agent.agent_id).is_some_and(|op| op.is_in_flight()));
+    // The legacy replacement path sets its own flag and is still live until
+    // that path is retired. Without this the two protocols each guard only
+    // themselves, and a legacy compaction in flight leaves this control armed.
+    let legacy_in_flight = state
+        .compaction_in_progress
+        .with(|map| map.contains_key(&agent.agent_id));
+    if in_flight || legacy_in_flight {
         return CompactionControlState::Disabled("Compaction already in progress");
     }
 
@@ -2164,7 +2176,7 @@ pub fn compaction_control_state(
     // capability is how a client sends a request the backend cannot serve and
     // then has to explain the refusal after the fact. Unknown reads as "still
     // determining", which is both true and self-resolving.
-    let availability = state.compaction_capability.with_untracked(|map| {
+    let availability = state.compaction_capability.with(|map| {
         map.get(&agent.agent_id)
             .map(|snapshot| snapshot.availability.clone())
     });
