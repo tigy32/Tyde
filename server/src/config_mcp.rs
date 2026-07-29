@@ -8,6 +8,7 @@
 //! immediately via the usual notify fan-out.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 
 use axum::{Json, Router, response::IntoResponse, routing::get};
@@ -35,7 +36,7 @@ use rmcp::{
     },
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::backend::setup;
@@ -273,6 +274,41 @@ fn err_text(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![Content::text(message.into())])
 }
 
+fn backend_status_acp_agents(settings: &protocol::HostSettings) -> Vec<setup::ConfiguredAcpAgent> {
+    crate::host::configured_acp_setup_agents(settings)
+}
+
+fn backend_status_response(payload: &protocol::BackendSetupPayload) -> Vec<Value> {
+    payload
+        .backends
+        .iter()
+        .map(|info| {
+            json!({
+                "backend_kind": info.backend_kind,
+                "status": info.status,
+                "installed_version": info.installed_version,
+                "docs_url": info.docs_url,
+            })
+        })
+        .collect()
+}
+
+async fn backend_status_with<ReadSettings, ReadFuture, CollectSetup, CollectFuture>(
+    read_settings: ReadSettings,
+    collect_setup: CollectSetup,
+) -> Result<Vec<Value>, String>
+where
+    ReadSettings: FnOnce() -> ReadFuture,
+    ReadFuture: Future<Output = Result<protocol::HostSettings, String>>,
+    CollectSetup: FnOnce(Vec<setup::ConfiguredAcpAgent>) -> CollectFuture,
+    CollectFuture: Future<Output = protocol::BackendSetupPayload>,
+{
+    let settings = read_settings().await?;
+    let acp_agents = backend_status_acp_agents(&settings);
+    let payload = collect_setup(acp_agents).await;
+    Ok(backend_status_response(&payload))
+}
+
 #[tool_router]
 impl TydeConfigMcpServer {
     #[tool(description = "Read the current Tyde host settings.")]
@@ -315,20 +351,15 @@ impl TydeConfigMcpServer {
         &self,
         Parameters(_input): Parameters<EmptyToolInput>,
     ) -> Result<CallToolResult, McpError> {
-        let payload = setup::collect_backend_setup(&[]).await;
-        let backends: Vec<_> = payload
-            .backends
-            .iter()
-            .map(|info| {
-                json!({
-                    "backend_kind": info.backend_kind,
-                    "status": info.status,
-                    "installed_version": info.installed_version,
-                    "docs_url": info.docs_url,
-                })
-            })
-            .collect();
-        ok_json(backends)
+        match backend_status_with(
+            || self.host.read_settings(),
+            |acp_agents| async move { setup::collect_backend_setup(&acp_agents).await },
+        )
+        .await
+        {
+            Ok(backends) => ok_json(backends),
+            Err(err) => Ok(err_text(err)),
+        }
     }
 
     #[tool(description = "List all custom agents (id, name, description, attachments).")]
@@ -671,6 +702,23 @@ pub fn start_server(
 mod tests {
     use super::*;
 
+    fn acp_profile(id: &str, label: &str, command: &str) -> protocol::HostLaunchProfileConfig {
+        protocol::HostLaunchProfileConfig {
+            id: protocol::LaunchProfileId(id.to_owned()),
+            label: label.to_owned(),
+            description: None,
+            backend_kind: BackendKind::Acp,
+            session_settings: protocol::SessionSettingsValues::default(),
+            acp: Some(protocol::AcpAgentSpec {
+                command: command.to_owned(),
+                args: Vec::new(),
+                cwd: None,
+                env: Default::default(),
+                adapter: protocol::AcpAdapterId::Stock,
+            }),
+        }
+    }
+
     #[test]
     fn tool_list_includes_skill_and_mcp_mutations() {
         let dir = tempfile::tempdir().expect("create temp host dir");
@@ -697,5 +745,103 @@ mod tests {
         ] {
             assert!(tool_names.contains(name), "missing config MCP tool {name}");
         }
+    }
+
+    #[test]
+    fn backend_status_derives_configured_acp_agents_from_settings() {
+        let mut settings = crate::store::settings::empty_settings_for_test();
+        settings.launch_profiles = vec![
+            acp_profile("acp:qa", "QA Stock", "/opt/qa-stock"),
+            protocol::HostLaunchProfileConfig {
+                backend_kind: BackendKind::Claude,
+                acp: None,
+                ..acp_profile("claude:custom", "Claude Custom", "")
+            },
+        ];
+
+        let agents = backend_status_acp_agents(&settings);
+
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].label, "Kiro (ACP)");
+        assert_eq!(agents[0].command, "");
+        assert_eq!(agents[0].adapter, protocol::AcpAdapterId::Kiro);
+        assert_eq!(agents[1].label, "QA Stock");
+        assert_eq!(agents[1].command, "/opt/qa-stock");
+        assert_eq!(agents[1].adapter, protocol::AcpAdapterId::Stock);
+    }
+
+    #[test]
+    fn backend_status_response_shape_remains_stable() {
+        let payload = protocol::BackendSetupPayload {
+            backends: vec![protocol::BackendSetupInfo {
+                backend_kind: BackendKind::Acp,
+                status: protocol::BackendSetupStatus::Installed,
+                installed_version: Some("qa-acp 1.0".to_owned()),
+                docs_url: "https://example.test/acp".to_owned(),
+                install_command: None,
+                diagnostic: Some(protocol::BackendSetupDiagnostic {
+                    code: protocol::BackendSetupDiagnosticCode::CommandFailed,
+                    message: "another profile failed".to_owned(),
+                }),
+                sign_in_command: None,
+            }],
+        };
+
+        assert_eq!(
+            backend_status_response(&payload),
+            vec![json!({
+                "backend_kind": "acp",
+                "status": "installed",
+                "installed_version": "qa-acp 1.0",
+                "docs_url": "https://example.test/acp",
+            })],
+            "the configured-agent fix must not expand the MCP response contract"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_status_handler_seam_passes_configured_agents() {
+        let mut settings = crate::store::settings::empty_settings_for_test();
+        settings.launch_profiles = vec![acp_profile("acp:qa", "QA Stock", "/opt/qa-stock")];
+
+        let response = backend_status_with(
+            || std::future::ready(Ok(settings)),
+            |agents| {
+                assert_eq!(agents.len(), 2, "configured agents must not become &[]");
+                assert_eq!(agents[0].adapter, protocol::AcpAdapterId::Kiro);
+                assert_eq!(agents[1].label, "QA Stock");
+                assert_eq!(agents[1].command, "/opt/qa-stock");
+                assert_eq!(agents[1].adapter, protocol::AcpAdapterId::Stock);
+                std::future::ready(protocol::BackendSetupPayload {
+                    backends: Vec::new(),
+                })
+            },
+        )
+        .await
+        .expect("backend status");
+
+        assert!(response.is_empty());
+    }
+
+    #[tokio::test]
+    async fn backend_status_handler_seam_stops_on_settings_failure() {
+        let collector_called = std::cell::Cell::new(false);
+
+        let result = backend_status_with(
+            || std::future::ready(Err("settings unavailable".to_owned())),
+            |_| {
+                collector_called.set(true);
+                std::future::ready(protocol::BackendSetupPayload {
+                    backends: Vec::new(),
+                })
+            },
+        )
+        .await;
+
+        assert_eq!(result, Err("settings unavailable".to_owned()));
+        assert!(
+            !collector_called.get(),
+            "setup collection must not run after settings read failure"
+        );
     }
 }
